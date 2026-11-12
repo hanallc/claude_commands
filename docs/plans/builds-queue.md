@@ -2165,7 +2165,7 @@ Design (builds approved it with two changes, items 2 and 6):
 
 The Work Order follows at phase start.
 
-### Phase 44e — Every build page tooltip shows labelled rows in one shape  · status: todo
+### Phase 44e — Every build page tooltip shows labelled rows in one shape  · status: merged into 44ad (2026-11-12); its hana CI rule is built by 44af
 **Depends on:** 44c. Starts next after the 44 and 44c deploy, before 44d and 44a. The user asked on 2026-11-11, from a shot of the cap line tooltip ("Cap 24.3 GiB; anonymous use 0.0 GiB + CI use 0.1 GiB + free 27.2 GiB – safety 3.0 GiB; reserved 0.0 GiB; room 24.2 GiB"): "i would like this tooltip for the cap (and other tooltips) to be more structured showing name: value pairs in rows - i also don't know what anonymous means so you need to provide better context - i don't want huge tool tips but i do want them to be informative and communicate information consistently". The Work Order follows at phase start.
 
 Every tooltip on `scripts/build_queue/memory_live.html` uses one shape:
@@ -2278,7 +2278,7 @@ Split from 44g on 2026-11-12. Current builds has no source for these rows: `veri
 3. An old or absent Mac reading keeps these rows.
 4. Port from the saved 44g tree `f86053a80` (the parts imp41 left out: the `verify.sh` placement log, `copy_watch` placement constraints and `SpeculativeCopy`, the placed-Mac fields and their tests).
 
-### Phase 44s — The AWS row shows its stage, region and zone  · status: todo
+### Phase 44s — The AWS row shows its stage, region and zone  · status: done (a2720807b, landed alone on builds as 1b43bdbad)
 
 User ask, relayed by aws 2026-11-12: show region and zone on the AWS row, with a smaller row font.
 aws landed `CloudProgress.stage`, `.region` and `.zone` (868eb2a14, all `str`, default `''`).
@@ -2287,6 +2287,142 @@ aws landed `CloudProgress.stage`, `.region` and `.zone` (868eb2a14, all `str`, d
 2. The AWS row shows the region and the zone after launch, for example `eu-south-2, zone a`. An empty value shows nothing.
 3. The AWS row detail text uses the smaller row font of the owner line.
 4. Old progress files without the fields render as today.
+
+### Phase 44t — The running panel has no separate table  · status: done (fb17c6952, landed alone on builds)
+
+User ask 2026-11-12: "whatever this table is at the bottom of the "Running, in start order" panel - i don't need that table - anything that is useful in it should show either in the main table or in a tooltip".
+The table is `.walk-table` in `memory_live.html` (columns #, Step, Duration, Machine, vCPU, Unit, Pid). It shows beside the chart when wide and below it when narrow.
+
+1. Remove the table in every layout.
+2. Each chart row shows its time: run duration, or the wait time for a waiting row.
+3. Each row tooltip shows place, machine, vCPU, unit and pid. Values the row already shows are not repeated.
+4. No feed, wire or record change.
+
+### Phase 44u — Test and proof runs leave no folders in the session TMPDIR  · status: done (c53a39f97, landed alone on builds)
+
+builds 2026-11-12: report's session TMPDIR held 56 `queue-place-*` and 2 `linux-copy-*` folders, plus 8 Chrome `url_fetcher` folders from page proofs. Each writer deletes its own folder at its end.
+
+1. `memory_page_proof.mjs` starts Chrome with `TMPDIR` set inside its profile folder, so Chrome's own temporary folders go with the profile.
+2. The `test_queue_place.py` fixture sets `TMPDIR` to its own root. A `queue_place.py` child that is killed then leaves its folder inside the fixture root, and the fixture removes it.
+3. Find each other test fixture that starts `queue_place.py` or the linux copy path without a private `TMPDIR`, and give it one.
+4. A test proves each writer leaves no folder in the caller's `TMPDIR`, also after a killed child.
+
+### Phase 44v — The protocol test builds its own version-one input  · status: done (3ed43b33f, sent to land alone on builds)
+
+aws via builds 2026-11-12: `test_admission_service.py:3692` runs `git show 7ab78b74e:scripts/build_queue/admission_protocol.py`. A copy without that history fails. The test builds its own input; no fixed old commit.
+
+1. The test reads its version-one reply decoder from a source the repository holds, not from git history.
+2. The test still checks that both protocol versions decode each unparsed-request refusal.
+3. The test passes in a copy with no git history.
+
+### Phase 44w — The step table returns; the reason list below the chart goes  · status: done (e071583c7, landed alone on builds and main eb53c88eb)
+
+User 2026-11-12, via builds: "it was not at my request - i was asking about the table at the bottom - not on the right - i even provided a screenshot highlighting exactly which table - the one that i asked to be deleted is still there and the one i did not ask to be deleted is gone". 44t removed the wrong table.
+
+1. Restore the step table beside the Running chart as it was before 44t (fb17c6952), in every layout. Revert the rest of 44t too. Keep the 44u cleanup in the page proof.
+2. Remove the list below the chart: the queue priority line, the Head line and each per-step reason line (`#priority-line`, `#head-line`, `#wait-reasons`).
+3. Move each useful value into the rows or their tooltips: a waiting row's tooltip gives its reason; the head row's tooltip gives the Head values; the priority row shows that it holds the queue priority. No value is shown twice.
+4. Page views prove both, wide and narrow.
+
+### Phase 44x — Saved priority evidence needs a readable document, and it expires  · status: todo
+**Depends on:** the priority follow-up to the queue answer fix (builds-queue-44answer).
+
+Two minor findings from the fourth closure review of the priority repair. They moved here under the hard-landing rule: neither is a regression, neither breaks what worked, and the user does not see them in normal use.
+
+1. `memory_admit.py:412` makes eligibility from any matching unit label. The roster can label a worker through staff relations without a readable document. Make evidence only from a successful document check in the background reader. Add a test row: an unavailable document with a labeled worker.
+2. `memory_admit.py:389` detects staff changes, but not a document removed at the same path. Evidence survives a restart. Give evidence a lifetime, refresh documents in the background, and reject evidence after a failed refresh.
+
+### Phase 44y — Test cleanup keeps the original failure  · status: todo
+**Depends on:** 44.
+
+A minor finding from the phase 44 closure review, moved here under the hard-landing rule. `verify_mac_offload_test_support.py:1240` and `verify_ssh_targets_test_support.py:520` capture diagnostics and stop processes before they raise again. If either step raises, its exception replaces the original failure.
+
+1. Keep the original exception. Attach a cleanup or diagnostic error to it.
+2. Add rows to the existing cleanup test: the exception identity stays, and a failed diagnostic capture is attached.
+
+### Phase 44z — /build:queue is removed; /build:page is the one queue view  · status: todo
+**Depends on:** none to build; it merges builds again after Phase 44 lands, and lands after it.
+
+User 2026-11-12, change review C1474: "okay - it's time to retire the /build:queue output within the claude sesssion - we will use /build:page going foward - you can remove the skill and any code dedicated to showing the /build:queue view - but keep whatever is needed (obviously) for the build memory page". builds: use `/remove_command build:queue`; remove the skill, the view code, its tests, its doc lines and any plugin pane that only shows that view; keep the bump action only if the page or another caller uses it.
+
+1. Inventory and classify every hit by `/remove_command` steps 1–3. Report the table before any deletion.
+2. Remove each dedicated part: `commands/build/queue.md`, the queue view and card code, the unit-board queue pane, and their tests and doc lines.
+3. Keep each shared part and name its caller: everything the build page reads, and `bump`/`clear`/`admit-head` when `/showrunner:bump` or another caller uses them.
+4. Verify by `/remove_command` step 5. The landing runs the full tests-only gate.
+
+### Phase 44aa — queue_place.py starts a program with no signal handler  · status: done (85ed7572d, sent to land alone on builds)
+**Depends on:** none to build; it lands alone on builds.
+
+The user's rule, via builds 2026-11-12: no signal handlers. `queue_place.py:293` wraps the program start in `build_folders.defer_signals()`, which installs `signal.signal` handlers. sdlc devtools deletes `defer_signals` when both callers are gone; `merge_gate.py` is the other caller.
+
+1. Remove the `defer_signals` call from `QueuePlace.popen`.
+2. Make an interrupt in the start window safe without a handler: write each record atomically, and let the next start find and clean up a program whose holder died before it was tracked.
+3. Add rows to `test_queue_place.py`: TERM, INT and KILL in the start window leave no untracked program and no partial record, and the next start cleans up.
+
+### Phase 44ae — Start recovery finds a detached descendant of an unscoped program  · status: todo
+**Depends on:** 44aa.
+
+Review finding F004 of 44aa. Recovery at the next start rebuilds an unscoped program tree from the program identity and its process group (`queue_place.py` near line 255). A descendant that calls `setsid()` and outlives its parent escapes it, and recovery deletes the record. `ProgramPurpose.RUNNER` uses this path. The same gap existed before 44aa under KILL. Keep the descendant identities or use durable containment, and add a row that fails without the change.
+
+### Phase 44ab — A bump names its caller and ends with its step  · status: todo
+**Depends on:** none to build. It lands alone on builds, before 44z. 44z merges it.
+
+builds sent this defect from cargo-liner on 2026-11-12. port-unit's bump at 11:24 stored `{unit: port, why: "the user's bump"}`. Every later port step still goes ahead of the queue, hours after port's Phase 7 merged. builds' bump of resources step #10 at 18:15 has the same open end. The port entry stays until the user clears it.
+
+1. Find why the bump stored a priority while the client printed "admission service unavailable". A failed request must store nothing. When the service stored the priority, the client must not report a failure.
+2. Find why /build:queue said bump is off while the bump stored a priority. When bump is off, a bump stores nothing and says so.
+3. The default `--why` names the real caller (its staff name), not "the user's bump". Only an explicit `--why` gives the user's words.
+4. A priority ends when its step ends. A bump selects one step, not every later step of the same unit. A priority with no live step ends on the next queue read.
+5. Add rows to the existing bump and admission tests for each item. Item 4 has a row that fails without the change: the next step of the same unit gets no priority.
+
+### Phase 44ac — The Mac builds row shows no awk error  · status: done (c71a75d63, landed alone on builds 5187b127c)
+**Depends on:** none. It lands alone on builds.
+
+The user's screenshot of 2026-11-12 18:10 (`/tmp/claude/scratch/user-shot-30-waits-tooltip.png`) shows the Mac builds row with a raw error: `awk: extra ] ... nonterminated character class`. The Mac reading program in `scripts/build_queue/queue_view.py:115` uses `sub(/\/[^/]*$/, "", folder)`. The Mac's awk ends the regular expression at the `/` inside the bracket.
+
+1. Write the expression so that the Mac awk and GNU awk both accept it.
+2. Proof: run the program on the Mac and on natedev; the Mac builds row shows the reading, not an error.
+
+### Phase 44af — The Running table shows the stage in its first column, and hana CI only while CI runs  · status: done (54c9f3403, sent to land alone on builds)
+**Depends on:** none. It lands alone on builds.
+
+The user, 2026-11-12, on the build memory page (`/tmp/claude/scratch/user-shot-33-running-stage.png`): "the stage should not be its own column - it should be that where it says # in the running section - it should say Stage and it should say there whether it is testing or building - based on what it knows".
+
+1. In the Running table, the `#` column (which shows `run`) becomes `Stage`. It shows `building` or `testing`.
+2. The separate Stage column goes.
+3. A row with no known stage (Mac builds, hana CI today) shows `—`, as other unknown cells do. If the page knows the stage from its data, it shows it.
+4. The Waiting table keeps its `#` place column.
+5. The user, again the same day (`/tmp/claude/scratch/user-shot-34-hana-ci-row.png`): "the hana CI row should only show if there is a CI running - otherwise it should be hidden and just reflected as part of the used - builds used memory - because it is negligible when ci is not running - but when it is running we should see the ci run". Hide the hana CI row when no CI job runs, and count its memory in the used total. Show the row only while a CI job runs. This is a repeat ask: find the earlier change and why the row came back. A test row holds it this time.
+6. Proof: the Running table from the screenshots, before and after, with and without a CI job.
+
+### Phase 44ad — Every tooltip on the build page is clear, short and consistent  · status: todo
+**Depends on:** 44ab for the priority setter name, and 44ag (the Mac row). It lands alone on builds after both and merges them.
+
+This phase carries out Phase 44e, which the user approved on 2026-11-11. 44e's shape (title line, one short sentence, name and value rows, calculations with `+`, `−` and `=`) and its rules 1, 2, 4 and 5 are the starting point for the astra review. 44e's hana CI rule is built by 44af.
+
+The user, C1488 on 2026-11-12, about the waits tooltip in the same screenshot: "the waiting should be on its own row. Then reason on the next. i can't interpret the Head: free 7.6 GiB; reserve 3.0 GiB; need 1.9GiB ... the queue priority line should just say priority: and 'port (the user's bump)' doesn't make any sense. please ask it to review with an astra designer so we can get useful and consistent information, concisely expressed in all of our tool tips on this page."
+
+1. List every tooltip on the page, with a live example of each.
+2. An astra review of that list gives one content rule for all tooltips: useful, consistent and short.
+3. The waits tooltip: the title names the step; the wait time is on its own line; the reason is on the next line, in words that match the drawn outline; the priority line reads `Priority: <who set it>`.
+4. Apply the rule to every other tooltip.
+5. The user, later the same day: "the free, reserve and need figures are fine with me as long as they make sense and align with what i see on screen - these ones didn't - i expect they should - and be explained correctly and succinctly". Keep free, reserve and need. Each number matches a part drawn on the page (the outline, a bar segment, the cap line), and the words say how they relate. In the screenshot, free 7.6 GiB and reserve 3.0 GiB matched nothing, while the bar showed 0.0 GiB next step room. Find why they disagree. A wrong number is a defect to fix, not only a label.
+6. builds decided on 2026-11-12: the bar draws the truth. The summary hatching now clips reserved memory to available minus safety (`memory_feed.py:1024`), so the screenshot showed 4.6 GiB while the rows reserved 15.8 GiB. Draw the full reservations and the shortfall. Name the safety amount "safety", never "reserve". The astra review sets the wording and layout around this.
+7. Proof: the waits tooltip from the screenshot, before and after, and each changed tooltip after.
+8. The astra review (2026-11-12, `/tmp/claude/astra/20261112T234648Z-932244/review.md`) is the design. It sets the content rule, the waits, room, cap, reserved and safety layouts, the pressure gauge text (`Full > limit`, or `Some > limit` and `Swap > limit`), one captured reading for the pressure decision and its gauges, the rounding rule (`=` only when the shown terms add up, otherwise `≈`), and the change for each tooltip. The labels are Free, Safety, Reserved, Needs, Next step room and Shortfall.
+
+### Phase 44ag — A Mac build row reads like every other Running row  · status: todo
+**Depends on:** 44af, for the Stage column. It lands alone on builds, before 44ad. 44ad merges it.
+
+The user, 2026-11-12, after 44ac (`/tmp/claude/scratch/user-shot-31-mac-row.png`): "so the mac isn't reading an error per se - but it also doesn't read like any of the other rows - and it should".
+
+1. One row for each Mac build. The Step column names the repository and the command, as natedev rows do (for example `hana nextest`), not the folder name.
+2. Stage shows `building` or `testing`. A test binary that runs under the build means `testing`; otherwise `building`.
+3. Duration, Unit, Pid, Machine and vCPU fill as on a natedev row. Unit comes from a record the queue already keeps for the Mac run (its Mac claim or copy lease). vCPU comes from the command's jobs value. A value with no source shows `—`.
+4. The bar draws the build's used memory (the resident memory of its process tree on the Mac) in the same used style and the same GiB scale. The Mac has no reservation, so the row has no hatching. The tooltip says that Mac memory does not count against natedev.
+5. A failed or old reading shows one `Mac builds` row with a short status, such as `Mac reading unavailable · 9 min old`. The raw error goes to the feed log, not the page.
+6. The tooltip follows the 44ad content rule: title with the step and its used memory, one short sentence, then rows for Machine, Started, Used, and reading age.
+7. Proof: the Running table with a Mac row next to a natedev row, before and after, plus the failed-reading row.
 
 ### Phase 44k — A hana or cargo-liner step waits for a busy Mac instead of running on natedev  · status: todo
 **Depends on:** 44. Starts after the 14:00 deploy on 2026-11-12. ETA 17:00 EST.
