@@ -2395,7 +2395,7 @@ The user, 2026-11-12, on the build memory page (`/tmp/claude/scratch/user-shot-3
 5. The user, again the same day (`/tmp/claude/scratch/user-shot-34-hana-ci-row.png`): "the hana CI row should only show if there is a CI running - otherwise it should be hidden and just reflected as part of the used - builds used memory - because it is negligible when ci is not running - but when it is running we should see the ci run". Hide the hana CI row when no CI job runs, and count its memory in the used total. Show the row only while a CI job runs. This is a repeat ask: find the earlier change and why the row came back. A test row holds it this time.
 6. Proof: the Running table from the screenshots, before and after, with and without a CI job.
 
-### Phase 44ad — Every tooltip on the build page is clear, short and consistent  · status: todo
+### Phase 44ad — Every tooltip on the build page is clear, short and consistent  · status: done (63b86a475 on builds-queue-44ad, contains 44ag; sent to land on builds)
 **Depends on:** 44ab for the priority setter name, and 44ag (the Mac row). It lands alone on builds after both and merges them.
 
 This phase carries out Phase 44e, which the user approved on 2026-11-11. 44e's shape (title line, one short sentence, name and value rows, calculations with `+`, `−` and `=`) and its rules 1, 2, 4 and 5 are the starting point for the astra review. 44e's hana CI rule is built by 44af.
@@ -2411,7 +2411,7 @@ The user, C1488 on 2026-11-12, about the waits tooltip in the same screenshot: "
 7. Proof: the waits tooltip from the screenshot, before and after, and each changed tooltip after.
 8. The astra review (2026-11-12, `/tmp/claude/astra/20261112T234648Z-932244/review.md`) is the design. It sets the content rule, the waits, room, cap, reserved and safety layouts, the pressure gauge text (`Full > limit`, or `Some > limit` and `Swap > limit`), one captured reading for the pressure decision and its gauges, the rounding rule (`=` only when the shown terms add up, otherwise `≈`), and the change for each tooltip. The labels are Free, Safety, Reserved, Needs, Next step room and Shortfall.
 
-### Phase 44ag — A Mac build row reads like every other Running row  · status: todo
+### Phase 44ag — A Mac build row reads like every other Running row  · status: done (a4ac8f03b, sent to land alone on builds)
 **Depends on:** 44af, for the Stage column. It lands alone on builds, before 44ad. 44ad merges it.
 
 The user, 2026-11-12, after 44ac (`/tmp/claude/scratch/user-shot-31-mac-row.png`): "so the mac isn't reading an error per se - but it also doesn't read like any of the other rows - and it should".
@@ -2423,6 +2423,9 @@ The user, 2026-11-12, after 44ac (`/tmp/claude/scratch/user-shot-31-mac-row.png`
 5. A failed or old reading shows one `Mac builds` row with a short status, such as `Mac reading unavailable · 9 min old`. The raw error goes to the feed log, not the page.
 6. The tooltip follows the 44ad content rule: title with the step and its used memory, one short sentence, then rows for Machine, Started, Used, and reading age.
 7. Proof: the Running table with a Mac row next to a natedev row, before and after, plus the failed-reading row.
+8. The user, the same day (`/tmp/claude/scratch/user-shot-36-hana-ci-owner.png`, Waiting rows 16 and 18): "hana-linux-2 and hana-linux-1 - pretty sure these are CI - they should not say owner not recorded they should just say hana CI". builds: every hana CI runner step names its owner `hana CI`, in Running and Waiting. One rule in the feed decides that a step belongs to a CI runner; the page does not match names. Proof: the same rows before and after.
+9. The user, the same day (`/tmp/claude/scratch/user-shot-37-mac-counter.png`, row `trunk-p172-assembly-rows`): "it should not be the case that the mac process has no readable counter - i am pretty sure i see the readable counter when i run cargo tile on the mac". Read the Mac build's progress counter the way `cargo tile` does (source: `~/rust/cargo-liner-tile`), and fill Unit from the Mac claim. Proof: this row before and after.
+10. The user, the same day (`/tmp/claude/scratch/user-shot-38-mac-tile.png`, `/tmp/claude/scratch/user-shot-39-page-mac-one-row.png`): "i see progress bars on the mac - additionally i see 3 runs happening on the mac where as the build queue page only shows 1". `cargo tile` showed three runs (a trunk-p172 release build at 60.4%, a hana mirror nextest at 64.7%, a cargo-liner mirror nextest at 98.3%). The page showed one row, `bevy_text-0.20.1`, a crate name, with no counter. Show one Mac row for each run that `cargo tile` shows, named by its run, with the done% that `cargo tile` reads. Proof: these three runs on the page next to a `cargo tile` capture.
 
 ### Phase 44k — A hana or cargo-liner step waits for a busy Mac instead of running on natedev  · status: todo
 **Depends on:** 44. Starts after the 14:00 deploy on 2026-11-12. ETA 17:00 EST.
