@@ -27,7 +27,7 @@ from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses)
 
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
@@ -56,7 +56,6 @@ from scripts.build_queue.admission_records import (
     BasisNotRecorded,
     BehindHead,
     BetweenStepsSlot,
-    CIKeepAside,
     CallerRun,
     CapNotRecorded,
     CapUnavailable,
@@ -170,6 +169,7 @@ from scripts.build_queue.admission_records import (
     WaitingStep,
     WidthNotRecorded,
     WithinSlot,
+    format_percent,
 )
 from scripts.build_queue.step_estimator import (
     Completed,
@@ -315,11 +315,7 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
         value = cast(object, json.loads(path.read_text()))
         if not isinstance(value, dict):
             raise ValueError("priority is not an object")
-        row = cast(dict[str, object], value)
-        if (any(not isinstance(row.get(key), str) for key in ("unit", "why", "set_by"))
-                or any(not isinstance(number := row.get(key), (float, int))
-                       or isinstance(number, bool) or not math.isfinite(number) for key in ("set_at",))):
-            raise ValueError("invalid priority fields")
+        row = records.upgrade_queue_priority(cast(dict[str, object], value))
         return cast(QueuePriority, codec.parse_snapshot_value(row, QueuePriority))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
@@ -329,24 +325,22 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
 
 
 def finish_priority_transition(priority: QueuePriority) -> None:
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, SettledPriority):
         return
-    record.queue_priority(transition.action, priority["unit"], priority["why"],
-                          priority["set_by"], transition.at, transition_id=transition.id, start=transition.month_row_end)
+    record.queue_priority(transition.action, transition.unit, transition.why,
+                          transition.set_by, transition.at, transition_id=transition.id, start=transition.month_row_end)
 
 
 def read_queue_priority(directory: Path, *, finish: bool = False) -> QueuePriority | NoQueuePriority:
     priority = load_queue_priority(directory)
     if isinstance(priority, NoQueuePriority):
         return priority
-    transition = priority["transition"]
+    transition = priority.transition
     if isinstance(transition, PendingPriorityTransition):
         if finish:
             finish_priority_transition(priority)
-        if transition.action == "clear":
-            return NO_QUEUE_PRIORITY
-    return priority
+    return priority if priority.entries else NO_QUEUE_PRIORITY
 
 
 class UnitMembership(Protocol):
@@ -383,7 +377,18 @@ def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMe
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
-        labels = roster.unit_labels_for(session_ids, os.environ)
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        recorded: dict[str, UnitMembership] = {}
+        try:
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+        except (OSError, ValueError):
+            pass
+        missing = [session for session in session_ids if session not in recorded]
+        if missing:
+            recorded.update(roster.unit_labels_for(missing, os.environ))
+        labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}
 
@@ -421,8 +426,9 @@ def apply_queue_priority(rows: Iterable[tuple[Path, Waiter]], context: QueueOrde
     ranked: list[tuple[Path, RankedWaiter]] = []
     for path, row in rows:
         unit = queue_unit(row.get("unit", ""), row.get("session_id", ""), context.labels)
-        order = (PriorityUnit(context.priority["unit"]) if not isinstance(context.priority, NoQueuePriority)
-                 and unit == context.priority["unit"] else NormalOrder())
+        entries = context.priority.entries if isinstance(context.priority, QueuePriority) else ()
+        position = next((index for index, entry in enumerate(entries) if unit == entry["unit"]), -1)
+        order = PriorityUnit(unit, position) if position >= 0 else NormalOrder()
         ranked.append((path, rank_waiter(row, order)))
     return sorted(ranked, key=lambda item: waiter_order(item[1])), context.priority
 
@@ -458,9 +464,6 @@ def head_override_event(action: Literal["set", "admitted", "lapsed"], override: 
                         need: int, free: int, reserve: int, at: float) -> None:
     record.head_admission(action, override["unit"], override["step"], need, free,
                           reserve, override["why"], override["set_by"], at)
-
-
-NO_CI_KEEP_ASIDE = CIKeepAside()
 
 
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
@@ -620,7 +623,6 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
 
 def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory],
                 policy: AdmissionPolicy, *,
-                ci_keep_aside: CIKeepAside = NO_CI_KEEP_ASIDE,
                 ci_use: int = 0) -> MemoryRoom | ReadingUnavailable:
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
@@ -630,20 +632,13 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
                   max(0, run.need - run.use.bytes) + run.held
                   if isinstance(run.use, AnonymousRunUse) else run.need + run.held) for run in runs)
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
-    kept = sum(run.bytes for run in holds) + ci_keep_aside.bytes
+    kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
                                  else max(0, used + ci_use + host.available - safety))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept, cap, holds, total=host.total,
-                      ci_keep_aside=ci_keep_aside, ci_use=ci_use)
-
-
-def ci_keep_aside(readings: Iterable[StepMemory], margin: int) -> CIKeepAside:
-    """Keep one margin for a CI job with readable slice evidence."""
-    running = any(isinstance(reading, UnownedSliceMemory)
-                  and isinstance(reading.job_state, RunningServiceJob) for reading in readings)
-    return CIKeepAside(margin if running else 0)
+                      ci_use=ci_use)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1312,7 +1307,9 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return (0 if isinstance(records.waiter_priority(row), PriorityUnit) else 1), row.get("order_since", row["since"]), row["pid"]
+    order = records.waiter_priority(row)
+    rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
+    return rank, row.get("order_since", row["since"]), row["pid"]
 
 
 @dataclass(frozen=True)
@@ -1819,7 +1816,7 @@ def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     return tuple(groups.values())
 
 
-PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "merge-gate", "cargo")
+PROGRESS_STEPS = ("build", "check", "clippy", "mend", "nextest", "test", "t", "merge-gate", "targeted-test", "cargo")
 
 
 def reservation_profile_key(row: Reservation, host: str) -> str:
@@ -1864,9 +1861,9 @@ def progress_text(reading: StepMemory) -> str:
     if not isinstance(reading, ProgressAdjustedMemory):
         return ""
     counter = reading.counter
-    phase = (f"{counter.phase}, {counter.percent:.0f}% done" if isinstance(counter, progress.ProgressCounter)
+    phase = (f"{counter.phase}, {format_percent(counter.percent, complete=counter.done == counter.total)} done" if isinstance(counter, progress.ProgressCounter)
              else counter.reason)
-    reason = (f"highest anonymous use in the next {reading.window.lookahead_percent:g}%"
+    reason = (f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
               if isinstance(reading.window, progress.WindowPeak) else
               f"full need: {reading.window.reason}")
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
@@ -1878,8 +1875,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     ci_use = sum(reading.bytes for reading in readings
                  if isinstance(reading, UnownedSliceMemory)
                  and not isinstance(reading.job_state, NotServiceSlice))
-    return memory_room(inputs.host, run_memories(inputs), policy,
-        ci_keep_aside=ci_keep_aside(readings, policy.ci_memory_margin_bytes), ci_use=ci_use)
+    return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
@@ -2065,7 +2061,7 @@ def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[i
 
 def running_has_reservation(step: RunningStep) -> bool:
     """Identify running rows that consume one reservation in the same order."""
-    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory))
+    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory, records.RemoteMemoryUnavailable))
 
 
 def inputs_after_steps_end(inputs: QueueInputs, ended: frozenset[int], policy: AdmissionPolicy) -> QueueInputs:
@@ -2513,10 +2509,11 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                    for value in readings.compilers)
     for value in unowned:
         activity = value.activity
-        if not isinstance(value.job_state, NotServiceSlice):
+        state = records.recorded_service_state(value)
+        if not isinstance(state, NotServiceSlice):
             running.append(RunningStep("", value.owner, "service", value.cgroup, 0, value,
                 pid=value.pid,
-                started_at=value.job_state.started_at if isinstance(value.job_state, RunningServiceJob) else 0.0))
+                started_at=state.started_at if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0))
             continue
         running.append(RunningStep(
             activity.session_id if isinstance(activity, ScopeProcesses) else "",
@@ -2587,9 +2584,23 @@ def owned_scope_roots(scopes: Iterable[Path], parent: Path) -> set[Path]:
     return {scope for scope in inside if inside.isdisjoint(scope.parents)}
 
 
+def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdentity],
+                      reserved_pids: set[int], waiters: Sequence[Waiter], started_at: float = 0.0) -> ServiceJobState:
+    """Match worker process trees to admitted and waiting step identities."""
+    trees = [process_tree({pid: processes[pid].start}, processes) for pid in workers if pid in processes]
+    if not trees:
+        return IdleService()
+    if any(tree.intersection(reserved_pids) for tree in trees):
+        return RunningServiceJob(started_at)
+    waiting_pids = process_tree({row["pid"]: row["start_time"] for row in waiters}, processes)
+    if any(tree.intersection(waiting_pids) for tree in trees):
+        return WaitingServiceJob(started_at)
+    return UnmatchedServiceJob(started_at)
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "") -> tuple[UnownedSliceMemory, ...]:
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -2616,6 +2627,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))
     children.extend(group for group in ci_groups if group not in children)
     for child in children:
+        if child.name == "builds-detached.slice":
+            continue
         required = child in ci_groups
         if not required and (child in owned or child.name == "sccache.service" or not child.is_dir()):
             continue
@@ -2640,8 +2653,10 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             row_pid: int | PidNotRecorded = (activity.members[0].pid
                 if isinstance(activity, ScopeProcesses) and activity.members else PidNotRecorded())
             job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+            current_state: ServiceJobState = NotServiceSlice()
             if required:
                 job_state = IdleService()
+                current_state = IdleService()
                 programs = member_programs(members.intersection(processes), proc)
                 workers = [pid for pid, program in programs.items() if program == "Runner.Worker"]
                 listeners = [pid for pid, program in programs.items() if program == "Runner.Listener"]
@@ -2649,18 +2664,19 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                 if candidates:
                     oldest = min(candidates, key=lambda pid: (int(processes[pid].start), pid))
                     row_pid = oldest
-                    if workers:
-                        unregistered = [pid for pid in workers
-                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
-                        if unregistered:
-                            first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
-                            job_state = RunningServiceJob(activity_reader.started_at(first))
+                    current_state = service_job_state(workers, processes, tree_pids | scoped_pids, waiters,
+                                                      activity_reader.started_at(oldest))
+                    unregistered = [pid for pid in workers
+                        if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
+                    if unregistered:
+                        first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
+                        job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped,
                                                  cgroup=str(child), owner=child.name,
                                                  activity=activity, pid=row_pid,
-                                                 job_state=job_state))
+                                                 job_state=job_state, service_job_state=current_state))
         except (OSError, ValueError) as error:
             if required:
                 result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), cgroup=str(child),

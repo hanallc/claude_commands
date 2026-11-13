@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import io
 import json
@@ -13,23 +13,23 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
 from collections.abc import Callable, Generator
 from pathlib import Path
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
-from typing import ClassVar, TypedDict, cast, override
+from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 from unittest import mock
 from scripts.style import rules
+from scripts.style.style_config import StyleUnitAssignment
 from scripts.style import style_ledger
 from scripts.style.approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
-from scripts.style import style_plan
 from scripts.style import style_rules
-from scripts.style import declarations
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
+
+if TYPE_CHECKING:
+    from scripts.style import declarations
 
 
 STYLE_UNIT_NAMES = (
@@ -40,6 +40,27 @@ STYLE_UNIT_NAMES = (
     "assigned", "candidate", "restamp", "worker", "drop", "holder-a", "holder-b",
     "other-crate", "third-names", "judge-values", "first-clean-1", "first-clean-2", "assign", "vanished", "merged", "dropped", "live",
 )
+
+
+DEFAULT_STYLE_ASSIGNMENTS = tuple(StyleUnitAssignment(family, (family,)) for family in (
+    cast(rules.Family, "names"), cast(rules.Family, "values"),
+    cast(rules.Family, "types"), cast(rules.Family, "modules"),
+))
+
+
+def write_style_units(document: Path, assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> None:
+    """Write the fixture's family assignments with the specified staff names."""
+    table = "\n## Style units\n\n| Unit | Families | Open tickets |\n| --- | --- | --- |\n"
+    table += "".join(f"| {row.unit} | {', '.join(row.families)} | {row.open_tickets} |\n" for row in assignments)
+    text = document.read_text()
+    section = re.search(r"(?m)^## Style units\s*$", text)
+    if section:
+        following = re.search(r"(?m)^#{1,2} ", text[section.end():])
+        end = section.end() + following.start() if following else len(text)
+        text = text[:section.start()] + table.lstrip("\n") + "\n" + text[end:]
+    else:
+        text += table
+    _ = document.write_text(text)
 
 
 def style_unit_id(name: str) -> str:
@@ -59,13 +80,14 @@ def ticket_owner_id(reference: str) -> str:
 
 
 @contextmanager
-def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
+def style_staff_fixture(root: Path, repo: Path,
+                        assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> Generator[None]:
     """Create private ticket owners for the copied repository."""
     with isolated_staff_file(root / "staff.json", {}), mock.patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
         owner = fixture_member("showrunner", name="sample-style")
         members = (staff.SeedMember("owner", "showrunner", owner.name, owner.id, staff.RootSeedParent()), *(
             staff.SeedMember(name, "unit", name, staff.NewSeedMember(), staff.SeedParent("owner"), style_unit_id(name))
-            for name in STYLE_UNIT_NAMES
+            for name in dict.fromkeys((*STYLE_UNIT_NAMES, *(row.unit for row in assignments)))
         ))
         record = staff.apply_seed(staff.SeedInput(tuple(members)))
         for row in record.find(kind="unit", parent=owner.id):
@@ -73,7 +95,9 @@ def style_staff_fixture(root: Path, repo: Path) -> Generator[None]:
                                   expected=row.worktree)
         document = repo / ".git/style-production.md"
         document.parent.mkdir(exist_ok=True)
-        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n")
+        _ = document.write_text("# Style production\n- **Kind:** style\n- **Branch point:** main\n" +
+                                f"- **Merge branch:** main\n- **Showrunner checkout:** {repo}\n")
+        write_style_units(document, assignments)
         _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
         yield
 
@@ -613,6 +637,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def widen(self, *paths: str, ticket: str = "1", reason: str = "the move needs a new file",
               by: str = "showrunner") -> tuple[int, str]:
+        from scripts.style import style_plan
+
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
             result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
@@ -804,6 +830,8 @@ class LedgerTestCase(unittest.TestCase):
     def renamed_binding(self, ledger: style_ledger.Ledger, built_path: str, before: str, after: str) -> str:
         """A filed rename of the binding ws in fn old, a built rename of fn old at built_path, and a tip that renames
         only the fn. The step follows the finding to fn new."""
+        from scripts.style import declarations
+
         function = "pub fn old() {\n    let ws = 1;\n}\n"
         _ = self.commit_tip(ledger, {PARENT_FILE: function, MOVED_FILE: "pub fn caller() {\n    crate::a::old();\n}\n"})
         _, (finding_id,) = self.judge_parent(ledger, ((2, "let ws = 1;"),), before="ws", after="workspace")
@@ -818,6 +846,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_gone_from_file(self, ledger: style_ledger.Ledger, finding_id: str, approved: Callable[[Path], bool]) -> None:
         """The declaration step leaves the filed finding on struct Parent gone from its file and writes nothing."""
+        from scripts.style import declarations
+
         filed = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))[0]
         before = self.held_rows(ledger.database)
         left, = ledger.follow_declarations([finding_id], ledger.synced_commit(), approved).outcomes
@@ -849,6 +879,8 @@ class LedgerTestCase(unittest.TestCase):
 
     def assert_method_rename_built_in_place(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
         """The step builds the filed rename of Parent::old to Parent::new at fn new in impl Parent in a.rs."""
+        from scripts.style import declarations
+
         filed = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == finding_id)
         renamed, = self.follow_approved(ledger, [finding_id])
         self.assertEqual(renamed, style_ledger.DeclarationRenamed(
@@ -889,44 +921,6 @@ class LedgerTestCase(unittest.TestCase):
     def comment_only_change(self, relative: str) -> None:
         content = (self.repo / relative).read_text()
         self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
-
-    def record_while_stalled(self, stalled: str, write: Callable[[style_ledger.Ledger], object]) -> None:
-        """A second ledger records a verdict before write may leave style_ledger.<stalled>."""
-        original = cast(Callable[..., object], getattr(style_ledger, stalled))
-        started, release = threading.Event(), threading.Event()
-
-        def stall(*arguments: object) -> object:
-            if not started.is_set():
-                started.set()
-                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "stalled writer was not released")
-            return original(*arguments)
-
-        _ = self.enterContext(mock.patch.object(style_ledger, "BUSY_TIMEOUT_SECONDS", 0.5))
-        rule = self.rule("concurrent")
-        recorder = self.ledger()
-        failures: list[BaseException] = []
-
-        def run() -> None:
-            # A connection serves only the thread that opened it.
-            try:
-                with style_ledger.open_ledger(self.repo) as writer:
-                    _ = write(writer)
-            except BaseException as error:
-                failures.append(error)
-
-        with mock.patch.object(style_ledger, stalled, side_effect=stall):
-            thread = threading.Thread(target=run)
-            thread.start()
-            try:
-                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS), "writer did not reach its stalled operation")
-                recorder.record(rule, self.sources[2], self.initial_tip, self.blob(rule), "clean",
-                                ticket="27001", worker="test-worker")
-            finally:
-                release.set()
-                thread.join(timeout=TEST_HANG_GUARD_SECS)
-            self.assertFalse(thread.is_alive(), "released writer did not finish")
-        self.assertEqual(failures, [])
-        self.assertEqual(self.states(rule)[self.sources[2]], "current")
 
     def judge_while_loading_rules(self, changes: int) -> tuple[style_ledger.Ledger, str, mock.MagicMock]:
         """A 1 ticket ready to checkpoint, and a catalog load whose first changes calls record a newer verdict for it."""

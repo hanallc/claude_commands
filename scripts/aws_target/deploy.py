@@ -7,13 +7,13 @@ except FileNotFoundError:
     pass
 
 import argparse
-import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable
-from dataclasses import dataclass, fields, replace
+from collections.abc import Callable, Sequence, Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-import gzip
+from decimal import Decimal
 from hashlib import sha256
 import json
 import os
@@ -22,26 +22,131 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
-from typing import Literal, cast, final
+from typing import cast, final
 from uuid import uuid4
 
 
 from scripts.aws_target import admin_secrets, box, ledger, remote, teardown
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command
-from scripts.aws_target.config import (
-    BudgetNotificationAddress, DeploymentSettings, deployment_price, deployment_price_path, money, read_budget_notification_address,
-    deployment_record, deployment_outputs, read_control_settings, read_deployment_settings, read_settings,
-)
-from scripts.lib import conf
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus
+from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
+from scripts.aws_target.terminal_table import aligned_table
+from scripts.lib import conf, user_zone
+from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
+CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
+
+
+UP_STAGE_LABELS = {
+    'price': 'reading the Spot price',
+    'bootstrap': 'preparing the boot script',
+    'stacks': 'updating the stack',
+    'scaler-key': 'preparing the scaler credentials',
+    'tailscale-policy': 'checking the Tailscale policy',
+    'box-join': 'joining the box to Tailscale',
+    'box-configuration': 'configuring the box',
+    'checks': 'checking the box',
+    'image': 'preparing the box image',
+    'idle-stop': 'configuring the idle timer',
+    'activation': 'activating the builder',
+    'routing-proof': 'checking the build route',
+}
+
+
+@contextmanager
+def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generator[None]:
+    """Show progress until the operation ends."""
+    interval = conf.read(settings).number('deploy_progress_interval_s')
+    stream = sys.stdout
+    started = time.monotonic()
+    stopped = threading.Event()
+    start = f'{text} ({hint})' if hint else text
+    print(f'{command}: {start}', file=stream, flush=True)
+
+    def heartbeat() -> None:
+        while not stopped.wait(interval):
+            minutes = int((time.monotonic() - started) / 60)
+            print(f'{command}: still {text}, {minutes} min', file=stream, flush=True)
+
+    worker = threading.Thread(target=heartbeat, name='deployment-progress', daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join()
+        elapsed = time.monotonic() - started
+        print(f'{command}: {text} done in {elapsed:.0f} s', file=stream, flush=True)
 
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
+    """Share the configured regions and quota codes between requests and reports."""
+    values = conf.read_or_repository('cloud_gate')
+    return (
+        (gate_regions(home, values), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+        (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+    )
+
+
+def quota_timestamp(value: object) -> float:
+    """Convert AWS timestamps to seconds for request ordering."""
+    if value is None:
+        return float('-inf')
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        moment = datetime.fromtimestamp(value, UTC)
+    elif isinstance(value, str):
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+    else:
+        raise ValueError('The quota request date is invalid')
+    return moment.timestamp()
+
+
+def quota_date(value: object) -> str:
+    """Format AWS timestamps in the user's zone."""
+    if value is None:
+        return '-'
+    return datetime.fromtimestamp(quota_timestamp(value), UTC).astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
+def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
+    """Request one regional quota unless its value is sufficient or a request is open."""
+    region = api.region
+    try:
+        quota = spot_quota(api, code)
+        if quota >= desired:
+            print(f'{region}: {label} quota {quota.normalize():f} vCPUs; no request is needed for {desired} vCPUs')
+            return True
+        history = api.call('list-requested-service-quota-change-history-by-quota',
+            '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+        opened = [row for row in ledger.rows(history, 'RequestedQuotas') if ledger.text(row, 'Status') not in CLOSED_QUOTA_REQUEST_STATUSES]
+        if opened:
+            for row in opened:
+                status = ledger.text(row, 'Status')
+                value = conf.decimal(str(row['DesiredValue']))
+                print(f'{region}: open {label} quota request {value.normalize():f} vCPUs; status {status}')
+            return True
+        reply = api.call('request-service-quota-increase', '--service-code', 'ec2',
+            '--quota-code', code, '--desired-value', str(desired), service='service-quotas')
+        status = ledger.text(ledger.mapping(reply['RequestedQuota']), 'Status')
+        print(f'{region}: {label} quota request {desired} vCPUs; status {status}')
+        return status not in {'DENIED', 'NOT_APPROVED', 'INVALID_REQUEST'}
+    except (admin_secrets.SecretsRefused, DeploymentRefused):
+        raise
+    except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+        match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+        reason = match[1] if match else type(error).__name__
+        print(f'{region}: {label} quota request failed: {reason}')
+        return False
 
 
 @dataclass(frozen=True)
@@ -51,33 +156,9 @@ class PreparedDeployment:
     parameters: dict[str, str]
 
 
-
-@dataclass(frozen=True)
-class UpStage:
-    name: str
-    check: Callable[[], bool]
-    action: Callable[[], object]
-    refresh: bool = False
-
-
-@dataclass(frozen=True)
-class StageResult:
-    status: Literal['present', 'done', 'refused']
-    started_at: int
-    finished_at: int
-    reason: str = ''
-
-def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_path: Path,
+def deployment_parameters(path: Path, settings: DeploymentSettings,
                           notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
     spending = read_settings(path)
-    bootstrap = bootstrap_path.read_text()
-    if not bootstrap.startswith('#!'):
-        raise DeploymentRefused('bootstrap.sh must contain the rendered public bootstrap script')
-    if any(marker in bootstrap for marker in ('PRIVATE KEY-----', 'aws_secret_access_key', 'AWS_SECRET_ACCESS_KEY')):
-        raise DeploymentRefused('bootstrap.sh must contain only public bootstrap settings')
-    bootstrap_payload = base64.b64encode(gzip.compress(bootstrap.encode(), mtime=0)).decode()
-    if len(bootstrap_payload) > 4096:
-        raise DeploymentRefused('the compressed bootstrap exceeds the CloudFormation parameter size limit')
     return {
         'InstanceType': settings.instance_type, 'AmiId': settings.ami_id,
         'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
@@ -87,7 +168,7 @@ def deployment_parameters(path: Path, settings: DeploymentSettings, bootstrap_pa
         'SpotMaxPrice': str(settings.spot_max_usd_per_hour), 'MonthlyLimitUsd': str(spending.monthly_limit_usd),
         'NoticeLowPercent': str(settings.notice_low), 'NoticeHighPercent': str(settings.notice_high),
         'StopPercent': str(settings.stop_percent), 'CostTagKey': spending.cost_explorer_tag_key,
-        'CostTagValue': spending.cost_explorer_tag_value, 'Bootstrap': bootstrap_payload,
+        'CostTagValue': spending.cost_explorer_tag_value, 'Bootstrap': '',
         'ExistingDataVolumeId': settings.existing_data_volume_id,
         'ScalerUserName': settings.scaler_user_name,
         'DeploymentId': deployment_id,
@@ -187,7 +268,7 @@ class Deployment:
     def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
-        parameters = deployment_parameters(self.settings_path, settings, self.output / 'bootstrap.sh', notification, deployment_id)
+        parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id)
         image = box.saved_image(self._api(settings), self.directory)
         if image.get('State') == 'available':
             parameters['AmiId'] = ledger.text(image, 'ImageId')
@@ -252,7 +333,8 @@ class Deployment:
             saved['stack_id'] = ledger.text(reply, 'StackId')
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
             _ = api.call('wait', 'change-set-create-complete', '--stack-name', ledger.text(saved, 'stack_id'),
-                         '--change-set-name', change_name, service='cloudformation')
+                         '--change-set-name', change_name, service='cloudformation',
+                         timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         except (AwsUnavailable, subprocess.SubprocessError) as error:
             stack_id = str(saved.get('stack_id') or settings.stack_name)
             try:
@@ -289,27 +371,21 @@ class Deployment:
     def _api(self, settings: DeploymentSettings) -> AwsCli:
         return AwsCli(settings.profile, settings.region, settings.timeout_s, self.admin.executor(self.execute))
 
-    def price(self) -> dict[str, str | int]:
-        """Save the current public Spot price without requesting resources."""
-        self._check_credentials()
-        path = deployment_price_path(self.settings_path)
-        settings = read_deployment_settings(self.settings_path, self.directory)
-        now = int(self.clock())
-        reply = self._api(settings).call('describe-spot-price-history', '--instance-types', settings.instance_type,
-                         '--availability-zone', settings.availability_zone,
-                         '--product-descriptions', 'Linux/UNIX',
-                         '--start-time', datetime.fromtimestamp(now, UTC).isoformat(), '--max-items', '1')
-        prices = ledger.rows(reply, 'SpotPriceHistory')
-        if len(prices) != 1:
-            raise DeploymentRefused('describe-spot-price-history must return one current price')
-        price = money(ledger.text(prices[0], 'SpotPrice'))
-        if price <= 0:
-            raise DeploymentRefused('describe-spot-price-history must return a positive price')
-        now = int(self.clock())
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        write_bytes_atomic(path, (f'deployment_price_usd_per_hour={price}\n'
-                                 + f'deployment_price_at={now}\n').encode(), mode=0o600)
-        return {'deployment_price_usd_per_hour': str(price), 'deployment_price_at': now, 'file': str(path)}
+    def _print_spot_quota(self, api: AwsCli, largest: int) -> None:
+        """Show the regional gate quota without stopping deployment on a failed read."""
+        try:
+            quota = spot_quota(api)
+        except (admin_secrets.SecretsRefused, DeploymentRefused):
+            raise
+        except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+            print(f'{api.region}: Spot vCPU quota unknown: {self.admin.redact(str(error))}')
+            return
+        print(f'{api.region}: Spot quota {quota.normalize():f} vCPUs')
+        if largest == 0:
+            print(f'{api.region}: gate vCPU count is unknown')
+        elif quota < largest:
+            print(f'{api.region}: cannot run one gate ({largest} vCPUs); ask AWS for a Spot vCPU quota increase in this region.')
+
 
     def _observe(self, settings: DeploymentSettings, instance_id: str, *,
                  confirms_transition: bool = False) -> ledger.InstanceObservation:
@@ -318,29 +394,6 @@ class Deployment:
         ledger.CostLedger(self.directory).observe(observation, confirms_transition=confirms_transition)
         return observation
 
-    def _refresh_observation(self, settings: DeploymentSettings) -> None:
-        pending = ledger.CostLedger(self.directory).pending_compute_requests()
-        if pending:
-            for request in pending:
-                _ = self._reconcile_compute_request(settings, request)
-            return
-        path = self.directory / 'deployment.json'
-        if path.exists():
-            saved = remote.read_record(path)
-            if not ledger.mapping(saved.get('outputs', {})).get('InstanceId'):
-                return
-            if saved.get('region') != settings.region:
-                raise DeploymentRefused('preserve the region of the saved deployment')
-            outputs = ledger.mapping(saved.get('outputs'))
-            try:
-                _ = self._observe(settings, ledger.text(outputs, 'InstanceId'))
-            except AwsUnavailable as error:
-                if ('InvalidInstanceID.NotFound' not in str(error)
-                        or settings.existing_data_volume_id != outputs.get('DataVolumeId')
-                        or self._stack(replace(settings, stack_name=ledger.text(saved, 'stack')))):
-                    raise
-                ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(
-                    int(self.clock()), 'terminated', 'confirmed missing instance after stack deletion'), confirms_transition=True)
 
     def _reconcile_compute_request(self, settings: DeploymentSettings, request: ledger.ComputeRequest) -> dict[str, str]:
         requested = replace(settings, stack_name=request.stack, region=request.region)
@@ -365,11 +418,9 @@ class Deployment:
         book.resolve_compute_request(request, ledger.ComputeInstanceConfirmed(observation.at, stack['InstanceId']))
         return stack
 
-    def _load(self, notification: BudgetNotificationAddress, *, refresh: bool = False
+    def _load(self, notification: BudgetNotificationAddress
               ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path, self.directory)
-        if refresh:
-            self._refresh_observation(settings)
         parameters = self._parameters(settings, notification)
         self._before_request(settings, parameters)
         return settings, parameters
@@ -383,17 +434,13 @@ class Deployment:
         with control_lock(self.directory):
             settings = read_deployment_settings(self.settings_path, self.directory)
             now = int(self.clock())
-            price_at, price = deployment_price(self.settings_path, now)
             notification = read_budget_notification_address(self.settings_path)
             parameters = self._parameters(settings, notification)
-            spending = read_settings(self.settings_path)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
-            resources = tuple(ledger.PricedResource(key, value) for key, value in spending.fixed_components)
-            if not state.inventories or state.inventories[-1].resources != resources:
-                book.record_inventory(ledger.ResourceInventory(now, resources, 'validated deployment configuration'))
-            book.record_price(ledger.PriceSample(price_at, price, 'public price recorded by the user'))
-            self._refresh_observation(settings)
+            resources = state.inventories[-1].resources if state.inventories else ()
+            if not state.inventories:
+                book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
             decision = self._guard()
             template = TEMPLATE.read_bytes()
             prepared = PreparedDeployment(now, fingerprint(settings, parameters, template), parameters)
@@ -535,16 +582,18 @@ class Deployment:
             lines.append('stack status is unavailable')
         return AwsUnavailable('\n'.join(lines).replace(notification, '<notification address>'))
 
-    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
+    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *,
+                      remove_builder: bool = False) -> None:
         api = self._api(settings)
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
+        notification = parameters.get('NotificationEmail') or '<notification address>'
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if remove_builder and key != 'EnableCompute' or key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
-            for key, value in {**parameters, 'EnableCompute': str(compute).lower()}.items()
+            for key, value in {**parameters, 'EnableCompute': 'false'}.items()
         ]
-        if (self.directory / 'gate-deployment.json').exists():
+        if not remove_builder and (self.directory / 'gate-deployment.json').exists():
             template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
             values.extend({'ParameterKey': key, 'UsePreviousValue': True}
                           for key in ledger.mapping(template['Parameters']) if key.startswith('Gate') or key == 'EnableGates')
@@ -561,7 +610,8 @@ class Deployment:
             wait_error: Exception | None = None
             try:
                 _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
-                             '--change-set-name', name, service='cloudformation')
+                             '--change-set-name', name, service='cloudformation',
+                             timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
             except (AwsUnavailable, subprocess.SubprocessError) as error:
                 wait_error = error
             change = api.call('describe-change-set', '--stack-name', stack_id, '--change-set-name', name,
@@ -583,18 +633,22 @@ class Deployment:
             replacements: list[str] = []
             for item in ledger.rows(change, 'Changes'):
                 resource = ledger.mapping(item.get('ResourceChange'))
+                if remove_builder and resource.get('Action') == 'Remove' and resource.get('LogicalResourceId') in (
+                        'Instance', 'DataVolume', 'DataAttachment', 'LaunchTemplate', 'InstanceRole', 'InstanceProfile',
+                        'SecurityGroup', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy'):
+                    continue
                 if resource.get('ResourceType') in protected and (resource.get('Action') == 'Remove'
                         or resource.get('Replacement') in ('True', 'Conditional')):
                     replacements.append(f"{ledger.text(resource, 'LogicalResourceId')} ({ledger.text(resource, 'ResourceType')})")
             if replacements:
                 raise DeploymentRefused('up refuses replacement: ' + ', '.join(replacements)
                                         + '; run deploy.py down --approve-destroy, then deploy.py up --approve-resources')
-            self._before_request(settings, parameters)
-            if compute:
-                self._record_compute_request(settings, parameters)
+            if not remove_builder:
+                self._before_request(settings, parameters)
             _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
             executed = True
-            _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
+            _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation',
+                         timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         except (ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             if not change:
                 try:
@@ -605,18 +659,12 @@ class Deployment:
                     pass
             leftover = self._discard_change_set(api, stack_id, name) if created and not executed else ''
             if isinstance(error, ValueError):
-                raise DeploymentRefused((str(error) + leftover).replace(parameters['NotificationEmail'], '<notification address>')) from None
-            failure = self._stack_failure(api, settings, stack_id, started, error, change, parameters['NotificationEmail'])
+                raise DeploymentRefused((str(error) + leftover).replace(notification, '<notification address>')) from None
+            failure = self._stack_failure(api, settings, stack_id, started, error, change, notification)
             raise AwsUnavailable(str(failure) + leftover) from None
 
-    def _record_compute_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
-        book = ledger.CostLedger(self.directory)
-        for request in book.pending_compute_requests():
-            _ = self._reconcile_compute_request(settings, request)
-        book.record_compute_request(ledger.ComputeRequest(int(self.clock()), settings.stack_name, settings.region,
-                                                         money(parameters['SpotMaxPrice'])))
 
-    def _deploy(self, settings: DeploymentSettings, parameters: dict[str, str], *, compute: bool) -> None:
+    def _deploy(self, settings: DeploymentSettings, parameters: dict[str, str], ) -> None:
         self._before_request(settings, parameters)
         self._adopt_volume(settings, parameters)
         self._reserve_stack(settings, parameters)
@@ -635,10 +683,8 @@ class Deployment:
                     raise AwsUnavailable(reason) from None
             raise
         if live:
-            self._update_stack(settings, parameters, compute=compute)
+            self._update_stack(settings, parameters)
         else:
-            if compute:
-                self._record_compute_request(settings, parameters)
             api = self._api(settings)
             started = self.clock()
             try:
@@ -647,13 +693,14 @@ class Deployment:
                     '--template-file', str(self.output / 'template.json'),
                     '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset',
                     '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
-                    f'EnableCompute={str(compute).lower()}', service='cloudformation')
+                    'EnableCompute=false', service='cloudformation')
             except (AwsUnavailable, subprocess.SubprocessError) as error:
                 raise self._stack_failure(api, settings, ledger.text(deployment_record(self.directory), 'stack_id'),
                                           started, error, {}, parameters['NotificationEmail']) from None
         self._save_scaler_identity(settings)
         outputs = self._stack(settings)
         saved = deployment_record(self.directory)
+        saved['outputs'] = {**ledger.mapping(saved.get('outputs', {})), **outputs}
         if outputs.get('DataVolumeId'):
             saved['data_volume_id'] = outputs['DataVolumeId']
         if outputs.get('BudgetName'):
@@ -673,14 +720,6 @@ class Deployment:
                 or fingerprint(settings, parameters, template) != expected
                 or (self.output / 'template.json').read_bytes() != template):
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
-        try:
-            _ = deployment_price(self.settings_path, int(self.clock()))
-        except ValueError:
-            if not renew:
-                raise
-            _ = self.price()
-            price_at, price = deployment_price(self.settings_path, int(self.clock()))
-            ledger.CostLedger(self.directory).record_price(ledger.PriceSample(price_at, price, 'public deployment price after foundation'))
         if renew:
             preflight['at'] = int(self.clock())
             write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
@@ -692,50 +731,18 @@ class Deployment:
 
     def _check_credentials(self) -> None:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        credential_file = os.environ.get('AWS_SHARED_CREDENTIALS_FILE', '')
-        if not credential_file or stat.S_IMODE(Path(credential_file).expanduser().stat().st_mode) != 0o600:
-            raise DeploymentRefused('AWS_SHARED_CREDENTIALS_FILE must name a private mode 0600 file')
+        try:
+            mode = admin_secrets.credentials_file().stat().st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o600:
+                raise OSError
+        except OSError:
+            raise DeploymentRefused('credential_file must name a private mode 0600 file') from None
 
-    def setup_start(self, *, approve_resources: bool = False) -> dict[str, str]:
-        """Restart the deployed instance for user setup while admission stays disabled."""
-        self._authorize(approve_resources)
-        with control_lock(self.directory):
-            prepared = cast(object, json.loads((self.output / 'parameters.json').read_text()))
-            notifications = [ledger.text(row, 'ParameterValue') for row in ledger.rows({'parameters': prepared}, 'parameters')
-                             if row.get('ParameterKey') == 'NotificationEmail']
-            if len(notifications) != 1:
-                raise DeploymentRefused('setup requires one prepared NotificationEmail parameter; run prepare again')
-            settings, parameters = self._load(BudgetNotificationAddress(notifications[0]), refresh=True)
-            previous = remote.read_record(self.directory / 'deployment.json')
-            stack = self._stack(settings)
-            saved_outputs = ledger.mapping(previous.get('outputs'))
-            instance = stack.get('InstanceId', '')
-            if (not instance or previous.get('stack') != settings.stack_name
-                    or previous.get('region') != settings.region
-                    or saved_outputs.get('InstanceId') != instance
-                    or saved_outputs.get('DataVolumeId') != stack.get('DataVolumeId')):
-                raise DeploymentRefused('setup requires the confirmed deployed instance and data volume')
-            state = self._observe(settings, instance).state
-            if state in ('pending', 'running'):
-                return {'InstanceId': instance, 'State': state}
-            if state != 'stopped':
-                raise DeploymentRefused(f'setup cannot start an instance in state {state}')
-            self._before_request(settings, parameters)
-            reply = self._api(settings).call('start-instances', '--instance-ids', instance)
-            starts = ledger.rows(reply, 'StartingInstances')
-            if len(starts) != 1 or starts[0].get('InstanceId') != instance:
-                raise DeploymentRefused('the start response is uncertain; inspect instance state before retry')
-            current = ledger.text(ledger.mapping(starts[0].get('CurrentState')), 'Name')
-            if current not in ('pending', 'running'):
-                raise DeploymentRefused('the start response does not confirm pending or running state')
-            ledger.CostLedger(self.directory).observe(ledger.InstanceObservation(
-                int(self.clock()), current, 'confirmed setup start response'), confirms_transition=True)
-            return {'InstanceId': instance, 'State': current}
 
     def apply(self, *, approve_resources: bool = False) -> dict[str, str]:
         self._authorize(approve_resources)
         with control_lock(self.directory):
-            settings, parameters = self._load(read_budget_notification_address(self.settings_path), refresh=True)
+            settings, parameters = self._load(read_budget_notification_address(self.settings_path))
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
             if previous_path.exists() and ledger.mapping(remote.read_record(previous_path).get('outputs', {})):
@@ -759,12 +766,12 @@ class Deployment:
                 raise DeploymentRefused('stop and delete the old stack, then select its saved DataVolumeId and a new stack_name')
             self._validate_inputs(settings, parameters, stack.get('InstanceId', ''))
             if not stack:
-                self._deploy(settings, parameters, compute=False)
+                self._deploy(settings, parameters)
                 stack = self._stack(settings)
                 if not stack.get('BudgetName') or stack.get('ComputeEnabled') != 'false':
                     raise DeploymentRefused('the Budget foundation has no confirmed evidence')
                 self._confirm_preparation(settings, parameters, renew=True)
-            self._deploy(settings, parameters, compute=True)
+            self._deploy(settings, parameters)
             pending = ledger.CostLedger(self.directory).pending_compute_requests()
             outputs = self._stack(settings)
             for request in pending:
@@ -772,56 +779,9 @@ class Deployment:
             saved = deployment_record(self.directory)
             saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+            self.scaler_key()
             return outputs
 
-
-    def bootstrap(self) -> None:
-        remote_settings = remote_configuration(self.settings_path)
-        text = bootstrap_configuration(self.settings_path, remote_settings, self.directory)
-        self.output.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(self.output / 'bootstrap.sh', text)
-        write_text_atomic(self.output / 'remote.conf', remote_settings)
-
-    def _bootstrap_present(self) -> bool:
-        remote_settings = remote_configuration(self.settings_path)
-        text = bootstrap_configuration(self.settings_path, remote_settings, self.directory)
-        try:
-            return ((self.output / 'bootstrap.sh').read_text() == text
-                    and (self.output / 'remote.conf').read_text() == remote_settings)
-        except FileNotFoundError:
-            return False
-
-    def _price_present(self) -> bool:
-        try:
-            _ = deployment_price(self.settings_path, int(self.clock()))
-            return True
-        except ValueError:
-            return False
-
-    def _stacks_present(self) -> bool:
-        settings = read_deployment_settings(self.settings_path, self.directory)
-        self._migrate_legacy(settings)
-        stack = self._stack(settings)
-        saved = deployment_record(self.directory)
-        if saved.get('account_id'):
-            account = ledger.text(self._api(settings).call('get-caller-identity', service='sts'), 'Account')
-            if account != saved['account_id']:
-                raise DeploymentRefused('the caller account differs from the deployment record')
-        outputs = deployment_outputs(self.directory)
-        if not stack or stack.get('ComputeEnabled') != 'true' or not outputs:
-            return False
-        if (saved.get('stack') != settings.stack_name or saved.get('region') != settings.region
-                or any(not stack.get(key) or stack.get(key) != outputs.get(key)
-                       for key in ('InstanceId', 'DataVolumeId', 'BudgetName'))):
-            return False
-        if ledger.CostLedger(self.directory).pending_compute_requests():
-            return False
-        parameters = self._parameters(settings, read_budget_notification_address(self.settings_path))
-        return saved.get('fingerprint') == fingerprint(settings, parameters, TEMPLATE.read_bytes())
-
-    def _apply_stacks(self) -> None:
-        _ = self.prepare()
-        _ = self.apply(approve_resources=True)
 
     def _scaler_api(self) -> AwsCli:
         settings = read_deployment_settings(self.settings_path, self.directory)
@@ -836,18 +796,11 @@ class Deployment:
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
             return False
 
-    def _scaler_stage_present(self) -> bool:
-        if not self._scaler_present():
-            return False
-        path = self.directory / 'up.json'
-        previous = remote.read_record(path) if path.exists() else {}
-        result = previous.get('scaler-key', {})
-        return not (self.directory / 'scaler-key.json').exists() and ledger.mapping(result).get('status') != 'refused'
 
-    def _scaler_key(self) -> None:
+    def scaler_key(self) -> None:
         settings = read_deployment_settings(self.settings_path, self.directory)
         api = self._api(settings)
-        credential_file = Path(os.environ['AWS_SHARED_CREDENTIALS_FILE']).expanduser()
+        credential_file = admin_secrets.credentials_file()
         previous = credential_file.read_bytes()
         key_id = ''
         checkpoint = self.directory / 'scaler-key.json'
@@ -909,73 +862,308 @@ class Deployment:
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
             raise DeploymentRefused('the scaler key works; IAM could not remove every old key') from None
 
-    def _box_stages(self) -> tuple[UpStage, ...]:
-        setup = box.BoxSetup(self.settings_path, self.directory, self._start_box, execute=self.execute, admin=self.admin)
-        return (
-            UpStage('tailscale-policy', setup.policy_present, setup.policy),
-            UpStage('box-join', setup.join_present, setup.join),
-            UpStage('box-configuration', setup.configuration_present, setup.configure),
-            UpStage('checks', setup.checks_present, setup.checks),
-            UpStage('image', setup.image_present, setup.image),
-            UpStage('idle-stop', setup.idle_stop_present, setup.idle_stop),
-            UpStage('activation', setup.activation_present, setup.activate),
-            UpStage('routing-proof', setup.routing_proof_present, setup.routing_proof),
-        )
 
-    def up(self, *, approve_resources: bool = False) -> bool:
-        """Check each deployment stage and stop at the first refusal."""
-        self._authorize(approve_resources)
-        stages = (
-            UpStage('price', self._price_present, self.price, refresh=True),
-            UpStage('bootstrap', self._bootstrap_present, self.bootstrap),
-            UpStage('stacks', self._stacks_present, self._apply_stacks),
-            UpStage('scaler-key', self._scaler_stage_present, self._scaler_key),
-            *self._box_stages(),
-        )
-        with control_lock(self.directory / 'up'):
-            if (self.directory / 'down.json').exists():
-                raise DeploymentRefused('target removal is incomplete; run deploy.py down --approve-destroy first')
-            path = self.directory / 'up.json'
-            results = remote.read_record(path) if path.exists() else {}
-            started = int(self.clock())
-            try:
-                status = self.execute(['tailscale', 'status', '--json'], capture_output=True, text=True,
-                                      timeout=conf.read(self.settings_path).whole('box_setup_timeout_s'), check=False)
-                if status.returncode:
-                    raise box.BoxRefused(f'tailscale status failed (exit {status.returncode})')
-                _ = box.policy_device_bindings(box.policy_source(), box.json_record(status.stdout))
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                result = StageResult('refused', started, int(self.clock()), self.admin.redact(str(error)))
-                results['up'] = {field.name: cast(object, getattr(result, field.name)) for field in fields(result)}
-                write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
-                print('up: refused: ' + result.reason)
-                return False
-            for stage in stages:
-                started = int(self.clock())
-                try:
-                    present = stage.check()
-                    if not present or stage.refresh:
-                        _ = stage.action()
-                    result = StageResult('present' if present else 'done', started, int(self.clock()))
-                except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                    reason = 'scaler credential stage failed' if stage.name == 'scaler-key' else self.admin.redact(str(error))
-                    result = StageResult('refused', started, int(self.clock()), reason)
-                results = remote.read_record(path) if path.exists() else results
-                _ = results.pop('up', None)
-                previous = ledger.mapping(results.get(stage.name, {}))
-                results[stage.name] = {**previous, **{field.name: cast(object, getattr(result, field.name)) for field in fields(result)}}
-                write_text_atomic(path, json.dumps(results, sort_keys=True) + '\n')
-                print(f'{stage.name}: {result.status}' + (f': {result.reason}' if result.reason else ''))
-                if result.status == 'refused':
-                    return False
+    def remove_images(self, *, approve_destroy: bool = False) -> bool:
+        """Boot gates from the official image and delete the saved gate and former builder images."""
+        if not approve_destroy:
+            print(teardown.IMAGES_DRY_RUN)
+            return True
+        self._check_credentials()
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        with control_lock(self.directory / 'gate-up'):
+            deployment = gate_deployment(self.directory / 'gate-deployment.json', settings.region)
+            home = ledger.rows(deployment, 'regions')[0]
+            stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+            body = api.call('get-template', '--stack-name', stack_id, service='cloudformation')['TemplateBody']
+            template_body = ledger.mapping(cast(object, json.loads(body))) if isinstance(body, str) else ledger.mapping(body)
+            image_policy = ledger.mapping(ledger.mapping(ledger.mapping(
+                ledger.mapping(template_body['Resources'])['GateScalerPolicy'])['Properties'])['PolicyDocument'])
+            statements = [row for row in ledger.rows(image_policy, 'Statement') if row.get('Sid') != 'GateImageTransition']
+            template = self.output / 'gate-image-template.json'
+            self.output.mkdir(parents=True, exist_ok=True)
+            if home.get('image') != settings.ami_id:
+                # Keep the old image launchable until gate-deployment.json names the official image.
+                image_policy['Statement'] = [*statements, {
+                    'Sid': 'GateImageTransition', 'Effect': 'Allow', 'Action': ['ec2:RunInstances'],
+                    'Resource': {'Fn::Sub': 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/'
+                                 + ledger.text(home, 'image')}}]
+                write_text_atomic(template, json.dumps(template_body))
+                stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
+                                            service='cloudformation'), 'Stacks')[0]
+                changes: list[dict[str, object]] = [
+                    {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
+                    for row in ledger.rows(stack, 'Parameters') if row['ParameterKey'] != 'GateImage']
+                changes.append({'ParameterKey': 'GateImage', 'ParameterValue': settings.ami_id})
+                with step('remove-images', 'switching gates to the official image', self.settings_path,
+                          hint='can take several minutes'):
+                    self._gate_change(api, stack_id, template, changes)
+                home.update(image=settings.ami_id, version=self._stack(settings)['GateLaunchVersion'])
+                write_text_atomic(self.directory / 'gate-deployment.json', json.dumps(deployment, sort_keys=True) + '\n')
+            if image_policy.get('Statement') != statements:
+                image_policy['Statement'] = statements
+                write_text_atomic(template, json.dumps(template_body))
+                stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
+                                            service='cloudformation'), 'Stacks')[0]
+                changes = [{'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
+                           for row in ledger.rows(stack, 'Parameters')]
+                with step('remove-images', 'removing the old image permission', self.settings_path,
+                          hint='can take several minutes'):
+                    self._gate_change(api, stack_id, template, changes)
+            with step('remove-images', 'deleting the gate image and its snapshot', self.settings_path):
+                removed = teardown.remove_gate_images(api, self.directory, self.clock)
+            with step('remove-images', 'deleting the former builder image and its snapshot', self.settings_path):
+                removed = teardown.remove_builder_image(api, self.directory) or removed
+        print('remove-images: done; gates boot from the official image and no saved image remains' if removed
+              else 'remove-images: nothing to remove; gates boot from the official image')
         return True
+
+    def _gate_change(self, api: AwsCli, stack_id: str, template: Path, changes: list[dict[str, object]]) -> None:
+        name = 'gate-' + uuid4().hex
+        executed = False
+        try:
+            print('cloud-gate: preparing the stack change (about 1 minute)', flush=True)
+            _ = api.call('create-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                         '--change-set-type', 'UPDATE', '--template-body', 'file://' + str(template),
+                         '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(changes),
+                         service='cloudformation')
+            try:
+                _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
+                             '--change-set-name', name, service='cloudformation',
+                             timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+            except AwsUnavailable:
+                pass
+            change = api.call('describe-change-set', '--stack-name', stack_id,
+                              '--change-set-name', name, service='cloudformation')
+            reason = str(change.get('StatusReason', '')).lower()
+            empty = change.get('Status') == 'FAILED' and any(text in reason for text in (
+                "didn't contain changes", 'no updates are to be performed', 'no changes'))
+            if not empty:
+                if change.get('Status') != 'CREATE_COMPLETE':
+                    raise DeploymentRefused(f"The gate change set is {change.get('Status')}: {change.get('StatusReason', 'no reason given')}")
+                for item in ledger.rows(change, 'Changes'):
+                    resource = ledger.mapping(item['ResourceChange'])
+                    if not ledger.text(resource, 'LogicalResourceId').startswith('Gate'):
+                        raise DeploymentRefused('The gate change set changes a Rust resource')
+                    print(f"cloud-gate: {resource.get('Action', 'Change')} {ledger.text(resource, 'LogicalResourceId')}", flush=True)
+                _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name,
+                             service='cloudformation')
+                executed = True
+                print('cloud-gate: applying the change (several minutes)', flush=True)
+                try:
+                    _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation',
+                                 timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+                except AwsUnavailable:
+                    events = ledger.rows(api.call('describe-stack-events', '--stack-name', stack_id,
+                                                  '--max-items', '60', service='cloudformation'), 'StackEvents')
+                    for event in reversed(events):
+                        if str(event.get('ResourceStatus', '')).endswith('_FAILED'):
+                            failure = event.get('ResourceStatusReason', 'no reason given')
+                            print(f"cloud-gate: {event.get('LogicalResourceId')} {event.get('ResourceStatus')}: {failure}", flush=True)
+                    raise
+        finally:
+            if not executed:
+                _ = self._discard_change_set(api, stack_id, name)
+
+    def regional_image(self, api: AwsCli, settings: DeploymentSettings, region: str) -> str:
+        """Find the matching release or retain a copied image for recovery."""
+        target = api.in_region(region)
+        source = ledger.rows(api.call('describe-images', '--image-ids', settings.ami_id), 'Images')[0]
+        images = ledger.rows(target.call('describe-images', '--owners', ledger.text(source, 'OwnerId'),
+            '--filters', 'Name=name,Values=' + ledger.text(source, 'Name'), 'Name=state,Values=available'), 'Images')
+        if images:
+            return ledger.text(images[0], 'ImageId')
+        path = self.directory / 'regional-images.json'
+        saved = remote.read_record(path) if path.exists() else {}
+        identity = region + ':' + settings.ami_id
+        if identity not in saved:
+            copied = target.call('copy-image', '--source-region', settings.region, '--source-image-id', settings.ami_id,
+                '--name', ledger.text(source, 'Name'), '--client-token', sha256(identity.encode()).hexdigest())
+            saved[identity] = {'region': region, 'image': ledger.text(copied, 'ImageId')}
+            write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
+        image = ledger.text(ledger.mapping(saved[identity]), 'image')
+        _ = target.call('wait', 'image-available', '--image-ids', image,
+                       timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+        return image
+
+    def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
+                            parameters: dict[str, str], region: str) -> dict[str, object]:
+        """Deploy only gate resources in the target region."""
+        target = api.in_region(region)
+        vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
+        if not vpcs:
+            raise DeploymentRefused(region + ': no default VPC is available')
+        vpc = ledger.text(vpcs[0], 'VpcId')
+        try:
+            subnets = gate_subnets(target, vpc)
+        except DeploymentRefused as error:
+            raise DeploymentRefused(region + ': ' + str(error)) from error
+        image = self.regional_image(api, settings, region)
+        account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
+        stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+        partition = stack_id.split(':')[1]
+        deployment = ledger.text(deployment_record(self.directory), 'deployment_id')
+        prefix = f'arn:{partition}:ec2:{region}:{account}:'
+        values = {**parameters, 'GateImage': image, 'VpcId': vpc,
+            'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
+            'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
+            'RootDeviceName': settings.root_device_name, 'ScalerUserName': settings.scaler_user_name,
+            'HomeGateProfileArn': home['GateProfileArn'], 'HomeGateRoleArn': home['GateRoleArn'],
+            'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets)}
+        template = self.output / ('region-gates-' + region + '.json')
+        write_text_atomic(template, json.dumps(region_gate_template(), sort_keys=True) + '\n')
+        definitions = ledger.mapping(region_gate_template()['Parameters'])
+        name = settings.stack_name + '-gates-' + region
+        stack_path = self.directory / 'regional-stacks.json'
+        stacks = remote.read_record(stack_path) if stack_path.exists() else {}
+        stacks[region] = name
+        write_text_atomic(stack_path, json.dumps(stacks) + '\n')
+        _ = target.call('deploy', '--stack-name', name, '--template-file', str(template),
+            '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset', '--parameter-overrides',
+            *[key + '=' + value for key, value in values.items() if key in definitions], service='cloudformation',
+            timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+        stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
+        outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')}
+        return {'region': region, 'image': image, 'subnets': subnets, 'template': outputs['GateLaunchTemplate'],
+                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name}
+
+    def prices(self) -> None:
+        """Print regional Spot prices without resource identities."""
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        from scripts.aws_target import cloud_gate
+        values = cloud_gate.settings()
+        configured_types = values.words('instance_types')
+        largest = largest_gate_vcpus(configured_types)
+        sizes = tuple(dict.fromkeys([*configured_types,
+                                    'r7a.8xlarge', 'm8a.8xlarge', 'c8a.8xlarge', *values.words('gpu_instance_types')]))
+        regions = tuple(dict.fromkeys([*gate_regions(settings.region), *values.words('spot_candidate_regions')]))
+        _ = self.admin.get()
+        print('region type zone price')
+        for region in regions:
+            target = api.in_region(region)
+            self._print_spot_quota(target, largest)
+            try:
+                quota = spot_quota(target, 'L-3819A6DF')
+                print(f'{region}: G and VT Spot quota {quota.normalize():f} vCPUs')
+            except (admin_secrets.SecretsRefused, DeploymentRefused):
+                raise
+            except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                code = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                reason = code[1] if code else type(error).__name__
+                print(f'{region}: G and VT Spot quota unknown: {reason}')
+            zones = [ledger.text(row, 'ZoneName') for row in ledger.rows(target.call('describe-availability-zones',
+                '--filters', 'Name=state,Values=available'), 'AvailabilityZones')]
+            prices = fetch_spot_prices(target, sizes, int(self.clock()))
+            latest = {(row.instance_type, row.zone): row.usd_per_hour for row in prices}
+            for size in sizes:
+                for zone in sorted(zones):
+                    print(region, size, zone, str(latest.get((size, zone), 'unavailable')))
+
+    def spot_table(self) -> None:
+        """Print the local snapshot without AWS credentials or network calls."""
+        from scripts.aws_target import spot_table
+        print(spot_table.render(self.directory, int(self.clock()), settings_path=self.settings_path))
+
+    def quota_request(self) -> bool:
+        """Request both regional Spot quotas without duplicating open requests."""
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        success = True
+        for regions, code, desired, label in quota_targets(settings.region):
+            for region in regions:
+                if not request_spot_quota(api.in_region(region), code, desired, label):
+                    success = False
+        return success
+
+    def quota_status(self) -> bool:
+        """Report applied quotas and request history without changing AWS or local state."""
+        from scripts.aws_target import gpu_size_trial
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        regional: dict[str, list[tuple[str, str]]] = {}
+        for regions, code, _desired, label in quota_targets(settings.region):
+            for region in dict.fromkeys(regions):
+                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
+        _ = self.admin.get()
+        success = True
+        ready: list[str] = []
+        opened: list[str] = []
+        unknown: list[str] = []
+        unknown_quota: list[str] = []
+        for region, quotas in regional.items():
+            print(region, flush=True)
+            target = api.in_region(region)
+            for code, name in quotas:
+                applied: Decimal | None = None
+                try:
+                    applied = spot_quota(target, code)
+                    print(f'  {name}: {applied.normalize():f} vCPUs applied', flush=True)
+                    if code == 'L-3819A6DF' and applied >= needed:
+                        ready.append(region)
+                    history = target.call('list-requested-service-quota-change-history-by-quota',
+                        '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
+                    requests = sorted(ledger.rows(history, 'RequestedQuotas'),
+                        key=lambda row: quota_timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
+                    rows: list[list[str]] = []
+                    for request in requests:
+                        asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}'
+                        status = ledger.text(request, 'Status')
+                        case = str(request.get('CaseId') or '-')
+                        date = quota_date(request.get('LastUpdated') or request.get('Created'))
+                        rows.append([asked, status, case, date])
+                        if status not in CLOSED_QUOTA_REQUEST_STATUSES:
+                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
+                    if rows:
+                        for line in aligned_table(('Asked vCPUs', 'Status', 'Case ID', 'Updated'), rows,
+                                                  right=frozenset((0,))):
+                            print('    ' + line)
+                    else:
+                        print('    No requests.')
+                except (admin_secrets.SecretsRefused, DeploymentRefused):
+                    raise
+                except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
+                    reason = match[1] if match else type(error).__name__
+                    if applied is None:
+                        print(f'  {name}: applied quota unknown')
+                        if code == 'L-3819A6DF':
+                            unknown_quota.append(region)
+                    print('    Quota status failed: ' + reason)
+                    unknown.append(region + ' ' + name)
+                    success = False
+            print()
+        fits = ', '.join(ready)
+        if unknown_quota:
+            fits += (', ' if fits else '') + 'unknown for ' + ', '.join(unknown_quota)
+        elif not fits:
+            fits = 'no region has enough applied quota'
+        requests_text = 'unknown' if unknown else ', '.join(opened) or 'none'
+        incomplete = '; request history unavailable: ' + ', '.join(unknown) if unknown else ''
+        print(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+              + 'open requests: ' + requests_text + incomplete, flush=True)
+        return success
+
+    def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
+        """Check terminal approval and start the scaler service."""
+        from scripts.aws_target import cloud_gate, gpu_size_trial
+        self._authorize(approve_resources)
+        limits = gpu_size_trial.settings()
+        timeout = (limits.lifetime_minutes * 60 * (len(limits.spot_max_usd_per_hour) + 2)
+                   + cloud_gate.settings().number('termination_timeout_s') * len(limits.spot_max_usd_per_hour))
+        def execute(arguments: Sequence[str]) -> int:
+            return self.execute(arguments, capture_output=False, text=True, timeout=timeout, check=False).returncode
+        return gpu_size_trial.start_service(folder, self.directory.resolve(),
+                                            self.settings_path.resolve(), execute) == 0
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        from scripts.aws_target import cloud_gate, gate_trial
+        from scripts.aws_target import cloud_gate, gate_trial, gpu_size_trial
         self._authorize(approve_resources)
         with control_lock(self.directory / 'gate-up'):
             settings = read_deployment_settings(self.settings_path, self.directory)
+            regions = gate_regions(settings.region)
             api = self._api(settings)
             saved = deployment_record(self.directory)
             stack_id = ledger.text(saved, 'stack_id')
@@ -992,6 +1180,7 @@ class Deployment:
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
                 'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets),
                 'GateInstanceTypes': ','.join(values.words('instance_types')),
+                'GateGpuInstanceTypes': ','.join(gpu_size_trial.settings().spot_max_usd_per_hour),
                 'GateRootGiB': str(values.whole('root_gib')),
                 'GateSpotMaxPrice': str(values.number('spot_max_usd_per_hour')),
                 'GateArtifactDays': str(values.whole('artifact_days')), 'GateLogDays': str(values.whole('log_days')),
@@ -1003,7 +1192,8 @@ class Deployment:
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
             book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
-                ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment'))
+                ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
+                builder_removed=bool(inventory and inventory[-1].builder_removed)))
             changes: list[dict[str, object]] = [
                 {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
                 for row in ledger.rows(stack, 'Parameters') if ledger.text(row, 'ParameterKey') not in parameters]
@@ -1011,59 +1201,84 @@ class Deployment:
             self.output.mkdir(parents=True, exist_ok=True)
             template = self.output / 'gate-template.json'
             write_bytes_atomic(template, TEMPLATE.read_bytes())
-            name = 'gate-' + uuid4().hex
-            executed = False
-            try:
-                print('cloud-gate: preparing the stack change (about 1 minute)', flush=True)
-                _ = api.call('create-change-set', '--stack-name', stack_id, '--change-set-name', name,
-                             '--change-set-type', 'UPDATE', '--template-body', 'file://' + str(template),
-                             '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(changes),
-                             service='cloudformation')
-                try:
-                    _ = api.call('wait', 'change-set-create-complete', '--stack-name', stack_id,
-                                 '--change-set-name', name, service='cloudformation')
-                except AwsUnavailable:
-                    pass
-                change = api.call('describe-change-set', '--stack-name', stack_id,
-                                  '--change-set-name', name, service='cloudformation')
-                reason = str(change.get('StatusReason', '')).lower()
-                empty = change.get('Status') == 'FAILED' and any(text in reason for text in (
-                    "didn't contain changes", 'no updates are to be performed', 'no changes'))
-                if not empty:
-                    if change.get('Status') != 'CREATE_COMPLETE':
-                        raise DeploymentRefused(f"The gate change set is {change.get('Status')}: {change.get('StatusReason', 'no reason given')}")
-                    for item in ledger.rows(change, 'Changes'):
-                        resource = ledger.mapping(item['ResourceChange'])
-                        if not ledger.text(resource, 'LogicalResourceId').startswith('Gate'):
-                            raise DeploymentRefused('The gate change set changes a Rust resource')
-                        print(f"cloud-gate: {resource.get('Action', 'Change')} {ledger.text(resource, 'LogicalResourceId')}", flush=True)
-                    _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name,
-                                 service='cloudformation')
-                    executed = True
-                    print('cloud-gate: applying the change (several minutes)', flush=True)
-                    try:
-                        _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation')
-                    except AwsUnavailable:
-                        events = ledger.rows(api.call('describe-stack-events', '--stack-name', stack_id,
-                                                      '--max-items', '60', service='cloudformation'), 'StackEvents')
-                        for event in reversed(events):
-                            if str(event.get('ResourceStatus', '')).endswith('_FAILED'):
-                                failure = event.get('ResourceStatusReason', 'no reason given')
-                                print(f"cloud-gate: {event.get('LogicalResourceId')} {event.get('ResourceStatus')}: {failure}", flush=True)
-                        raise
-            finally:
-                if not executed:
-                    _ = self._discard_change_set(api, stack_id, name)
+            with step('up', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
             manifest: dict[str, object] = {
-                'deployment_id': ledger.text(saved, 'deployment_id'), 'region': settings.region,
-                'image': settings.ami_id, 'revision': revision, 'subnets': subnets,
-                'bucket': outputs['GateBucket'], 'template': outputs['GateLaunchTemplate'],
-                'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'],
-                'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
+                'deployment_id': ledger.text(saved, 'deployment_id'), 'revision': revision,
+                'bucket': outputs['GateBucket'], 'artifact_prefix': 'artifacts/' + outputs['GateRoleId'] + ':',
+                'regions': [{'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
+                    'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
+                    'security_group': outputs['GateSecurityGroup']}],
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
+            regional = list(ledger.rows(manifest, 'regions'))
+            for region in regions[1:]:
+                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, region))
+                manifest['regions'] = regional
+                cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
+        return True
+
+    def remove_builder(self, *, approve_destroy: bool = False) -> bool:
+        if not approve_destroy:
+            print(teardown.BUILDER_DRY_RUN)
+            return True
+        self._check_credentials()
+        settings = read_deployment_settings(self.settings_path, self.directory)
+        api = self._api(settings)
+        removal = teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
+            api, self.execute, tailnet=box.tailnet_request, clock=self.clock, builder_only=True)
+        with control_lock(self.directory / 'up'):
+            with step('remove-builder', 'checking the deployment', self.settings_path):
+                _ = removal.verify()
+            removal.remember()
+            with step('remove-builder', 'disabling builder routing', self.settings_path):
+                _ = removal.routing()
+            paths = box.builder_state_paths()
+            with mac_test.locked(paths.lock), control_lock(self.directory):
+                if box.running_claims(paths):
+                    raise DeploymentRefused('AWS claims remain live; retry after their completion')
+                with step('remove-builder', 'removing the builder from Tailscale', self.settings_path):
+                    _ = removal.devices()
+                stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
+                stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
+                                            service='cloudformation'), 'Stacks')[0]
+                body = api.call('get-template', '--stack-name', stack_id, service='cloudformation')['TemplateBody']
+                template = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
+                resources = ledger.mapping(template['Resources'])
+                builder_roles = ('InstanceRole', 'InstanceProfile', 'SecurityGroup')
+                needs_update = (self._stack(settings).get('ComputeEnabled') != 'false'
+                                or any(ledger.mapping(resources[name]).get('Condition') != 'Compute' for name in builder_roles))
+                for name in builder_roles:
+                    ledger.mapping(resources[name])['Condition'] = 'Compute'
+                self.output.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(self.output / 'template.json', json.dumps(template) + '\n')
+                parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
+                              for row in ledger.rows(stack, 'Parameters')}
+                if needs_update:
+                    with step('remove-builder', 'updating the stack', self.settings_path, hint='can take several minutes'):
+                        self._update_stack(settings, parameters, remove_builder=True)
+                with step('remove-builder', 'deleting builder storage', self.settings_path):
+                    _ = removal.data_volume()
+                now = int(self.clock())
+                book = ledger.CostLedger(self.directory)
+                book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed builder removal'), confirms_transition=True)
+                for request in book.pending_compute_requests():
+                    book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
+                inventories = book.read_snapshot().inventories
+                if not inventories or not inventories[-1].builder_removed:
+                    builder_costs = {key for key, _cost in read_settings(self.settings_path).fixed_components}
+                    kept = tuple(resource for resource in inventories[-1].resources
+                                 if resource.name not in builder_costs) if inventories else ()
+                    book.record_inventory(ledger.ResourceInventory(now, kept, 'confirmed builder removal', builder_removed=True))
+                saved = deployment_record(self.directory)
+                saved.update(outputs=self._stack(settings), data_volume_id='')
+                write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
+                with step('remove-builder', 'deleting local builder records', self.settings_path):
+                    for name in ('up.json', 'box-tools.json', 'box-shell.json'):
+                        (self.directory / name).unlink(missing_ok=True)
+        print('remove-builder: done; gate resources and gate-deployment.json kept')
         return True
 
     def down(self, *, approve_destroy: bool = False) -> bool:
@@ -1072,35 +1287,54 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path, self.directory)
-        return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
-                                      self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
+        with step('down', 'removing local and cloud resources', self.settings_path):
+            return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
+                self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
-    def _start_box(self) -> object:
-        settings = read_deployment_settings(self.settings_path, self.directory)
-        outputs = deployment_outputs(self.directory)
-        if not outputs.get('InstanceId'):
-            raise DeploymentRefused('deployment.json has no InstanceId')
-        instance = outputs['InstanceId']
-        state = self._api(settings).observe(instance, int(self.clock())).state
-        if state in ('running', 'pending'):
-            return state
-        while True:
-            _ = self.price()
-            _ = self.prepare()
-            try:
-                return self.setup_start(approve_resources=True)
-            except AwsUnavailable as error:
-                if 'InsufficientInstanceCapacity' not in str(error):
-                    raise
-                delay = read_control_settings(self.settings_path).capacity_backoff_s
-                print(f'AWS has no Spot capacity for the box now; next try in {delay:g} seconds.')
-                self.pause(delay)
+
+def region_gate_template() -> dict[str, object]:
+    """Reuse the home gate bodies without regional copies of global resources."""
+    source = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
+    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateScalerPolicy', 'GateGpuTrialScalerPolicy', 'GateExpiryRole',
+             'GateExpiryFunction', 'GateExpiryLog', 'GateExpirySchedule', 'GateExpiryPermission')
+    resources = ledger.mapping(source['Resources'])
+    def rewrite(value: object) -> object:
+        if isinstance(value, str):
+            return value.replace('cloud-claude-gate-${DeploymentId}', 'cloud-gate-${DeploymentId}-${AWS::Region}')
+        if isinstance(value, list):
+            return [rewrite(item) for item in cast(list[object], value)]
+        if isinstance(value, dict):
+            row = ledger.mapping(cast(object, value))
+            if row.get('Fn::GetAtt') == ['GateProfile', 'Arn']:
+                return {'Ref': 'HomeGateProfileArn'}
+            if row.get('Fn::GetAtt') == ['GateRole', 'Arn']:
+                return {'Ref': 'HomeGateRoleArn'}
+            if row.get('Ref') == 'ScalerUser':
+                return {'Ref': 'ScalerUserName'}
+            return {key: rewrite(item) for key, item in row.items() if not (key == 'Condition' and item == 'Gates')}
+        return value
+    regional = {name: rewrite(resources[name]) for name in names}
+    actions = {'ec2:RunInstances', 'ec2:CreateTags', 'ec2:TerminateInstances', 'iam:PassRole'}
+    for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy'):
+        policy = ledger.mapping(ledger.mapping(ledger.mapping(regional[name])['Properties'])['PolicyDocument'])
+        policy['Statement'] = [row for row in ledger.rows(policy, 'Statement') if set(cast(list[str], row['Action'])) & actions]
+    parameters = ledger.mapping(source['Parameters'])
+    needed = ('VpcId', 'DeploymentId', 'CostTagKey', 'CostTagValue', 'RootDeviceName', 'GateImage', 'GateSubnets',
+              'GateInstanceTypes', 'GateGpuInstanceTypes', 'GateRootGiB', 'GateSpotMaxPrice', 'GateExpiryMinutes', 'GateExpiryTimeout',
+              'GateExpiryMemory', 'GateLogDays')
+    definitions = {key: parameters[key] for key in needed}
+    definitions.update({key: {'Type': 'String'} for key in ('HomeGateProfileArn', 'HomeGateRoleArn', 'ScalerUserName')})
+    outputs = {key: rewrite(value) for key, value in ledger.mapping(source['Outputs']).items()
+               if key in ('GateLaunchTemplate', 'GateLaunchVersion', 'GateSecurityGroup')}
+    return {'AWSTemplateFormatVersion': '2010-09-09', 'Parameters': definitions,
+            'Conditions': {'GateEveryMinute': ledger.mapping(source['Conditions'])['GateEveryMinute']},
+            'Resources': regional, 'Outputs': outputs}
 
 
 def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
     """Choose one public subnet in each available zone."""
     tables = ledger.rows(api.call('describe-route-tables', '--filters', 'Name=vpc-id,Values=' + vpc), 'RouteTables')
-    main: dict[str, object] = {}
+    main: dict[str, object] = {'Routes': []}
     assigned: dict[str, dict[str, object]] = {}
     for table in tables:
         for association in ledger.rows(table, 'Associations'):
@@ -1122,59 +1356,6 @@ def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
     return [zones[zone] for zone in sorted(zones)]
 
 
-def remote_configuration(path: Path) -> str:
-    """Build separate public lifecycle settings without granting execution permission."""
-    settings = read_control_settings(path)
-    source = path.read_text().splitlines()
-    limits: dict[str, str] = {}
-    for index, line in enumerate(source):
-        key, separator, _ = line.partition('=')
-        if separator and index and source[index - 1].startswith(('# range:', '# whole:', '# one of:')):
-            limits[key.strip()] = source[index - 1]
-    lines = ['# one of: on, off', 'offload=on', 'ci_repo=']
-    for field in fields(settings):
-        if field.name == 'enabled':
-            continue
-        value = cast(object, getattr(settings, field.name))
-        if field.name == 'instance_id':
-            continue
-        if field.name in limits:
-            lines.append(limits[field.name])
-        lines.append(f'{field.name}={value}')
-    return '\n'.join(lines) + '\n'
-
-
-def bootstrap_configuration(path: Path, remote_settings: str, directory: Path | None = None) -> str:
-    """Render the reviewed public bootstrap without creating resources."""
-    settings = read_deployment_settings(path, directory)
-    def nix_string(value: str) -> str:
-        return json.dumps(value).replace('${', '\\${')
-    def module_text(path: Path) -> str:
-        return '\n'.join(line for line in path.read_text().splitlines() if not line.lstrip().startswith('#'))
-    base_path = settings.bootstrap_template_path.with_name('aws-build-base.nix')
-    tailscale = module_text(base_path.parent.parent / 'modules/linux/tailscale.nix')
-    base = module_text(base_path).replace('../modules/linux/tailscale.nix', '(' + tailscale + ')')
-    text = settings.bootstrap_template_path.read_text()
-    inputs = {
-        'INPUT': base,
-        'IDLE_STOP_SECONDS': f"{conf.read(path).number('idle_stop_minutes') * 60:g}",
-        'DATA_VOLUME_WAIT_SECONDS': str(settings.timeout_s),
-        'SCRIPTS_SOURCE_URL_JSON': nix_string(settings.scripts_source_url),
-        'SCRIPTS_SOURCE_SHA256_JSON': nix_string(settings.scripts_source_sha256),
-        'SCRIPTS_SOURCE_COMMIT_JSON': nix_string(settings.scripts_source_commit),
-        'REMOTE_SETTINGS_JSON': nix_string(remote_settings),
-        'EXISTING_DATA_VOLUME_JSON': nix_string(settings.existing_data_volume_id),
-    }
-    for key, value in inputs.items():
-        marker = f'@{key}@'
-        if marker not in text:
-            raise DeploymentRefused(f'the bootstrap template has no {key} input')
-        text = text.replace(marker, value)
-    if re.search(r'@[A-Z_]+@', text):
-        raise DeploymentRefused('the bootstrap template has unknown inputs')
-    return text
-
-
 class DeploymentArguments(argparse.Namespace):
     def __init__(self) -> None:
         super().__init__()
@@ -1185,15 +1366,22 @@ class DeploymentArguments(argparse.Namespace):
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
+        self.trial_action: str | None = None
+        self.trial_folder: Path = Path()
 
 
 def main() -> int:
+    os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
     if sys.argv[1:2] == ['gate-trial']:
         from scripts.aws_target import gate_trial
-        return gate_trial.main(sys.argv[2:], conf.path('aws_target'), target_config.ssh_target_state_directory('aws'))
+        settings_path = conf.path('aws_target')
+        with step('gate-trial', 'running the trial', settings_path):
+            return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('secrets', 'up', 'down', 'price', 'prepare', 'apply', 'setup-start', 'bootstrap'))
-    _ = parser.add_argument('--workload', choices=('rust', 'merge-gates'), default='rust')
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'apply'))
+    _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
+    _ = parser.add_argument('--trial-folder', type=Path)
+    _ = parser.add_argument('--workload', choices=('merge-gates',), default='merge-gates')
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--output', type=Path)
@@ -1202,23 +1390,32 @@ def main() -> int:
     args = parser.parse_args(namespace=DeploymentArguments())
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
+        if args.command == 'gpu-size-trial':
+            if args.trial_action != 'run' or args.trial_folder == Path():
+                raise DeploymentRefused('Use gpu-size-trial run --trial-folder DIR --approve-resources')
+            return 0 if deploy.gpu_size_trial(args.trial_folder, approve_resources=args.approve_resources) else 1
         if args.command == 'secrets':
-            admin_secrets.configure(args.settings)
+            with step('secrets', 'saving encrypted credentials', args.settings):
+                admin_secrets.configure(args.settings)
         elif args.command == 'up':
-            action = deploy.gate_up if args.workload == 'merge-gates' else deploy.up
-            return 0 if action(approve_resources=args.approve_resources) else 1
+            return 0 if deploy.gate_up(approve_resources=args.approve_resources) else 1
         elif args.command == 'down':
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
-        elif args.command == 'price':
-            print(json.dumps(deploy.price(), sort_keys=True))
-        elif args.command == 'bootstrap':
-            deploy.bootstrap()
-            print(str(args.output / 'bootstrap.sh'))
+        elif args.command == 'remove-builder':
+            return 0 if deploy.remove_builder(approve_destroy=args.approve_destroy) else 1
+        elif args.command == 'remove-images':
+            return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
+        elif args.command == 'spot-table':
+            deploy.spot_table()
+        elif args.command == 'prices':
+            deploy.prices()
+        elif args.command == 'quota-request':
+            return 0 if deploy.quota_request() else 1
+        elif args.command == 'quota-status':
+            return 0 if deploy.quota_status() else 1
         elif args.command == 'prepare':
             prepared = deploy.prepare()
             print(json.dumps({'at': prepared.at, 'fingerprint': prepared.fingerprint, 'output': str(args.output)}))
-        elif args.command == 'setup-start':
-            print(json.dumps(deploy.setup_start(approve_resources=args.approve_resources), sort_keys=True))
         else:
             print(json.dumps(deploy.apply(approve_resources=args.approve_resources), sort_keys=True))
         return 0

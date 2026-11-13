@@ -27,6 +27,7 @@ Codex review prompts also include section 3's command block.
    Assign its required suites to the director or a writer.
    Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
    Include this command block verbatim after section 2 in every Codex prompt:
+   Merge prompts replace only the exit 3 line under <MergeWorkerCommands/>.
 
    ```
    ## Builds and tests
@@ -86,6 +87,9 @@ Codex review prompts also include section 3's command block.
       Keep every main-path test.
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
+   Every implementation, fix, test, research and review prompt carries this instruction verbatim:
+   "Make every folder you need for your own work (a clone, a copy, a download, a trial project) with `~/.claude/scripts/lib/scratch.py new --worker [--name <word>]`. It prints the path, and the folder is removed when your assignment ends. Never make a folder under `/tmp` or `~/rust` by hand."
+   "A folder or file you make on another machine (the Mac) follows the same rule. Make it in a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`."
    Include these repair rules:
    - Remove dead code and unused bindings. Do not suppress warnings or prefix unused names with `_`.
    - Before a rename or signature change, use LSP `findReferences`. Update all references and reread the changed body.
@@ -120,6 +124,22 @@ Codex review prompts also include section 3's command block.
 
     Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
+
+<MergeWorkerCommands>
+Apply section 3's command block from <WritePromptContract/> with this replacement for its exit 3 line:
+
+```
+Exit 3 means the caller has no registered worker route. Report the route failure and stop.
+Never run the command attached.
+```
+</MergeWorkerCommands>
+
+<MergeWorkerPaths>
+Store merge worker prompts, replies, logs, and command scripts under the existing run directory.
+Replace old session scratch paths in scripts and their dependencies before dispatch.
+Run long gates and builds in task-owned copies at the ordered commit.
+Keep those copies independent of the director's movable checkout until their commands end.
+</MergeWorkerPaths>
 
 <PhaseTeam>
 Every phase's implementation dispatch assigns **two workers at once**; a
@@ -195,7 +215,7 @@ Herdr pane workers use these forms. The commands read `UNIT_RUN_DIR`.
   A `status` post does not change the role field.
 
 Record decisions on the board. Keep the slot argument in every post.
-Read worker names and states with `worker.py list`.
+Read worker names and states with `worker.py list all`.
 Use `send.py --to worker:<unit>/<short name> --from "<sender>" --text "<text>"` under the sender's showrunner.
 Use `worker:<showrunner>/<unit>/<short name>` from outside that showrunner.
 The address resolves through staff and the shared pane observation.

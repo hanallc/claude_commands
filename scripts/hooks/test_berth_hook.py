@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+from dataclasses import replace
 import os
 import runpy
 import shutil
@@ -26,7 +27,7 @@ from scripts.production.staff_test_support import (  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
-DIRECTOR = "sid-director"
+DIRECTOR = fixture_runtime_id("sid-director")
 RESERVATION = "01a13f9c-0000-7000-8000-000000000001"
 RUN = "01a13f9c-0000-7000-8000-0000000000aa"
 HEAD = "0123456789abcdef0123456789abcdef01234567"
@@ -79,8 +80,6 @@ class BerthHookTests(unittest.TestCase):
         _ = subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "base"], check=True, capture_output=True)
         self.session_dir = self.root / "unit" / "run-1"
         self.session_dir.mkdir(parents=True)
-        (self.root / "unit" / "active").mkdir()
-        _ = (self.root / "unit" / "active" / DIRECTOR).write_text(f"{self.session_dir}\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
         fake = self.bin_dir / "cargo-berth"
@@ -90,7 +89,7 @@ class BerthHookTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_CODE_SESSION_ID": DIRECTOR,
-            "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
+            "STAFF_FILE": str(self.root / "unit" / "staff.json"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
@@ -101,6 +100,8 @@ class BerthHookTests(unittest.TestCase):
         }
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         owner = fixture_unit_location(showrunner_relationship("demo"), "design-unit", self.repo)
+        owner = staff.update_current_session(owner.id, staff.native_id(DIRECTOR))
+        _ = staff.set_run(owner.id, staff.OpenRun(self.session_dir))
         self.owner_id = owner.id
         self.recorder_phases("15")
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
@@ -157,13 +158,16 @@ class BerthHookTests(unittest.TestCase):
         design_id = "00000000-0000-4000-8000-000000000036"
         binding = design_roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
         parent = unit_membership("demo", "design-unit")
+        parent = staff.set_worktree(parent.id, staff.PresentWorktree("natedev", self.repo), expected=parent.worktree)
+        binding = replace(binding, checkout=design_roles.UnitCheckout(parent.id))
         thread = fixture_runtime_id("berth-designer")
-        _ = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
+        worker = fixture_worker("lasting-designer", parent.id, runtime_id=thread)
         design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
                                   "2026-10-21T12:00:00+00:00", binding,
-                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(staff.native_id(thread))),
-                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen(worker.id)),
+                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())),
+                                  checkout=design_roles.UnitCheckout(parent.id))
         self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):
             design_roles._save(design)  # pyright: ignore[reportPrivateUsage]

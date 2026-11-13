@@ -21,10 +21,10 @@ from typing import NotRequired, TypedDict, cast
 
 from scripts.herdr import herdr
 from scripts.production import staff, worker
-from scripts.shutdown import pane_record
-from scripts.shutdown.launch_names import LaunchNames
+from scripts.agents import pane_record
+from scripts.agents.launch_names import LaunchNames
 from scripts.lib.agent_program import resolve_program
-from scripts.lib.models_registry import agent_environment
+from scripts.lib.models_registry import agent_environment, claude_arguments
 from scripts.lib.resume_message import NO_WORKERS, resume_message
 from scripts.whoami.account import NAMED_ACCOUNT_VARIABLES
 
@@ -49,6 +49,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
     restored.update({key: environment[key] for key in NAMED_ACCOUNT_VARIABLES if key in environment})
     if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
         workers = NO_WORKERS
+        row: staff.StaffRow | None = None
         try:
             record = staff.snapshot()
             row = record.by_current_session(identity)
@@ -56,7 +57,7 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
                 workers = worker.resume_workers(row.id, record)
         except (OSError, ValueError) as error:
             print(f"{identity}: workers anomaly: {error}", file=sys.stderr)
-        argv = [*argv, resume_message("you were stopped and resumed", workers=workers)]
+        argv = [*argv, resume_message("you were stopped and resumed", workers=workers, unit=row)]
     return argv, restored
 
 
@@ -148,6 +149,8 @@ def child_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str
     argv, environment = restored_launch(argv, environment)
     if program:
         argv = [program, *argv[1:]]
+    if argv and Path(argv[0]).name == "claude":
+        argv = [argv[0], *claude_arguments(argv[1:], environment)]
     return argv, environment
 
 

@@ -264,6 +264,8 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+`abandoned_session_minutes` sets the minimum age for removing abandoned compiler sessions before builds on Mac and Linux targets.
+
 The Mac floor sweep reads `sweep_floor_gib=150` from this file.
 The value must meet `free_floor_gib`. A missing or lower floor refuses the pass.
 `sweep_floor_roots` names `/tmp`, `~/rust`, and `~/.local/state/mac-test/mirror`.
@@ -272,9 +274,10 @@ The on-demand command and the future timer use `sweep.py --floor-only --host mac
 
 ## aws_target.conf
 
-This file defines the disabled AWS SSH target. `offload=off` prevents work.
-The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-The user completes deployment before target activation.
+This file defines the AWS SSH builder target.
+`offload=off` disables builder routing and controller actions unless the external activation record overrides it.
+`build_targets.conf` lists the active SSH targets.
+Cloud gates use `cloud_gate.conf` and `gate-deployment.json`; they do not depend on `offload`.
 
 `host=aws-build` names the Tailscale SSH host. `region` selects the AWS region.
 The controller reads the instance ID from `deployment.json`.
@@ -310,14 +313,25 @@ The installed account file supplies these settings:
 The checkout retains its source, module selection, build settings, and settings from `cloud_gate.conf`.
 These include `instance_types`, `clone_url`, `lifetime_minutes`, `module_time_limit_s`, `spot_max_usd_per_hour`, and `attempt_allowance_usd`.
 They also include `log_push_s`, `result_poll_s`, `launch_reply_tries`, `api_timeout_s`, `termination_timeout_s`, and `credential_file`.
+`spot_quota_request_vcpus=136` requests capacity through `deploy.py quota-request`.
+This covers four 32-vCPU gates and one 8-vCPU Hana box.
 The gate records its own bid and allowance in each reservation.
+`attempt_allowance_usd` reserves non-compute costs before launch.
+Admission includes every open reservation's allowance when bills exist.
+Completed gates use bill rates for root storage and public IPv4 over their actual box hours.
+They use the bill day's S3 costs divided by that day's gate launch count.
+The ledger uses the gate day's bill, the newest earlier bill, or the oldest bill for earlier days.
+Missing cost rows contribute zero.
+The configured allowance supplies the cost when the bill has no needed rows.
+Bill pricing corrects saved estimates that still include the older configured allowance.
 The installed account limits decide whether that reservation fits.
 
 The spending guard requires usable live spending settings through `ConfigRead.origin`.
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
-`offload=off` leaves ordinary builds outside accounting and performs no AWS call.
+`offload=off` disables ordinary builder accounting and controller AWS calls when no external activation record overrides it.
+Cloud gates still read account charges and enforce the spending caps.
 
 `accounting_zone` selects day and month boundaries, including clock changes.
 `price_refresh_seconds=3600` bounds reads from the injected price source.
@@ -361,19 +375,19 @@ Existing boxes use their saved start and end times and the instance types in `cl
 A box without a saved instance type retains its bid rate.
 No migration is required.
 Reports use the saved AWS bill and label provisional days.
-Reports show today's spend, daily limit, successful launch count, and spend groups with amounts and percentage shares.
-Historical reports omit today's estimated spend.
+Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
+Reports show daily spending, limits, run counts, and compute, storage, and other costs.
+The daily spend table shows bill days and estimate days after the newest bill day.
+Historical reports omit estimate days after the report date.
 The groups are gate compute at 32 CPU, compute at 16 CPU, storage, public IPv4, data transfer, and other.
 Compute at 16 CPU includes gates and the older builder.
-Unbilled days use the label `estimated from the newest bill` when a bill exists.
+Unbilled days use the label `estimate`.
 Spot compute includes the older Spot builder when it uses the same instance type.
-The cost for each run is a daily allocation: Spot compute divided by successful launches of that type in UTC.
+The matrix splits each day's Spot cost by box seconds and divides the cost by finished runs on billed days.
 Reports read local evidence without an AWS call or a coordination file.
-`go-live.json` records the first permitted running observation for the wait comparison.
 
-`### AWS` reports uptime, steps, estimated queue wait saved, cost, and cost per saved hour.
-Missing comparisons remain unavailable. Run time differences can remain negative.
-The daily wait comparison remains unmatched for load.
+`### AWS` shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
+`gate_type_window_days=14` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
@@ -406,6 +420,20 @@ Replacement uses its saved `DataVolumeId`. Configuration contains no instance or
 Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
 The command records stage results and times in `up.json` beside `deployment.json`.
 It checks live state before each stage. It always refreshes the price.
+To inspect builder removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder`.
+To remove the builder, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder --approve-destroy`.
+The command disables builder routing and `aws-target.service`, removes its Tailscale device, and removes its compute resources.
+It deletes the retained data volume after the stack update. The `/home` build cache is lost.
+It keeps the stack, Budget, scaler credentials, every gate resource, and `gate-deployment.json`.
+The command preserves spending history and resolves builder observations, pending compute requests, and resource inventory.
+A saved `builder-removal.json` identity supports a repeat after a partial removal.
+Current instance and volume identities take priority over the receipt.
+Removal uses the live CloudFormation template and changes only the builder role, profile, and security group conditions to `Compute`.
+It preserves live gate definitions that differ from the repository template.
+The repository template has the same three conditions for later gate deployment.
+`down --approve-destroy` removes the whole stack, including the gate resources, then deletes the retained volume and Budget.
+It is not the builder-only removal command.
+No removal command changes a tracked configuration value.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
 It writes the price and its read time atomically with mode `0600`.
@@ -417,6 +445,17 @@ The guard runs before each resource request. `deployment_timeout_s` bounds each 
 `scaler_key_check_delay_s=5` allows IAM time to publish the key between checks.
 The scaler stage keeps other credential profiles and writes the private file with mode `0600`.
 It verifies the new key before deleting old keys. It deletes a new key that fails verification.
+Cloud gates boot the official NixOS image that `ami_id` names, and fetch their tools at boot.
+A saved gate image was measured and taken out of use: gates were no faster with it, and its snapshot cost 1.60 USD each month.
+To inspect the saved image removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-images`.
+Without the flag, the command prints its plan and needs no credentials.
+To remove the saved images, run `scripts/lib/py scripts/aws_target/deploy.py remove-images --approve-destroy`.
+The command switches the live stack GateImage parameter to `ami_id` and keeps every other parameter and template definition.
+The old image stays launchable until `gate-deployment.json` names the official image.
+A second stack update then removes the old image permission.
+Then the command deletes the saved gate image, its snapshot, and its cost row.
+Last, it deletes the former builder image, its snapshot, and `image.json`. A later builder `up` would make a new image.
+A repeat after a partial removal continues from the live state. A repeat after a full removal changes nothing.
 `bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
 `scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
 The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
@@ -430,6 +469,9 @@ The corresponding component keys state each monthly estimate.
 The guard uses the greater of the total and the component sum.
 A priced resource inventory can increase that estimate before deployment.
 Stopped instances continue to incur fixed costs.
+After confirmed builder removal, an inventory with `builder_removed=true` stops applying the builder's configured fixed-cost floor.
+The remaining inventory still prices gate resources.
+A confirmed terminated builder does not accrue later estimated compute costs.
 
 The target directory stores `cost-ledger.json` and `cost-ledger.lock`.
 The ledger retains observations, prices, inventories, reconciliations, decisions and limit events.
@@ -542,6 +584,13 @@ Rsync replaces complete files and preserves this host's append files.
 | `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
+| `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
+| `machine_natedev_light` / `machine_natedev_dark` | `#6243a6` / `#bba0ef` | Color the natedev name in the Machine column. |
+| `machine_mac_light` / `machine_mac_dark` | `#526b13` / `#b5ca72` | Color the mac name in the Machine column. |
+| `machine_aws_light` / `machine_aws_dark` | `#855126` / `#dbaa7d` | Color the aws name in the Machine column. |
+
+Configuration values use six hexadecimal digits without `#`.
+The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.
@@ -603,22 +652,6 @@ Unset values differ from empty values.
 The new inputs do not change build keys or other command keys.
 Mac and SSH nextest runs receive the same values, including copy runs.
 
-## dailies.conf
-
-The counts each production's dailies show on one line above the chart, in
-every length: `counts: nightly queue 8 · proposals 3`. A line is
-`<staff id>.<label>=lines <file> <regex>`, which counts the file's lines
-matching the regex, `<staff id>.<label>=files <glob>`, which counts the
-matching files, or `<staff id>.<label>=issues <folder> <tag>`, which
-counts the issues directly in the folder whose frontmatter is open and tagged
-with the tag. The key uses the showrunner staff id. `~` expands, and a hyphen in the label reads as a space.
-`scripts/production/dailies_counts.py` reads it each time the dailies input is
-built, so an edit applies to the next dailies. A missing file or folder shows as
-`not found`. A bad line leaves out the counts line, and the builder prints
-`counts: unavailable — dailies.conf line <n>: …`. `DAILIES_COUNTS_CONFIG`
-overrides the path. Today it holds build-followups' nightly review queue and
-plan backlog, and hana's open hanadocs proposal issues (user, 2026-10-10).
-
 ## user_zone.conf
 
 The zone every time shown to the user is written in: `zone=<IANA zone name>`,
@@ -638,8 +671,7 @@ file named.
 - `/zone <place>` changes it on both machines and tells every session; a bare
   `/zone` shows it. The status line reads the file in `statusline.sh`.
 
-A production keeps its own `User zone` line in its production doc, and the
-dailies read that. A time stored without an offset keeps the zone it was
+A production document's old `User zone` line is ignored. A time stored without an offset keeps the zone it was
 recorded in: `scripts/model_study/turns.py` names Pacific for the model study's
 roster.
 
@@ -778,22 +810,70 @@ The folder uses task `gate:aws-routing-proof`.
 The next `up` removes a folder left by a dead run.
 Its `default` development shell uses the host tools.
 
-`deploy.py gate-trial` reads these keys when it uses them:
+Paired trials use the installed scaler service and the existing `cloud_gate.conf` settings.
+Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Both refs must exist in pushed public history for `~/.claude`.
+Each module uses one box for all rounds.
+All module boxes run concurrently.
+Each box first runs base and changed once in separate processes without measurements.
+These warm-up runs use the same process isolation as measured runs.
+The result rows and medians exclude the warm-up runs.
+The default remains three measured rounds.
+The reserved box lifetime includes both warm-up runs and all measured rounds.
+The guest divides the available time across warm-up runs and measured rounds.
+Odd rounds run base first; even rounds run changed first.
+The command reserves the full trial cost before it permits any launch.
+A refused launch never uses a local runner.
 
-| Key | Value | Reason |
-| --- | --- | --- |
-| `gate_trial_size_reserve_usd` | `4` | Limit the spend of the size step. |
-| `gate_trial_start_reserve_usd` | `3` | Limit the spend of the start step. |
-| `gate_trial_lifetime_minutes` | `30` | Set the guest shutdown time and the attempt deadline. |
-| `gate_trial_url_lifetime_s` | `7200` | Keep presigned URLs valid through a stop and start. |
-| `gate_trial_target_gate_s` | `420` | Select the cheapest size that meets the 7-minute goal. |
-| `gate_trial_default_sizes` | `8,16,32,64` | Set the vCPU sizes of the size step. |
-| `gate_trial_size_runs` | `3` | Set the attempts for each size. |
-| `gate_trial_start_runs` | `5` | Set the attempts of the start step. |
-| `gate_trial_poll_pause_s` | `2` | Set the pause between state and result reads. |
-| `gate_trial_group_delete_wait_s` | `120` | Limit the security group delete retries. |
+Stdout contains JSON lines: each run, each module summary, and the final cost.
+Progress goes to stderr.
+The final line has `total_cost_usd`, `cost_basis: "estimate"`, and `cleanup_complete`.
+The estimate uses each box's rate, minimum billed seconds, lifetime, allowance, and new bill-query fees.
+Unconfirmed cleanup uses the reserved lifetime and returns a nonzero status.
+The paired trial adds no settings.
+
+The paired trial replaces the size/start trials.
+The following settings are removed:
+
+1. `gate_trial_size_reserve_usd`.
+1. `gate_trial_start_reserve_usd`.
+1. `gate_trial_lifetime_minutes`.
+1. `gate_trial_url_lifetime_s`.
+1. `gate_trial_target_gate_s`.
+1. `gate_trial_module_limit_s`.
+1. `gate_trial_default_sizes`.
+1. `gate_trial_size_runs`.
+1. `gate_trial_start_runs`.
+1. `gate_trial_poll_pause_s`.
+1. `gate_trial_log_push_s`.
+1. `gate_trial_group_delete_wait_s`.
+
 The setup checks compare plain tool commands on both hosts.
 These stages need no other source repository.
 `deploy.py up` stores routing activation in `~/.local/state/build-targets/aws/routing.json`.
 The controller and sender use this record before the tracked `offload` value.
 The command edits no tracked file.
+
+### Cloud gate regions
+
+`cloud_gate.conf` sets `regions=us-east-2 us-west-2` in launch order.
+The first region must match the home region in `aws_target.conf`.
+The list must contain at least one region and must not repeat a region.
+The list can include other regions that the account policy permits.
+Each gate tries every configured type and public zone in one region before it tries the next region.
+Capacity refusals and unsupported types select the next variant.
+After all regions refuse, a normal gate can use natedev.
+All regions use the same daily and monthly spend caps.
+
+`deploy.py up --workload merge-gates --approve-resources` updates the home stack and the regional gate stack.
+The home stack keeps the bucket and the global instance profile.
+The regional stack uses the default VPC and contains only gate network, launch, policy, and expiry resources.
+The deployment resolves the pinned image by its Name and owner in each region.
+It copies the image when the region has no matching image.
+No per-region image setting is required.
+All boxes use signed links to the home bucket.
+
+`deploy.py prices` prints region, type, zone, and Spot price without resource identities.
+The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.8xlarge candidates.
+`down` removes regional stacks and copied images.
+`remove-images` changes the home image and keeps regional stacks and copied images.

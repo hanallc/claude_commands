@@ -5,6 +5,7 @@ import fcntl
 import json
 import re
 import os
+import socket
 from subprocess import run as run_taplo
 import tempfile
 import tomllib
@@ -16,7 +17,7 @@ from pathlib import Path
 from threading import RLock
 from typing import cast
 
-from scripts.lib import atomic_file, git_exclude
+from scripts.lib import atomic_file, conf, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
 
@@ -71,6 +72,72 @@ class NoAppPort:
     pass
 
 
+@dataclass(frozen=True)
+class PlanDefault:
+    """The request needs the unit's default plan."""
+
+
+def default_port(worktree: Path, selected: AppPort | NoAppPort) -> AppPort | NoAppPort:
+    """Keep an explicit port or choose the lowest available Hana port."""
+    if isinstance(selected, AppPort):
+        return selected
+    manifest = worktree / "Cargo.toml"
+    package = cast(dict[str, object], tomllib.loads(manifest.read_text()).get("package", {})) if manifest.is_file() else {}
+    if not (worktree / "crates/hana/Cargo.toml").is_file() and package.get("name") != "hana":
+        return selected
+    settings = conf.read("production")
+    first, last = settings.whole("unit_port_first"), settings.whole("unit_port_last")
+    reserved = {settings.whole("mac_run_port"), settings.whole("smoke_port")}
+    for row in staff.snapshot().rows:
+        if row.kind != "unit":
+            continue
+        configurations = [read_parked(row.id, cleanup=False)]
+        if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
+            configurations.append(read(row.worktree.path, cleanup=False))
+        reserved.update(config.port.number for config in configurations
+                        if isinstance(config, UnitConfig) and isinstance(config.port, AppPort))
+    for number in range(first, last + 1):
+        if number in reserved:
+            continue
+        with socket.socket() as listener:
+            try:
+                listener.bind(("127.0.0.1", number))
+            except OSError:
+                continue
+        return AppPort(number)
+    raise ConfigRefused(f"port default is unavailable; no free port in {first}..{last}")
+
+
+def default_plan(worktree: Path, document: Path, unit: str = "") -> PlanFile | StandbyPlan | PermanentPlan:
+    """Read a saved configuration or the owner's existing plan record."""
+    from scripts.production.production_doc import cell_value, optional_field, FieldPresent
+
+    saved = read(worktree, cleanup=False)
+    if isinstance(saved, UnitConfig):
+        return saved.plan
+    lines = document.read_text().splitlines()
+    if unit:
+        headers: list[str] = []
+        for line in lines:
+            if not line.startswith("|"):
+                headers = []
+                continue
+            cells = [cell_value(cell.strip()) for cell in line.strip("|").split("|")]
+            if "Unit" in cells and "Plan" in cells:
+                headers = cells
+            elif headers and len(cells) == len(headers) and cells[headers.index("Unit")] == unit:
+                value = cells[headers.index("Plan")]
+                if value and value not in ("—", "-"):
+                    return StandbyPlan() if value == "standby" else PermanentPlan() if value == "permanent" else PlanFile(Path(value))
+    else:
+        field = optional_field(lines, "Plan")
+        if isinstance(field, FieldPresent):
+            return PlanFile(Path(cell_value(field.text)))
+        if document.is_relative_to(worktree):
+            return PlanFile(document.relative_to(worktree))
+    raise ConfigRefused(f"plan default is missing; looked in {worktree / '.unit.toml'} and {document}")
+
+
 def parse_port_cell(raw: str) -> AppPort | NoAppPort:
     """Read a raw Port cell and keep its text in each refusal."""
     from scripts.production.production_doc import cell_value
@@ -93,19 +160,9 @@ class NoFormattingWorktree:
 
 
 @dataclass(frozen=True)
-class Branch:
-    value: str
-
-    def __post_init__(self) -> None:
-        if not self.value or any(character.isspace() for character in self.value):
-            raise ConfigRefused(f"retired.branch: invalid branch {self.value!r}")
-
-
-@dataclass(frozen=True)
 class RetiredSession:
     date: str
     session_id: str
-    branch: Branch
 
     def __post_init__(self) -> None:
         try:
@@ -214,10 +271,11 @@ def writer_lock() -> Generator[None]:
 
 
 def parked_path(unit: StaffId, *, home: Path | None = None) -> Path:
-    """Park on this machine, independently of the staff record's owner."""
+    """Use private staff state unless the caller selects a home."""
     if not unit or Path(unit).name != unit or unit in (".", ".."):
         raise ConfigRefused(f"invalid staff id for parked configuration: {unit!r}")
-    return (Path.home() if home is None else home) / ".local/state/staff/units" / f"{unit}.toml"
+    directory = home / ".local/state/staff" if home is not None else staff.record_path().parent
+    return directory / "units" / f"{unit}.toml"
 
 
 def _string(fields: dict[str, object], key: str) -> str:
@@ -255,10 +313,9 @@ def decode(fields: dict[str, object]) -> UnitConfig:
         if not isinstance(raw_retired, dict):
             raise ConfigRefused("retired: expected a table")
         facts = cast(dict[str, object], raw_retired)
-        if set(facts) - {"folder"} != {"date", "session", "branch"}:
-            raise ConfigRefused("retired: expected date, session and branch")
-        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"),
-                                 Branch(_string(facts, "branch")))
+        if set(facts) != {"date", "session"}:
+            raise ConfigRefused("retired: expected date and session")
+        retired = RetiredSession(_string(facts, "date"), _string(facts, "session"))
     formatting = RepositoryTaploConfig(_string(fields, "taplo_config")) if "taplo_config" in fields else DefaultTaploConfig()
     return UnitConfig(plan, port, tuple(duties), retired, formatting)
 
@@ -302,8 +359,7 @@ def _fields(config: UnitConfig) -> dict[str, object]:
         fields["taplo_config"] = config.formatting.text
     if isinstance(config.retired, RetiredSession):
         facts = config.retired
-        fields["retired"] = {"date": facts.date, "session": facts.session_id,
-                             "branch": facts.branch.value}
+        fields["retired"] = {"date": facts.date, "session": facts.session_id}
     return fields
 
 

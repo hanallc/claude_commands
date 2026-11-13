@@ -20,11 +20,10 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
-from scripts.style import rules
+from scripts.style import rules, style_config
 from scripts.style import style_ledger
-from scripts.production import staff, unit_lookup
 from scripts.lib.user_zone import user_zone
-from scripts.style.add_style import NoStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, configured_style_production
 
 
 class RuleSnapshot(TypedDict):
@@ -65,15 +64,14 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
-    standing = standing_style_production(ledger.repo)
-    units = tuple(f"{standing.name}-{family}" for family in ("modules", "names", "values", "types"))
+    standing = configured_style_production(ledger.repo)
     if not isinstance(standing, NoStyleProduction):
-        declared = tuple(unit for unit in (row.name for row in unit_lookup.doc_units(standing.doc, staff.snapshot()))
-                         if not isinstance(rules.style_family(unit), rules.NotStyleUnit))
-        return StyleProduction(standing.name, standing.branch_point, declared or units)
+        config = style_config.read_config(standing.doc)
+        return StyleProduction(standing.name, config.route.branch_point,
+                               tuple(assignment.unit for assignment in config.assignments))
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
-    return StyleProduction(standing.name, branch_point, units)
+    return StyleProduction(standing.name, branch_point, ())
 
 
 def previous_report(path: Path) -> FirstReport | PreviousReport:
@@ -154,8 +152,10 @@ def resolve_rule(name: str, progress: tuple[style_ledger.RuleCounts, ...]) -> st
 
 
 def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMember, ...]:
-    paths = git(ledger.repo, "ls-tree", "-rz", "--name-only", tip).split("\0")
-    manifests = {path: git(ledger.repo, "show", f"{tip}:{path}") for path in paths if PurePosixPath(path).name == "Cargo.toml"}
+    entries = style_ledger.tree_entries(ledger.repo, tip)
+    blobs = {path: entry.object for path, entry in entries.items()
+             if entry.kind == "blob" and PurePosixPath(path).name == "Cargo.toml"}
+    manifests = {path: content.decode(errors="replace") for path, content in style_ledger.blob_contents(ledger.repo, blobs)}
     return rules.workspace_members(manifests)
 
 

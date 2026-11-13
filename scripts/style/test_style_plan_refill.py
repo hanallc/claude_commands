@@ -7,11 +7,12 @@ from scripts.style.ledger_test_support import ticket_owner_id
 import io
 import os
 import sqlite3
+import subprocess
 import traceback
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
-from typing import final
+from typing import cast, final
 from unittest import mock
 
 
@@ -24,8 +25,10 @@ from scripts.style import coverage_report
 from scripts.style import style_ledger
 
 from scripts.production import staff
+from scripts.production.issues import frontmatter
 
 from scripts.style.style_plan_test_support import StylePlanFixture
+from scripts.style.unit_plans import AllCrates
 
 
 @final
@@ -48,6 +51,52 @@ class StylePlanTests(StylePlanFixture):
     def test_refill_uses_the_planners_catalog_snapshot(self) -> None:
         _ = self.rule("read")
         self.sync()
+        with self.ledger() as ledger, ledger.finding_reads():
+            context = style_plan.RefillContext(ledger)
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+            cells = tuple(ledger.cells())
+            busy = style_plan.BusyFiles(self.board(), frozenset())
+            scopes: dict[rules.Family, AllCrates] = {"names": AllCrates()}
+            base = self.base()
+            with (mock.patch.object(ledger, "_held_rows", wraps=ledger._held_rows) as rows,  # pyright: ignore[reportPrivateUsage]
+                  mock.patch.object(style_plan, "source_line_counts", wraps=style_plan.source_line_counts) as lengths):
+                first = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, ("names",), AllCrates(), scopes, base, frozenset(),
+                    definitions, cells, context=context)
+                self.assertTrue(first)
+                self.assertEqual(rows.call_count, 1)
+                reads = lengths.call_count
+                self.assertGreater(reads, 0)
+                second = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, ("names",), AllCrates(), scopes, base, frozenset(),
+                    definitions, cells, context=context)
+                self.assertEqual(second, first)
+                self.assertEqual((rows.call_count, lengths.call_count), (1, reads))
+                definition = next(iter(definitions.values()))
+                finding = ledger.hold(definition.rule_id, self.sources[0], 1, "pub fn alpha() {}", "rename",
+                                      "alpha", "better_alpha", definition.blob, "outside")
+                before = sum(not call.args for call in rows.call_args_list)
+                _ = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, ("names",), AllCrates(), scopes, base, frozenset(),
+                    definitions, cells, context=context)
+                self.assertEqual(sum(not call.args for call in rows.call_args_list), before + 1)
+                self.assertGreater(lengths.call_count, reads)
+                self.assertIn(finding, context.held[(definition.rule_id, self.sources[0])])
+                # An external commit also starts a new observation.
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET state='waived' WHERE finding_id=?",
+                                           (finding.finding_id,))
+                before = sum(not call.args for call in rows.call_args_list)
+                _ = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, ("names",), AllCrates(), scopes, base, frozenset(),
+                    definitions, cells, context=context)
+                self.assertEqual(sum(not call.args for call in rows.call_args_list), before + 1)
+                self.assertNotIn((definition.rule_id, self.sources[0]), context.held)
+            counts = ledger.line_counts(self.tip, self.sources)
+            with mock.patch.object(subprocess, "run", side_effect=AssertionError("unexpected Git process")):
+                self.assertEqual(ledger.line_counts(self.tip, self.sources), counts)
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                self.assertGreater(cast(tuple[int], connection.execute("SELECT COUNT(*) FROM refill_objects").fetchone())[0], 0)
         load = rules.load_rules
 
         def shared_catalog(repo: Path | None) -> tuple[rules.Rule, ...]:
@@ -85,6 +134,58 @@ class StylePlanTests(StylePlanFixture):
         read = self.rule("read")
         self.sync()
         issue = self.held_proposal(read, self.sources[0])
+        with self.ledger() as ledger, ledger.finding_reads():
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+            more = ledger.hold(read, self.sources[0], 3, "another held defect", "rename", "before_more", "after_more",
+                               definitions[read].blob, "outside")
+            ledger.file_held(more.finding_id, issue)
+            context = style_plan.RefillContext(ledger)
+            cells = (style_ledger.Cell(read, self.sources[0], "crates/alpha", "C", "names", "stale"),
+                     style_ledger.Cell(read, self.sources[1], "crates/alpha", "C", "names", "open"),
+                     style_ledger.Cell(read, self.sources[2], "crates/beta", "C", "names", "open"))
+            scopes: dict[rules.Family, AllCrates] = {family: AllCrates() for family in style_plan.FAMILIES}
+            busy = style_plan.BusyFiles(self.board(), frozenset())
+            with (mock.patch.object(style_plan, "held_site_cells", wraps=style_plan.held_site_cells) as filtered,
+                  mock.patch.object(style_plan, "frontmatter", wraps=frontmatter) as parsed,
+                  mock.patch.object(ledger, "newest_held_judgment", wraps=ledger.newest_held_judgment) as newest,
+                  mock.patch.object(style_ledger, "rule_changed_since_judged",
+                                    wraps=style_ledger.rule_changed_since_judged) as changed,
+                  mock.patch.object(rules, "judged_text_unchanged", wraps=rules.judged_text_unchanged) as matched,
+                  mock.patch.object(context.reader, "blob", wraps=context.reader.blob) as blobs):
+                first = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, style_plan.FAMILIES, AllCrates(), scopes, style_plan.NoUnitBranch(),
+                    frozenset(), definitions, cells, context=context)
+                self.assertTrue(first)
+                self.assertTrue(all(self.sources[0] not in ticket.files for ticket in first))
+                second = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, style_plan.FAMILIES, AllCrates(), scopes, style_plan.NoUnitBranch(),
+                    frozenset(), definitions, cells, context=context)
+                self.assertEqual(second, first)
+                self.assertEqual((filtered.call_count, parsed.call_count, newest.call_count, changed.call_count,
+                                  matched.call_count, blobs.call_count), (1, 1, 1, 1, 1, 1))
+                original = issue.read_text()
+                _ = issue.write_text(original.replace("status: open", "status: closed"))
+                after_close = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, style_plan.FAMILIES, AllCrates(), scopes, style_plan.NoUnitBranch(),
+                    frozenset(), definitions, cells, context=context)
+                self.assertTrue(any(self.sources[0] in ticket.files for ticket in after_close))
+                self.assertEqual((filtered.call_count, parsed.call_count), (2, 2))
+                self.assertEqual((newest.call_count, changed.call_count, matched.call_count, blobs.call_count),
+                                 (1, 1, 1, 1))
+                ledger.finding_need(more.finding_id, self.sources[1])
+                after_write = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, style_plan.FAMILIES, AllCrates(), scopes, style_plan.NoUnitBranch(),
+                    frozenset(), definitions, cells, context=context)
+                self.assertEqual(after_write, after_close)
+                self.assertEqual((filtered.call_count, parsed.call_count), (3, 2))
+                self.assertEqual((newest.call_count, changed.call_count, matched.call_count), (2, 2, 2))
+                _ = issue.write_text(original)
+                restored = style_plan.ranked_candidates(
+                    self.repo, ledger, busy, style_plan.FAMILIES, AllCrates(), scopes, style_plan.NoUnitBranch(),
+                    frozenset(), definitions, cells, context=context)
+                self.assertEqual(restored, first)
+                self.assertEqual((filtered.call_count, parsed.call_count), (4, 3))
+                self.assertEqual(len(context.proposal_statuses), 1)
         rule_file = self.rule_dir / "read.md"
         _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
         ledger = self.ledger()
@@ -318,19 +419,60 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket())
 
     def test_refill_starts_the_selected_decision_when_only_the_lockfile_changes(self) -> None:
-        rule = self.rule("read")
-        self.sync()
-        issue = self.approved_decision(rule, self.sources[:1], "rename")
-        self.write("Cargo.lock", "# incoming lockfile update\n")
-        _ = self.commit()
-        with mock.patch.object(style_proposals, "proposal_command") as start:
-            code, output, errors = self.run_next()
-        self.assertEqual(code, 0, errors + output)
-        start.assert_called_once()
-        ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
-        self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
-                         ("proposal", str(issue), list(self.sources[:1]), self.tip))
-        self.assertEqual(self.sync_wait_rows(), [])
+        _ = self.doCleanups()
+        for change in ("lockfile", "recorded need"):
+            with self.subTest(change=change):
+                case = StylePlanTests()
+                case.setUp()
+                try:
+                    rule = case.rule("read")
+                    case.sync()
+                    issue = case.approved_decision(rule, case.sources[:1],
+                                                   "restructure" if change == "recorded need" else "rename")
+                    ledger = case.ledger()
+                    finding, = ledger.proposal_findings(issue)
+                    need = case.sources[2]
+                    busy: tuple[str, ...] = ()
+                    if change == "recorded need":
+                        ledger.ticket_add("7001", ticket_owner_id("names"), "proposal", "names", "crates/alpha",
+                                          [finding.path], [rule], proposal=str(issue), finding_ids=(finding.finding_id,))
+                        ledger.finding_need(finding.finding_id, need)
+                        ledger.finding_need(finding.finding_id, finding.path)
+                        edits = style_plan.EditedFiles(case.repo, ledger, style_plan.NoUnitBranch())
+                        footprint = edits.of(finding)
+                        self.assertEqual((footprint[0], footprint[-1], footprint.count(finding.path)), (finding.path, need, 1))
+                        self.assertIn(need, edits.of_ticket(ledger.ticket_get("7001")))
+                        ledger.ticket_drop("7001")
+                        self.assertEqual(ledger.finding_needs(finding.finding_id), tuple(sorted((finding.path, need))))
+                        ledger.record(rule=rule, path=finding.path, commit=case.tip, verdict="held", detail="",
+                                      ticket="outside", worker="test", rule_blob=finding.rule_blob,
+                                      input_scope=style_ledger.DeclaredInputScope.RULE)
+                        for path in case.sources[1:]:
+                            case.record(rule, path, case.tip)
+                        busy = (need,)
+                    else:
+                        case.write("Cargo.lock", "# incoming lockfile update\n")
+                        _ = case.commit()
+                    with (mock.patch.object(berth_board, "read_board", return_value=case.board(*busy)),
+                          mock.patch.object(style_proposals, "proposal_command") as start):
+                        code, output, errors = case.run_next()
+                    if change == "recorded need":
+                        start.assert_not_called()
+                        self.assertEqual(code, 3, output + errors)
+                        self.assertEqual(errors, "")
+                        self.assertIn(f"waiting {issue}: {finding.path} edits {need}, busy (1 finding)\n", output)
+                        self.assertEqual(case.count_tickets(), 1)
+                        self.assertEqual(ledger.ticket_open(ticket_owner_id("names")), ())
+                        self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
+                    else:
+                        self.assertEqual(code, 0, errors + output)
+                        start.assert_called_once()
+                        ticket = ledger.ticket_open(ticket_owner_id("names"))[0]
+                        self.assertEqual((ticket["kind"], ticket["proposal"], ticket["files"], ticket["base"]),
+                                         ("proposal", str(issue), list(case.sources[:1]), case.tip))
+                        self.assertEqual(case.sync_wait_rows(), [])
+                finally:
+                    case.doCleanups()
 
     def test_refill_holds_a_rename_when_main_adds_a_reference(self) -> None:
         rule = self.rule("read")
@@ -448,6 +590,7 @@ class StylePlanTests(StylePlanFixture):
         self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
         self.assertNotEqual(self.tip, branch_tip)
         self.sync()
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         self.assertEqual(self.run_next(), (0, "phase written: 1\n", ""))
         self.assertEqual(self.count_tickets(), 1)
         self.assertEqual(self.sync_wait_rows(), [])

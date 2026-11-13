@@ -170,6 +170,9 @@ class CargoWrapperTest(unittest.TestCase):
             [], ["metadata"], ["fmt"], ["tree"], ["--version"], ["--help"],
             ["custom-command"], ["+nightly", "metadata"],
             ["--config", "test", "metadata"], ["--color", "build", "tree"],
+            ["nextest", "--version"], ["clippy", "-V"],
+            ["build", "--help"], ["test", "-h"], ["install", "--help"],
+            ["+nightly", "--color", "auto", "nextest", "--version"],
         ):
             with self.subTest(args=args):
                 done = self.invoke(*args)
@@ -180,13 +183,14 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertFalse(self.python_log.exists())
 
     def test_building_commands_use_builds_slice(self) -> None:
-        for command in (
+        calls = [[command, "--", "$HOME", "${HOME}", "$$", "two words", ""] for command in (
             "build", "b", "check", "c", "clippy", "test", "t", "nextest",
             "run", "r", "bench", "doc", "d", "rustc", "rustdoc", "fix",
             "install", "miri", "mend",
-        ):
-            with self.subTest(command=command):
-                args = [command, "--", "$HOME", "${HOME}", "$$", "two words", ""]
+        )]
+        calls.extend((["install", "--version", "1.0", "x"], ["nextest", "run", "--", "--help"]))
+        for args in calls:
+            with self.subTest(args=args):
                 done = self.invoke(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assert_cargo(args)
@@ -236,12 +240,18 @@ class CargoWrapperTest(unittest.TestCase):
         # A hidden entry must also cause a hold check.
         _ = (self.hold / ".holder").write_text("held")
         self.env["HOLD_EXIT"] = "1"
-        done = self.invoke("test")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stderr, "cargo stderr\n")
-        self.assertTrue(self.hold_log.exists())
-        self.assert_cargo(["test"])
-        self.assert_scope(["test"])
+        for cgroup in (
+            "0::/user.slice/app-agents.slice/session.scope\n",
+            "0::/user.slice/builds.slice/builds-detached.slice/run-42.scope\n",
+        ):
+            with self.subTest(cgroup=cgroup):
+                _ = self.cgroup.write_text(cgroup)
+                done = self.invoke("test")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stderr, "cargo stderr\n")
+                self.assertTrue(self.hold_log.exists())
+                self.assert_cargo(["test"])
+                self.assert_scope(["test"])
 
     def test_unreadable_hold_prints_one_note_and_builds(self) -> None:
         _ = (self.hold / "holder").write_text("held")

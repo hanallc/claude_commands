@@ -19,9 +19,12 @@ from unittest.mock import patch
 # Hang guards allow for load 136 on natedev (2026-10-29).
 
 from scripts.lib.process_group import send_process_group
-from scripts.shutdown.test_support import ShutdownTestCase
+from scripts.agents.test_support import ShutdownTestCase
 from scripts.lib import relaunch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, worker
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.lib.resume_message import AccountMove, ResumeWorkers, resume_message
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 
@@ -37,6 +40,37 @@ class RelaunchObservation(TypedDict):
 class FinishedChild:
     def wait(self) -> int:
         return 23
+
+
+class UnitResumeCommandTests(StaffTestCase):
+    def test_resume_and_account_move_name_the_recorded_command(self) -> None:
+        runner = fixture_member("showrunner", name="demo")
+        for unit_type in staff.UNIT_TYPES:
+            with self.subTest(unit_type=unit_type):
+                row = staff.ensure("unit", name=unit_type, parent=staff.ReportsTo(runner.id),
+                    runtime_id=fixture_runtime_id(unit_type), unit_type=unit_type)
+                text = resume_message("maintenance", unit=row, move=AccountMove("claude1", "claude2"))
+                self.assertIn(f"/unit:{unit_type}", text)
+                self.assertIn(f"~/.claude/commands/unit/{unit_type}.md", text)
+                self.assertIn("moved from claude1 to claude2", text)
+                self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.", text)
+
+    def test_relaunch_uses_the_retained_unit_after_rename(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.production.staff_test_support import fixture_session
+
+        runner = fixture_member("showrunner", name="demo")
+        row = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+            runtime_id=fixture_runtime_id("merges"), unit_type="merge")
+        fixture_session(row.current_session, staff.ClaudeBackend())
+        row = staff.rename(row.id, "renamed")
+        entry = pane_record.launch("w1:p2", str(row.current_session), str(self.root), {}, ["claude"])
+        environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
+        with (patch.object(pane_record, "matching_launch", return_value=entry),
+              patch.object(worker, "resume_workers", return_value=ResumeWorkers())):
+            arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)
+        self.assertIn("/unit:merge", arguments[-1])
+        self.assertNotIn("/unit:direct", arguments[-1])
 
 
 class RelaunchTests(ShutdownTestCase):
@@ -123,6 +157,8 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", move=AccountMove("source", "destination"), workers=workers)
         self.assertIn("for messages kept while you were down, then continue from there; if you were waiting on the user, keep waiting.", text)
         self.assertIn("moved from source to destination", text)
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
+                      text.splitlines()[1])
         self.assertEqual(text.count("Worker busy-id: busy dispatch dispatch-id"), 1)
         self.assertEqual(text.count("Worker idle-id: idle"), 1)
         self.assertNotIn("implement.sh", resume_message("a shutdown"))
@@ -134,6 +170,8 @@ class RelaunchTests(ShutdownTestCase):
         text = resume_message("a shutdown", workers=ResumeWorkers(panes=[
             PaneWorkerResume(staff.StaffId(name), IdleWorker()) for name in ("impl-id", "review-id")]))
         self.assertIn("You were stopped and resumed because a shutdown.", text)
+        self.assertIn("Background commands can still be running or can have finished. Follow ~/.claude/docs/direct/restart_takeover.md before repeating one.",
+                      text.splitlines()[1])
         self.assertIn("for messages kept while you were down", text)
         for name in ("impl-id", "review-id"):
             self.assertEqual(text.count(f"Worker {name}: idle"), 1)
@@ -155,6 +193,7 @@ class RelaunchTests(ShutdownTestCase):
         state = cast(dict[str, object], json.loads(state_path.read_text()))
         passes = cast(dict[str, dict[str, object]], state["pass"])
         command = ("bash", "assign.sh", "--role", "impl", "--prompt", str(fixture.root / "saved prompt.md"))
+        passes[row.name]["worker_id"] = row.id
         passes[row.name]["launcher_command"] = list(command)
         for status in ("unsubmitted", "submitted", "done", "completed"):
             with self.subTest(status=status):
@@ -229,17 +268,23 @@ class RelaunchTests(ShutdownTestCase):
 
     def test_director_resume_without_a_pane_marker_names_its_workers(self) -> None:
         from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_member, fixture_worker
-        from scripts.shutdown import pane_record
+        from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_session
+        from scripts.agents import pane_record
 
         with patch.dict(os.environ, {"HOME": str(self.root), "ROSTER_RUN_ROOT": str(self.root / "runs"),
                                      "UNIT_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": ""}):
             runner = fixture_member("showrunner", name="TEST-showrunner")
             director = fixture_member("unit", name="TEST-director", parent=runner.id,
                                       worktree=staff.PresentWorktree("natedev", self.root))
+            fixture_session(director.current_session, staff.ClaudeBackend())
             workers = [fixture_worker(name, director.id) for name in ("impl", "review")]
             entry = pane_record.launch("w1:p2", director.current_session, str(self.root), {}, ["claude"])
-            with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
+            from scripts.agents.test_pane_restore import FakeClient
+            from scripts.herdr import herdr
+
+            client = FakeClient([{"pane_id": "w1:p2", "label": director.name, "workspace_id": "w1"}])
+            with (patch.object(pane_record, "RECORD_DIR", self.root / "panes"),
+                  patch.object(herdr, "Herdr", return_value=client)):
                 pane_record.write("agents", entry)
                 arguments, _ = relaunch.restored_launch(["claude", "--resume", director.current_session],
                     {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"})
@@ -256,8 +301,8 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(stdout, "")
 
     def test_herdr_relaunch_restores_its_conversation_marks_and_one_resume_note(self) -> None:
-        from scripts.shutdown import pane_record
-        from scripts.shutdown.stop_resume import resume_message
+        from scripts.agents import pane_record
+        from scripts.agents.stop_resume import resume_message
 
         program = self.root / ".local/bin/claude"
         program.parent.mkdir(parents=True)
@@ -289,8 +334,37 @@ class RelaunchTests(ShutdownTestCase):
                 self.assertEqual(observed["argv"], expected)
                 self.assertEqual(observed["marks"], native if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
+        from scripts.production import staff
+
+        from scripts.herdr import pane_launch
+        from scripts.herdr.test_worker_panes import WorkerPaneTests
+        from dataclasses import replace
+
+        case = WorkerPaneTests("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        _ = case.enterContext(patch.object(pane_record, "RECORD_DIR", pane_launch.record_directory()))
+        owner = case.worker("selected-native")
+        foreign = replace(owner, id=staff.StaffId("foreign-native"),
+                          current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000199"))
+        case.world.add(owner, "w1:p7", label="misleading-current")
+        case.world.add(foreign, "w1:p8", label=owner.name)
+        case.world.locations["w1:p7"]["agent_session"] = {"value": "stale-report"}
+        case.world.locations["w1:p8"]["agent_session"] = {"value": owner.current_session}
+        case.world.record(owner, "w1:p8")
+        entries = pane_record.read("agents")
+        _ = entries.pop("w1:p7", None)
+        pane_record.save("agents", entries)
+
+        with self.subTest(record="reused pane"):
+            arguments = ["claude", "--resume", str(owner.current_session)]
+            resumed = relaunch.restored_launch(arguments,
+                {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p7"})[0]
+            self.assertEqual(resumed, [*arguments, resume_message("you were stopped and resumed")])
+
+
     def test_explicit_move_account_replaces_the_saved_launch_account(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
 
         entry = pane_record.launch("w1:p2", "session", str(self.root),
@@ -307,7 +381,7 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(restored["ENABLE_TOOL_SEARCH"], "true")
 
     def test_pane_delivery_does_not_add_a_second_prompt(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
 
         entry = pane_record.launch("w1:p2", "session", str(self.root), {}, ["claude"])
@@ -318,7 +392,7 @@ class RelaunchTests(ShutdownTestCase):
         self.assertEqual(arguments, ["claude", "--resume", "session"])
 
     def test_enveloped_resume_needs_no_source_record(self) -> None:
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         from scripts.production import session_staff
         from scripts.lib import script_prompts
 

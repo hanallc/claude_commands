@@ -8,12 +8,13 @@ import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lint import sweep
 from scripts.lib import conf
 from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+from scripts.lib.user_zone import user_zone
 
 from scripts.buildlog import store
 from scripts.buildlog import filesystem
@@ -49,6 +50,7 @@ class FilesystemCapacity(TypedDict):
 
 class DiskSnapshot(TypedDict):
     measured_at: str
+    capacity_measured_at: NotRequired[str]
     host: str
     rows: list[DiskRow]
     used: int
@@ -63,6 +65,7 @@ class DiskSnapshot(TypedDict):
 
 class MeasuredDiskSnapshot(TypedDict):
     measured_at: str
+    capacity_measured_at: str
     host: str
     rows: list[DiskRow]
     used: int
@@ -80,6 +83,7 @@ MIN_OUTSIDE_DIRECTORY_BYTES = 1 << 30
 
 FOLDERS: list[tuple[str, str]] = [
     ("~/rust", "~/rust"),
+    ("~/.local/state", "~/.local/state"),
     ("/tmp", "/tmp"),
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
@@ -108,6 +112,8 @@ class InvalidFloor(ValueError):
 
 
 def read_floor() -> int | None:
+    from scripts.lint import sweep
+
     config = str(conf.path("lint"))
     floor, key = sweep.floor_bytes(conf.read(Path(config)).values(), socket.gethostname())
     if floor is None and key is not None:
@@ -117,6 +123,8 @@ def read_floor() -> int | None:
 
 def outside_directory_bytes(folders: list[tuple[str, str]]) -> tuple[dict[str, int], dict[str, int]]:
     """Allocated bytes under folder roots and shallow directories, excluding cargo targets."""
+    from scripts.lint import sweep
+
     sizes: dict[str, int] = {}
     depths: dict[str, int] = {}
     seen: set[sweep.InodeKey] = set()
@@ -210,6 +218,8 @@ def measure(
     folders: list[tuple[str, str]], usage: Callable[[], filesystem.FilesystemUsage], floor: int | None,
     previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT,
 ) -> MeasuredDiskSnapshot:
+    from scripts.lint import sweep
+
     seen: set[sweep.InodeKey] = set()
     rows: list[DiskRow] = [
         {"label": label, "bytes": sweep.directory_blocks(os.path.expanduser(path), seen)}
@@ -220,6 +230,7 @@ def measure(
     measured_at = store.utc_iso(time.time())
     return {
         "measured_at": measured_at,
+        "capacity_measured_at": measured_at,
         "host": store.host_name(),
         "rows": rows,
         "used": current_usage.used,
@@ -255,6 +266,8 @@ def capacity_rows(paths: list[Path], measured: tuple[tuple[int, filesystem.Files
 
 def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], list[str]]:
     """Read current mappings and retain saved output roots for older workspaces."""
+    from scripts.lint import sweep
+
     saved = sweep.saved_cargo_output_roots()
     mappings = list((*saved.workspaces, *saved.history))
     checkouts: list[str] = []
@@ -273,8 +286,37 @@ def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], lis
 
 
 def snapshot() -> MeasuredDiskSnapshot:
+    previous_snapshot = read_snapshot()
     floor = read_floor()
-    previous = previous_outside_measurement(read_snapshot())
+    settings = conf.read("buildlog")
+    walk_minutes = settings.whole("DISK_WALK_MINUTES")
+    walk_hour = settings.whole("DISK_WALK_HOUR")
+    if (previous_snapshot is not None and "filesystems" in previous_snapshot
+            and "outside_build_caches" in previous_snapshot and "outside_build_cache_totals" in previous_snapshot
+            and "previous_measured_at" in previous_snapshot):
+        now = datetime.now(user_zone())
+        request = store.read_disk_walk_request()
+        requested = (not isinstance(request, store.DiskWalkRequestState)
+                     and datetime.fromisoformat(request["requested_at"]) > datetime.fromisoformat(previous_snapshot["measured_at"]))
+        if not requested and (now.timestamp() - datetime.fromisoformat(previous_snapshot["measured_at"]).timestamp() < walk_minutes * 60
+                              or now.hour != walk_hour):
+            usage = filesystem.filesystem_usage("/")
+            capacities: list[FilesystemCapacity] = []
+            for row in previous_snapshot["filesystems"]:
+                try:
+                    current = filesystem.filesystem_usage(row["path"])
+                except OSError:
+                    capacities.append(row)
+                else:
+                    capacities.append({**row, "used": current.used, "free": current.free})
+            return {
+                **previous_snapshot, "used": usage.used, "free": usage.free, "floor": floor,
+                "filesystems": capacities, "capacity_measured_at": store.utc_iso(now.timestamp()),
+                "outside_build_caches": previous_snapshot["outside_build_caches"],
+                "outside_build_cache_totals": previous_snapshot["outside_build_cache_totals"],
+                "previous_measured_at": previous_snapshot["previous_measured_at"],
+            }
+    previous = previous_outside_measurement(previous_snapshot)
     folders = list(FOLDERS)
     outputs, unavailable = mapped_output_paths(folders)
     for output in outputs:

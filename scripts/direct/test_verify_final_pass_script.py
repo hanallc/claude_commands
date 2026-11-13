@@ -18,6 +18,7 @@ class FinalPassTests(FinalPassFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         folder = Path(self.environment["HOME"]) / "changed/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         _ = shutil.copyfile(VERIFY.parent / "final_pass.py", folder / "final_pass.py")
         changed = folder / "verify.sh"
@@ -46,7 +47,9 @@ class FinalPassTests(FinalPassFixture):
                 self.assertGreaterEqual(int(cpu_ms), 0)
         # The final command starts its proof before the gate and finishes it on exit.
         self.assertEqual(names.count("final_pass.py"), 2, rows)
-        self.assertEqual(names.count("verify_metadata.py"), 1, rows)
+        calls = Path(str(trace) + ".calls").read_text().splitlines()
+        metadata_calls = [row for row in calls if row.split("\t")[0] == "verify_metadata.py"]
+        self.assertEqual(len(metadata_calls), 1, calls)
 
         query = self.verify("final", "--saved")
         self.assertEqual(query.returncode, 0, query.stdout + query.stderr)
@@ -68,6 +71,7 @@ class FinalPassTests(FinalPassFixture):
     def test_python_trace_records_sigterm_and_preserves_signal_status(self) -> None:
         folder = self.root.parent / "terminated/direct"
         folder.mkdir(parents=True)
+        _ = shutil.copyfile(VERIFY.with_name("file_lock.sh"), folder / "file_lock.sh")
         (folder.parent / "lib").symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         changed = folder / "verify.sh"
         _ = shutil.copyfile(VERIFY, changed)

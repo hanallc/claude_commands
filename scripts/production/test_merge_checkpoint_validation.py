@@ -21,7 +21,7 @@ from scripts.production.production_doc import read_new_production
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, SCRIPT, STARTED, STUB, TRIAL, configure_test_environment
 
 
 def setUpModule() -> None:
@@ -81,6 +81,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_cancel_prior_reaches_validate_and_push_only_when_requested(self) -> None:
         self.push = "validate_and_push"
         self.production_doc()
+        self.executable(self.bin / "validate_and_push.sh", STUB + '''
+with (state / "validation-locks").open("a") as output:
+    output.write(os.environ.get("MAIN_PUSH_LOCK_HELD", "missing") + "\\n")
+''')
         first = self.checkpoint()
         first_result = self.run_checkpoint(first)
         self.assertEqual(first_result.process.returncode, 0, first_result.process.stderr + first_result.process.stdout)
@@ -92,17 +96,20 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("--cancel-prior", calls[0])
         self.assertIn("--cancel-prior", calls[1])
-    def test_cancel_prior_with_git_push_is_refused_before_merge(self) -> None:
-        sha = self.checkpoint()
-        result = self.run_checkpoint(sha, "--cancel-prior")
-        self.assertEqual(result.process.returncode, 1)
-        self.assertIn("input: failed", result.process.stdout)
-        self.assertIn("--cancel-prior applies only to Push: validate_and_push", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
-        self.assertEqual(self.events("checkpoint-test"), [])
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        self.assertEqual((self.state / "validation-locks").read_text().splitlines(),
+                         [str(common / "main-push.lock")] * len(calls))
     def test_a_checkpoint_without_a_change_review_line_is_held_before_merge(self) -> None:
         from scripts.production import change_review
 
+        with self.subTest(line="malformed on a non-checkpoint commit"):
+            malformed = self.dated_checkpoint("Show waiting and starting session states\n\n"
+                                             + "Change-Review: a worker reads waiting")
+            result = self.run_checkpoint(malformed)
+            self.assertEqual(result.process.returncode, 1)
+            self.assert_stopped_before_merge(result, "held", "needs three parts")
+            self.assertIn(malformed[:change_review.SHORT], result.process.stdout)
+            self.assertNotIn("change review: ok", result.process.stdout)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 1)
@@ -133,11 +140,18 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
     def test_a_production_without_a_list_writes_no_rows(self) -> None:
-        sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script")
-        result = self.run_checkpoint(sha)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
-                      result.process.stdout)
+        for message, count in (("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script", 1),
+                               ("Show waiting and starting session states", 0),
+                               ("Show waiting and starting session states\n\n"
+                                + "Change-Review: Sessions show waiting | Read the session list | The state reads waiting", 1)):
+            with self.subTest(message=message):
+                sha = self.dated_checkpoint(message)
+                result = self.run_checkpoint(sha)
+                self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                self.assertIn("change review: ok — the production doc has no Change review line; no rows written",
+                              result.process.stdout)
+                self.assertIn(f"change review: ok — {count} unit commit(s) carry their Change-Review lines",
+                              result.process.stdout)
     def test_absent_optional_fields_default_to_validate_push_without_promotion(self) -> None:
         self.push = ""
         self.production_doc()
@@ -175,6 +189,24 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.events("review_regime.py"), [])
         self.assertEqual(self.events("style_sync.py"), [])
     def test_style_notification_observes_the_successfully_pushed_tip(self) -> None:
+        observer = STUB + '''
+import fcntl
+import subprocess
+tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
+with (Path(common) / "main-push.lock").open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_state = "held"
+    else:
+        lock_state = "free"
+with (state / "refreshed-test-locks").open("a") as output:
+    output.write(lock_state + "\\n")
+(state / "refreshed-test-tip").write_text(tip)
+'''
+        for name in ("verify.sh", "checkpoint-test"):
+            self.executable(self.bin / name, observer)
         result = self.run_checkpoint(self.checkpoint())
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         tip = self.git("rev-parse", "HEAD")
@@ -182,23 +214,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             "notify", "--repo-dir", str(self.checkout), "--branch", "production", "--tip", tip,
         ]])
         self.assertEqual((self.state / "notified-tip").read_text(), tip)
+        self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free"])
         with self.subTest(refresh="main moved"):
             main = self.push_main_change("crates/main-proof/Cargo.toml",
                                          '[package]\nname = "main-proof"\nversion = "0.1.0"\n')
-            observer = STUB + '''
-import fcntl
-import subprocess
-tip = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-common = subprocess.run(["git", "rev-parse", "--git-common-dir"], check=True, capture_output=True, text=True).stdout.strip()
-with (Path(common) / "main-push.lock").open("a") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-(state / "refreshed-test-tip").write_text(tip)
-'''
-            for name in ("verify.sh", "checkpoint-test"):
-                self.executable(self.bin / name, observer)
             production = read_new_production(self.doc, "example")
             with mock.patch.dict(os.environ, self.env):
                 refreshed = merge_checkpoint.refresh_pushed_tip(production, tip)
+            self.assertEqual((self.state / "refreshed-test-locks").read_text().splitlines(), ["free", "held", "held"])
             self.assertEqual(refreshed, (self.state / "refreshed-test-tip").read_text())
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), refreshed)
             self.assertEqual(self.git("merge-base", "--is-ancestor", main, refreshed), "")
@@ -215,12 +238,6 @@ with (Path(common) / "main-push.lock").open("a") as lock:
             self.assertEqual(self.git("rev-parse", "HEAD"), before_refresh)
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), before_refresh)
             self.assertEqual(self.git("status", "--porcelain"), "")
-    def test_style_notification_failure_does_not_fail_a_pushed_checkpoint(self) -> None:
-        _ = (self.state / "fail-style_sync.py").touch()
-        result = self.run_checkpoint(self.checkpoint())
-        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
-        self.assertIn("style sync: exit 1", result.process.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "production", cwd=self.origin))
     def test_notification_value_error_leaves_the_completed_checkpoint_successful(self) -> None:
         sha = self.checkpoint()
         original_notify = merge_checkpoint.notify_style
@@ -231,7 +248,7 @@ with (Path(common) / "main-push.lock").open("a") as lock:
 
         arguments = [str(SCRIPT), "--production", "example", "alpha", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),
-                     "--review-trial", TRIAL, "--delivers", DELIVERS, "--parallel", PARALLEL]
+                     "--review-trial", TRIAL, "--delivers", DELIVERS]
         output = StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, "argv", arguments), mock.patch.object(
             merge_checkpoint, "notify_style", side_effect=malformed_notification,

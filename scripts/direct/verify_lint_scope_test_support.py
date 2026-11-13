@@ -209,8 +209,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
             _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
-        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.config = self.root / "lint.conf"
         self.events = self.root / "cargo-events.jsonl"
         self.taplo_events = self.root / "taplo-events.jsonl"
@@ -233,7 +233,20 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
-        self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")\n')
+        self.write_executable(targets, '''import runpy
+import sys
+from pathlib import Path
+def main():
+    if sys.argv[1] == "eligible":
+        print("natedev_only test target\\nnatedev\\teligible\\t-\\t-\\t-")
+    else:
+        if sys.argv[1] == "constraints":
+            sys.argv.extend(("--local", "test target"))
+        runpy.run_path(str(Path.home() / ".claude/scripts/build_targets/build_targets.py"), run_name="__main__")
+
+if __name__ == "__main__":
+    main()
+''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):

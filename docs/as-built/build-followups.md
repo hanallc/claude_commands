@@ -120,7 +120,7 @@ The index, report, Mac outcome reader, and step estimator read the recorded pack
 
 The walk is too slow for report time, so a job measures and the report reads.
 
-**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first, then calls `measure(FOLDERS, lambda: filesystem_usage("/"), floor)`. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walking; the command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr, exits 1, and the previous `disk.json` stays.
+**Measuring.** `buildlog disk` runs `disk.write_snapshot(disk.snapshot())` and prints nothing on success. `snapshot()` reads the floor first. Without a newer walk request, `snapshot()` walks when no full previous snapshot exists. Otherwise, it walks when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` in the user's zone. Other runs refresh free and used space only and set `capacity_measured_at`. Folder freshness uses `measured_at`; a capacity refresh does not refresh folder sizes. A large unnamed fall requests one walk through `disk-walk-request.json`. A request newer than the last walk permits a walk outside the configured hour. The request needs recent floor records with the same held roots and filesystem. The floor sweep deletes the request after it sends the folder growth follow-up. `write_snapshot` writes `<store.root()>/disk.json.tmp` and renames it over `disk.json` (`store.DISK_NAME`). A malformed floor raises `InvalidFloor` before any walk. The command prints `buildlog disk: <key> in <config> must be a non-negative number of GiB` to stderr. It exits 1 and keeps the previous `disk.json`.
 
 ```python
 FOLDERS = [("~/rust", "~/rust"), ("/tmp", "/tmp"),
@@ -169,6 +169,12 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
 | free (floor 500.0 GiB) | … GiB |
 
 Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-linked file once.
+```
+
+After a capacity refresh, the report shows both times:
+
+```text
+Folder sizes measured by the buildlog disk job at 03:14 EDT; free and used space at 12:14 EDT: allocated blocks, each hard-linked file once.
 ```
 
 `other` is used minus the sum of the rows, clamped at zero. The free label is `free` alone when the floor is None. The time goes through `sync_time`, which adds the date when it is not today.
@@ -249,3 +255,9 @@ Measured by the buildlog disk job at 12:14 EDT: allocated blocks, each hard-link
 - **Reuse the sweep's walk and config reader.** One block counter and one lint.conf parser; the floor shown is the one the sweep enforces, against free measured the same way (`f_bavail`).
 - **These four rows.** They are where builds write: worktrees and their targets under `~/rust`, scratch clones and session folders under `/tmp`, and the two CI runners' trees. Everything else is `other`.
 - **natedev only.** The user scoped the Disk table to natedev; the Mac is not measured.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
+import shutil
 import unittest
 from pathlib import Path
 from typing import final
@@ -112,19 +113,39 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(ledger.read_bytes(), first_row)
 
     def test_shrink_merges_only_plan_and_next_items_after_code_checkpoint(self) -> None:
-        code = self.checkpoint()
-        first = self.run_checkpoint(code)
-        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
-        self.write(self.unit, "docs/plans/alpha.md", "short as built\n")
-        self.write(self.unit, "docs/plans/alpha-next.md", "next items\n")
-        _ = self.git("add", "docs/plans/alpha.md", "docs/plans/alpha-next.md", cwd=self.unit)
-        _ = self.git("commit", "-m", "shrink", cwd=self.unit)
-        sha = self.git("rev-parse", "HEAD", cwd=self.unit)
-        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
-        result = self.run_checkpoint(sha, "--shrink", review=False)
-        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
-        self.assertEqual(len(self.events("review_regime.py")), 1)
-        self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
+        for configured_plan, closing_kind in (("docs/plans/alpha.md", "shrink"),
+                                               ("docs/plans/new-alpha.md", "shrink"),
+                                               ("docs/plans/new-alpha.md", "as-built"),
+                                               ("docs/as-built/beta.md", "as-built")):
+            with self.subTest(configured_plan=configured_plan, closing_kind=closing_kind):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                if closing_kind == "as-built":
+                    _ = self.checkpoint("docs/plans/alpha.md", "plan before closing\n")
+                code = self.checkpoint()
+                first = self.run_checkpoint(code)
+                self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+                self.write(self.unit, "docs/plans/alpha.md", "short as built\n")
+                self.write(self.unit, "docs/plans/alpha-next.md", "next items\n")
+                _ = self.git("add", "docs/plans/alpha.md", "docs/plans/alpha-next.md", cwd=self.unit)
+                subject = "shrink(alpha): phase 2 — Alpha phase" if configured_plan != "docs/plans/alpha.md" else "shrink"
+                if closing_kind == "as-built":
+                    _ = self.git("rm", "-f", "docs/plans/alpha.md", cwd=self.unit)
+                    as_built_plan = configured_plan if configured_plan.startswith("docs/as-built/") else "docs/as-built/alpha.md"
+                    self.write(self.unit, as_built_plan, "as built\n")
+                    _ = self.git("add", as_built_plan, cwd=self.unit)
+                    subject = "docs(alpha): as-built"
+                _ = self.git("commit", "-m", subject, cwd=self.unit)
+                sha = self.git("rev-parse", "HEAD", cwd=self.unit)
+                _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+                config = self.unit / ".unit.toml"
+                _ = config.write_text(config.read_text().replace("docs/plans/alpha.md", configured_plan))
+                result = self.run_checkpoint(sha, "--" + closing_kind, review=False)
+                self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                self.assertEqual(len(self.events("review_regime.py")), 1)
+                self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
+
     def test_shrink_after_criss_cross_merge_scopes_only_its_doc(self) -> None:
         code = self.checkpoint()
         self.write(self.checkout, "src/beta.txt", "beta on the merge branch\n")
@@ -146,6 +167,33 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = self.run_checkpoint(self.as_built_commit("src/alpha.rs"), "--as-built", review=False)
         self.assertNotEqual(result.process.returncode, 0)
         self.assertIn("an as-built commit carries only docs", result.process.stdout)
+
+        _ = self.git("reset", "--hard", "production", cwd=self.unit)
+        _ = self.git("push", "--force", "origin", "alpha-branch", cwd=self.unit)
+        self.assertEqual(self.git("ls-tree", "--name-only", "production", "--", "docs/plans/staff-copies.md"), "")
+        for path, accepted in (("docs/as-built/staff-copies.md", True), ("docs/outside.md", False)):
+            with self.subTest(plan="absent", path=path):
+                sha = self.checkpoint(path, "closing documentation\n", subject="docs(staff-copies): as-built")
+                result = self.run_checkpoint(sha, "--as-built", review=False)
+                if accepted:
+                    self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+                    self.assertIn("scope: ok — 1 changed paths", result.process.stdout)
+                else:
+                    self.assertNotEqual(result.process.returncode, 0)
+                    self.assertIn("scope: held", result.process.stdout)
+                    self.assertIn("allows only docs/as-built/*.md", result.process.stdout)
+                    self.assertEqual(self.git("rev-parse", "HEAD"), result.before)
+
+        with self.subTest(plan="added on unit branch", path="docs/notes.md"):
+            _ = self.git("reset", "--hard", "production", cwd=self.unit)
+            _ = self.git("push", "--force", "origin", "alpha-branch", cwd=self.unit)
+            self.write(self.unit, "docs/plans/staff-copies.md", "completed plan\n")
+            _ = self.git("add", "docs/plans/staff-copies.md", cwd=self.unit)
+            sha = self.checkpoint("docs/notes.md", "closing notes\n", subject="docs(staff-copies): as-built")
+            result = self.run_checkpoint(sha, "--as-built", review=False)
+            self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+            self.assertIn("scope: ok — 2 changed paths", result.process.stdout)
+
     def test_reruns_report_their_own_code_and_shrink_merge_hashes(self) -> None:
         code = self.checkpoint()
         first = self.run_checkpoint(code)
@@ -168,10 +216,10 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"send alpha: phase 2 merged and pushed as {shrink_merge}",
                       shrink_rerun.process.stdout)
     def test_shrink_holds_before_code_checkpoint(self) -> None:
-        _ = self.checkpoint()
+        code = self.checkpoint()
         sha = self.checkpoint("docs/plans/alpha.md", "short as built\n")
         early = self.run_checkpoint(sha, "--shrink", review=False)
-        self.assert_stopped_before_merge(early, "held", "phase 2")
+        self.assert_stopped_before_merge(early, "held", f"unmerged commit {code[:12]}: alpha work")
 
     def test_shrink_passes_after_code_merges_through_another_branch(self) -> None:
         code = self.checkpoint()

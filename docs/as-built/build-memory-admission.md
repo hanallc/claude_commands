@@ -2,7 +2,21 @@
 
 ## What it is
 
-Every build on natedev, CI's and the sessions', is admitted so that it fits in memory, and earlyoom is a last resort rather than a routine event (target: a normal working day with no earlyoom kill). Before this, two admission systems could not see each other: CI ran outside steve in a slice whose limit counted page cache, sessions took steve slots that were admitted before their compilers grew, swap sat full of idle processes so earlyoom's swap condition always held, and a build hold released every session at the same instant. On 2026-10-04, 58 earlyoom SIGTERMs failed whole build steps and CI jobs. Now session builds and their compiles run in one bounded user slice, CI runs in its own smaller slice and slot pool with a kill order below the sessions', build steps sit above both so earlyoom kills the largest build first, every compiling step and every BRP launch waits for free memory before it starts, a build hold releases every held session at once into those gates, and the build log measures all of it: per-slice samples and snapshots, a window memory report, the day's waits, memory kills and CI freshness. The same body of work also hardened neighbors that share these files: the example-test guard in `verify.sh`, prompt reclaim of a cargo token whose `verify.sh` was killed, CI queue-time accounting, BRP launch recording, the disk-floor alerts, the Codex launcher's capacity handling, the dailies Agents section, and broadcasts to every live session.
+Build admission keeps CI and session builds within available memory on natedev.
+The target is a normal working day without an earlyoom kill.
+On 2026-10-04, 58 earlyoom SIGTERMs failed build steps and CI jobs.
+Two admission systems previously could not see each other.
+CI ran outside steve in a slice whose limit counted page cache.
+Session compilers grew after steve admitted their slots.
+Full swap caused earlyoom's swap condition to remain true.
+A build hold released every session at once.
+Session builds and compilers now share one bounded user slice.
+CI uses a smaller slice and slot pool, with a lower kill priority than sessions.
+Build steps sit above both, so earlyoom kills the largest build first.
+Every compiling step and BRP launch waits for free memory.
+A build-hold release sends held sessions through those memory gates.
+The build log records slice samples, snapshots, memory reports, waits, kills, and CI freshness.
+This work also hardened the example-test guard, Cargo token recovery, CI queue accounting, BRP records, disk alerts, Codex capacity handling, and session broadcasts.
 
 ## How it works
 
@@ -45,7 +59,10 @@ The service removes the progress files when the reservation ends.
 
 The queue pane and the build page show each cloud gate in the main table.
 A running row shows machine `aws` and its vCPU count.
-The last column shows the state, module count, and failed modules.
+The queue pane's last column shows the state, module count, and failed modules.
+On the build page, a cloud row with a module counter draws the local rows' progress line.
+Small text under the line shows the module count and failed modules.
+The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
 The Head line shows `cloud N of M slots`.
@@ -59,14 +76,78 @@ The display uses one age formatter for the table, the card, and the feed.
 `CloudPushIntervalUnavailable` names an unavailable push interval.
 The display omits the stale age when the push interval is unavailable.
 
-The wire envelope uses protocol version 2 and keeps the existing admission code version rule.
-The service accepts client versions 1 and 2.
+The wire envelope uses protocol version 3 and keeps the existing admission code version rule.
+The service accepts client versions 1, 2 and 3.
 The service sends a version 1 refusal when it cannot determine the request version.
-Both client versions can decode that refusal.
+All three client versions can decode that refusal.
 Version 1 view and mine replies carry plain `QueueRead` records without cloud rows.
 Version 2 replies can carry `CloudQueueRead` records.
 The shared codec encodes the new place field and its frozen dataclasses.
 Old requests default to local admission when they omit the place field.
+
+Version 3 supplies placement messages for converted verify, offload, copy-watch, and shared lint callers.
+`PlacementRequest` carries the episode, profile, fixed constraints, checked coordinator, run identity, and local admission context.
+The context carries the actual arguments, sidecar, call identity, test width, and fresh-test state.
+Missing context becomes `LocalAdmissionUnavailable` at the wire boundary.
+Configured candidates remain in the request through disk, busy, hold, and reachability changes.
+Fixed pins, platform rules, tree writes, local artifacts, and final-step rules restrict those candidates.
+Dynamic exclusions remain refreshed evidence.
+Saved disk exclusions remain diagnostic evidence.
+`SourceKeyKnown` carries an available source key.
+`SourceKeyUnavailable` preserves the existing copy path when neither source key is available.
+An unavailable key permits placement and sends no source key with the copy.
+`PlacementWait` carries the original queue time, position and candidate eligibility.
+`Assignment` carries a persisted destination and attempt; it grants no execution permission.
+`ClaimFailure` closes the exact assignment before another placement decision.
+`ConsumePermission` carries the exact assignment, adopted provider claim reference, and checked claim-holder identity.
+The coordinator remains separate from its offload child.
+The service checks the local process tree before it accepts that child as the holder.
+Cleanup takeover supplies no launch authority.
+The first valid consumption returns `FirstAuthorization` after the state write completes.
+Every repeated consumption returns `DispatchStatus`, including a retry with a different transport request id.
+Unknown, changed and closed attempts grant no authority.
+`ExecutionReport` supplies typed outcomes and execution evidence without creating another durable provider lifecycle.
+`DispatchPathSettled` confirms that the adapter has resolved its pending claim and start operations.
+An empty remote observation cannot establish that condition.
+A settled prelaunch refusal permits retry only after fresh provider evidence confirms that the exact claim has departed.
+The service retains terminal reports while cached evidence still contains the claim.
+Later passes reevaluate those reports after provider evidence refreshes.
+The saved terminal report preserves the outcome, dispatch settlement, and original report time across restart.
+Execution observations remain reconstructed evidence.
+The retry deadline uses the original report time.
+`AttemptDeclined` preserves caller policy for no-tests results and lost runs after confirmed cleanup.
+An unavailable observation cannot substitute for confirmed cleanup or a settled dispatch path.
+Busy, blocked, and disk refusals retain normal polling.
+Other temporary Mac refusals delay that destination for 180 seconds.
+Final command results remain terminal.
+A retry retains the episode, queue time, run place, and priority.
+Each retry receives a new attempt identity.
+A late report cannot close a replacement attempt.
+Version 1 and 2 requests retain their existing local or scaler destinations and reply shapes.
+Placement messages require version 3.
+
+Converted local candidates and fixed local waiters use the same queue order and memory planner.
+Priority changes affect the next placement pass.
+The planner evaluates continuation memory, pressure, spacing, starts-alone admission, and head protection.
+Remote selection removes the local projection before local effects commit.
+It releases that waiting step's unused continuation claim.
+It changes no local start spacing.
+`LocalPlacementGranted` carries the existing local reservation and execution controls.
+The adapter uses that grant without a second admission request.
+
+`TokenRequired`, `TokenHeld`, and `TokenNotRequired` describe the local execution prerequisite.
+`PrerequisiteReport` updates that state separately from fixed constraints.
+Restart requires fresh token confirmation for requests that need a token.
+A token waiter holds no local reservation and can receive a remote assignment.
+The adapter keeps token renewal active during placement waits.
+
+Remote rows carry execution evidence and the assigned host.
+Physical grouping includes the host, generation, PID, and start time.
+Unavailable remote identity remains uncertain.
+Remote memory remains unavailable and contributes zero to local admission accounting.
+A speculative local parent retains its actual reservation.
+The queue selects the newest eligible speculative copy by call start time, then call identity.
+The watcher keeps result collection and loser stopping.
 `CloudSlotWait` carries the used slots and slot limit in wait replies.
 `CloudQueueRead` extends the local queue reading with cloud rows and the slot limit.
 Local queue readings keep their existing wire form when no cloud row exists.
@@ -110,7 +191,7 @@ Shell callers request allocation only when a stable folder is missing.
 `verify.sh` first sources `invoke.sh --prepare-temp` to create a missing inherited `TMPDIR` before environment loading.
 This mode uses the same allocation block as a normal `invoke.sh` call.
 `unit_runs.RUN_TEMP_NAME` defines the run temporary folder name.
-`unit_runs.activate()` writes the current marker and removes the former marker.
+`staff.set_run()` stores the open run path in the director's staff row.
 
 `temporary_build_folder()` yields a `Path` and uses the standard library's cleanup and permission repair.
 Other callers retain their cleanup traps, owner records, task records, and release order.
@@ -139,6 +220,7 @@ Not in this repo; listed because the code here reads it.
 | Piece | Setting |
 | --- | --- |
 | `builds.slice` (user slice, `modules/linux/development.nix`) | `MemoryMax=44G`, no `MemoryHigh`, `MemorySwapMax=4G`, `CPUWeight=20` against `app.slice`'s 100, so the sessions and their panes get the CPU first. CI's `hana.slice` sits at 5 against `user.slice`'s 100 (`modules/linux/hana-runners.nix`). Holds every recorded step's scope (`run-*.scope`), the `sccache.service` user service, and the `buildlog` unit (nightly Rust trial, `OOMScoreAdjust=200`). |
+| `builds-detached.slice` | Holds detached commands under `builds.slice`, whose limits still apply. Detached Python memory appears in Other without a queue row. Direct cargo calls take the hold check and enter a new scope in `builds.slice`. Reserved cargo and lint steps still ask the queue. Their memory counts once as build memory through their reservations. |
 | `sccache.service` | Runs the server in the foreground with `SCCACHE_NO_DAEMON=1` and `SCCACHE_START_SERVER=1` on `ExecStart` only; takes the port from an already running server on start; `RestartSec=5`. Every compile handed to sccache therefore runs inside `builds.slice`. `OOMScoreAdjust=500`, so its compiles rank with the build steps. |
 | `hana-ci.slice` | `MemoryMax=18G` only, `MemorySwapMax=2G`, no `MemoryHigh`. Runners `OOMPolicy=continue`. |
 | CI slot pool | `/dev/steve-ci`, 14 slots, separate from the sessions' `/dev/steve` (31 slots). Runners: `CARGO_MAKEFLAGS=--jobserver-auth=fifo:/dev/steve-ci`, `BindPaths=-/dev/steve-ci`, `DeviceAllow` `char-rtc r` and `/dev/steve-ci rw`, ordered after `steve-ci.service`. No `CARGO_BUILD_JOBS`. |
@@ -283,6 +365,25 @@ Unavailable settings produce refusals rather than replacement policy values.
 ### Durable state and lifetime
 
 `admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, start spacing, and the replay ledger.
+It also holds placement requests, assignments and current attempt keys.
+`SavedPlacementAssignment` retains assignment state, launch permission, exact provider reference, consumed holder identity, and retry decision.
+It also retains a terminal report intent until fresh provider evidence permits settlement.
+The consumption ledger key contains the episode and attempt, independent of the transport request id.
+The ledger stores status, never a replayable authorization.
+Current attempts retain their ledger entries through the existing replay retention path.
+A pruned or unknown attempt cannot create another permission.
+Restart restores unconsumed and consumed attempts without changing their identities or queue times.
+Only checked local submitting owners receive process watches.
+Remote execution identities retain their host and generation, separate from those submitting owners.
+
+Each provider evidence key includes the session, destination, scope, command policy and configuration generation.
+Each background reader publishes immutable evidence through the service wake path.
+The loop takes no provider lock and performs no remote probe.
+Evidence expires after the existing waiting poll interval plus the target probe timeout.
+Stale evidence prevents a new decision that needs it; it never releases a provider claim.
+Mac and SSH records retain their claim id, episode, attempt and submitting session through adoption.
+Release compares the exact claim identity under the provider lock.
+The provider keeps its existing repository scopes and cleanup policy.
 Held slots and waiting extras remain in memory. A restart removes them and retains the run's queue place.
 The service replaces this file atomically. Reservation records retain accepted needs, run identities, scope paths, and finalization intent.
 Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
@@ -303,7 +404,7 @@ It imports live reservations, saved intents, waiter places, token handoffs, prio
 It writes state before it deletes imported files. Later starts import nothing.
 The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
 There is no admission lock.
-`build_hold` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
+`hold_enforcer` imports `admission_service` inside `admitted_processes()` when it reads durable grants.
 Importing `build_hold` or `build_targets` does not load the admission service.
 `ServiceState` and `read_state` retain one definition in `admission_service.py` because the state uses several service types.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
@@ -616,7 +717,7 @@ Build estimates use completed same-shape history from the last 14 days.
 Ten or more earlier runs supply a ranked peak. One to nine earlier runs supply their largest peak.
 `ShapeRankedPeak` records the run count and the share used to select the peak.
 Stored `shape_ranked_peak` records retain that share; the decoder reads older `shape_p90` records as share 10.
-The wire retains protocol version 2.
+The wire uses protocol version 3 and retains decoding for versions 1 and 2.
 The encoder writes share-10 bases with the older `ShapeP90` tag and no share field.
 The wire decoder reads older `ShapeP90` tags as `ShapeRankedPeak` with share 10.
 Other shares use the `ShapeRankedPeak` tag and retain their recorded share.
@@ -637,22 +738,18 @@ Each estimate stores its history rule, factors, and failed-peak floor.
 New estimates remain uncut. Historical `CappedAtBudget` and `CapNotRecorded` values remain readable.
 
 Each pass reads the resident working set and swap for service reports.
-CI RAM and unowned scopes reduce host free memory. They do not create a run promise.
+Unregistered CI use and unowned scopes reduce host free memory. They do not create a run promise.
 `ci_memory_slice` names the CI slice. A missing CI reading remains a labelled diagnostic.
-`ci_memory_margin_gib=7` supplies one CI keep-aside while `job_state` is `RunningServiceJob`.
-The service reads that value once with the other policy values.
-`AdmissionPolicy.ci_memory_margin_bytes` stores its byte value.
-`MemoryRoom.ci_keep_aside` stores the separate `CIKeepAside(bytes)` evidence.
-`MemoryRoom.ci_use` stores readable CI use separately from admitted swap-backed use.
-`MemoryRoom.kept` includes run keep-asides and this CI keep-aside once.
-Idle CI and unavailable CI readings add no CI keep-aside.
+`MemoryRoom.ci_use` stores readable unregistered CI use separately from admitted swap-backed use.
+`MemoryRoom.kept` includes only run keep-asides.
+Registered CI jobs reserve memory through admission.
+An unregistered CI job has no memory reservation. Its limit is the systemd `MemoryMax=34G` setting, or 34 GiB.
 CI RAM already reduces host free memory. The room calculation never subtracts it again.
 The service does not require `memory.max` for admission.
 [Free memory, head protection, and step slots](#free-memory-head-protection-and-step-slots) defines the cap.
-The cap text names the CI keep-aside within kept memory.
-The page shows CI use and the CI keep-aside inside the cap.
+The page shows registered CI use with admitted runs and unregistered CI use inside the cap.
 The page and the queue text show CI use under 0.1 GiB in MiB, so idle CI never reads 0.0 GiB.
-The page includes both CI amounts in its taken total. Room and admission do not change.
+The page counts each CI job once in its taken total.
 `RunningServiceJob` and `IdleService` retain the CI job state.
 `AnonymousRunUse` stores resident swap-backed memory: anonymous memory plus shared memory, which includes tmpfs files.
 Scope readings use `memory.stat` `anon + shmem`.
@@ -717,6 +814,25 @@ Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
 `finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
+`QueuePlace.popen` installs no signal handler.
+It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
+It then restores the caller's previous signal mask.
+The program wrapper unblocks these signals before exec.
+The program wrapper atomically publishes a `ProgramStart` record before execution.
+The record contains the holder identity, program identity, and memory scope.
+The wrapper checks the holder's PID and start time before and after publication.
+A dead holder prevents program execution.
+A later interruption leaves the complete record in the build log's `program-starts` directory.
+The next start stops recorded scopes or program groups with dead holders before it requests admission.
+It removes their records after their scopes or process trees become empty.
+Normal cleanup removes the record after the program and its descendants stop.
+Temporary queue-place folder names contain the holder's PID and start time.
+The next start removes this account's folders after those exact holders end.
+Folder allocation and removal use a signal mask and install no handler.
+SIGTERM uses its default action and can leave cleanup for the next start or service read.
+Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
+`defer_cleanup_signals` retains its signal mask during normal cleanup.
+It uses `pthread_sigmask` and installs no handler.
 
 ### Startup, cut-over, and rollback
 
@@ -764,7 +880,17 @@ The next cut-over imports the polling checker's current priority because the ret
 
 ### Cargo wrapper (natedev only)
 
-`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope. This includes `cargo mend`, which builds the workspace. It finds the first other cargo on PATH, keeps its arguments and exit status, and passes non-building commands such as `metadata`, `fmt` and `tree` through at once. A call already in `builds.slice` skips the hold check and a second scope. Other building calls check `hold_applies.py` when the hold directory has an entry: an applicable hold refuses the command; unreadable state prints a note and allows it. An empty hold directory starts no Python. Without a user bus or `systemd-run`, cargo runs directly.
+`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope.
+This includes `cargo mend`, which builds the workspace.
+The wrapper uses the first other cargo on PATH and keeps its arguments and exit status.
+Non-building commands such as `metadata`, `fmt` and `tree` run immediately.
+A call already in `builds.slice` skips the hold check and a second scope, unless it runs under `builds-detached.slice`.
+A call under `builds-detached.slice` follows the same hold and scope path as a call from a shell.
+These building calls check `hold_applies.py` when the hold directory has an entry.
+An applicable hold refuses the command.
+Unreadable state prints a note and allows the command.
+An empty hold directory starts no Python.
+Without a user bus or `systemd-run`, cargo runs directly.
 
 Install on natedev from the repo root with `scripts/build_hold/install_cargo_wrapper.sh`. It links `~/.local/bin/cargo` to the wrapper and refuses to replace another file. `~/.local/bin` must precede `~/.cargo/bin` on PATH. On macOS, the installer makes no link and the wrapper calls cargo directly. Tests use `BUILD_HOLD_DIR`, `CARGO_WRAPPER_CGROUP_FILE` and `XDG_RUNTIME_DIR` to select temporary state.
 
@@ -813,7 +939,7 @@ A call that waits again keeps its original FIFO position through its `.again` wa
 The hold wait and token wait retain separate history records.
 `TOKEN_WAIT_FILE` carries a step's token wait to the call record.
 `TOKEN_WAIT_FILE.given_back` records a subshell release for its parent.
- An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `detached_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release run under an exclusive flock on `locks/<res>.guard`, taken by python3 `fcntl` on descriptor 9 (the Mac has no `flock(1)`) and dropped by the kernel when its holder dies: a reclaimer re-reads the lock under it, so two waiters cannot both reclaim and a release cannot remove a lock a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
+ An INT, TERM or HUP during the token wait stops the waiting acquire and gives back a token it took in the last instant, and with `--pid N` `board.sh acquire` itself exits 4 (`gone <res>: pid N ended while it waited`) once N is gone. A step whose call is gone stops its token wait (`token_wait_orphaned`): each pass checks that the call's pid (`$$`) still runs, an acquire that exits 4 ends the wait too, and the step prints `verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token.` and exits 1. On 2026-10-20 a test killed a call's group and left its step, which runs in a group of its own (`run()`'s `set -m`), trying again for 45 h with 15 GiB of deleted output still open; the test's cleanup now also ends every process in the call's session. A release moves the lock's `reclaimed_holders` lines whose holder still runs to `locks/<res>.reclaimed`, and the next acquire moves them back into its lock, so a reclaimed holder's late release still exits 3 after the token changed hands again. `board.sh acquire --pid N` (a positive integer, else exit 2) records N in `locks/<res>.d/holder_pid`. A waiter treats the token as stale when that process is gone, checked first, or when its hold has expired. Gone means `ps -p N -o stat=` exits 1 with empty output or reports a zombie; anything else, a failure of `ps` included, counts as alive, and a lock with no or a malformed `holder_pid` waits for expiry. So a `verify.sh` killed before its EXIT trap frees the token within one 3 s poll, posting `token cargo reclaimed from <holder>: holder pid <N> is gone`, while a manual holder is never reclaimed early. A newer call from the same worker, with the same verb and arguments in the same worktree (a lint key leaves out its package), ends an older one that still waits for its first token: each waiting call keeps `token_waiters/<slot>.<key>.<start>.<pid>` on the board, and a newer call sends SIGUSR1 to each older one whose pid still runs `verify.sh`. The older call gives back a token its acquire took in the last instant, prints `verify.sh: superseded by a newer <verb> call`, records outcome `superseded` and exits 76 (`VERIFY_SUPERSEDED_STATUS`); `detached_runs.py` delivers that as `Result: SUPERSEDED (exit 76)`, not a failure, also when the run has a done message. A call whose acquire already won runs to the end, and a SIGUSR1 after the first wait does nothing. On 2026-10-21 one worker queued 27 calls this way, most on trees it had already left, and its peers waited up to 20 h for the token. Reclaiming a dead holder first SIGKILLs the step process group it recorded in `locks/<res>.d/owned` and fails closed (acquire exits 1, token left in place) when that group cannot be inspected or stopped; an expired hold whose holder is alive is reclaimed without touching its build. Reclaim and release use an exclusive flock on `locks/<res>.guard`. One perl call locks descriptor 9 because the Mac has no `flock(1)`. The shell retains the lock after perl exits. The kernel releases the lock when the holder dies. A reclaimer reads the lock again while it holds the guard. Thus, two waiters cannot both reclaim the lock. A release cannot remove a lock that a reclaimer just made. Reclaim never waits for the guard; release retries for up to 10 s, then exits 1 (`board.sh: cannot guard <res> release`).
 
 ### Build log: records and schema
 
@@ -907,7 +1033,23 @@ The hourly task can retry the exchange.
 
 ### Build hold (`scripts/build_hold/build_hold.py`, `commands/build/hold.md`)
 
-**Holder files.** One file per holder in `BUILD_HOLD_DIR` (default `~/.local/state/build-hold/`), one JSON line `{holder, since, for, release_eta, keep}`. `keep` holds PID/start-time pairs and defaults to empty for old files. Installed scripts refuse set directory variables or a changed `HOME`; unset the variable or use a shell with the user's home. The shell guard also refuses read-only `HOME`. The legacy free-text form reads, and an unreadable or malformed regular file stays a hold. Types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, `Holder(name, since, purpose, release, key, keep)`, `ReleaseEta = KnownReleaseEta | UnknownReleaseEta`, and `ReleaseRequest = NoReleaseEta | ClockReleaseEta`. `write_hold` and `start_hold` take the resolved identity. Holder files supply state to status, dailies and Rust release checks. `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle. Every present holder file is in force, even when the cycle has `released_at` or `release_started_at`. There is no releasing state. Only removal ends that holder's hold.
+**Holder files.** `BUILD_HOLD_DIR` defaults to `~/.local/state/build-hold/`.
+Each holder has one file with one JSON line: `{holder, since, for, release_eta, keep}`.
+`keep` holds PID/start-time pairs and defaults to empty for old files.
+Installed scripts refuse directory overrides or a changed `HOME`.
+Unset the override or use a shell with the user's home.
+The shell guard also refuses a read-only `HOME`.
+Legacy free text remains readable.
+An unreadable or malformed regular file remains a hold.
+The types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, and `Holder(name, since, purpose, release, key, keep)`.
+`ReleaseEta = KnownReleaseEta | UnknownReleaseEta` describes the release time.
+`ReleaseRequest = NoReleaseEta | ClockReleaseEta` describes the request.
+`write_hold` and `start_hold` take the resolved identity.
+Holder files supply state to status and Rust release checks.
+`natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle.
+Every present holder file remains in force, including when the cycle has `released_at` or `release_started_at`.
+There is no releasing state.
+Only removal ends the holder's hold.
 
 ### Step state publication
 
@@ -1011,7 +1153,8 @@ This applies to direct calls and calls through Python or `lib/py`.
 The refusal tells the caller to run after the hold ends.
 Quoted mentions and written examples pass.
 Codex workers use the same Bash front and guard through `scripts/hooks/codex_hooks.py`.
-Unit run markers let workers of the sole holder build.
+The staff run pointer identifies the director for workers of the sole holder.
+Those workers may build.
 
 **CLI.**
 
@@ -1044,9 +1187,20 @@ The `hold`, `status`, and `audit` commands accept `--proc-root` for a fake proce
 
 The audit calls `hold_enforcer.record_build(..., action="audit")` for each `other_session` or `no_session` build. The enforcer uses the same writer with `action="stopped"` for each stopped root. Both call `store.append_line` in the current process, after the audit read; no detached audit recorder runs. The kernel boot id, PID and process start time identify the build. The permanent file is `buildlog/<host>/hold-builds-<hold hash>.jsonl`. A separate `.lock` file covers the duplicate check and append, once per build, holder key, `since` and action. A new hold or a reused PID gets a new row. Index schema 21 adds `action` to `hold_builds`; old rows read as `audit`. Rows record hold identity, build identity, class, owner, command as shell text, working directory and observation time. Holder and admitted builds get no audit row.
 
-**Holder key (2026-10-08).** A hold file is named by the holder's Claude session id: the caller's (`CLAUDE_CODE_SESSION_ID`) when `--holder` is left out, else the live session `--holder` means (`sessions.addressed`: its name now, or a name it alone once had). `Holder.key` is that file name and `Holder.name` is the session's name now, looked up at each read; the `holder` field in the file is the name at hold time and is shown only while the session is not live. `cycle["holders"]` keeps the key given to `start_hold`; `holder_path` replaces unsafe characters to make `Holder.key`, the file name. Different keys can name the same file, so a recorded release matches both that file name and its `since` instant. A holder that is no live Claude session keeps its name as the key. `held_key` finds a hold taken under a name before this change by the name given, the session's name now and its former names.
+**Holder key.** A staff holder uses its fixed staff ID as the file key. Without `--holder`, `CLAUDE_CODE_SESSION_ID` must resolve through `staff.snapshot().by_current_session`. A given holder resolves through its fixed ID, current session, or current staff name. An explicit holder outside staff keeps its given text as the key. Registry names and former names do not select holds or release records. `Holder.name` shows the current staff name when the key resolves. `cycle["holders"]` retains the key from `start_hold`. `holder_path` replaces unsafe file-name characters in that key. A recorded release matches the resulting file name and its `since` instant. The deployment converter handles old keys once; runtime readers accept only the fixed key.
 
-**Hold cycle.** `BUILD_HOLD_RELEASE_DIR` defaults to `~/.local/state/build-hold-release`, outside the holder directory. `current` names `<id>/cycle.json`, atomically replaced under `release.lock`. `HoldCycle` stores its id, open time, holders with `{since, released_at}`, recipients by session id, release start and `ReleaseEntry` rows with session id, name and delivery outcome. The first hold with no files opens a cycle without reading an old one. With other holders it joins the cycle; without a readable cycle it writes its file and opens none. Old cycle files with call, generation and gate fields still read; those fields no longer control a build.
+**Hold cycle.** `release_directory()` uses `BUILD_HOLD_RELEASE_DIR` when set.
+Otherwise, it uses a sibling of `holder_directory()` named `<hold folder name>-release`.
+With neither variable set, the release folder remains `~/.local/state/build-hold-release`.
+`current` names `<id>/cycle.json`.
+The writer replaces this file atomically under `release.lock`.
+`HoldCycle` stores its id, open time, and holders with `{since, released_at}`.
+It also stores recipients by session id, release start, and `ReleaseEntry` rows with session id, name, and delivery outcome.
+The first hold with no files opens a cycle without reading an old one.
+With other holders, it joins the cycle.
+Without a readable cycle, it writes its holder file and opens no cycle.
+Readers still accept old cycle files with call, generation, and gate fields.
+These fields no longer control a build.
 
 **Release** (`release_cycle`). Under `release.lock`, `release_hold` first removes the holder file and queues the `ended` event. Only then does `release_cycle` record the holder's `released_at`. With another holder file present it prints `released; still held by <holder> (for ..., release eta ...)` and sends no notice. After the last file is gone it records `release_started_at` and sends notices. A stopped release leaves either a present file that still holds, or no file and a released hold; cycle fields grant nothing. All `wait-local` calls can then return and enter their memory gates. No waiter acknowledgement or turn can delay release. The memory gate orders the builds and starts each only when memory is available.
 
@@ -1058,7 +1212,16 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 `status` reads current and retained pending releases without taking the release lock or changing files, including old receipts. Each `release pending:` line gives the holder, release time in the user's zone, unsent names and `/build:hold release` to finish it. Status and the drain call `release_notices` to validate the referenced cycle id and select the same first entry for each recorded recipient. A missing cycle entry, `NotAttempted` or `DeliveryFailed` means unsent; a broadcast says `every session (broadcast)`. An unreadable record or cycle, including an id mismatch, is named by path with its error and the command that sets it aside. Completed receipts add no pending line.
 
-**Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities and delivery outcomes and requires each holder's `since` to be an instant with an offset; it raises `ReleaseRecordReadError` (a `ValueError`) naming the fault. An invalid holder time follows the same recovery path as any other unreadable record. Changing commands read through `read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside(path)` under the lock: on damage it renames `cycle.json` (when it exists or is a dangling symlink), else `current`, to `<name>.damaged-<UTC YYYYMMDDTHHMMSSZ>` (`-2`, `-3`... when taken), removes `current`, and prints `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`. Read-only `status` and the dailies footer print `release record could not be read: <error>; /build:hold release sets it aside and ends the hold` and change nothing.
+**Damaged record.** `read_cycle` validates the `HoldCycle` shape, session identities, and delivery outcomes.
+Each holder's `since` must have a time offset.
+It raises `ReleaseRecordReadError`, a `ValueError`, that names the fault.
+An invalid holder time uses the same recovery path as another unreadable record.
+Changing commands call `read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside(path)` under the lock.
+On damage, it renames `cycle.json`, including a dangling symlink, or `current` when no cycle file exists.
+The new name is `<name>.damaged-<UTC YYYYMMDDTHHMMSSZ>`, with `-2`, `-3`, or later suffixes when needed.
+It removes `current` and prints `release record could not be read (<error>); set aside as <path>; this hold now releases every session at once`.
+Read-only `status` prints `release record could not be read: <error>; /build:hold release sets it aside and ends the hold`.
+It changes nothing.
 
 **Recorded hold intervals.** A new holder file queues a `began` event after writing the file; every removal in `release_hold` queues `ended`, using that file's key, name and reason. Repeating a hold writes no event. The event's UTC `at` is taken under the coordination lock and queued there; a detached `record.py hold-event` starts after the lock closes. A stalled event log cannot delay hold or release. Both reports read current coordination state independently. A lost event reads `end not recorded` or `began not recorded`, never a changed hold. The index keeps one row per event with its source file; the `holds` view pairs by host, target and key, ordering equal instants began first. Overlapping holders count once in held duration. A present holder file keeps an interval with no recorded end open, regardless of cycle release fields. Times shown use the user's zone, stored instants UTC.
 
@@ -1070,11 +1233,8 @@ After the file is gone, `notify_release` sends one notice to each recorded recip
 
 `top_level.py` takes no arguments (any argument: `usage: top_level.py`, exit 2) and runs no ssh. `forwarded_sessions()` reads this machine's roster (`roster.roster(os.environ, roster.ThisMachine())`, `docs/as-built/session-roster.md`) and keeps each `roster.is_top_level` row: a Claude session that is neither a worker nor a unit director under a showrunner, so a unit director with no running showrunner is included. It leaves out the sender by `roster.sender_identity` and `roster.is_sender`: `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID`; with neither set nobody is left out. Roster problems print on stderr as `top_level: roster: <problem>` and the rest still prints. Each row's socket comes from the newest running record for its session id (`sessions.running_sessions()`), so a conversation two processes hold (resumed in a terminal while the desktop app still has it open; seen 2026-10-08 as `bevy_brp` listed twice) is listed once, and two sessions that share only a name are both listed. Each row becomes `AddressableSession(name, session_id, address) | UnaddressableSession(name, session_id)`. Only addressable sessions print, one `<name>\tuds:<messagingSocketPath>` line each, sorted by name then address, and are recorded as hold recipients (`build_hold.py record-recipient`; `main` returns 1 when a record fails); each unaddressable one prints `not reachable: <name> [<session id>] has no messaging socket` on stderr. `/notify_top_level` sends to each `uds:` address, adds every ListAgents peer on another machine unless `--here`, asks showrunners to pass the message to their unit directors, names held or refused deliveries by name and address, and reports each `not reachable` line as a session not told.
 
-### Dailies (`scripts/production/dailies_render.py`)
-
-- Holds: `read_dailies_hold()` reads the holder files. The report and `--footer` show each holder's purpose, start time and release ETA. Old files show `released HH:MM ZONE; the memory gate orders builds`. `hold_action_lines` names recipients without a confirmed notice: `<session> could not be told builds are released; tell it`. It uses the session name, or `an unnamed session` when only an id exists. `build_hold.py status` keeps the delivery list. The last release removes the holder file. The renderer refuses these states with exit 2: a top-level `build_hold` field; a build hold marker without a holder file; an invalid holder marker. Active holders require a marker when any report unit does not hold the builds itself. A report with no units can render. A report whose units all hold the builds can render. A holder marker is invalid when its unit carries `holds_builds` or matches an active holder's name. The diagnostic is `units.build_hold: <unit> holds the build hold itself; remove its marker`. A holder purpose cannot contain production plumbing words.
-- `### Agents` sits after the hold lines and above `waiting on you:` (the `--footer` form writes the same lines as bullets, with no heading): one line per note in use (`role` or `sessions`) in `AGENTS_DIR` (`~/rust/hanadocs/agents/`), by account label, e.g. `- codex2: 78%; runs out about 20:45 PDT today, before its Sun 02:25 refill; 1 reset available until Oct 29`; `- none active` otherwise. Run-out = reading time + (100 - used) / rate, rounded to the minute. The rate is `run_out.weighted_rate` over the `READINGS_LOG` readings: each rise weighted by half per 12 h of age; refills, time at 100% and gaps over 15 min are skipped. Until the readings cover a weighted hour, it is used percent over the time since the later of the last refill and 24 h ago. `scripts/whoami/agent_notes.apply` appends `{"account", "at", "remaining"}` to `~/.local/state/agent-notes/readings.jsonl` and keeps 8 days.
-- `same_phase` compares only the title after the first `: `, so a renumbered phase keeps its ETA history and a retitled one starts afresh. `draw_from` sets the latest cell only when it is after the ETA cell.
+2026-11-11: Dailies and their build-hold footer were retired.
+Use `build_hold.py status` to read holder and release-delivery state.
 
 ### Disk floor: what it removes (`scripts/lint/sweep.py`)
 
@@ -1082,12 +1242,30 @@ While `/` has less free than `sweep_free_floor_gib.<host>` in `config/lint.conf`
 
 - A target that goes away during a pass counts as done. The pass finishes with status 0. Its bytes do not count as removed.
 - **What a target is.** `is_cargo_target(directory)`: a directory holding `.rustc_info.json`, or cargo's `CACHEDIR.TAG` (matched on its line `# This file is a cache directory tag created by cargo.`) beside a build tree (`build_trees`). `target_dirs()` and `disk.py`'s `outside_directory_bytes()` both call it. Either marker alone misses targets: into a folder cargo creates, the tag and `debug/` appear at once and `.rustc_info.json` comes when the first build ends, or never; into a folder that already exists (mend's wrapper makes hana worktrees' first) cargo writes `.rustc_info.json` early and no tag.
-- **Targets in use.** A target whose cargo locks a build holds is busy, and so is one a live process uses (`process_uses`, 2026-10-15): its `/proc/<pid>/exe`, `cwd` or a `maps` file lies under the target, or it is a cargo-nextest run (`nextest` as its first argument, or argv[0] `cargo-nextest`) whose `--target-dir`, `CARGO_TARGET_DIR`, or else the directory beside a target that holds its cwd, names it. nextest's run phase holds no cargo lock and executes binaries from `deps/`; a floor sweep at test 2105 of 4072 left 1965 hana tests failing to exec. `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts it with the held targets; `sweep_workspace` prints `… skipped` and sweeps nothing. A running app keeps its target too. An exe or mapped file that reads `(deleted)` is no use (2026-10-21): the sweep can neither take nor break it, so a stale process whose exe and mappings under a target are all deleted, with its `cwd` outside, leaves the target idle (a hung `cargo-berth resolve` had held 26 GiB of cargo-liner-berth's target for three days). One scan of `/proc` covers every target (0.21 s over 110 targets and about 600 readable processes); it runs only below the floor. Without `/proc` (the Mac) nothing counts as in use.
+- **Targets in use.** A target is busy while a build holds its Cargo locks.
+  It is also busy when a live process uses an executable, working directory, or mapped file under it.
+  `process_uses()` checks `/proc/<pid>/exe`, `cwd` and `maps`.
+  A cargo-nextest or `verify.sh` process also keeps its workspace targets busy, including time between test binaries and time in the build queue.
+  The scan recognizes `verify.sh` directly or as the first script argument after options to `bash`, `sh`, `zsh` or `dash`.
+  `workspace_targets()` resolves `--target-dir`, `CARGO_TARGET_DIR`, Cargo config, or a target beside an ancestor of the working directory.
+  The use text is `runs verify.sh in <cwd>`.
+  nextest holds no Cargo lock during tests and executes binaries from `deps/`.
+  A floor sweep at test 2105 of 4072 left 1965 hana tests unable to execute their binaries.
+  `hold_floor` prints `lint sweep: pid <pid> <how>; <target> left alone` and counts the target as held.
+  `sweep_workspace` prints `… skipped` and removes nothing from the busy target.
+  A running app also keeps its target busy.
+  Executable or mapped paths that end with `(deleted)` do not count as use.
+  The sweep cannot remove or damage those files.
+  A process with only deleted files under a target leaves it idle when its working directory is outside.
+  A hung cargo-berth process held 26 GiB of cargo-liner-berth output for three days before this rule changed on 2026-10-21.
+  One scan of `/proc` covers every target and runs only below the floor.
+  A measured scan took 0.21 seconds over 110 targets and about 600 readable processes.
+  Without `/proc`, as on the Mac, the scan finds no use.
 - **Roots.** `sweep_floor_roots` is `~/rust`, `~/.local/state`, `~/.cache` and `/tmp`. `~/.cache` came in on 2026-10-21, after 421 GiB of idle targets under `~/.cache/trace-targets` had stayed unseen; it adds 0.4 s to the walk (21,000 folders). `~/.cache/sccache` holds no `.rustc_info.json` and no cargo tag, so it is never a target.
 - **Agent scratch under /tmp.** `sweep.py --floor-only` calls `tmp_sweep.run_if_due` before `hold_floor`, so idle scratch goes before any build cache. It runs the sweep when `tmp-sweep.stamp` in the lint-sweep state folder is an hour old or more (`RUN_INTERVAL_SECONDS`). The stamp moves before the run, so a failed run also waits an hour. `tmp_sweep.py [--dry-run]` runs it at once. For hand cleanup, run `tmp_sweep.py --plan <new-plan.json>` to list every candidate with `keep` or `remove` and one reason, and save the plan without deleting anything. Then run `tmp_sweep.py --apply <plan.json>`; it judges every candidate again once, at its start, with the timed sweep's ownership and process-use checks, keeps planned paths that gained a keep reason, and logs each removal. It never deletes an unplanned path. Hand cleanup also requires end evidence: all recorded workers ended, an expired scratch task, or a recorded verify run that stopped. Age alone does not permit hand cleanup. On the Mac, the hourly `tmp-sweep` job runs `tmp_sweep.py`.
 `modules/darwin/tmp-sweep.nix` in nixos defines this job.
 The separate disk-floor job runs every 120 seconds.
- The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per direct child; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. These stay: the roots and both `active/` run-marker folders with every marker in them; a run folder under `unit/` or `delegate/` named by any active marker, with a staff worker whose pane state does not prove it ended, or whose `progress_history_state.json` worktree belongs to a live session or a paused session in the shutdown mover's records; these runs and their temp entries stay even when their director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `detached_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty detached run file is not a record. Each current staff worker whose pane state does not prove it ended keeps its `/tmp/claude/session/<session_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty detached run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Any unreadable marker, pane evidence, session, shutdown or run ownership record keeps the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
+ The roots are the same on both machines, each by its real path, because the Mac's /tmp is a link to /private/tmp and lsof prints real paths. They are `/tmp/claude`, `/tmp/claude/delegate`, `/tmp/claude/unit`, each `-`-prefixed project folder in every `/tmp/claude-<uid>` this user owns (so Claude Code's own `bash-edit-diff/` stays), the scratch root `/tmp/claude/scratch` (one entry per direct child; a change review row's folder stays until its verdict), and the temp folders: /tmp, `$TMPDIR` and the Mac's `CS_DARWIN_USER_TEMP_DIR`. In a temp folder only a tempfile folder and a `lint/invoke.sh` log file (`INVOKE_TEMP_NAME`: `lint_invoke.*.log`, `buildlog.*.log`, `.peak` and `.peak.cgroup`; a killed run leaves them, and natedev /tmp held 1,308 and 1,438 on 2026-10-27) are judged. A tempfile folder (`TEMPFILE_NAME`) is `.tmp` and 6 letters or digits (Rust's tempfile crate), `tmp.` and 8 to 10 letters or digits (mktemp), or `tmp` and 8 lower-case letters, digits or `_` (Python's tempfile), the names test runs leave behind (natedev /tmp held 2,662 Rust ones on 2026-10-26 and the Mac's temp folder 273; the first folder audit that day found 3,917 mktemp and Python ones). In /tmp alone (the wide root; `$TMPDIR` and the Mac's temp folder hold app state, and macOS clears its own) every other empty folder this user owns is judged too, whatever its name, and uses `lint.conf` `folder_remove_after_seconds` with the same process-use check. A folder that holds only folders, however deep, counts as empty (`holds_no_file`; a tree of more than 1,000 folders does not), and its idle time is the newest mtime in the tree (2026-10-27: 155 nix-shell folders of empty `hana-runtime` folders stayed). A `direct/verify.sh` run folder (`VERIFY_TEMP_NAME`: `verify-hold.<pid>.XXXXXX`, with the run's `verify-copy.<pid>.XXXXXX` folders inside it) is judged in every temp folder. Its EXIT trap removes it, but a killed run leaves it (natedev /tmp held 47 hold and 6 copy folders on 2026-10-27). It stays while the named pid runs `verify.sh` (a `verify.sh` argument in `/proc/<pid>/cmdline`, or `ps` on the Mac) and that process started no later than the folder's mtime, so a reused pid does not keep it; otherwise it goes at the next run. An old name with no pid takes the 4-hour rule. A folder there that holds something can hold work, so the folder audit judges it, with a git check first (2026-10-27; until then the sweep took any idle folder, and on 2026-10-26 1,103 month-old ones went by hand, an rm the user had to approve). A folder a system tool owns stays (`SYSTEM_TEMP_NAMES`: `claude`, `.X11-unix` and the other X folders; `SYSTEM_TEMP_PREFIXES`: `systemd-private-`, `tmux-`, `nix-`, `ssh-`, `claude-`, `com.apple.`, `powerlog`), except an empty `nix-` one (`EMPTY_PREFIXES`: nix-shell and nix develop leave theirs, 1,321 in natedev /tmp on 2026-10-27), as do another root and a folder that holds one. The sweep does not judge or log other entries in a temp folder. An entry is one top-level file, folder or link under a root. It goes when nothing in it changed in 4 hours (`IDLE_SECONDS`) and no process has its cwd, an open file or a mapped file in it (one `/proc` scan per run; where there is no `/proc`, one `lsof -n -P -w -F pfn` scan: `cwd`, open files, and `txt`/`mem` mapped files). A change is the newer of mtime and ctime, over everything inside the entry, except a folder's ctime in a temp folder or a session or run temp root (systemd-tmpfiles-clean moves it daily). The entry's own times count only for a file, a link or an empty folder. The roots stay. A staff row's `OpenRun` pointer keeps its run folder under `unit/` or `delegate/`. A staff worker also keeps the run when its pane state does not prove that it ended. A worktree in `progress_history_state.json` keeps the run when it belongs to a live or paused session. The shutdown mover records paused sessions. These runs and their temp entries stay when the director process stops. A running director recorded in `director` or the opening `run_started` history event also keeps the run. A kept run also keeps any folder that contains a `detached_runs/*.json` record's `cwd`, or is that working folder, only while that record has status `running`. Finished records do not keep worker folders. Only these records name worker folders; pending files are not read. An empty detached run file is not a record. Each current staff worker whose pane state does not prove it ended keeps its `/tmp/claude/session/<session_id>` parent; old entries inside that parent still take the 4-hour rule. An unreadable non-empty detached run record keeps scratch entries and top-level `/tmp/claude` entries and prints its path. It does not keep old temp entries in session roots. Before deleting an idle entry under any root, both timed and hand cleanup check for git worktrees down to three folder levels, without following links. Uncommitted changes, untracked files, a stash or commits absent from remote and local clone-source refs keep the entry. Git checks use `GIT_OPTIONAL_LOCKS=0`, a 10-second timeout per command, and never fetch. A failed check keeps the entry. The folder audit uses the same git check. The new reasons `a live worker uses it` and `it holds unsaved git work` include kept paths in the log. Unreadable staff, pane evidence, session, shutdown, or run ownership records keep the affected runs; a session folder named for a running session, though an entry of 1 GiB or more in its `scratchpad/` and `tasks/` is judged like any other (`SESSION_ENTRY_MIN_BYTES`; showrunner, 2026-10-25: a live session keeps small files there that it only reads, and a read does not move mtime); each of these when a session record cannot be read; an entry that cannot be read; and everything when neither `/proc` nor lsof can show which processes use the entries. Links are never followed, a read-only folder is made writable and deleted, and a project folder left empty goes. Each run appends one JSON line to `~/.local/state/lint-sweep/tmp-sweep.jsonl`: `deleted` (path, GiB, last change), `freed_gib`, `failed`, `kept` (a count per reason), and `kept_paths` (every reason except a recent change and a small entry in a running session's folder; an in-use path names its pid and how it uses the entry). Lines older than 7 days drop off. The sweep is the only remover under its roots: `disk-floor.nix` excludes `/tmp/claude` and `/tmp/claude-*` from systemd-tmpfiles' age cleanup (`x` rules). Its `q /tmp 10d` rule deletes each file in /tmp older than 10 days, and then each empty folder. On 2026-10-26 that rule had removed an idle unit's run folder and its run marker, one file at a time. The run also prints one line per deletion and a summary to the disk-floor journal. History: it replaced `remove_session_scratch` (2026-10-21: ended sessions only, 24 h idle) on 2026-10-25. That day /tmp/claude held 122 GiB and /tmp/claude-1000 held 86 GiB, and a one-time cleanup had deleted both `active/` folders. The first dry run, with the 1 GiB line, would delete 1,891 entries (20.4 GiB) in about 4 s. The rest stayed because processes used the entries (a 70 GiB target) or because running sessions and unit runs held them.
 - **Use stamp.** `sweep_workspace()` sets the mtime of `.lint-sweep-used` (`USE_STAMP`) in every root `cargo_roots()` returns, before `lock_trees`, so a step that compiled nothing, or whose sweep was skipped because a build held a lock, still counts as use. A dry run and `--target-dir` (CI) write none; a write failure is ignored.
 - **Target last use.** `target_last_use(root, groups)` is the newest of the stamp's mtime and the target's build units' `last_used`.
 - **Order.** `shrink()` and `choose()` take a `RemovalOrder`, a sort key over `Group`; the smallest key goes first. The workspace budget sweep passes `unit_age` (most whole days unused, then oldest compile). For the floor's target order, see [Build output retained by the sweep](build-targets.md#build-output-retained-by-the-sweep). A scratch target a build holds is left like any held target. Orphaned files (`Scan.orphans`, one group per build tree) go first from any idle target, whatever the order.
@@ -1115,6 +1293,8 @@ Agents made loose repo copies, repros and test trees in /tmp and ~/rust, and not
 Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27).
 Each scratch folder belongs to a task. The task's end removes its folders.
 `scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]` makes a folder and prints its path.
+`scratch.py new --worker [--name <word>]` makes a folder under `TMPDIR` for the caller's worker task.
+The DONE completion hook ends that task before pane closure. Other workers' folders remain.
 `scratch.py list` shows each folder's task and last change.
 The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
 
@@ -1150,9 +1330,9 @@ The hold record stays in `~/.local/state/scratch/holds.json`.
 `end` removes the held folder unless a repository in it has uncommitted changes, a stash or commits absent from all remotes.
 The folder stays with its hold marked ended.
 
-A folder uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
+A folder made without `--worker` uses `/tmp/claude/scratch/<kind>-<name>-<word>-<6 chars>`.
 `--visible` puts a row task's folder at `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
-Each folder holds `.scratch.json` with its task, maker session and times.
+Each folder holds `.scratch.json` with its task, maker staff id, and times.
 A Git worktree uses `git worktree remove` for removal.
 A failed removal prints a warning and does not fail the merge or the verdict.
 
@@ -1312,7 +1492,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - A cargo token is reclaimed early only through a `holder_pid` that names a gone process; holder and waiter share one pid namespace. The guard file is never removed.
 - Holder files supply current hold state. Old cycles distinguish files still in force from completed holds. A release removes its holder file at once. Historical log rows never decide whether a build can start.
 - Releases go by session id, never by name. A session that cannot be messaged is never recorded as a recipient.
-- Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status` or the dailies.
+- Hold changes use `release.lock`. Release delivery uses the ended cycle after the holder file is gone. A damaged record is set aside by a changing command, never by `status`.
 - `steps.mem_wait_s` is the memory wait. `steps.wait_s` is the call's lookup and token wait. The file name hashes the schema SQL. Bump `SCHEMA_VERSION` only when the way rows are derived changes.
 - Only `ran` CI jobs carry duration and queue time. CI days key on the run attempt's `started_at` everywhere.
 - The window report is host-scoped; the daily report aggregates hosts. A run's own peak comes from `ci_anon_bytes` / `builds_anon_bytes` samples, never from `memory.peak`.
@@ -1346,7 +1526,11 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - **Disk floor order.** A no-op cargo build writes nothing under `target/`, and relatime refreshes atimes at most once a day, so only the use stamp records a step that compiled nothing. The stamp lags a lint step by up to 5 minutes (`invoke.sh`'s sweep rate limit), which only reorders targets used within the same 5 minutes. The build log's `sweep_freed_bytes` counts each workspace's budget sweep and the floor sweep after it together, so it is not the floor's cost alone; the journal's per-target lines are.
 - **procps cuts user names** over 8 characters unless the format says `user:32`.
 - **Codex.** On an idle thread the app-server opens a turn per queued message, so never `thread/queue/add` to a thread no launcher streams. `thread/read` can report active with no turn id; get the id from a steer probe before `turn/interrupt`. `turn/interrupt` errors when the turn ended in between; only a re-read tells that from a live turn.
-- **Dailies.** The run-out time rounds to the minute in epoch seconds (rounding aware local time loses the DST fold). `resets` is the writing machine's wall time with its offset (2026-10-12: notes travel between machines in hanadocs, and an offset-free value read on the other machine was off by the zones' difference); `note_file.reset_time` reads it for `agent_notes.still_ahead`, `quota_alert.ahead` and its two account checks, and `codex_pacer.parse_local`, taking a value written before the offset as the reading machine's wall time. A naive `limit_reset` is the writing machine's wall time. Every subprocess dailies test sets `HOME` to a temporary directory.
+- **Account reset times.** `resets` records the writing machine's wall time with its offset.
+  Notes can move between machines with different zones.
+  `note_file.reset_time` reads that value for account checks and alerts.
+  For older offset-free values, readers use their own wall time.
+  A naive `limit_reset` uses the writing machine's wall time.
 - **`verify.sh` guard.** A failing `cargo metadata` exits with cargo's status under `set -e`, not 2.
 - **Live scripts.** Units run `~/.claude/scripts/direct/board.sh` and `verify.sh` while they change, and bash reads a script as it runs: replace either by writing a temp file beside it, setting its mode, and `mv`ing it over.
 - **A target with neither marker.** A folder made before a build that runs with `CARGO_CACHE_RUSTC_INFO=0` has no `.rustc_info.json` and no `CACHEDIR.TAG`; the floor and the disk measurement do not see it. Nothing on natedev sets that variable.
@@ -1383,7 +1567,6 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
   - Keying the example guard on the target's `test` setting or advising `test = true`: examples carry no tests (user, 2026-10-04).
   - Withholding the phone push when a removal failed, or cutting a path's last component to fit 1,024 characters.
   - Queuing a message to an out-of-retries Codex thread (it opens a turn nothing streams); changing the service tier on capacity.
-  - The dailies renderer importing the note code from `scripts/whoami`: it parses the flat frontmatter itself and imports only `run_out`.
 
 ## Not built
 
@@ -1399,7 +1582,9 @@ A test-width update persists the reservation in `state.json` through `os.replace
 
 A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.
 
-Python queue layouts, evidence tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
+Python queue layouts and evidence tables share `scripts/lib/terminal_cells.py::terminal_width`.
+Combining marks occupy zero cells.
+Wide characters occupy two cells.
 
 **One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, the head cause, run keep-asides, and start spacing.
 The service commits proposals and stores the pass.
@@ -1473,12 +1658,16 @@ Only targets with our use stamp, mirror mark, or a registered copy ancestor are 
 Resolved paths must stay inside these roots. The scan does not follow directory symlinks.
 
 The sweep reads the local and natedev Mac claims under their existing admission locks.
-It keeps these locks until deletion ends. A live or kept claim protects its mirror.
+Each reader releases its admission lock before it returns a claim snapshot.
+The sweep holds acquired mirror leases through deletion.
+It reads claims again before each removal group outside those leases.
+A live or kept claim protects its mirror.
 For a marked target without a copy record, the claim check compares each existing claimed mirror path.
 A missing unrelated claimed mirror does not protect the target.
 Other claim read errors still protect the target.
 Remote mirror removal keeps its own lease exemption and still checks sibling leases.
-An unreadable claim reply or a lost lock process protects every target.
+An unreadable claim reply protects every target.
+The claim server prints its reply after it releases the admission lock.
 The Mac uses `lsof` for other process use. Unreadable process use protects every target.
 The sweep checks protection again before each target deletion.
 It takes only the shortfall, in the existing least recently used order.
@@ -1486,7 +1675,7 @@ The result line reports removed bytes, free bytes before and after, and skipped 
 `--dry-run` lists proposed takes and removes nothing. It does not run the general tmp sweep.
 The nix-darwin `nate.jobs.disk-floor` job runs this same command every 120 seconds on the Mac.
 `modules/darwin/default.nix` imports the new `modules/darwin/disk-floor.nix` module.
-The job uses the mirror leases and claim locks above, plus the shared floor lock.
+The job uses mirror leases, short claim reads, and the shared floor lock.
 It trims only the shortfall below `sweep_floor_gib`, without an offload request.
 `ensure_mac_disk_floor()` keeps its 100 GiB on-demand trigger.
 
@@ -1497,7 +1686,12 @@ The floor job writes both output streams to `~/Library/Logs/nate-jobs/disk-floor
 Nix-darwin activation deploys the job definition and its PATH.
 The Mac floor finalizer uses the shared crossing path above and saves its receipts on the Mac.
 Its session message goes to natedev; its phone title and body name `Mac`.
-When a crossing delivery is pending, the Mac measures each direct folder child under its floor roots.
+When a crossing delivery is pending, the Mac measures each root's direct folder children and each cargo target the floor pass found.
+The target list contains only targets the Mac floor policy allows.
+The Mac crossing alert waits for a pass that searched for targets.
+A completed search with no targets still permits the alert.
+Failure alerts do not wait for the target search.
+The measurement skips targets that no longer exist and does not search the roots again.
 Each size estimates the file blocks that deleting that folder alone frees.
 An inode counts once only when every hard link is inside that folder.
 An inode with a link outside the folder counts zero.
@@ -1527,7 +1721,7 @@ Unreadable folders can make the measured sizes incomplete.
 
 `memory_room` calculates room from one captured admission pass.
 For each admitted run, kept bytes equal `max(0, selected need − swap-backed use)` plus held slot bytes.
-Room equals free memory minus `safety_gib`, run keep-asides, and the CI keep-aside. The safety is 3 GiB.
+Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 GiB.
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
@@ -1559,7 +1753,58 @@ Slots are not saved. Restart keeps active reservations and run order, but drops 
 `queue_evidence.room_text` supplies the captured cap calculation to the view, card, and memory report.
 The view shows zero room during a shortfall and records that shortfall in the cap explanation.
 The queue view and cards show captured process ids as `pid N` for each process row.
-Running rows show a `machine` column after `min` and before `pid`.
+The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
+The first column shows `building` or `testing` from the recorded progress counter.
+A row without a counter shows `—`.
+Local builds, merge gates, and cloud rows use their recorded counters.
+hana CI currently has no admission counter.
+The Running table shows hana CI only when a recorded runner has a busy job.
+Idle or unreadable runners have no separate Running row.
+Their memory remains in the taken total, the cap, and the summary tooltip.
+Waiting rows use `#` in the first column for their queue place.
+Both sections use the same column widths.
+The narrow layout adds the `Step` column.
+The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
+It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
+A v3 registration must match the current boot, process start time, uid, PID, and generation.
+The reader reads at most 64 KiB from each registration and log.
+It groups descendant cargo calls and compilers under their top-level cargo run.
+Native projects and both test mirrors appear as separate runs.
+The recorded project directory identifies the run; a compiler's crate directory does not.
+The step name uses the command's package, then the repository when the command has no package.
+A step name never contains an unknown-value dash.
+The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
+The Mac row shows the repository on its second label line.
+The stage uses a test counter or a running test binary as evidence for `testing`.
+The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
+It embeds the shared Cargo folder reader in the same Mac reading.
+The Mac kernel supplies only the selected Cargo path environment fields.
+Observed compiler output folders also identify test binaries, as they do in cargo tile.
+The reader resolves symlinks before it compares directory components.
+A test binary under a custom target folder can supply `testing` without a counter.
+Build scripts and binaries outside the selected output folders do not supply `testing`.
+The stage otherwise shows `building` for an observed cargo run.
+The reader uses the same captured Cargo and nextest output that cargo tile reads.
+The page shows the recorded done percentage and a progress line.
+The command's `--test-threads`, `-j`, or `--jobs` value supplies vCPU.
+An absent positive value supplies `—`.
+The Unit comes from the submitting session in a matching Mac claim and that session's staff record.
+A remote mirror session and repository can identify that claim.
+A mirror lease can identify the claim session.
+The copy record's fallback owner does not supply a Unit.
+The page shows `—` when no claim supplies an owner.
+The Mac row uses the local used-memory style and the same GiB scale.
+Its memory is the sum of resident memory for the run's process tree.
+The Mac row has no reservation or hatching and changes no natedev memory total.
+The Mac tooltip states that its memory does not count against natedev.
+It aligns Machine, Started, Used, and Reading age in labelled rows.
+A readable counter adds a Progress row.
+A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
+The feed log retains raw errors; the page shows only the status and reading age.
+CI runner records supply the `hana CI` owner for their Running and Waiting steps.
+The aggregate running CI row also shows Unit `hana CI`.
+The feed compares the step's recorded runner unit with the runner records, not page text.
+The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.
 Waiting rows have no machine value. Services lines do not change.
@@ -1603,7 +1848,7 @@ Active records retain this evidence across service restarts and completion.
 Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
 Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.
-CI keeps its configured margin until registered CI steps supply counters and profiles.
+Registered CI steps supply counters and profiles through admission.
 `lint/invoke.sh` enables Cargo progress in its capture log. It removes redraw frames from worker output.
 Cargo-tile enables progress for its own captures. The cargo wrapper does not enable progress for other pipes.
 
@@ -1655,12 +1900,12 @@ The service also samples swap-backed use during each admission pass.
 The service reads the runner's peak and wave files beside its sidecar.
 It copies the maximum into its own peak files before finalization.
 The service writes completed and failed peaks through the normal history path.
-The runner creates its sidecar and progress counter in a temporary directory.
+The runner creates its sidecar and progress counter in a temporary directory, below `--shared-folder` when that argument is given.
 The directory mode is `0755`; the sidecar, counter, peak, and wave modes are `0644`.
 The runner account owns these files; the service reads them without group write access.
 The service completes release when sample deletion fails with `PermissionError`.
 The front removes its temporary directory after release.
-A front killed by SIGKILL leaves that directory for the existing sweep.
+A front killed by SIGKILL leaves that directory for the existing sweep, or for the `systemd-tmpfiles` age rule of a `--shared-folder` folder.
 The service reads the counter through the sidecar path in the reservation.
 The child alone receives `CARGO_TERM_PROGRESS_WHEN=always` and `CARGO_TERM_PROGRESS_WIDTH=80`.
 The shared progress reader and profile history apply the existing look-ahead rule.
@@ -1671,12 +1916,10 @@ The deadline covers closed connections and connections without replies.
 A valid reply renews the deadline.
 Cleanup uses the separate timing from the grant.
 
-CI memory keeps the mixed accounting rule during activation.
 Registered process trees count through their reservations.
 The CI slice reading subtracts their swap-backed use.
-The CI keep-aside remains while any busy runner has no registered tree.
-The keep-aside applies once to a mix of registered and unregistered jobs.
-`ci_memory_margin_gib` remains in configuration until the approved activation step.
+Unregistered CI use counts once in the cap and has no memory reservation.
+A CI job that admission cannot cover uses the systemd `MemoryMax=34G` limit of 34 GiB.
 
 NixOS activation remains natedev's work.
 The socket uses group `build-admission` and mode `0660`.
@@ -1686,8 +1929,12 @@ Runner sandboxes need `BindPaths=/run/build-admission` when `/run` is hidden.
 The package must contain the pinned source tree and a Python interpreter.
 No client code is copied into `/etc/nixos`.
 The service must read runner `/proc` records and runner temporary counter files.
-Set `TMPDIR` to a shared runner-owned directory if `PrivateTmp` hides the default directory.
-For example, `/run/build-admission/ci/<uid>` uses mode `0755` and the runner's ownership.
+`nix develop` sets `TMPDIR` to a private `0700` folder, so `TMPDIR` cannot name these files.
+The front takes `--shared-folder <folder>` for them and leaves `TMPDIR` to the job.
+The folder is `/run/hana-ci-admission/<runner>`, with mode `0755` and the runner's ownership.
+It stays outside the socket's runtime folder.
+The socket sets `RuntimeDirectoryPreserve=yes`, so a socket restart keeps the folder that running runners bind.
+The wrapper runs the front with `python3 -I` and the script path, and exports no `PYTHONPATH`.
 The fixed slice limits remain `MemoryMax=34G` and `MemorySwapMax=2G`.
 The service authorization and protocol must be live before runner socket access starts.
 
@@ -1736,3 +1983,9 @@ The merge gate and style lint own private folders through `build_folders.tempora
 The contexts remove these folders after success or an exception.
 Style review keeps its input folder for the review worker and finish command.
 Session TMPDIRs and unit session folders remain for later session commands.
+
+
+## Synchronous verify helpers
+
+`verify.sh` shares one Python process across synchronous helper calls.
+See [Synchronous verify helpers](build-targets.md#synchronous-verify-helpers) for the protocol, process exceptions, recovery, and trace format.

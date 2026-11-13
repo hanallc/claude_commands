@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -15,7 +16,10 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production import staff
+from scripts.production.production_doc import read_production
+from scripts.production.update_registration import scheduled_prompt
+from scripts.production.staff_test_support import isolated_staff_file, fixture_runtime_id, recorded_showrunner
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
@@ -94,27 +98,52 @@ finally:
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
 
-    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
-        from scripts.production import staff
-        from scripts.production.staff_test_support import fixture_runtime_id
+    def scheduled_owner(self) -> tuple[staff.StaffRow, Path]:
+        doc = self.root / "production.md"
+        _ = doc.write_text(f"# Production — demo\n\n## Production Context\n\n"
+                           + f"- **Merge branch:** main\n- **Showrunner checkout:** `{self.root}`\n"
+                           + "- **Log:** production.log\n- **Updates:** every 2 minutes\n")
+        owner = recorded_showrunner("demo", doc)
+        self.record(owner.current_session)
+        return owner, doc
 
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
-            owner = staff.ensure("showrunner", name="demo", runtime_id=fixture_runtime_id("timer-first"))
-            current = staff.native_id(fixture_runtime_id("timer-after-clear"))
-            _ = staff.update_current_session(owner.current_session, current)
-            self.record(current)
-            _ = self.successful("new", "example", "--to", "session:" + owner.id,
-                                "--every", "2", "--command", "the scheduled prompt")
-            configuration = self.state_dir / "example" / "conf"
-            before = configuration.read_bytes(), configuration.stat().st_mtime_ns
-            _ = self.successful("fire", "example")
-            arguments = self.send_args.read_text().splitlines()
-            self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
-            self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
-            self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
-            retained = staff.by_id(owner.id)
-            assert retained is not None
-            self.assertEqual(retained.current_session, current)
+    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
+        owner, doc = self.scheduled_owner()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
+        current = staff.native_id(fixture_runtime_id("timer-after-clear"))
+        _ = self.successful("new", "example", "--to", "session:" + owner.id,
+                            "--every", "2", "--prompt", "scheduled")
+        configuration = self.state_dir / "example" / "conf"
+        before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+        for index, change in enumerate(("session", "name", "document"), start=1):
+            with self.subTest(change=change):
+                if change == "session":
+                    owner = staff.update_current_session(owner.current_session, current)
+                    self.record(current)
+                elif change == "name":
+                    owner = staff.rename(owner.id, "renamed-demo")
+                else:
+                    moved = doc.with_name("moved-production.md")
+                    _ = doc.rename(moved)
+                    _ = moved.write_text(moved.read_text().replace("every 2 minutes", "every 7 minutes"))
+                    assert isinstance(owner.doc, staff.LiveDoc)
+                    owner = staff.set_doc(owner.id, staff.LiveDoc(owner.doc.machine, moved))
+                _ = self.successful("tick", now=MINUTE + 120 * index)
+                arguments = self.send_args.read_text().splitlines()
+                self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+                self.assertEqual(arguments[arguments.index("--from") + 1], "showrunner-timer-" + owner.name)
+                prompt = arguments[arguments.index("--text") + 1:]
+                delivered = "\n".join(prompt)
+                self.assertIn("--production " + owner.name, delivered)
+                self.assertIn("every 7 minutes" if change == "document" else "every 2 minutes", delivered)
+                self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
+                self.assertEqual(self.conf()["PROMPT"], "scheduled")
+                self.assertNotIn("PROMPT_FILE", self.conf())
+                self.assertNotIn("FROM", self.conf())
+                self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+        retained = staff.by_id(owner.id)
+        assert retained is not None
+        self.assertEqual(retained.current_session, current)
 
     def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
         pending = self.root / "repeat-outbox"
@@ -371,15 +400,99 @@ finally:
         self.assertEqual(self.state()["NEXT_DUE"], str(MINUTE + 240))
         self.assertRegex(self.lines()[-1], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d .+ / \d\d:\d\d:\d\d UTC \| exit 0 \| to session:sid-1 uds:.+ \| fake send result$")
 
-    def test_prompt_file_fire_ignores_schedule_and_hold(self) -> None:
-        prompt = self.root / "prompt.txt"
-        _ = prompt.write_text("prompt contents")
-        _ = self.successful("new", "example", "--to", "showrunner", "--every", "2", "--prompt-file", str(prompt), "--hold")
-        _ = self.successful("fire", "example")
-        self.assertEqual(self.send_args.read_text().splitlines()[-2:], ["--file", str(prompt)])
+    def test_scheduled_prompt_fire_ignores_schedule_and_hold(self) -> None:
+        owner = self.scheduled_owner()[0]
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
+        _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
+                            "--prompt", "scheduled", "--hold")
+        configuration = self.state_dir / "example" / "conf"
+        with configuration.open("a") as output:
+            _ = output.write("FROM=showrunner-timer-old-name\n")
+        before = configuration.read_bytes()
+        scripts = self.root / "scripts"
+        (scripts / "message").mkdir(parents=True)
+        (scripts / "lib").mkdir()
+        notifier = scripts / "message/notifier.sh"
+        _ = notifier.write_text(SCRIPT.read_text())
+        calls = self.root / "delivery.calls"
+        python = scripts / "lib/py"
+        source = SCRIPT.parents[1]
+        _ = python.write_text(
+            "#!/bin/sh\n"
+            + 'case "$1" in */production/update_registration.py) '
+            + f'printf "%s\\n" "$2" >> {shlex.quote(str(calls))} ;; esac\n'
+            + f'script=${{1#{shlex.quote(str(scripts))}/}}\nshift\n'
+            + f'exec {shlex.quote(str(source / "lib/py"))} {shlex.quote(str(source))}/"$script" "$@"\n'
+        )
+        python.chmod(0o755)
+        with mock.patch(__name__ + ".SCRIPT", notifier):
+            _ = self.successful("fire", "example")
+        self.assertEqual(calls.read_text().splitlines(), ["delivery"])
+        arguments = self.send_args.read_text().splitlines()
+        self.assertIn("--text", arguments)
+        self.assertEqual(arguments[arguments.index("--from") + 1], "showrunner-timer-" + owner.name)
+        self.assertIn("--production " + owner.name, "\n".join(arguments[arguments.index("--text") + 1:]))
+        self.assertEqual("\n".join(arguments[arguments.index("--text") + 1:]),
+                         scheduled_prompt(2, read_production(owner.id)))
         self.assertEqual(self.state()["NEXT_DUE"], str(MINUTE + 120))
-        _ = self.successful("fire", "example", now=NOW + 1)
+        with mock.patch(__name__ + ".SCRIPT", notifier):
+            _ = self.successful("fire", "example", now=NOW + 1)
+        self.assertEqual(calls.read_text().splitlines(), ["delivery", "delivery"])
         self.assertEqual(len([line for line in self.lines() if " | exit 0 | " in line]), 2)
+        self.assertEqual(configuration.read_bytes(), before)
+
+    def test_failed_scheduled_prompt_skips_delivery_with_one_error_line(self) -> None:
+        owner, doc = self.scheduled_owner()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
+        _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
+                            "--prompt", "scheduled")
+        document = doc.read_bytes()
+        doc.unlink()
+        result = self.run_cli("tick", now=MINUTE + 120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn("prompt", result.stderr)
+        self.assertFalse(self.send_args.exists())
+        _ = doc.write_bytes(document)
+        scripts = self.root / "scripts"
+        (scripts / "message").mkdir(parents=True)
+        (scripts / "production").mkdir()
+        (scripts / "lib").mkdir()
+        notifier = scripts / "message/notifier.sh"
+        _ = notifier.write_text(SCRIPT.read_text())
+        source = SCRIPT.parents[1]
+        _ = shutil.copyfile(source / "production/update_registration.py", scripts / "production/update_registration.py")
+        (scripts / "message/sessions.py").symlink_to(source / "message/sessions.py")
+        template = self.root / "commands/showrunner/produce.md"
+        template.parent.mkdir(parents=True)
+        _ = template.write_text("The prompt:\n\n> \n>\n\n**A tick**\n")
+        python = scripts / "lib/py"
+        wrapper = ("#!/bin/sh\n"
+                   + f"export PYTHONPATH={shlex.quote(str(source.parent))}\n"
+                   + f'exec {shlex.quote(str(source / "lib/py"))} "$@"\n')
+        _ = python.write_text(wrapper)
+        python.chmod(0o755)
+        for defect in ("empty template", "missing separator", "empty framed prompt", "old command"):
+            with self.subTest(defect=defect):
+                self.send_args.unlink(missing_ok=True)
+                if defect != "empty template":
+                    output = "showrunner-timer-demo" + ("\n\n" if defect == "empty framed prompt" else "")
+                    response = ("printf '%s\\n' 'invalid choice: delivery' >&2; exit 2" if defect == "old command"
+                                else f"printf '%s' {shlex.quote(output)}; exit 0")
+                    _ = python.write_text(
+                        "#!/bin/sh\n"
+                        + 'case "$1" in */production/update_registration.py) '
+                        + response + " ;; esac\n"
+                        + wrapper.removeprefix("#!/bin/sh\n")
+                    )
+                with mock.patch(__name__ + ".SCRIPT", notifier):
+                    result = self.run_cli("fire", "example")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn("prompt", result.stderr)
+                self.assertFalse(self.send_args.exists())
+                if defect == "old command":
+                    self.assertIn("invalid choice: delivery", result.stderr)
 
     def test_check_exit_one_skips_and_exit_two_removes(self) -> None:
         _ = self.new("--check", "/bin/sh -c 'exit 1'")
@@ -404,7 +517,7 @@ finally:
         self.assertFalse(self.send_args.exists())
 
     def test_empty_prompt_sources_do_not_create_an_instance(self) -> None:
-        for source in ("--command", "--prompt-file"):
+        for source in ("--command", "--prompt"):
             with self.subTest(source=source):
                 result = self.run_cli(
                     "new", "example", "--to", "session:sid-1", "--every", "2", source, "",

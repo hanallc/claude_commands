@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,12 +27,14 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
+from scripts.buildlog import index
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -205,7 +209,8 @@ class FixtureTest(unittest.TestCase):
         if (state / "leak-child").exists() and suite == "hooks":
             import subprocess
             child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=(state / "detached-child").exists())
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
@@ -319,10 +324,11 @@ class MergeGateFixture(unittest.TestCase):
         from scripts.message import session_send
 
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
+        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
-        self.addCleanup(shutil.rmtree, self.fixture_root)
         self.admission = caller_admission(self, self.root, self.environment)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -348,6 +354,7 @@ class MergeGateFixture(unittest.TestCase):
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
+            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -407,10 +414,11 @@ class MergeGateFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
+        git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "MERGE_GATE_TEST_STATE": str(self.state),
             "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
@@ -423,7 +431,7 @@ class MergeGateFixture(unittest.TestCase):
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             # The calling showrunner is found from these update timers, never the live ones.
@@ -528,6 +536,17 @@ class MergeGateFixture(unittest.TestCase):
         self.bind_fixture(root)
         self.bin.mkdir()
         self.state.mkdir()
+        _ = write_config_fixture(self.root / "config/buildlog.conf")
+        _ = write_config_fixture(self.root / "config/merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        # These tests prove gate behavior without a near deadline from their short jobs.
+        history = Path(self.environment["BUILDLOG_DIR"])
+        history.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
+            index.create_schema(connection)
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
+                VALUES ('fixture-normal', '2000-01-01', 'merge-gate', ?, 0, 0, 'full', 1000000)""",
+                (os.cpu_count() or 1,)).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"

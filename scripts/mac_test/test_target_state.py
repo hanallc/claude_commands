@@ -15,7 +15,10 @@ import threading
 import time
 from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 import unittest
 from unittest import mock
@@ -27,7 +30,6 @@ if TYPE_CHECKING:
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
     from scripts.buildlog import record, store
-    from scripts.lib import conf
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 else:
@@ -36,12 +38,11 @@ else:
     from scripts.build_hold import build_hold
     from scripts.buildlog import record
     from scripts.buildlog import store
-    from scripts.lib import conf
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
-TARGET_NAMES = ("mac", "aws", "linux-two")
+TARGET_NAMES = ("mac", "linux", "linux-two")
 
 
 class HoldClock(datetime):
@@ -78,7 +79,7 @@ class IsolatedTargetState(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "build_targets.conf"
         self.mac_state = self.root / "legacy-mac"
-        lines = ["targets=mac,aws,linux-two,natedev"]
+        lines = ["targets=mac,linux,linux-two,natedev"]
         for name, hours in zip(TARGET_NAMES, (4, 1, 2), strict=True):
             settings = self.root / f"{name}.conf"
             _ = write_config_fixture(settings,
@@ -104,7 +105,7 @@ class IsolatedTargetState(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "STAFF_FILE": str(self.root / "staff.json"),
             "CLAUDE_CODE_SESSION_ID": "",
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -116,7 +117,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(offload, "repository_identity",
                                               return_value=offload.KnownRepository("project")))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=build_hold.NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
@@ -127,8 +128,8 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(store, "host_name", return_value="fixture-host"))
 
     def use_generic_linux_target(self) -> None:
-        _ = self.config.write_text(self.config.read_text().replace("aws", "linux-one"), encoding="utf-8")
-        _ = (self.root / "aws.conf").rename(self.root / "linux-one.conf")
+        _ = self.config.write_text(self.config.read_text().replace('targets=mac,linux,', 'targets=mac,linux-one,').replace('.linux=', '.linux-one=').replace('=linux.conf', '=linux-one.conf'), encoding="utf-8")
+        _ = (self.root / "linux.conf").rename(self.root / "linux-one.conf")
 
     def record_command(self, arguments: list[str], **_options: object) -> mock.Mock:
         """Write hold events synchronously and refuse all other child commands."""
@@ -155,6 +156,13 @@ class IsolatedTargetState(unittest.TestCase):
     def claim(self, target: str, pid: int = 101) -> subprocess.CompletedProcess[str]:
         return self.invoke_mac(["claim", "--target", target, "--pid", str(pid),
                                 "--what", f"test {target}", "--worktree", str(self.root / "project")])
+
+    def release(self, target: str = "", pid: int = 101) -> subprocess.CompletedProcess[str]:
+        paths = mac_test.state_paths(target or "mac")
+        record = next(claim.record for claim in mac_test.read_claims(paths) if claim.record["pid"] == pid)
+        selection = ["--target", target] if target else []
+        return self.invoke_mac(["release", *selection, "--pid", str(pid), "--claim-id", record["claim_id"],
+                                "--episode", record["episode"], "--attempt", record["attempt"]])
 
     def block(self, target: str, holder: str = "alice") -> subprocess.CompletedProcess[str]:
         return self.invoke_mac(["block", "--target", target, "--holder", holder, "--for", f"inspect {target}"])
@@ -202,6 +210,19 @@ class TargetStateTests(IsolatedTargetState):
             self.assertNotIsInstance(block, mac_test.NoMacBlock)
             if not isinstance(block, mac_test.NoMacBlock):
                 self.assertEqual(block.expires - block.since, timedelta(hours=4))
+        self.assertEqual(self.invoke_mac(["unblock", "--holder", "alice"]).returncode, 0)
+        with isolated_staff_file(self.root / "staff.json", {}):
+            member = fixture_member("producer", name="before-rename")
+            self.assertEqual(self.block("mac", member.id).returncode, 0)
+            member = staff.rename(member.id, "after-rename")
+            status = self.invoke_mac(["status", "--target", "mac"])
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertIn("blocked by after-rename since ", status.stdout)
+            state = targets.target_state(self.selected_target("mac"))
+            self.assertIsInstance(state, targets.Held)
+            assert isinstance(state, targets.Held)
+            self.assertEqual(state.holder, member.name)
+            self.assertEqual(self.invoke_mac(["unblock", "--holder", member.id, "--target", "mac"]).returncode, 0)
 
     def test_explicit_mac_free_now_reads_the_registry_offload_setting(self) -> None:
         legacy = self.root / "mac_test.conf"
@@ -242,7 +263,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertEqual(self.snapshot(), before)
 
     def test_state_reader_reports_named_read_errors_and_preserves_unexpected_errors(self) -> None:
-        target = self.selected_target("aws")
+        target = self.selected_target("linux")
         for error in (mac_test.StateReadError("bad state"), targets.ConfigError("bad target")):
             with self.subTest(error=type(error)), mock.patch.object(mac_test, "state_paths", side_effect=error):
                 state = targets.target_state(target)
@@ -253,36 +274,20 @@ class TargetStateTests(IsolatedTargetState):
             with self.assertRaisesRegex(ValueError, "unexpected reader defect"):
                 _ = targets.target_state(target)
 
-    def test_aws_drain_reserve_covers_its_configured_maximum_duration(self) -> None:
-        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
-        reserve = float(values["limit_reserve_usd"])
-        minutes = float(values["drain_max_minutes"])
-        self.assertGreater(minutes, 0)
-        self.assertGreater(reserve, 0)
-        self.assertGreaterEqual(reserve, float(values["fallback_usd_per_hour"]) * minutes / 60)
-        self.assertLess(reserve, float(values["daily_limit_usd"]))
 
-    def test_aws_repository_budgets_fit_the_build_budget(self) -> None:
-        values = conf.read(SCRIPTS.parent / "config/aws_target.conf").values()
-        ceiling = float(values["build_budget_gib"])
-        for key, value in values.items():
-            if key == "target_budget_gib" or key.startswith("target_budget_gib."):
-                with self.subTest(setting=key):
-                    self.assertGreater(float(value), 0)
-                    self.assertLessEqual(float(value), ceiling)
 
     def test_hold_activation_warning_and_expiry_notify_the_selected_target(self) -> None:
         result = self.block("mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         mac_before = (self.mac_state / "block.json").read_bytes()
-        result = self.claim("aws")
+        result = self.claim("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.invoke_mac(["release", "--target", "aws", "--pid", "101"])
+        result = self.release("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        paths = mac_test.state_paths("aws")
-        config = mac_test.read_config("aws")
+        paths = mac_test.state_paths("linux")
+        config = mac_test.read_config("linux")
         notifications: list[HoldNotification] = []
 
         def receive_message(recipient: str, summary: str, key: str, repeat_minutes: float, text: str) -> bool:
@@ -294,25 +299,25 @@ class TargetStateTests(IsolatedTargetState):
             outcome = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             self.assertIsInstance(outcome.block, mac_test.ActiveMacBlock)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws is free")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-free-"))
-            self.assertIn("aws is free", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux is free")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-free-"))
+            self.assertIn("linux is free", notifications[-1]["text"])
             self.assertNotIn("Mac", notifications[-1]["text"])
             messages.reset_mock()
             with mock.patch.object(mac_test, "utc_now", return_value=NOW + timedelta(minutes=50)):
                 _ = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws block nearing its time limit")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-block-warn-"))
-            self.assertIn("aws block", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux block nearing its time limit")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-block-warn-"))
+            self.assertIn("linux block", notifications[-1]["text"])
             messages.reset_mock()
             with mock.patch.object(mac_test, "utc_now", return_value=NOW + timedelta(hours=1)):
                 outcome = mac_test.full_settle(paths, config, watcher_holds_lock=True)
             self.assertIsInstance(outcome.block, mac_test.NoMacBlock)
             messages.assert_called_once()
-            self.assertEqual(notifications[-1]["summary"], "aws block lifted")
-            self.assertTrue(notifications[-1]["key"].startswith("aws-block-expired-"))
-            self.assertIn("aws block", notifications[-1]["text"])
+            self.assertEqual(notifications[-1]["summary"], "linux block lifted")
+            self.assertTrue(notifications[-1]["key"].startswith("linux-block-expired-"))
+            self.assertIn("linux block", notifications[-1]["text"])
             self.assertNotIn("Mac", notifications[-1]["text"])
         self.assertEqual((self.mac_state / "block.json").read_bytes(), mac_before)
 
@@ -343,7 +348,7 @@ class TargetStateTests(IsolatedTargetState):
                 self.assertEqual([job.what for job in state.jobs], [f"test {name}"])
         self.assertEqual(self.claim("linux-one", 202).returncode, 11)
         mac_before = {path: path.read_bytes() for path in self.mac_state.rglob("*.json")}
-        result = self.invoke_mac(["release", "--target", "linux-one", "--pid", "101"])
+        result = self.release("linux-one")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsInstance(targets.target_state(self.selected_target("linux-one")), targets.Free)
         self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Running)
@@ -379,14 +384,15 @@ class TargetStateTests(IsolatedTargetState):
         self.assertEqual(self.snapshot(), before)
 
     def test_free_now_uses_only_the_selected_targets_backoff(self) -> None:
-        offload.write_backoff(NOW.timestamp() + 30, "aws")
+        offload.write_backoff(NOW.timestamp() + 30, "linux")
         for name, answer in zip(TARGET_NAMES, ("free", "backoff", "free"), strict=True):
             result = self.invoke_mac(["free-now", "--target", name, "--repo-root", str(self.root)])
             self.assertEqual(result.stdout.strip(), answer, result.stderr)
             self.assertEqual(result.returncode, 0 if answer == "free" else 1)
 
     def test_unknown_target_commands_refuse_before_any_state_write(self) -> None:
-        commands = (["claim", "--pid", "101", "--what", "test"], ["release", "--pid", "101"],
+        commands = (["claim", "--pid", "101", "--what", "test"],
+                    ["release", "--pid", "101", "--claim-id", "claim-a", "--episode", "episode-a", "--attempt", "attempt-a"],
                     ["block", "--holder", "alice", "--for", "inspect"], ["unblock", "--holder", "alice"],
                     ["status"], ["free-now"])
         before = self.snapshot()
@@ -423,48 +429,48 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(result.stdout.strip(), "free")
         self.assertEqual(self.snapshot(), before)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         result = self.claim("linux-two")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
-        for name, expected in zip(TARGET_NAMES, ("free", "inspect aws", "test linux-two"), strict=True):
+        for name, expected in zip(TARGET_NAMES, ("free", "inspect linux", "test linux-two"), strict=True):
             result = self.invoke_mac(["status", "--target", name])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(expected, result.stdout)
-            if name != "aws":
-                self.assertNotIn("inspect aws", result.stdout)
+            if name != "linux":
+                self.assertNotIn("inspect linux", result.stdout)
             if name != "linux-two":
                 self.assertNotIn("test linux-two", result.stdout)
         self.assertEqual(self.snapshot(), before)
 
     def test_malformed_block_refuses_only_its_target(self) -> None:
-        self.directory("aws").mkdir(parents=True)
-        path = self.directory("aws") / "block.json"
+        self.directory("linux").mkdir(parents=True)
+        path = self.directory("linux") / "block.json"
         for content in ("{broken", "[]", '{"holder":"alice"}'):
             with self.subTest(content=content):
                 _ = path.write_text(content, encoding="utf-8")
-                result = self.claim("aws")
+                result = self.claim("linux")
                 self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
                 self.assertEqual(path.read_text(encoding="utf-8"), content)
-                self.assertIsInstance(targets.target_state(self.selected_target("aws")), targets.StateUnreadable)
+                self.assertIsInstance(targets.target_state(self.selected_target("linux")), targets.StateUnreadable)
                 self.assertIsInstance(targets.target_state(self.selected_target("mac")), targets.Free)
                 self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
                 before = self.snapshot()
-                result = self.invoke_mac(["status", "--target", "aws"])
+                result = self.invoke_mac(["status", "--target", "linux"])
                 self.assertEqual(result.returncode, 12, result.stdout + result.stderr)
                 self.assertEqual(self.snapshot(), before)
 
     def test_state_reads_preserve_stale_claims_and_expired_blocks(self) -> None:
         result = self.claim("linux-two")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.block("aws")
+        result = self.block("linux")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before = self.snapshot()
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
                 mock.patch.object(targets, "utc_now", return_value=NOW + timedelta(days=1)):
             self.assertIsInstance(targets.target_state(self.selected_target("linux-two")), targets.Free)
-            state = targets.target_state(self.selected_target("aws"))
+            state = targets.target_state(self.selected_target("linux"))
             self.assertIsInstance(state, targets.Held)
             if isinstance(state, targets.Held):
                 self.assertIsInstance(state.end, targets.AwaitingBlockRemoval)
@@ -474,7 +480,8 @@ class TargetStateTests(IsolatedTargetState):
         self.use_generic_linux_target()
         self.mac_state.mkdir()
         legacy = self.mac_state / "run.json"
-        _ = legacy.write_text(json.dumps({"pid": 101, "proc_start": "fake-start", "what": "legacy test",
+        _ = legacy.write_text(json.dumps({"claim_id": "claim-a", "episode": "episode-a", "attempt": "attempt-a",
+                                         "submitting_session": "", "pid": 101, "proc_start": "fake-start", "what": "legacy test",
                                          "worktree": str(self.root), "since": NOW.isoformat()}), encoding="utf-8")
         _ = (self.mac_state / "unreachable_until").write_text(str(NOW.timestamp() + 30), encoding="utf-8")
         before = self.snapshot()
@@ -487,7 +494,7 @@ class TargetStateTests(IsolatedTargetState):
             self.assertIsInstance(targets.target_state(self.selected_target(name)), targets.Free)
             self.assertNotIsInstance(offload.read_backoff(NOW.timestamp(), name), offload.ActiveBackoff)
         self.assertEqual(self.snapshot(), before)
-        result = self.invoke_mac(["release", "--pid", "101"])
+        result = self.release()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(legacy.exists())
 

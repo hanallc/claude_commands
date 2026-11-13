@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
 from scripts.production import staff, unit_config
@@ -196,7 +196,7 @@ print('SENT: fixture')
 
 
 class OpenPass(TypedDict):
-    worker_name: str
+    worker_id: str
     kind: str
     status: str
 
@@ -332,7 +332,7 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             destination = self.root / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(DIRECT_DIR.parent / relative, destination)
-        for name in ("conf.py", "conf.sh"):
+        for name in ("conf.py", "conf_reads.py", "conf.sh", "conf_record.sh"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         configure_launcher_fixture(direct_dir / "assign.sh")
@@ -404,7 +404,6 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
         environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
-        environment["UNIT_ACTIVE_DIR"] = str(self.root / "active")
         environment["UNIT_RUN_ROOT"] = str(self.root / "runs")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
         return environment
@@ -465,7 +464,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
               patch.object(assign, "SCRIPTS", direct),
               patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
               patch.object(assign_claude, "SCRIPTS", direct),
-              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py"))):
+              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
+              direct_launcher_helpers()):
             return invoke_cli(module, child_main, arguments, environment, self.working_dir)
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
@@ -628,3 +628,13 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             json.loads((session_dir / "progress_history_state.json").read_text(encoding="utf-8")),
         )
         return stored["pass"]
+
+
+class InProcessAssignClaudeLauncherFixture(AssignClaudeLauncherFixture):
+    """Run content calls in process after the fixture prepares its child entry."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"MODELS_CONFIG_TIER_ONLY": "1"})))
+        _ = self.enterContext(patch.object(self, "direct_cli_calls", not process_boundary_for_case(self)))

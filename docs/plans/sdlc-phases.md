@@ -304,7 +304,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 #### As-built
 
-- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/plans/verify-copies.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
+- `docs/plans/sdlc-run-cancel-design.md` holds each owner's answer to builds' part. The design defines no copy path. It points to the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/as-built/gate-checkouts.md`), and the run-stop provenance goes in a file inside that folder. `board.sh` is natedev's file.
 - verify-unit agreed items 1, 3, 4 and 6: the launchers export the owner link before `verify.sh` refuses calls without it; one command id passes down in the environment; the TERM order builds on verify-unit's token fix (no reclaim from a live holder, token renewed with `--pid`); the Mac claim stays until the remote side is empty; one 15 s attempt deadline; only verify's own cancel path sets exit 77.
 - resources-unit agreed item 2: charges bind to the step's systemd scope cgroup; a dead wrapper's kept charge counts measured memory; a step with no scope keeps today's rule; hold waits cancel through `interrupt-local`; a stopped command leaves a tombstone.
 - Items still open stay under the doc's Open questions. No code changed.
@@ -437,7 +437,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `scripts/lib/process_start.py` — the shared reader and `OwnerCheck`; `scripts/lib/test_process_start.py`.
 - `scripts/lib/process_start_test_support.py` — the one fake stat helper for tests (`write_stat`, `process_start_probe`, `stored_start_probe`).
 - `scripts/direct/assign.py`, `findings.py`, `verify.sh`, `end_session.sh` — the five rerun fixes; tests in `test_assign_launcher.py`, `test_findings.py`, `test_verify_hold_lint.py`, `test_verify_hold_wait.py`, `test_end_session.py`.
-- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/shutdown/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
+- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/agents/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
 
 **Binds later work:**
 - Any code that reads a process start or decides a process is stale calls `scripts.lib.process_start` (`check_owner`, `check_group_leader`). Only GONE and REPLACED reclaim. Only ALIVE signals. UNKNOWN keeps the record.
@@ -524,3 +524,42 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Gotchas:** `repair` and `committed` take no shared lock, so a checkpoint during a repair of the same phase can lose its pending-release record. The cargo-berth side of the shared release belongs to tile.
 
 **Ruled out:** a repair/checkpoint lock in this phase (a new guard; a next item).
+
+### Phase 22 — Checkpoint notices carry no Parallel line  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- Checkpoint notices carry no `Parallel:` line. `merge_checkpoint.py` takes no `--parallel` argument and has no `check_parallel`.
+- `phase_table.py` has no `parallel` subcommand, no `"parallel"` JSON key and no `CouldStart`, `NothingToStart`, `DependenciesUnknown` or `ParallelCheck` types.
+- `plan_history.plan_phases(plan_path)` reads no `**Depends on:**` line; each `PlanPhase` has `id`, `title` and `done`. `plan_member` stays for `phase_table.py` and `progress_history.py`.
+- `dailies_input.py` prints no `parallel check:` line.
+- The docs keep the `**Depends on:**` rule and the rule that a director starts independent phases itself, with no report line.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — checkpoint merge request checks, without the Parallel line
+- `scripts/direct/phase_table.py` — phase table build and render
+- `scripts/direct/plan_history.py` — plan phase reader
+- `scripts/production/dailies_input.py`, `scripts/production/unit_phases.py` — callers without the parallel data
+- `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
+
+**Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
+
+**Files:**
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows

@@ -1,19 +1,32 @@
 # Production format
 
-The shared contract for a **production**: several `/unit:direct` runs building
-one deliverable in parallel, coordinated by one session. The commands sit in one
-folder per role under `~/.claude/commands/`. These read or write this format and
-must not drift from it:
+This contract defines a **production** with units that build one deliverable in parallel.
+One showrunner coordinates the units.
+Commands use one folder per role under `~/.claude/commands/`.
+These commands read or write this format:
 
 - `/producer:greenlight` — judges whether phased plans should run as a
   production and proposes the units.
 - `/producer:to_production` — splits the plans into unit plans and writes the
   production doc.
 - `/showrunner:produce` — runs the production from the showrunner session.
-- `/showrunner:dailies` — reports the production to the executive producer.
-- `/showrunner:report_interval` — changes how often the scheduled updates come.
+- `/showrunner:units` — shows the production status.
 - `/showrunner:accounts` — opens the accounts board.
-- `/unit:direct` — a unit's run; it applies <ProductionUnit/> below.
+- `/unit:direct`, `/unit:merge`, and `/unit:style` — unit commands selected by the staff row's `unit_type`.
+
+The staff row stores each unit's type: `direct`, `merge`, or `style`.
+
+| Type | Command | Work |
+| --- | --- | --- |
+| `direct` | `/unit:direct` | Phased implementation plans |
+| `merge` | `/unit:merge` | Authorized merge, gate, build, and promotion orders |
+| `style` | `/unit:style` | Standing tickets under `docs/direct/style_unit.md` |
+
+An absent type reads as `direct`; invalid values make the row unreadable.
+Readers discard the field on other staff kinds; the next write removes it.
+Promotion removes the type; demotion selects an explicit type with `--unit-type`, default `direct`.
+Pending admission and demotion records keep the selected type until the operation completes.
+Launch, resume, account move, rename, and compaction select the command from this type.
 
 ---
 
@@ -28,13 +41,12 @@ must not drift from it:
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
   and reports when asked. It writes no implementation code.
-- **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
-  branch. A unit is named for its area, e.g. `widget`. Its plan, worktree,
-  branch, phases, checkpoints and ETA are the unit's.
-- **Unit director** — the Claude session that runs a unit: the `/unit:direct`
-  session the showrunner launches in its own herdr session. It receives messages,
-  decides, writes Work Orders, dispatches workers, runs gates, checkpoints and
-  reports. It writes no implementation code.
+- **Unit** — a production member with its own worktree and branch.
+  Its plan, phases, checkpoints, and ETA belong to the unit.
+- **Unit director** — the Claude session that runs a unit in a herdr tab.
+  The director writes Work Orders and dispatches workers.
+  The director controls gates, checkpoints, and reports.
+  The director writes no implementation code.
 - **Worker** — a staff member under a unit or showrunner, with a native Claude or Codex conversation in a pane.
   Launchers use the run's existing transport pin.
   Pane assignments reuse an idle or resumable worker in role-number order.
@@ -86,11 +98,6 @@ The showrunner staff row gives its path. The row's `name` is the production name
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **Updates:** `on demand` (the default, also when the line is missing), or every <N>
-  minutes when the user asks for a schedule; each update reports every unit in full; the
-  update timer reads N from this line, `on demand` runs no timer and a dailies runs only
-  when the user asks, and `/showrunner:report_interval` changes it (user, 2026-10-13: no
-  timer unless asked)
 - **Merge tests:** <backticked commands for the showrunner checkout on every merge,
   in addition to the changed packages' tests.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
@@ -123,10 +130,36 @@ The showrunner staff row gives its path. The row's `name` is the production name
   still to decide or hand out show as `N projects` in the `For you:` line
 - **Efficiency ledger:** <path to a nightly-review style ledger>; optional; its
   proposed and deferred lines show as `N efficiency` in the `For you:`
-  line on the status line and in the dailies footer
+  line on the status line
 
 Read the current showrunner name from its staff row.
 Send to the address from `showrunners.py address <showrunner name>`.
+
+## Style units
+
+Pass `--unit-type style` when launching a style unit with `add_unit.py`.
+The table below stores family ownership and ticket limits.
+
+Include this table when the production controls style units.
+It can name one to four units. Each family has exactly one owner.
+One unit can own all four families. Unit names are staff names, not derived family ids.
+Refill refuses a configuration with a missing owner.
+
+| Unit | Families | Open tickets |
+| --- | --- | --- |
+| `<unit staff name>` | names, values, types, modules | 1 |
+
+`Open tickets` sets how many tickets the unit can have assigned at once; an empty value means 1.
+A row whose unit reads `<name> (retired <date>)` makes no assignment and claims no family.
+A table with only retired rows has no assignments and no owner check.
+Each ticket gets its own Codex worker through `assign.sh`.
+The Families table in `docs/style_production.md` sets work order, not ownership.
+Apply each rule exception the same way in every crate, for any unit count.
+
+With `**Kind:** style`, units merge through the style showrunner and its style merge branch.
+Otherwise, units branch from the branch point and the parent merges each ticket as a normal unit checkpoint.
+The parent's merge branch is the branch point for the direct route.
+Direct units use `style_sync.py` for normal main merges; see `docs/style_production.md`.
 
 ## Hub files
 
@@ -149,7 +182,7 @@ The row gives its name, parent and worktree; git there gives the repository and 
 The units appear in staff.json row order. Untracked `.unit.toml` at the worktree root gives
 the plan, app port and short duty names. Responsibilities do not limit changed paths.
 
-The staff name names the unit everywhere: in the log, the dailies, the waits and
+The staff name names the unit everywhere: in the log, the status table, the waits and
 every tool's arguments. A unit's session name can change, so find the unit at that moment:
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/unit_lookup.py pane <showrunner name> <unit>`
 prints its pane, and `unit_lookup.py list <showrunner name>` prints every unit's pane and its
@@ -176,7 +209,7 @@ It stops worker agents and retains their rows, native conversations, and stopped
 `/agents resume NAME --retired` restores the worktree and resumes the director and its retained workers.
 The showrunner asks the user yes or no before it runs `--retired`.
 
-A retired unit keeps its staff row. The status script, the dailies, the waits and the stall watch
+A retired unit keeps its staff row. The status script, the waits and the stall watch
 skip it. A unit's plan run ending retires nothing, because the unit's next plan keeps the same
 reviewer.
 
@@ -229,6 +262,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    notice after each final-gate and as-built commit. Timing:
    `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
+   When several small changes are coming, hold their notices and send them together.
+   The merge gate lands them in one batch run.
+
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
@@ -237,18 +273,13 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    ```
    From <unit>: phase <N> checkpoint <hash> — <title>. Shots: <paths | none, no visible change>. Phase <next> ETA: <HH:MM zone>
    review trial: ux <N> findings, code <N> findings, review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>
-   Parallel: <Phase N, Phase M could start | none — <what the next phase waits on>>
    design check: <pass | N defects, each moved to <phase>> — fresh check on exactly these shots, built from <hash>
    ```
 
    A phase checkpoint's notice carries the second line:
    `progress_history.py review-trial`'s output, verbatim
    (`/unit:checkpoint` step 9). `Phase <next> ETA` counts from the code
-   checkpoint commit. The `Parallel:` line is
-   `phase_table.py parallel --session-dir <SESSION_DIR>`'s output, verbatim.
-   `merge_checkpoint.py` refuses `Parallel: unknown`: add the plan's missing
-   `**Depends on:**` lines (`/plan:to_phased_plan` → <PhaseNumbering/>) and
-   rerun.
+   checkpoint commit.
 
    The shrink notice has this form:
 
@@ -298,11 +329,9 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    dispatch (user, 2026-10-16), and when the showrunner asks:
    `git fetch origin <merge branch> && git merge --no-ff -m "merge(<plan-slug>): <merge branch> at <short hash> — <reason>" origin/<merge branch>`.
    Resolve conflicts on your side, build and test, then continue.
-   Standing style units instead use
-   `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`.
-   Refill waits for the previous ticket's merge, so no unmerged unit work remains
-   at phase start. Report a refused fast-forward to the style showrunner as an
-   error; never create a merge commit to work around it.
+   Standing style units use the configured sync route.
+   A pending sync stops new assignments while assigned workers finish.
+   Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrunner route or Direct route.
 6. **Start order.** The showrunner records a start-order wait as an owed action in its notes.
    Use `cargo-berth sequence` for merge order.
 7. **What a phase fixes** (user, 2026-09-28 and 2026-10-01). Reviews, design

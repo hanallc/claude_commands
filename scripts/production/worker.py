@@ -10,28 +10,32 @@ import argparse
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, replace
-from enum import IntEnum
+from enum import Enum, IntEnum
 from importlib import import_module
+from functools import partial
 import io
 import json
+import math
 import os
 import re
 import time
 from pathlib import Path
 import subprocess
 import sys
-from typing import Literal, cast, final
+from typing import Literal, Protocol, cast, final
 
 from scripts.agents import detached_runs, worker_lifecycle
-from scripts.accounts import accounts
-from scripts.direct import progress_history
+from scripts.herdr import herdr_types
+from scripts.accounts import accounts, session_state
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import atomic_file, conf, unit_runs
+from scripts.lib import atomic_file, conf, detached, unit_runs
+from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
-from scripts.production import session_staff, staff, worker_admission
+from scripts.production import display_cells, session_staff, staff, worker_admission
 
 from scripts.herdr import herdr
 
@@ -51,6 +55,7 @@ class DispatchSubmitted:
     """The transcript contains the prompt without a matching final reply."""
 
     reply: str = ""
+    compacted_after_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,7 +125,7 @@ class DispatchPrompt:
     dispatch_id: str
 
 
-def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRecord],
+def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
@@ -133,13 +138,20 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 incomplete = True
                 continue
+            if isinstance(entry, dict):
+                if rollouts.is_compaction(cast(rollouts.RolloutRecordJson, cast(object, entry))):
+                    if submitted and responding and isinstance(reply, DispatchSubmitted):
+                        reply = replace(reply, compacted_after_prompt=True)
+                    continue
+                entry = worker_admission.transcript_entry(entry, set())
             if entry.startswith("user:\n"):
                 text = entry.removeprefix("user:\n").strip()
                 results = {part.removeprefix("Detached run: ") for part in text.splitlines()
                            if part.startswith("Detached run: ")}
                 received.update(results)
                 if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        any(f"End your final reply with DONE {identity}." in text for identity in
+                        any(f"End your final reply with DONE {identity}." in text
+                            or f"End your final reply with this line alone: DONE {identity}\n" in text for identity in
                             (line.dispatch_id, worker_panes.stage_two_completion_id(line.dispatch_id)))):
                     submitted = True
                     responding = True
@@ -147,7 +159,8 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 elif isinstance(completion, FinalReply):
                     responding = False
                     reply = DispatchSubmitted()
-                elif "Read the unchanged prompt file" in text and "End your final reply with DONE " in text:
+                elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
+                        "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
                 elif submitted and responding and results:
                     reply = DispatchAwaitingReply(
@@ -158,10 +171,10 @@ def transcript_receipt(entries: Iterable[str | worker_admission.TornTranscriptRe
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
                 else:
-                    endings = {f"DONE {completion.dispatch_id}"}
+                    complete = worker_admission.reply_ends_dispatch(text, completion.dispatch_id)
                     if isinstance(line, DispatchPrompt):
-                        endings.add(f"DONE {worker_panes.stage_two_completion_id(completion.dispatch_id)}")
-                    complete = bool(text.rstrip().splitlines()[-1:] and text.rstrip().splitlines()[-1] in endings)
+                        complete = complete or worker_admission.reply_ends_dispatch(
+                            text, worker_panes.stage_two_completion_id(completion.dispatch_id))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
                 if not (isinstance(line, DispatchPrompt) and isinstance(reply, DispatchComplete)):
@@ -195,14 +208,25 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
             raise ValueError("no review was written")
 
 
+def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend
+                     ) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+    try:
+        source = worker_admission.transcript_source(row, backend)
+    except ValueError as error:
+        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+            return
+        raise
+    yield from worker_admission.transcript_records(source)
+
+
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: Path) -> DispatchReceipt:
     """Read the shared receipt and require delivery of detached results."""
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    transcript = transcript_receipt(worker_admission.conversation_entries(row, backend, set()), line, DoneReply(dispatch_id))
+    transcript = transcript_receipt(_receipt_records(row, backend), line, DoneReply(dispatch_id))
     if isinstance(transcript.receipt, DispatchNotSubmitted):
-        transcript = transcript_receipt(worker_admission.conversation_entries(row, backend, set()), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
+        transcript = transcript_receipt(_receipt_records(row, backend), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
@@ -226,30 +250,43 @@ def _client() -> herdr.Herdr:
     return herdr.Herdr(herdr.shared_session())
 
 
-def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "") -> None:
+def _agent_command(client: herdr.Herdr, worker: worker_panes.OpenWorker, action: str, line: str = "", *,
+                   deadline: float = math.inf,
+                   on_submission: Callable[[], object] = lambda: None) -> None:
     if not herdr.check_target(str(worker.row.current_session), action="keys",
             place=herdr.HerdrPlace(client.session, worker.pane), terminal=worker.terminal, text=line, client=client):
-        raise herdr.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
+        raise herdr_types.HerdrFailure(f"{worker.row.name}: dispatch target is unproved", "wrong_target")
     arguments = ["agent", "prompt" if action == "compact" else action, worker.pane]
     if action == "prompt":
         arguments.append(script_prompt(line))
     elif action == "compact":
-        arguments.extend(("/compact", "--wait"))
-    result = subprocess.run(client.argv(*arguments), text=True, capture_output=True, check=False)
+        arguments.extend(("/compact", "--timeout", str(max(0, int((deadline - time.monotonic()) * 1000))), "--wait"))
+    command = client.argv(*arguments)
+    _ = on_submission()
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
     herdr.require_success(result, f"herdr agent {action}")
 
 
-def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
-    """Compact a large Codex conversation between assignments."""
-    backend = staff.backend(current.row)
+@dataclass(frozen=True)
+class CompactionRequired:
+    backend: staff.CodexBackend
+    offset: int
+
+
+class CompactionNotRequired(Enum):
+    SKIP = "the conversation needs no compaction"
+
+
+def _compaction_plan(row: staff.StaffRow) -> CompactionRequired | CompactionNotRequired:
+    backend = staff.backend(row)
     if not isinstance(backend, staff.CodexBackend):
-        return
+        return CompactionNotRequired.SKIP
     try:
-        source = worker_admission.transcript_source(current.row, backend)
+        source = worker_admission.transcript_source(row, backend)
     except ValueError:
-        return
+        return CompactionNotRequired.SKIP
     tokens = 0
-    with source.open(encoding="utf-8") as transcript:
+    with open_transcript(source) as stream, io.TextIOWrapper(stream, encoding="utf-8") as transcript:
         for line in transcript:
             record = rollouts.decode_rollout(line)
             if record is None:
@@ -259,11 +296,31 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
             usage = rollouts.token_usage(record)
             if usage is not None:
                 tokens = usage.uncached_input + usage.cached_input + usage.output
-    if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS"):
-        _agent_command(client, current, "compact")
-        ended = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
-        if isinstance(ended, herdr.WaitTimedOut):
-            raise herdr.HerdrFailure("compaction did not finish before the settle bound", "timeout")
+        offset = stream.tell()
+    return (CompactionRequired(backend, offset) if tokens > conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
+            else CompactionNotRequired.SKIP)
+
+
+def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWorker) -> None:
+    """Compact a large Codex conversation between assignments."""
+    plan = _compaction_plan(current.row)
+    if not isinstance(plan, CompactionRequired):
+        return
+    deadline = time.monotonic() + conf.read("direct").number("WORKER_COMPACT_SECONDS")
+    _agent_command(client, current, "compact", deadline=deadline)
+    ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
+    if isinstance(ended, herdr.WaitTimedOut):
+        raise herdr_types.HerdrFailure("compaction did not finish before the compaction bound", "timeout")
+    source = worker_admission.transcript_source(current.row, plan.backend)
+    with open_transcript(source) as stream:
+        _ = stream.seek(plan.offset)
+        for line in stream:
+            if not line.endswith(b"\n"):
+                break
+            record = rollouts.decode_rollout(line.decode("utf-8"))
+            if record is not None and rollouts.is_compaction(record):
+                return
+    raise herdr_types.HerdrFailure("compaction has no transcript proof", "not_submitted")
 
 
 def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCode:
@@ -308,16 +365,96 @@ class DispatchSubmission(IntEnum):
     SUBMITTED = 0
 
 
+class LaunchRow(IntEnum):
+    CREATED = 1
+    RETAINED = 2
+
+
+def rows_before_launch() -> frozenset[StaffId]:
+    return frozenset(row.id for row in staff.snapshot().rows)
+
+
+def arm_launch_cleanup(cleanup: ExitStack, before: frozenset[StaffId],
+                       result: worker_panes.WorkerStart) -> None:
+    if isinstance(result, (worker_panes.OpenWorker, worker_panes.ProcessUnknownWorker, worker_panes.IncompleteStart)):
+        if isinstance(result.created_pane, worker_panes.CreatedWorkerPane) and result.created_pane.terminal:
+            row = LaunchRow.RETAINED if result.row.id in before else LaunchRow.CREATED
+            _ = cleanup.callback(cleanup_failed_launch, result.row, result.pane, result.created_pane.terminal, row)
+
+
+def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownership: LaunchRow) -> None:
+    """Close only the saved terminal and retire only a newly created row."""
+    try:
+        with redirect_stderr(io.StringIO()) as diagnostics:
+            client = _client()
+            closed = (client.close_tab_confirmed(pane, target=str(row.current_session), terminal=terminal)
+                      and client.close_retained_pane(pane, terminal=terminal))
+        if closed:
+            if ownership is LaunchRow.CREATED:
+                _ = staff.retire(row.id)
+            return
+        reason = " ".join(line.removeprefix("anomaly: ") for line in diagnostics.getvalue().splitlines())
+        reason = reason or "pane close is incomplete"
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+            staff.StaffRefused, staff.StaffUnreadable) as error:
+        reason = str(error)
+    print(f"anomaly: {pane}: cleanup failed: {' '.join(reason.splitlines())}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class SendNoticesAfterDispatch:
+    """This dispatch owns the lock and sends notices after its return."""
+
+
+SEND_NOTICES_AFTER_DISPATCH = SendNoticesAfterDispatch()
+COMPACTION_STARTED_TEXT = "compaction runs detached; the prompt follows"
+
+
+class AttachedCompaction(Enum):
+    RUN = "run compaction in this process"
+
+
+def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path) -> None:
+    handoff = worker_admission.dispatch_record(run, row.name)
+    if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED,
+                         worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
+        allowed = worker_admission.WorkerStartAllowed(row.name, parent, run, worker_admission.ExistingWorkerSlot(row))
+        worker_admission.record_dispatch(allowed, handoff.assignment_id, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
+                                        expected_request=handoff.assignment_id)
+
+
+def _done_instruction(dispatch_id: str) -> str:
+    return (f"End your final reply with this line alone: DONE {dispatch_id}\n"
+            "A reply that waits on a detached run is not final.")
+
+
+def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str) -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), "finish-dispatch", "--parent", str(parent),
+               "--worker-id", str(row.id), "--session-dir", str(run), "--dispatch-id", instance]
+    try:
+        _ = detached.start_detached(command, ready=lambda: True, within=herdr.PROGRAM_TIMEOUT_SECONDS,
+                                    output=detached.AppendLog(run / f"compact-{instance}.log"))
+    except detached.DetachedStartFailure as error:
+        progress_history.complete_dispatch(run, row.name, instance, status="error")
+        raise herdr_types.HerdrFailure(str(error)) from error
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
              fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
              policy: worker_panes.LaunchPolicy | worker_panes.UseRolePolicy = worker_panes.UseRolePolicy.CURRENT,
              started: worker_panes.OpenWorker | StartAtDispatch = START_AT_DISPATCH,
-             completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
+             completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+             on_submission: Callable[[], object] = lambda: None,
+             lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+             notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
+             ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
-    with worker_panes.worker_lock(parent, name) as hold:
+    with ExitStack() as after_dispatch, ExitStack() as operations, ExitStack() as cleanup:
+        notice_delivery = notices if isinstance(notices, ExitStack) else after_dispatch
+        hold = operations.enter_context(worker_panes.worker_lock(parent, name)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
@@ -330,13 +467,21 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
             if isinstance(receipt, DispatchComplete):
                 save_reply(Path(delivery.reply_file), receipt.reply)
-            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], None],
+            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
                           import_module("scripts.herdr.turn_end").repeat_completion_notice)
-            repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
-                   worker_panes.worker_pass(row, session_dir))
+            _ = notice_delivery.callback(repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
+                                           worker_panes.worker_pass(row, session_dir)))
             return DispatchSubmission.SUBMITTED
+        if row is not None:
+            owner = staff.snapshot().parent_of(row)
+            if owner is not None:
+                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], Callable[[], None]],
+                                   import_module("scripts.herdr.turn_end").finish_late_completion)
+                _ = notice_delivery.callback(finish_late(row, owner, hold, completion_actions.held_role))
         if isinstance(started, StartAtDispatch):
+            before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
+            arm_launch_cleanup(cleanup, before, current_start)
         else:
             if not started.row.reports_to(parent) or started.row.name != name.value or not hold.owns(started.row):
                 print("dispatch startup does not belong to this worker", file=sys.stderr)
@@ -345,6 +490,19 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if not isinstance(current_start, worker_panes.OpenWorker):
             return startup_result(name, current_start)
         started = current_start
+        if not isinstance(matched, progress_history.MatchedDispatch):
+            ready = _dispatch_ready(parent, started, _client())
+            if not isinstance(ready, worker_panes.OpenWorker):
+                return ready
+            started = ready
+            if started.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
+                print(f"{started.row.name}: agent is {started.status.value}", file=sys.stderr)
+                return ExitCode.BUSY
+
+        def submitted() -> None:
+            _ = cleanup.pop_all()
+            _ = on_submission()
+
         instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
             worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
@@ -354,8 +512,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         saved = progress_history.dispatch_delivery(worker_panes.worker_pass(started.row, session_dir))
         if not saved.line:
             dispatch_id = dispatch_id or instance
-            line = (f"Read the unchanged prompt file {json.dumps(str(prompt))}. End your final reply with DONE {dispatch_id}. "
-                    "A reply that waits on a detached run is not final.")
+            line = f"Read the unchanged prompt file {json.dumps(str(prompt))}. " + _done_instruction(dispatch_id)
             handoff = worker_admission.dispatch_record(session_dir, name.value)
             if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
                 extract = worker_admission.handoff_path(session_dir, started.row)
@@ -365,29 +522,29 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             saved = progress_history.DispatchDelivery(line, dispatch_id, str(destination),
                 str(early_ready) if isinstance(early_ready, Path) else "", completion_actions)
             progress_history.save_dispatch_delivery(session_dir, instance, saved)
-        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id, run=session_dir)
-        handoff = worker_admission.dispatch_record(session_dir, name.value)
-        if (result is DispatchSubmission.SUBMITTED and handoff.state in
-                (worker_admission.SwitchState.CREATION_INTENT_RECORDED, worker_admission.SwitchState.DISPATCH_IN_FLIGHT)):
-            allowed = worker_admission.WorkerStartAllowed(name.value, parent, session_dir, worker_admission.ExistingWorkerSlot(started.row))
-            worker_admission.record_dispatch(allowed, handoff.assignment_id, worker_admission.SwitchState.ASSIGNMENT_ACCEPTED,
-                                            expected_request=handoff.assignment_id)
+        deferred = False
+
+        def defer_compaction() -> None:
+            nonlocal deferred
+            _detach_dispatch(parent, started.row, session_dir, instance)
+            deferred = True
+            print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
+
+        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
+                               run=session_dir, on_submission=submitted, defer_compaction=defer_compaction)
+        if result is DispatchSubmission.SUBMITTED:
+            submitted()
+        if result is DispatchSubmission.SUBMITTED and not deferred:
+            _accept_dispatch(parent, started.row, session_dir)
         return result
 
 
-def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
-                   line: str, dispatch_id: str, *, run: Path) -> DispatchSubmission | ExitCode:
-    """Submit the saved prompt after the bounded idle checks."""
-    current = started
+def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
+                    client: herdr.Herdr) -> worker_panes.OpenWorker | ExitCode:
+    """Use the existing bounded wait before replacing a submitted pass."""
     codex = isinstance(staff.backend(current.row), staff.CodexBackend)
     if current.status == herdr.AgentStatus.BLOCKED and codex:
         return _blocked_question(client, current)
-    receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
-    if isinstance(receipt, DispatchEvidenceUnknown):
-        print(f"anomaly: {current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
-    if not isinstance(receipt, DispatchNotSubmitted):
-        return DispatchSubmission.SUBMITTED
     if current.status == herdr.AgentStatus.WORKING:
         try:
             _ = client.wait_turn_end(current.pane, int(conf.read("direct").number("WORKER_SETTLE_SECONDS") * 1000))
@@ -399,7 +556,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                     return _blocked_question(client, observed)
             print(f"{error}; no prompt sent", file=sys.stderr)
             return ExitCode.UNCERTAIN
-        except (OSError, herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+        except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
             print(f"{error}; no prompt sent", file=sys.stderr)
             return ExitCode.UNCERTAIN
         if not isinstance(observed, worker_panes.OpenWorker):
@@ -408,6 +565,29 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         current = observed
         if current.status == herdr.AgentStatus.BLOCKED and codex:
             return _blocked_question(client, current)
+    return current
+
+
+def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
+                   line: str, dispatch_id: str, *, run: Path,
+                   on_submission: Callable[[], object] = lambda: None,
+                   defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
+                   ) -> DispatchSubmission | ExitCode:
+    """Submit the saved prompt after the bounded idle checks."""
+    if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
+        return _blocked_question(client, started)
+    receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.UNCERTAIN
+    if not isinstance(receipt, DispatchNotSubmitted):
+        return DispatchSubmission.SUBMITTED
+    ready = _dispatch_ready(parent, started, client)
+    if not isinstance(ready, worker_panes.OpenWorker):
+        return ready
+    current = ready
+    codex = isinstance(staff.backend(current.row), staff.CodexBackend)
+    if started.status == herdr.AgentStatus.WORKING:
         receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
             print(f"{current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
@@ -418,21 +598,50 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
         return ExitCode.BUSY
     try:
+        if callable(defer_compaction) and isinstance(_compaction_plan(current.row), CompactionRequired):
+            defer_compaction()
+            return DispatchSubmission.SUBMITTED
         _compact_before_dispatch(client, current)
-    except (OSError, herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
-        print(f"{current.row.name}: compaction failed: {error}; no prompt sent", file=sys.stderr)
-        return ExitCode.UNCERTAIN
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        reason = " ".join(str(error).splitlines())
+        try:
+            composer = client.composer(current.pane)
+            if isinstance(composer, herdr.ComposerInput) and composer.text.strip() == "/compact":
+                client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
+            reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
+        print(f"{current.row.name}: compaction failed: {reason}; no prompt sent", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
-        _agent_command(client, current, "prompt", line)
+        _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
         reason = " ".join(str(error).splitlines())
         raise OSError(f"{reason}; prompt delivered to pane {current.pane}") from error
-    except (herdr.HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
         if isinstance(error, herdr.AgentBlocked) and codex:
             return _blocked_question(client, current, delivered_to=current.pane)
         reason = " ".join(str(error).splitlines())
         print(f"{reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
         return ExitCode.UNCERTAIN
+    if codex:
+        deadline = time.monotonic() + conf.read("direct").number("WORKER_SETTLE_SECONDS")
+        while True:
+            receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
+            if not isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                if isinstance(client.pane_activity(current.pane), herdr.PaneAtShell):
+                    break
+            except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired):
+                pass
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        if isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+            reason = receipt.reason if isinstance(receipt, DispatchEvidenceUnknown) else "dispatch prompt is not in the transcript"
+            print(f"anomaly: {current.row.name}: {' '.join(reason.splitlines())}; submission is unproved", file=sys.stderr)
+            return ExitCode.UNCERTAIN
     return DispatchSubmission.SUBMITTED
 
 
@@ -440,7 +649,7 @@ def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker, *, d
     print(f"question: {worker.row.name} pane {worker.pane}", file=sys.stderr)
     try:
         question = client.read(worker.pane, 40, joined=False, ansi=False)
-    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
+    except (herdr_types.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         reason = f"anomaly: {worker.row.name}: {' '.join(str(error).splitlines())}"
         if delivered_to:
             reason += f"; prompt delivered to pane {delivered_to}"
@@ -448,6 +657,108 @@ def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker, *, d
     else:
         print(question.rstrip("\n"), file=sys.stderr)
     return ExitCode.BLOCKED
+
+
+class PreparedDirectorNotice(Protocol):
+    def send_notice(self) -> None: ...
+
+
+def _dispatch_notice(parent: StaffId, identity: StaffId, run: Path, instance: str,
+                     passed: dict[str, object], outcome: Literal["error", "uncertain"], detail: str) -> None:
+    """Send the existing director notice without completing the worker turn."""
+    record = staff.snapshot()
+    owner = record.by_id(parent)
+    if owner is None:
+        raise ValueError(f"{parent}: notice recipient is not in staff")
+    row = record.by_id(identity)
+    name = row.name if row is not None else str(passed.get("team_slot", identity))
+    module = import_module("scripts.herdr.turn_end")
+    prepare = cast(Callable[[str, staff.StaffRow, Path, dict[str, object], str, object, Path, str, str],
+                            PreparedDirectorNotice], module._prepare_notice)
+    turn_outcome = cast(Callable[[str], object], module.TurnOutcome)(outcome)
+    prepare(name, owner, run, passed, instance, turn_outcome, run, "", detail).send_notice()
+
+
+def _dispatch_failure_step(identity: StaffId, step: str, action: Callable[[], None]) -> bool:
+    """Report each failed step and return whether it succeeds."""
+    try:
+        action()
+        return True
+    except (Exception, SystemExit) as error:
+        print(f"anomaly: {identity}: dispatch {step} failed: {' '.join(str(error).splitlines())}", file=sys.stderr)
+        return False
+
+
+def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str) -> int:
+    """Finish a saved dispatch outside the caller's process group."""
+    passed: dict[str, object] = {}
+    path = run / f"compact-{instance}_dispatch_error.txt"
+    diagnostics = io.StringIO()
+    result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
+    try:
+        with redirect_stderr(diagnostics):
+            record = staff.snapshot()
+            row = record.by_id(identity)
+            if row is None:
+                raise ValueError(f"{identity}: worker staff row is unavailable")
+            with worker_panes.worker_lock(parent, WorkerName.parse(row.name), blocking=True) as hold:
+                if isinstance(hold, worker_panes.Kept):
+                    raise ValueError(hold.blocker)
+                passed = worker_panes.worker_pass(row, run)
+                if passed.get("instance_id") != instance or passed.get("status") != "active":
+                    return ExitCode.OK
+                delivery = progress_history.dispatch_delivery(passed)
+                if delivery.reply_file:
+                    reply = Path(delivery.reply_file)
+                    path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
+                current = worker_panes.observe_worker(parent, row, staff.snapshot())
+                if not isinstance(current, worker_panes.OpenWorker):
+                    raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
+                result = dispatch_turn(parent, current, _client(), delivery.line, delivery.completion_id, run=run)
+                if result is DispatchSubmission.SUBMITTED:
+                    _accept_dispatch(parent, row, run)
+                    return result
+        detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
+        print(detail, file=sys.stderr)
+        if result is ExitCode.UNCERTAIN:
+            _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
+                parent, identity, run, instance, passed, "uncertain", detail))
+            return result
+    except (Exception, SystemExit) as error:
+        result = ExitCode.UNCERTAIN
+        detail = diagnostics.getvalue().strip()
+        detail = (detail + "\n" if detail else "") + str(error)
+        print(detail, file=sys.stderr)
+
+    def end_pass() -> None:
+        nonlocal passed
+        if not passed:
+            state = worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+            no_pass: dict[str, object] = {}
+            passed = next((item for item in _pass_records(state)
+                           if item.get("instance_id") == instance and item.get("worker_id") == identity), no_pass)
+        slot = str(passed.get("team_slot", ""))
+        if not slot:
+            raise ValueError(f"{instance}: dispatch pass is unavailable")
+        progress_history.complete_dispatch(run, slot, instance, status="error")
+
+    def notice() -> None:
+        if not completion_saved or not reply_saved:
+            _dispatch_notice(parent, identity, run, instance, passed, "error", detail)
+            return
+        row = staff.snapshot().by_id(identity)
+        if row is None:
+            _dispatch_notice(parent, identity, run, instance, passed, "error", detail)
+        else:
+            notify = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
+            notify(str(row.current_session))
+
+    _ = _dispatch_failure_step(identity, "pass end", end_pass)
+    completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
+        run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
+    reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
+    _ = _dispatch_failure_step(identity, "notice", notice)
+    return result
 
 
 def _role_number(name: str, role: WorkerRole) -> int:
@@ -487,10 +798,12 @@ def _free_name(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot) -
 
 
 def launch(target: worker_panes.StaffWorker | worker_panes.DurableDesignRole,
-           policy: worker_panes.LaunchPolicy) -> worker_panes.WorkerStart:
+           policy: worker_panes.LaunchPolicy, *,
+           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+           ) -> worker_panes.WorkerStart:
     """Start an explicit staff target with the supplied policy."""
     with staff.row_operation(target.parent):
-        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy)
+        return worker_panes.start_or_resume(target.parent, target.name, target.role, policy=policy, lock=lock)
 
 
 def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.WorkerStart:
@@ -498,59 +811,68 @@ def add(parent: StaffId, role: WorkerRole, *, name: str = "") -> worker_panes.Wo
         return worker_panes.start_or_resume(parent, WorkerName.parse(name) if name else _free_name(parent, role, staff.snapshot()), role)
 
 
+@herdr.pane_evidence_run()
 def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path, slot: str,
            phase: str, kind: str, launcher_command: list[str], lens: str = "", name: str = "",
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
            completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
-    if not name:
-        matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-            prompt=prompt.resolve(), launcher_command=launcher_command)
-        if isinstance(matched, progress_history.MatchedDispatch):
-            name = matched.worker_name
-    record = staff.snapshot()
-    rows = record.find(kind="worker", parent=parent)
-    needs_team = False
-    if not name and role in ("impl", "fix", "review", "test"):
-        owner = record.by_id(parent)
-        runs = unit_runs.held(str(owner.current_session) if owner is not None else "",
-                             os.environ.get("ROSTER_RUN_ROOT"), record=record)
-        with progress_history.dispatch_reads(record, dict.fromkeys([*(Path(run) for run in runs), session_dir])):
-            needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
-    if needs_team:
-        names = {row.name for row in rows}
-        for default_role in ("impl", "fix", "review", "test"):
-            if default_role in names:
-                continue
-            with redirect_stderr(io.StringIO()) as diagnostics:
-                result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
-            if isinstance(result, worker_panes.OpenWorker):
-                print(diagnostics.getvalue(), end="", file=sys.stderr)
-                continue
-            detail = (result.detail if isinstance(result, worker_panes.StartRefused) else
-                      result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
-            print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
+    with ExitStack() as cleanup:
+        if not name:
+            matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
+                prompt=prompt.resolve(), launcher_command=launcher_command)
+            if isinstance(matched, progress_history.MatchedDispatch):
+                name = matched.worker_name
         record = staff.snapshot()
-    chosen = WorkerName.parse(name) if name else select_worker(parent, role, record)
-    if not isinstance(chosen, WorkerName):
-        return startup_result(WorkerName.parse(role), chosen)
-    if chosen.value != slot:
-        if completion_actions.status_file:
-            status = Path(completion_actions.status_file)
-            target = progress_history.worker_artifact(status, slot, chosen.value)
-            completion_actions = replace(completion_actions, status_file=str(target))
-            if status.is_file():
-                _ = status.replace(target)
-        if completion_actions.summary_file:
-            target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
-            completion_actions = replace(completion_actions, summary_file=str(target))
-        if isinstance(reply, Path):
-            reply = progress_history.worker_artifact(reply, slot, chosen.value)
-    return dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=slot,
-        phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
-        fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
-        completion_actions=completion_actions)
+        rows = record.find(kind="worker", parent=parent)
+        needs_team = False
+        if not name and role in ("impl", "fix", "review", "test"):
+            owner = record.by_id(parent)
+            runs = unit_runs.held(str(owner.current_session) if owner is not None else "",
+                                 os.environ.get("ROSTER_RUN_ROOT"), record=record)
+            with progress_history.dispatch_reads(record, dict.fromkeys([*(Path(run) for run in runs), session_dir])):
+                needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
+        if needs_team:
+            names = {row.name for row in rows}
+            for default_role in ("impl", "fix", "review", "test"):
+                if default_role in names or default_role == role:
+                    continue
+                before = rows_before_launch()
+                with redirect_stderr(io.StringIO()) as diagnostics:
+                    result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
+                if isinstance(result, worker_panes.OpenWorker):
+                    arm_launch_cleanup(cleanup, before, result)
+                    print(diagnostics.getvalue(), end="", file=sys.stderr)
+                    continue
+                with ExitStack() as failed:
+                    arm_launch_cleanup(failed, before, result)
+                detail = (result.detail if isinstance(result, worker_panes.StartRefused) else
+                          result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
+                print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
+            record = staff.snapshot()
+        chosen = WorkerName.parse(name) if name else select_worker(parent, role, record)
+        if not isinstance(chosen, WorkerName):
+            return startup_result(WorkerName.parse(role), chosen)
+        if chosen.value != slot:
+            if completion_actions.status_file:
+                status = Path(completion_actions.status_file)
+                target = progress_history.worker_artifact(status, slot, chosen.value)
+                completion_actions = replace(completion_actions, status_file=str(target))
+                if status.is_file():
+                    _ = status.replace(target)
+            if completion_actions.summary_file:
+                target = progress_history.worker_artifact(Path(completion_actions.summary_file), slot, chosen.value)
+                completion_actions = replace(completion_actions, summary_file=str(target))
+            if isinstance(reply, Path):
+                reply = progress_history.worker_artifact(reply, slot, chosen.value)
+        result = dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
+            phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
+            fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
+            completion_actions=completion_actions, on_submission=cleanup.pop_all)
+        if result is DispatchSubmission.SUBMITTED:
+            _ = cleanup.pop_all()
+        return result
 
 
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
@@ -567,6 +889,11 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
     if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
         client.answer_question(state.pane, text, target=str(row.current_session))
     else:
+        run = worker_panes.worker_run(row, record=record)
+        if isinstance(progress_history.active_dispatch(row.id, run), progress_history.ActiveDispatch):
+            delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run, record=record))
+            if delivery.completion_id:
+                text += "\n" + _done_instruction(delivery.completion_id)
         client.prompt(state.pane, text, target=str(row.current_session))
     return ExitCode.OK
 
@@ -614,14 +941,25 @@ def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
     return receipt if isinstance(receipt, DispatchEvidenceUnknown) else NO_OWN_PASS
 
 
-def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch) -> ExitCode:
+@dataclass(frozen=True)
+class NoLaunchCleanup:
+    """The restore owns no new pane to close."""
+
+
+NO_LAUNCH_CLEANUP = NoLaunchCleanup()
+
+
+def _resume_launcher(row: staff.StaffRow,
+                     dispatch: progress_history.ActiveDispatch | progress_history.NoActiveDispatch, *,
+                     detached: str = "",
+                     on_submission: Callable[[], object] | NoLaunchCleanup = NO_LAUNCH_CLEANUP) -> ExitCode:
     """Read and deliver the resume step while restore holds the dispatch lock."""
     record = staff.snapshot()
     parent = record.parent_of(row)
-    step = resume_step(row, dispatch)
-    if isinstance(step, NoOwnPass):
+    step = resume_step(row, dispatch) if isinstance(dispatch, progress_history.ActiveDispatch) else NO_OWN_PASS
+    if isinstance(step, NoOwnPass) and not detached:
         return ExitCode.OK
-    recipient = row if isinstance(step, BusyPass) else parent
+    recipient = row if isinstance(step, (BusyPass, NoOwnPass)) else parent
     client = _client()
     pane = next((item for item in client.tab_sessions()
                  if recipient is not None and item.session_id == recipient.current_session), None)
@@ -631,24 +969,29 @@ def _resume_launcher(row: staff.StaffRow, dispatch: progress_history.ActiveDispa
     if isinstance(step, DispatchEvidenceUnknown):
         print(f"anomaly: {row.name}: {step.reason}", file=sys.stderr)
         return ExitCode.UNCERTAIN
-    if isinstance(step, BusyPass):
+    if isinstance(step, (BusyPass, NoOwnPass)):
         status = next((agent["agent_status"] for agent in client.agents() if agent["pane_id"] == pane.pane_id),
                       herdr.AgentStatus.UNKNOWN)
         if status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
             return ExitCode.OK
-    text = (launcher_prompt(row.id, step.dispatch_id, step.command)
-            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step))
-    client.prompt(pane.pane_id, text, target=str(recipient.current_session))
+    text = (launcher_prompt(row.id, step.dispatch_id, step.command) + ("\n" + detached if detached else "")
+            if isinstance(step, UnsubmittedAssignment) else resume_message("", own_pass=step, detached=detached))
+    submit = (client.prompt if isinstance(on_submission, NoLaunchCleanup) else
+              partial(client.prompt, on_submission=on_submission))
+    submit(pane.pane_id, text, target=str(recipient.current_session))
     return ExitCode.OK
 
 
-def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | UnsubmittedAssignment | NoOwnPass:
+def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot, *,
+             run: worker_panes.DispatchRun | worker_panes.HolderRun = worker_panes.HolderRun.CURRENT
+             ) -> BusyPass | UnsubmittedAssignment | NoOwnPass:
     """Read the worker's active pass from its own run."""
     try:
         parent = record.parent_of(row)
         if parent is None:
             raise ValueError("worker parent is unavailable")
-        active = progress_history.active_dispatch(row.id, worker_panes.worker_run(row, record=record))
+        directory = run.directory if isinstance(run, worker_panes.DispatchRun) else worker_panes.worker_run(row, record=record)
+        active = progress_history.active_dispatch(row.id, directory)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             print(f"anomaly: {row.name}: {active.reason}", file=sys.stderr)
         elif isinstance(active, progress_history.ActiveDispatch):
@@ -663,7 +1006,7 @@ def own_pass(row: staff.StaffRow, record: staff.StaffSnapshot) -> BusyPass | Uns
 
 def resume_workers(parent: StaffId, record: staff.StaffSnapshot) -> ResumeWorkers:
     """Supply Claude child launchers and pane dispatch ids to the shared builder."""
-    from scripts.shutdown.inventory import worker_resumes
+    from scripts.agents.inventory import worker_resumes
 
     holder = record.by_id(parent)
     if holder is None:
@@ -718,6 +1061,7 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",
@@ -730,6 +1074,20 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
+    held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
+    selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
+        if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
+            worker_panes.StoppedWorker, worker_panes.ClosedWorker)))) if only != "all" else ()
+    for run in held_runs:
+        for name in selected_workers if only != "all" else ("",):
+            try:
+                reaped = (detached_runs.reap_orphans(str(run), name) if name else
+                          detached_runs.reap_orphans(str(run)))
+                for run_id in reaped:
+                    print(f"{holder.name}: reaped detached run {run_id}")
+            except OSError as error:
+                print(f"anomaly: {run}: {error}", file=sys.stderr)
+                outcome = ExitCode.UNCERTAIN
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
@@ -737,7 +1095,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                 outcome = ExitCode.UNCERTAIN
                 continue
             try:
-                with worker_panes.worker_lock(parent, WorkerName.parse(state.row.name)) as hold:
+                with worker_panes.worker_lock(parent, WorkerName.parse(state.row.name)) as hold, ExitStack() as cleanup:
                     if isinstance(hold, worker_panes.Kept):
                         outcome = ExitCode.REFUSED
                         continue
@@ -749,30 +1107,141 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
                         outcome = ExitCode.UNCERTAIN
                         continue
-                    if not isinstance(active, progress_history.ActiveDispatch):
+                    detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, state.row.name)
+                    if not isinstance(active, progress_history.ActiveDispatch) and not detached:
+                        if isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+                            allowed = worker_panes.can_close(state, run=worker_panes.DispatchRun(run), lock=hold)
+                            if isinstance(allowed, worker_panes.Kept):
+                                continue
+                            closed = worker_panes.close(parent, WorkerName.parse(state.row.name), lock=hold)
+                            if not isinstance(closed, worker_panes.Closed):
+                                outcome = ExitCode.UNCERTAIN
+                                continue
+                            changed = True
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
                         continue
+                    resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
                         role = worker_panes.dispatch_role(state.row)
+                        before = rows_before_launch()
                         result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
                             account=launch_account, lock=hold, runs=runs, codex=codex)
+                        arm_launch_cleanup(cleanup, before, result)
                         code = startup_result(WorkerName.parse(state.row.name), result)
                         if code != ExitCode.OK:
                             outcome = code
                             continue
                         if isinstance(started_panes, dict):
                             started_panes[state.row.id] = cast(worker_panes.OpenWorker, result).pane
+                        opened = cast(worker_panes.OpenWorker, result)
+                        if isinstance(opened.created_pane, worker_panes.CreatedWorkerPane):
+                            resume = partial(resume, on_submission=cleanup.pop_all)
                         changed = True
-                    code = _resume_launcher(state.row, active)
+                        row = opened.row
+                    else:
+                        row = state.row
+                    code = resume(row, active)
                     if code != ExitCode.OK:
                         outcome = code
-            except (herdr.HerdrFailure, OSError, ValueError) as error:
+                    else:
+                        _ = cleanup.pop_all()
+            except (herdr_types.HerdrFailure, OSError, ValueError) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:
         print(f"{holder.name}: workers {'restored' if changed else 'unchanged'}")
+    for result in _finished_worker_results(holder, record, held_runs):
+        print(f"{result.worker}: phase {result.phase}; dispatch {result.dispatch_id}; reply {result.reply_path or 'unavailable'}")
     return outcome
+
+
+def _pass_records(state: dict[str, object]) -> list[dict[str, object]]:
+    raw = state.get("pass", {})
+    if not isinstance(raw, dict):
+        return []
+    slots = cast(dict[str, object], raw)
+    return ([slots] if "instance_id" in slots else
+            [cast(dict[str, object], value) for value in slots.values() if isinstance(value, dict)])
+
+
+def _dispatch_fields(run: str, entry: dict[str, object]) -> dict[str, object]:
+    """Read dispatch evidence from a pass or its recorder event."""
+    completion = progress_history.hook_completion(entry)
+    reply = (completion.reply_file if isinstance(completion, progress_history.HookCompletion) else
+             progress_history.dispatch_delivery(entry).reply_file)
+    if not reply:
+        saved_reply = entry.get("reply_file")
+        reply = saved_reply if isinstance(saved_reply, str) else ""
+    if not reply:
+        command = entry.get("launcher_command")
+        if isinstance(command, list):
+            parts = cast(list[object], command)
+            for index, part in enumerate(parts[:-1]):
+                if part in ("--reply-file", "--reply") and isinstance(parts[index + 1], str):
+                    reply = cast(str, parts[index + 1])
+    return {"dispatch_id": entry.get("instance_id", entry.get("pass_instance_id", "")),
+            "run_path": run,
+            "completion_state": entry.get("status", "active" if entry.get("event_type") == "pass_started" else "unknown"),
+            "reply_path": reply}
+
+
+@dataclass(frozen=True)
+class FinishedWorkerResult:
+    worker: str
+    phase: str
+    dispatch_id: str
+    reply_path: str
+    finished_at: float
+
+
+def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot,
+                             runs: Iterable[Path]) -> list[FinishedWorkerResult]:
+    """List completed passes in open phases without changing the recorder."""
+    wanted = {str(row.id).encode(): row for row in record.find(kind="worker", parent=holder.id)}
+    results: dict[tuple[Path, str], FinishedWorkerResult] = {}
+    for run in runs:
+        try:
+            state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            print(f"anomaly: {run}: {error}", file=sys.stderr)
+            continue
+        if unit_runs.run_owner(state, record) != holder:
+            continue
+        open_ids = set(recorder_state.open_phase_ids(state))
+        if not open_ids:
+            continue
+        parked = state.get(recorder_state.OPEN_PHASES_KEY, [])
+        phases = [*(cast(list[object], parked) if isinstance(parked, list) else []), state.get("phase")]
+        open_instances = {str(phase.get("id")): str(phase.get("instance_id", ""))
+                          for raw in phases if isinstance(raw, dict)
+                          for phase in (cast(dict[str, object], raw),) if phase.get("id") in open_ids}
+        history = state.get("history_file")
+        entries = [*(_worker_history_events(Path(history), wanted, complete=True)
+                     if isinstance(history, str) and history else ()), *_pass_records(state)]
+        for entry in entries:
+            if entry.get("run_id") and state.get("run_id") and entry["run_id"] != state["run_id"]:
+                continue
+            identity = entry.get("worker_id")
+            row = wanted.get(identity.encode()) if isinstance(identity, str) else None
+            if row is None or entry.get("status") != "completed":
+                continue
+            phase = entry.get("phase")
+            phase_id = (cast(dict[str, object], phase).get("id") if isinstance(phase, dict)
+                        else entry.get("phase_id"))
+            phase_instance = (cast(dict[str, object], phase).get("instance_id") if isinstance(phase, dict)
+                              else entry.get("phase_instance_id"))
+            if (isinstance(phase_id, str) and phase_instance and open_instances.get(phase_id)
+                    and phase_instance != open_instances[phase_id]):
+                continue
+            fields = _dispatch_fields(str(run), entry)
+            dispatch_id = fields["dispatch_id"]
+            if not isinstance(phase_id, str) or phase_id not in open_ids or not isinstance(dispatch_id, str) or not dispatch_id:
+                continue
+            stamp = entry.get("finished_at", entry.get("timestamp_epoch", 0))
+            results[run, dispatch_id] = FinishedWorkerResult(row.name, phase_id, dispatch_id,
+                str(fields["reply_path"]), float(stamp) if isinstance(stamp, (int, float)) else 0)
+    return sorted(results.values(), key=lambda result: result.finished_at, reverse=True)
 
 
 def _worker_list_row(row: staff.StaffRow, facts: dict[str, object]) -> dict[str, object]:
@@ -796,15 +1265,15 @@ WORKER_HISTORY_BYTES = 64 * 1024
 type WorkerHistoryTargets = dict[bytes, staff.StaffRow]
 
 
-def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generator[dict[str, object]]:
+def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
+                           complete: bool = False) -> Generator[dict[str, object]]:
     identity_pattern = re.compile(rb'"worker_id"\s*:\s*"([^"\\]*)"')
-    name_pattern = re.compile(rb'"(?:worker_name|team_slot)"\s*:\s*("(?:[^"\\]|\\.)*")')
     bad_line_reported = False
     try:
         with path.open("rb") as history:
-            offset = max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
+            offset = 0 if complete else max(0, history.seek(0, os.SEEK_END) - WORKER_HISTORY_BYTES)
             _ = history.seek(offset - 1 if offset else 0)
-            tail = history.read(WORKER_HISTORY_BYTES + bool(offset))
+            tail = history.read() if complete else history.read(WORKER_HISTORY_BYTES + bool(offset))
         if offset:
             boundary, tail = tail[:1], tail[1:]
             if boundary != b"\n":
@@ -813,11 +1282,7 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generato
             if b'"pass_started"' not in line and b'"pass_finished"' not in line:
                 continue
             identity = identity_pattern.search(line)
-            if identity is not None and identity[1]:
-                if identity[1] not in wanted:
-                    continue
-            elif not any(name[1] == json.dumps(row.name).encode()
-                         for name in name_pattern.finditer(line) for row in wanted.values()):
+            if identity is None or not identity[1] or identity[1] not in wanted:
                 continue
             try:
                 value = cast(object, json.loads(line))
@@ -836,35 +1301,43 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets) -> Generato
         print(f"anomaly: {path}: {error}", file=sys.stderr)
 
 
-def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, WorkerDispatchRecord]:
+@dataclass(frozen=True)
+class RecordedWorkerDispatches:
+    by_worker: dict[StaffId, WorkerDispatchRecord]
+    runs: tuple[Path, ...]
+
+
+def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
+                                 runs: Iterable[Path] | Literal["discover"] = "discover") -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
-    names = {(row.parent.id, row.name): row for row in workers if isinstance(row.parent, staff.ReportsTo)}
-    runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
-    for parent in parents.values():
-        runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
-        try:
-            runs.append(Path(unit_runs.marker(parent.current_session).read_text().strip()))
-        except FileNotFoundError:
-            pass
-    if current := unit_runs.environ("RUN_DIR"):
-        runs.append(Path(current))
+    if runs == "discover":
+        runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
+        for parent in parents.values():
+            runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
+            if isinstance(parent.run, staff.OpenRun):
+                runs.append(parent.run.path)
+        if current := unit_runs.environ("RUN_DIR"):
+            runs.append(Path(current))
+    run_paths = tuple(dict.fromkeys(path.resolve() for path in runs))
     found: dict[StaffId, WorkerDispatchRecord] = {}
-    histories: dict[Path, WorkerHistoryTargets] = {}
+    histories: dict[Path, dict[Path, WorkerHistoryTargets]] = {}
+    run_ids: dict[Path, object] = {}
 
-    def keep(row: staff.StaffRow, entry: dict[str, object]) -> None:
+    def keep(row: staff.StaffRow, entry: dict[str, object], run: str) -> None:
         stamp = entry.get("finished_at", entry.get("timestamp_epoch", entry.get("started_at", 0)))
         timestamp = float(stamp) if isinstance(stamp, (int, float)) else 0
         previous = found.get(row.id)
         if previous is None or timestamp > previous.timestamp:
             found[row.id] = WorkerDispatchRecord({
+                **_dispatch_fields(run, entry),
                 "kind": entry.get("kind", entry.get("pass_kind", "")),
                 "activity": entry.get("activity", entry.get("pass_activity", "")),
                 "called_agent": entry.get("called_agent", {}),
                 "status": entry.get("status", "active" if entry.get("event_type") == "pass_started" else "unknown")},
                 timestamp)
 
-    for run in dict.fromkeys(path.resolve() for path in runs):
+    for run in run_paths:
         path = run / unit_runs.STATE_FILE
         try:
             value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -876,57 +1349,75 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot) -> dict[StaffId, Wo
         if not isinstance(value, dict):
             continue
         state = cast(dict[str, object], value)
-        agent = state.get("main_agent", {})
-        session = cast(dict[str, object], agent).get("session_id", "") if isinstance(agent, dict) else ""
-        reference = state.get(unit_runs.OWNER_FIELD) or session or state.get("owner_session") or state.get("director_session")
-        owner = record.owner_of(reference) if isinstance(reference, str) else None
-        parent_id = owner.id if owner is not None else StaffId("")
+        run_ids[run] = state.get("run_id")
+        owner = unit_runs.run_owner(state, record)
+        parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
         history = state.get("history_file")
         if isinstance(history, str) and history and parent_id in parents:
-            histories.setdefault(Path(history).resolve(), {}).update({str(row.id).encode(): row
-                for row in workers if row.parent == staff.ReportsTo(parent_id)})
-        entries: list[dict[str, object]] = []
-        raw = state.get("pass", {})
-        if isinstance(raw, dict):
-            slots = cast(dict[str, object], raw)
-            entries.extend([slots] if "instance_id" in slots else
-                           [cast(dict[str, object], value) for value in slots.values() if isinstance(value, dict)])
+            histories.setdefault(Path(history).resolve(), {})[run] = {str(row.id).encode(): row
+                for row in workers if row.parent == staff.ReportsTo(parent_id)}
+        entries = _pass_records(state)
         for entry in entries:
             identity = entry.get("worker_id")
-            row = (record.by_id(StaffId(identity)) if isinstance(identity, str) and identity else
-                   names.get((parent_id, str(entry.get("worker_name") or entry.get("team_slot") or ""))))
-            if row is None or row.kind != "worker":
+            row = record.by_id(StaffId(identity)) if isinstance(identity, str) and identity else None
+            if row is None or row.kind != "worker" or row.parent != staff.ReportsTo(parent_id):
                 continue
-            keep(row, entry)
-    for path, targets in histories.items():
-        pending = targets.copy()
+            keep(row, entry, str(run))
+    for path, sources in histories.items():
+        pending = {identity: row for targets in sources.values() for identity, row in targets.items()}
         for entry in _worker_history_events(path, pending):
             identity = entry.get("worker_id")
             target = pending.get(identity.encode()) if isinstance(identity, str) and identity else None
-            if target is None and not identity:
-                matches = [pair for pair in pending.values()
-                           if pair.name == (entry.get("worker_name") or entry.get("team_slot"))]
-                if len(matches) == 1:
-                    target = matches[0]
             if target is not None:
-                keep(target, entry)
+                candidates = [run for run, targets in sources.items() if str(target.id).encode() in targets]
+                if identity := entry.get("run_id"):
+                    candidates = [run for run in candidates if run_ids[run] == identity]
+                keep(target, entry, str(candidates[0]) if len(candidates) == 1 else "")
                 del pending[str(target.id).encode()]
             if not pending:
                 break
-    return found
+    return RecordedWorkerDispatches(found, run_paths)
 
 
-def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
+class WorkerFilter(Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+    ALL = "all"
+
+
+def _open_worker(state: worker_panes.WorkerPane) -> bool:
+    return isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ProcessUnknownWorker))
+
+
+def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter) -> bool:
+    return (selection is WorkerFilter.ALL or selection is WorkerFilter.OPEN and _open_worker(state)
+            or selection is WorkerFilter.CLOSED and isinstance(state, worker_panes.ClosedWorker))
+
+
+def _waiting_on(row: staff.StaffRow, detached: session_state.RunningDetachedWork) -> str:
+    return ", ".join(detached.labels.get(row.id, ())) or "-"
+
+
+def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = WorkerFilter.ALL,
+                     as_json: bool = True) -> list[dict[str, object]]:
     dispatches = _recorded_worker_dispatches(record)
+    detached = (session_state.running_detached_work(record, additional_runs=dispatches.runs)
+                if not as_json else session_state.NO_DETACHED_WORK)
+    states = {state.row.id: state for parent_id in dict.fromkeys(
+        row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo))
+        for state in worker_panes.observe(parent_id, record)} if selection is not WorkerFilter.ALL or not as_json else {}
     listing: list[dict[str, object]] = []
     for row in record.find(kind="worker"):
         parent = record.parent_of(row)
-        saved = dispatches.get(row.id, WorkerDispatchRecord({}, 0))
+        saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
         if parent is None:
+            continue
+        if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
             continue
         fields = saved.fields
         status = fields.get("status", "unknown")
         status = status if isinstance(status, str) else "unknown"
+        activity = fields.get("kind") if status in ("active", "refused") else ""
         if isinstance(row.exited, staff.Exited):
             status = "exited"
         elif isinstance(row.paused, staff.Paused):
@@ -934,25 +1425,38 @@ def list_all_workers(record: staff.StaffSnapshot) -> list[dict[str, object]]:
         work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
         if status == "active":
             try:
-                dispatch = worker_panes.worker_dispatch_state(row, worker_panes.worker_run(row, record=record))
+                run = worker_panes.worker_run(row, record=record)
+                dispatch = (worker_panes.worker_dispatch_state(row, run) if as_json else
+                            worker_panes.worker_dispatch_state(row, run, detached=detached))
                 if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
                     status, work = dispatch.value, "idle"
                 elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
                     status, work = "completed", "idle"
             except (OSError, ValueError) as error:
                 print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-        listing.append(_worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
-            "activity": fields.get("activity") or status}))
+        item = _worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
+            "activity": fields.get("activity") or status,
+            **{key: fields.get(key, "unknown" if key == "completion_state" else "")
+               for key in ("dispatch_id", "run_path", "completion_state", "reply_path")}})
+        if not as_json:
+            item["list_activity"] = activity or item["role"]
+            observed = states.get(row.id)
+            if observed is not None and isinstance(observed, worker_panes.OpenWorker):
+                item["pane"], item["state"] = _worker_pane_state(observed, detached)
+            item["waiting_on"] = _waiting_on(row, detached)
+        listing.append(item)
+    if not as_json:
+        listing.sort(key=lambda fields: not (StaffId(str(fields["id"])) in states
+                     and _open_worker(states[StaffId(str(fields["id"]))])))
     return listing
 
 
-def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
+def _worker_pane_state(state: worker_panes.WorkerPane,
+                       detached: session_state.RunningDetachedWork) -> tuple[str, str]:
     if isinstance(state, worker_panes.OpenWorker):
-        if isinstance(state.row.paused, staff.Paused):
-            return "open", "paused"
-        if isinstance(state.row.exited, staff.Exited):
-            return "open", "exited"
-        return "open", worker_panes.worker_state(state)
+        activity = "starting" if state.status == "starting" else worker_panes.worker_state(state)
+        classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
+        return "open", activity if activity == "unknown" and classified == "idle" else classified
     if isinstance(state, worker_panes.StoppedWorker):
         return "open", "exited"
     if isinstance(state, worker_panes.ClosedWorker):
@@ -960,38 +1464,71 @@ def _worker_pane_state(state: worker_panes.WorkerPane) -> tuple[str, str]:
     return "unknown", "-"
 
 
-def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True) -> list[dict[str, object]]:
+def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True,
+                 selection: WorkerFilter = WorkerFilter.ALL) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
-    observed = _read_workers(next(row for row in record.rows if row.id == parent), record)
+    detached = session_state.running_detached_work(record)
+    observed = _read_workers(next(row for row in record.rows if row.id == parent), record,
+                             scanned=detached.launcher_runs.by_session)
+    dispatches = (_recorded_worker_dispatches(record, runs=observed.runs)
+                  if as_json else RecordedWorkerDispatches({}, ()))
     with progress_history.dispatch_reads(record, observed.runs):
-        for state in observed.states:
-            facts: dict[str, object] = {"state": type(state).__name__, "work": worker_panes.worker_state(state)}
+        states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
+        for state in states:
+            if not _listed_worker(state, selection):
+                continue
+            pane, displayed_state = _worker_pane_state(state, detached)
+            work = displayed_state if isinstance(state, worker_panes.OpenWorker) else worker_panes.worker_state(state)
+            facts: dict[str, object] = {"state": type(state).__name__, "work": work}
+            if as_json:
+                saved = dispatches.by_worker.get(state.row.id, WorkerDispatchRecord({}, 0)).fields
+                facts.update({key: saved.get(key, "unknown" if key == "completion_state" else "")
+                              for key in ("dispatch_id", "run_path", "completion_state", "reply_path")})
             fields = _worker_list_row(state.row, facts)
             if isinstance(state, worker_panes.OpenWorker):
                 fields["activity"] = state.status.value
             if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
                 fields["reason"] = state.reason
             if not as_json:
-                fields["pane"], fields["state"] = _worker_pane_state(state)
+                fields["pane"], fields["state"] = pane, displayed_state
+                dispatch = progress_history.last_dispatch(state.row.id)
+                fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
+                                           and dispatch.status in ("active", "refused") else fields["role"])
+                fields["waiting_on"] = _waiting_on(state.row, detached)
             listing.append(fields)
     return listing
 
 
-def _print_workers(listing: list[dict[str, object]], as_json: bool) -> ExitCode:
+def _print_workers(listing: list[dict[str, object]], as_json: bool, record: staff.StaffSnapshot) -> ExitCode:
     if as_json:
         print(json.dumps(listing))
     else:
-        width = len(str(len(listing)))
+        locations: list[str] = []
+        for fields in listing:
+            row = record.by_id(StaffId(str(fields.get("id", ""))))
+            parent = record.parent_of(row) if row is not None else None
+            locations.append(staff.worktree_machine(parent) if parent is not None else "")
+        machines = display_cells.machine_column(locations)
+        rows = [["#", "Name", "Account", "Activity", "Pane", "State", "Waiting on"]]
         for number, fields in enumerate(listing, 1):
-            role = fields["role"] if isinstance(fields.get("role"), str) else "role unknown"
-            account = fields["account"] if isinstance(fields.get("account"), str) else "account unknown"
+            activity = fields.get("list_activity", fields.get("role"))
+            activity = activity if isinstance(activity, str) and activity else "activity unknown"
+            account = fields.get("account")
+            account = account if isinstance(account, str) else "account unknown"
             pane = fields.get("pane", "-")
             state = fields["state"]
             if pane == "-":
                 state = state if state in ("paused", "exited") else "busy" if state == "active" else "idle"
             elif pane != "open":
                 account = "-"
-            print(f"{number:>{width}} {fields['name']} {role} {account} {pane} {state} {fields.get('reason', '')}".rstrip())
+            machine = f" ({machines[number - 1]})" if machines else ""
+            reason = f" ({fields['reason']})" if fields.get("reason") else ""
+            rows.append([str(number), str(fields["name"]), account + machine, activity, str(pane), str(state) + reason,
+                         " ".join(str(fields.get("waiting_on", "-")).splitlines())])
+        widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+        for row in rows:
+            print("  ".join(cell.rjust(widths[column]) if column == 0 else cell.ljust(widths[column])
+                            for column, cell in enumerate(row)).rstrip())
     return ExitCode.OK
 
 
@@ -1017,6 +1554,7 @@ class Arguments(argparse.Namespace):
     lens: str = ""
     reply: str = ""
     dispatch_id: str = ""
+    worker_id: str = ""
     fix_cause: str = ""
     fix_pass: int = 0
     activity: str = ""
@@ -1026,7 +1564,8 @@ class Arguments(argparse.Namespace):
     effort: str = ""
     completion_actions: str = ""
     json: bool = False
-    all: bool = False
+    all_parents: bool = False
+    selection: WorkerFilter = WorkerFilter.OPEN
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -1036,7 +1575,9 @@ def main(arguments: list[str] | None = None) -> int:
         child = commands.add_parser(command)
         if command == "list":
             _ = child.add_argument("--json", action="store_true")
-            _ = child.add_argument("--all", action="store_true")
+            _ = child.add_argument("selection", nargs="?", type=WorkerFilter,
+                                   choices=list(WorkerFilter), default=WorkerFilter.OPEN, metavar="open|closed|all")
+            _ = child.add_argument("--all-parents", action="store_true", help="read saved dispatches for every parent")
     answering = commands.add_parser("answer")
     _ = answering.add_argument("name")
     _ = answering.add_argument("--text", required=True)
@@ -1060,17 +1601,23 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--fix-pass", "--pass", type=int, default=0)
     _ = assignment.add_argument("--launcher-command", required=True, help="JSON list of launcher arguments")
     _ = assignment.add_argument("--completion-actions", default="{}")
+    finishing = commands.add_parser("finish-dispatch", help=argparse.SUPPRESS)
+    for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
+        _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
     try:
-        if args.command == "list" and args.all:
-            return _print_workers(list_all_workers(staff.local_snapshot()), args.json)
+        if args.command == "finish-dispatch":
+            return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir), args.dispatch_id)
+        if args.command == "list" and args.all_parents:
+            record = staff.local_snapshot()
+            return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)
         record = staff.snapshot()
         owner = record.by_id(StaffId(args.parent)) if args.parent else record.by_current_session(staff.runtime_id())
         if owner is None or owner.kind not in ("unit", "showrunner"):
             print("staff: caller: not opened: caller is not a unit or showrunner", file=sys.stderr)
             return ExitCode.REFUSED
         if args.command == "list":
-            return _print_workers(list_workers(owner.id, record, as_json=args.json), args.json)
+            return _print_workers(list_workers(owner.id, record, as_json=args.json, selection=args.selection), args.json, record)
         if args.command == "check":
             observed = _read_workers(owner, record)
             with progress_history.dispatch_reads(record, observed.runs):
@@ -1111,7 +1658,7 @@ def main(arguments: list[str] | None = None) -> int:
         elif code == ExitCode.OK:
             print("done")
         return code
-    except (staff.StaffUnreadable, staff.StaffRefused, herdr.HerdrFailure, OSError, ValueError) as error:
+    except (staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure, OSError, ValueError) as error:
         print(f"anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.UNCERTAIN
 

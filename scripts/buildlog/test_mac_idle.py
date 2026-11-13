@@ -332,7 +332,9 @@ done
 
     def claim(self, *, working: bool = False, remote: bool = True, work_idle_since: float = 1000,
               name: str = "research", since: float = 900) -> Path:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
+        row: dict[str, object] = {"claim_id": f"claim-{name}", "episode": f"episode-{name}",
+            "attempt": "fixture-attempt", "submitting_session": "research",
+            "pid": os.getpid(), "proc_start": "ended-owner", "what": "P15 F11 L0 run",
             "worktree": str(self.root / name), "since": datetime.fromtimestamp(since, timezone.utc).isoformat(),
             "holder_session": "research"}
         if remote:
@@ -508,13 +510,6 @@ done
             mac_idle.watch_once(self.paths, 1600, 100)
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["state"], saved["waiting"]), ("busy", 1))
-
-    def test_unchanged_stale_record_is_reported_only_once(self) -> None:
-        self.process(123, 1, "789", ("bash",))
-        errors = io.StringIO()
-        with redirect_stderr(errors):
-            self.two_passes()
-        self.assertEqual(errors.getvalue().count("ignored stale step record v-call"), 1)
 
     def test_missing_or_bad_idle_configuration_produces_a_watch_diagnostic(self) -> None:
         self.block()
@@ -694,6 +689,14 @@ done
             "TEST_RUNNER_BUSY_REASON": "disk"})
         self.addCleanup(fixture.stop_verify, process)
         fixture.wait_for_memory_wait(process)
+        def recorded_disk_exclusion() -> bool:
+            for path in (fixture.root / "verify-steps").glob("*.json"):
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                if row.get("mac_disk_exclusions") == ["mac"]:
+                    return True
+            return False
+
+        fixture.wait_until(recorded_disk_exclusion, "the recorded Mac disk exclusion", (process,))
         records = list((fixture.root / "verify-steps").glob("*.json"))
         self.assertEqual(len(records), 1)
         with mock.patch.dict(os.environ, {

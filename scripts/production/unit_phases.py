@@ -17,19 +17,28 @@ import sys
 import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
+from datetime import datetime
+from dataclasses import replace
+from zoneinfo import ZoneInfo
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import NamedTuple, TypedDict, cast
 
 from scripts.production import live_units
 from scripts.production import session_staff, showrunners, staff, staff_sources, unit_lookup
 from scripts.production.production_doc import Refusal, production_field, read_production
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.lib import conf
+from scripts.lib import names as display_names
+from scripts.lib.user_zone import user_zone
+from scripts.production import unit_config
 from scripts.message import session_send
+from scripts.herdr import herdr
 from scripts.lib.process_failure import failure_detail
 
-from scripts.direct import phase_table
+from scripts.style import style_config
+from scripts.direct import phase_table, worker_runs
 from scripts.direct import plan_history
 
 from scripts.production import display_cells
@@ -41,8 +50,18 @@ TASK_WIDTH = 80
 RunEventsReader = Callable[[Path], list[dict[str, object]]]
 
 
+class ProgressState(NamedTuple):
+    square: str
+    label: str
+
+
+PROGRESS_DONE = ProgressState("🟩", "done")
+PROGRESS_OPEN = ProgressState("🟨", "open")
+PROGRESS_NOT_STARTED = ProgressState("⬜", "not started")
+
+
 WORK_EVENT = re.compile(r'"event_type"\s*:\s*"([^"\\]+)"')
-WORK_EVENTS = frozenset(("phase_started", "phase_finished", "run_finished", "pass_started", "pass_finished",
+WORK_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "run_finished", "pass_started", "pass_finished",
                          "activity_started", "activity_finished"))
 
 
@@ -66,47 +85,201 @@ def read_work_events(path: Path) -> list[dict[str, object]]:
     return events
 
 
+def single_spaced(text: str) -> str:
+    """Join the words of text with one space each."""
+    return " ".join(text.split())
+
+
 def shortened(text: str) -> str:
-    text = " ".join(text.split())
+    text = single_spaced(text)
     return text if len(text) <= TASK_WIDTH else text[: TASK_WIDTH - 1].rstrip() + "…"
 
 
-def plan_phase_rows(fields: dict[str, object]) -> list[dict[str, object]]:
-    rows = fields.get("phases")
-    return [cast(dict[str, object], row) for row in cast(list[object], rows)
-            if isinstance(row, dict)] if isinstance(rows, list) else []
+class PlanCellPhase(TypedDict, total=False):
+    phase: str
+    title: str
+    status: str
 
 
-def phase_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
-    """Show the open phase and its task, or the plan's current state."""
-    if not isinstance(record, dict):
+class CurrentPlanPhase(TypedDict):
+    phase: str
+    of: int
+    title: str
+
+
+class PlanCellRecord(TypedDict, total=False):
+    plan: str
+    current: CurrentPlanPhase | None
+    phases: list[PlanCellPhase]
+    unavailable: str
+
+
+def record_fields(record: object) -> PlanCellRecord:
+    """Expose the existing phase cell fields from a built plan or its JSON form."""
+    if isinstance(record, phase_table.PhaseRecord):
+        current = record.current
+        return {"plan": str(record.plan),
+                "current": ({"phase": current.phase, "of": len(record.phases), "title": current.title}
+                            if isinstance(current, phase_table.OpenPhase) else None),
+                "phases": [{"phase": row.phase, "title": row.title,
+                            "status": ("done" if isinstance(row, phase_table.DonePhase) else
+                                       "running" if isinstance(row, phase_table.OpenPhase) else "todo")}
+                           for row in record.phases]}
+    return cast(PlanCellRecord, cast(object, record)) if isinstance(record, dict) else {}
+
+
+def progress_cell(record: object) -> str:
+    """Show phase states as a colored bar."""
+    rows = plan_phase_rows(record_fields(record))
+    if not rows:
         return display_cells.NONE
-    fields = cast(dict[str, object], record)
+    size = min(20, len(rows))
+    cells: list[str] = []
+    for index in range(size):
+        states = {row.get("status") for row in rows[index * len(rows) // size:(index + 1) * len(rows) // size]}
+        progress = PROGRESS_OPEN if states & {"running", "open"} else PROGRESS_NOT_STARTED if "todo" in states else PROGRESS_DONE
+        cells.append(progress.square)
+    return "".join(cells)
+
+
+def progress_legend() -> str:
+    """Describe the squares in the Progress bar."""
+    return "Progress: " + " · ".join(f"{state.square} {state.label}" for state in (
+        PROGRESS_DONE, PROGRESS_OPEN, PROGRESS_NOT_STARTED))
+
+
+def elapsed_text(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def short_time(moment: datetime, *, now: float, zone: ZoneInfo) -> str:
+    local = moment.astimezone(zone)
+    days = abs((local.date() - datetime.fromtimestamp(now, zone).date()).days)
+    return local.strftime("%H:%M" if days == 0 else "%a %H:%M" if days <= 6 else "%d %b")
+
+
+def eta_cell(record: object, *, now: float, zone: ZoneInfo,
+             open_run_phases: tuple[phase_table.OpenPhase, ...] = ()) -> str:
+    """Show the promise for open work or the next promised plan phase."""
+    phases = record.phases if isinstance(record, phase_table.PhaseRecord) else []
+    phase_ids = {phase.phase for phase in phases}
+    opened = [phase for phase in open_run_phases if phase.phase in phase_ids]
+    if not opened:
+        opened = [phase for phase in phases if isinstance(phase, phase_table.OpenPhase)]
+    current = record.current if isinstance(record, phase_table.PhaseRecord) else phase_table.NoOpenPhase()
+    selected: phase_table.OpenPhase | phase_table.TodoPhase | phase_table.NoOpenPhase
+    if opened:
+        selected = (current if isinstance(current, phase_table.OpenPhase)
+                    and any(phase.phase == current.phase for phase in opened) else opened[-1])
+    elif open_run_phases:
+        selected = open_run_phases[-1]
+    elif isinstance(current, phase_table.OpenPhase):
+        selected = current
+    else:
+        selected = next((phase for phase in phases if isinstance(phase, phase_table.TodoPhase) and phase.eta_trail),
+                        phase_table.NoOpenPhase())
+    if isinstance(selected, phase_table.NoOpenPhase):
+        return display_cells.NONE
+    if not selected.eta_trail:
+        return "no ETA"
+    promise = selected.eta_trail[-1][0]
+    text = short_time(promise, now=now, zone=zone)
+    if now > promise.timestamp():
+        text += " · late " + elapsed_text(now - promise.timestamp())
+    return shortened(text)
+
+
+def running_plan(record: object) -> bool:
+    """Return whether the record has unfinished plan phases."""
+    return any(phase.get("status") != "done" for phase in plan_phase_rows(record_fields(record)))
+
+
+def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
+    """Show the predicted finish of an unfinished plan."""
+    if (running_plan(record) and isinstance(record, phase_table.PhaseRecord)
+            and isinstance(record.plan_finish, phase_table.PredictedFinish)):
+        return short_time(record.plan_finish.at, now=now, zone=zone)
+    return display_cells.NONE
+
+
+def workers_cell(rows: list[dict[str, object]], *, now: float) -> str:
+    """Show active workers with detached runs before workers that are working."""
+    bearing: list[str] = []
+    working: list[str] = []
+    idle = 0
+    for row in rows:
+        state = row.get("state")
+        name = str(row.get("slot", ""))
+        run = row.get("run")
+        if state in ("waiting on run", "result queued", "run gone") and isinstance(run, dict):
+            run = cast(dict[str, object], run)
+            text = f"{name} {state}: {run.get('label', '')}"
+            started = run.get("started_at")
+            if state == "waiting on run" and isinstance(started, int | float):
+                text += " " + elapsed_text(now - started)
+            bearing.append(text)
+        elif state in ("working", "running", "starting"):
+            working.append(f"{name} working")
+        elif state == "idle":
+            idle += 1
+    result = " · ".join([*bearing, *working])
+    if result and idle:
+        result += f" +{idle} idle"
+    return shortened(result) if result else display_cells.NONE
+
+
+def plan_phase_rows(fields: PlanCellRecord) -> list[PlanCellPhase]:
+    return fields.get("phases", [])
+
+
+def phase_cell(record: object) -> str:
+    """Show the completed phase count and total."""
+    rows = plan_phase_rows(record_fields(record))
+    return f"{sum(row.get('status') == 'done' for row in rows)}/{len(rows)}" if rows else display_cells.NONE
+
+
+def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
+    """Show the current phase, task, and repair rounds."""
+    fields = record_fields(record)
+    if not fields:
+        return display_cells.NONE
     unavailable = fields.get("unavailable")
     if isinstance(unavailable, str):
         return "no plan"
     current = fields.get("current")
     phases = plan_phase_rows(fields)
     if (not isinstance(current, dict)
-            or cast(dict[str, object], current).get("phase") not in {row.get("phase") for row in phases}):
+            or current.get("phase") not in {row.get("phase") for row in phases}):
         done = sum(row.get("status") == "done" for row in phases)
         if not phases:
             return "no phases"
         if done == len(phases):
             return "plan done"
-        return f"between phases, {done} of {len(phases)} done" if done else "not started"
-    phase = cast(dict[str, object], current)
+        return "between phases" if done else "not started"
+    phase = current
     task = task_cell(fields, read_run=read_run)
     if task == display_cells.NONE:
         task = str(phase.get("title", ""))
-    return shortened(f"phase {phase.get('phase')} of {phase.get('of')} — {task}")
+    parts = [f"phase {phase.get('phase')} — {task}"]
+    if isinstance(record, phase_table.PhaseRecord) and isinstance(record.current, phase_table.OpenPhase):
+        current = record.current
+        if current.fix_rounds:
+            parts.append(f"fix rounds {current.fix_rounds}" + (" + 1 running" if current.fix_running else ""))
+    return single_spaced(" · ".join(parts))
 
 
 def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
     """The open step of the newest run of the unit's plan, when a phase is open."""
-    if not isinstance(record, dict):
+    fields = record_fields(record)
+    if not fields:
         return display_cells.NONE
-    fields = cast(dict[str, object], record)
     plan = fields.get("plan")
     if not isinstance(fields.get("current"), dict) or not isinstance(plan, str):
         return display_cells.NONE
@@ -115,7 +288,7 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     if isinstance(step, display_cells.NoOpenStep):
         return display_cells.NONE
     task = f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text or display_cells.NONE
-    return shortened(task)
+    return single_spaced(task)
 
 
 class OpenRunPhase(NamedTuple):
@@ -138,6 +311,7 @@ class NewestUnitRun(NamedTuple):
 
     started: float
     path: Path
+    start: dict[str, object]
 
 
 class NoOpenUnitRun(NamedTuple):
@@ -151,15 +325,11 @@ class OpenPhaseHistory(NamedTuple):
     events: list[dict[str, object]]
 
 
-def open_unit_runs(snapshot: staff.StaffSnapshot, *,
-                   read_run: RunEventsReader = read_work_events) -> dict[staff.StaffId, OpenUnitRun]:
-    """Read only each unit's newest run and retain its open phases."""
+def newest_unit_runs(snapshot: staff.StaffSnapshot) -> dict[staff.StaffId, NewestUnitRun]:
+    """Find each unit's newest run from its recorded owner."""
     snapshot = staff.StaffSnapshot(staff.active(snapshot, "unit"))
     newest: dict[staff.StaffId, NewestUnitRun] = {}
-    for path in (plan_history.history_root() / "runs").glob("*.jsonl"):
-        started_event = plan_history.run_started_event(path)
-        if started_event is None:
-            continue
+    for path, started_event in plan_history.run_starts():
         try:
             owner = unit_runs.run_owner(started_event, snapshot)
         except staff.StaffUnreadable:
@@ -170,12 +340,23 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
                         if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
         previous = newest.get(owner.id)
         if previous is None or (started, path.name) > (previous.started, previous.path.name):
-            newest[owner.id] = NewestUnitRun(started, path)
+            newest[owner.id] = NewestUnitRun(started, path, started_event)
+    return newest
+
+
+def open_unit_runs(snapshot: staff.StaffSnapshot, *,
+                   read_run: RunEventsReader = read_work_events,
+                   newest: dict[staff.StaffId, NewestUnitRun] | None = None) -> dict[staff.StaffId, OpenUnitRun]:
+    """Read each unit's staff pointer and retain its open phases."""
     result: dict[staff.StaffId, OpenUnitRun] = {}
-    for owner_id, run in newest.items():
-        events = read_run(run.path)
-        if any(event.get("event_type") == "run_finished" for event in events):
+    for owner in snapshot.find(kind="unit"):
+        if not isinstance(owner.run, staff.OpenRun) or not unit_runs.run_is_open(owner.run.path):
             continue
+        path = plan_history.history_root() / "runs" / f"{owner.run.path.name}.jsonl"
+        events = read_run(path)
+        start = next((event for event in events if event.get("event_type") == "run_started"), dict[str, object]())
+        started = next((float(value) for value in (start.get("run_started_at"), start.get("timestamp_epoch"))
+                        if isinstance(value, int | float) and not isinstance(value, bool)), 0.0)
         phases: dict[str, OpenPhaseHistory] = {}
         current = ""
         for event in events:
@@ -188,54 +369,218 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
                 _ = phases.pop(key, None)
             elif key in phases:
                 phases[key].events.append(event)
+        previous = newest.get(owner.id) if newest is not None else None
+        if previous is not None and previous.path == path:
+            started = previous.started
         if phases:
-            result[owner_id] = OpenUnitRun(run.started, run.path, tuple(
+            result[owner.id] = OpenUnitRun(started, path, tuple(
                 OpenRunPhase(phase.phase_id, display_cells.open_step(phase.events)) for phase in phases.values()))
     return result
 
 
-def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun) -> str:
+def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_record: object = None) -> str:
+    """Show open phases outside the plan, excluding the phase that Notes names."""
     if isinstance(run, NoOpenUnitRun):
         return display_cells.NONE
-    fields = cast(dict[str, object], record) if isinstance(record, dict) else {}
+    fields = record_fields(record)
     phase_ids = {str(row.get("phase")) for row in plan_phase_rows(fields)}
+    notes_fields = record_fields(notes_record)
+    current = notes_fields.get("current")
+    if (not isinstance(notes_fields.get("unavailable"), str) and isinstance(current, dict)
+            and current.get("phase") in {row.get("phase") for row in plan_phase_rows(notes_fields)}):
+        phase_ids.add(current["phase"])
     work: list[str] = []
     for identifier, step in run.phases:
         if identifier and identifier not in phase_ids:
             text = (f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text
                     ) if isinstance(step, display_cells.OpenStep) else display_cells.NONE
-            work.append(shortened(f"{identifier}: {text}"))
+            work.append(single_spaced(f"{identifier}: {text}"))
     return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
 
 
-def queued_cell(staff_id: staff.StaffId) -> str:
+def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE) -> str:
+    """Show queued work, excluding queue items equal to Notes."""
     try:
         items = unit_queue.read(staff_id)
     except (OSError, ValueError) as error:
         print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
-        return "queue unreadable"
-    return (shortened(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else display_cells.NONE
+        queue = "queue unreadable"
+    else:
+        items = [item for item in items if item != notes]
+        queue = (single_spaced(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
+    rows = [row for row in plan_phase_rows(record_fields(record)) if row.get("status") not in ("done", "running", "open")]
+    plan = ""
+    if rows:
+        title = single_spaced(rows[0].get("title", ""))
+        plan = (f"plan: phase {rows[0].get('phase')}: {title}"
+                + (f" +{len(rows) - 1} more" if len(rows) > 1 else ""))
+    return " · ".join(part for part in (queue, plan) if part) or display_cells.NONE
 
 
-def table(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
-    snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
+def session_directory(run: NewestUnitRun) -> Path:
+    candidates = [root / run.path.stem for root in unit_runs.run_roots()]
+    return next((path for path in candidates if path.is_dir()), candidates[0])
+
+
+def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRun | NoOpenUnitRun,
+                  record: object, *, read_plan: Callable[[Path], list[plan_history.PlanPhase]]) -> PlanCellRecord:
+    """Read unfinished plan headings against the newest run's open phases."""
+    if not isinstance(member.worktree, staff.PresentWorktree):
+        return {}
+    value = run.start.get("project_plan_doc") or run.start.get("plan_doc")
+    if not isinstance(value, str) or not value:
+        return {}
+    previous = run.start.get("working_dir")
+    if isinstance(previous, str) and previous and value.startswith(previous + "/"):
+        value = str(Path(value).relative_to(previous))
+    path = plan_history.resolve_plan_path(member.worktree.path, value)
+    if isinstance(record, phase_table.PhaseRecord) and record.plan == path:
+        return record_fields(record)
+    running = {phase.phase_id for phase in opened.phases} if isinstance(opened, OpenUnitRun) else set[str]()
+    return {"plan": str(path), "phases": [
+        {"phase": phase["id"], "title": phase["title"],
+         "status": "done" if phase["done"] else "running" if phase["id"] in running else "todo"}
+        for phase in read_plan(path)]}
+
+
+def worker_heading() -> str:
+    """Return the worker column title from the configured display names."""
+    loaded = display_names.runtime_names()
+    return loaded.audience("workers").capitalize() if isinstance(loaded, display_names.Names) else display_cells.NONE
+
+
+def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
+          now: float | None = None, zone: ZoneInfo | None = None,
+          snapshot: staff.StaffSnapshot | None = None,
+          pane_rows: dict[staff.StaffId, list[dict[str, object]]] | None = None,
+          runs_reader: worker_runs.WorkerRuns | None = None) -> str:
+    snapshot = plan_history.staff_record() if snapshot is None else snapshot
+    if now is None:
+        now = runs_reader.now if runs_reader is not None else plan_history.now_epoch()
+    zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
+    plans: dict[Path, list[plan_history.PlanPhase]] = {}
+
+    def read_plan(path: Path) -> list[plan_history.PlanPhase]:
+        if path not in plans:
+            try:
+                plans[path] = plan_history.plan_phases(path)
+            except (OSError, UnicodeError):
+                plans[path] = []
+        return plans[path]
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
-            events[path] = read_work_events(path)
+            events[path] = plan_history.read_run_events(path)
         return events[path]
 
-    runs = open_unit_runs(snapshot, read_run=read_run)
-    lines = ["| Unit | Status | Phase | Non-Phase Work | Queued |", "| --- | --- | --- | --- | --- |"]
-    for unit in units:
+    unit_snapshot = staff.StaffSnapshot(tuple(
+        current for unit in units if isinstance(unit.member, staff.StaffRow)
+        if (current := snapshot.by_id(unit.member.id)) is not None))
+    newest = newest_unit_runs(unit_snapshot)
+    runs = open_unit_runs(unit_snapshot, read_run=read_run, newest=newest)
+    runs_reader = worker_runs.WorkerRuns(now) if runs_reader is None else runs_reader
+    if pane_rows is None:
+        try:
+            unit_ids = {member.id for member in unit_snapshot.rows}
+            worker_snapshot = replace(snapshot, rows=tuple(
+                row for row in snapshot.rows if row.id in unit_ids
+                or isinstance(row.parent, staff.ReportsTo) and row.parent.id in unit_ids))
+            pane_rows = worker_runs.pane_worker_rows(worker_snapshot)
+        except (OSError, ValueError) as error:
+            print(f"unit_phases: workers: {error}", file=sys.stderr)
+            pane_rows = {}
+    machines = display_cells.machine_column([unit.machine for unit in units])
+    status_rows: list[tuple[str, ...]] = []
+    work_rows: list[tuple[str, ...]] = []
+    show_plan_eta = False
+    for index, unit in enumerate(units):
         record = records.get(unit.unit)
+        progress_record = record
         member = unit.member
-        other = non_phase_cell(record, runs.get(member.id, NoOpenUnitRun())) if isinstance(member, staff.StaffRow) else display_cells.NONE
-        queued = queued_cell(member.id) if isinstance(member, staff.StaffRow) else display_cells.NONE
-        cells = (unit.unit, unit.status, phase_cell(record, read_run=read_run), other, queued)
-        lines.append("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |")
+        opened: OpenUnitRun | NoOpenUnitRun = NoOpenUnitRun()
+        queued_record = record
+        workers = display_cells.NONE
+        open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
+        if isinstance(member, staff.StaffRow):
+            run = newest.get(member.id)
+            opened = runs.get(member.id, NoOpenUnitRun())
+            if not plan_phase_rows(record_fields(record)) and run is not None:
+                queued_record = fallback_plan(member, run, opened,
+                                              record, read_plan=read_plan)
+            phase_ids = {phase.get("phase") for phase in plan_phase_rows(record_fields(record))}
+            if isinstance(opened, OpenUnitRun) and (
+                not phase_ids or any(phase.phase_id not in phase_ids for phase in opened.phases)
+            ):
+                plan = (record_fields(record).get("plan") or record_fields(queued_record).get("plan")
+                        or (str(run.start.get("project_plan_doc") or run.start.get("plan_doc") or "")
+                            if run is not None else ""))
+                run_record = phase_table.build_run(Path(plan), read_run(opened.path))
+                open_run_phases = tuple(phase for phase in run_record.phases if isinstance(phase, phase_table.OpenPhase))
+                if not phase_ids:
+                    progress_record = run_record
+            if (run is not None and isinstance(member.worktree, staff.PresentWorktree)
+                    and member.worktree.machine == remote.local_machine()):
+                rows = worker_runs.observe_pane_rows(session_directory(run), pane_rows.get(member.id, []),
+                                                     snapshot, member.id, read_run(run.path), runs_reader)
+                workers = workers_cell(rows, now=now)
+        notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
+        notes = notes_cell(notes_record, read_run=read_run)
+        queued = (queued_cell(member.id, queued_record, notes=notes)
+                  if isinstance(member, staff.StaffRow) else display_cells.NONE)
+        show_plan_eta = show_plan_eta or running_plan(progress_record)
+        status_rows.append((unit.unit, unit.status, *((machines[index],) if machines else ()),
+                            progress_cell(progress_record), phase_cell(progress_record),
+                            eta_cell(progress_record, now=now, zone=zone, open_run_phases=open_run_phases),
+                            eta_plan_cell(progress_record, now=now, zone=zone), workers))
+        work_rows.append((unit.unit, notes, non_phase_cell(record, opened, notes_record=notes_record), queued))
+    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan",
+                      worker_heading())
+    work_headers = ("Unit", "Notes", "Non-Phase Work", "Queued")
+    if not show_plan_eta:
+        status_headers = (*status_headers[:-2], status_headers[-1])
+        status_rows = [(*cells[:-2], cells[-1]) for cells in status_rows]
+    progress_column = 3 if machines else 2
+    show_progress = any(cells[progress_column] != display_cells.NONE for cells in status_rows)
+    lines: list[str] = []
+    for headers, table_rows in ((status_headers, status_rows), (work_headers, work_rows)):
+        if lines:
+            if show_progress:
+                lines.extend(("", progress_legend()))
+            lines.append("")
+        headers, table_rows = display_cells.wrapped(headers, table_rows)
+        lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
+                      "| " + " | ".join(("---",) * len(headers)) + " |"))
+        lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
     return "\n".join(lines)
+
+
+def production_records(doc: Path) -> dict[str, object]:
+    """Build phase facts once for each configured unit plan."""
+    snapshot = plan_history.staff_record()
+    resolver = session_staff.RowResolver(snapshot)
+    records: dict[str, object] = {}
+    plans: dict[Path, phase_table.PhaseRecord | dict[str, object]] = {}
+    for member in unit_lookup.doc_units(doc, snapshot):
+        try:
+            tree = resolver.unit_worktree(member)
+            config = resolver.unit_config(member)
+            if not isinstance(tree, staff.PresentWorktree):
+                records[member.name] = {"unavailable": "the worktree is not recorded"}
+            elif not isinstance(config, unit_config.UnitConfig):
+                records[member.name] = {"unavailable": ("configuration is unavailable"
+                                                     if isinstance(config, session_staff.NoUnitConfig) else config.reason)}
+            elif isinstance(config.plan, unit_config.PlanFile):
+                path = (tree.path / config.plan.path).resolve()
+                if path not in plans:
+                    try:
+                        plans[path] = phase_table.build_plan(path, resolver=resolver)
+                    except phase_table.NoPlan as error:
+                        plans[path] = {"unavailable": str(error)}
+                records[member.name] = plans[path]
+        except ValueError as error:
+            records[member.name] = {"unavailable": str(error)}
+    return records
 
 
 def is_style_production(doc: Path) -> bool:
@@ -250,7 +595,7 @@ def style_ledger_paths(doc: Path, units: list[live_units.LiveUnit]) -> dict[str,
     from scripts.style import style_ledger
 
     try:
-        rows = {row.name: row for row in unit_lookup.doc_units(doc, staff.snapshot())}
+        rows = {row.name: row for row in unit_lookup.doc_units(doc, plan_history.staff_record())}
     except (OSError, staff.StaffRefused) as error:
         print(f"unit_phases: {error}", file=sys.stderr)
         return {}
@@ -285,6 +630,9 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
 
 def main(arguments: list[str]) -> int:
     match arguments:
+        case ["--help"] | ["-h"]:
+            print("usage: unit_phases.py [--production <staff name>]")
+            return 0
         case ["--production", name]:
             pass
         case []:
@@ -296,24 +644,36 @@ def main(arguments: list[str]) -> int:
         case _:
             print("usage: unit_phases.py [--production <staff name>]", file=sys.stderr)
             return 2
-    with session_staff.anomalies() as rendering_lines:
+    with session_staff.anomalies() as rendering_lines, herdr.observation_snapshot():
         try:
-            doc = read_production(name).doc
-            style = is_style_production(doc)
-            with ThreadPoolExecutor(max_workers=2) as reads:
-                sessions = reads.submit(live_units.read_units, name,
-                                        check=staff_sources.CodexProcessThreads().check)
-                records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
-                listing = sessions.result()
-                units = listing.units
-            paths = style_ledger_paths(doc, units) if style and units else {}
-            if not units:
-                output = "no live units"
-            elif style:
-                from scripts.production import style_units
-                output = style_units.table(units, records, doc=doc, ledger_paths=paths)
-            else:
-                output = table(units, records)
+            snapshot = staff.snapshot()
+            with plan_history.history_snapshot(snapshot):
+                production = read_production(name, record=snapshot)
+                doc = production.doc
+                style = is_style_production(doc)
+                with ThreadPoolExecutor(max_workers=2) as reads:
+                    sessions = reads.submit(copy_context().run, live_units.read_units, name, record=snapshot,
+                                            check=staff_sources.CodexProcessThreads().check)
+                    records = (cast(dict[str, object], json.loads(phase_table.show_production(doc)))
+                               if style else production_records(doc))
+                    listing = sessions.result()
+                    units = sorted(listing.units, key=lambda unit: unit.unit.casefold())
+                configured: set[str] = set()
+                if not style and style_config.has_style_units(doc.read_text().splitlines()):
+                    configured = {assignment.unit for assignment in style_config.read_config(doc).assignments}
+                ticket_units = [unit for unit in units if style or unit.unit in configured]
+                product_units = [unit for unit in units if unit not in ticket_units]
+                paths = style_ledger_paths(doc, ticket_units) if ticket_units else {}
+                if not units:
+                    output = "no live units"
+                else:
+                    sections: list[str] = []
+                    if product_units:
+                        sections.append(table(product_units, records, zone=production.zone))
+                    if ticket_units:
+                        from scripts.production import style_units
+                        sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
+                    output = "\n\n".join(sections)
         except (OSError, ValueError, Refusal) as error:
             print(f"unit_phases: {error}", file=sys.stderr)
             return 1

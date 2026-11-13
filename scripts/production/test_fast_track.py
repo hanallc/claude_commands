@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 import errno
 import hashlib
@@ -13,16 +14,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import cast, final, override
+from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import conf
+from scripts.lib import conf, user_zone, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
-from scripts.production import fast_track
+from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
@@ -78,7 +79,7 @@ with Path(os.environ["FAST_TRACK_TEST_LOCK"]).open("a") as lock:
         held = True
 with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
     output.write(json.dumps({"kind": "types", "args": sys.argv[1:],
-                             "cwd": str(Path.cwd()), "lock_held": held}) + "\\n")
+                             "cwd": str(Path.cwd()), "cache": str(Path("target").resolve()), "lock_held": held}) + "\\n")
 control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
 move = control / "move-origin"
 if move.exists():
@@ -224,6 +225,8 @@ sys.exit(result.returncode)
 @final
 class FastTrackTests(MergeCheckpointFixture):
     production_name: str = "example"
+    fixture_common_directory: ClassVar[Path]
+    fixture_initial_main: ClassVar[str]
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -232,6 +235,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.events_path: Path = Path()
         self.control: Path = Path()
         self.settings: dict[str, object] = {}
+        self.common_directory: Path = Path()
         self.initial: str = ""
 
     @override
@@ -257,10 +261,15 @@ class FastTrackTests(MergeCheckpointFixture):
         _ = self.git("push", "origin", "HEAD:main", "HEAD:production")
         _ = self.git("reset", "--hard", "production", cwd=self.unit)
         _ = self.git("merge", "--ff-only", "production", cwd=self.promote)
+        type(self).fixture_common_directory = Path(self.git(
+            "rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.unit))
+        type(self).fixture_initial_main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.common_directory = self.fixture_common_directory
+        self.initial = self.fixture_initial_main
         # SIGKILL bypasses the child context, so the test owns its temporary parent.
         self.env["TMPDIR"] = self.enterContext(tempfile.TemporaryDirectory())
         self.config = self.root / "config" / "fast_track.conf"
@@ -272,12 +281,10 @@ class FastTrackTests(MergeCheckpointFixture):
         self.control.mkdir()
         bounded_git = self.bin / "bounded-git"
         self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
-        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.unit))
         self.env.update({
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
-            "FAST_TRACK_TEST_LOCK": str(common / "main-push.lock"),
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
         })
         with patch.dict(os.environ, {"CONF_DIR": str(REPOSITORY / "config")}):
             settings_read = conf.read("fast_track")
@@ -296,7 +303,6 @@ class FastTrackTests(MergeCheckpointFixture):
         self.executable(self.bin / "basedpyright", TYPE_TOOL)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
-        self.initial = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
 
     def save_config(self) -> None:
         lines: list[str] = []
@@ -320,7 +326,21 @@ class FastTrackTests(MergeCheckpointFixture):
             return subprocess.run([sys.executable, str(COMMAND), *arguments], cwd=self.unit,
                                   env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         args = list(arguments)
-        with LauncherHangGuard("fast-track CLI").protect():
+        run_process = cast(Callable[..., subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]],
+                           subprocess.run)
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+            if len(command) == 5 and command[:4] == [
+                merge_checkpoint.PYTHON, str(merge_checkpoint.ZONE_SCRIPT), "drain", "--pulled",
+            ]:
+                zone_args = command[2:]
+                with patch.object(user_zone, "CONF", self.env.get(
+                    "USER_ZONE_CONF", str(REPOSITORY / "config/user_zone.conf"),
+                )):
+                    return invoke_cli(zone, lambda: zone.main(zone_args), zone_args, dict(os.environ), Path.cwd())
+            return run_process(command, **options)
+
+        with LauncherHangGuard("fast-track CLI").protect(), patch.object(subprocess, "run", run):
             return invoke_cli(fast_track, lambda: fast_track.main(args), args, self.env, self.unit)
 
     def fast_track(self, *paths: str) -> subprocess.CompletedProcess[str]:
@@ -384,16 +404,6 @@ class FastTrackTests(MergeCheckpointFixture):
     def director_fetches(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line))
                 for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
-
-    def test_fetch_wrapper_skips_python_logic_for_ordinary_git_commands(self) -> None:
-        _ = self.arrange_fetch_failures("after-push", ["lock"])
-        self.env["FAST_TRACK_FETCH_LOGIC"] = str(self.root / "missing-fetch-logic")
-        _ = (self.control / "fetch-plan.json").write_text("invalid fetch plan")
-        result = subprocess.run([str(self.bin / "git"), "-C", str(self.unit), "rev-parse", "HEAD"],
-                                env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), self.initial)
-        self.assertFalse((self.control / "fetch-events.jsonl").exists())
 
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
@@ -553,7 +563,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.observations("types"), [])
 
     def test_agents_cannot_bypass_the_staff_writer_refusal(self) -> None:
-        path = "scripts/shutdown/shutdown.py"
+        path = "scripts/agents/shutdown.py"
         self.write(self.unit, path, "from add_unit import VALUE\n")
         self.assert_refused(self.fast_track(path), "refused path")
 
@@ -803,18 +813,23 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(self.git("cat-file", "-t", candidate, cwd=self.unit), "commit")
         self.assertIn('VALUE = "after"', self.git("show", f"{candidate}:scripts/sample/item.py", cwd=self.unit))
 
-    def test_repeated_checks_reuse_checkout_and_keep_ignored_target(self) -> None:
+    def test_repeated_checks_replace_checkout_and_keep_ignored_target(self) -> None:
         self.change_module()
         first = self.fast_track()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         tree = Path(str(self.observations("types")[0]["cwd"]))
-        cache = tree / "target" / "warm-cache"
+        cache = Path(str(self.observations("types")[0]["cache"])) / "warm-cache"
         cache.parent.mkdir(exist_ok=True)
         _ = cache.write_text("keep")
-        self.write(self.unit, "scripts/sample/note.txt", "new note\n")
-        second = self.fast_track("scripts/sample/note.txt")
+        self.write(self.unit, "scripts/sample/note.py", "# New module.\n")
+        second = self.fast_track("scripts/sample/note.py")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(Path(str(self.observations("types")[-1]["cwd"])), tree)
+        self.assertEqual(len(self.observations("types")), 2)
+        current = self.observations("types")[-1]
+        self.assertNotEqual(Path(str(current["cwd"])), tree)
+        self.assertFalse(tree.exists())
+        self.assertFalse(Path(str(current["cwd"])).exists())
+        self.assertEqual(Path(str(current["cache"])), cache.parent)
         self.assertEqual(cache.read_text(), "keep")
 
     def test_rerun_recovers_a_push_that_stopped_before_the_review_record(self) -> None:
@@ -1001,18 +1016,6 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
 
-    def test_one_command_shares_its_settings_through_fetch_and_recovery(self) -> None:
-        self.change_module()
-        with patch.object(conf, "read", wraps=conf.read) as reads:
-            result = self.fast_track()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "fast_track"],
-                         ["fast_track"])
-        tip = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
-        self.assertNotEqual(tip, self.initial)
-        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
-        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
-
     # Keep one complete CLI process case.
     @process_boundary
     def test_push_checks_only_direct_tests_in_a_private_clone_and_restores_named_paths(self) -> None:
@@ -1047,7 +1050,7 @@ class FastTrackTests(MergeCheckpointFixture):
         for row in [*tests, *checks]:
             clone = Path(str(row["cwd"]))
             self.assertNotIn(clone, (self.unit, self.checkout, self.promote))
-            self.assertTrue((clone / ".git").is_dir(), "the standing checkout must remain")
+            self.assertFalse(clone.exists(), "The checkout must end with its gate")
         row, = self.records()
         self.assertEqual((row["unit"], row["commit"], row["why"], row["review"]),
                          ("alpha", tip, "repair the sample", "pending"))
@@ -1100,10 +1103,10 @@ class FastTrackTests(MergeCheckpointFixture):
         paths.update({"settings.json", "scripts/hooks/private/check.py", "scripts/lib/py",
                       ".local/state/staff/staff.json", "scripts/production/staff.py",
                       "scripts/production/staff_sources.py", "scripts/production/add_unit.py",
-                      "scripts/production/add_showrunner.py", "scripts/shutdown/shutdown.py",
+                      "scripts/production/add_showrunner.py", "scripts/agents/shutdown.py",
                       "scripts/production/promote_showrunner.py", "scripts/production/transfer_unit.py",
-                      "scripts/accounts/moves.py", "scripts/shutdown/shutdown.py",
-                      "scripts/shutdown/shutdown.py", "scripts/production/merge_gate.py",
+                      "scripts/accounts/moves.py", "scripts/agents/shutdown.py",
+                      "scripts/agents/shutdown.py", "scripts/production/merge_gate.py",
                       "scripts/production/merge_checkpoint.py", "scripts/direct/verify.sh",
                       "scripts/production/build_hold.py", "scripts/production/fast_track.py",
                       "config/fast_track.conf"})
@@ -1190,13 +1193,16 @@ class FastTrackTests(MergeCheckpointFixture):
         self.save_config()
         pid_file = self.root / "check-descendant.pid"
         self.env["FAST_TRACK_DESCENDANT_PID"] = str(pid_file)
+        # The alarm outlasts the wait below, so only the time limit can satisfy the assertions.
+        self.env["FAST_TRACK_FIXTURE_ALARM_SECS"] = str(2 * TEST_HANG_GUARD_SECS)
         self.write(self.unit, "scripts/sample/test_item.py", '''import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm(int(os.environ[\\\"FAST_TRACK_FIXTURE_ALARM_SECS\\\"])); signal.pause()"])
 Path(os.environ["FAST_TRACK_DESCENDANT_PID"]).write_text(str(child.pid))
+signal.alarm(int(os.environ["FAST_TRACK_FIXTURE_ALARM_SECS"]))
 signal.pause()
 ''')
         result = self.fast_track("scripts/sample/item.py", "scripts/sample/test_item.py")

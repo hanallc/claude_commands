@@ -11,6 +11,8 @@
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f;
   --used: #2a78d6; --res-a: #427caf; --res-b: #6b91b7; --room: #1baf7a;
   --building: #007e78; --testing: #b00079;
+  --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
+  --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
   --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c;
 }
 @media (prefers-color-scheme: dark) {
@@ -20,6 +22,8 @@
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
     --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
     --building: #27c6b8; --testing: #ca458f;
+    --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+    --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
   }
 }
@@ -29,6 +33,8 @@
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
   --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
   --building: #27c6b8; --testing: #ca458f;
+  --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
+  --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
     --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372;
 }
 * { box-sizing: border-box; }
@@ -63,7 +69,6 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .seg-used { background: var(--used); }
 .seg-room { background: var(--room); }
 .seg-ci { background: var(--used); border-left: 1px solid var(--card); }
-.reserve-tip { position: absolute; top: 0; height: 100%; z-index: 1; cursor: help; }
 .seg-other { background: var(--other); }
 .seg-free { background: var(--free); box-shadow: inset 0 0 0 1px var(--ink-2); }
 .seg-floor { background: var(--floor); }
@@ -79,6 +84,15 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
+#tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
+#tip .mac-tip-fields dt { text-align: left; }
+#tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tip .mac-note { display: block; margin-top: 6px; white-space: nowrap; }
+#tip:has(.mac-note) { width: max-content; max-width: min(calc(100vw - 20px), 34rem); }
+.seg-remote { background: var(--remote-memory); }
+.machine[data-machine="natedev"] { color: var(--machine-natedev); }
+.machine[data-machine="mac"] { color: var(--machine-mac); }
+.machine[data-machine="aws"] { color: var(--machine-aws); }
 #tip b { display: block; margin-bottom: 2px; }
 .mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); transition: left 0.6s ease; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
@@ -154,11 +168,12 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
 .row-heading { display: flex; min-width: 0; gap: 4px; align-items: baseline; }
 .row-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 0.75rem; }
+.row-label .owner { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.row-label .owner, .cloud-status .amounts { font-size: 0.75rem; }
 .row-memory { min-width: 0; }
-.cloud-status .track { height: auto; min-height: 18px; overflow: visible; overflow-wrap: anywhere; line-height: 1.3; }
 .cloud-status .cap { color: var(--cap); }
 .amounts { position: relative; height: 16px; margin-top: 2px; color: var(--ink-2); font-size: 0.7rem; line-height: 14px; font-variant-numeric: tabular-nums; }
+.cloud-status .amounts { height: auto; min-height: 16px; overflow-wrap: anywhere; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
 .wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
@@ -169,16 +184,18 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
 .walk-table table, :root.layout-measuring .walk-table table { width: max-content; max-width: 100%; margin: 0; table-layout: auto; font-size: 0.88rem; }
-.walk-table thead tr { height: 30px; }
+.walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
 .walk-table tbody tr { height: 44px; }
 .walk-table .step { display: none; }
 .walk-table th, .walk-table td { padding: 3px 16px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
 .walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
+.walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
+.walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
@@ -234,12 +251,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
-#s-ci_ram[hidden], #s-ci_kept[hidden], #ci-kept-legend[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
+#s-ci_ram[hidden], #mark[hidden], #marklabel[hidden], .sw.cap[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.wait-reason { color: var(--ink-2); font-size: 0.8rem; overflow-wrap: anywhere; }
-.wait-reasons { margin-top: 10px; }
-.wait-reasons p { margin: 4px 0; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
@@ -276,7 +290,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="bar">
         <div class="seg-used" id="s-used" data-tip="used"><span class="lbl" id="l-used"></span></div>
         <div class="seg-ci" id="s-ci_ram" data-tip="ci"><span class="lbl" id="l-ci_ram"></span></div>
-        <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span><div class="reserve-tip" hidden id="s-ci_kept" data-tip="ci_kept"><span hidden id="l-ci_kept"></span></div></div>
+        <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
         <div class="seg-floor" id="s-floor" data-tip="floor"><span class="lbl" id="l-floor"></span></div>
         <div class="seg-other" id="s-other" data-tip="other"><span class="lbl" id="l-other"></span></div>
@@ -292,7 +306,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="used"><span class="sw used"></span><span class="name">Builds use now</span><span class="v num" id="v-used">–</span></div>
       <div class="row" data-tip="ci"><span class="sw used ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci_ram">–</span></div>
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved, not used yet</span><span class="v num" id="v-reserved">–</span></div>
-      <div class="row" data-tip="ci_kept" id="ci-kept-legend" hidden><span class="sw res"></span><span class="name">CI reserved</span><span class="v num" id="v-ci_kept">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
       <div class="row" data-tip="cap"><span class="sw cap"></span><span class="name">Cap line</span><span class="v num" id="v-cap">–</span></div>
       <div class="row" data-tip="floor"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-floor">–</span></div>
@@ -314,10 +327,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   <section class="card">
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
-    <p class="report-window" id="priority-line"></p>
-    <p class="report-window" id="head-line"></p>
     <p class="pressure-reason" id="cap-reason"></p>
-    <div class="wait-reasons" id="wait-reasons"></div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -361,12 +371,15 @@ const TIPS = {
     const row = d.walk.find((r) => r.ci);
     return [`hana CI · ${row ? row.detail : `${f1(d.ci_ram)} GiB RAM`}`, row ? row.keep_text : "CI runner memory is not readable."];
   },
-  ci_kept: (d) => d.ci_kept > 0 ? [`CI reserved ${f1(d.ci_kept)} GiB`, "The queue reserves this memory while a CI job runs. It reduces room and stays separate from admitted runs."] : ["", ""],
   other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds: editors, agents, browsers and the system."],
   past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety. The bar shows zero room."],
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
+function formatPercent(value, complete = true) {
+  const tenths = Math.floor(value * 10);
+  return `${((complete ? tenths : Math.min(tenths, 999)) / 10).toFixed(1)}%`;
+}
 function level(d) {
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
@@ -380,10 +393,42 @@ Object.assign(TIPS, {
   walkhead: () => ["Running, in start order", "Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
   ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The cap is unavailable." : "The red tick is the cap line."}`],
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
-  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : d.psi.some.toFixed(1))}%`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${d.limits.some}% (the red line).`],
-  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : d.psi.full.toFixed(1))}%`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${d.limits.full}%.`],
-  "g-swap": (d) => [`Swap used · ${pctOf(d.swap_used, d.swap_total).toFixed(0)}%`, `The queue holds above ${d.limits.swap}% swap used.`],
+  "g-some": (d) => [`Some tasks stall · ${(!recorded(d.psi.some) ? "not recorded" : formatPercent(d.psi.some))}`, `Part of the last 10 s that at least one task waited for memory. The queue holds above ${formatPercent(d.limits.some)} (the red line).`],
+  "g-full": (d) => [`All tasks stall · ${(!recorded(d.psi.full) ? "not recorded" : formatPercent(d.psi.full))}`, `Part of the last 10 s that all tasks waited for memory. This is the serious signal. The queue holds above ${formatPercent(d.limits.full)}.`],
+  "g-swap": (d) => [`Swap used · ${formatPercent(pctOf(d.swap_used, d.swap_total))}`, `The queue holds above ${formatPercent(d.limits.swap)} swap used.`],
 });
+function macRow(row) {
+  return row.kind === "mac-build" || row.kind === "mac-unavailable";
+}
+function stageText(row) {
+  if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
+  return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
+}
+function doneText(row) {
+  const progress = row.progress;
+  if (!progress || progress.kind !== "RowProgress") return "—";
+  const percent = recorded(progress.percent) ? progress.percent
+    : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
+  return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
+}
+function macTipFields(row, data) {
+  const fields = [["Machine", "mac"],
+    ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
+    ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
+    ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
+  if (row.progress?.kind === "RowProgress") fields.push(["Progress",
+    `${row.progress.done} of ${row.progress.total} ${row.progress.unit} · ${formatPercent(row.progress.percent, row.progress.done === row.progress.total)}`]);
+  return fields;
+}
+function tooltipHtml(key, data) {
+  const [head, body] = tipText(key, data);
+  const [kind, index] = key.split(":");
+  const row = kind === "row" ? data.walk[+index] : null;
+  if (!row || !macRow(row)) return `<b>${esc(head)}</b>${esc(body)}`;
+  return `<b>${esc(head)}</b><dl class="mac-tip-fields">` +
+    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
+    `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
+}
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
@@ -400,9 +445,10 @@ function publicText(text) {
   return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
 function rowUnit(row) {
-  return row.ci ? visibleDetail(row) : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
+  return row.ci ? "hana CI" : /\.(slice|service)\b/.test(row.unit || "") ? row.name : row.unit || "";
 }
 function rowOwner(row, waiting = false) {
+  if (macRow(row)) return row.repository || "";
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
     return visibleDetail(row);
   }
@@ -417,15 +463,15 @@ function rowMemory(tip, bars = "") {
   return `<div class="row-memory" data-tip="${tip}"><div class="track" data-tip="${tip}">${bars}</div>` +
     `<div class="amounts"></div></div>`;
 }
-function cloudStatus(row) {
-  return `<div class="row-memory cloud-status"><div class="track">${esc(row.status)}` +
-    (row.stale ? ` · <span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div><div class="amounts"></div></div>`;
+function cloudStatus(row, tip) {
+  return `<div class="row-memory cloud-status" data-tip="${tip}"><div class="track" data-tip="${tip}"></div><div class="amounts">${esc(row.status)}` +
+    (row.stale ? `${row.status ? " · " : ""}<span class="cap">no update for ${esc(row.late_age)}</span>` : "") + `</div></div>`;
 }
 function progressTip(row) {
   const progress = row.progress;
   if (!progress || progress.kind !== "RowProgress") return "";
-  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${Math.round(progress.percent)}% done`;
-  return `\n${counter}` + (row.name === "merge-gate" ? "\nModules start slowest first, so this reads low early." : "");
+  const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${formatPercent(progress.percent, progress.done === progress.total)} done`;
+  return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
 }
 function rawTipText(key, d) {
   const [kind, i] = key.split(":");
@@ -436,7 +482,9 @@ function rawTipText(key, d) {
   if (kind === "row") {
     const r = d.walk[+i];
     if (!r) return ["", ""];
-    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status}. Machine: aws. No local memory reservation.`];
+    if (macRow(r)) return [`${r.name} · ${recorded(r.used) ? f1(r.used) + " GiB" : "unavailable"}`,
+      macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
+    if (r.kind === "cloud") return [`${r.name} · ${rowOwner(r)}`, `${r.status ? r.status + ". " : ""}Machine: ${r.machine}. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${rowOwner(r)} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
     const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
@@ -452,7 +500,8 @@ function rawTipText(key, d) {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
     if (w.kind === "cloud") return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${w.reason}. No local memory reservation.`];
-    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `Needs ${f1(w.need)} GiB. Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    const need = w.head_text?.includes("; need ") ? "" : `Needs ${f1(w.need)} GiB. `;
+    return [`Waits · ${w.name} · ${rowOwner(w, true)}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
   }
   return TIPS[key](d);
 }
@@ -462,12 +511,18 @@ function memoryText(text) {
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
 function tipText(key, d) {
-  return rawTipText(key, d).map(memoryText);
+  const text = rawTipText(key, d);
+  const [kind, index] = key.split(":");
+  const row = kind === "row" ? d.walk[+index] : kind === "wait" ? d.waiters[+index] : null;
+  const notes = row ? [row.head_text, row.priority_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
+  if (key === "walkhead") notes.push(d.unmatched_priority_text);
+  text[1] = [text[1], ...notes].filter(Boolean).join("\n");
+  return text.map(memoryText);
 }
 function roomEquation(d) {
   const terms = d.room_source === "cap"
-    ? [["cap", d.cap], ["builds use", d.used], ["hana CI", d.ci_ram], ["reserved", d.reserved], ["CI reserved", d.ci_kept]]
-    : [["free", d.available], ["reserved", d.reserved], ["CI reserved", d.ci_kept], ["safety", d.floor]];
+    ? [["cap", d.cap], ["builds use", d.used], ["hana CI", d.ci_ram], ["reserved", d.reserved]]
+    : [["free", d.available], ["reserved", d.reserved], ["safety", d.floor]];
   const shown = terms.filter((term, index) => index === 0 || f1(term[1]) !== "0.0");
   const sum = shown.map(([name, amount]) => `${name} ${f1(amount)}`).join(" − ");
   return `Next step room = ${d.shortfall > 0 ? `max(0, ${sum})` : sum} = ${f1(d.room)} GiB`;
@@ -484,8 +539,7 @@ let tipKey = null;
 function showTip(key, x, y) {
   if (!latest) return;
   tipKey = key;
-  const [head, body] = tipText(key, latest);
-  tip.innerHTML = `<b>${esc(head)}</b>${esc(body)}`;
+  tip.innerHTML = tooltipHtml(key, latest);
   tip.classList.add("on");
   placeTip(x, y);
 }
@@ -527,6 +581,12 @@ function render(d) {
     recordReadFailure("The queue did not answer.");
     return;
   }
+  for (const [theme, colors] of Object.entries(d.colors)) {
+    document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
+    for (const [machine, color] of Object.entries(colors.machines)) {
+      document.documentElement.style.setProperty(`--machine-${machine}-${theme}`, color);
+    }
+  }
   $("mac-idle-alert").textContent = d.mac_idle_alert;
   $("mac-idle-alert").hidden = !d.mac_idle_alert;
   $("room-equation").textContent = roomEquation(d);
@@ -538,7 +598,6 @@ function render(d) {
   setSeg("s-room", d.room, t);
   setSeg("s-other", d.other, t);
   setSeg("s-ci_ram", d.ci_ram, t);
-  setSeg("s-ci_kept", d.shown_ci_kept, t);
   setSeg("s-past", 0, t);
   setSeg("s-floor", d.shown_safety, t);
   $("mark").hidden = !hasCap(d);
@@ -546,24 +605,20 @@ function render(d) {
   document.querySelector('.sw.cap').hidden = !hasCap(d);
   $("marklabel").textContent = !hasCap(d) ? "cap unavailable" : `cap ${f1(d.cap)}`;
   $("barwrap").setAttribute("aria-label",
-    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, ${d.ci_kept > 0 ? `CI reserved ${f1(d.ci_kept)}, ` : ""}room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
+    `RAM ${f1(t)} GiB: builds use ${f1(d.used)}, CI RAM ${f1(d.ci_ram)}, reserved ${f1(d.reserved)}, room ${f1(d.room)}, ${!hasCap(d) ? d.cap_text : `cap ${f1(d.cap)}`}`);
 
   const [roomValue, roomUnit] = memoryAmount(d.room).split(" ");
   $("room").textContent = roomValue;
   $("room-unit").textContent = roomUnit;
-  const wait = d.waiting > 0 ? `${d.waiting} ${d.waiting === 1 ? "step waits" : "steps wait"}.` : "No step waits.";
-  $("answer").textContent = `Next step room · ${wait}`;
-  for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram", "ci_kept"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
+  for (const k of ["used", "reserved", "room", "other", "floor", "ci_ram"]) $(`v-${k}`).textContent = memoryAmount(d[k]);
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : memoryAmount(d.cap);
   $("v-past").textContent = memoryAmount(d.shortfall);
-  const segVals = { used: shownUse, reserved: d.shown_reserved + d.shown_ci_kept, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram, ci_kept: d.shown_ci_kept };
-  $("s-ci_kept").hidden = d.ci_kept === 0;
-  $("ci-kept-legend").hidden = d.ci_kept === 0;
+  const segVals = { used: shownUse, reserved: d.shown_reserved, room: d.room, other: d.other, past: 0, floor: d.shown_safety, ci_ram: d.ci_ram };
   for (const [k, v] of Object.entries(segVals)) $(`l-${k}`).textContent = f1(v);
   latest = d;
   setTimeout(fitLabels, 650);
-  if (tipKey) { const [h, b] = tipText(tipKey, d); tip.innerHTML = `<b>${esc(h)}</b>${esc(b)}`; }
+  if (tipKey) tip.innerHTML = tooltipHtml(tipKey, d);
 
 
   renderWalk(d);
@@ -596,8 +651,8 @@ function renderSwap(d) {
     $(`gf-${k}`).style.width = `${!recorded(v) ? 0 : Math.min(100, v).toFixed(2)}%`;
     $(`gf-${k}`).className = `gf ${v >= lim ? "hold" : v >= lim * 0.6 ? "warn" : ""}`;
     $(`gl-${k}`).style.left = `${(lim).toFixed(2)}%`;
-    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : `${v.toFixed(1)}%`;
-    $(`limit-${k}`).textContent = `Queue holds at ${lim}%`;
+    $(`gv-${k}`).textContent = !recorded(v) ? "not recorded" : formatPercent(v);
+    $(`limit-${k}`).textContent = `Queue holds at ${formatPercent(lim)}`;
   }
   placeLimitLabels();
   $("swaprows").innerHTML = d.swap_by.map((row, index) =>
@@ -745,27 +800,34 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const cells = (place, name, duration, machine, vcpus, unit, pid, tip, className = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="machine">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td><td class="unit"><span class="cell-text">${esc(publicText(unit || ""))}</span></td>` +
-      `<td class="pid">${typeof pid === "number" ? pid : "—"}</td></tr>`);
+  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
+    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th>`;
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
   const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || row.queued && !row.ci), ...running.filter(({row}) => row.ci)];
+  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
-    cells("run", r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.machine, r.vcpus, idleCI ? "" : rowUnit(r), r.pid, `row:${i}`);
+    cells(stageText(r),
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, r.ci ? "" : rowOwner(r))}` +
-      (r.kind === "cloud" ? cloudStatus(r) : rowMemory(`row:${i}`)) + `</div>`;
+      (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
   cells("", "Next step room", "", "", null, "", null, "room", "room");
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
+  if (d.waiters.length) {
+    tableRows.push(`<tr class="queue-head">${columns("#", "Waiting")}</tr>`);
+    rows.push(`<div class="walk-chart-head queue-head" aria-hidden="true"></div>`);
+  }
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.machine || "", null, w.detail, w.pid, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, `waits ${ago(w.since, d.read_at)}`, w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
-      (w.kind === "cloud" ? cloudStatus(w) : rowMemory(`wait:${i}`)) +
+      (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${d.cap / scale})"></div>`);
@@ -773,8 +835,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `<th scope="col" class="place">#</th><th scope="col" class="step">Step</th><th scope="col" class="duration">Duration</th><th scope="col" class="machine">Machine</th><th scope="col" class="vcpus">vCPU</th><th scope="col" class="unit">Unit</th>` +
-    `<th scope="col" class="pid">Pid</th></tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `${columns("Stage", "Duration")}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
@@ -785,10 +846,6 @@ function renderWalk(d) {
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
   $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
-  $("priority-line").textContent = d.priority_text || "";
-  $("head-line").textContent = d.head_text || "";
-  $("wait-reasons").innerHTML = d.waiters.map(waiter =>
-    `<p class="wait-reason"><strong>${esc(waiter.name)}</strong> · ${esc(waiter.reason)}</p>`).join("");
   fitLabels();
 }
 
@@ -846,8 +903,8 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   context.font = getComputedStyle(walk.querySelector(".amounts")).font;
-  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci))
-    .map(row => [useValue(row), row.ci ? latest.ci_kept : row.reserved].filter(value => value > 0));
+  const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
+    .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
@@ -878,7 +935,7 @@ function fitWalkDetails() {
   measureColumn("duration");
   measureColumn("machine");
   if (!beside) {
-    const fixedWidth = ["place", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
+    const fixedWidth = ["place", "done", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
       width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
     const padding = ["step", "unit"].reduce((width, name) =>
       width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
@@ -893,6 +950,9 @@ function fitWalkDetails() {
   }
   for (const row of walk.querySelectorAll(".wrow.cloud-work")) {
     const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
+    const detail = row.querySelector(".amounts");
+    detail.style.maxWidth = beside
+      ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
     row.style.minHeight = "";
     metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
@@ -906,12 +966,11 @@ function placeMemoryBars(d) {
   const width = range.width;
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const unit = width / d.total;
-  const end = ((hasCap(d) ? d.cap : Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.shown_ci_kept + d.room))) * unit;
+  const end = ((hasCap(d) ? d.cap : Math.min(d.total, d.used + d.ci_ram + d.shown_reserved + d.room))) * unit;
   const used = Math.min(end, d.used * unit);
   const ci = Math.min(end - used, d.ci_ram * unit);
   let reserved = Math.min(end - used - ci, d.shown_reserved * unit);
-  const kept = Math.min(end - used - ci - reserved, d.shown_ci_kept * unit);
-  let room = Math.min(d.room * unit, Math.max(0, end - used - ci - reserved - kept));
+  let room = Math.min(d.room * unit, Math.max(0, end - used - ci - reserved));
   const extra = d.ci_ram > 0 ? Math.min(Math.max(0, 4 - ci), room + reserved) : 0;
   const fromRoom = Math.min(extra, room);
   room -= fromRoom;
@@ -919,18 +978,15 @@ function placeMemoryBars(d) {
   const ciWidth = ci + extra;
   $("s-ci_ram").hidden = d.ci_ram === 0;
   const reserveAt = used + ciWidth;
-  const keptAt = reserveAt + reserved;
-  const roomAt = keptAt + kept;
-  for (const [name, pixels] of Object.entries({used, ci_ram: ciWidth, reserved: reserved + kept, room})) {
+  const roomAt = reserveAt + reserved;
+  for (const [name, pixels] of Object.entries({used, ci_ram: ciWidth, reserved, room})) {
     $("s-" + name).style.flex = `0 0 ${pixels}px`;
   }
-  $("s-ci_kept").style.left = `${reserved}px`;
-  $("s-ci_kept").style.width = `${kept}px`;
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
-    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${memoryAmount(amount.value)}</span>`).join("");
+    container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
     const limit = !hasCap(d) ? width : Math.max(0, progressEnd - LABEL_GAP);
     placeBarLabels(container, limit);
   }
@@ -938,16 +994,22 @@ function placeMemoryBars(d) {
   const reserveScale = d.shown_reserved > 0 ? reserved / d.shown_reserved : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
     const index = Number(row.dataset.run), run = d.walk[index];
-    if (run.kind === "cloud") continue;
-    let bars;
+    let bars = "";
     const amounts = [];
-    if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci", "ci") + box(keptAt, kept, "hatch", "ci_kept");
+    if (macRow(run)) {
+      if (run.kind === "mac-build" && recorded(run.used)) {
+        const useWidth = Math.min(row.querySelector(".track").clientWidth, run.used * unit);
+        bars = box(0, useWidth, "seg-remote");
+        amounts.push({kind: "used-amount", left: 0, value: run.used});
+      }
+    } else if (run.kind === "cloud" && recorded(run.used)) {
+      bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
+    } else if (run.ci) {
+      bars = box(used, ciWidth, "seg-ci", "ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
-      if (kept > 0) amounts.push({kind: "reserved-amount", left: keptAt, value: d.ci_kept});
-    } else {
+    } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, Math.min(useValue(run) * unit, used - usedAt));
-      const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, keptAt - reservedAt));
+      const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.min(Math.max(3, useWidth), end - usedAt) : 0;
       bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
@@ -963,8 +1025,11 @@ function placeMemoryBars(d) {
       }
     }
     row.querySelector(".track").innerHTML = bars;
-    placeAmounts(row, amounts);
-    if (!recorded(run.used)) row.querySelector(".amounts").textContent = `Use unavailable: ${run.used.reason}`;
+    if (run.kind !== "cloud") {
+      placeAmounts(row, amounts);
+      if (run.kind === "mac-unavailable") row.querySelector(".amounts").textContent = run.status;
+      else if (!recorded(run.used)) row.querySelector(".amounts").textContent = macRow(run) ? "Used unavailable" : `Use unavailable: ${run.used.reason}`;
+    }
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {
@@ -1012,7 +1077,7 @@ function fitLabels() {
   const at = latest && hasCap(latest) ? $("barwrap").getBoundingClientRect().width * latest.cap / latest.total : 0;
   $("mark").style.left = `${at}px`;
   $("marklabel").style.left = `${at}px`;
-  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram", "ci_kept"]) {
+  for (const k of ["used", "reserved", "room", "other", "past", "floor", "ci_ram"]) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
     lbl.classList.toggle("hide", lbl.offsetWidth + 6 > seg.clientWidth);
   }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 from scripts.whoami.note_file import note_name
@@ -11,6 +12,7 @@ from scripts.production import staff_sources, staff, staff_test_support
 from scripts.message import sessions as status_sessions
 import io
 import fcntl
+import itertools
 import json
 import os
 import socket
@@ -22,15 +24,17 @@ from contextlib import AbstractContextManager, contextmanager, redirect_stderr, 
 from collections.abc import Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
+from functools import partial
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import ANY, Mock, call, patch
 
-from scripts.lib import conf
+from scripts.lib import conf, transcripts
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -44,16 +48,16 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    from scripts.agents import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
-    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    inventory = import_module("scripts.shutdown.inventory")
-    shutdown_record = import_module("scripts.shutdown.shutdown_record")
-    restart_support = import_module("scripts.shutdown.restart_support")
+    from scripts.agents.unit_staff_test_support import isolated_parents, unit_host
+    inventory = import_module("scripts.agents.inventory")
+    shutdown_record = import_module("scripts.agents.shutdown_record")
+    restart_support = import_module("scripts.agents.restart_support")
     sessions = import_module('scripts.message.sessions')
-    pane_record = import_module("scripts.shutdown.pane_record")
+    pane_record = import_module("scripts.agents.pane_record")
 
 
 def setUpModule() -> None:
@@ -113,6 +117,8 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "herdr-panes"))
+        _ = self.enterContext(patch.object(transcripts, "subprocess", SimpleNamespace(
+            run=partial(subprocess.run, env={"PATH": os.environ.get("PATH", os.defpath)}), PIPE=subprocess.PIPE)))
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
             "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
@@ -173,7 +179,8 @@ class RefusalWatchTests(unittest.TestCase):
             return record
         return staff.StaffSnapshot(tuple(staff.StaffRow(
             staff.StaffId(owner["session_id"]), owner["kind"], owner["name"], staff.StaffRoot(),
-            current_session=staff.StaffId(owner["session_id"]))
+            current_session=staff.StaffId(owner["session_id"]),
+            unit_type=staff.UnitDetails("direct") if owner["kind"] == "unit" else staff.NotUnit())
             for owner in self.owners if owner["kind"] in ("unit", "showrunner")))
 
     def process_dir(self, pid: int) -> account.ConfiguredClaudeFolder | account.ProcessEnvironmentUnread:
@@ -1985,6 +1992,20 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertNotEqual(self.moves.calls[0].target, "claude1")
         self.assertIsInstance(refusal_watch.session_refusal("probe"), refusal_watch.NoSessionRefusal)
         self.assertIsInstance(refusal_watch.session_refusal("other"), refusal_watch.NoSessionRefusal)
+        with staff_test_support.isolated_staff_file(self.home / "proof-staff.json", {}):
+            member = staff_test_support.fixture_member("producer", name="old-probe")
+            owner = self.owner(str(member.current_session))
+            owner["name"] = "old-probe"
+            _ = staff.rename(member.id, "renamed-probe")
+            current = staff.native_id(staff_test_support.fixture_runtime_id("renamed-proof-current"))
+            _ = staff.update_current_session(member.current_session, current)
+            _ = self.owner(str(current))
+            with patch.object(refusal_watch, "run", return_value=[]) as run:
+                code, _, _ = self.cli("--assume-refused", "renamed-probe", "weekly")
+                self.assertEqual(code, 0)
+                run.assert_called_once()
+            with self.assertRaises(SystemExit):
+                _ = self.cli("--assume-refused", "old-probe", "weekly")
 
     def test_proof_without_room_does_not_suppress_a_real_refusals_notice_on_the_same_login(self) -> None:
         _ = self.owner("probe")
@@ -2403,8 +2424,8 @@ class RefusalWatchTests(unittest.TestCase):
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         roles = [row.split("|")[3].strip() for row in rows]
-        self.assertIn("units 1 (busy 0, idle 1, paused 0, exited 0)", roles)
-        self.assertIn("showrunners 1 (busy 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("units 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
+        self.assertIn("showrunners 1 (busy 0, starting 0, waiting 0, idle 1, paused 0, exited 0)", roles)
         self.assertFalse(any("✓" in role for role in roles))
         self.assertEqual(self.snapshot(), before)
 
@@ -2560,19 +2581,32 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertEqual(found.refused_at.at, REFUSAL_AT)
 
     def test_codex_refusal_keeps_its_time_and_window_after_bookkeeping(self) -> None:
-        for folder, window in (("sessions", "weekly"), ("archived_sessions", "5-hour")):
-            with self.subTest(folder=folder):
+        for folder, window, task_error, compressed in (
+            ("sessions", "weekly", False, False), ("archived_sessions", "5-hour", False, False),
+            ("sessions", "weekly", True, False), ("sessions", "weekly", False, True),
+            ("archived_sessions", "5-hour", False, True), ("sessions", "weekly", True, True),
+        ):
+            with self.subTest(folder=folder, task_error=task_error, compressed=compressed):
                 home = self.home / ".codex2"
                 path = home / folder / "2026/11/05/rollout-refused-thread.jsonl"
-                path.parent.mkdir(parents=True)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 text = f"You've hit your usage limit. {window} limit reached."
-                _ = path.write_text("\n".join(json.dumps(entry) for entry in [
-                    {"type": "session_meta", "payload": {"id": "refused-thread"}},
+                refusal: list[dict[str, object]] = [
+                    {"type": "event_msg", "payload": {"type": "token_count"}},
+                    {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+                     "payload": {"type": "task_complete", "last_agent_message": None,
+                                 "error": {"message": text, "codex_error_info": "usage_limit_exceeded"}}},
+                ] if task_error else [
                     {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
                      "payload": {"type": "error", "message": text}},
                     {"type": "event_msg", "payload": {"type": "token_count"}},
                     {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ]
+                _ = path.write_text("\n".join(json.dumps(entry) for entry in [
+                    {"type": "session_meta", "payload": {"id": "refused-thread"}}, *refusal,
                 ]) + "\n")
+                if compressed:
+                    path = compressed_copy(path)
                 found = refusal_watch.transcript_refusal("refused-thread", config_dir=home)
                 self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
                 if isinstance(found, refusal_watch.TranscriptRefusal):
@@ -2615,16 +2649,22 @@ class RefusalWatchTests(unittest.TestCase):
         home = self.home / ".codex"
         path = home / "sessions/rollout-continued-thread.jsonl"
         path.parent.mkdir(parents=True)
-        refusal = {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
-                   "payload": {"type": "error", "message": "You've hit your usage limit."}}
-        for exchange in (
+        for refusal, exchange in itertools.product((
+            {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+             "payload": {"type": "error", "message": "You've hit your usage limit."}},
+            {"type": "event_msg", "timestamp": REFUSAL_AT.isoformat(),
+             "payload": {"type": "task_complete", "error": {"message": "You've hit your usage limit."}}},
+        ), (
+            {"type": "event_msg", "payload": {"type": "task_started"}},
             {"type": "event_msg", "payload": {"type": "user_message", "message": "continue"}},
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "I checked the usage limit."}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant",
                 "content": [{"type": "output_text", "text": "You've hit your usage limit is the old error."}]}},
             {"type": "event_msg", "payload": {"type": "error", "message": "Connection failed."}},
-        ):
-            with self.subTest(exchange=exchange):
+            {"type": "event_msg", "payload": {"type": "task_complete",
+                "error": {"message": "Connection failed.", "codex_error_info": "other"}}},
+        )):
+            with self.subTest(refusal=refusal, exchange=exchange):
                 _ = path.write_text(json.dumps(refusal) + "\n" + json.dumps(exchange) + "\n")
                 found = refusal_watch.transcript_refusal("continued-thread", config_dir=home,
                                                        screen_text="You've hit your weekly limit.")
@@ -2705,15 +2745,19 @@ class RefusalWatchTests(unittest.TestCase):
                     self.assertEqual(found.reset, refusals.KnownReset(reset))
 
     def test_newest_exchange_reassembles_large_utf8_lines_and_skips_long_metadata(self) -> None:
-        path = self.transcript("split-refusal", "weekly limit " + "é" * 70_000)
-        entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
-        _ = path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n", encoding="utf-8")
-        with path.open("a") as stream:
-            _ = stream.write(json.dumps({"type": "cost-state", "padding": "x" * 70_000}) + "\n")
-        found = refusal_watch.transcript_refusal("split-refusal")
-        self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
-        if isinstance(found, refusal_watch.TranscriptRefusal):
-            self.assertIn("é" * 70_000, found.text)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                path = self.transcript("split-refusal", "weekly limit " + "é" * 70_000)
+                entries = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+                _ = path.write_text("\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n", encoding="utf-8")
+                with path.open("a") as stream:
+                    _ = stream.write(json.dumps({"type": "cost-state", "padding": "x" * 70_000}) + "\n")
+                if compressed:
+                    _ = compressed_copy(path)
+                found = refusal_watch.transcript_refusal("split-refusal")
+                self.assertIsInstance(found, refusal_watch.TranscriptRefusal)
+                if isinstance(found, refusal_watch.TranscriptRefusal):
+                    self.assertIn("é" * 70_000, found.text)
 
     def test_healthy_live_owners_never_invoke_inventory_or_start_a_move(self) -> None:
         for host in ("herdr", "unit", "ghostty", "zed", "terminal"):
@@ -3267,39 +3311,46 @@ class RefusalWatchTests(unittest.TestCase):
     def test_refusal_pass_searches_projects_once_and_keeps_each_latest_exchange(self) -> None:
         for identity in ("first", "second", "continued"):
             _ = self.owner(identity)
-            _ = self.transcript(identity)
-        continued = self.transcript("continued", tail={"type": "user", "message": {"content": "continue"}})
-        # A resumed copy in another project must still win by modification time.
-        newer = continued.parent.parent / "resumed" / "first.jsonl"
-        newer.parent.mkdir()
-        _ = newer.write_text(json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n")
-        original = continued.parent / "first.jsonl"
-        os.utime(newer, (original.stat().st_mtime + 60, original.stat().st_mtime + 60))
-        expected = {identity: refusal_watch.session_refusal(identity)
-                    for identity in ("first", "second", "continued")}
-        def read_individually(identities: list[str], *, account_config: conf.ConfigRead) -> dict[str, refusal_watch.TranscriptRefusal | refusal_watch.ProofRefusal | refusal_watch.NoSessionRefusal]:
-            return {identity: refusal_watch.session_refusal(identity, account_config=account_config) for identity in identities}
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed):
+                transcripts: list[Path] = []
+                for identity in ("first", "second", "continued"):
+                    transcripts.append(self.transcript(identity))
+                continued = self.transcript("continued", tail={"type": "user", "message": {"content": "continue"}})
+                # Select the resumed copy by its modification time.
+                newer = continued.parent.parent / "resumed" / "first.jsonl"
+                newer.parent.mkdir(exist_ok=True)
+                _ = newer.write_text(json.dumps({"type": "user", "message": {"content": "continue"}}) + "\n")
+                original = continued.parent / "first.jsonl"
+                os.utime(newer, (original.stat().st_mtime + 60, original.stat().st_mtime + 60))
+                if compressed:
+                    for path in (*transcripts, newer):
+                        _ = compressed_copy(path)
+                expected = {identity: refusal_watch.session_refusal(identity)
+                            for identity in ("first", "second", "continued")}
+                def read_individually(identities: list[str], *, account_config: conf.ConfigRead) -> dict[str, refusal_watch.TranscriptRefusal | refusal_watch.ProofRefusal | refusal_watch.NoSessionRefusal]:
+                    return {identity: refusal_watch.session_refusal(identity, account_config=account_config) for identity in identities}
 
-        with patch.object(refusal_watch, "session_refusals", side_effect=read_individually):
-            expected_code, expected_output, expected_error = self.cli("--dry-run")
-        glob = Path.glob
-        with (patch.object(Path, "glob", autospec=True, side_effect=glob) as search,
-              patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as read):  # pyright: ignore[reportPrivateUsage]
-            code, output, error = self.cli("--dry-run")
-        self.assertEqual((code, output, error), (expected_code, expected_output, expected_error))
-        self.assertIn("owner second: refused; move", output)
-        self.assertNotIn("owner first: refused", output)
-        self.assertNotIn("owner continued: refused", output)
-        self.assertEqual(read.call_count, 3)
-        project_searches = [item for item in search.call_args_list
-                            if item.args[0] == self.home / ".claude/projects"]
-        self.assertLessEqual(len(project_searches), 1)
-        self.assertEqual(expected, {identity: refusal_watch.session_refusal(identity)
-                                   for identity in expected})
-        # A later exchange must be read on the next pass, without a persistent cache.
-        _ = self.transcript("continued", entry_id="new-refusal")
-        _, next_output, _ = self.cli("--dry-run")
-        self.assertIn("owner continued: refused; move", next_output)
+                with patch.object(refusal_watch, "session_refusals", side_effect=read_individually):
+                    expected_code, expected_output, expected_error = self.cli("--dry-run")
+                glob = Path.glob
+                with (patch.object(Path, "glob", autospec=True, side_effect=glob) as search,
+                      patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as read):  # pyright: ignore[reportPrivateUsage]
+                    code, output, error = self.cli("--dry-run")
+                self.assertEqual((code, output, error), (expected_code, expected_output, expected_error))
+                self.assertIn("owner second: refused; move", output)
+                self.assertNotIn("owner first: refused", output)
+                self.assertNotIn("owner continued: refused", output)
+                self.assertEqual(read.call_count, 3)
+                project_searches = [item for item in search.call_args_list
+                                    if item.args[0] == self.home / ".claude/projects"]
+                self.assertLessEqual(len(project_searches), 1)
+                self.assertEqual(expected, {identity: refusal_watch.session_refusal(identity)
+                                           for identity in expected})
+                # Read a later exchange on the next pass.
+                _ = self.transcript("continued", entry_id="new-refusal")
+                _, next_output, _ = self.cli("--dry-run")
+                self.assertIn("owner continued: refused; move", next_output)
 
     def test_refusal_pass_reads_known_transcripts_in_an_unlistable_project(self) -> None:
         _ = self.owner("refused")
@@ -3362,7 +3413,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("assumed", host="ghostty")
         _ = self.owner("unrelated", host="terminal")
         before = usage_store.store_file().read_bytes()
-        _, output, error = self.cli("--assume-refused", "owner assumed", "five-hour", "--reset-in", "19")
+        _, output, error = self.cli("--assume-refused", "assumed", "five-hour", "--reset-in", "19")
         self.assertEqual(error, "")
         self.assertIn("wait", output)
         self.assertNotIn("unrelated", output)

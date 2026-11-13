@@ -16,8 +16,9 @@ from pathlib import Path
 
 
 from scripts.build_queue import progress_profile as progress
+from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.buildlog import parse
 from scripts.lib import conf
@@ -25,6 +26,17 @@ from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as No
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
 GIB = 1 << 30
+
+
+@dataclass(frozen=True)
+class SavedPlacementAssignment:
+    assignment: placement.PlacementAssignment
+    state: placement.AssignmentState = placement.CurrentAssignment()
+    permission: placement.LaunchPermission = placement.PermissionAvailable()
+    provider: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+    holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
+    retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
+    terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -65,7 +77,6 @@ class AdmissionPolicy:
     pressure: PressurePolicy
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
-    ci_memory_margin_bytes: int = field(default=0, kw_only=True)
     progress_lookahead_percent: float = field(kw_only=True)
 
 
@@ -414,20 +425,43 @@ class CompilerServiceMemory(MeasuredMemory):
 
 
 @dataclass(frozen=True)
+class ServiceJobStateNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
     diagnostic: str = ""
     cgroup: str = ""
     owner: str = ""
     activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
     pid: int | PidNotRecorded = field(kw_only=True)
-    job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+    # Keep this wire union stable for pinned clients.
+    job_state: RunningServiceJob | IdleService | NotServiceSlice = field(
+        default=NotServiceSlice(), metadata={"acquisition_unused": True})
+    # New service states belong in this optional field.
+    service_job_state: ServiceJobState | ServiceJobStateNotRecorded = field(
+        default_factory=ServiceJobStateNotRecorded, kw_only=True, metadata={"acquisition_unused": True})
+
+
+def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -> ServiceJobState:
+    """Read the current state, with the legacy state for older snapshots."""
+    if isinstance(memory, UnownedSliceMemory) and not isinstance(memory.service_job_state, ServiceJobStateNotRecorded):
+        return memory.service_job_state
+    return memory.job_state
 
 
 @dataclass(frozen=True)
 class GoneMemory:
     pass
 
-StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory
+
+@dataclass(frozen=True)
+class RemoteMemoryUnavailable:
+    reason: str
+
+
+StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory | RemoteMemoryUnavailable
 
 
 @dataclass(frozen=True)
@@ -505,6 +539,7 @@ class Waiter(TypedDict):
 @dataclass(frozen=True)
 class PriorityUnit:
     unit: str
+    position: int = 0
 
 
 @dataclass(frozen=True)
@@ -537,14 +572,37 @@ class PendingPriorityTransition:
     action: Literal["set", "clear"]
     at: float
     month_row_end: int = 0
+    unit: str = ""
+    why: str = ""
+    set_by: str = ""
 
 
-class QueuePriority(TypedDict):
+class PriorityEntry(TypedDict):
     unit: str
     why: str
     set_at: float
     set_by: str
-    transition: SettledPriority | PendingPriorityTransition
+
+
+@dataclass(frozen=True)
+class QueuePriority:
+    entries: tuple[PriorityEntry, ...]
+    transition: SettledPriority | PendingPriorityTransition = SettledPriority()
+
+
+def upgrade_queue_priority(value: dict[str, object]) -> dict[str, object]:
+    """Read an older priority without changing its stored record."""
+    if "entries" in value or not all(key in value for key in ("unit", "why", "set_at", "set_by")):
+        return value
+    entry = {key: value[key] for key in ("unit", "why", "set_at", "set_by")}
+    transition = value.get("transition", {"kind": "SettledPriority"})
+    clearing = False
+    if isinstance(transition, dict):
+        old = cast(dict[str, object], transition)
+        clearing = old.get("action") == "clear"
+        if old.get("kind") == "PendingPriorityTransition":
+            transition = {**old, "unit": entry["unit"], "why": entry["why"], "set_by": entry["set_by"]}
+    return {"kind": "QueuePriority", "entries": [] if clearing else [entry], "transition": transition}
 
 
 @dataclass(frozen=True)
@@ -625,11 +683,6 @@ class CapUnavailable:
 
 
 @dataclass(frozen=True)
-class CIKeepAside:
-    bytes: int = 0
-
-
-@dataclass(frozen=True)
 class MemoryRoom:
     available: int
     safety: int
@@ -639,7 +692,6 @@ class MemoryRoom:
     cap: int | CapUnavailable
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
-    ci_keep_aside: CIKeepAside = field(default_factory=CIKeepAside, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
 
     @property
@@ -810,6 +862,28 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
+    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    assignment_host: str = ""
+
+
+def execution_host(step: RunningStep, local_host: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+    return step.assignment_host or local_host
+
+
+def execution_group(step: RunningStep, fallback: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        if isinstance(identity, placement.ProcessExecution):
+            return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        return repr((identity.target, identity.generation, identity.instance, identity.attempt))
+    if step.assignment_host:
+        return repr((step.assignment_host, fallback))
+    return run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else fallback
 
 
 @dataclass(frozen=True)
@@ -1182,7 +1256,6 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       ci_memory_margin_bytes=value("ci_memory_margin_gib", lambda raw: int(float(raw) * GIB)),
                                        progress_lookahead_percent=number("progress_lookahead_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
@@ -1221,12 +1294,18 @@ def process_start_time(pid: int) -> str | None:
         return None
 
 
+def format_percent(value: float, *, complete: bool = True) -> str:
+    """Round down to one decimal place without showing an early completion."""
+    tenths = math.floor(value * 10)
+    return f"{(tenths if complete else min(tenths, 999)) / 10:.1f}%"
+
+
 def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
-                f"some avg10 {pressure.some_avg10:.1f}; swap {pressure.swap_used_percent:.1f}% used")
+                f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
     if pressure.condition == "swap":
-        return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
+        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 

@@ -15,8 +15,10 @@ while :; do
 done
 
 subcommand=
+subcommand_index=0
 skip_value=0
 for arg in "$@"; do
+    (( subcommand_index += 1 ))
     if (( skip_value )); then
         skip_value=0
         continue
@@ -35,15 +37,25 @@ case "$subcommand" in
     *) exec "$real_cargo" "$@" ;;
 esac
 
+for arg in "${@:subcommand_index+1}"; do
+    case "$arg" in
+        --) break ;;
+        -h|--help) exec "$real_cargo" "$@" ;;
+        -V|--version)
+            [[ "$subcommand" == install ]] || exec "$real_cargo" "$@"
+            ;;
+    esac
+done
+
 [[ "$OSTYPE" == linux* ]] || exec "$real_cargo" "$@"
 
-# The caller's scope has already passed hold admission. The override lets
-# checks use a saved cgroup record without reading the host's process state.
+# Build scopes have passed hold admission. Detached scopes have not.
+# The override selects a saved cgroup record instead of the host's process state.
 cgroup_file=${CARGO_WRAPPER_CGROUP_FILE:-/proc/self/cgroup}
 in_build_scope=0
 if [[ -r "$cgroup_file" ]]; then
     while IFS= read -r cgroup || [[ -n "$cgroup" ]]; do
-        if [[ "$cgroup" == */builds.slice/* ]]; then
+        if [[ "$cgroup" == */builds.slice/* && "$cgroup" != */builds.slice/builds-detached.slice/* ]]; then
             in_build_scope=1
             break
         fi

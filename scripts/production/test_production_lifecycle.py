@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from scripts.production.staff_test_support import foreign_hostname
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
-from scripts.production.staff_test_support import fixture_member
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import contextlib
 from dataclasses import replace
 import io
 import json
 import os
+import shutil
 import socket
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import final, override
@@ -24,7 +27,7 @@ from scripts.production import fake_unit_host
 from scripts.production import production_lifecycle
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
-from scripts.shutdown import stop_resume
+from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 
@@ -33,7 +36,9 @@ from scripts.production import staff, unit_config
 from scripts.production.production_doc import read_production, Refusal
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
+from scripts.production.cli_fixture import production_paths
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 
 def setUpModule() -> None:
@@ -74,8 +79,8 @@ class LifecycleTests(LifecycleFixture):
             parked = unit_config.read_parked(alpha.id)
         assert isinstance(parked, unit_config.UnitConfig)
         self.assertEqual(replace(parked, retired=unit_config.NoRetiredSession()), expected)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
+        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
 
@@ -207,7 +212,7 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         for row in (alpha, beta):
             assert isinstance(row.worktree, staff.PresentWorktree)
-            self.assertEqual(staff.by_id(row.id), replace(row, worktree=staff.RemovedWorktree(remote.local_machine(), row.worktree.path)))
+            self.assertEqual(staff.by_id(row.id), replace(row, worktree=staff.RemovedWorktree(remote.local_machine(), row.worktree.path, staff.ParkedBranch(row.name + "-branch"))))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(len(self.sent()), 1)
         data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
@@ -231,16 +236,16 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertTrue(any(call.args[0] == alpha.id for call in stops.call_args_list))
         self.assertIn(worker.id, result.stdout)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
         self.assertEqual(staff.by_id(worker.id), worker)
-        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta)))
+        self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
         self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.snapshot().pending_retire, (alpha.id,))
         self.assertIn("wrapped", self.doc.read_text())
         _ = staff.retire(worker.id)
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha)))
+        self.assertEqual(staff.by_id(alpha.id), replace(alpha, worktree=staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch"))))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.snapshot().pending_retire, ())
 
@@ -294,8 +299,11 @@ class LifecycleTests(LifecycleFixture):
                 production_lifecycle.release_edges("example")
             self.assertEqual(production_lifecycle.capture_release("example").told, ())
 
-    def assert_release_notice_retry(self, *, reported_failure: bool) -> None:
+    def assert_release_notice_retry(self, *, reported_failure: bool, rename_during_delivery: bool = False) -> None:
         _ = self.staff_tree()
+        child_id = self.owner_id("kid")
+        parent_id = self.owner_id("top")
+        child_name = "renamed-kid" if rename_during_delivery else "kid"
         for child in ("example", "kid"):
             (self.state / "showrunner" / self.owner_id(child) / "parent").unlink()
         calls: list[str] = []
@@ -303,25 +311,73 @@ class LifecycleTests(LifecycleFixture):
             target, = texts
             self.assertEqual(key, f"showrunner-tree:{'example' if target == 'top' else target}")
             calls.append(target)
-            if target == "kid" and calls.count("kid") == 1:
+            if rename_during_delivery:
+                if target == "top":
+                    _ = staff.rename(child_id, child_name)
+                    _ = staff.rename(parent_id, "renamed-top")
+                else:
+                    self.assertEqual(target, child_name)
+                    self.assertEqual(texts[target], f"example wrapped; {child_name} keeps its recorded parent for history.")
+            if target == child_name and calls.count(child_name) == 1:
                 if reported_failure:
                     return showrunners.NoticeDelivery(("could not tell kid: unavailable",), failed=("kid",))
                 raise OSError("second notice failed")
             return showrunners.NoticeDelivery((f"told {target}",))
+        output = io.StringIO()
         with mock.patch.dict(os.environ, self.env), mock.patch.object(
                 showrunners, "SHOWRUNNER_STATE_DIR", self.state / "showrunner"), mock.patch.object(
-                showrunners, "tell_others", side_effect=tell), contextlib.redirect_stdout(io.StringIO()):
+                showrunners, "tell_others", side_effect=tell), contextlib.redirect_stdout(output):
             _ = production_lifecycle.capture_release("example")
             error = production_lifecycle.LifecycleStop if reported_failure else OSError
             reason = "could not tell kid: unavailable" if reported_failure else "second notice failed"
             with self.assertRaisesRegex(error, reason):
                 production_lifecycle.release_edges("example")
-            self.assertEqual(production_lifecycle.capture_release("example").told, ("top",))
+            self.assertEqual(production_lifecycle.capture_release("example").told, (parent_id,))
             production_lifecycle.release_edges("example")
             production_lifecycle.release_edges("example")
-        self.assertEqual(calls, ["top", "kid", "kid"])
+        if rename_during_delivery:
+            self.assertEqual(calls, ["top", child_name, child_name])
+            self.assertIn("retained parent renamed-top; retained children renamed-kid", output.getvalue())
+        else:
+            self.assertEqual(calls, ["top", "kid", "kid"])
         self.assertFalse((self.state / "showrunner" / self.owner_id("example") / "parent").exists())
-        self.assertFalse((self.state / "showrunner" / self.owner_id("kid") / "parent").exists())
+        self.assertFalse((self.state / "showrunner" / child_id / "parent").exists())
+
+    def test_wrap_release_retries_with_the_name_changed_during_an_earlier_notice(self) -> None:
+        self.assert_release_notice_retry(reported_failure=False, rename_during_delivery=True)
+
+    def test_wrap_release_delivers_to_the_current_session_after_a_recipient_rename(self) -> None:
+        _ = self.staff_tree()
+        parent = staff.by_id(self.owner_id("top"))
+        child_id = self.owner_id("kid")
+        assert parent is not None
+        with (mock.patch.dict(os.environ, self.env),
+              production_paths(self.env),
+              contextlib.redirect_stdout(io.StringIO())):
+            captured = production_lifecycle.capture_release("example")
+            self.assertEqual(captured.former_parent, showrunner_tree.ReportedTo(parent.id))
+            self.assertEqual(captured.former_children, (child_id,))
+            saved = self.state / "showrunner" / self.owner_id("example") / "wrap_release.json"
+            self.assertEqual(json.loads(saved.read_text()), {
+                "former_parent": parent.id, "former_children": [child_id], "told": [],
+            })
+            current = staff.native_id(fixture_runtime_id("wrap-recipient-after-account-move"))
+            _ = staff.update_current_session(parent.current_session, current)
+            _ = staff.rename(parent.id, "renamed-top")
+            self.showrunner("renamed-top", live=True)
+            _ = fixture_member("showrunner", name="top", runtime_id=fixture_runtime_id("replacement-wrap-parent"))
+
+            production_lifecycle.release_edges("example")
+            production_lifecycle.release_edges("example")
+
+            self.assertEqual(production_lifecycle.capture_release("example").told, (parent.id, child_id))
+        [sent] = self.sent()
+        self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'renamed-top.sock'}")
+        self.assertEqual(sent[sent.index("--text") + 1],
+                         "example wrapped; its recorded parent is retained for history.")
+        self.assertEqual(json.loads(saved.read_text()), {
+            "former_parent": parent.id, "former_children": [child_id], "told": [parent.id, child_id],
+        })
 
     def test_in_process_cli_matches_process_output_and_status(self) -> None:
         for arguments in (("load", "--no-ci", "--resume"), ("wrap", "--no-ci"),
@@ -646,6 +702,17 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(second, "ok")
         self.assertIn(f"{destination}: already at {tip}", second.stdout)
 
+        with self.subTest(holder="another process"):
+            reject.unlink()
+            self.write(self.checkout / "second.txt", "another promotion\n")
+            _ = self.git("add", "second.txt")
+            _ = self.git("commit", "-m", "another promotion")
+            _ = self.git("push", "origin", "production")
+            command = [sys.executable, str(Path(production_lifecycle.__file__)), "promote-main",
+                       "--production", "example", "--no-ci"]
+            _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
+            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
+
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()
         _ = self.merge_tip()
@@ -823,6 +890,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.git("commit", "-m", "unmerged", cwd=self.alpha)
         _ = self.git("push", "origin", "alpha-branch", cwd=self.alpha)
         self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
+        row = unit_membership("example", "alpha")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch")), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-D", "alpha-branch")
         result = self.run_lifecycle("wrap", "--no-ci")
@@ -837,6 +906,8 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         _ = self.git("push", "origin", "production")
         self.park_fixture_unit("alpha", self.alpha, "alpha-branch")
+        row = unit_membership("example", "alpha")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.alpha, staff.ParkedBranch("alpha-branch")), expected=row.worktree)
         _ = self.git("worktree", "remove", str(self.alpha))
         _ = self.git("branch", "-d", "alpha-branch")
         _ = self.git("push", "origin", "--delete", "alpha-branch")
@@ -955,25 +1026,51 @@ class LifecycleTests(LifecycleFixture):
         self.assertTrue(self.alpha.exists())
 
     def test_wrap_without_ci_retires_units_removes_notifier_and_reports(self) -> None:
-        self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
-        _ = self.git("push", "origin", "production")
-        result = self.run_lifecycle("wrap", "--no-ci")
-        self.assert_step(result, "ok")
-        self.assert_no_ci_skips(result.stdout)
-        self.assertFalse(self.alpha.exists())
-        self.assertFalse(self.beta.exists())
-        self.assertIn("wrapped", self.doc.read_text())
-        for area in ("Units", "Merge branch", "CI", "Close-out", "Main", "Next"):
-            self.assertIn(f"| {area} |", result.stdout)
-        calls = (self.state / "calls").read_text()
-        self.assertIn("notifier.sh remove", calls)
-        self.assertNotIn("showrunners.py", calls)
-        self.assertNotIn("gh ", calls)
-        self.assertNotIn("ssh ", calls)
-        self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
-        self.assertEqual(self.sent(), [])
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "snapshot"
+            _ = shutil.copytree(self.root, snapshot)
+            staff_bytes = self.staff.staff_file.read_bytes()
+            for landed in ("ancestor", "equal-patch", "separate-promotion"):
+                with self.subTest(landed=landed):
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    _ = self.staff.staff_file.write_bytes(staff_bytes)
+                    self.running()
+                    if landed != "equal-patch":
+                        alpha, _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
+                    else:
+                        self.write(self.alpha / "alpha-1.txt", "alpha work\n")
+                        _ = self.git("add", "alpha-1.txt", cwd=self.alpha)
+                        _ = self.git("commit", "-m", "alpha work", cwd=self.alpha)
+                        alpha = self.git("rev-parse", "HEAD", cwd=self.alpha)
+                        _ = self.git("push", "origin", "alpha-branch", cwd=self.alpha)
+                        _ = self.git("cherry-pick", "--no-commit", alpha)
+                        _ = self.git("commit", "-m", "Copy alpha patch")
+                    _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
+                    if landed == "separate-promotion":
+                        destination = self.promotion_checkout("installed")
+                        self.production_doc("running", promote=f"`{destination}`")
+                        _ = self.git("add", str(self.doc))
+                        _ = self.git("commit", "-m", "Declare promotion")
+                    _ = self.git("push", "origin", "production")
+                    result = self.run_lifecycle("wrap", "--no-ci")
+                    self.assert_step(result, "ok")
+                    self.assert_no_ci_skips(result.stdout)
+                    self.assertFalse(self.alpha.exists())
+                    self.assertFalse(self.beta.exists())
+                    self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
+                    self.assertIn("wrapped", self.doc.read_text())
+                    if landed == "equal-patch":
+                        self.assertEqual(self.git("cherry", "origin/main", alpha).split()[0], "-")
+                    for area in ("Units", "Merge branch", "CI", "Close-out", "Main", "Next"):
+                        self.assertIn(f"| {area} |", result.stdout)
+                    calls = (self.state / "calls").read_text()
+                    self.assertIn("notifier.sh remove", calls)
+                    self.assertNotIn("showrunners.py", calls)
+                    self.assertNotIn("gh ", calls)
+                    self.assertNotIn("ssh ", calls)
+                    self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
+                    self.assertEqual(self.sent(), [])
 
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()
@@ -1143,14 +1240,14 @@ class LifecycleTests(LifecycleFixture):
         owner = staff.snapshot().by_doc(remote.local_machine(), self.doc)
         assert owner is not None
         owner_id = owner.id
-        own = (state / "footers-off" / owner_id, state / "review-paused" / f"{owner_id}.json",
+        own = (state / "footers-off" / owner_id,
                state / "outstanding" / f"{owner_id}.json", state / owner_id / "prompt.txt")
         other = (state / "footers-off/other", state / "outstanding/other.json", state / "other/prompt.txt")
         for path in (*own, *other):
             self.write(path, "[]\n")
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
-        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, review-paused/{owner_id}\.json, "
+        self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, "
                          + rf"outstanding/{owner_id}\.json, {owner_id}/$")
         self.assertFalse(any(path.exists() for path in own))
         self.assertFalse((state / owner_id).exists())

@@ -11,8 +11,12 @@ import sys
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
-from scripts.direct.verify_mac_offload_test_support import SLEEP_STUB, VERIFY, VerifyMacOffloadFixture
+from scripts.direct import verify_mac_offload_test_support
+from scripts.direct.verify_mac_offload_test_support import (
+    CARGO_STUB, SLEEP_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
+)
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -75,39 +79,65 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         }
 
     def mac_result(self, *, extra: dict[str, str], fetch: str = "") -> subprocess.CompletedProcess[str]:
-        """Pass a runner result through the real result reader and call recorder."""
-        functions = shell_functions(
-            VERIFY, "target_for_settings", "target_platform", "step_state", "release_wait_claim",
-            "phase_wait_finish", "collect_routing_wait", "collect_hold_wait", "note_event",
-            "try_mac_test", "check_mac_only_result", "mac_only_refuse", "try_reserved_target",
-        )
-        # These calls start after routing. Other tests keep the watcher and admission boundaries.
-        script = functions + r'''
-set -euo pipefail
-CMD=test PKG=sample ARGS=(sample) MAC_ONLY=1 LOCAL_ONLY=0
-MAC_ENV_NAMES=() VERIFY_MAC_ENVIRONMENT=() NEXTEST_ARGS=()
-MAC_VERB=nextest MAC_SOURCE_ROOT="" MAC_IDLE_MARKER=""
-MAC_FINISH_CALL=1 FILTER_RUN=0 CALL_NOTED=0 CACHE_DIR=""
-STEP_RECORD_ACTIVE=0 STEP_RUNS_ON=mac_allowed
-TREE_WATCH_PID=caller-owned ROUTING_WAIT_STARTED=""
-BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
-BUILDLOG_MAC_COPY="" BUILDLOG_MAC_COPY_S=""
-BUILDLOG_MAC_COPY_COUNT="" BUILDLOG_MAC_COPY_NATEDEV_S=""
-BUILDLOG_LOCAL_REASON=""
-export BUILDLOG_CALL_ID="result-$$" BUILDLOG_LOCAL_REASON
-STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_SETTINGS")
-MAC_LEAVE_SETTINGS=$MAC_SETTINGS MAC_LEAVE_REASON=""
-try_reserved_target
-'''
-        return subprocess.run(
-            ["bash", "-c", script], cwd=self.root,
-            env={**self.environment, "PY": sys.executable, "MAC_RUNNER": str(self.runner),
-                 "MAC_SETTINGS": self.environment["MAC_TEST_CONFIG"],
-                 "DOC_REPO_TOP": str(self.root), "HOLD_WAIT_DIR": str(self.root / "tmp"),
-                 "BUILDLOG_RECORD": str(self.home / ".claude/scripts/buildlog/record.py"),
-                 "MAC_FETCH": fetch, "MAC_FETCH_GIVEN": "1" if fetch else "0", **extra},
-            text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS,
-        )
+        """Run the same result rows through queue placement."""
+        words = ["test", "sample", "--mac", "why", "--no-cache"]
+        if fetch:
+            words.extend(("--fetch", fetch))
+        return self.verify(*words, extra=extra)
+
+    def routing_result(self) -> subprocess.CompletedProcess[str]:
+        """Check caller routing through the real placement command."""
+        return self.verify("test", "sample", "--mac", "needs macOS", "--no-cache")
+
+    def test_fixed_cargo_replies_match_python_events(self) -> None:
+        reference = self.bin_directory / "cargo-reference"
+        self.write_executable(reference, CARGO_STUB)
+        cargo = self.bin_directory / "cargo"
+        install_fixed_cargo(cargo)
+        token = Path(self.environment["TEST_TOKEN_RECORD"])
+        token.parent.mkdir(parents=True, exist_ok=True)
+        self.environment["BUILDLOG_HOLD_PID"] = "owned"
+        for token_held in (False, True):
+            if token_held:
+                _ = token.write_text("owned\n")
+            else:
+                token.unlink(missing_ok=True)
+            for arguments in (
+                ("check", "with space", 'double"quote', "back\\slash", ""),
+                ("check", "with space", 'double"quote', "back\\slash", "é", ""),
+                ("metadata", "--format-version", "1"),
+                ("mend", "--version"), ("+nightly", "fmt", "--version"),
+                ("clippy", "--version"), ("nextest", "--version"),
+            ):
+                with self.subTest(arguments=arguments, token_held=token_held):
+                    events: list[bytes] = []
+                    replies: list[subprocess.CompletedProcess[bytes]] = []
+                    for executable in (reference, cargo):
+                        self.cargo_events_path.unlink(missing_ok=True)
+                        replies.append(subprocess.run(
+                            [str(executable), *arguments], env=self.environment,
+                            capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                        ))
+                        events.append(self.cargo_events_path.read_bytes() if self.cargo_events_path.exists() else b"")
+                    self.assertEqual(events[1], events[0])
+                    self.assertEqual(replies[1].returncode, replies[0].returncode)
+                    self.assertEqual(replies[1].stdout, replies[0].stdout)
+                    self.assertEqual(replies[1].stderr, replies[0].stderr)
+                    if arguments[0] == "metadata":
+                        self.assertEqual(replies[1].stdout, (self.environment["TEST_METADATA"] + "\n").encode())
+                    elif arguments in (("mend", "--version"), ("+nightly", "fmt", "--version"), ("clippy", "--version")):
+                        self.assertEqual(events[1], b"")
+                    if events[1]:
+                        self.assertEqual(cast(dict[str, object], json.loads(events[1]))["token_held"], token_held)
+
+        for executable in (reference, cargo):
+            with self.subTest(executable=executable.name, event_output="/dev/full"):
+                result = subprocess.run(
+                    [str(executable), "metadata", "--format-version", "1"],
+                    env={**self.environment, "TEST_CARGO_EVENTS": "/dev/full"},
+                    capture_output=True, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
@@ -150,14 +180,45 @@ try_reserved_target
         self.assert_nothing_outlives()
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
-        self.write_executable(self.bin_directory / "sleep", SLEEP_STUB)
+        from unittest import mock
+        from scripts.build_queue import admission_client, admission_protocol as wire, admission_service as service, placement
+        from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+
+        admission = caller_admission(self, self.root, self.environment)
+        controls = caller_provider_controls(self, admission)
+        previous = admission.server.handle_request
+        busy_published = False
+
+        def publish_busy(request: wire.Request,
+                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            nonlocal busy_published
+            if (isinstance(request, wire.ExecutionReport) and not busy_published
+                    and request.outcome == placement.PrelaunchRefused("busy")):
+                controls.set_host("mac", placement.TemporaryExclusion("busy"))
+                busy_published = True
+            return previous(request, connection)
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=publish_busy))
         process = self.start_verify("test", "sample", "--mac", "why", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "never-free"),
-            "TEST_STEP_ROUTING_SLEEP": "1"})
+            "TEST_PROVIDER_ALLOW_RUNNER_REFUSALS": "1"})
         self.addCleanup(self.stop_verify, process)
-        self.wait_for_path(self.runner_state / "routing-sleep", (process,))
+
+        def busy_wait_delivered() -> bool:
+            if not busy_published:
+                return False
+            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+                try:
+                    queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
+                except (OSError, ValueError):
+                    continue
+                if queued.episode == self.runner_episode():
+                    return True
+            return False
+
+        self.wait_until(busy_wait_delivered, "the client queue wait after the busy refusal", (process,))
         _ = (self.runner_state / "busy-reason").write_text("blocked\n")
-        _ = (self.runner_state / "continue-sleep-1").write_text("continue\n")
+        controls.set_host("mac", placement.AllowedHost())
         output, errors = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 2, output + errors)
         self.assertIn("verify.sh: test --mac refused: the Mac is blocked (/build:status names the holder and when it lifts); nothing ran on natedev.\n", errors)
@@ -203,14 +264,15 @@ try_reserved_target
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
-        self.assertGreaterEqual(len(self.runner_events()), 2)
+        self.assertGreaterEqual(sum(key.destination.provider == "mac" for key in self.provider_observations), 2)
+        self.assertEqual(len(self.runner_events()), 1)
         self.assertIn("Mac only (needs macOS)", errors)
         self.assertEqual(self.last_call()["mac"], "passed_full")
         self.assertEqual(self.routing_record()["target"], "mac")
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
 
     def test_policy_refusals_start_nothing(self) -> None:
-        result = self.verify("test", "sample", "--env", "SHOTS")
+        result, = self.parser_results([("test", "sample", "--env", "SHOTS")])
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(result.stderr, 'verify.sh: --env and --fetch need --mac "<why>".\n')
         self.assertEqual(self.runner_events(), [])
@@ -293,7 +355,7 @@ try_reserved_target
 
     def test_eligibility_refuses_before_runner_and_records_decline(self) -> None:
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nexit 255\n')
-        result = self.verify("test", "sample", "--mac", "needs macOS")
+        result = self.routing_result()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac cannot be reached (/build:status --probe)", result.stderr)
         self.assertEqual(self.runner_events(), [])
@@ -304,7 +366,7 @@ try_reserved_target
         self.assertEqual(self.routing_record()["target"], "")
 
     def test_mac_failure_keeps_runner_status(self) -> None:
-        result = self.verify("test", "sample", "--mac", "why", extra={
+        result = self.mac_result(extra={
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "42"})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
@@ -344,8 +406,8 @@ try_reserved_target
     def test_local_first_target_is_skipped_for_mac_only(self) -> None:
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
-        result = self.verify("test", "sample", "--mac", "why", extra={
-            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.environment.update({"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        result = self.routing_result()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.runner_events()), 1)
         self.assertEqual(self.local_runs(), [])
@@ -408,12 +470,33 @@ try_reserved_target
 
     def test_missing_runner_refuses_instead_of_running_locally(self) -> None:
         self.runner.unlink()
-        result = self.verify("test", "sample", "--mac", "why")
+        result = self.mac_result(extra={})
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("the Mac runner gave no usable result", result.stderr)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac_reason"], "runner")
+
+    def test_fixture_reports_and_reaps_a_marked_process_that_outlives_the_test(self) -> None:
+        ready = self.runner_state / "leaked-child-ready"
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys; from pathlib import Path; Path(sys.argv[1]).touch(); signal.pause()",
+             str(ready)],
+            env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.wait_for_path(ready, (child,))
+            # Expire the leak wait while the real marked child remains alive.
+            with mock.patch.object(verify_mac_offload_test_support, "TEST_HANG_GUARD_SECS", 0):
+                with self.assertRaisesRegex(AssertionError, "processes outlived the test"):
+                    self.assert_nothing_outlives()
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(child.returncode, -signal.SIGKILL, output + errors)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

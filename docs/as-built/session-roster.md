@@ -23,22 +23,24 @@ other machine: ssh roster.py --here --snapshot ──►├─► Roster(entries
 
 ### Record sources
 
-The roster joins staff, run records, process evidence, and assignment logs.
-Staff supplies each worker's current session and parent.
-The assignment log supplies its task role and lens.
+The roster joins staff, run records, and process evidence.
+Staff supplies each worker's current session, parent, and task role.
+`progress_history.last_dispatch` supplies an addressed reviewer's lens.
+An unavailable lens keeps the worker with a plain `review` label.
+The roster reads no current role from the agents log.
 The [worker design](long-lived-workers.md#staff-membership-and-dispatch) defines stored run fields.
 
 | Source | Where | Gives |
 |---|---|---|
-| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
+| Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | Owner staff id; staff supplies the current session, name, and document; native records supply the socket |
 | Unit staff rows | `staff.json`, via `unit_lookup.doc_units` with a present worktree | unit id and worktree per row (fallback only) |
-| Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
+| Open runs | The director's staff row | `run` stores the run folder; `current_session` selects the director |
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
 | Staff worker rows | `staff.json`, through `staff.local_snapshot()`: rows of kind `worker` under the run's director whose backend reads `ClaudeBackend`. A running registry record counts as Claude evidence when no transcript exists yet | Claude workers |
 | Staff workers | Staff membership and backend evidence | Fixed staff id, current native session and pane state |
 | Held role store | `~/.local/state/astra/design-roles/<design id>/design.json` | Held Astra role lifecycle and staff reference |
 | Review state | `<run>/<worker>_status[_<lens>]`, `<run>/<worker>_pid[_<lens>]` | running blind reviewers |
-| Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: id, name, cwd, status, owning daemon |
+| Codex account daemons | each account home from `agent_accounts.codex_homes`, at `<home>/app-server-control/app-server-control.sock` (`ROSTER_CODEX_SOCKET` replaces the list for tests) | loaded threads: native id, cwd, status, owning daemon |
 | Process table | `ps -eo pid=,ppid=,comm=,args=` (`PROCESS_TABLE_PS`) | Codex exec processes and reviewer descendants |
 
 The roster reads staff membership and pane evidence.
@@ -46,6 +48,14 @@ The roster reads staff membership and pane evidence.
 The worker command preserves staff identity when it closes a worker.
 The held assignment launcher retains its thread and allocation helpers until round 2b.
 The roster uses the staff row's current native session.
+Each roster name comes from the staff row that owns the native session.
+A native session without a staff row has an empty roster name.
+Its native address still accepts messages.
+The roster reads one staff snapshot and passes it to each entry reader.
+Codex thread titles and herdr labels do not become recipient names.
+The native registry helpers live in `scripts/message/session_records.py`.
+`sessions.py` exports those helpers and adds staff recipient lookup.
+Staff imports the native helpers directly, so neither module imports the other.
 
 ### How each row's role is derived
 
@@ -58,19 +68,29 @@ Codex rows:
 - **Worker.** Staff membership and pane evidence supply state and process evidence.
   The fixed staff id resolves the current thread and parent through one staff snapshot.
   A worker whose backend is Claude appears only as a Claude row.
-  The assignment log supplies the task role and review lens.
+  The staff row supplies the task role through `KnownWorkerRole`.
+  Dispatch evidence supplies the review lens.
+  A failed lens lookup keeps this worker and later workers in the roster.
+  An unknown staff role produces an unrecorded assignment without a history fallback.
   Open workers show the native status and pane.
   Other workers show stopped, closed, unknown or incomplete evidence.
   `session_staff.worker_directory` supplies the working directory.
   Staff parents supply the director and showrunner relationships.
 - **Held Astra role.** `_durable_roles` lists opened roles that have not ended.
-  Staff supplies the current thread and the role's parent.
-  The role store supplies the design repository, instance name, and lifecycle.
+  Staff supplies the current thread, worker name, role parent, and owned checkout path.
+  The role store supplies lifecycle and checkout ownership.
+  Independent checkouts retain their stored paths.
   A missing backend prints an anomaly and skips that role.
   The row uses `astra-designer` or `astra-reviewer` and cannot receive direct messages.
   The holder adds pending messages through `design_roles.py`.
   The [held-role design](long-lived-workers.md#lasting-roles) defines its authority.
-- **blind reviewer** — `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
+- **Blind reviewer.** `<worker>_status[_<lens>]` reads `reviewing` with a live `<worker>_pid[_<lens>]`.
+  A `codex exec` descendant supplies kind `codex`.
+  Otherwise, a `claude` descendant supplies kind `claude`.
+  Without either descendant, the roster adds no reviewer.
+  A known native registry identity supplies its current staff name.
+  Other reviewers have an empty name.
+  The assignment remains `review (<lens>)` or `review`.
 - **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
   A native Codex pane uses its reported session when available.
   Without a report, `native_pane_process(...).current_identity` supplies its thread.
@@ -120,7 +140,7 @@ Codex rows:
 
 ### `roster.py` command
 
-`roster.py [--json] [--kind claude|codex] [--here]`. Without `--here` it reads `AllMachines`: `ssh -o BatchMode=yes -o ConnectTimeout=10 <other machine> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'` (20 s timeout, session identity variables removed) runs in parallel with the local read, and entries merge with this machine first.
+`roster.py [--json] [--kind claude|codex] [--here]`. Without `--here` it reads `AllMachines`: `ssh -o BatchMode=yes <other machine> '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/roster.py" --here --snapshot'`. The command has a 20 s timeout and removes session identity variables. It runs beside the local read and merges entries with this machine first.
 
 - **Text** — per machine: a machine line, then showrunner → unit director → worker, unit directors with no running showrunner and their workers, `director not running: <session dir>` groups for workers with no listed director, freestanding Claude, and `your Codex sessions`. Each row: `<role> <name>[ (you)][ (context)] — <kind>, <status>[, <slot role>][, <unit>][, <cwd with ~>]`. `(you)` marks the sender's row on this machine. No pids or ports.
 - **`--kind`** keeps rows of that kind and adds each listed worker's unit director and showrunner (same machine) as `(context)` rows; `--json` includes them unmarked.
@@ -151,8 +171,28 @@ The two flags together cause a usage error.
 `Options.action` is `UserAction` or `NoUserRecipient`.
 
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
-A typed name first matches a staff path or short name. Unit names use the staff name.
-One staff row selects its `current_session`. Several staff rows produce a named ambiguity error and no delivery.
+A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
+A `<name>-unit` target finds the unit `<name>` when no staff row or live session has that exact name.
+The `<name>-unit` form uses `copies.unit_owner` and matches only rows of kind `unit`.
+In a `/` path, only the last part uses the form, and the earlier parts must match the parent chain.
+
+A `RecipientLookupFailed` route or a missing recipient name calls `failed_lookup.report`.
+The detector records the sender and failed name in `failed_lookups.json` under the message state directory.
+The detector tells the sender's owner on the first failure and at most once per pair every 24 hours.
+Each notice includes the count since the last notice, the caller command line, known configuration paths, and the printed reason.
+The count stays until a notice is confirmed as sent, queued or kept.
+An in-flight notice blocks a second notice for one send budget.
+A worker's owner is its director.
+Other staff senders use their first showrunner ancestor.
+The notice addresses a staff owner by its staff id, so two units with one name stay distinct.
+Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `UNIT_ANOMALIES_TO` from `production.conf`.
+Staff senders without a parent also use `UNIT_ANOMALIES_TO`.
+The detector sends notices as `send.py` and ignores failures from that sender.
+Detector errors print one stderr line and preserve the failed send's result.
+
+A bare worker name selects a worker under the sender's own unit.
+A match only in another unit refuses delivery and lists the full paths.
+One selected staff row supplies its `current_session`. Several matching rows produce a named ambiguity error and no delivery.
 The repeat-notice owner follows staff parents to the showrunner. It uses the default owner for a non-staff sender.
 
 A non-staff name uses a unique live roster session. Lookup checks this machine before the peer.
@@ -400,10 +440,11 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 ### `sessions.py`
 
 - `read_session(path) -> SessionRecord | UnreadableSessionRecord`; `procStart` is `NotRequired[str]`, filled with `""` when absent (callers read `record.get("procStart", "")`).
-- `process_start(pid) -> str | None` is the one process-start reader: Linux reads `/proc/<pid>/stat` as bytes, splits after the last `)` and returns field 22 when all digits; macOS runs `ps -o lstart= -p <pid>` under `LC_ALL=C`, `TZ=UTC`, 5 s timeout. `scripts/shutdown/inventory.py` imports it as `_process_start`.
+- `process_start(pid) -> str | None` is the one process-start reader: Linux reads `/proc/<pid>/stat` as bytes, splits after the last `)` and returns field 22 when all digits; macOS runs `ps -o lstart= -p <pid>` under `LC_ALL=C`, `TZ=UTC`, 5 s timeout. `scripts/agents/inventory.py` imports it as `_process_start`.
 - `running_session(record)`: the pid exists and a nonempty `procStart` equals `process_start(pid)`, socket or not; a record with no `procStart` is running when its messaging socket exists. `messaging_socket_exists(record)`; `live_session(record) = running_session and messaging_socket_exists`.
 - `_readable_records()` yields every readable record; `running_sessions()` and `live_sessions()` each filter it through their own predicate per record, newest `updatedAt` first.
-- `addressed(to, records)` resolves `uds:`, `session:`, a current name, or a former name only one session had.
+- `addressed(to, records)` resolves `uds:`, `session:`, or a staff name through its current session.
+  Registry names and former names do not resolve.
 
 ### `process_table.py`
 
@@ -459,9 +500,9 @@ Release recalculates the priority of a kept decision.
 - `restart_support.send_message(recipient, ...)` raises `ValueError` for `user`; `restart_support.alert_user(push: RenderedPush, *, machine="")` is the shutdown path to the user; the catalog render supplies title, body and action; it takes no scope, and callers skip the call when the session record's `alerts` is `"none"`.
 - `/alert_user` uses a registered template. Mac callers add `--machine natedev`. Only a reviewed blocked push with a registered template can use the exact rendered emergency fallback after delivery fails.
 
-### Shutdown test guard (`scripts/shutdown/test_support.py`)
+### Shutdown test guard (`scripts/agents/test_support.py`)
 
-- `ShutdownSendLeaf(StrEnum)` names each real send leaf in `scripts/shutdown/*.py`, the last call before a process that delivers to a session, the other machine or the user: `restart_support._deliver_message`, `restart_support.retire_shutdown_messages`, `restart._retire`, `remote.run_remote`, `remote_control.launch_fixer`, `restart_support.run_notifier`. The fixer launch remains guarded because it starts a detached service; Remote Control recovery has no phone-send path.
+- `ShutdownSendLeaf(StrEnum)` names each real send leaf in `scripts/agents/*.py`, the last call before a process that delivers to a session, the other machine or the user: `restart_support._deliver_message`, `restart_support.retire_shutdown_messages`, `restart._retire`, `remote.run_remote`, `remote_control.launch_fixer`, `restart_support.run_notifier`. The fixer launch remains guarded because it starts a detached service; Remote Control recovery has no phone-send path.
 - `ShutdownTestCase.setUp` patches every binding in `_REAL_LEAF_BINDINGS` with a stub. A reached stub records the hit and raises `AssertionError("shutdown test reached real send leaf <dotted name> for <recipient>; fake the step above it, or allow_leaf(ShutdownSendLeaf.<member>) and fake the subprocess beneath it")`, so no process starts. A cleanup fails the test for any recorded hit, so a caller that catches the error still fails. `restart._retire(dry_run=True)` passes through.
 - `allow_leaf(leaf: ShutdownSendLeaf)` restores the real function for the rest of the test (class-wide when called in `setUp` after `super().setUp()`); anything but a `ShutdownSendLeaf` raises `TypeError`, and `ShutdownSendLeaf("<unknown>")` raises `ValueError`. A test that patches a leaf itself needs no `allow_leaf`.
 - `registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation` is a test helper beside the guard: the answer for a stand-in `restart.wait_for_confirmation`, one `SessionRecord` per id in sorted order.
@@ -491,10 +532,10 @@ Release recalculates the priority of a kept decision.
 - `scripts/production/broadcast.py` — groups on both machines
 - `scripts/message/top_level.py` — top-level Claude sessions here
 - `scripts/notify/user_action.py`, `scripts/notify/pushover.py` — the message-to-user gate; `scripts/notify/review.py` — the clarity review
-- `scripts/message/escalate.py`, `scripts/shutdown/restart_support.py`, `scripts/shutdown/restart.py` — held and shutdown messages
-- `scripts/shutdown/test_support.py` — shutdown send guard
+- `scripts/message/escalate.py`, `scripts/agents/restart_support.py`, `scripts/agents/restart.py` — held and shutdown messages
+- `scripts/agents/test_support.py` — shutdown send guard
 - `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
-- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/shutdown/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
+- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
 
 ## Invariants
 
@@ -504,7 +545,8 @@ Release recalculates the priority of a kept decision.
 
 - A source that cannot be read becomes one problem line naming it; the rest still prints. Every consumer prints `Roster.problems` and continues.
 
-- Every address is unique on both machines: `session:<id>`, `worker:<run id>/<worker name>`, `codex:<thread id>`. A `CannotReceiveMessages` row has an empty address and takes no messages; broadcast skips it rather than send to `""`.
+- Every address is unique on both machines: `session:<id>`, `worker:<parent>/<worker>`, `codex:<thread id>`.
+  A `CannotReceiveMessages` row has an empty address and takes no messages. Broadcast skips that row.
 
 - Pane state determines whether a worker can receive a message.
 
@@ -528,7 +570,7 @@ Release recalculates the priority of a kept decision.
 
 - Tests never write the real outbox: scratch HOME/state, fake clocks and mod/file/send calls only.
 
-- Every `TestCase` in `scripts/shutdown/` derives from `ShutdownTestCase` and calls `super().setUp()` first. A new send leaf, or a new module that imports `run_remote` by name, gets an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`.
+- Every `TestCase` in `scripts/agents/` derives from `ShutdownTestCase` and calls `super().setUp()` first. A new send leaf, or a new module that imports `run_remote` by name, gets an entry in `_REAL_LEAF_BINDINGS` and a stub in `setUp`.
 
 - Live checks never message a real session: they use a scratch background Claude session, a private pane worker and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
 
@@ -554,7 +596,7 @@ Release recalculates the priority of a kept decision.
 **Sending**
 - Under `--machine HOST`, `remote()` keeps the outcome word from the other machine's last stdout line, so a `REFUSED:` there stays `REFUSED` (exit 2). Only stderr-only exit-2 errors (cannot take messages, ambiguous name, no roster session has address, usage) return as `FAILED: ssh <host>: <reason>` (exit 3).
 - `uds:` is always this machine's socket, even with `--machine`.
-- A `worker:` address of a worker between turns matches no row on either machine and reads `no roster session has address`, not `cannot take messages`.
+- A worker keeps its staff identity between turns. Current pane evidence determines whether it can receive a message.
 - Staff worker delivery resolves the observed pane and its holder.
 - `pushover.py` exit 2 also means usage or missing keys; only the `refused before sending:` stderr marker marks a refusal. A caller with no keys and no action flag gets the action refusal, not `keys missing`.
 - Every roster problem on stderr carries `could not read: `, so a machine not reached reads `could not read: <host>: not reached: <why>` (exit 1). In a sandbox this usually means rerun outside it, or use `--here`.
@@ -593,7 +635,7 @@ Release recalculates the priority of a kept decision.
 
 **Tests**
 - `PROCESS_TABLE_PS` is read at import: a test that sets it reloads `process_table` or patches `process_table.PS`.
-- `scripts/shutdown/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
+- `scripts/agents/test_inventory.py` fakes `sessions.live_session`, so `live_sessions()` must call that predicate per record. Suites outside the message package (build_hold, model_study rerun, shutdown) read `live_sessions()`.
 - Tests that fake both session readers hide the socket cases; socket fixtures build real session records, and socketless fixtures carry a real start.
 - `RUN_REMOTE` stubs and restores four bindings: `remote.run_remote`, `restart_support.run_remote`, `restart.run_remote`, `shutdown.run_remote`.
 - `_REAL_LEAF_BINDINGS` holds the real functions captured at import, so `allow_leaf` restores them even inside a case nested in another guarded case.
@@ -679,3 +721,9 @@ Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.p
 
 For `decision.choices`, file the question with `/unit:question` or `/showrunner:question`, then pass its record path with `--question`.
 Filing a question alone never sends a push.
+
+Postmaster replies use a fixed `staff:<id>` or an explicit `session:<id>`.
+A fixed staff ID selects the row's `current_session`.
+The sender label remains message text and does not select a reply destination.
+The relay miss hook uses the relay process identity and its recorded sender.
+A registry name does not prove a relay identity.

@@ -10,13 +10,16 @@ import fcntl
 import io
 import json
 import os
+import select
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -27,7 +30,7 @@ from scripts.lib import copy_record
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
-from scripts.shutdown import remote
+from scripts.agents import remote
 from scripts.production.production_doc import Production
 from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
@@ -37,7 +40,11 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
 from scripts.lib import urgency
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.fork_test_support import ForkChild, ForkChildren
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.production.cli_fixture import invoke_cli
+
+TIMER_DOCS = showrunners.timer_docs
 
 LIST = """# Change review list
 
@@ -140,7 +147,7 @@ class ProducerFixture(unittest.TestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""))
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", staff.StaffRoot(), current_session=staff.StaffId(""), unit_type=staff.UnitDetails("direct"))
 
 
     @override
@@ -452,12 +459,37 @@ class ProducerWriterTests(ProducerFixture):
             self.assertEqual([row["Change"] for row in rows],
                              ["A visible change", "Queued change", "Final change", "Queued later"])
 
+        for location in ("unfilled", "other-machine", "absent", "remote-parent"):
+            with self.subTest(location=location):
+                _ = self.git("checkout", "-b", f"producer-{location}")
+                _ = self.git("commit", "--allow-empty", "-m",
+                             f"queue(8): delivery\n\nChange-Review: {location} | Read | Fixed producer")
+                _ = self.git("checkout", "main")
+                _ = self.git("merge", "--no-ff", f"producer-{location}", "-m", "Merge delivery")
+                _ = self.git("push", "origin", "main")
+                merged = self.git("rev-parse", "HEAD")
+                member = replace(self.unit, worktree=(staff.WorktreeUnfilled() if location == "unfilled"
+                                 else staff.PresentWorktree(remote.other_machine(), self.root / "unit")))
+                if location == "remote-parent":
+                    parent = fixture_member("showrunner", name="remote-parent",
+                        doc=staff.LiveDoc(remote.other_machine(), self.root / "remote-production.md"))
+                    member = replace(member, parent=staff.ReportsTo(parent.id))
+                rows = tuple(member if row.id == self.unit.id else row for row in staff.snapshot().rows
+                             if row.id != self.unit.id or location != "absent")
+                merge_checkpoint.record_publication_changes(production, record=staff.StaffSnapshot(rows),
+                    known_producer=change_review.KnownMergeProducer(merged, self.unit.id))
+                row = change_review.pending(self.listing)[-1]
+                self.assertEqual(row["Change"], location)
+                self.assertEqual(row["Producer"], self.unit.id)
+                if location == "remote-parent":
+                    self.assertEqual(row["Production"], production.owner.id)
+
     def test_an_unregistered_unit_writes_an_empty_producer_and_one_named_note(self) -> None:
-        _ = self.merge()
         production = Production(self.doc, "top", "main", self.repo, self.root / "log", ZoneInfo("UTC"), unit_lookup.doc_owner(self.doc, staff.snapshot()))
         output = io.StringIO()
         with (mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(
                   tuple(staff.snapshot().find(kind="showrunner")))), redirect_stdout(output)):
+            _ = self.merge()
             merge_checkpoint.record_publication_changes(production)
         notes = [line for line in output.getvalue().splitlines() if line.startswith("change review: no staff row")]
         self.assertEqual(len(notes), 1)
@@ -513,6 +545,13 @@ class ParseTest(unittest.TestCase):
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
         self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
         self.assertEqual(change_review.problem("checkpoint(x): y", SEE, ("a.py",)), "")
+        for subject, files in (("Show waiting and starting session states", ("a.py",)),
+                               ("docs: describe session states", ("a.md",)),
+                               ("checkpoint(x): docs", ("a.md",))):
+            with self.subTest(subject=subject, files=files):
+                self.assertIn("needs three parts", change_review.problem(subject, "Change-Review: a worker reads waiting", files))
+                self.assertEqual(change_review.problem(subject, subject, files), "")
+                self.assertEqual(change_review.problem(subject, SEE, files), "")
 
     def test_a_line_without_exactly_three_full_parts_is_refused(self) -> None:
         for value in ("The grid fades | Look across the floor", "A | B | ", " | B | C", "A | B | C | D"):
@@ -720,6 +759,28 @@ class AttachedListTest(unittest.TestCase):
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(self.current), errors.getvalue())
 
+    def test_a_collector_retains_unreadable_lists_while_default_readers_skip_them(self) -> None:
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == self.current:
+                raise PermissionError(f"{path}: unreadable")
+            return read_text(path, encoding=encoding, errors=errors)
+
+        record = staff.snapshot()
+        errors = io.StringIO()
+        sources: list[Path] = []
+        with mock.patch.object(Path, "read_text", read), redirect_stderr(errors):
+            routed = change_review.routed_review_entries(self.current, self.doc, record=record)
+            with self.assertRaises(ValueError) as raised:
+                _ = change_review.routed_review_entries(self.current, self.doc, record=record, sources=sources)
+        self.assertIn(self.earlier, {source.path for source, _, _ in routed})
+        self.assertNotIn(self.current, {source.path for source, _, _ in routed})
+        self.assertIn(self.doc, sources)
+        self.assertIn(self.current, sources)
+        self.assertIn(str(self.current), str(raised.exception))
+        self.assertIn(str(self.current), errors.getvalue())
+
     def test_absent_earlier_list_preserves_current_row_keys_and_filter(self) -> None:
         self.earlier.unlink()
         entries = change_review.scope_entries(self.current, self.doc)
@@ -839,6 +900,16 @@ def run(*arguments: str) -> tuple[int, str, str]:
     with redirect_stdout(output), redirect_stderr(error):
         code = change_review.main(list(arguments))
     return code, output.getvalue(), error.getvalue()
+
+
+def run_review_child(arguments: list[str], environment: dict[str, str]) -> int:
+    """Run the real command with private output and the fresh CLI's timer reader."""
+    with mock.patch.object(showrunners, "timer_docs", TIMER_DOCS):
+        result = invoke_cli(change_review, lambda: change_review.main(arguments), arguments,
+                            {**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, Path.cwd())
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def origin_commits(root: Path) -> tuple[Path, str, str]:
@@ -999,6 +1070,40 @@ class ReadyListTests(ProducerFixture):
             self.assertEqual(self.ready()[0], 0)
             self.assertEqual(self.listing.read_bytes(), before)
 
+        for owner_record in ("fixed", "legacy-session", "inner-unrecorded"):
+            with self.subTest(owner_record=owner_record, checkpoint="repair after the visible checkpoint"):
+                branch = f"repair-{owner_record}"
+                _ = self.git("checkout", "-b", branch)
+                _ = self.git("commit", "--allow-empty", "-m",
+                             f"checkpoint(unrelated-slug): visible change\n\nChange-Review: {branch} | Read | Proof")
+                if owner_record == "inner-unrecorded":
+                    _ = self.git("checkout", "-b", f"side-{branch}")
+                    _ = self.git("commit", "--allow-empty", "-m",
+                                 f"checkpoint(other): visible change\n\nChange-Review: side-{branch} | Read | Other result")
+                    _ = self.git("checkout", branch)
+                    _ = self.git("merge", "--no-ff", f"side-{branch}", "-m", "Merge another unit")
+                _ = self.git("commit", "--allow-empty", "-m", "fix: repair\n\nChange-Review: none — fixture repair")
+                tip = self.git("rev-parse", "HEAD")
+                history = self.root / f"history/runs/{branch}.jsonl"
+                owner = ({"main_agent": {"session_id": self.unit.current_session}} if owner_record == "legacy-session"
+                         else {"owner_staff_id": self.unit.id})
+                _ = history.write_text(json.dumps({"schema_version": 1, "event_type": "checkpoint",
+                    "checkpoint_commit": tip, **owner}) + "\n")
+                _ = self.git("checkout", "integration")
+                _ = self.git("merge", "--no-ff", branch, "-m", "Merge delivery")
+                _ = self.git("push", "origin", "integration")
+                self.promote()
+                self.assertEqual(self.ready()[0], 0)
+                rows = change_review.pending(self.listing)
+                row = (next(row for row in rows if row["Change"] == branch)
+                       if owner_record == "inner-unrecorded" else rows[-1])
+                self.assertEqual(row["Change"], branch)
+                self.assertEqual(row["Producer"], "" if owner_record == "legacy-session" else self.unit.id)
+                if owner_record == "inner-unrecorded":
+                    row = next(row for row in rows if row["Change"] == f"side-{branch}")
+                    self.assertEqual(row["Producer"], "")
+                    self.assertEqual(row["Production"], unit_lookup.doc_owner(self.doc, staff.snapshot()).id)
+
     def test_a_second_scan_of_an_unregistered_unit_adds_no_row_or_staff_note(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result\n"
@@ -1106,21 +1211,43 @@ class ReadyListTests(ProducerFixture):
         merged = self.merge_change("Change-Review: Plain | Read | Ready\n"
                                    + "Change-Review: Restarted | Open | New service | after restart")
         self.promote()
-        code, output, error = self.ready()
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
-        notices = [line for line in output.splitlines() if "restart" in line]
-        self.assertEqual(len(notices), 1)
-        self.assertIn(merged[:8], notices[0])
-        self.assertIn(f"live --merged {merged[:8]}", notices[0])
-        self.assertIn(f"--repo {self.repo}", notices[0])
-        self.assertIn("--production top", notices[0])
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
-        written = self.listing.read_bytes()
-        self.assertEqual(self.live(merged)[0], 0)
-        self.assertEqual(self.ready()[0], 0)
-        self.assertEqual(self.listing.read_bytes(), written)
+        for layout in ("not-imported", "imported", "later-side-checkpoint"):
+            with self.subTest(layout=layout):
+                if layout == "imported":
+                    outside_doc = self.root / "outside.md"
+                    _ = outside_doc.write_text(f"# Outside\n- **Repository:** `{self.repo}`\n"
+                        + "- **Merge branch:** `outside-integration`\n"
+                        + f"- **Change review:** `{self.root / 'change-review - outside.md'}`\n")
+                    _ = recorded_showrunner("outside", outside_doc)
+                    _ = self.git("checkout", "-b", "outside-integration", "main")
+                    _ = self.git("commit", "--allow-empty", "-m", "Independent outside work")
+                    _ = self.git("merge", "--no-ff", "integration", "-m", "Import published work")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                elif layout == "later-side-checkpoint":
+                    _ = self.git("checkout", "-b", "later-side", "old-branch")
+                    _ = self.git("commit", "--allow-empty", "-m",
+                                 "checkpoint(old-branch): later phase\n\nChange-Review: none — fixture continuation")
+                    _ = self.git("checkout", "outside-integration")
+                    _ = self.git("merge", "--no-ff", "later-side", "-m", "Merge later phase")
+                    _ = self.git("push", "origin", "outside-integration")
+                    _ = self.git("checkout", "integration")
+                _ = self.listing.write_text(change_review.skeleton(self.listing, self.doc, change_review.today()))
+                code, output, error = self.ready()
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain"])
+                notices = [line for line in output.splitlines() if "restart" in line]
+                self.assertEqual(len(notices), 1)
+                self.assertIn(merged[:8], notices[0])
+                self.assertIn(f"live --merged {merged[:8]}", notices[0])
+                self.assertIn(f"--repo {self.repo}", notices[0])
+                self.assertIn("--production top", notices[0])
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Plain", "Restarted"])
+                written = self.listing.read_bytes()
+                self.assertEqual(self.live(merged)[0], 0)
+                self.assertEqual(self.ready()[0], 0)
+                self.assertEqual(self.listing.read_bytes(), written)
 
     def test_the_live_command_uses_tools_outside_the_production_repository(self) -> None:
         merged = self.merge_change("Change-Review: Restarted | Open | New service | after restart")
@@ -1266,18 +1393,53 @@ class ReadyListTests(ProducerFixture):
     def test_two_readiness_calls_share_the_list_lock_without_duplicate_rows(self) -> None:
         _ = self.merge_change("Change-Review: Concurrent | Read | One row")
         self.promote()
-        command = [str(Path(change_review.__file__).parents[1] / "lib/py"), str(Path(change_review.__file__)),
-                   "list-ready", "--repo", str(self.repo), "--production", "top"]
-        descriptor = os.open(self.listing.parent, os.O_RDONLY)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            processes = [subprocess.Popen(command, env=os.environ.copy(), stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE, text=True) for _ in range(2)]
-        finally:
-            os.close(descriptor)
-        for process in processes:
-            output, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(process.returncode, 0, output + error)
+        arguments = ["list-ready", "--repo", str(self.repo), "--production", "top"]
+        environment = os.environ.copy()
+        directory = self.listing.parent.stat()
+        guard = LauncherHangGuard("readiness list contention")
+
+        def ready(announcement: int) -> int:
+            real_flock = fcntl.flock
+
+            def observe_lock(descriptor: int, operation: int) -> None:
+                target = os.fstat(descriptor)
+                if operation == fcntl.LOCK_EX and (target.st_dev, target.st_ino) == (directory.st_dev, directory.st_ino):
+                    try:
+                        real_flock(descriptor, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        _ = os.write(announcement, b"blocked")
+                        os.close(announcement)
+                    else:
+                        raise AssertionError("The parent must hold the list lock.")
+                    fcntl.flock = real_flock
+                real_flock(descriptor, operation)
+
+            with mock.patch.object(fcntl, "flock", observe_lock):
+                return run_review_child(arguments, environment)
+
+        with ForkChildren() as children:
+            descriptor = os.open(self.listing.parent, os.O_RDONLY)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                processes: list[ForkChild] = []
+                for _ in range(2):
+                    reader, writer = children.pipe()
+                    processes.append(children.start(lambda writer=writer: ready(writer),
+                                                    close_fds=(descriptor,), pass_fds=(writer,)))
+                    self.assertEqual(select.select([reader], [], [], guard.remaining())[0], [reader],
+                                     "readiness did not reach the list lock")
+                    announcement = os.read(reader, 7)
+                    if not announcement:
+                        result = processes[-1].result(timeout=guard.remaining())
+                        self.fail("readiness ended before the list lock: " + result.stdout + result.stderr)
+                    self.assertEqual(announcement, b"blocked")
+                self.assertTrue(all(process.is_alive() for process in processes))
+            finally:
+                os.close(descriptor)
+            for child in processes:
+                process = child.result(timeout=guard.remaining())
+                output, error = process.stdout, process.stderr
+                self.assertEqual(process.returncode, 0, output + error)
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Concurrent"])
 
     def test_foreign_production_and_child_handoff_rows_keep_their_lists(self) -> None:
@@ -1550,16 +1712,26 @@ class ActionTest(unittest.TestCase):
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
         python = str(Path(__file__).resolve().parents[1] / "lib/py")
-        for path, first in ((self.fresh, 1), (self.path, 81)):
-            numbers = [subprocess.run([python, script, "add", "--repo", str(repo), "--production", DOC, "--list", str(path),
-                                       "--change", item.change, "--check", item.check, "--see", item.see,
-                                       "--merged", commits[-1][:8]],
-                                      capture_output=True, text=True, check=True).stdout.strip()
-                       for item in changes]
-            self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
-            rows = [row for row in change_review.pending(path) if row["#"] in numbers]
-            self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
-                             [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
+        environment = os.environ.copy()
+        with ForkChildren() as children:
+            for path, first in ((self.fresh, 1), (self.path, 81)):
+                numbers: list[str] = []
+                for item in changes:
+                    arguments = ["add", "--repo", str(repo), "--production", DOC, "--list", str(path),
+                                 "--change", item.change, "--check", item.check, "--see", item.see,
+                                 "--merged", commits[-1][:8]]
+                    if path == self.fresh and not numbers:
+                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                                                text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+                    else:
+                        child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
+                        result = child.result()
+                        result.check_returncode()
+                    numbers.append(result.stdout.strip())
+                self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
+                rows = [row for row in change_review.pending(path) if row["#"] in numbers]
+                self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
+                                 [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
 
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
         for change, check, see in (("", "Look", "It"), ("A", " ", "It"), ("A\nB", "Look", "It"), ("A", "Look", "")):

@@ -14,6 +14,7 @@ import time
 import unittest
 from collections.abc import Iterator
 from contextlib import redirect_stderr
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import override
 from unittest import mock
@@ -24,6 +25,7 @@ from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import linux_runner
 
@@ -38,7 +40,11 @@ class DiskTests(unittest.TestCase):
         root = self.base()
         test_index.point_root_at(self, root / "log")
         self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
-        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(root / "sweep")}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
+        }))
+        _ = (root / "buildlog.conf").write_text(
+            "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -288,6 +294,14 @@ class DiskTests(unittest.TestCase):
 
     def test_snapshot_reads_filesystem_usage_once_after_the_walk(self) -> None:
         events: list[str] = []
+        old: disk.DiskSnapshot = {
+            "measured_at": "2026-10-03T07:00:00Z", "host": "test", "rows": [],
+            "used": 1, "free": 2, "floor": None,
+        }
+        full: disk.DiskSnapshot = {
+            **old, "filesystems": [], "outside_build_caches": [],
+            "outside_build_cache_totals": [], "previous_measured_at": None,
+        }
 
         def walk(path: str, _seen: set[tuple[int, int]]) -> int:
             events.append(path)
@@ -298,17 +312,24 @@ class DiskTests(unittest.TestCase):
             events.append("usage")
             return filesystem.FilesystemUsage(used=500, free=600)
 
-        with (
-            mock.patch.object(disk, "FOLDERS", [("first", "first"), ("second", "second")]),
-            mock.patch.object(disk, "read_floor", return_value=None),
-            mock.patch.object(sweep, "directory_blocks", side_effect=walk),
-            mock.patch.object(filesystem, "filesystem_usage", side_effect=usage),
-        ):
-            result = disk.snapshot()
+        for label, previous, hour in (("none", None, 15), ("old shape", old, 15), ("old full", full, 3)):
+            clock = mock.Mock(return_value=datetime(2026, 10, 4, hour, tzinfo=user_zone()))
+            with (
+                self.subTest(previous=label),
+                mock.patch.object(disk, "FOLDERS", [("first", "first"), ("second", "second")]),
+                mock.patch.object(disk, "read_floor", return_value=None),
+                mock.patch.object(disk, "read_snapshot", return_value=previous),
+                mock.patch.object(disk, "datetime", wraps=datetime, now=clock),
+                mock.patch.object(sweep, "directory_blocks", side_effect=walk),
+                mock.patch.object(filesystem, "filesystem_usage", side_effect=usage),
+            ):
+                events.clear()
+                result = disk.snapshot()
 
-        self.assertEqual(events, ["first", "second", "usage"])
-        self.assertEqual(result["used"], 500)
-        self.assertEqual(result["free"], 600)
+            self.assertEqual(events, ["first", "second", "usage"])
+            self.assertEqual(result["used"], 500)
+            self.assertEqual(result["free"], 600)
+            self.assertEqual(result["capacity_measured_at"], result["measured_at"])
 
     def test_malformed_floor_read_reports_its_config_key(self) -> None:
         config = self.base() / "lint.conf"
@@ -436,38 +457,49 @@ class DiskTests(unittest.TestCase):
         self.assertGreater(by_path[str(target)]["bytes"], 0)
 
     def test_outside_directories_compare_previous_snapshot_and_count_new_directory(self) -> None:
-        root = self.base() / "tmp"
-        old = root / "old"
-        child = old / "child"
-        deep = child / "deep"
-        deep.mkdir(parents=True)
-        first_file = deep / "first"
-        _ = first_file.write_bytes(os.urandom(4096))
-        folders = [("tmp", str(root))]
+        for label, relative_root in (("tmp", "tmp"), ("~/.local/state", ".local/state")):
+            with self.subTest(root=label):
+                home = self.base()
+                root = home / relative_root
+                old = root / "old"
+                child = old / "child"
+                deep = child / "deep"
+                deep.mkdir(parents=True)
+                first_file = deep / "first"
+                _ = first_file.write_bytes(os.urandom(4096))
+                folders = ([folder for folder in disk.FOLDERS if folder[0] == label]
+                           if label == "~/.local/state" else [(label, str(root))])
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
-            disk.write_snapshot(first)
-            next_file = deep / "next"
-            _ = next_file.write_bytes(os.urandom(8192))
-            fresh = root / "new"
-            fresh.mkdir()
-            _ = (fresh / "new-file").write_bytes(os.urandom(4096))
-            second = disk.measure(
-                folders, lambda: filesystem.FilesystemUsage(0, 0), None,
-                disk.previous_outside_measurement(disk.read_snapshot()),
-            )
+                with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+                     mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
+                    first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
+                    disk.write_snapshot(first)
+                    next_file = deep / "next"
+                    _ = next_file.write_bytes(os.urandom(8192))
+                    fresh = root / "new"
+                    fresh.mkdir()
+                    _ = (fresh / "new-file").write_bytes(os.urandom(4096))
+                    second = disk.measure(
+                        folders, lambda: filesystem.FilesystemUsage(0, 0), None,
+                        disk.previous_outside_measurement(disk.read_snapshot()),
+                    )
 
-        growth = next_file.stat().st_blocks * 512
-        by_path = {row["path"]: row for row in second["outside_build_caches"]}
-        self.assertEqual(second["previous_measured_at"], first["measured_at"])
-        self.assertEqual(by_path[str(old)]["growth_bytes"], growth)
-        self.assertEqual(by_path[str(child)]["growth_bytes"], growth)
-        self.assertEqual(by_path[str(old)]["largest_child_growth_bytes"], growth)
-        self.assertEqual(by_path[str(child)]["largest_child_path"], str(deep))
-        self.assertEqual(by_path[str(child)]["largest_child_growth_bytes"], growth)
-        self.assertNotIn(str(deep), by_path)
-        self.assertEqual(by_path[str(fresh)]["growth_bytes"], by_path[str(fresh)]["bytes"])
+                growth = next_file.stat().st_blocks * 512
+                by_path = {row["path"]: row for row in second["outside_build_caches"]}
+                self.assertEqual(second["previous_measured_at"], first["measured_at"])
+                self.assertEqual(by_path[str(old)]["bytes"], first_file.stat().st_blocks * 512 + growth)
+                self.assertEqual(by_path[str(old)]["growth_bytes"], growth)
+                self.assertEqual(by_path[str(child)]["growth_bytes"], growth)
+                self.assertEqual(by_path[str(old)]["largest_child_growth_bytes"], growth)
+                self.assertEqual(by_path[str(child)]["largest_child_path"], str(deep))
+                self.assertEqual(by_path[str(child)]["largest_child_growth_bytes"], growth)
+                self.assertNotIn(str(deep), by_path)
+                self.assertEqual(by_path[str(fresh)]["growth_bytes"], by_path[str(fresh)]["bytes"])
+                new_bytes = (fresh / "new-file").stat().st_blocks * 512
+                self.assertEqual(second["outside_build_cache_totals"], [
+                    {"label": label, "bytes": first_file.stat().st_blocks * 512 + growth + new_bytes,
+                     "growth_bytes": growth + new_bytes},
+                ])
 
     def test_deleted_directory_reduces_folder_growth_without_a_listed_row(self) -> None:
         root = self.base() / "tmp"
@@ -577,15 +609,76 @@ class DiskTests(unittest.TestCase):
         folder = root / "traces"
         folder.mkdir(parents=True)
         _ = (folder / "first").write_bytes(os.urandom(4096))
+        began = datetime(2026, 10, 4, 3, tzinfo=user_zone())
+        clock = mock.Mock(return_value=began)
         with (
             mock.patch.object(disk, "FOLDERS", [("tmp", str(root))]),
             mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1),
             mock.patch.object(disk, "read_floor", return_value=None),
             mock.patch.object(filesystem, "filesystem_usage", return_value=filesystem.FilesystemUsage(0, 0)),
+            mock.patch.object(disk, "datetime", wraps=datetime, now=clock),
+            mock.patch.object(time, "time", return_value=began.timestamp()) as timestamp,
         ):
             first = disk.snapshot()
+            gone: disk.FilesystemCapacity = {
+                "path": str(root / "gone"), "device": "9:9", "device_name": "old device", "used": 7, "free": 8,
+            }
+            first.setdefault("filesystems", []).append(gone)
+            first["output_unavailable"] = ["saved mapping warning"]
             disk.write_snapshot(first)
             _ = (folder / "second").write_bytes(os.urandom(4096))
+            original = (store.root() / store.DISK_NAME).read_bytes()
+
+            def capacity(path: str) -> filesystem.FilesystemUsage:
+                if path == gone["path"]:
+                    raise FileNotFoundError(path)
+                return filesystem.FilesystemUsage(50, 60)
+
+            for elapsed, request_age in ((timedelta(minutes=10), None), (timedelta(hours=2), None),
+                                         (timedelta(hours=2), timedelta(minutes=-1))):
+                request_path = store.root() / store.DISK_WALK_REQUEST_NAME
+                if request_age is not None:
+                    store.write_disk_walk_request({"requested_at": store.utc_iso((began + request_age).timestamp()),
+                                                   "alert_at": store.utc_iso(began.timestamp()), "unnamed_bytes": 123})
+                with (
+                    self.subTest(age=elapsed, request_age=request_age),
+                    mock.patch.object(disk, "mapped_output_paths", side_effect=AssertionError("unexpected walk")),
+                    mock.patch.object(sweep, "target_dirs", side_effect=AssertionError("unexpected walk")),
+                    mock.patch.object(disk, "read_cargo_output_roots", side_effect=AssertionError("unexpected walk")),
+                    mock.patch.object(sweep, "directory_blocks", side_effect=AssertionError("unexpected walk")),
+                    mock.patch.object(disk, "outside_directory_bytes", side_effect=AssertionError("unexpected walk")),
+                    mock.patch.object(disk, "read_floor", return_value=42),
+                    mock.patch.object(filesystem, "filesystem_usage", side_effect=capacity),
+                ):
+                    clock.return_value = began + elapsed
+                    refreshed = disk.snapshot()
+                for key in ("rows", "outside_build_caches", "outside_build_cache_totals", "measured_at",
+                            "previous_measured_at", "output_unavailable"):
+                    self.assertEqual(dict(refreshed)[key], dict(first)[key])
+                self.assertEqual((refreshed["used"], refreshed["free"], refreshed["floor"]), (50, 60, 42))
+                self.assertEqual(refreshed["capacity_measured_at"], store.utc_iso((began + elapsed).timestamp()))
+                self.assertEqual(refreshed.get("filesystems", [])[-1], gone)
+                for row in refreshed.get("filesystems", [])[:-1]:
+                    self.assertEqual((row["used"], row["free"]), (50, 60))
+                self.assertEqual((store.root() / store.DISK_NAME).read_bytes(), original)
+                disk.write_snapshot(refreshed)
+                original = (store.root() / store.DISK_NAME).read_bytes()
+                if request_age is not None:
+                    self.assertTrue(request_path.is_file())
+                    request_path.unlink()
+            store.write_disk_walk_request({"requested_at": store.utc_iso((began + timedelta(minutes=1)).timestamp()),
+                                           "alert_at": store.utc_iso(began.timestamp()), "unnamed_bytes": 123})
+            request_bytes = (store.root() / store.DISK_WALK_REQUEST_NAME).read_bytes()
+            clock.return_value = began + timedelta(hours=2)
+            timestamp.return_value = (began + timedelta(hours=2)).timestamp()
+            requested = disk.snapshot()
+            self.assertEqual(requested["previous_measured_at"], first["measured_at"])
+            self.assertEqual(requested["measured_at"], store.utc_iso((began + timedelta(hours=2)).timestamp()))
+            self.assertGreater(requested["outside_build_caches"][0]["growth_bytes"], 0)
+            self.assertEqual((store.root() / store.DISK_WALK_REQUEST_NAME).read_bytes(), request_bytes)
+            (store.root() / store.DISK_WALK_REQUEST_NAME).unlink()
+            clock.return_value = began + timedelta(days=1)
+            timestamp.return_value = (began + timedelta(days=1)).timestamp()
             second = disk.snapshot()
 
         self.assertEqual(second["previous_measured_at"], first["measured_at"])

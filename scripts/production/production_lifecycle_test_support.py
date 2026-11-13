@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 import json
 import os
@@ -70,6 +70,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
@@ -90,6 +91,7 @@ class LifecycleFixture(unittest.TestCase):
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
+    running_snapshot: ClassVar[Path]
     fixture_env: ClassVar[dict[str, str]]
 
     @classmethod
@@ -100,11 +102,14 @@ class LifecycleFixture(unittest.TestCase):
         cls.fixture_root = Path(folder.name).resolve() / "case"
         cls.fixture_root.mkdir()
         cls.fixture_snapshot = cls.fixture_root.with_name("snapshot")
+        cls.running_snapshot = cls.fixture_root.with_name("running")
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
         cls.fixture_env = builder.env.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot)
+        builder.build_running_repository()
+        _ = shutil.copytree(cls.fixture_root, cls.running_snapshot)
         shutil.rmtree(cls.fixture_root)
 
     @override
@@ -161,6 +166,7 @@ class LifecycleFixture(unittest.TestCase):
                          ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
         self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
+                    "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "SHOWRUNNER_SESSION": "environment-showrunner",
@@ -223,7 +229,7 @@ class LifecycleFixture(unittest.TestCase):
         lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
         self.write(self.doc, "\n".join(lines) + "\n")
 
-    def running(self) -> None:
+    def build_running_repository(self) -> None:
         _ = self.git("switch", "-c", "production")
         self.production_doc("running")
         _ = self.git("add", str(self.doc))
@@ -232,6 +238,13 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+
+    def running(self) -> None:
+        # Keep the per-test state and the fixed paths in Git worktree links.
+        for directory in (self.origin, self.checkout, self.alpha, self.beta):
+            if directory.exists():
+                shutil.rmtree(directory)
+            _ = shutil.copytree(self.running_snapshot / directory.name, directory)
         runner = fixture_member("showrunner", name="example",
                               doc=staff.LiveDoc(remote.local_machine(), self.doc))
         for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
@@ -251,7 +264,9 @@ class LifecycleFixture(unittest.TestCase):
     def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == name)
         with mock.patch.dict(os.environ, self.env):
-            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id, unit_config.Branch(branch)))
+            _ = unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", row.id))
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), worktree, staff.ParkedBranch(branch)),
+                                   expected=row.worktree)
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.

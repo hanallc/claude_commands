@@ -19,7 +19,7 @@ from types import ModuleType
 from typing import cast
 from unittest.mock import patch
 
-
+from scripts.lib.git_test_support import write_fixture_git_config
 
 
 def process_boundary[**P](test: Callable[P, None]) -> Callable[P, None]:
@@ -60,18 +60,12 @@ def parse_arguments(main: Callable[[list[str]], int], arguments: list[str]) -> a
 @contextmanager
 def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     """Bind source readers to the same fixture paths for direct and CLI calls."""
-    from scripts.production import dailies_render
     from scripts.production import showrunners
     from scripts.message import session_send
     from scripts.whoami import note_file
 
     home = Path(environment.get("HOME", str(Path.home())))
     with ExitStack() as scope:
-        for name, value in {
-            "CHART_CONF": home / ".local/state/showrunner/dailies.conf",
-            "READINGS_LOG": home / ".local/state/agent-notes/readings.jsonl",
-        }.items():
-            _ = scope.enter_context(patch.object(dailies_render, name, value))
         _ = scope.enter_context(patch.object(note_file, "AGENTS_DIR", home / "rust/hanadocs/agents"))
         for name, value in {
             "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
@@ -87,9 +81,23 @@ def production_paths(environment: Mapping[str, str]) -> Generator[None]:
         yield
 
 
+@contextmanager
+def locked_environment(environment: Mapping[str, str], lock: AbstractContextManager[object]) -> Generator[None]:
+    """Keep environment changes outside a private service loop's reads."""
+    change = cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True))
+    with lock:
+        _ = change.__enter__()
+    try:
+        yield
+    finally:
+        with lock:
+            _ = change.__exit__(None, None, None)
+
+
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],
                environment: Mapping[str, str], cwd: Path, *, combined_output: bool = False,
-               production_state: bool = False) -> subprocess.CompletedProcess[str]:
+               production_state: bool = False,
+               environment_lock: AbstractContextManager[object] | None = None) -> subprocess.CompletedProcess[str]:
     """Keep the real parser, handlers and child commands; isolate their boundaries.
 
     These commands do not mutate containers in their module globals. Restore
@@ -100,18 +108,21 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     # patch.object will then restore caller paths rather than fixture paths.
     if production_state:
         with patch.object(sys, "path", sys.path.copy()):
-            _ = import_module('scripts.production.dailies_render')
             _ = import_module("scripts.production.showrunners")
+            _ = import_module("scripts.whoami.note_file")
 
     before = vars(module).copy()
     directory = Path.cwd()
     stdout = io.StringIO()
     stderr = stdout if combined_output else io.StringIO()
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     handlers = {sig: signal.getsignal(sig) for sig in
                 (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)}
     try:
         with ExitStack() as scope:
-            _ = scope.enter_context(cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True)))
+            environment_scope = (locked_environment(environment, environment_lock) if environment_lock is not None
+                                 else cast(AbstractContextManager[object], patch.dict(os.environ, environment, clear=True)))
+            _ = scope.enter_context(environment_scope)
             _ = scope.enter_context(patch.object(sys, "argv", [str(module.__file__), *arguments]))
             _ = scope.enter_context(patch.object(sys, "path", sys.path.copy()))
             _ = scope.enter_context(redirect_stdout(stdout))
@@ -126,11 +137,14 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
                 if isinstance(exit_status.code, str):
                     print(exit_status.code, file=sys.stderr)
     finally:
-        os.chdir(directory)
-        for sig, handler in handlers.items():
-            _ = signal.signal(sig, handler)
-        vars(module).clear()
-        vars(module).update(before)
+        try:
+            os.chdir(directory)
+            for sig, handler in handlers.items():
+                _ = signal.signal(sig, handler)
+            vars(module).clear()
+            vars(module).update(before)
+        finally:
+            _ = signal.pthread_sigmask(signal.SIG_SETMASK, mask)
     return subprocess.CompletedProcess([sys.executable, str(module.__file__), *arguments],
                                        status, stdout.getvalue(), "" if combined_output else stderr.getvalue())
 
@@ -146,7 +160,9 @@ class ImmutableGitSeed:
     def create(cls, root: Path, branch: str, author: str, email: str,
                files: Mapping[str, str]) -> ImmutableGitSeed:
         checkout, origin = root / "checkout", root / "origin.git"
-        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        root.mkdir(parents=True, exist_ok=True)
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root)),
+                       "GIT_CONFIG_NOSYSTEM": "1"}
         commands = [["init", "--bare", str(origin)], ["init", "-b", branch, str(checkout)]]
         for arguments in commands:
             _ = subprocess.run(["git", *arguments], env=environment, capture_output=True, check=True)

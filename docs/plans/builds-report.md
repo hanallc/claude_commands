@@ -235,9 +235,9 @@ The user, 2026-11-03: tables do not work for them. Lower priority. Design a char
 #### As-built
 
 - Design: `docs/plans/builds-report-charts-design.md`. The user said "go" on 2026-11-03, relayed by builds.
-- `buildlog charts [--days 7|30] [--no-open]` (`scripts/buildlog/charts.py`) writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.py` and prints the tailnet link (Phase 22). The page is inline SVG with no server or external library. It has light, dark and Auto themes and daily buckets in the user's zone.
+- The charts are on the shared build page. `/build:page` prints its link, and `charts.page_data` (`scripts/buildlog/charts.py`) feeds it. Phase 47 removed the `buildlog charts` command. The charts have light, dark and Auto themes and daily buckets in the user's zone.
 - Charts: hana phase time (daily median and p90), costs by cause as small multiples, and costs by machine. Each has numbered moment lines, a crosshair tooltip and a table view.
-- `costs.py` is the shared cost reader for `buildlog costs` and `buildlog charts`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
+- `costs.py` is the cost reader for `charts.page_data`. It pairs reruns and Mac runs in one pass, then splits at bucket edges. A missing applicable memory wait stays `CostUnavailable`, never 0. Mac idle is classified by coverage intervals; its unknown part is shown.
 - `index.py` `COST_INDEXES` (made in `create_schema` and `open_for_update`) give indexed window reads instead of whole-table scans.
 - Speed, as process CPU time (user+sys): 7 days 0.60–0.71 s (limit 1.5 s); 30 days 1.76–1.82 s (limit 3 s).
 - The fresh design check found two label defects; Phase 10 fixes them.
@@ -320,14 +320,14 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
 - `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
-- `buildlog charts` output is unchanged; `main` and `page_data` share `read_index`, and `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
+- `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
 - `scripts/buildlog/charts.py` — `page_data`, its types, the snapshot and index helpers.
 - `scripts/buildlog/test_charts.py` — `PageDataTests`.
 - `config/buildlog.conf` — recent days, actions and owners.
 
-**Binds later work:** queue's build page feed calls `charts.page_data`; it stays when `buildlog charts` moves to the shared page.
+**Binds later work:** queue's build page feed calls `charts.page_data`; it stays.
 
 **Ruled out:** a `read_costs` keyword that skips phase rows (one read makes it unnecessary); a snapshot inside `read_costs` for every reader (`buildlog costs` is its only unsnapshotted reader and goes away with the shared page).
 
@@ -446,6 +446,8 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
+- Phase 26 removed `present_page`. Phase 47 removed `buildlog charts` and `local_display`. The bullets below are history.
+
 - `buildlog charts` writes `~/.cache/buildlog/charts/latest.html`, publishes it with `review_link.snapshot`, and prints only the bare tailnet link. It prints no file path. Two runs print the same link.
 - `charts.present_page(series, path, no_open) -> int` puts the page write and the snapshot under one handler of `review_link.SNAPSHOT_ERRORS`. A failure prints one stderr line (`buildlog charts: publication failed: <reason>`) and returns 1.
 - `charts.local_display(environ, platform) -> bool`: false in any ssh session (`SSH_CONNECTION` set); otherwise true on darwin, or with `DISPLAY` or `WAYLAND_DISPLAY`. Only then does `webbrowser.open(link)` run, under `suppress(OSError, webbrowser.Error)`. `--no-open` and `BUILDLOG_CHARTS_NO_OPEN=1` skip the open.
@@ -535,9 +537,11 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
+- Phase 47 removed `buildlog charts` and `charts.main`. `/build:page` is the one way to the build page. The `buildlog charts` bullets below are history.
+
 - `buildlog charts` publishes no page of its own. `charts.main` runs `scripts/build_queue/memory_feed.py link` (the `/build:page` command) from the same checkout and prints its one URL line. It opens the URL when a local display exists and `--no-open` is absent. `--days 7|30` stays.
 - No link prints `buildlog charts: <reason>` to stderr and exits 1. No link means: a non-zero exit, a missing command, or stdout that is not one printable `http`/`https` URL with a valid port. The reason is the command's stderr when it gave one.
-- `buildlog costs` is gone: the CLI prints its unknown-command usage and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
+- `buildlog costs` is gone: the CLI takes its unknown-command path and exits 2. `read_costs`, `aggregate_costs`, `collect_costs` and the cost types stay; the shared page reads them through `page_data`.
 - `render_html`, `publish`, `PAGE`, `chart_data` and the cost text output are gone. Calculation tests read the typed `ChartSet`.
 - The cost Definitions are sentences in `docs/as-built/buildlog-memory-stalls.md`. `build-report-session.md`, `build-targets.md` and `mac-test-offload.md` name `buildlog charts`.
 - Live check, 2026-11-09, from this branch: `buildlog charts --no-open` printed `http://100.103.14.30:8765/h7uj5c/memory_live.html`, the same line as `/build:page`.
@@ -921,3 +925,334 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 
 **Gotchas:**
 - Chrome refuses a long temporary socket path. Run the proof under a short `$TMPDIR` when the default path is long.
+
+### Phase 44 — A vault stop files a question only when the next hourly try also stops · status: done
+
+#### As-built
+
+- The Mac script's `retry_git` prints Git output only for the final failure: exhausted lock retries, or an error that is not a lock. A vault stop shows the Git error once.
+- `_vault_locked` files a question only when an outage was already open before the run, for every stop cause. A first stop opens the outage with `asked` false.
+- The 24-hour Mac unreachable grace still applies. A failed `ask` retries on the next run. A good sync after a first stop files no question and withdraws none.
+- Any run of `buildlog vault` counts as the next try, also a manual one.
+- Exit codes did not change. The rule has no config key: one try is not a tunable.
+
+**Files:**
+- `scripts/buildlog/vault_pull.py` — the sync and its question rule.
+- `scripts/buildlog/test_vault_pull.py` — the rule for each stop cause, and the single error line.
+
+### Phase 45 — Copy watch test processes end by themselves · status: done
+
+#### As-built
+
+- Every helper process that `test_copy_watch.py` starts arms `signal.alarm` at the test hang guard as its first action: the step stub, the runner stub, the parent wrapper, its delayed child and the live-pid child.
+- The fixture passes `TEST_HANG_GUARD_SECS` from `test_hang_guard` in each process environment.
+- A suite that is killed before `tearDown` leaves no helper for longer than the guard. The real watcher did not change and ends when its parent is gone.
+- No new test. A one-second trial showed the step stub and the runner stub in hold mode end with SIGALRM.
+
+**Files:**
+- `scripts/mac_test/test_copy_watch.py` — the fixture processes and their time limit.
+
+**Gotchas:**
+- A forked child does not inherit a pending alarm, so each process arms its own. An alarm does stay across `exec`.
+
+### Phase 46 — Report and memory commands load only the code they use · status: done
+
+#### As-built
+
+- `disk.py` imports `scripts.lint.sweep` inside the four functions that use it. `disk.read_snapshot` does not load it.
+- `memory.window_report` imports `queue_snapshot` on each run. It imports `room_text` and `memory_admit` only for a queue snapshot in the window.
+- `report.py` has no direct queue or sweep import, so the report command loads neither `sweep` nor `queue_evidence`.
+- Thirty interleaved process pairs measured 0.268 CPU seconds saved per report process and 0.148 per memory process. The saving is 16.25 CPU seconds per merge gate at 7 report, 41 `test_index` and 23 memory children, and 5.3 without the `test_index` children.
+- Program output, row counts and SQL do not change.
+
+**Files:**
+- `scripts/buildlog/disk.py` — the disk snapshot and its floor.
+- `scripts/buildlog/memory.py` — the memory snapshot and the window report.
+
+**Gotchas:**
+- A module-level import of `sweep` or `queue_evidence` in these files brings the cost back.
+
+**Ruled out:**
+- A separate module for the `disk.py` writers needs caller and test edits and saves no more.
+
+### Phase 47 — buildlog charts is removed; /build:page is the one way to the build page · status: done
+
+#### As-built
+
+- `buildlog charts` is removed. It takes the unknown-command path and exits 2, as `buildlog costs` does.
+- `/build:page` is the one way to the shared build page link. `charts.page_data` stays and feeds that page, with the same output.
+- `charts.main`, `local_display` and `MEMORY_FEED` are removed with their tests.
+- The as-built docs and the charts design name `/build:page`.
+
+**Files:**
+- `scripts/buildlog/cli.py` — the command list and usage text.
+- `scripts/buildlog/charts.py` — `page_data` and the chart series.
+- `scripts/buildlog/test_costs.py` — the removed-command test, with rows for `costs` and `charts`.
+
+### Phase 48 — buildlog names a wrong command in one line · status: done
+
+#### As-built
+
+- An unknown `buildlog` command prints one line to stderr and exits 2: `buildlog: unknown command '<word>'; type buildlog to see the commands`. It prints no help page.
+- `buildlog` with no command prints the help page and exits 2. `help`, `-h` and `--help` print it and exit 0.
+- `test_unknown_commands_and_help_do_not_read_the_index` is one table: `costs`, `charts`, a word that never was a command, no command, and the three help forms. No row opens the index.
+
+**Files:**
+- `scripts/buildlog/cli.py` — the unknown-command line at the end of `main`.
+- `scripts/buildlog/test_costs.py` — the unknown-command and help table.
+
+### Phase 49 — buildlog query uses the shared table printer · status: done
+
+#### As-built
+
+- `buildlog query` prints its text table through `scripts/lib/terminal_cells.print_table`. `cli.py` has no table printer of its own.
+- `cli.cell` makes the text of each value: NULL is `—`, a float uses `:g` below `1e15`, any other value uses `str`. A number column with NULLs stays right-aligned, because the shared number test counts `—` as a number.
+- An empty result prints `no rows`. The table has no dashed line under the headers. The `--json` output and the stderr timing line do not change.
+
+**Files:**
+- `scripts/buildlog/cli.py` — `cell` and the text branch of `query`.
+- `scripts/buildlog/test_gate_index.py` — `test_query_text_aligns_numbers_and_prints_empty_results`.
+
+### Phase 50 — Gate records hold each module's start and end time · status: done
+
+#### As-built
+
+- Each gate module run records its wall-clock start and end. `start_gate_job` sets `RunningGateJob.started_at`; `finish_gate_job` passes it on and sets `ended_at`. A hold restart keeps both times.
+- `GateJobResult` and `gate_record.Execution` carry `started_at` and `ended_at` as keyword-only `float | None`. `None` means "not recorded": a job that never started, or a result from a box that runs an older tree.
+- `gate_record.module_runs` writes `started_at` and `ended_at` as UTC ISO text (`store.utc_iso`) only when recorded. `ModuleRun` marks both keys `NotRequired`.
+- The cloud transfer keeps the times. `gate_box.encode_run` leaves out an unknown time. The decoder accepts a row with no times and refuses a negative or non-finite time.
+- `buildlog` schema 40 adds `gate_modules.module_started_at` and `module_ended_at` (TEXT). Older records give NULL. `gate_runs.started_at` is still the run start.
+- `docs/as-built/merge-gate-and-test-speed.md` has a "Module start and end times" section with the ordering query.
+
+**Files:**
+- `scripts/production/merge_gate.py` — `GateJobResult`, `RunningGateJob`, `start_gate_job`, `finish_gate_job`, `record_gate_run`.
+- `scripts/test_times/gate_record.py` — `ModuleRun`, `Execution`, `module_runs`.
+- `scripts/aws_target/gate_box.py` — `encode_run`, the job decoder, `execution_records`.
+- `scripts/buildlog/index.py` — `SCHEMA_VERSION`, `GATE_MODULE_COLUMNS`, `add_gate_run`.
+- `scripts/test_times/test_gate_record.py`, `scripts/buildlog/test_gate_index.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py`, `scripts/production/test_merge_gate_holds.py` — the tests.
+- `docs/as-built/merge-gate-and-test-speed.md` — module start and end times.
+
+### Phase 51 — Gate module times use named recorded and not-recorded states · status: done
+
+#### As-built
+
+- `gate_record.py` has two frozen dataclasses. `WallClockSpan(started_at, ended_at)` holds the wall-clock epoch seconds of one module attempt. `WallClockNotRecorded(reason)` means the attempt has no recorded span.
+- `gate_record.Execution` and `merge_gate.GateJobResult` hold one keyword field `wall_clock: WallClockSpan | WallClockNotRecorded`. The defaults are `WallClockNotRecorded("not recorded")` and `WallClockNotRecorded("job did not run")`. `finish_gate_job` sets a `WallClockSpan`; `RunningGateJob.started_at` stays a `float`.
+- `module_runs` writes `started_at` and `ended_at` only for a span. The JSON record and the `buildlog` columns do not change.
+- The cloud wire format does not change. `gate_box.encode_job` writes the top-level `started_at` and `ended_at` keys only for a span. The decoder gives a span for both keys, `WallClockNotRecorded("box result has no module times")` for none, and `WallClockNotRecorded("box result has only one module time")` for one. A row with one time keeps its job status and gate result. A negative or non-finite time is still refused.
+- `docs/as-built/merge-gate-and-test-speed.md` says that a cloud row with only one of the two times records neither.
+- A separate main fix (0236b558e) narrowed the Phase 50 test times. A merge of it with this phase conflicts in `test_merge_gate_suites_tripwires.py`; keep this phase's side.
+
+**Files:**
+- `scripts/test_times/gate_record.py` — `WallClockSpan`, `WallClockNotRecorded`, `Execution`, `module_runs`.
+- `scripts/production/merge_gate.py` — `GateJobResult`, `finish_gate_job`, `record_gate_run`.
+- `scripts/aws_target/gate_box.py` — `encode_job`, the job decoder, `execution_records`.
+- `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_gate_box.py`, `scripts/production/test_merge_gate_suites_tripwires.py` — the tests, with half-timed cloud rows.
+- `docs/as-built/merge-gate-and-test-speed.md` — partial cloud times.
+
+### Phase 52 — The 10-minute disk job reads almost nothing · status: done
+
+#### As-built
+
+- `disk.snapshot()` walks the build folders only when there is no full previous snapshot (none, or an old shape), or when the last walk is at least `DISK_WALK_MINUTES` old **and** the current hour in the user's zone (`scripts.lib.user_zone.user_zone()`) is `DISK_WALK_HOUR`.
+- Every other run refreshes only free and used space: `/` and each `filesystems` row through `filesystem.filesystem_usage`. A path that fails keeps its old row. It refreshes `floor` and sets `capacity_measured_at`. It keeps `rows`, the outside data, `measured_at`, `previous_measured_at` and `output_unavailable`. It calls no walk function. A whole `buildlog disk` refresh took 0.17-0.28 s on a copy of the live `disk.json`.
+- A full walk sets `capacity_measured_at` equal to `measured_at`. `sweep.read_disk_measurement` still reads the walk time, so folder growth spans walks.
+- `report.disk_section` names both times when they differ: `Folder sizes measured by the buildlog disk job at {walk}; free and used space at {capacity}: allocated blocks, each hard-linked file once.` Without the key, or with equal times, it keeps the one-time line.
+- `config/buildlog.conf`: `DISK_WALK_MINUTES=1200` (below a day, so drift never skips the daily walk) and `DISK_WALK_HOUR=3` (the builds showrunner, 2026-11-12: a walk at a random daytime minute makes the keyboard stick).
+- natedev's IO scheduler is `none`, so `ionice` has no effect; the interval and the quiet hour are the fix.
+- With a daily walk, floor-crossing alerts drop folder choices after 15 minutes (`sweep_snapshot_max_age_seconds=900`). Phase 53 holds the fix.
+
+**Files:**
+- `config/buildlog.conf` — `DISK_WALK_MINUTES`, `DISK_WALK_HOUR`.
+- `scripts/buildlog/disk.py` — `snapshot()`, `capacity_measured_at` in `DiskSnapshot` and `MeasuredDiskSnapshot`.
+- `scripts/buildlog/report.py` — the `disk_section` closing line.
+- `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
+
+### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: done
+
+From the user (via the builds showrunner), 2026-11-12: "approve. Question: allow a 28-hour-old folder snapshot for the disk floor alert (sweep_snapshot_max_age_seconds 900 -> 100800)."
+
+#### As-built
+
+- `/tune` set `sweep_snapshot_max_age_seconds=100800` on main (d83275f72). Two daily walks can be 90,120 seconds apart on the day clocks go back; the limit adds timer drift and the walk time.
+- `folder_choices` and `disk_measurement_lines` read the limit at use, so no code changed. Folder freshness uses `measured_at`; `capacity_measured_at` does not make folder sizes fresh.
+- `config/lint.conf`: the comment above the value states the daily walk.
+- `docs/as-built/build-followups.md` **Measuring**: the walk rule (no full snapshot, or `DISK_WALK_MINUTES` old in the `DISK_WALK_HOUR` hour, or a newer walk request) and the two-time report line.
+
+**Files:**
+- `config/lint.conf` — the comment.
+- `scripts/lint/test_sweep.py` — `test_crossing_session_keeps_trash_and_scratch_effects` rows with their own 100800 limit: a 26-hour-old walk offers its folders; an older one offers none and says "stale".
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
+
+From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is resources' file, and the builds showrunner gave the go for this unit to write the fix.
+
+#### As-built
+
+- `tmp_sweep.judge_entries`: a run keep reason from `run_folder_guards` keeps the run folder and its `tmp/` folder. It no longer keeps the entries inside `tmp/`.
+- Each run `tmp/` entry goes by the 4 h rule, process use (`IN_USE`), `WORKER_USES` and the git check.
+- `RunKeepReason.UNREADABLE_RECORD` and an unreadable session registry (`NO_SESSIONS`) still keep run `tmp/` entries.
+- The module docstring states the rule once.
+- Cause: killed test runs left temp folders in run `tmp/` folders (verify.sh's TMPDIR). On 2026-11-12 the sweep kept 925 such entries in one run; the dry run after the fix selects 55,100 across all runs.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
+- `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.
+
+### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
+
+From builds (not the user), 2026-11-12: put the 2 h limit and the fall size in config as new keys; start the walk only on an unnamed fall beyond cache growth.
+
+Problem: after Phase 52 the folder walk runs once a day, so the 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall.
+
+#### As-built
+
+- New keys in `config/lint.conf`: `sweep_walk_request_fall_bytes=10737418240` and `sweep_walk_request_interval_seconds=7200`.
+- `store.py`: `DISK_WALK_REQUEST_NAME`, the `DiskWalkRequest` TypedDict (`requested_at`, `alert_at`, `unnamed_bytes`), `DiskWalkRequestState` (`ABSENT`, `UNREADABLE`), `read_disk_walk_request` and an atomic `write_disk_walk_request`.
+- `sweep.py` `unnamed_disk_fall` holds the fall arithmetic that `disk_measurement_lines` also uses.
+- The natedev floor pass writes a request when all of these are true:
+  - the previous floor record is recent, with the same build holds and filesystem (the checks the growth alert uses, computed once);
+  - no request file exists;
+  - the unnamed fall is over `sweep_walk_request_fall_bytes`;
+  - the last walk is at least `sweep_walk_request_interval_seconds` old.
+- `disk.py` `snapshot()` walks when the request's `requested_at` is later than the previous `measured_at`. The 03:00 daily walk stays.
+- `finish_disk_walk_request` sends "Folder walk for the <alert_at> fall:" with the growth lines through `send_floor_alert`. It deletes the request only after the send is accepted. It runs only on a natedev root-scope sweep.
+- An unreadable request file prints one stderr line and blocks a new request.
+- Review: F001 (blocker) — a changed build hold could request a walk with no free-space change; fixed by the shared checks above.
+
+**Files:**
+- `config/lint.conf` — the two keys.
+- `scripts/buildlog/store.py` — the request file types and I/O.
+- `scripts/buildlog/disk.py` — the request walk.
+- `scripts/lint/sweep.py` — `unnamed_disk_fall`, the request gate, `finish_disk_walk_request`.
+- `scripts/buildlog/test_disk.py`, `scripts/lint/test_sweep.py` — request, no-request and follow-up rows.
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 56 — Old buildlog indexes go by change time only · status: done
+
+From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahead of Phase 55.
+
+#### As-built
+
+- `cleanup_unused_indexes` compares `st_mtime` alone with the `INDEX_UNUSED_DAYS` cutoff. It does not read `st_atime`.
+- Cause: `complete_gate_index_in` reads every index and refreshes its atime, so the old `max(atime, mtime)` test kept every index (37 GiB held on 2026-11-12).
+- `update_in` sets an index mtime at least each `INDEX_TOUCH_MINUTES`, so an index that a tree updates stays.
+- `config/buildlog.conf` keeps `INDEX_UNUSED_DAYS=2`; its Basis states the mtime rule.
+
+**Files:**
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
+- `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
+- `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.
+
+### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
+
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
+
+#### As-built
+
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
+
+**Files:**
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
+
+### Phase 58 — The tmp sweep judges closed phase folders of a run that is not open · status: done
+
+From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved deleting folders of finished runs in /tmp/claude/unit (open runs stay). … Fix tmp_sweep where it lives: a closed phase folder whose run has ended is a candidate, with the normal process and unsaved-git checks. Then run --plan and --apply with the fix."
+
+#### As-built
+
+- Cause: `run_folder_guards` kept a whole run folder for `SESSION_WORKTREE` or `DIRECTOR`, so every `phases/<id>/` folder of a finished run stayed while its director session lived.
+- `tmp_sweep.judge_entries`: a run kept only by `SESSION_WORKTREE` or `DIRECTOR` adds its `phases/` folder (not a link) to the judged parents. The `phases/` folder itself stays.
+- Open phase ids from `recorder_state.read_open_phase_ids`, mapped through `phase_reservation.phase_directory_name` (`ad hoc` is `adhoc`), keep their folders with the reason "its phase is open". An unreadable recorder state keeps every phase folder of that run.
+- `OPEN_RUN`, `UNREADABLE_RECORD`, an unreadable session registry and `UNENDED_WORKER` keep every phase folder. `run_folder_guards` no longer lets `SESSION_WORKTREE` replace `UNENDED_WORKER`.
+- Other phase folders use the run `tmp/` rules: the 4-hour idle rule, `IN_USE`, `WORKER_USES` and the git check.
+- `ClosedPhaseEntry` carries `CleanupEndReason.CLOSED_PHASE` into `--plan` and `--apply`. Removal checks again that the parent is a real folder at the judged root; otherwise the entry stays with "its phases parent changed".
+- Director ruling on review finding F003: the window between the parent recheck and `rmtree` stays. Every other sweep removal has the same window; a file-descriptor delete for all removals is a separate change.
+- Live run, 2026-11-12 20:18 EST: `--apply` deleted 641 closed phase folders, 5.5 GiB. Most of the 35 GiB in the first plan was gone before apply.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, `run_folder_guards`, `ClosedPhaseEntry`, `CleanupEndReason.CLOSED_PHASE`, `remove_entry`.
+- `scripts/lint/test_tmp_sweep.py` — rows in `assert_run_tmp_entries`, `OwnerTests`, `RunFolderTests` and `PaneRunTests`: both eligible guards, open and older open phases, `ad hoc`, fresh and used folders, unreadable state, an unended worker with a live worktree, a replaced parent, and `--plan`/`--apply`.
+
+### Phase 59 — The disk walk measures ~/.local/state · status: done
+
+From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~/.local/state/gpu-size-trial` in 90 min, and neither the disk walk nor the floor alert saw it; measure the large writers under `~/.local/state` too.
+
+#### As-built
+
+- `disk.FOLDERS` includes `~/.local/state`. Its walk rows (levels 0 to 3, cargo targets excluded) and growth total reach `read_disk_measurement` and the floor alert with no other change.
+- Measured 2026-11-12 20:25 EST: `~/.local/state` held 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+- The checkpoint also carries the package import block for `scripts/aws_target/gpu_size_trial.py`, which bootstrap added after the builds merge.
+
+**Files:**
+- `scripts/buildlog/disk.py` — `FOLDERS`.
+- `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
+
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+
+**Reverted 2026-11-13, landed again in phase 62.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below holds again, with the job state change in phase 62.
+
+From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
+
+#### As-built
+
+- `config/memory_feed.conf` holds eight colors as six hex digits: `remote_memory_light`/`_dark` and `machine_{natedev,mac,aws}_light`/`_dark`. `memory_feed.FeedConfiguration.colors` reads them once and checks each value; `memory.json` carries them as `colors` (`PageColors`, by theme).
+- `memory_live.html` draws a Mac or AWS used bar in the remote color, colors the Machine text by machine, and shows a Done column after Stage in the Running and Waiting tables (`—` without a percent). The "N% done" text under the bar is gone, and the Mac note is the last tooltip line, on one line.
+- `scope_activity.py` adds `WaitingServiceJob` and `UnmatchedServiceJob`; `ServiceJobState` is the closed union. `memory_admit.service_job_state` matches each `Runner.Worker` process tree against reservation pids (Running), then waiter pid and start time (Waiting), else Unmatched. `memory_admit.py` and `admission_service.py` both classify through it; `admission_records.py` and `queue_evidence.py` read every state.
+- `build_ci_row` sets `admitted` only for `RunningServiceJob`, so a hana CI row shows in Running only for a matched reservation. A waiting job stays in the Waiting table. CI amounts, `duplicate_use`, the taken total and the cap do not change.
+- Text colors exceed 5.55:1 contrast in light and 7.79:1 in dark. `memory_page_proof.mjs` saves before and after screenshots of the three user-shot elements in both themes and keeps the after-page table, note list, layout and tooltip checks.
+
+**Files:**
+- `config/memory_feed.conf`, `config/README.md` — the eight color keys.
+- `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
+- `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
+- `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: done
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, with a test that the client at `7fdfd9a6a` parses the new service snapshot.
+
+#### As-built
+
+- The phase 60 as-built above applies again, with one change: `WaitingServiceJob` and `UnmatchedServiceJob` go only in `UnownedSliceMemory.service_job_state`, beside `ServiceJobStateNotRecorded`.
+- `job_state` keeps `RunningServiceJob`, `IdleService` and `NotServiceSlice`. A waiting or unmatched worker keeps the `job_state` value the code before phase 60 wrote, so older clients see no change.
+- `build_ci_row`, `queue_evidence` and `admission_service` read `service_job_state`. The hana CI row shows in Running only for a worker matched to a reservation.
+- `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
+
+**Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
+
+### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
+
+From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches shrank 151.6 GiB" while free space fell 0.9 GiB. The cache total must count the same folders before and after each sweep.
+
+#### As-built
+
+- Cause: the old `scripts/lint/sweep.py` subtracted two cache totals without matching folder paths. A folder that left the list counted as shrinkage.
+- `cache_folder_growth` compares only folders in both readings (`common_cache_bytes`). A folder in only one reading adds no growth and no shrinkage. A record from before phase 63 gives no growth.
+- `MeasuredCacheFolders` keeps one total per folder and a `SharedCacheInode` only for an inode in two or more folders. `CacheFoldersNotMeasured` marks a reading with no folder sizes.
+- `CacheFolderWalk` holds a map in memory from each inode to the first folder that saw it. A second folder registers both as owners, whatever `st_nlink` says. So a link made or removed during the walk counts once. The map is not saved, and it carries across the protected and CI measurements of one sweep.
+- On 37 real folders the saved snapshot is 3,255 bytes and process peak memory is 203.0 MiB.
+- Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.

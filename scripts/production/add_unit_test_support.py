@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.shutdown import remote
+from scripts.agents import remote
 
 from pathlib import Path
 
@@ -39,8 +39,8 @@ from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.hooks import conversation_pause
 from scripts.production import unit_lookup
 from scripts.message import sessions
-from scripts.shutdown import inventory
-from scripts.shutdown import restart
+from scripts.agents import inventory
+from scripts.agents import restart
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
@@ -49,7 +49,7 @@ from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.fake_unit_host import confirm_tab_close, process as write_process, private_process_registry
 from scripts.whoami.account_test_support import stored_room
-from scripts.shutdown.test_support import registry_confirmation, ShutdownTestCase
+from scripts.agents.test_support import registry_confirmation, ShutdownTestCase
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -64,7 +64,7 @@ SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.
 LINUX_LAUNCHER_CLI = """import runpy, sys
 from unittest.mock import patch
 from scripts.production.fake_unit_host import private_process_registry
-from scripts.shutdown import remote
+from scripts.agents import remote
 script = sys.argv.pop(1)
 with private_process_registry(), patch.object(remote, 'local_machine', return_value='natedev'):
     runpy.run_path(script, run_name='__main__')
@@ -270,8 +270,8 @@ class AddUnitTestCase(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.staff = StaffTestCase()
-        self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
+        self.staff.setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=fixture_process_start))
         _ = self.enterContext(patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start))
@@ -369,6 +369,20 @@ class AddUnitTestCase(ShutdownTestCase):
 
 
 def submit_command(argv):
+    if argv[2:4] == ["tab", "create"]:
+        from scripts.lib.atomic_file import write_text_atomic
+        path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+        responses = json.loads(path.read_text())
+        for command, response in tuple(responses.items()):
+            if command.startswith("--session " + argv[1] + " ") and "w1:p1" in command:
+                responses[command.replace("w1:p1", "w1:p2")] = response
+        responses[" ".join(argv)] = {"code": 0, "stdout": json.dumps({"result": {
+            "root_pane": {"pane_id": "w1:p2"}, "tab": {"tab_id": "w1:t2"}}})}
+        inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+        inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+            "label": argv[argv.index("--label") + 1]})
+        responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+        write_text_atomic(path, json.dumps(responses))
     if argv[2:4] == ["pane", "process-info"] and "FAKE_SHELL_PID" in os.environ:
         from scripts.production.add_unit_test_support import fixture_foreground
         from scripts.lib.atomic_file import write_text_atomic
@@ -377,7 +391,7 @@ def submit_command(argv):
         responses[" ".join(argv)] = fixture_foreground(int(os.environ["FAKE_SHELL_PID"]))
         write_text_atomic(path, json.dumps(responses))
     result = main(argv)
-    if result == 0 and argv[2:4] == ["workspace", "create"]:
+    if result == 0 and argv[2:4] in (["workspace", "create"], ["tab", "create"]):
         from scripts.production.fake_unit_host import process
         from scripts.lib.atomic_file import write_text_atomic
         root = Path(os.environ["HERDR_PROC"])
@@ -385,7 +399,8 @@ def submit_command(argv):
         original = root / os.environ["FAKE_SHELL_PID"]
         parent = int((original / "stat").read_text().rsplit(")", 1)[1].split()[1])
         process(os.environ, shell, parent, ["zsh"],
-                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p1"}, cwd=(original / "cwd").resolve())
+                {"HERDR_SESSION": argv[1], "HERDR_PANE_ID": "w1:p2" if argv[2] == "tab" else "w1:p1"},
+                cwd=(original / "cwd").resolve())
         write_text_atomic(Path(os.environ["STUB_STATE"]) / "pane-shell", str(shell))
     if result == 0 and argv[2:4] == ["agent", "start"]:
         from scripts.production.add_unit_test_support import fixture_agent_started
@@ -403,6 +418,18 @@ def submit_command(argv):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
                                    "message": {"role": "user", "content": argv[-1]}}) + "\n")
+        if argv[4] == "w1:p2":
+            from scripts.production.add_unit_test_support import fixture_foreground
+            from scripts.lib.atomic_file import write_text_atomic
+            responses_path = Path(os.environ["FAKE_HERDR_RESPONSES"])
+            responses = json.loads(responses_path.read_text())
+            inventory = json.loads(responses["--session " + argv[1] + " pane list"]["stdout"])
+            inventory["result"]["panes"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1",
+                "label": session_id, "agent_session": {"kind": "id", "value": session_id}})
+            responses["--session " + argv[1] + " pane list"] = {"code": 0, "stdout": json.dumps(inventory)}
+            responses["--session " + argv[1] + " pane process-info --pane w1:p2"] = fixture_foreground(
+                int(os.environ["FAKE_SHELL_PID"]))
+            write_text_atomic(responses_path, json.dumps(responses))
     return result
 
 '''
@@ -497,7 +524,7 @@ def submit_command(argv):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
-        from scripts.shutdown import pane_record
+        from scripts.agents import pane_record
         with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
             pane_record.write(session, pane_record.launch("w1:p1", "62ccbd64-f22e-5647-b20e-7899aa39d766", str(self.root),
                 {"CLAUDE_CONFIG_DIR": str(directory)},
@@ -548,6 +575,7 @@ def submit_command(argv):
             f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
                 code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
             "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "workspace": {"workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
@@ -623,7 +651,7 @@ def submit_command(argv):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact", "unit-type"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -639,6 +667,7 @@ def submit_command(argv):
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
                 worktree=requested.worktree, plan=requested.plan, port=requested.port,
                 session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
+                unit_type=requested.unit_type,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
         except (Refusal, OSError, ValueError):
@@ -860,7 +889,7 @@ def submit_command(argv):
             return launch_session(request, director, prompt, selected, target=target, model=model,
                                   autocompact_window=autocompact_window)
 
-        from scripts.shutdown import stop_resume
+        from scripts.agents import stop_resume
         def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
             nonlocal stopped
             self.assertEqual(identity, "62ccbd64-f22e-5647-b20e-7899aa39d766")

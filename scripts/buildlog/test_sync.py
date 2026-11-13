@@ -84,16 +84,30 @@ class SyncTests(unittest.TestCase):
 
     def test_mkdir_uses_last_printed_status_and_then_runs_rsync(self) -> None:
         (self.root / "natedev").mkdir(parents=True)
-        self.responses = [
-            subprocess.CompletedProcess(["ssh"], 0, stdout="rc=1\nmessage\nrc=0\n", stderr=""),
-            subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
-            subprocess.CompletedProcess(["rsync"], 0, stdout="", stderr=""),
-        ]
-        with mock.patch.object(store, "host_name", return_value="natedev"):
-            self.assertEqual(sync.sync(), 0)
+        for stats in ("Total bytes sent: 1,234\nTotal bytes received: 56\n",
+                      "sent 1,234 bytes  received 56 bytes  1.0 bytes/sec\n"):
+            with self.subTest(stats=stats):
+                self.commands = []
+                self.responses = [
+                    subprocess.CompletedProcess(["ssh"], 0, stdout="rc=1\nmessage\nrc=0\n", stderr=""),
+                    subprocess.CompletedProcess(["rsync"], 0, stdout=stats, stderr=""),
+                    subprocess.CompletedProcess(["rsync"], 0, stdout=stats, stderr=""),
+                ]
+                with mock.patch.object(store, "host_name", return_value="natedev"):
+                    self.assertEqual(sync.sync(), 0)
 
-        self.assertEqual([command[0] for command in self.commands], ["ssh", "rsync", "rsync"])
-        self.assertIs(self.status()["ok"], True)
+                self.assertEqual([command[0] for command in self.commands], ["ssh", "rsync", "rsync"])
+                self.assertIs(self.status()["ok"], True)
+                transfers = self.status()["transfers"]
+                self.assertEqual(transfers, [
+                    {"operation": "buildlog_control", "sent_bytes": len(self.commands[0][-1].encode()),
+                     "received_bytes": len("rc=1\nmessage\nrc=0\n".encode()), "complete": True},
+                    {"operation": "buildlog_push", "sent_bytes": 1234, "received_bytes": 56, "complete": True},
+                    {"operation": "buildlog_pull", "sent_bytes": 1234, "received_bytes": 56, "complete": True},
+                ])
+                for command in self.commands[1:]:
+                    self.assertIn("--stats", command)
+                    self.assertIn("--compress", command)
 
     def test_non_255_ssh_exit_uses_printed_success(self) -> None:
         self.responses = [
@@ -147,6 +161,20 @@ class SyncTests(unittest.TestCase):
                 self.assertLess(filters.index(exclusion), filters.index("--include=/Mac/***"))
         self.assertNotIn("--include=/*/", filters)
         self.assertEqual(filters[-1], "--exclude=*")
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json",
+                     "index.sqlite-wal", "launch.lock", "record.tmp", "old.jsonl.bak"):
+            path = source / "Mac" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_text(name)
+        process = subprocess.Popen(["rsync", "-rt", "--compress", *filters, f"{source}/", f"{destination}/"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        copied = {str(path.relative_to(destination / "Mac")): path.read_text()
+                  for path in (destination / "Mac").rglob("*") if path.is_file()}
+        self.assertEqual(copied, {name: name for name in (
+            "2026-11.jsonl", "logs/failure.log.gz", "recorder-health.json")})
 
     def test_pull_excludes_unknown_folders_and_the_current_host(self) -> None:
         filters = self.assert_host_pull("Mac")
@@ -305,6 +333,7 @@ class SyncTests(unittest.TestCase):
         with (
             mock.patch.object(ci, "ci", return_value=0) as poll,
             mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
+            mock.patch.object(cli, "aws_snapshot", return_value=0) as snapshot,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
@@ -313,12 +342,14 @@ class SyncTests(unittest.TestCase):
         poll.assert_called_once_with()
         screenshots.assert_called_once_with()
         release.assert_called_once_with()
+        snapshot.assert_called_once_with()
         self.assertEqual(self.commands, [])
 
     def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
         jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
-                (rust_release, "check_release", "rust release"), (index, "update", "index"))
+                (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
+                (index, "update", "index"))
         expected = [name for _, _, name in jobs]
         for failed in expected:
             for raises in (False, True):
@@ -342,6 +373,18 @@ class SyncTests(unittest.TestCase):
                     self.assertEqual(calls, expected)
                     # index.update returns a row count, unlike the job exit statuses.
                     self.assertEqual(result, 0 if failed == "index" and not raises else 1)
+
+    def test_aws_snapshot_uses_the_installed_settings_and_state_directory(self) -> None:
+        from scripts.aws_target import aws_target
+        from scripts.build_targets import target_config
+        from scripts.lib import conf
+
+        folder = self.root / "aws"
+        with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
+              mock.patch.object(aws_target, "snapshot", return_value=1) as read):
+            self.assertEqual(cli.aws_snapshot(), 1)
+        state.assert_called_once_with("aws")
+        read.assert_called_once_with(conf.path("aws_target"), folder)
 
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []

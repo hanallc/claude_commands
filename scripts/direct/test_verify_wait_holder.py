@@ -1,7 +1,7 @@
 """Record resource holders through private event pipes and real verify calls."""
 from __future__ import annotations
 
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_client, admission_records, admission_protocol as wire, admission_service as service, placement
 
 import json
 import os
@@ -12,12 +12,13 @@ import sys
 from datetime import datetime, timezone
 from typing import ClassVar, cast, override
 import unittest
+from unittest import mock
 
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture
 from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -121,12 +122,16 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
-                              "phase_wait_finish_all", "buildlog_memory_event") + '''
+                              "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
+                              "buildlog_memory_event")
+            + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
 PY=$TEST_EVENT_ROOT/recorder-python
 PHASE_WAIT_RECORDER=$2
 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
 HOLD_WAIT_DIR=$TEST_EVENT_ROOT/waits
 BOARD_DIR=$UNIT_RUN_DIR
+ROUTING_WAIT_STARTED="" PHASE_RESOURCE_WAIT="" PLACEMENT_WAIT_MEMORY=0
+BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/hold-seconds
 BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_EVENT_ROOT/event-client.py
 BUILDLOG_MEM_WAIT_SINCE=100
 BUILDLOG_MEM_WAIT_FIRST_FILE=$HOLD_WAIT_DIR/first-queued-at
@@ -173,17 +178,32 @@ done
         self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", FIRST_SESSION))
 
     def test_recorder_failures_retry_without_changing_admission(self) -> None:
-        for command in ("start-wait", "wait-holder"):
+        for command in ("start-wait", "wait-holder", "not-recorded"):
             with self.subTest(command=command):
                 (self.root / "recorder-failed").unlink(missing_ok=True)
+                if command == "not-recorded":
+                    self.environment["CODEX_THREAD_ID"] = fixture_runtime_id("unregistered-wait-worker")
+                previous_rows = len(wait_rows(self.root / "session"))
                 self.run_events([{"events": ["first", 'holder ' + json.dumps({"kind": "session",
                                 "session_id": FIRST_SESSION, "session_name": "render"}),
                                 'holder ' + json.dumps({"kind": "session", "session_id": NEXT_SESSION,
                                 "session_name": "next"}), "done"], "outcome": "Granted", "seconds": 15}], failure=command)
                 self.assertIn("wait history NotRecorded", self.event_errors)
+                if command == "wait-holder":
+                    call = next(call for call in reversed(self.recorder_calls()) if call[0] == "wait-holder")
+                    identifier = call[call.index("--wait-id") + 1]
+                    message = f"verify.sh: wait history NotRecorded: cannot update {identifier} holder"
+                else:
+                    message = "verify.sh: wait history NotRecorded: memory admission"
+                self.assertIn(message, self.event_errors.splitlines())
                 rows = wait_rows(self.root / "session")
-                self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
-                self.assertEqual(rows[-1]["event_type"], "wait_finished")
+                if command == "not-recorded":
+                    self.assertEqual(self.event_errors.count("NotRecorded"), 1, self.event_errors)
+                    self.assertNotIn("cannot update", self.event_errors)
+                    self.assertEqual([row["event_type"] for row in rows[previous_rows:]], ["wait_not_recorded"])
+                else:
+                    self.assertEqual(recorded_holders(rows)[-1], named_holder("memory", "memory", NEXT_SESSION))
+                    self.assertEqual(rows[-1]["event_type"], "wait_finished")
                 self.assertEqual((self.root / "outcomes").read_text().splitlines()[-1], "Granted|15")
 
     def test_memory_rejoin_opens_new_intervals_and_keeps_queue_age(self) -> None:
@@ -214,6 +234,8 @@ done
         rows = wait_rows(self.root / "session")
         starts = [row for row in rows if row["event_type"] == "wait_started"]
         self.assertEqual(len(starts), 2, rows)
+        self.assertIn(f"verify.sh: wait history NotRecorded: cannot close {starts[0]['wait_id']}",
+                      self.event_errors.splitlines())
         self.assertNotEqual(starts[0]["wait_id"], starts[1]["wait_id"])
         for start, holder in zip(starts, (FIRST_SESSION, NEXT_SESSION), strict=True):
             interval = [row for row in rows if row["wait_id"] == start["wait_id"]]
@@ -298,6 +320,9 @@ class VerifyRecordedTokenIdentityTests(RecordedWaitFixture):
         observer = self.root / "identity-python"
         _ = observer.write_text('''#!/bin/sh
 printf '%s\\n' "${VERIFY_PY_HELPER:-recorder}" >> "$TEST_HOLDER_PY_CALLS"
+if [ "${1##*/}" = progress_history.py ]; then
+    printf '%s\\n' "$@" >> "$TEST_IDENTITY_ROOT/identity-recorder-args"
+fi
 exec "$TEST_REAL_PYTHON" "$@"
 ''')
         observer.chmod(0o755)
@@ -342,12 +367,19 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         return rows
 
     def test_director_token_uses_the_recorded_owner_without_a_director_file(self) -> None:
+        self.environment.update({"CODEX_THREAD_ID": "",
+                                 "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-director")})
         self.acquire_identity_token("director")
         rows = self.record_token_passes('phase_wait_start token "cargo token"\n' * 3)
         self.assertEqual(recorded_holders(rows), [named_holder(
             "slot", "cargo", fixture_runtime_id("fixture-director"))])
         self.assertEqual((self.root / "identity-python-calls").read_text().splitlines(),
                          ["PHASE_WAIT_HOLDER", "recorder", "recorder"])
+        arguments = (self.root / "identity-recorder-args").read_text().splitlines()
+        self.assertIn("--director", arguments)
+        self.assertNotIn("--worker-thread-id", arguments)
+        self.assertEqual(arguments[arguments.index("--owner-session") + 1],
+                         fixture_runtime_id("fixture-director"))
 
     def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
         reference = self.worker_reference("fixture-first")
@@ -356,6 +388,10 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.acquire_identity_token("writer")
         self.assertEqual(recorded_holders(self.record_token_passes()),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
+        arguments = (self.root / "identity-recorder-args").read_text().splitlines()
+        self.assertEqual(arguments[arguments.index("--worker-thread-id") + 1],
+                         fixture_runtime_id("thread-impl"))
+        self.assertNotIn("--director", arguments)
 
     def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
         state = cast(dict[str, object], json.loads(
@@ -439,13 +475,35 @@ phase_wait_start token "cargo token"
 
 
 class VerifyHoldHolderTests(VerifyHoldWaitFixture):
+    def start_hold_step(self) -> subprocess.Popen[str]:
+        """Call the real hold wrapper before the real cargo launcher."""
+        script = self.fixture.root / "held-step.sh"
+        _ = script.write_text('set -euo pipefail\nsource "$1"\n'
+            + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
+            + shell_functions(VERIFY, "step_state", "publish_step_state", "phase_wait_holder_flags",
+                              "phase_wait_start", "phase_wait_finish", "build_hold_wait_local") + '''
+PY=$TEST_REAL_PYTHON
+PHASE_WAIT_RECORDER=$2 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
+HOLD_WAIT_DIR=$PACKAGE_ROOT/hold-functions
+mkdir -p "$HOLD_WAIT_DIR"
+STEP_RECORD_ACTIVE=0 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
+export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify
+run_once cargo check
+''')
+        process = subprocess.Popen(["bash", str(script), str(SCRIPTS / "lint/invoke.sh"),
+                                    str(SCRIPTS / "direct/progress_history.py")], cwd=self.fixture.root,
+                                   env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        self.addCleanup(self.stop_process, process)
+        return process
+
     def test_local_build_hold_names_its_holder_and_closes_before_the_step(self) -> None:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         self.set_hold_routing("natedev_only")
         self.hold(FIRST_SESSION)
         _ = self.record_phase()
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
-        process = self.start("check", "sample", "--local", "holder test")
+        process = self.start_hold_step()
         self.fixture.wait_until(lambda: bool(wait_rows(session)), "the recorded hold", (process,), directory=session)
         self.assertEqual(recorded_holders(wait_rows(session)), [named_holder("slot", "natedev", FIRST_SESSION)])
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / FIRST_SESSION).unlink()
@@ -457,18 +515,9 @@ class VerifyHoldHolderTests(VerifyHoldWaitFixture):
         self.assertTrue(any(event["args"][:1] == ["check"] for event in self.fixture.cargo_events()))
 
 
-CAPACITY_TOOL = '''import os, runpy, sys
-from pathlib import Path
-root = Path(os.environ["PACKAGE_ROOT"])
-if sys.argv[1] == "eligible" and (root / "target-starting").exists():
-    print("any_target")
-    print("mac\\texcluded\\tstarting\\t" + os.environ["MAC_TEST_CONFIG"] + "\\tmacos")
-    raise SystemExit(0)
-runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
-'''
-
 POLL_SLEEP = '''#!/bin/sh
 if [ "$1" != "${BUILD_TARGETS_POLL_S}" ]; then exec "$TEST_REAL_SLEEP" "$@"; fi
+if ! find "$TMPDIR" -name 'phase-wait.*.resource' -print -quit | read -r marker; then exit 0; fi
 count=0
 [ ! -f "$PACKAGE_ROOT/target-passes" ] || read -r count < "$PACKAGE_ROOT/target-passes"
 count=$((count + 1))
@@ -545,8 +594,6 @@ class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("The fixture needs sleep.")
-        tool = root / "capacity-tool.py"
-        _ = tool.write_text(CAPACITY_TOOL)
         self.fixture.write_executable(self.fixture.bin_directory / "sleep", POLL_SLEEP)
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(ROUTING_WAIT_STUB)
@@ -554,6 +601,9 @@ class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
             "TEST_REAL_TARGETS": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
             "TEST_REAL_SLEEP": real_sleep, "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(local_wait),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        controls = caller_provider_controls(self.fixture, admission)
+        controls.starting["mac"] = root / "target-starting"
         git = self.fixture.bin_directory / "git"
         source = git.read_text().replace("wanted=rev-parse\n", '''if [[ "$*" == "rev-parse HEAD" ]]; then
     printf '%040d\\n' 1
@@ -563,16 +613,20 @@ wanted=rev-parse
 ''')
         self.fixture.write_executable(git, source)
         runner = self.fixture.runner
-        source = runner.read_text().replace('raise SystemExit(runner_status)', RUN_HISTORY + '''
-if os.environ.get("TEST_REHOLD_FINAL") == "1" and attempt == 1:
-    Path(os.environ["TEST_CLAIM_FILE"]).write_text(os.environ["TEST_NEXT_CLAIM"])
-raise SystemExit(runner_status)
-''')
+        source = runner.read_text().replace('if "--assignment-file" in arguments:', '''import atexit
+def hold_after_cleanup():
+    if os.environ.get("TEST_REHOLD_FINAL") == "1" and globals().get("attempt") == 1:
+        Path(os.environ["TEST_CLAIM_FILE"]).write_text(os.environ["TEST_NEXT_CLAIM"])
+atexit.register(hold_after_cleanup)
+if "--assignment-file" in arguments:''', 1)
+        source = source.replace('raise SystemExit(runner_status)', RUN_HISTORY + 'raise SystemExit(runner_status)')
         self.fixture.write_executable(runner, source)
         return claims / f"{root.name}.json"
 
     def claim(self, path: Path, owner: str) -> dict[str, object]:
-        row: dict[str, object] = {"pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
+        row: dict[str, object] = {"claim_id": f"claim-{owner}", "episode": f"episode-{owner}",
+            "attempt": "fixture-attempt", "submitting_session": owner,
+            "pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
             "what": "private fixture work", "worktree": str(self.fixture.root),
             "since": datetime.now(timezone.utc).isoformat(), "holder_session": owner}
         _ = path.write_text(json.dumps(row))
@@ -584,6 +638,10 @@ raise SystemExit(runner_status)
 
     def resume(self, number: int) -> None:
         (self.fixture.root / f"target-resume-{number}").touch()
+
+    def start_pinned_route(self) -> subprocess.Popen[str]:
+        """Check target waits through the real placement command."""
+        return self.start("check", "sample", "--target", "mac", "--no-cache")
 
     def assert_closed_before_remote_steps(self) -> list[dict[str, object]]:
         snapshots = [cast(dict[str, object], json.loads(line)) for line in
@@ -627,7 +685,7 @@ raise SystemExit(runner_status)
         root = self.fixture.root
         settings = root / "linux-box.conf"
         _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n",
-                                 template="aws_target")
+                                 template="mac_test")
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
             + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n")
@@ -649,7 +707,7 @@ raise SystemExit(runner_status)
             process = self.start("check", "sample", "--target", "linux-box", "--no-cache")
             rows = self.pause(process, 1)
             self.assertEqual(recorded_holders(rows), [named_holder("slot", "linux-box", NEXT_SESSION)])
-            self.assertEqual((root / "reservation-results").read_text().splitlines(), ["1"])
+            self.assertEqual((root / "reservation-results").read_text().splitlines(), ["11"])
             self.assertEqual(self.fixture.runner_events(), [])
             claim = Path((root / "reservation-raced").read_text())
             claim.unlink()
@@ -663,7 +721,7 @@ raise SystemExit(runner_status)
     def test_pinned_check_names_a_busy_claim_and_its_next_owner(self) -> None:
         claim = self.prepare_target_wait()
         _ = self.claim(claim, FIRST_SESSION)
-        process = self.start("check", "sample", "--target", "mac", "--no-cache")
+        process = self.start_pinned_route()
         rows = self.pause(process, 1)
         self.assertEqual(recorded_holders(rows), [named_holder("slot", "mac", FIRST_SESSION)])
         _ = self.claim(claim, NEXT_SESSION)
@@ -706,10 +764,9 @@ raise SystemExit(runner_status)
 
     def test_pinned_starting_target_records_an_unnamed_holder(self) -> None:
         _ = self.prepare_target_wait()
-        self.fixture.environment["BUILD_TARGETS_SCRIPT"] = str(self.fixture.root / "capacity-tool.py")
         starting = self.fixture.root / "target-starting"
         starting.touch()
-        process = self.start("check", "sample", "--target", "mac", "--no-cache")
+        process = self.start_pinned_route()
         rows = self.pause(process, 1)
         holder, = recorded_holders(rows)
         self.assertEqual(cast(dict[str, object], holder)["state"], "HolderNotNamed")
@@ -759,36 +816,31 @@ raise SystemExit(runner_status)
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
-MEMORY_CLIENT_OBSERVER = '''import json, os, sys
-from pathlib import Path
-arguments = sys.argv[1:]
-if arguments and arguments[0].endswith("admission_client.py") and arguments[1] == "admit":
-    with (Path(os.environ["PACKAGE_ROOT"]) / "memory-joins.jsonl").open("a") as output:
-        output.write(json.dumps({"since": arguments[arguments.index("--since") + 1],
-            "first": Path(os.environ["BUILDLOG_MEM_WAIT_FIRST_FILE"]).read_text()}) + "\\n")
-os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *arguments])
-'''
-
-
 class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
     def prepare_memory_route(self) -> Path:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()
-        observer = self.fixture.root / "observe-memory-python"
-        recorder = self.fixture.root / "observe-memory-client.py"
-        self.fixture.write_executable(recorder, MEMORY_CLIENT_OBSERVER)
-        self.fixture.write_executable(observer, '''#!/bin/sh
-case "$1" in
-    */admission_client.py)
-        if [ "$2" = admit ]; then
-            exec "$TEST_REAL_PYTHON" "$TEST_MEMORY_OBSERVER" "$@"
-        fi
-        ;;
-esac
-exec "$TEST_REAL_PYTHON" "$@"
-''')
-        self.fixture.environment["TEST_MEMORY_OBSERVER"] = str(recorder)
-        self.fixture.environment["CLAUDE_PYTHON"] = str(observer)
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        controls = caller_provider_controls(self.fixture, admission)
+        controls.set_host("mac", placement.TemporaryExclusion("busy"))
+        handle_request = admission.server.handle_request
+
+        def observe(request: wire.Request,
+                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            if isinstance(request, wire.PlacementRequest):
+                for path in Path(self.fixture.environment["TMPDIR"]).glob(
+                        f"verify-hold.{request.owner.pid}.*/placement-*.json.wait"):
+                    notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
+                    if isinstance(notice.last_reply, wire.Wait):
+                        _ = controls.hosts.pop("mac", None)
+                first, = Path(self.fixture.environment["TMPDIR"]).glob(
+                    f"verify-hold.{request.owner.pid}.*/first-queued-at")
+                with (self.fixture.root / "memory-joins.jsonl").open("a") as output:
+                    _ = output.write(json.dumps({"since": str(request.since).removesuffix(".0"),
+                        "first": first.read_text()}) + "\n")
+            return handle_request(request, connection)
+
+        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=observe))
         _ = self.fixture.hold_memory()
         return Path(self.fixture.environment["UNIT_RUN_DIR"])
 
@@ -821,7 +873,10 @@ exec "$TEST_REAL_PYTHON" "$@"
         self.fixture.environment.update({"TEST_RUNNER_BUSY_UNTIL": str(self.fixture.runner_state / "mac-free"),
                                          **self.fixture.leave_once()})
         process = self.start("test", "sample", "--no-cache")
-        self.fixture.wait_for_path(self.fixture.runner_state / "free-now-after-leave", (process,))
+        admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
+        controls = caller_provider_controls(self.fixture, admission)
+        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 2 and bool(controls.memory_waits()),
+                                "the refused remote attempt and its memory wait", (process,))
         self.fixture.wait_until(lambda: sum(row["event_type"] == "wait_started" for row in wait_rows(session)) == 2,
                                 "the second memory interval", (process,), directory=session)
         self.assertEqual(len(self.fixture.runner_events()), 2)

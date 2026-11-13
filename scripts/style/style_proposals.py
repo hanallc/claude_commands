@@ -28,13 +28,13 @@ from urllib.parse import quote
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.style import coverage_report
-from scripts.style import rules
+from scripts.style import rules, style_config
 from scripts.style import style_footprint
 from scripts.style import style_ledger
 from scripts.style import style_rules
 from scripts.style.approved_renames import (ApprovedRename, BindingRename, BindingScope, NoAppliedCheck, RenameNotApplied,
                               approved_rename, binding_rename, BindingScopeReader)
-from scripts.style.add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
+from scripts.style.add_style import NoStyleProduction, StandingStyleProduction, configured_style_production
 from scripts.style.declarations import declaration_line
 from scripts.production.issues import Issue, frontmatter, open_issues, plain
 from scripts.production import session_staff, staff, unit_config, unit_lookup
@@ -67,10 +67,19 @@ def is_decision(issue: Issue) -> bool:
             and {"proposal", "style"} <= set(issue.fields.get("tags", [])))
 
 
+def owned_decision_rules(unit: str) -> frozenset[str]:
+    """Return the catalog rules that the unit's current family assignment owns."""
+    row = staff_reference(unit, "unit")
+    config = style_config.config_for_unit(row, staff.snapshot())
+    families = config.assignment(row.name).families
+    return frozenset(rule.rule_id for rule in rules.load_rules(config.route.checkout) if rule.family in families)
+
+
 def approved_decisions(folder: Path, unit: str) -> tuple[Issue, ...]:
+    owned_rules = owned_decision_rules(unit)
     return tuple(sorted((issue for issue in open_issues(folder, "style")
                          if is_decision(issue) and isinstance(decision_answer(issue), ApprovedDecision)
-                         and issue.value("unit") == staff_reference(unit, "unit").id),
+                         and issue.value("style_rule").removesuffix("#uncovered") in owned_rules),
                         key=lambda issue: (issue.value("date_created"), issue.path.name)))
 
 
@@ -299,15 +308,16 @@ def family_units(doc: Path) -> dict[rules.Family, staff.StaffId]:
         rows = unit_lookup.doc_units(doc, record)
     except staff.StaffUnreadable as error:
         raise style_ledger.LedgerError(str(error)) from error
+    config = style_config.read_config(doc)
     units: dict[rules.Family, staff.StaffId] = {}
     for row in rows:
-        unit = row.name
-        family = rules.style_family(unit)
-        if isinstance(family, rules.NotStyleUnit) or isinstance(row.worktree, staff.RemovedWorktree):
+        if isinstance(row.worktree, staff.RemovedWorktree):
             continue
         match resolver.unit_config(row):
             case unit_config.UnitConfig(plan=unit_config.PlanFile()):
-                units[family] = row.id
+                for assignment in config.assignments:
+                    if assignment.unit == row.name:
+                        units.update((family, row.id) for family in assignment.families)
             case _:
                 continue
     return units
@@ -386,11 +396,13 @@ class DecisionWriter:
         approval = self.rule_approval(key, inherited)
         project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
+        caller = staff.snapshot().by_current_session(staff.caller_identity())
+        proposed_by = caller.id if caller is not None and caller.kind == "unit" else self.standing.name
         with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
             body = Path(scratch) / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
-                             "--proposed-by", self.standing.name, "--extra-tags", "style",
+                             "--proposed-by", proposed_by, "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
                              "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
@@ -410,7 +422,7 @@ class DecisionWriter:
 
 
 def decision_writer(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> DecisionWriter:
-    standing = standing_style_production(ledger.repo)
+    standing = configured_style_production(ledger.repo)
     holders = unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
     return DecisionWriter(ledger, proposals, parent, {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)},
                           holders, RuleLinker(ledger.repo), repository_name(ledger.repo), standing)
@@ -728,8 +740,11 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     work = RankedWork({})
     if isinstance(writer.standing, StandingStyleProduction) and any(
             family is not None and rules.ranked_above(family) for _, family in candidates):
-        scopes = family_pilot_scopes(writer.standing.doc, ledger.repo)
-        work = ranked_work(ledger, ledger.cells(), scopes)
+        owners = family_units(writer.standing.doc)
+        if owners:
+            scopes = {family: scope for family, scope in family_pilot_scopes(writer.standing.doc, ledger.repo).items()
+                      if family in owners}
+            work = ranked_work(ledger, ledger.cells(), scopes)
     family_waits = {family: work.waits(family) for family in rules.FAMILY_RANKS}
     tip = ledger.synced_commit()
     exemptions = RankExemptions(ledger, tip)
@@ -976,7 +991,7 @@ class LegacyIssue:
 
 def off_rule_issues(ledger: style_ledger.Ledger, proposals: Path) -> tuple[Path, ...]:
     """The open issues that a style unit filed by hand through `/issue`, by name. Migrate never writes them."""
-    proposer = standing_style_production(ledger.repo).name
+    proposer = configured_style_production(ledger.repo).name
     owner = staff_reference(proposer, "showrunner")
     filers = {owner.id, *(row.id for row in staff.snapshot().find(kind="unit", parent=owner.id))}
     named = frozenset(ledger.proposal_paths())
@@ -1744,10 +1759,16 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
     # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading
     # the answer again under its write lock. The first step after the approval builds it.
-    reading = (style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
-                                                                  if outcome.finding.finding_id not in refused))
-               if dry_run else ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
-                                                          planned.tip, approved_decision))
+    if dry_run:
+        reading = style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
+                                                                   if outcome.finding.finding_id not in refused))
+    elif any(isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRenamed, style_ledger.DeclarationRemoved))
+             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite)
+             for outcome in planned.outcomes):
+        reading = ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
+                                             planned.tip, approved_decision)
+    else:
+        reading = planned
     for outcome in reading.outcomes:
         if not isinstance(outcome, (style_ledger.DeclarationNotRead, style_ledger.DeclarationInPlace,
                                     style_ledger.RenameAwaitingApproval)):

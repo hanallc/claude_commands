@@ -30,8 +30,7 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 Read `~/.claude/docs/direct/held_astra_roles.md` in full when the run holds an Astra role.
 </HeldAstraRoles>
 
-At startup or restart, a header `**Standing:** style_plan.py` runs
-<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+After restart, compaction, move, or rename, apply <RestartTakeover/> before new dispatches.
 
 State:
 
@@ -82,6 +81,7 @@ it:
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
 | <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
+| <RestartTakeover/> | `docs/direct/restart_takeover.md` | — |
 | <PhaseChecks/> | `docs/direct/phase_checks.md` | — |
 | <StyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
@@ -98,10 +98,10 @@ it:
 | <PhaseReservationContract/>, <RetainPhaseReservation/>, <CoordinatePhaseReservation/> | `docs/direct/phase_reservation.md` | — |
 | <VerificationContract/>, <VerificationNarration/> | `docs/direct/verification.md` | — |
 | <UXReview/>, <RunApplicationSmokeTest/> | `docs/direct/ux_review.md` | — |
+| <NoWorkerMode/> | `docs/direct/no_worker_mode.md` | — |
 | <WorkerLaunchFailure/> | `docs/direct/launch_failure.md` | — |
 | <AuthorizationContract/> | `docs/direct/authorization.md` | — |
 | <HeldAstraRoles/> | `docs/direct/held_astra_roles.md` | — |
-| <StandingPlanRefill/> | `docs/direct/standing_plan_refill.md` | — |
 | <BerthDecisions/> | `docs/direct/berth_decisions.md` | — |
 | <CodexDispatchWait/> | `docs/direct/codex_dispatch_wait.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
@@ -120,13 +120,13 @@ the director neither prepares style inputs nor pastes a style assignment.
 <LongLivedWorkers>
 Dispatch through `assign.sh --role implement|test|fix|review --prompt <path> --cwd <worktree>`.
 The launcher calls `worker.py assign` with the explicit role.
-Use `worker.py list` to inspect workers and `worker.py restore` to resume workers with active dispatches.
+Use `worker.py list all` to inspect workers and `worker.py restore` to resume workers with active dispatches.
 The list uses `worker_panes.observe` for open, stopped, closed, unknown, and incomplete states.
 An unknown pane outside this parent's tabs does not make its absent workers uncertain.
 An unknown pane in a parent's tab, or an unreadable parent pane, can leave absence unproved.
 Use `worker.py end <name>` only for permanent removal.
 The worker command selects idle workers and resumes a stopped worker in its same pane.
-Use the short name from `worker.py list` with `--to` when selecting a retained pane worker.
+Use the short name from `worker.py list all` with `--to` when selecting a retained pane worker.
 Keep every busy or unknown worker unchanged.
 Successful prompt delivery returns the launcher.
 The transcript prevents replay and proves completion with the matching `DONE <dispatch id>` reply.
@@ -137,8 +137,7 @@ Read that reply before the next workflow step.
 A completed pass closes its pane and keeps its staff row and native conversation.
 A live detached run keeps the pass active. Its completion uses the same receipt rule.
 A finished run with an absent transcript result permits DONE completion and adds one anomaly line.
-A pending friend reply keeps the same pass and saved launcher arguments.
-Send no recovery prompt while either result remains pending.
+Send no recovery prompt while a run result remains pending.
 For `no DONE`, request a complete result with the saved dispatch id. The next turn hook records it.
 Exit 2 means refused. Exit 4 reports a Codex question and its visible pane lines.
 Answer with `worker.py answer <name> --text "<answer>"`. Keep the same pass.
@@ -160,7 +159,8 @@ An idle worker's next assign opens its conversation on the current role account.
 A closed worker with no active dispatch has nothing to move. A worker that changes family opens a new pane.
 An unknown worker supplies no stopped proof. Inspect its named pane.
 Unrelated proved moves can continue.
-A completed restore or move rerun prints one `unchanged` line and exits 0 without a restart notice.
+A completed restore or move rerun prints `unchanged` and exits 0 without a restart notice.
+Restore also lists completed results under <RestartTakeover/>.
 An interrupted split rebuild can leave panes in the source workspace and lose the split ratio.
 Inspect the tab and panes named by the anomaly line. A retry does not rebuild that split.
 
@@ -175,8 +175,8 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   removes each worktree it made when that work ends. In the home worktree, the
   only branch the run may create is the remote branch <PushCheckpoint/> pushes;
   never switch to an existing branch.
-- The unit director does not write implementation code unless the user explicitly
-  asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
+- The unit director does not write implementation code unless the user explicitly asks.
+  Exceptions: <FastTrack/>, <NoWorkerMode/>, and agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
@@ -195,6 +195,15 @@ Other prompts carry the Three Gods and Type Design Contract under <WritePromptCo
   settled by the plan. Do not expose sandbox flags, scripts, status files,
   ledger ids, or other tooling mechanics in user-facing reports.
 </CoreContract>
+
+<NoWorkerMode>
+A no-capacity broadcast turns this mode on until the workers-back notice arrives.
+A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
+That self-on mode lasts through the current phase; try a normal assign at the next phase start.
+A broadcast-on mode keeps its longer lifetime if both triggers occur.
+Send no assign while this mode is on.
+Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
+</NoWorkerMode>
 
 <ProductionUnit>
 Your staff row identifies your unit and its parent showrunner.
@@ -285,6 +294,7 @@ under that directory. This avoids half-applied durable-state writes.
 
 - Run pane assignments in the foreground. They return after submission.
 - Run `verify.sh final` through its detached verification path.
+- Each folder or file you make on another machine (the Mac) needs automatic removal. Use a `with` block or a `scratch.py` task with an end. Never use a fixed path such as `~/.cache`.
 - Saved run output (traces, captures, logs) stays under a few GB: read each run
   and delete it before the next. A disk-floor sweeper keeps 300 GiB free on `/`
   by deleting only the shortfall, least recently used build output first, never
@@ -306,7 +316,7 @@ Applies to implementation, test, fix, and review assignments.
 
 Submission does not finish a pass or release a held role.
 The hook records completion and runs the saved completion actions.
-It receives Codex `notify` or Claude `Stop` input from the launch line.
+It receives the Codex `Stop` event from `hooks.json` and the Claude `Stop` event from the launch line.
 No launcher shell waits for a worker.
 </DispatchContract>
 
@@ -542,9 +552,8 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker; every exit must
-eventually run `end_session.sh`
-through <RunSummary/> or single-mode completion.
+records the open run in the director's staff row.
+Run `end_session.sh` through <RunSummary/> or single-mode completion for every exit.
 
 When the plan header carries a `> **Issues:**` line, mark each issue it names
 as being built:
@@ -685,9 +694,6 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
-Standing plans skip this tag entirely: their excluded plan and pinned files
-are never staged, and no shrink commit or notice is sent.
-
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -757,10 +763,8 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, a plan whose header carries
-`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
-the next phase or close the plan. If no
-todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
+At <PhaseEnd/>'s next boundary, choose the next phase or close the plan.
+If no todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
 For `next N`, decrement after completion and clear at zero. For `through X`,
@@ -776,10 +780,6 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
-
-<StandingPlanRefill>
-Read `~/.claude/docs/direct/standing_plan_refill.md` in full when the plan header has `**Standing:**`.
-</StandingPlanRefill>
 
 <FinalGateCommit>
 Read `~/.claude/docs/direct/final_gate_commit.md` in full at the final gate or when a `single` task finishes.

@@ -5,7 +5,7 @@ import { register } from '../hooks/register';
 import { accountDisplay } from '../hooks/accounts';
 import { cellWidth } from '../hooks/geometry';
 import type { StoredAccountsStatus } from '../types/accounts';
-import { BOARD, CWD, DISCOVERY, drawnText, element, elements, fixture, hostEngine, NOW, REGISTRY, rowLines, RUN, styledText } from './kit';
+import { CWD, drawnText, element, elements, hostEngine, NOW, rowLines, styledText } from './kit';
 
 const HOME = '/test-home';
 const USAGE = `${HOME}/.local/state/agent-notes/usage.json`;
@@ -68,32 +68,39 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   "30": [
     "● aLpha",
     "  60% left · role showrunners",
-    "  busy 1 · idle 0 · paused 0",
-    "  exited 1 · total 2",
-    "  resets 14:00",
+    "  busy 1 · starting 0",
+    "  waiting 0 · idle 0",
+    "  paused 0 · exited 1",
+    "  total 2 · resets 14:00",
     "  credits unlimited · enabled",
     "  role unit directors · busy 2",
+    "  starting 0 · waiting 0",
     "  idle 1 · paused 0 · exited 0",
     "  total 3",
     "● beta",
     "  20% left · role workers",
-    "  busy 7 · idle 5 · paused 0",
-    "  exited 0 · total 12",
-    "  resets Sat 14:00",
+    "  busy 7 · starting 0",
+    "  waiting 0 · idle 5",
+    "  paused 0 · exited 0",
+    "  total 12 · resets Sat 14:00",
     "  credits 13,446",
     "● Charlie",
     "  8% left · role workers",
-    "  busy 0 · idle 1 · paused 0",
-    "  exited 0 · total 1",
-    "  resets Sun 14:00",
+    "  busy 0 · starting 0",
+    "  waiting 0 · idle 1",
+    "  paused 0 · exited 0",
+    "  total 1 · resets Sun 14:00",
     "● Delta",
     "  25% left · role spare",
     "  resets 23 Oct",
     "● Echo",
     "  — left · role showrunners",
-    "  busy 0 · idle 0 · paused 0",
-    "  exited 0 · total 0",
+    "  busy 0 · starting 0",
+    "  waiting 0 · idle 0",
+    "  paused 0 · exited 0",
+    "  total 0",
     "  role unit directors · busy 0",
+    "  starting 0 · waiting 0",
     "  idle 0 · paused 0 · exited 0",
     "  total 0",
     "● Foxtrot",
@@ -101,12 +108,15 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  resets Thu 14:00 · enabled",
     "● Gamma",
     "  74% left · role workers",
-    "  busy 1 · idle 2 · paused 0",
-    "  exited 1 · total 4",
-    "  resets 24 Oct",
+    "  busy 1 · starting 0",
+    "  waiting 0 · idle 2",
+    "  paused 0 · exited 1",
+    "  total 4 · resets 24 Oct",
     "total",
-    "  busy 11 · idle 9 · paused 0",
-    "  exited 2 · total 22",
+    "  busy 11 · starting 0",
+    "  waiting 0 · idle 9",
+    "  paused 0 · exited 2",
+    "  total 22",
     "",
     "Problems",
     "• Stored weekly reading is",
@@ -121,31 +131,33 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   ],
   "60": [
     "● aLpha",
-    "  60% left · role showrunners · busy 1 · idle 0 · paused 0",
-    "  exited 1 · total 2 · resets 14:00 · credits unlimited",
-    "  enabled",
-    "  role unit directors · busy 2 · idle 1 · paused 0",
-    "  exited 0 · total 3",
+    "  60% left · role showrunners · busy 1 · starting 0",
+    "  waiting 0 · idle 0 · paused 0 · exited 1 · total 2",
+    "  resets 14:00 · credits unlimited · enabled",
+    "  role unit directors · busy 2 · starting 0 · waiting 0",
+    "  idle 1 · paused 0 · exited 0 · total 3",
     "● beta",
-    "  20% left · role workers · busy 7 · idle 5 · paused 0",
-    "  exited 0 · total 12 · resets Sat 14:00 · credits 13,446",
+    "  20% left · role workers · busy 7 · starting 0 · waiting 0",
+    "  idle 5 · paused 0 · exited 0 · total 12 · resets Sat 14:00",
+    "  credits 13,446",
     "● Charlie",
-    "  8% left · role workers · busy 0 · idle 1 · paused 0",
-    "  exited 0 · total 1 · resets Sun 14:00",
+    "  8% left · role workers · busy 0 · starting 0 · waiting 0",
+    "  idle 1 · paused 0 · exited 0 · total 1 · resets Sun 14:00",
     "● Delta",
     "  25% left · role spare · resets 23 Oct",
     "● Echo",
-    "  — left · role showrunners · busy 0 · idle 0 · paused 0",
-    "  exited 0 · total 0",
-    "  role unit directors · busy 0 · idle 0 · paused 0",
-    "  exited 0 · total 0",
+    "  — left · role showrunners · busy 0 · starting 0",
+    "  waiting 0 · idle 0 · paused 0 · exited 0 · total 0",
+    "  role unit directors · busy 0 · starting 0 · waiting 0",
+    "  idle 0 · paused 0 · exited 0 · total 0",
     "● Foxtrot",
     "  90% left · role spare · resets Thu 14:00 · enabled",
     "● Gamma",
-    "  74% left · role workers · busy 1 · idle 2 · paused 0",
-    "  exited 1 · total 4 · resets 24 Oct",
+    "  74% left · role workers · busy 1 · starting 0 · waiting 0",
+    "  idle 2 · paused 0 · exited 1 · total 4 · resets 24 Oct",
     "total",
-    "  busy 11 · idle 9 · paused 0 · exited 2 · total 22",
+    "  busy 11 · starting 0 · waiting 0 · idle 9 · paused 0",
+    "  exited 2 · total 22",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare",
@@ -155,17 +167,26 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  needs refreshing before the next production starts."
   ],
   "100": [
-    "   account  left  role            busy  idle  paused  exited  total     resets    credits  enabled",
-    "●  aLpha     60%  showrunners        1     0       0       1      2      14:00  unlimited  yes",
-    "                  unit directors     2     1       0       0      3",
-    "●  beta      20%  workers            7     5       0       0     12  Sat 14:00     13,446",
-    "●  Charlie    8%  workers            0     1       0       0      1  Sun 14:00",
-    "●  Delta     25%  spare                                                 23 Oct",
-    "●  Echo        —  showrunners        0     0       0       0      0",
-    "                  unit directors     0     0       0       0      0",
-    "●  Foxtrot   90%  spare                                              Thu 14:00             yes",
-    "●  Gamma     74%  workers            1     2       0       1      4     24 Oct",
-    "   total                            11     9       0       2     22",
+    "   account  left  role            busy  starting  waiting  idle  paused  exited  total",
+    "     resets    credits  enabled",
+    "●  aLpha     60%  showrunners        1         0        0     0       0       1      2",
+    "      14:00  unlimited  yes",
+    "                  unit directors     2         0        0     1       0       0      3",
+    "●  beta      20%  workers            7         0        0     5       0       0     12",
+    "  Sat 14:00     13,446",
+    "●  Charlie    8%  workers            0         0        0     1       0       0      1",
+    "  Sun 14:00",
+    "●  Delta     25%  spare",
+    "     23 Oct",
+    "●  Echo        —  showrunners        0         0        0     0       0       0      0",
+    "",
+    "                  unit directors     0         0        0     0       0       0      0",
+    "●  Foxtrot   90%  spare",
+    "  Thu 14:00             yes",
+    "●  Gamma     74%  workers            1         0        0     2       0       1      4",
+    "     24 Oct",
+    "   total                            11         0        0     9       0       2     22",
+    "",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare account; keep its previous assignment until",
@@ -174,17 +195,17 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  starts."
   ],
   "140": [
-    "   account  left  role            busy  idle  paused  exited  total     resets    credits  enabled",
-    "●  aLpha     60%  showrunners        1     0       0       1      2      14:00  unlimited  yes",
-    "                  unit directors     2     1       0       0      3",
-    "●  beta      20%  workers            7     5       0       0     12  Sat 14:00     13,446",
-    "●  Charlie    8%  workers            0     1       0       0      1  Sun 14:00",
-    "●  Delta     25%  spare                                                 23 Oct",
-    "●  Echo        —  showrunners        0     0       0       0      0",
-    "                  unit directors     0     0       0       0      0",
-    "●  Foxtrot   90%  spare                                              Thu 14:00             yes",
-    "●  Gamma     74%  workers            1     2       0       1      4     24 Oct",
-    "   total                            11     9       0       2     22",
+    "   account  left  role            busy  starting  waiting  idle  paused  exited  total     resets    credits  enabled",
+    "●  aLpha     60%  showrunners        1         0        0     0       0       1      2      14:00  unlimited  yes",
+    "                  unit directors     2         0        0     1       0       0      3",
+    "●  beta      20%  workers            7         0        0     5       0       0     12  Sat 14:00     13,446",
+    "●  Charlie    8%  workers            0         0        0     1       0       0      1  Sun 14:00",
+    "●  Delta     25%  spare                                                                    23 Oct",
+    "●  Echo        —  showrunners        0         0        0     0       0       0      0",
+    "                  unit directors     0         0        0     0       0       0      0",
+    "●  Foxtrot   90%  spare                                                                 Thu 14:00             yes",
+    "●  Gamma     74%  workers            1         0        0     2       0       1      4     24 Oct",
+    "   total                            11         0        0     9       0       2     22",
     "",
     "Problems",
     "• Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading arrives.",
@@ -231,9 +252,8 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
   });
   const directories = new Set([HOME, `${HOME}/.local`, `${HOME}/.local/state`,
     `${HOME}/.local/state/agent-notes`, `${HOME}/.local/state/accounts`, `${HOME}/.claude`,
-    `${HOME}/.claude/config`, DISCOVERY, REGISTRY]);
-  const mtimes = new Map<string, number>([...directories, ...INPUTS, BOARD, RUN].map(path => [path, NOW - 1000]));
-  mtimes.set(BOARD, NOW);
+    `${HOME}/.claude/config`]);
+  const mtimes = new Map<string, number>([...directories, ...INPUTS].map(path => [path, NOW - 1000]));
   for (const path of missing) mtimes.delete(path);
   let data = statusFixture();
   let failure = '';
@@ -272,8 +292,7 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
     if (e.path === zonePath) {
       return { value: zoneConfig };
     }
-    if (e.path !== BOARD) throw new Error('The accounts pane must consume process JSON only');
-    return { value: JSON.stringify(fixture()) };
+    throw new Error('The accounts pane must consume process JSON only');
   });
   on('fs.write', (_$, e) => { fs.push(e.path); throw new Error('Unexpected fixture write'); });
   on('process.run', async (_$, e) => {
@@ -289,15 +308,13 @@ function accountsHost(on: On, missing: readonly string[] = [], environment: Reco
       return { value: { exitCode: 0, stdout: JSON.stringify(data), stderr: '',
         isStdoutTruncated: false, isStderrTruncated: false } };
     }
-    mtimes.set(BOARD, clock.now());
-    return { value: { exitCode: 0, stdout: JSON.stringify({ files: [BOARD], watch: [REGISTRY] }),
-      stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
+    throw new Error('Unexpected process from the accounts pane');
   });
   on('session.send', (_$, e) => { escaped.push(e.text); throw new Error('Unexpected message from accounts pane'); });
   return { ...host, clock, fs, mtimes, processes, escaped, stateWrites,
     accountStateKind: () => accountStateKind,
     accountRuns: () => processes.filter(isAccounts),
-    boardRuns: () => processes.filter(argv => !isAccounts(argv)),
+    otherRuns: () => processes.filter(argv => !isAccounts(argv)),
     replace: (next: StoredAccountsStatus) => { data = next; },
     failNext: () => { failure = `Stored status failed for ${address('fixture')}.`; },
     clear: () => { fs.length = 0; processes.length = 0; stateWrites.length = 0; },
@@ -346,35 +363,59 @@ describe('accounts table', () => {
       expect(previous).toContain('units');
       expect(previous).not.toContain('✓');
       if (columns === 140) {
-        expect(selected).toContain('units ✓ 1 0 0 0 1');
-        expect(selected).toContain('showrunners ✓ 0 0 0 0 0');
-        expect(previous).toContain('units 1 1 0 1 3');
+        expect(selected).toContain('units ✓ 1 0 0 0 0 0 1');
+        expect(selected).toContain('showrunners ✓ 0 0 0 0 0 0 0');
+        expect(previous).toContain('units 1 0 0 1 0 1 3');
       } else {
-        expect(selected).toContain('role units ✓ busy 1 idle 0 paused 0 exited 0 total 1');
-        expect(selected).toContain('role showrunners ✓ busy 0 idle 0 paused 0 exited 0 total 0');
-        expect(previous).toContain('role units busy 1 idle 1 paused 0 exited 1 total 3');
+        expect(selected).toContain('role units ✓ busy 1 starting 0 waiting 0 idle 0 paused 0 exited 0 total 1');
+        expect(selected).toContain('role showrunners ✓ busy 0 starting 0 waiting 0 idle 0 paused 0 exited 0 total 0');
+        expect(previous).toContain('role units busy 1 starting 0 waiting 0 idle 1 paused 0 exited 1 total 3');
       }
       const lines = rowLines(tree);
       const total = lines.findIndex(line => line.trim().startsWith('total'));
-      expect(normalized(lines.slice(total))).toContain(columns === 140 ? 'total 2 1 0 1 4' : 'total busy 2 · idle 1 · paused 0 · exited 1 · total 4');
+      expect(normalized(lines.slice(total))).toContain(columns === 140 ? 'total 2 0 0 1 0 1 4' : 'total busy 2 · starting 0 · waiting 0 · idle 1 paused 0 · exited 1 · total 4');
     });
   }
 
-  test('activity columns preserve busy, idle, paused, exited, and total order', async ($, on) => {
-    const fake = accountsHost(on);
-    const data = statusFixture();
-    data.accounts = [{ ...data.accounts[0]!, roles: ['units'], selected_roles: ['units'],
-      role_counts: [{ busy: 1, idle: 2, paused: 3, exited: 4, total: 10 }] }];
-    data.problems = [];
-    fake.replace(data);
-    await $.command.run(command());
-    const ui = await mount($);
-    const lines = rowLines(await ui.drawn());
-    expect(lines[0]!.trim().split(/\s+/)).toEqual([
-      'account', 'left', 'role', 'busy', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('units ✓ 1 2 3 4 10');
-    expect(lines.join(' ')).not.toContain('shell');
-  });
+  for (const [name, count, expected, total] of [
+    ['older status', { busy: 1, idle: 2, paused: 3, exited: 4, total: 10 }, '1 0 0 2 3 4 10', '2 0 0 4 6 8 20'],
+    ['current status', { busy: 1, starting: 5, waiting: 6, idle: 2, paused: 3, exited: 4, total: 21 }, '1 5 6 2 3 4 21', '2 10 12 4 6 8 42'],
+    ['starting only', { busy: 1, starting: 5, idle: 2, paused: 3, exited: 4, total: 15 }, '1 5 0 2 3 4 15', '2 10 0 4 6 8 30'],
+    ['waiting only', { busy: 1, waiting: 6, idle: 2, paused: 3, exited: 4, total: 16 }, '1 0 6 2 3 4 16', '2 0 12 4 6 8 32'],
+  ] as const) {
+    for (const columns of [170, 100, 50, 30]) {
+      test(`${name}, ${columns} cells: activity columns preserve the status order and totals`, async ($, on) => {
+        const fake = accountsHost(on);
+        const data = statusFixture();
+        data.accounts = [{ ...data.accounts[0]!, roles: ['units', 'showrunners'], selected_roles: ['units'],
+          role_counts: [count, count] }];
+        data.problems = [];
+        fake.replace(data);
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
+          surface: 'terminal', props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        const headings = ['busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total'];
+        const facts = (values: string) => values.split(' ').map((value, index) => `${headings[index]} ${value}`).join(' ');
+        const row = normalized(accountLines(tree, 'Low')).replace(/ · /g, ' ');
+        if (columns >= 100) {
+          expect(lines.slice(0, lines.findIndex(line => line.startsWith('● '))).join(' ').trim().split(/\s+/)).toEqual([
+            'account', 'left', 'role', ...headings, 'resets', 'credits', 'enabled']);
+          expect(row).toContain(`units ✓ ${expected}`);
+          expect(row).toContain(`showrunners ${expected}`);
+        } else {
+          expect(row).toContain(`role units ✓ ${facts(expected)}`);
+          expect(row).toContain(`role showrunners ${facts(expected)}`);
+        }
+        const totalIndex = lines.findIndex(line => line === 'total' || line.startsWith('   total '));
+        expect(normalized(lines.slice(totalIndex)).replace(/ · /g, ' ')).toBe(
+          columns >= 100 ? `total ${total}` : `total ${facts(total)}`);
+        expect(lines.join(' ')).not.toContain('shell');
+        for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+      });
+    }
+  }
 
   for (const upcoming of [
     ['Upcoming moves:', 'showrunners 1: at 1% → claude3, else claude2', '', 'units 1: at 1% → claude4', '', 'workers 1: at 1% → codex2'],
@@ -416,7 +457,7 @@ describe('accounts table', () => {
       expect(next).toBeGreaterThan(0);
       const continuation = normalized(rows.slice(next)).replace(/ · /g, ' ');
       expect(continuation).toBe(columns <= 60
-        ? 'role showrunners busy 1 idle 1 paused 0 exited 0 total 2' : 'showrunners 1 1 0 0 2');
+        ? 'role showrunners busy 1 starting 0 waiting 0 idle 1 paused 0 exited 0 total 2' : 'showrunners 1 0 0 1 0 0 2');
       expect(rows.filter(line => line.startsWith('● '))).toHaveLength(1);
       expect(JSON.stringify(data)).toBe(before);
     });
@@ -448,24 +489,24 @@ describe('accounts table', () => {
       const tree = await ui.drawn();
       const row = normalized(accountLines(tree, 'Low'));
       if (columns === 140) {
-        expect(row).toContain('unit directors 3 1 0 2 6');
-        expect(row).toContain('showrunners 1 3 0 1 5');
+        expect(row).toContain('unit directors 3 0 0 1 0 2 6');
+        expect(row).toContain('showrunners 1 0 0 3 0 1 5');
       } else {
         const facts = row.replace(/ · /g, ' ');
-        expect(facts).toContain('role unit directors busy 3 idle 1 paused 0 exited 2 total 6');
-        expect(facts).toContain('role showrunners busy 1 idle 3 paused 0 exited 1 total 5');
+        expect(facts).toContain('role unit directors busy 3 starting 0 waiting 0 idle 1 paused 0 exited 2 total 6');
+        expect(facts).toContain('role showrunners busy 1 starting 0 waiting 0 idle 3 paused 0 exited 1 total 5');
       }
       expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
-        { kind: 'available', value: { busy: 3, idle: 2, paused: 0, exited: 0, total: 5 } },
+        { kind: 'available', value: { busy: 3, starting: 0, waiting: 0, idle: 2, paused: 0, exited: 0, total: 5 } },
       ]);
       const lines = rowLines(tree);
       if (columns === 140) expect(lines.find(line => line.trim().startsWith('total'))!.trim().replace(/\s+/g, ' '))
-        .toBe('total 7 6 0 3 16');
-      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain(columns === 30 ? 'total busy 7 · idle 6 · paused 0 exited 3' : 'total busy 7 · idle 6 · paused 0 · exited 3');
+        .toBe('total 7 0 0 6 0 3 16');
+      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain(columns === 30 ? 'total busy 7 · starting 0 waiting 0 · idle 6 paused 0 · exited 3 total 16' : 'total busy 7 · starting 0 · waiting 0 · idle 6 paused 0 · exited 3 · total 16');
       expect(JSON.stringify(data)).toBe(before);
       data.accounts[1]!.role_counts_by_machine = {};
       expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
-        { kind: 'available', value: { busy: 3, idle: 2, paused: 0, exited: 0, total: 5 } },
+        { kind: 'available', value: { busy: 3, starting: 0, waiting: 0, idle: 2, paused: 0, exited: 0, total: 5 } },
       ]);
     });
   }
@@ -479,13 +520,13 @@ describe('accounts table', () => {
         role_counts: [zero, null], role_counts_by_machine: { natedev: {}, mac: {} } }];
       fake.replace(data);
       expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
-        { kind: 'available', value: zero }, { kind: 'unavailable' },
+        { kind: 'available', value: { ...zero, starting: 0, waiting: 0 } }, { kind: 'unavailable' },
       ]);
       await $.command.run(command());
       const ui = await mount($);
       const lines = rowLines(await ui.drawn());
       const row = lines.find(line => line.includes('Low'))!;
-      expect(row.trim().replace(/\s+/g, ' ')).toContain('units ✓ 0 0 0 0 0');
+      expect(row.trim().replace(/\s+/g, ' ')).toContain('units ✓ 0 0 0 0 0 0 0');
       const exited = lines[0]!.indexOf('exited');
       expect(row.slice(exited, exited + 6).trim()).toBe('0');
       expect(lines.find(line => line.trim().startsWith('spare'))!.trim()).toBe('spare');
@@ -504,7 +545,7 @@ describe('accounts table', () => {
     const text = drawnText(await ui.drawn());
     expect(text.split(data.problems[0]!).length - 1).toBe(1);
     expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
-      { kind: 'available', value: { busy: 2, idle: 2, paused: 0, exited: 0, total: 4 } },
+      { kind: 'available', value: { busy: 2, starting: 0, waiting: 0, idle: 2, paused: 0, exited: 0, total: 4 } },
     ]);
   });
 
@@ -533,7 +574,7 @@ describe('accounts table', () => {
           expect(labels.length).toBeGreaterThan(0);
           expect(labels.every(span => span.bold && span.color === 'default')).toBe(true);
         }
-        for (const heading of ['account', 'left', 'role', 'busy', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']) {
+        for (const heading of ['account', 'left', 'role', 'busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']) {
           const headings = spans.filter(span => span.bold && span.text.trim() === heading);
           expect(headings.length).toBe((columns <= 60 ? 0 : 1) + (heading === 'total' ? 1 : 0));
           expect(headings.every(span => span.bold && span.color === 'default')).toBe(true);
@@ -558,7 +599,7 @@ describe('accounts table', () => {
     const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
     fake.replace(readableFixture());
     await $.command.run(command());
-    for (const columns of [140, 80]) {
+    for (const columns of [140, 100]) {
       const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
@@ -567,9 +608,11 @@ describe('accounts table', () => {
       expect(header.indexOf('role')).toBe(18);
       expect(header.indexOf('left')).toBe(12);
       expect(header.indexOf('busy')).toBe(34);
-      expect(header.indexOf('exited')).toBe(54);
-      expect(header.indexOf('idle')).toBe(40);
-      expect(header.indexOf('total')).toBe(62);
+      expect(header.indexOf('starting')).toBe(40);
+      expect(header.indexOf('waiting')).toBe(50);
+      expect(header.indexOf('exited')).toBe(73);
+      expect(header.indexOf('idle')).toBe(59);
+      expect(header.indexOf('total')).toBe(81);
       const firstRows = lines.filter(line => line.startsWith('● '));
       for (const [i, row] of firstRows.entries()) {
         expect(row.indexOf(LABELS[i]!)).toBe(3);
@@ -578,14 +621,16 @@ describe('accounts table', () => {
         expect(row.slice(12, 16).trim()).toBe(['60%', '20%', '8%', '25%', '—', '90%', '74%'][i]);
         expect(row[15]).toBe(i === 4 ? '—' : '%');
         expect(row.slice(34, 38).trim()).toBe(['1', '7', '0', '', '0', '', '1'][i]);
-        expect(row.slice(54, 60).trim()).toBe(['1', '0', '0', '', '0', '', '1'][i]);
-        expect(row.slice(40, 44).trim()).toBe(['0', '5', '1', '', '0', '', '2'][i]);
-        expect(row.slice(62, 67).trim()).toBe(['2', '12', '1', '', '0', '', '4'][i]);
+        expect(row.slice(40, 48).trim()).toBe(i === 3 || i === 5 ? '' : '0');
+        expect(row.slice(50, 57).trim()).toBe(i === 3 || i === 5 ? '' : '0');
+        expect(row.slice(73, 79).trim()).toBe(['1', '0', '0', '', '0', '', '1'][i]);
+        expect(row.slice(59, 63).trim()).toBe(['0', '5', '1', '', '0', '', '2'][i]);
+        expect(row.slice(81, 86).trim()).toBe(['2', '12', '1', '', '0', '', '4'][i]);
       }
       const detail = columns === 140 ? firstRows : firstRows.map(row => lines[lines.indexOf(row) + 1]!);
-      const resetStart = columns === 140 ? 69 : 2;
-      const creditStart = columns === 140 ? 80 : 13;
-      const enabledStart = columns === 140 ? 91 : 24;
+      const resetStart = columns === 140 ? 88 : 2;
+      const creditStart = columns === 140 ? 99 : 13;
+      const enabledStart = columns === 140 ? 110 : 24;
       for (const [i, row] of detail.entries()) {
         expect(row.slice(resetStart, resetStart + 9).trim()).toBe(['14:00', 'Sat 14:00', 'Sun 14:00', '23 Oct', '', 'Thu 14:00', '24 Oct'][i]);
         expect(row.slice(creditStart, creditStart + 9).trim()).toBe(i === 0 ? 'unlimited' : i === 1 ? '13,446' : '');
@@ -595,7 +640,7 @@ describe('accounts table', () => {
     }
   });
 
-  for (const columns of [140, 80, 50]) {
+  for (const columns of [140, 100, 50]) {
     test(`all columns remain at ${columns} cells when no balance exists`, async ($, on) => {
       const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
       const data = readableFixture();
@@ -609,10 +654,10 @@ describe('accounts table', () => {
       // Empty balances retain every column and the credit setting.
       if (columns === 50) {
         expect(normalized(accountLines(await ui.drawn(), 'aLpha')).replace(/ · /g, ' ')).toBe(
-          '● aLpha 60% left role showrunners busy 1 idle 0 paused 0 exited 1 total 2 resets 14:00 enabled role unit directors busy 2 idle 1 paused 0 exited 0 total 3');
+          '● aLpha 60% left role showrunners busy 1 starting 0 waiting 0 idle 0 paused 0 exited 1 total 2 resets 14:00 enabled role unit directors busy 2 starting 0 waiting 0 idle 1 paused 0 exited 0 total 3');
       } else {
         expect(lines.slice(0, lines.findIndex(line => line.startsWith('● '))).join(' ').trim().split(/\s+/))
-          .toEqual(['account', 'left', 'role', 'busy', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
+          .toEqual(['account', 'left', 'role', 'busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
       }
       if (columns === 50) expect(lines.join(' ')).not.toContain('credits');
       else expect(lines.join(' ')).toContain('credits');
@@ -684,7 +729,7 @@ describe('accounts table', () => {
       fake.replace({ accounts: [account], problems: [] });
       await $.command.run(command());
       const rows = rowLines(await (await mount($)).drawn());
-      expect(rows[0]!.trim().split(/\s+/)).toEqual(['account', 'left', 'role', 'busy', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
+      expect(rows[0]!.trim().split(/\s+/)).toEqual(['account', 'left', 'role', 'busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
       expect(rows[1]!.split(expected)).toHaveLength(2);
     });
   }
@@ -698,12 +743,12 @@ describe('accounts table', () => {
     await $.command.run(command());
     const tree = await (await mount($)).drawn();
     expect(rowLines(tree)).toEqual([
-      "   account  left  role  busy  idle  paused  exited  total  resets  credits  enabled",
-      "●  Invalid     —                                                            yes",
+      "   account  left  role  busy  starting  waiting  idle  paused  exited  total  resets  credits  enabled",
+      "●  Invalid     —                                                                               yes",
       "●  Unknown     —",
-      "●  Zero       0%                                                         0",
-      "   total                   0     0       0       0      0"
-]);
+      "●  Zero       0%                                                                            0",
+      "   total                   0         0        0     0       0       0      0"
+    ]);
     const text = rowLines(tree).join(' ');
     for (const missing of ['no reading', 'null', 'undefined', 'Problems']) expect(text).not.toContain(missing);
   });
@@ -753,7 +798,7 @@ describe('accounts table', () => {
       expect(display.readOk).toBe(false);
       expect('creditsInUse' in display).toBe(false);
       expect(display.roleCounts).toEqual([{ kind: 'unavailable' }, { kind: 'unavailable' }]);
-      for (const heading of ['busy', 'idle', 'paused', 'exited', 'total']) {
+      for (const heading of ['busy', 'starting', 'waiting', 'idle', 'paused', 'exited', 'total']) {
         const start = lines[0]!.indexOf(heading);
         expect(start).toBeGreaterThan(0);
         expect(lines[1]!.slice(start, start + heading.length).trim()).toBe('');
@@ -773,23 +818,23 @@ describe('accounts table', () => {
       const lines = rowLines(await ui.drawn());
       const row = normalized(accountLines(await ui.drawn(), 'Watch'));
       if (columns === 140) {
-        expect(row).toContain('workers 2 3 0 0 5');
-        expect(row).toContain('reviewers 1 4 0 0 5');
+        expect(row).toContain('workers 2 0 0 3 0 0 5');
+        expect(row).toContain('reviewers 1 0 0 4 0 0 5');
       } else {
         const facts = row.replace(/ · /g, ' ');
-        expect(facts).toContain('role workers busy 2 idle 3 paused 0 exited 0 total 5');
-        expect(facts).toContain('role reviewers busy 1 idle 4 paused 0 exited 0 total 5');
+        expect(facts).toContain('role workers busy 2 starting 0 waiting 0 idle 3 paused 0 exited 0 total 5');
+        expect(facts).toContain('role reviewers busy 1 starting 0 waiting 0 idle 4 paused 0 exited 0 total 5');
       }
       expect(lines.join(' ')).not.toContain('in use');
       if (columns === 140) {
         const exited = lines[0]!.indexOf('exited');
         expect(lines[1]!.slice(exited, exited + 6).trim()).toBe('0');
         expect(lines.at(-1)!.slice(exited, exited + 6).trim()).toBe('0');
-        expect(lines.at(-1)!.trim().replace(/\s+/g, ' ')).toBe('total 3 7 0 0 10');
+        expect(lines.at(-1)!.trim().replace(/\s+/g, ' ')).toBe('total 3 0 0 7 0 0 10');
       } else {
         const total = lines.indexOf('total');
         expect(total).toBeGreaterThan(0);
-        expect(normalized(lines.slice(total))).toBe(columns === 30 ? 'total busy 3 · idle 7 · paused 0 exited 0 · total 10' : 'total busy 3 · idle 7 · paused 0 · exited 0 · total 10');
+        expect(normalized(lines.slice(total))).toBe(columns === 30 ? 'total busy 3 · starting 0 waiting 0 · idle 7 paused 0 · exited 0 total 10' : 'total busy 3 · starting 0 · waiting 0 · idle 7 paused 0 · exited 0 · total 10');
         expect(row).toContain('exited 0');
       }
       for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
@@ -814,7 +859,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 1 3');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 1 0 1 3');
     fake.clear();
     const changed = statusFixture();
     changed.session_inputs = [path];
@@ -823,8 +868,8 @@ describe('accounts pane', () => {
     fake.change(path);
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 2 0 1 4');
-    expect(fake.boardRuns()).toEqual([]);
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 2 0 1 4');
+    expect(fake.otherRuns()).toEqual([]);
     fake.clear();
     await fake.clock.advance(10_000);
     expect(fake.accountRuns()).toEqual([ARGV]);
@@ -841,7 +886,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 1 3');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 1 0 1 3');
     const unchanged = [...fake.mtimes.entries()];
     const afterExit = structuredClone(data);
     afterExit.accounts[0]!.role_counts = [{ busy: 1, idle: 1, paused: 0, exited: 0, total: 2 }, { busy: 1, idle: 1, paused: 0, exited: 0, total: 2 }];
@@ -850,8 +895,8 @@ describe('accounts pane', () => {
     await fake.clock.advance(10_000);
     expect([...fake.mtimes.entries()]).toEqual(unchanged);
     expect(fake.accountRuns()).toEqual([ARGV]);
-    expect(fake.boardRuns()).toEqual([]);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 0 2');
+    expect(fake.otherRuns()).toEqual([]);
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 1 0 0 2');
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
   });
@@ -865,7 +910,7 @@ describe('accounts pane', () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 1 3');
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 1 0 1 3');
     const unchanged = [...fake.mtimes.entries()];
     fake.clear();
     fake.failNext();
@@ -880,8 +925,8 @@ describe('accounts pane', () => {
     expect([...fake.mtimes.entries()]).toEqual(unchanged);
     expect(fake.accountRuns()).toEqual([ARGV]);
     expect(fake.accountStateKind()).toBe('accounts');
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 1 0 0 2');
-    expect(fake.boardRuns()).toEqual([]);
+    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('unit directors 1 0 0 1 0 0 2');
+    expect(fake.otherRuns()).toEqual([]);
     expect(fake.escaped).toEqual([]);
     expect(fake.forbidden).toEqual([]);
   });
@@ -1004,10 +1049,9 @@ describe('accounts pane', () => {
     expect(fake.closed).toEqual(['accounts']);
   });
 
-  test('closing during startup zone lookup cannot restart accounts while the board keeps refreshing', async ($, on) => {
+  test('closing during startup zone lookup cannot restart accounts', async ($, on) => {
     const fake = accountsHost(on, [], {});
     await $.session.start(start);
-    await $.command.run(command('showrunner:unit_board'));
     await $.command.run(command());
     const pending = fake.pauseZone();
     const restarting = $.session.start(start);
@@ -1022,10 +1066,6 @@ describe('accounts pane', () => {
     expect(fake.accountRuns()).toEqual([]);
     expect(fake.fs.some(path => INPUTS.includes(path))).toBe(false);
     expect(fake.fs.includes(`${HOME}/.claude/config/user_zone.conf`)).toBe(false);
-    fake.change(RUN);
-    await fake.clock.advance(10_000);
-    expect(fake.boardRuns().length).toBe(1);
-    expect(fake.fs.includes(RUN)).toBe(true);
     expect(fake.accountRuns()).toEqual([]);
   });
 
@@ -1144,22 +1184,18 @@ describe('accounts pane', () => {
     expect(fake.processes).toEqual([]);
   });
 
-  for (const close of ['showrunner:accounts', 'showrunner:unit_board']) {
-    test(`closing ${close} preserves the other pane refresh loop`, async ($, on) => {
+  for (const close of ['showrunner:accounts', 'build:queue']) {
+    test(`closing ${close} preserves the accounts lifecycle`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('showrunner:unit_board'));
       await $.command.run(command());
       await $.command.run(command(close, 'close'));
       fake.clear();
       fake.change(USAGE);
-      fake.change(RUN);
       await fake.clock.advance(10_000);
       expect(fake.accountRuns().length).toBe(close === 'showrunner:accounts' ? 0 : 1);
-      expect(fake.boardRuns().length).toBe(close === 'showrunner:unit_board' ? 0 : 1);
       expect(fake.fs.includes(USAGE)).toBe(close !== 'showrunner:accounts');
-      expect(fake.fs.includes(RUN)).toBe(close !== 'showrunner:unit_board');
-      await $.command.run(command(close === 'showrunner:accounts' ? 'showrunner:unit_board' : 'showrunner:accounts', 'close'));
+      await $.command.run(command(close === 'showrunner:accounts' ? 'build:queue' : 'showrunner:accounts', 'close'));
       fake.clear();
       await fake.clock.advance(60_000);
       expect(fake.fs).toEqual([]);
@@ -1204,11 +1240,10 @@ describe('accounts pane', () => {
   });
 
   for (const refresh of [false, true]) {
-    test(`closing during pending ${refresh ? 'refresh' : 'open'} leaves no state and keeps the board live`, async ($, on) => {
+    test(`closing during pending ${refresh ? 'refresh' : 'open'} leaves no state or background work`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
-      await $.command.run(command('showrunner:unit_board'));
-      if (refresh) await $.command.run(command());
+        if (refresh) await $.command.run(command());
       const pending = fake.pause();
       let opening: Promise<unknown> = Promise.resolve();
       if (refresh) { fake.change(USAGE); opening = fake.clock.advance(10_000); }
@@ -1222,10 +1257,9 @@ describe('accounts pane', () => {
       expect(fake.accountStateKind()).toBe('closed');
       expect(fake.stateWrites.length).toBe(0);
       expect(fake.fs).toEqual([]);
-      fake.change(RUN);
       await fake.clock.advance(10_000);
       expect(fake.accountRuns()).toEqual([]);
-      expect(fake.boardRuns().length).toBe(1);
+      expect(fake.otherRuns()).toEqual([]);
     });
   }
 });

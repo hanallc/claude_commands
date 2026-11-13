@@ -51,7 +51,7 @@ Choose a retained worker that did not write the affected files when one is avail
 Otherwise have their writer review its choices without relying on its earlier reasoning.
 Apply <RoleReassignment/> and <ReviewPromptContract/>.
 Use `assign.sh --role review` with this session and the next review index.
-For `herdr`, use `worker.py list` and pass the short name with `--to` for a retained worker.
+For `herdr`, use `worker.py list all` and pass the short name with `--to` for a retained worker.
 If all pane workers are busy, pass `--new-worker <free review name>` to `assign.sh --role review`.
 For a phase review outside a unit run, omit both worker options.
 Otherwise omit `--to` only for a new worker allowed by <LongLivedWorkers/>.
@@ -60,9 +60,7 @@ Ad hoc work skips this section.
 </RunPhaseReview>
 
 <RunPhaseShrink>
-Standing plans (`**Standing:** style_plan.py`) skip shrink and its structural
-check: refill discards merged or dropped ticket phases. Never commit the plan
-or pinned rule files.
+Style units apply <StyleStandingLifetime/> in `docs/direct/style_unit.md` instead of shrink.
 
 For a phased plan, read `~/.claude/commands/plan/shrink.md` in full and apply it
 with arguments `"${PLAN_DOC}" --phases <current-id> --closeout "${SESSION_DIR}"`
