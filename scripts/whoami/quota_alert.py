@@ -918,13 +918,16 @@ def registry_assignments() -> dict[str, str]:
 def edit_registry(editor: str, *args: str) -> str | None:
     """Run a validated registry editor and return its failure cause.
 
+    The edit is live at once and never waits for main; publish_registry() pushes it later.
     A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
     timeout = conf.read("accounts").whole("quota_edit_timeout_seconds")
+    publish = "0" if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" else "later"
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY),
+                                        "MODELS_CONFIG_PUBLISH": publish}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:
@@ -937,6 +940,15 @@ def edit_registry(editor: str, *args: str) -> str | None:
     if process.returncode == 0:
         return None
     return " ".join((err.strip() or out.strip() or f"exit {process.returncode}").split())
+
+
+def publish_registry() -> list[str]:
+    """Push the rows edit_registry() wrote; a busy main leaves them for the next pass."""
+    try:
+        published = models_registry.publish_pending(REGISTRY)
+    except OSError as error:
+        return [f"registry rows not published yet: {' '.join(str(error).split())}"]
+    return ["registry rows published"] if published else []
 
 
 @dataclass(frozen=True)

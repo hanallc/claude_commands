@@ -93,6 +93,7 @@ The notice names that choice.
 The pane move stops the live agent before it resumes the conversation.
 The request records `cause: credits off`, separately from provider refusal.
 Without room, or after a failed move, that pass routes Codex assignments to Claude.
+Assignment changes are live in the same pass, even while a landing holds main. Main gets them at the next notes pass that finds main free.
 The notice names the earliest refill and any failure.
 The fallback remains until that refill or the selected account recovers.
 Turning credits on does not end it early.
