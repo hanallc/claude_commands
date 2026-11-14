@@ -243,7 +243,10 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
                     NoOwningSession(), self.holders, lineage), expected)
 
+        # The fake gate starts at tick 11000; fix the boot clock after it so a fresh host keeps it.
         with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000), \
+             mock.patch.object(os, "sysconf", return_value=100), \
              mock.patch.object(build_hold, "start_hold", side_effect=publish), \
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
