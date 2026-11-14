@@ -144,6 +144,9 @@ The retry deadline uses the original report time.
 `AttemptDeclined` preserves caller policy for no-tests results and lost runs after confirmed cleanup.
 An unavailable observation cannot substitute for confirmed cleanup or a settled dispatch path.
 Busy, blocked, and disk refusals retain normal polling.
+A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
+The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
+Before this rule, a waiting Mac step made one refused attempt each second.
 Other temporary Mac refusals delay that destination for 180 seconds.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
@@ -384,6 +387,8 @@ The pane passes its session id to mutating commands. Read-only commands keep the
 Mutation requests have replay ids. The service persists each terminal reply before delivery.
 A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
 Ended replies expire under `replay_retention_seconds`. Wait replies remain only on their connection.
+Each state write also removes an ended placement episode: no current attempt, an owner that is not live, and no request or attempt report newer than `ended_placement_seconds` (600 s).
+It removes the request and every closed attempt of that episode.
 `Wait` carries the decision, readings, need, policy, and `ConfigurationDiagnostic` records from the same pass.
 Client commands print each recovery warning once per process.
 Unavailable settings produce refusals rather than replacement policy values.
