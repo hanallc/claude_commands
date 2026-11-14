@@ -163,6 +163,12 @@ A conflict or a merge commit names the commit and preserves main.
 A waiting row is a `config/*.conf` value that differs from HEAD; other edits in those files refuse the move.
 Main synchronization, local promotion, the Mac pull and the registry fast-forward use the same move.
 After publication, the Mac pulls or receives a queued pull.
+`scripts/lib/mac_wake.py` sends a queued pull as soon as the Mac answers.
+Each queue writer and each quota pass call `mac_wake.start()`.
+It starts one detached watcher on natedev while a pull waits; a lock keeps it to one.
+The watcher probes the Mac over ssh and runs `zone.py drain` when the Mac answers.
+`mac_wake_probe_seconds` and `mac_wake_pause_seconds` in `config/live_settings.conf` set its pace.
+The watcher exits when nothing waits. A fixture queue starts no watcher.
 
 `showrunners.timer_scratch` uses the showrunner's fixed staff id to find its timer.
 It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent`, or `TimerScratchFound`.

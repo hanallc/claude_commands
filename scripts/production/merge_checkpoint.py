@@ -32,7 +32,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import change_review, checkpoint_gate
 from scripts.worktree import worktrees
-from scripts.lib import main_publish, main_push_lock, scratch, waiting_rows
+from scripts.lib import mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -929,6 +929,7 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> main_publish.MacPulle
             if result.returncode == 255 and match is None:
                 main_publish.queue_pull_only(f"mac {mac}", main_publish.first_line(result),
                                              pulls=(main_publish.MacCheckoutPull(mac, source),))
+                _ = mac_wake.start()
                 return main_publish.MacPullPending()
             raise checkpoint_gate.Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
                        "the showrunner will repair the Mac pull and rerun this checkpoint")
