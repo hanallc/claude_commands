@@ -920,15 +920,6 @@ def edit_registry(editor: str, *args: str) -> str | None:
     return " ".join((err.strip() or out.strip() or f"exit {process.returncode}").split())
 
 
-def publish_registry() -> list[str]:
-    """Push the rows edit_registry() wrote; a busy main leaves them for the next pass."""
-    try:
-        published = models_registry.publish_pending(REGISTRY)
-    except OSError as error:
-        return [f"registry rows not published yet: {' '.join(str(error).split())}"]
-    return ["registry rows published"] if published else []
-
-
 @dataclass(frozen=True)
 class CodexWorkMovedToClaude:
     account: str
