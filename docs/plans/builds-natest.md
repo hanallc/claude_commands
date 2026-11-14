@@ -3930,3 +3930,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The branch test in `test_progress_history` also switches the branch with `git symbolic-ref`.
 - AWS pair (c7a, 3 rounds): `direct/test_assign_launcher.py` 33.44 -> 31.43 CPU s; four other progress modules 0.02 to 0.36 CPU s less.
 - Commit 776786ce5. Production change; sdlc gave the go.
+
+### Phase 268 — A staff read parses the staff record only when its text changes  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/production/staff.py`; sdlc gives the go).
+
+#### As-built
+
+- `staff._load` keeps the last clean parse in the process. A same path and record text returns a new `StaffSnapshot` from it, so backends are found again.
+- A parse that prints an anomaly (unknown kind, invalid `role` or `home`) is not kept. Each parse print has a comment that names `_clean_parse`.
+- `_local_text` and `_record_fields` split `_local_fields`. The bad JSON error keeps its text.
+- AWS pair (c7a.4xlarge, 3 rounds): `message/test_roster.py` 25.00 -> 19.73 CPU s; `direct/test_assign_launcher.py` 33.49 -> 32.79.
+- Commit b93c54f12. Production change; sdlc gave the go.
