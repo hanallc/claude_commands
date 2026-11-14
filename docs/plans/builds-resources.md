@@ -2635,14 +2635,19 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 123 — The build cap leaves out agents' swapped memory  · status: done
 
-**Why:** the user, via builds, 2026-11-14: the Builds page shows the agents' swapped memory inside the build cap. Live 09:27 EST: cap 27.0 GiB with an 11.5 GiB swapped-agent block left of the cap line. `memory_admit.memory_room` sets cap = used + CI + free − safety, but room also subtracts `agent_swap_demand`, so that part of the cap can never go to builds.
+#### As-built
 
-**Work:**
-1. `memory_room`: cap = max(0, used + CI + free − safety − `agent_swap_demand`). Room = cap − used − CI − kept stays true. Admission is unchanged: no start decision reads the cap.
-2. `queue_evidence.room_text`: the swapped term is part of the cap calculation.
-3. `memory_live.html`: the cap line sits left of the swapped-agent block, next to the safety floor. The room equation shows the swapped term. The swapped-memory hover says it is outside the cap.
-4. `queue_view.cap_bar`: the terminal bar draws the swapped block between the cap line and safety.
-5. `memory_feed.memory_shares`: the swapped share comes first, then the reserved share stops at the cap line.
-6. Tests: `memory_room` cap rows, `room_text`, `cap_bar`, `memory_shares`, and the page hover and equation.
+- `memory_admit.memory_room`: cap = max(0, used + CI + free − safety − `agent_swap_demand`). Room = cap − cap use − kept while the cap is above zero. No start decision reads the cap, so admission does not change.
+- `queue_evidence.room_text` puts the swapped term in the cap calculation: `… − safety 3.0 GiB − 12.0 GiB swapped outside builds; kept aside …`.
+- `queue_view.cap_bar` draws the swapped block (`▓`, inactive) between the cap line and safety.
+- `memory_feed.memory_shares` places the swapped share first. The reserved share stops at free − safety − swapped, so on the page the reserved block ends at the cap line.
+- `memory_live.html`: the swapped-memory, shortfall and room-equation text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
 
-**Files:** `scripts/lint/memory_admit.py`, `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, and their tests.
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `test_swap_outside_the_build_and_ci_slices_is_demand` (cap and room rows, "swapped past the cap").
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — `RoomTextTests`.
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py` — `test_swapped_agent_memory_sits_between_the_cap_and_safety`.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py` — `test_swapped_demand_stays_right_of_the_cap_when_reserved_fills_free_memory`.
+- `scripts/build_queue/memory_live.html`.
+
+**Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
