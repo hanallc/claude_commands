@@ -39,6 +39,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.copies import copies
 from scripts.direct import phase_reservation
 from scripts.lib import berth_board
+from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
 from scripts.style import coverage_report
@@ -3666,9 +3667,12 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
                      "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket_id])
     if passed.get("status") not in ("active", "completed"):
-        commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
-                     "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
-                     "--cwd", str(worktree), "--paths", str(paths)])
+        if quota_state.no_worker_mode():
+            print(f"{slot}: {quota_state.NO_WORKER_START}")
+        else:
+            commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
+                             "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
+                             "--cwd", str(worktree), "--paths", str(paths)])
     for command in commands:
         result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
         if result.returncode:
