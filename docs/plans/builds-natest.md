@@ -4015,28 +4015,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** the `reserve-refusal.py` and `reserve-response-loss.py` fixtures in `direct/test_verify_ssh_targets_routing.py` run inside verify_helper, so the module uses less AWS CPU.
-
-**Decision:** profile on 6f96941d0: `reserve-response-loss.py` 25 starts (6.7 s) and `reserve-refusal.py` 13 starts. Each start ran `build_targets.py` with runpy in a new process, because the wrapper had no top-level `main`.
-
-**Spec:**
-1. `verify_ssh_targets_test_support.BUILD_TARGETS_STATUS` replaces `RUN_BUILD_TARGETS`. It defines `build_targets_status()`, which loads the real `build_targets.py` once for each process and returns the `main` status.
-2. The two routing wrappers put their work in a top-level `main`. Each answer, exit status and observation stays the same.
-3. The retained wrapper `interrupted-reservation.py` calls `build_targets_status()` and stays a separate process.
-
-**Files:**
-- `scripts/direct/verify_ssh_targets_test_support.py`
-- `scripts/direct/test_verify_ssh_targets_routing.py`
-- `scripts/direct/test_verify_ssh_targets_retained.py`
-
-**Workers:** director; no-worker mode.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phase 273: the same pattern for the step-routes `targets.py` fixture.
-
-**Acceptance gate:**
-- Both modules pass with the same tests; basedpyright 0 errors and 0 warnings.
-- aws pair (3 rounds) shows a gain.
+- `verify_ssh_targets_test_support.BUILD_TARGETS_STATUS` loads the real `build_targets.py` once for each process and returns its `main` status. It replaces `RUN_BUILD_TARGETS`.
+- `reserve-refusal.py` and `reserve-response-loss.py` have a top-level `main`, so verify_helper runs them inside its process. Each answer and observation stays the same.
+- `interrupted-reservation.py` uses the same loader and stays a separate process.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_verify_ssh_targets_routing` 45.76 -> 36.50 CPU s.
+- Commit 785de7dbe. Test-only change.
