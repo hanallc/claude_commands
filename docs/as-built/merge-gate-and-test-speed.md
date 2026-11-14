@@ -433,27 +433,29 @@ It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
 The gate sends no red result push.
 `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
-The record holds the branch, tree, finish time, failure lines, receipt time, assignment, and push acceptance.
+The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 The notice names the failed test files and includes the result ID.
 After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
-The command requires a unit director under sdlc.
-`UNIT` accepts the staff ID or the unit name.
+The command accepts a unit director of any production.
+`UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
 The push places the receipt and assignment status before the failure list.
 The phone retains that status when it truncates a long failure list.
 A rerun prints `unchanged` after the sender accepts the push.
-`merge_gate.py nightly-check` sends `nightly.unassigned` when an unassigned result reaches its deadline.
-`nightly_assign_minutes=30` sets that deadline in `config/merge_gate.conf`.
+Only `nightly-assigned` sends the user push, and the push names the assignee.
+An unassigned red result never sends a user push.
+`merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
+The alert repeats once in each later deadline window until the fix is assigned.
+`nightly_assign_minutes=30` sets that window in `config/merge_gate.conf`.
+The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
+A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
-The fallback push states that sdlc has not assigned the fix yet.
-It reports an unconfirmed receipt when the sdlc notice failed.
-Assignment and fallback use the same file lock and push acceptance state.
-An assignment after a fallback push records the unit without another push.
-A failed send keeps the result pending for the next periodic check.
+Assignment and the check use the same file lock.
+A failed push keeps the result pending; run `nightly-assigned` again to send it.
 Each red result uses the key `nightly-result:<id>`.
 The sender suppresses a second accepted push for the complete `datetime` range.
 This also prevents another push when the gate cannot save its acceptance state.
