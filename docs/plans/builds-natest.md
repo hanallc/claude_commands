@@ -3947,21 +3947,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change in `scripts/direct/progress_history.py` and `scripts/direct/plan_history.py`; sdlc gives the go).
 
-#### Work Order
+#### As-built
 
-**Goal:** the `start-wait`, `wait-holder` and `finish-wait` commands write the same events with less staff work on each start.
-
-**Spec:**
-- `verify.sh` starts `progress_history.py` for each wait record. Each start resolved the run state through staff and found worker backends (an `agent_accounts` import and a session folder scan).
-- `finish-wait` and `wait-holder` copy a recorded wait event and read only the history file. They read the state with `resolve_staff=False`.
-- `start-wait` reads the state with `pass_agents=False`. `staff_directory` then leaves each pass as recorded and finds no worker backend. A wait event names its phase, so `_event` adds no pass fields. `main_agent`, `worktree` and `branch` still resolve.
+- `finish-wait` and `wait-holder` read the state with `resolve_staff=False`; they copy a recorded wait event.
+- `start-wait` reads it with the new `pass_agents=False`: `staff_directory` leaves each pass as recorded and finds no worker backend.
 - The events each command writes stay the same.
-
-**Files:** `scripts/direct/progress_history.py`, `scripts/direct/plan_history.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- basedpyright reports 0 errors and 0 warnings on both files.
-- `test_progress_history`, `test_verify_wait_holder`, `test_phase_table` and `test_phase_waits` pass.
-- AWS pair on the wait-heavy verify modules. Every behavior check stays.
+- AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
+- Commit 0a9c37dd6. Production change; sdlc gave the go.
