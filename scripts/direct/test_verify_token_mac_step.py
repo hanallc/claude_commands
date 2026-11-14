@@ -20,16 +20,16 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
         Path(self.environment["BUILD_HOLD_DIR"]).mkdir()
         targets = self.root / "claim-targets.py"
         _ = targets.write_text(TARGETS.replace(
-            'if command == "eligible":',
-            'if command in ("reserve", "release-wait"):\n'
-            + '    import subprocess\n'
-            + '    arguments = sys.argv[1:]\n'
-            + '    if command == "reserve":\n'
-            + '        package = arguments.index("--package") + 1\n'
-            + '        if arguments[package] == "--workspace":\n'
-            + '            arguments[package] = ""\n'
-            + '    raise SystemExit(subprocess.call([sys.executable, os.environ["TEST_REAL_TARGETS"], *arguments]))\n'
-            + 'if command == "eligible":'))
+            '    if command == "eligible":',
+            '    if command in ("reserve", "release-wait"):\n'
+            + '        import subprocess\n'
+            + '        arguments = sys.argv[1:]\n'
+            + '        if command == "reserve":\n'
+            + '            package = arguments.index("--package") + 1\n'
+            + '            if arguments[package] == "--workspace":\n'
+            + '                arguments[package] = ""\n'
+            + '        return subprocess.call([sys.executable, os.environ["TEST_REAL_TARGETS"], *arguments])\n'
+            + '    if command == "eligible":'))
         reader = self.root / "claim-lint-config.sh"
         _ = reader.write_text(
             'lint_config_enabled() { [[ "$1" == mend || "$1" == fmt ]]; }\n'

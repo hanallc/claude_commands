@@ -40,10 +40,10 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_unreadable_record_refuses_before_local_or_mac_compile(self) -> None:
         script = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
         # Damage the record in a check that still reports the active hold.
-        source = TARGETS.replace('if command in ("constraints",', '''if command == "assigned-info":
-    for record in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
-        record.write_text("{")
-if command in ("constraints",''')
+        source = TARGETS.replace('    if command in ("constraints",', '''    if command == "assigned-info":
+        for record in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+            record.write_text("{")
+    if command in ("constraints",''')
         _ = script.write_text(source)
         result = self.run_verify("check", "sample")
         self.assertNotEqual(result.returncode, 0)

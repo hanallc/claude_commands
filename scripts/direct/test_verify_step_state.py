@@ -235,18 +235,18 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         for damage in ("removed", "foreign", "nul"):
             with self.subTest(damage=damage):
                 targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-                source = TARGETS.replace('raise SystemExit(10 if any(holders.iterdir()) else 0)', '''
-    if command == "register-local":
-        for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
-            if os.environ["TEST_RECORD_DAMAGE"] == "removed":
-                path.unlink()
-            elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
-                path.write_bytes(path.read_bytes() + bytes([0]))
-            else:
-                row = json.loads(path.read_text())
-                row["pid"] = os.getpid()
-                path.write_text(json.dumps(row))
-    raise SystemExit(10 if any(holders.iterdir()) else 0)''')
+                source = TARGETS.replace('        return 10 if any(holders.iterdir()) else 0', '''
+        if command == "register-local":
+            for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+                if os.environ["TEST_RECORD_DAMAGE"] == "removed":
+                    path.unlink()
+                elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
+                    path.write_bytes(path.read_bytes() + bytes([0]))
+                else:
+                    row = json.loads(path.read_text())
+                    row["pid"] = os.getpid()
+                    path.write_text(json.dumps(row))
+        return 10 if any(holders.iterdir()) else 0''')
                 _ = targets.write_text(source)
                 self.fixture.environment["TEST_RECORD_DAMAGE"] = damage
                 result = self.call_step_functions("run cargo check -p sample\n", kind="check")
