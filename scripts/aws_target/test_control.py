@@ -149,7 +149,7 @@ class ControlTests(CostFixture):
         self.assertEqual(self.snapshot(), 0)
         self.assertEqual(len(self.calls), 2 * count)
 
-    def test_forced_snapshot_reads_inside_the_refresh_interval(self) -> None:
+    def test_forced_snapshot_reads_inside_the_refresh_interval_and_keeps_the_scheduled_read(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         count = len(self.calls)
         self.clock.advance(1)
@@ -158,6 +158,10 @@ class ControlTests(CostFixture):
         self.assertEqual(len(self.calls), 2 * count)
         readings = ledger.rows(aws_target.read_snapshot(self.state), 'regions')
         self.assertTrue(all(row['read_at'] == self.clock.now for row in readings))
+        # The forced read does not move the interval: the next scheduled read runs one interval after the last one.
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds') - 1)
+        self.assertEqual(self.snapshot(), 0)
+        self.assertEqual(len(self.calls), 3 * count)
 
     def test_regional_failure_preserves_its_values_and_time_but_refreshes_other_regions(self) -> None:
         self.assertEqual(self.snapshot(), 0)
