@@ -29,7 +29,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, teardown
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
@@ -1361,7 +1361,29 @@ class Deployment:
                 manifest['regions'] = regional
                 cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
+        self._fill_prices()
         return True
+
+    def _fill_prices(self) -> None:
+        """Read Spot prices and quotas once the stack allows it; the hourly refresh continues."""
+        configuration = conf.read(self.settings_path)
+        attempts = configuration.whole('deploy_price_fill_attempts')
+        for attempt in range(1, attempts + 1):
+            try:
+                # The user sees the reasons here; the hourly refresh sends the alert if they remain.
+                status = read_price_snapshot(self.settings_path, self.directory, execute=self.execute,
+                                             clock=self.clock, notify=lambda _key, _push, _timeout: False, force=True)
+            except (OSError, ValueError) as error:
+                print(f'cloud-gate: the Spot price read did not run: {type(error).__name__}: '
+                      + admin_secrets.redact(str(error)), flush=True)
+                break
+            if status == 0:
+                print('cloud-gate: Spot prices and quotas read', flush=True)
+                return
+            if attempt < attempts:
+                self.pause(configuration.number('deploy_price_fill_pause_s'))
+        print('cloud-gate: deployed, but the Spot price read failed for the regions above. '
+              + 'The hourly refresh tries again.', flush=True)
 
     def remove_builder(self, *, approve_destroy: bool = False) -> bool:
         if not approve_destroy:
