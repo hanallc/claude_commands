@@ -4994,7 +4994,7 @@ class ShellTests(unittest.TestCase):
     def formatted(self, peak: admission_records.ExpectedPeak, *, available: int = 0, reserve: int = 0,
                   measured: int = 0, running: tuple[admission_records.RunningStep, ...] = (),
                   reason: admission_records.WaitReason = READY_FOR_ADMISSION, head_need: int = 0,
-                  head_label: str = "", periodic: bool = False) -> str:
+                  head_label: str = "", periodic: bool = False, position: int = 1) -> str:
         decision = admission_records.AdmissionDecision("hold", peak.bytes + reserve, 0, reserve, measured,
             pressure=reason.decision.pressure if isinstance(reason, admission_records.HeadAdmissionStatus) else
                 reason if isinstance(reason, admission_records.MemoryPressure) else admission_records.NO_PRESSURE_HOLD,
@@ -5003,10 +5003,10 @@ class ShellTests(unittest.TestCase):
             admission_policy_fixture(), (), head_need, head_label, reason)
         output = client.WaitOutput()
         with patch.object(client, "CLOCK", self.admission.clock), contextlib.redirect_stderr(io.StringIO()) as text:
-            output(wire.Wait(reason, 1, head_label, "", snapshot))
+            output(wire.Wait(reason, position, head_label, "", snapshot))
             if periodic:
                 self.admission.clock.advance(admission_records.read_memory_config().wait_reply_seconds)
-                output(wire.Wait(reason, 1, head_label, "", snapshot))
+                output(wire.Wait(reason, position, head_label, "", snapshot))
         return text.getvalue().splitlines()[-1] + "\n"
 
     def test_mac_claim_admission_never_opens_a_socket_or_reads_proc(self) -> None:
@@ -5070,7 +5070,7 @@ class ShellTests(unittest.TestCase):
         for periodic in (False, True):
             text = self.formatted(admission_records.ExpectedPeak(11_600_000_000, "measured", 5),
                 available=49_000_000_000, reserve=3_000_000_000, measured=3 * GIB, running=running,
-                head_need=11_703_785_881, head_label="clone88ci nextest (verify pid 300)", periodic=periodic)
+                head_need=11_703_785_881, head_label="clone88ci nextest (verify pid 300)", periodic=periodic, position=2)
             self.assertEqual(len(text.splitlines()), 1)
             self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", text)
             self.assertIn("0.0 GiB promised, 3.0 GiB measured across 2 running steps: one nextest in /tmp/one, two clippy in /tmp/two; ", text)

@@ -114,6 +114,24 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
+        for position, label, expected in (
+            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB"),
+            (2, "compiler · check", "head compiler · check needs 12.3 GiB"),
+            (2, "hana · test", "head hana · test needs 12.3 GiB"),
+            (2, "42 · test", "head 42 · test needs 12.3 GiB"),
+            (1, "hana CI · hana-linux-2 · test", "this build is the queue head"),
+        ):
+            with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
+                waiting = replace(WAIT, position=position, head=label,
+                    snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
+                with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput()(waiting)
+                self.assertIn(expected, output.getvalue())
+                self.assertNotIn("head  needs", output.getvalue())
+                if position == 1:
+                    self.assertNotIn(f"head {label} needs", output.getvalue())
+
     def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
         raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
         snapshot = cast(dict[str, object], cast(dict[str, object], raw["data"])["snapshot"])

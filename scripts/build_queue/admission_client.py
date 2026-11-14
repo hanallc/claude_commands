@@ -893,7 +893,9 @@ class WaitOutput:
         if reply.position == 1 and self.last_position != 1:
             text += "; this step is now first in line"
         self.last_position = reply.position
-        if snapshot.head_need:
+        if reply.position == 1:
+            text += "; this build is the queue head"
+        elif snapshot.head_need:
             text += f"; head {snapshot.head_label} needs {snapshot.head_need / records.GIB:.1f} GiB"
         from scripts.message import unit_labels
 

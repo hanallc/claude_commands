@@ -989,6 +989,15 @@ class ServiceEstimatedAdmission(wire.AdmitRequest):
     """Retain service estimation for this connection without changing saved records."""
 
 
+def wait_line_name(waiting: WaitingAdmission) -> str:
+    """Name a queued build from its recorded owner and step."""
+    row = waiting.row
+    identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
+    name = (f"hana CI · {identity.get('unit', '')}" if isinstance(waiting.request, ServiceEstimatedAdmission)
+            else gate.waiter_unit_name(identity, row["pid"]))
+    return f"{name} · {identity['step']}" if identity["step"] else name
+
+
 def peer_uid(connection: Connection | NoConnection) -> int:
     """Read the account before any replay or state lookup."""
     if isinstance(connection, NoConnection):
@@ -1798,6 +1807,10 @@ class AdmissionServer:
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
         cloud_started = self._cloud_pass(inputs, self.configuration)
         by_owner = {records.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
+        head = result.policy.queued_head
+        head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
+                      if isinstance(head, gate.QueuedHead) else "")
+        head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
         if not starts:
@@ -1822,11 +1835,11 @@ class AdmissionServer:
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
-                head = inputs.ordered[0][1].get("session_name", "") if inputs.ordered else ""
                 waiting = self.waiters[episode]
                 reason = decision.reason
-                reply = wire.Wait(reason, position, head, reason_phrase(reason, waiting_steps),
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder))
+                reply = wire.Wait(reason, position, head_label, reason_phrase(reason, waiting_steps),
+                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder,
+                                        head_label, head_need))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -1835,7 +1848,7 @@ class AdmissionServer:
             reason = records.ReadingUnavailable(text)
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
             reply = wire.Wait(reason, position, "", text,
-                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder()))
+                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -2026,10 +2039,8 @@ class AdmissionServer:
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: records.AdmissionDecision,
                        inputs: records.QueueInputs, config: records.MemoryConfig,
-                       reason: records.WaitReason, holder: WaitHolder) -> AdmissionWaitSnapshot:
-        head = gate.first_queued_waiter(row for _, row in inputs.ordered)
-        head_need = head.waiter["need"] if isinstance(head, gate.QueuedWaiter) else 0
-        head_label = head.waiter.get("session_name", "") if isinstance(head, gate.QueuedWaiter) else ""
+                       reason: records.WaitReason, holder: WaitHolder, head_label: str,
+                       head_need: int) -> AdmissionWaitSnapshot:
         return AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
             inputs.host.available if isinstance(inputs.host, records.HostMemory) else 0,
             waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics,

@@ -2363,7 +2363,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_hold/cargo` — the help and version scan after the subcommand
 - `scripts/build_hold/test_cargo_wrapper.py` — rows in `test_non_building_commands_skip_scope_and_python` for `nextest --version`, `clippy -V`, `build --help` and `test -h`; rows in the building test for `install --version 1.0 x` and `nextest run -- --help`
 
-### Phase 114 — A memory wait line names the build it waits behind  · status: todo
+### Phase 114 — A memory wait line names the build it waits behind  · status: done
 
 **Depends on:** none. Merge queue's phase 44 re-land into this branch when it is on main, before the checkpoint; it edits `scripts/build_queue/admission_service.py` too.
 
