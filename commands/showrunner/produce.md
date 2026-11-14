@@ -597,6 +597,9 @@ notice to the unit director before any merge command runs:
    first `held` or `failed` line stops a single-item run.
    A batch drops stopped items and retries the remaining items once.
    Send each final `send <unit>:` message to its unit director.
+   A `merge director:` line names red tests or modules that are red on the
+   base without the checkpoint. It goes to the merge director, who repairs
+   the base red and then runs the held checkpoints again.
 
 <ChangeReviewFeatureLog>
 Run only for a project that closes out by change review, after

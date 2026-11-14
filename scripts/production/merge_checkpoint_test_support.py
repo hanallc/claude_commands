@@ -117,6 +117,16 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
+    # Each named test fails while its file is in the tested tree; --filter limits the run to the named tests.
+    tree_rows = state / "tree-fail-rows"
+    if tree_rows.exists():
+        filters = {args[index + 1] for index, word in enumerate(args[:-1]) if word == "--filter"}
+        rows = [f"        FAIL [   1.000s] (1/2) fixture::tests {test}\\n"
+                for path, test in json.loads(tree_rows.read_text()).items()
+                if (Path.cwd() / path).exists() and (not filters or test in filters)]
+        if rows:
+            print("".join(rows), end="")
+            raise SystemExit(1)
     fail_rows = state / "fail-rows"
     if fail_rows.exists() and "--filter" not in args:
         print(fail_rows.read_text(), end="")
