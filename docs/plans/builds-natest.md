@@ -3942,3 +3942,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `_local_text` and `_record_fields` split `_local_fields`. The bad JSON error keeps its text.
 - AWS pair (c7a.4xlarge, 3 rounds): `message/test_roster.py` 25.00 -> 19.73 CPU s; `direct/test_assign_launcher.py` 33.49 -> 32.79.
 - Commit b93c54f12. Production change; sdlc gave the go.
+
+### Phase 269 — The wait commands skip staff work they never use  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/direct/progress_history.py` and `scripts/direct/plan_history.py`; sdlc gives the go).
+
+#### As-built
+
+- `finish-wait` and `wait-holder` read the state with `resolve_staff=False`; they copy a recorded wait event.
+- `start-wait` reads it with the new `pass_agents=False`: `staff_directory` leaves each pass as recorded and finds no worker backend.
+- The events each command writes stay the same.
+- AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
+- Commit 0a9c37dd6. Production change; sdlc gave the go.
