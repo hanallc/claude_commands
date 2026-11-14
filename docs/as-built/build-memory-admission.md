@@ -873,7 +873,8 @@ A restored head override receives reconnect grace only after the listener is rea
 It sends the outage message to the `builds` session first.
 The message names the journal command and the restart command.
 If the result is not `sent`, it sends an `alert.blocked` phone push.
-The phone action is `sudo systemctl restart build-admission.socket build-admission.service` on natedev.
+The phone action is `systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service` on natedev.
+It needs no sudo: a polkit rule in the nixos module `modules/linux/development.nix` permits only `reset-failed` and `start` on these two units.
 The push clears when `admission_client.py view`, through `scripts/lib/py`, succeeds.
 The sender releases the claim only when both sends return `failed`, `refused`, or `retry`.
 Every other outcome preserves the delivered claim.
