@@ -2544,17 +2544,22 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 124 — The Builds page memory bar names every GiB  · status: done
 
-The user found the memory bar confusing (screenshots 16 and 17, 2026-11-14). Fix the bar as one phase:
+#### As-built
 
-1. Put the swapped block beside the agents block. Name it for what it is: swap outside builds and CI, which the queue keeps free RAM for.
-2. Use one swapped figure in the bar width, its label, its tooltip and the swap section.
-3. Join safety and the desktop guarantee into one block.
-4. Split "other" into named parts: the largest programs by name, the kernel, file cache and a small "not attributed" rest.
-5. Show queue-placed work in builds.slice (rust-analyzer through queue_place) in the builds block with its name, never in other.
-6. When room is 0 or only one build fits, show one plain line with the reason.
-7. Rewrite every bar tooltip from the astra design: short lines, each line says what its number holds, no page-wide owner lines on a block that is not one build.
+- The feed sends `ram` (`RamBlocks`, all amounts in bytes) and `memory_status`; the old share fields are gone. The bar has 11 blocks in this order: builds, ci, reserved, room, safety, swap, agents, programs, kernel, cache, unattributed. The blocks sum to `total_bytes`.
+- Reserves show the covered amount: safety = min(S, A), swap = min(W, max(0, A−S)), build = min(R, max(0, A−S−W)). The missing amounts sum to the shortfall.
+- Builds = queued use + rust-analyzer + sccache + other build tools. Other build tools = builds.slice anon+shmem − queued use − named groups inside builds.slice, plus recorded tool groups outside it.
+- Agents, desktop, programs (`other_programs`, named by `program_name`), kernel and cache are read live (`attribution_read_at`); the room is the recorded capture (`capture_time`). A negative rest or cache sets `agreement: disagree`, and the page hides the bar.
+- `memory_status` gives one code: unavailable, pressure, shortfall, no_room, one_running_memory_wait or none. A read error shows "Last reading: HH:MM" in place of the status line.
+- Swap rows carry `pool` (outside, builds_ci, all), `category`, `members` and `owner_count`. Each pool has its own Not attributed or Reading difference row. Without the recorded builds and CI swap, `read_swap` reads host swap live.
+- The cap is the text "Queue cap N GiB"; the bar has no cap mark. The running chart cap line uses `capEnd`.
 
-Proof: screenshots 16 and 17 are the before proof; the after screenshot shows each element. Run every build_queue test module before the checkpoint.
+**Files:**
+- `config/memory_feed.conf` — new key `other_rows=6`.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/lint/memory_admit.py`.
+- `scripts/build_queue/test_memory_feed.py`, `scripts/build_queue/test_memory_hover.py` (block order, design tooltip texts, status line, swap rows), `scripts/build_queue/memory_page_proof.mjs`.
+
+**Gotchas:** the block key "swap" and the swap row keys "swap:N" share a prefix; `rawTipText` checks for an index. A leftover process in builds.slice counts as a build tool until it exits.
 
 ### Phase 125 — The Mac watch finds a placed run's compiler under sccache  · status: done
 
