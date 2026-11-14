@@ -7992,15 +7992,17 @@ class Ledger:
         input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
         reads: Iterable[str] | NoReadFiles = NO_READ_FILES,
     ) -> RemovedCell:
-        """Close a ticket cell whose file the ticket's own commits deleted; the row keeps the commit that deleted it.
+        """Close a ticket cell whose file the ticket's own commits deleted, or a commit under its start deleted; the row
+        keeps the commit that deleted it.
 
         Own commits are the first-parent commits from the ticket's start to commit, as `checkpoint_restamps` reads them.
         The deleting commit is the newest first-parent commit whose diff against its first parent deletes the path, and it
         must be an own commit that is not a merge: a merge that only brings in other work deletes nothing in that diff,
         and a delete that a merge brings in is not the ticket's. Commits of other work that changed the file before the
-        delete do not matter. It refuses a ticket the ledger does not hold, a cell outside the ticket, a ticket with no
-        start, a commit not under the start, a path that is not a file at the start (a crate folder included), a path
-        still in the tree at commit, and a path whose newest delete is a merge or is not there. The git reads run before
+        delete do not matter. With no own delete, a path that is not in the tree at the start keeps the newest commit
+        under the start that deleted it. It refuses a ticket the ledger does not hold, a cell outside the ticket, a ticket
+        with no start, a commit not under the start, a folder at the start (a crate folder included), a path still in the
+        tree at commit, a path whose newest delete is a merge, and a path that no commit deleted. The git reads run before
         the write lock; under it, a yield of the path refuses as in record.
         """
         if input_scope == DeclaredInputScope.FILE:
@@ -8020,18 +8022,26 @@ class Ledger:
         commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if not self._is_ancestor(base, commit):
             raise LedgerError(f"{ticket_id}: {commit[:7]} is not under the ticket's start {base[:7]}")
-        if not isinstance(self._file_at(base, path), bytes):
+        at_start = self._file_at(base, path)
+        if isinstance(at_start, Folder):
             raise LedgerError(f"{path}: not a file at the ticket's start {base[:7]}")
         if not isinstance(self._file_at(commit, path), MissingFile):
             raise LedgerError(f"{path}: still in the tree at {commit[:7]}")
         # The newest first-parent delete, then its parents: more than one parent is a merge.
         removing = _git(self.repo, "log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=D", "--no-renames",
                         "--no-patch", "--format=%H %P", "-n", "1", commit, "^" + base, "--", path).split()
-        if not removing:
+        if removing:
+            deleting = removing[0]
+            if len(removing) > 2:
+                raise LedgerError(f"{path}: merge {deleting[:7]} deletes it, not a commit of {ticket_id}'s own")
+        elif isinstance(at_start, MissingFile):
+            # A refill read the cell at a synced tip before the delete; the commit under the start that deleted it ends it.
+            deleting = _git(self.repo, "log", "--diff-filter=D", "--no-renames", "--no-patch", "--format=%H", "-n", "1",
+                            base, "--", path).strip()
+            if not deleting:
+                raise LedgerError(f"{path}: not a file at the ticket's start {base[:7]}, and no commit deletes it")
+        else:
             raise LedgerError(f"{path}: no commit of {ticket_id}'s own deletes it")
-        deleting = removing[0]
-        if len(removing) > 2:
-            raise LedgerError(f"{path}: merge {deleting[:7]} deletes it, not a commit of {ticket_id}'s own")
         scope = _cell_scope(definition, path, self._tip(deleting))
         with self._record_write(ticket_id, rule, path, rule_blob) as generation:
             _ = self._connection.execute(
