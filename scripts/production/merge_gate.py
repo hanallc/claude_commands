@@ -19,7 +19,7 @@ Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
 A green nightly sends a result push unless merge_gate.conf disables it.
-A red nightly records its result and notifies sdlc before an assignment push.
+A red nightly records its result and notifies sdlc. Only its assignment sends the user push.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -2180,6 +2180,14 @@ def nightly_owner(args: GateArguments) -> str:
     return str(unit_lookup.doc_owner(doc, staff.snapshot()).id)
 
 
+def nightly_owner_name(args: GateArguments) -> str:
+    from scripts.production import staff
+
+    owner = nightly_owner(args)
+    row = staff.snapshot().by_id(staff.StaffId(owner))
+    return row.name if row is not None else owner
+
+
 def type_check_summaries(output: str) -> list[str]:
     return [line for line in output.splitlines()
             if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
@@ -2256,8 +2264,18 @@ class NightlyFixAssigned:
 
 
 @dataclass(frozen=True)
+class NightlyAlertUnsent:
+    """The production owner has no alert about the missing assignment."""
+
+
+@dataclass(frozen=True)
+class NightlyAlertSent:
+    at: str
+
+
+@dataclass(frozen=True)
 class NightlyPushPending:
-    """Assignment or its deadline must release the result push."""
+    """Assignment must release the result push."""
 
 
 @dataclass(frozen=True)
@@ -2277,6 +2295,7 @@ class NightlyRedResult:
     received: NightlyNoticeUnreceived | NightlyNoticeReceived = NightlyNoticeUnreceived()
     assignment: NightlyFixUnassigned | NightlyFixAssigned = NightlyFixUnassigned()
     delivery: NightlyPushPending | NightlyPushAccepted = NightlyPushPending()
+    alerted: NightlyAlertUnsent | NightlyAlertSent = NightlyAlertUnsent()
 
 
 @contextmanager
@@ -2321,38 +2340,32 @@ def read_nightly_red(path: Path) -> NightlyRedResult:
     if identity != path.stem or not re.fullmatch(r"[a-zA-Z0-9_-]+", identity):
         raise GateRefused(f"{path}: nightly result identity differs")
     received, assignment, delivery = (fields(saved.get(key)) for key in ("received", "assignment", "delivery"))
+    # A result saved before the owner alert existed has no alert table.
+    alerted = fields(saved.get("alerted", {}))
     return NightlyRedResult(identity, text(saved, "branch"), text(saved, "tree"), at(saved, "finished"),
         tuple(cast(list[str], failures)), text(saved, "types"), text(saved, "tests"),
         NightlyNoticeReceived(at(received, "at")) if received else NightlyNoticeUnreceived(),
         NightlyFixAssigned(text(assignment, "unit"), at(assignment, "at")) if assignment else NightlyFixUnassigned(),
-        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending())
+        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending(),
+        NightlyAlertSent(at(alerted, "at")) if alerted else NightlyAlertUnsent())
 
 
 def nightly_time(at: str) -> str:
     return datetime.fromisoformat(at).astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def send_nightly_red(directory: Path, result: NightlyRedResult) -> bool:
+def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: NightlyFixAssigned) -> bool:
     from scripts.message import send_budget
     from scripts.notify import push_texts, review
     from scripts.production import staff
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
         return False
-    values = {"branch": result.branch, "time": nightly_time(result.finished), "types": result.types,
-              "tests": result.tests, "outcome": "failed"}
-    if isinstance(result.assignment, NightlyFixAssigned):
-        row = staff.snapshot().by_id(staff.StaffId(result.assignment.unit))
-        values.update(unit=row.name if row is not None else result.assignment.unit,
-                      assigned=nightly_time(result.assignment.at),
-                      received=nightly_time(result.received.at) if isinstance(result.received, NightlyNoticeReceived)
-                      else nightly_time(result.assignment.at))
-        text_id = "nightly.assigned"
-    else:
-        values["notice"] = ("sdlc received it at " + nightly_time(result.received.at)
-                            if isinstance(result.received, NightlyNoticeReceived) else "sdlc has not confirmed receipt")
-        text_id = "nightly.unassigned"
-    rendered = push_texts.render(text_id, **values)
+    row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
+    rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
+        types=result.types, tests=result.tests, outcome="failed",
+        unit=row.name if row is not None else assignment.unit, assigned=nightly_time(assignment.at),
+        received=nightly_time(result.received.at if isinstance(result.received, NightlyNoticeReceived) else assignment.at))
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
@@ -2370,9 +2383,8 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
 
     record = staff.snapshot()
     row = record.by_member_reference(unit) or record.by_path(unit if "/" in unit else f"sdlc/{unit}")
-    parent = record.parent_of(row) if row is not None else None
-    if row is None or row.kind != "unit" or parent is None or parent.name != "sdlc":
-        raise GateRefused(f"{unit}: choose an sdlc unit director")
+    if row is None or row.kind != "unit" or record.parent_of(row) is None:
+        raise GateRefused(f"{unit}: choose a unit director by staff ID or <production>/<unit> path")
     with nightly_red_lock() as directory:
         results = [read_nightly_red(path) for path in sorted(directory.glob("*.json"))]
         if identity:
@@ -2383,18 +2395,41 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
         if len(results) != 1:
             raise GateRefused("choose one saved red result with --result ID")
         result = results[0]
-        changed = isinstance(result.assignment, NightlyFixUnassigned)
-        if isinstance(result.assignment, NightlyFixAssigned) and result.assignment.unit != str(row.id):
+        assignment = result.assignment
+        if isinstance(assignment, NightlyFixAssigned) and assignment.unit != str(row.id):
             raise GateRefused(f"{result.id}: another unit already owns this fix")
-        if changed:
-            at = datetime.now(UTC).isoformat()
-            result = replace(result, assignment=NightlyFixAssigned(str(row.id), at),
+        changed = isinstance(assignment, NightlyFixUnassigned)
+        if isinstance(assignment, NightlyFixUnassigned):
+            assignment = NightlyFixAssigned(str(row.id), datetime.now(UTC).isoformat())
+            result = replace(result, assignment=assignment,
                              received=result.received if isinstance(result.received, NightlyNoticeReceived)
-                             else NightlyNoticeReceived(at))
+                             else NightlyNoticeReceived(assignment.at))
             save_nightly_red(directory, result)
-        changed = send_nightly_red(directory, result) or changed
+        changed = send_nightly_red(directory, result, assignment) or changed
         print("done" if changed else "unchanged")
     return 0
+
+
+def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
+    """Tell the production owner once in each assignment window that a red result has no assigned fix."""
+    from scripts.production import showrunners
+
+    window = timedelta(minutes=conf.read("merge_gate").whole("nightly_assign_minutes"))
+    now = datetime.now(UTC)
+    since = datetime.fromisoformat(result.alerted.at if isinstance(result.alerted, NightlyAlertSent) else result.finished)
+    if now - since < window:
+        return False
+    owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
+    minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
+    outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
+        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+        + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
+        + f"The user gets the result push only after assignment: merge_gate.py nightly-assigned --result {result.id} --unit UNIT.")
+    print(f"Nightly assignment alert: {outcome}", flush=True)
+    if outcome != f"told {owner}":
+        return False
+    save_nightly_red(directory, replace(result, alerted=NightlyAlertSent(now.isoformat())))
+    return True
 
 
 def check_nightly_assignments() -> int:
@@ -2407,12 +2442,8 @@ def check_nightly_assignments() -> int:
         for path in sorted(directory.glob("*.json")):
             try:
                 result = read_nightly_red(path)
-                if isinstance(result.delivery, NightlyPushAccepted):
-                    continue
-                age = (datetime.now(UTC) - datetime.fromisoformat(result.finished)).total_seconds()
-                if isinstance(result.assignment, NightlyFixUnassigned) and age < 60 * conf.read("merge_gate").whole("nightly_assign_minutes"):
-                    continue
-                changed = send_nightly_red(directory, result) or changed
+                if isinstance(result.assignment, NightlyFixUnassigned):
+                    changed = alert_nightly_unassigned(directory, result) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
@@ -2422,7 +2453,7 @@ def check_nightly_assignments() -> int:
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                      type_failures: Sequence[GateJobResult] = (), result_id: str = "") -> NightlyNoticeReceived | NightlyNoticeUnreceived:
-    from scripts.production import showrunners, staff
+    from scripts.production import showrunners
 
     requires_full = bool(failed) or not type_failures
     try:
@@ -2439,10 +2470,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                 detail += "\n" + summaries[-1]
         if result_id:
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
-        owner = nightly_owner(args)
-        row = staff.snapshot().by_id(staff.StaffId(owner))
-        if row is not None:
-            owner = row.name
+        owner = nightly_owner_name(args)
         outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
