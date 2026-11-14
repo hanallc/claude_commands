@@ -2411,58 +2411,33 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf` — `swap_used_limit` deleted
 - tests: `test_memory_admit.py`, `test_snapshot_codec.py`, `test_admission_protocol.py`, `test_queue_evidence.py`, `test_queue_view.py`, `test_memory_feed.py`, `test_memory_hover.py`, `test_merge_gate_suites_admission.py`
 
-### Phase 118 — A nextest run takes jobserver tokens for its test threads  · status: todo
+### Phase 118 — A nextest run takes jobserver tokens for its test threads  · status: done
 
-**Depends on:** queue's phase 44 re-land on origin/builds (builds sends the word), and Phase 114 checkpointed first.
+#### As-built
 
-**Source (2026-11-13, builds showrunner):** "a nextest run takes jobserver tokens for its test threads, so compiles and tests share one CPU pool and the jobserver queues them fairly. Cores and widths come from config, not code." Design approved; item 6: "remove the width share and its marker files in this phase. One way to do a thing." At the 12:26 natedev freeze, four hana nextest runs had 42 test threads beside 32 compile tokens, and load reached 437.
-
-#### Work Order
-
-**Goal:** on natedev, compiles and test threads share the one `/dev/steve` pool. A test run holds one token for each test thread, and holds no token while it compiles.
-
-**Measured:**
-1. `run_once` (`scripts/lint/invoke.sh`) claims the test width (`nextest_share_claim`, about line 381) after the memory gate and before `cargo nextest run`, which can still compile.
-2. `run_nextest_shared` and `nextest_share_claim` divide the mode's width by the runs in flight through flock marker files under `admission/nextest` (`scripts/lint/nextest_budget.py` `claim`, `shared_width`, `is_locked`).
-3. `CARGO_MAKEFLAGS="--jobserver-auth=fifo:/dev/steve"` joins the machine pool (`invoke.sh` about line 61). steve takes back the tokens of a process that exits (`/etc/nixos/modules/linux/jobserver.nix`).
-4. hana CI's `cargo nextest run` reaches `run_once` through the queue's cargo wrapper.
-
-**Spec:**
-1. A `cargo nextest run` step on a host with `/dev/steve` first runs `cargo nextest run --no-run` with the same arguments.
-2. Then a token holder (a new script beside `nextest_budget.py`) opens `/dev/steve`. It takes `test_token_floor` tokens, waiting if needed. Then it takes more without a wait, up to the run's width.
-3. The holder runs the test command as its child with `--test-threads` equal to the tokens it holds. It writes every token back when the child ends, on any exit, signal or cancel.
-4. The width per mode still comes from the cores, as now. `test_token_floor` is a new key in `config/build_admission.conf`, proposed value 4.
-5. The holder writes the tokens it holds to the step's memory reservation (`memory_admit width`), as the share claim does now.
-6. Remove the width share: `run_nextest_shared`, `nextest_share_claim`, `nextest_share_end`, the marker files, and `claim`/`shared_width`/`is_locked` in `nextest_budget.py`. Keep `nextest_thread_report` and the trial mode. Name any config key that becomes unused.
-7. A host with no `/dev/steve` (the Mac) keeps today's width with no token take.
-8. Change no admission wire record. The client at `7fdfd9a6a` must still parse every reply.
-
-**Tests:**
-1. A fake pool of 4 tokens: a compile holds 3, a test run asks for floor 2 and width 8. The run waits until the compile gives a token back, then runs at the tokens it got.
-2. A killed child and a cancelled run give every token back.
-3. The width written to the reservation equals the tokens held.
-4. No `/dev/steve`: the run keeps today's width and takes no token.
-5. Remove the share tests in `test_nextest_budget.py` and `test_nextest_width.py` that test removed code only.
+- `scripts/lint/nextest_tokens.py` holds one jobserver token for each test thread. `run_step_attempt` (`scripts/lint/invoke.sh`) puts it before the argv of a `cargo nextest run --test-threads W` step when `LINT_NEXTEST_POOL` is set: `$BUILDLOG_MEM_PY nextest_tokens.py --pool P --width-file F --reservation R -- cargo nextest run ...`.
+- The holder builds with `--no-run` and the selection arguments before `--`. Then it takes `test_token_floor` tokens (new key in `config/build_admission.conf`, 4) and waits for them, then takes free tokens without a wait, up to W. It writes N to F, calls `admission_client.width(R, N)` when N is not W, prints the thread line, and runs the tests with `--test-threads N`. Every token goes back in `finally`. TERM, INT and HUP go on to the child, and the holder exits 128 + the signal.
+- A build failure returns its status and takes no token. A pool that does not open prints `nextest: W test threads with no jobserver tokens: <pool>: <error>` and runs at W.
+- `nextest_token_pool` (in `run_nextest`, not in trial mode) reads `--jobserver-auth=fifo:PATH` from `CARGO_MAKEFLAGS` and accepts a readable and writable character device or FIFO. After the exec, `nextest_token_width` reads and removes F, and the shell puts N in argv position 5 for the build log. The memory sampler calls `buildlog_token_phase_context` when the test phase starts, so the test-phase context has N.
+- Removed: `run_nextest_shared`, `nextest_share_claim`, `nextest_share_end`, the `admission/nextest` marker files, and `claim`, `shared_width`, `is_locked`, `FLOOR` and `PENDING_GRACE_S` in `nextest_budget.py`. `FLOOR` and `PENDING_GRACE_S` were code constants, so no config key becomes unused. `nextest_budget.py` keeps the width types, `requested_threads`, `thread_line` and `report`.
+- hana CI's nextest runs through `scripts/build_queue/ci_cargo_front.py` with `/dev/steve-ci`, not through `run_once`. It takes no test tokens. Measured item 4 of the Work Order was wrong.
 
 **Files:**
-- `scripts/lint/invoke.sh`
-- `scripts/lint/nextest_budget.py`
-- `scripts/lint/nextest_tokens.py`
-- `scripts/lint/test_nextest_tokens.py`
-- `scripts/lint/test_nextest_budget.py`
-- `scripts/lint/test_nextest_width.py`
-- `config/build_admission.conf`
-- `scripts/lint/fixtures/build_admission.conf`
+- `scripts/lint/nextest_tokens.py`, `scripts/lint/test_nextest_tokens.py` — the holder; 11 tests (floor wait, free take, `--no-run` selection, build failure, killed child, cancel, cancel in the wait, other commands, reservation width, real `run_once` with and without a pool).
+- `scripts/lint/invoke.sh` — the holder prefix, `nextest_token_pool`, `nextest_token_width`, `buildlog_token_phase_context`.
+- `scripts/lint/nextest_budget.py`, `scripts/lint/test_nextest_budget.py` — the share removed.
+- `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf` — `test_token_floor=4`.
+- `scripts/lint/test_memory_admit.py` — `test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width` replaces the share tests.
+- `scripts/buildlog/test_test_phase_peak.py` — the token width (8 of 32) in the row, the reservation and the test-phase context.
+- `scripts/direct/verify_examples_test_support.py`, `scripts/direct/verify_mac_offload_test_support.py` — a no-pool `CARGO_MAKEFLAGS`.
+- `scripts/build_hold/test_override_guard.py` — the new module in the checkout-import list. Stub removals in `test_invoke_scope.py`, `test_verify_build_key.py`, `test_verify_lint_output.py`.
+- `docs/as-built/nextest-width-and-lint-scope.md` — the "Jobserver tokens" section.
 
-**Workers:** one implement worker.
-
-**State:** the `admission/nextest` marker files are no longer written.
-
-**Verification:**
-1. Test: `scripts.lint.test_nextest_tokens`, `scripts.lint.test_nextest_budget`, `scripts.lint.test_nextest_width`, `scripts.lint.test_invoke_scope`, `scripts.build_queue.test_snapshot_codec`.
-2. Lint: `basedpyright` on the changed Python files; `bash -n scripts/lint/invoke.sh`.
-
-**Speed:** one extra `--no-run` cargo call per test step, which finds the build fresh; one token read per test thread.
+**Gotchas:**
+- `invoke.sh` fills `CARGO_MAKEFLAGS` with `/dev/steve` when it is empty. A test that reaches `run_nextest` must set `CARGO_MAKEFLAGS` to its own FIFO or to a path with no pool. Otherwise it takes live tokens, and its fake cargo sees one more call (`--no-run`). The first full run found 59 such tests.
+- To find a fixture that leaks, run the suites with `CARGO_MAKEFLAGS` set to a private FIFO that holds tokens. A leaking test then fails on the extra call, and no live token is taken.
+- A shell killed between the holder's write and `nextest_token_width` leaves one width file in `$TMPDIR`.
+- `buildlog_retry_unstarted_step` retries with the original W: the argv change is local to `run_step_attempt`.
 
 ### Phase 119 — An agent or ssh cargo run on the Mac needs a live queue placement  · status: done
 
