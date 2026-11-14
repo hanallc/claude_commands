@@ -87,6 +87,9 @@ class NoTimeLimit:
 UNLIMITED_GIT = NoTimeLimit()
 ZONE_SSH_LIMIT = CommandTimeLimit(120)
 PUBLICATION_PREFIXES = ("tune(", "zone(", "user zone: ")
+REGISTRY_SUBJECT = "config(models): "
+# A landing merges a main move made only of these commits, on config/ paths only, with no retest.
+SETTINGS_SUBJECTS = (*PUBLICATION_PREFIXES, REGISTRY_SUBJECT)
 
 
 def _timeout_detail(error: subprocess.TimeoutExpired) -> str:
