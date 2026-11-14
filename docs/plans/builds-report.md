@@ -1435,10 +1435,12 @@ From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period b
 - `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
 - Checkpoint e34c01903.
 
-### Phase 77 — The running-row memory sentence starts with a capital · status: todo
+### Phase 77 — The running-row memory sentence starts with a capital · status: done
 
-From builds (not the user), 2026-11-14 09:35: "yes, fix the lowercase 'need' after a period as a small phase; land alone." The live hover reads "Started 6 min ago. need 15.8 GiB; …".
+From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "Started … ago." in the running-row hover.
 
-1. `keep_text` stays data. At the join in `rawTipText`, the page starts the memory text with a capital through `sentence()`.
-2. The phase 76 hover test covers a row with a start time: "Started … ago. Need …".
-3. Run every build_queue module before the checkpoint.
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
+- `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
+- Checkpoint b62309ba4.
