@@ -81,6 +81,7 @@ def seed_rebuild_cache(home: Path) -> None:
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
 UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), unit_type=staff.UnitDetails("direct"))
 WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
+PRODUCER = staff.StaffRow(staff.StaffId("01a18dbb-0000-7000-8000-00000000c0de"), "producer", "morty", staff.StaffRoot(), current_session=staff.StaffId("c27e8199-0000-4000-8000-0000000c1a0d"))
 
 
 def staff_text(*rows: staff.StaffRow) -> str:
@@ -488,12 +489,31 @@ class RoleTests(unittest.TestCase):
             with self.subTest(home_identity="directory", shell=shell):
                 self.assertNotIn("claude2", ANSI.sub("", "\n".join(self.command_lines({}, shell=shell))))
 
+    @staticmethod
+    def seed_empty_counts(record: Path, state: Path) -> None:
+        """Keep a fresh empty counts cache for each staff row, so the shell starts no counts_row.py.
+
+        These tests check the assignment line; CountsRowTests checks the counts row and its cache.
+        A unit cache names its source, as statusline.sh requires; a showrunner cache names none.
+        """
+        try:
+            rows = assignment.staff_record(record.read_text(encoding="utf-8")).rows
+        except OSError:
+            return
+        folder = state / "counts"
+        folder.mkdir(parents=True, exist_ok=True)
+        for row in rows:
+            source = f"source=unit:{row.id}\n" if row.kind == "unit" else ""
+            _ = (folder / row.id).write_text(f"\n9999999999\n{source}", encoding="utf-8")
+
     def first_line(self, session_id: str = "aaaa-1111", **marks: str) -> str:
         return ANSI.sub("", self.command_lines({"session_id": session_id}, **marks)[0])
 
     def command_lines(self, payload: object, *, command: str = COMMAND, shell: str = "/bin/sh", **marks: str) -> list[str]:
         """Run the statusLine command as Claude Code does, with only `marks` beside a bare environment."""
         seed_rebuild_cache(self.home)
+        self.seed_empty_counts(Path(marks.get("STAFF_FILE", self.home / ".local/state/staff/staff.json")),
+                               Path(marks.get("SHOWRUNNER_STATE_DIR", self.home / ".local/state/showrunner")))
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), **read_log, **marks}
         result = subprocess.run(
@@ -627,10 +647,11 @@ class RoleTests(unittest.TestCase):
                     self.assertEqual(ANSI.sub("", line), f"trunk unit for show | {path} | {branch}")
 
     def test_other_roles_omit_the_repository_branch(self) -> None:
-        _ = self.write_staff(OWNER, UNIT, WORKER)
+        _ = self.write_staff(OWNER, UNIT, WORKER, PRODUCER)
         (self.home / ".git").mkdir()
         _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"), ("unknown", "unassigned")):
+        for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"),
+                                  (PRODUCER.current_session, "morty producer"), ("unknown", "unassigned")):
             for shell in SHELLS:
                 with self.subTest(session_id=session_id, shell=shell):
                     self.assertEqual(self.first_line(session_id, shell=shell), f"{label} | ~")

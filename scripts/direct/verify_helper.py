@@ -2,19 +2,20 @@
 """Run synchronous verify helpers in one process."""
 from __future__ import annotations
 
-import ast
 import ctypes
+from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
 import importlib.util
 import inspect
 import os
 from pathlib import Path
+import re
 import select
 import signal
+import stat
 import sys
 import tempfile
-import time
 import traceback
 from types import ModuleType
 from typing import BinaryIO, Callable, cast
@@ -22,6 +23,8 @@ from typing import BinaryIO, Callable, cast
 
 PARENT_CHECK_INTERVAL_SECONDS = 1
 PR_SET_PDEATHSIG = 1
+# A top-level main marks a program that the helper runs inside the helper process.
+TOP_LEVEL_MAIN = re.compile(rb"^def main\(", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -72,12 +75,8 @@ def read_call(source: BinaryIO) -> HelperCall:
 
 def load_program(path: str) -> LoadedProgram | SeparateProcess:
     # Shell fixtures and scripts without main retain their original entry point.
-    source = Path(path).read_bytes()
-    try:
-        syntax = ast.parse(source, filename=path)
-    except (SyntaxError, ValueError):
-        return SeparateProcess()
-    if not any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in syntax.body):
+    # A text search costs far less than a parse of each program at each run.
+    if TOP_LEVEL_MAIN.search(Path(path).read_bytes()) is None:
         return SeparateProcess()
     name = "verify_helper_" + hashlib.sha256(os.fsencode(path)).hexdigest()
     specification = importlib.util.spec_from_file_location(name, path)
@@ -92,30 +91,45 @@ def load_program(path: str) -> LoadedProgram | SeparateProcess:
     return LoadedProgram(module, main)
 
 
+def replace_environment(values: dict[str, str]) -> None:
+    """Make os.environ equal values; change only the names that differ."""
+    for name in [name for name in os.environ if name not in values]:
+        del os.environ[name]
+    for name, value in values.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+
+
 def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProcess]) -> tuple[str, str, str]:
     environment = os.environ.copy()
     arguments, directory, search = sys.argv, os.getcwd(), sys.path[:]
     streams = sys.stdin, sys.stdout, sys.stderr
     temporary_parent = tempfile.tempdir
-    started, cpu = time.time(), time.process_time()
     status = "fallback"
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdin, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stdout, \
             tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="surrogateescape") as stderr, \
-            tempfile.TemporaryFile() as forwarded:
+            tempfile.TemporaryFile() as forwarded, ExitStack() as live_streams:
         descriptors = [os.dup(number) for number in range(3)]
+        stderr_output = stderr
         try:
-            os.environ.clear()
-            os.environ.update(call.environment)
+            if live_path := call.environment.get("VERIFY_HELPER_STDERR_PATH", ""):
+                live = live_streams.enter_context(os.fdopen(os.open(live_path, os.O_WRONLY | os.O_APPEND),
+                    "w", buffering=1, encoding="utf-8", errors="surrogateescape"))
+                mode = os.fstat(live.fileno()).st_mode
+                if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
+                    raise OSError("the helper cannot share this stderr stream")
+                stderr_output = live
+            replace_environment(call.environment)
             os.chdir(call.directory)
             tempfile.tempdir = None
             sys.argv = [call.program, *call.arguments]
             sys.path.insert(0, str(Path(call.program).parent))
             _ = stdin.write(call.stdin)
             _ = stdin.seek(0)
-            for number, stream in enumerate((stdin, stdout, stderr)):
+            for number, stream in enumerate((stdin, stdout, stderr_output)):
                 _ = os.dup2(stream.fileno(), number)
-            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
+            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr_output
             if "VERIFY_RESULT_ENVIRONMENT_FD" in os.environ:
                 _ = forwarded.write(b"".join(os.fsencode(value) + b"\0" for value in call.forwarded_environment))
                 _ = forwarded.seek(0)
@@ -140,26 +154,22 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             status = "fallback"
         finally:
             stdout.flush()
-            stderr.flush()
+            stderr_output.flush()
             for number, descriptor in enumerate(descriptors):
                 _ = os.dup2(descriptor, number)
                 os.close(descriptor)
             sys.stdin, sys.stdout, sys.stderr = streams
             sys.argv, sys.path[:] = arguments, search
             os.chdir(directory)
-            os.environ.clear()
-            os.environ.update(environment)
+            replace_environment(environment)
             tempfile.tempdir = temporary_parent
         _ = stdout.seek(0)
         _ = stderr.seek(0)
         output, errors = stdout.read(), stderr.read()
     if status != "fallback" and (trace := call.environment.get("VERIFY_PY_TRACE")):
         try:
-            with open(trace, "a") as target:
-                _ = target.write(f"{Path(call.program).name}\t{round((time.time() - started) * 1000)}\t{round((time.process_time() - cpu) * 1000)}\n")
             with open(trace + ".calls", "a") as target:
-                argument = call.arguments[0] if call.arguments else ""
-                _ = target.write(f"{Path(call.program).name}\t{argument}\n")
+                _ = target.write("\t".join([Path(call.program).name, *call.arguments]) + "\n")
         except OSError:
             pass
     return status, output, errors
@@ -177,6 +187,9 @@ def stop_when_parent_exits(parent: int) -> None:
 
 
 def main() -> int:
+    if trace := os.environ.get("VERIFY_PY_TRACE"):
+        with open(trace, "a") as target:
+            _ = target.write("verify_helper.py\t0\t0\n")
     parent = os.getppid()
     stop_when_parent_exits(parent)
     programs: dict[str, LoadedProgram | SeparateProcess] = {}
