@@ -13,6 +13,10 @@ from typing import TypedDict, cast
 from scripts.lib import conf
 
 
+# Each command that starts a worker refuses with this text while no-worker mode is on.
+NO_WORKER_START = "no-worker mode is on, so no worker starts; do the work directly"
+
+
 class _SavedMode(TypedDict, total=False):
     no_worker_mode: bool
 

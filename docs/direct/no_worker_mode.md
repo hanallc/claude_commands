@@ -15,6 +15,7 @@ The no-capacity broadcast stops every Codex worker on the machine; you stop none
 - `Detached run continues` names a run that is not stopped, with its result file and its log. Its result comes to you when the run ends; it starts no worker.
 - `Not proved stopped` names a worker that can still run. Send it no work; your showrunner gets the same fault.
 Claude workers are not stopped. The workers-back notice starts no worker; your next assign starts it.
+`assign.sh` refuses every assignment while the mode is on. A style refill prints one line for each ticket that you do directly.
 
 Use `PY=~/.claude/scripts/lib/py` and `DIRECT=~/.claude/scripts/direct` in the commands below.
 Run them from `${WORKING_DIR}` with the normal phase ID and paths.

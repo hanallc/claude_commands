@@ -561,7 +561,8 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit, give the order to it under `commands/unit/merge.md`.
+4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
+   That unit is under this showrunner or under a showrunner above it. The order names this production.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>

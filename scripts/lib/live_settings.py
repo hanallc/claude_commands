@@ -19,7 +19,7 @@ import sys
 import tempfile
 from typing import cast
 
-from scripts.lib import conf, main_publish, main_push_lock, models_registry
+from scripts.lib import conf, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.waiting_rows import git, replace_value, show
 
@@ -159,7 +159,8 @@ def pull_mac(checkout: Path, label: str) -> str:
         return "mac: pulled"
     main_publish.queue_pull_only(label, outcome.reason,
                                  pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
-    return f"mac: queued ({outcome.reason}); the 15-minute sync sends it when the Mac wakes"
+    _ = mac_wake.start()
+    return f"mac: queued ({outcome.reason}); it goes out as soon as the Mac answers"
 
 
 def write_mac(stem: str, key: str, value: str) -> str:
