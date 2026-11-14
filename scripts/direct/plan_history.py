@@ -309,8 +309,12 @@ def _worktree_branch(worktree: Path) -> str:
     return name
 
 
-def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
-    """Resolve current state through staff and preserve recorded events."""
+def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot, *,
+                    pass_agents: bool = True) -> dict[str, object]:
+    """Resolve current state through staff and preserve recorded events.
+
+    pass_agents=False leaves each pass as recorded and finds no worker backend.
+    """
     if fields.get("event_type"):
         return fields
     row = unit_runs.run_owner(fields, record)
@@ -326,7 +330,7 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
         identity.update(session_id=row.current_session, family=_director_family(row))
         fields["main_agent"] = identity
         passes = fields.get("pass")
-        if isinstance(passes, dict):
+        if pass_agents and isinstance(passes, dict):
             for value in cast(dict[str, object], passes).values():
                 if not isinstance(value, dict):
                     continue
