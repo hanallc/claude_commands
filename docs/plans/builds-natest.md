@@ -3954,3 +3954,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The events each command writes stay the same.
 - AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
 - Commit 0a9c37dd6. Production change; sdlc gave the go.
+
+### Phase 270 — The test times report ranks the AWS gate hosts  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/test_times/show.py`, `config/test_times.conf` and `commands/test_times.md`; sdlc gives the go).
+
+#### Work Order
+
+**Goal:** `show.py top --host aws` ranks the gate modules by median CPU over every AWS gate host.
+
+**Spec:**
+- The prize is AWS CPU. `top` ranked only one host name, and each AWS gate host has a new `ip-*` name.
+- `--host aws` selects each host that starts with `AWS_HOST_PREFIX` (`ip-`). It counts runs from the new key `TOP_AWS_CHECKOUT` (`/var/lib/gate-trial/repo`).
+- The default `top` view stays the same. The trend view uses the same `AWS_HOST_PREFIX`.
+- `commands/test_times.md` names the new value.
+
+**Files:** `scripts/test_times/show.py`, `scripts/test_times/test_show.py`, `config/test_times.conf`, `commands/test_times.md`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:**
+- basedpyright reports 0 errors and 0 warnings on `show.py` and `test_show.py`.
+- `test_show` passes, with a new test for two AWS hosts, another checkout and the default view.
+- The live `top --host aws` lists AWS modules. Every behavior check stays.
