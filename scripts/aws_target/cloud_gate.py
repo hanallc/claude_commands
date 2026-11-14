@@ -538,7 +538,8 @@ class GateWorker:
             position, variant = item
             key = (variant.region, variant.instance_type, variant.zone)
             # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
-            cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, mode, wait_cost, default_seconds)
+            cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, (mode,), wait_cost,
+                                         default_seconds)
                     + (transfer if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))

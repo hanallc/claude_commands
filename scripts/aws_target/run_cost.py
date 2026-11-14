@@ -12,6 +12,23 @@ from scripts.aws_target import ledger
 from scripts.aws_target.measurement import number
 
 KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
+
+
+@dataclass(frozen=True)
+class RunScope:
+    """The run kinds that one cost table counts."""
+    name: str
+    # The filter label on the AWS prices page.
+    label: str
+    # One run of this scope, as the table headers and sentences name it.
+    noun: str
+    modes: tuple[str, ...]
+
+
+SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
+          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
+          RunScope('both', 'Both', 'run', tuple(mode for mode, _label in KINDS)))
+
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
 # The region has no Spot quota room.
@@ -136,10 +153,10 @@ class RunEvidence:
     # Median seconds from a refused launch request to the next request of the same attempt.
     refusal_wait_s: Decimal
 
-    def box_seconds(self, size: str, region: str, mode: str) -> tuple[list[Decimal], bool]:
+    def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], bool]:
         """The region's own box times, else the type's times in all regions (False)."""
-        own = self.by_region.get((size, region, mode))
-        return (own, True) if own else (self.by_type.get((size, mode), []), False)
+        own = [time for mode in modes for time in self.by_region.get((size, region, mode), [])]
+        return (own, True) if own else ([time for mode in modes for time in self.by_type.get((size, mode), [])], False)
 
     def refusals_per_launch(self, size: str, region: str) -> tuple[Decimal | None, int, int]:
         """Refused requests for each launched box, with the counts it comes from."""
@@ -148,11 +165,11 @@ class RunEvidence:
             return None, 0, 0
         return Decimal(refused) / max(launched, 1), refused, launched
 
-    def expected_usd(self, price: Decimal, size: str, region: str, mode: str, wait_usd_per_minute: Decimal,
+    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
                      default_seconds: Decimal) -> Decimal:
         """Spot price for the median box time, plus the wait cost of the expected refusals first."""
-        seconds, _own = self.box_seconds(size, region, mode)
-        seconds = seconds or self.by_mode.get(mode, [])
+        seconds, _own = self.box_seconds(size, region, modes)
+        seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
         box = Decimal(median(seconds)) if seconds else default_seconds
         refusals = self.refusals_per_launch(size, region)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
