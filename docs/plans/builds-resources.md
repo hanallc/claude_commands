@@ -2597,9 +2597,13 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 127 — The memory bar names compressed swap and the kernel rest  · status: done
 
-Builds asked what the 8.2 GiB "Not attributed" holds. Measured on natedev (16:03 EST): zram 5.45 GiB, memmap 0.36 GiB, other kernel counters 0.57 GiB, kernel memory with no counter about 1.7 GiB.
+#### As-built
 
-1. The feed reads the zram compressed pages (`mm_stat` field 3 of each `/sys/block/zram*`), `nr_memmap_pages`, `SecPageTables`, `Percpu` and `VmallocUsed` (less `KernelStack`, which VMAP_STACK puts in vmalloc).
-2. "Kernel, measured" holds them as three parts: compressed swap, kernel structures, and other kernel counters. Its tooltip names each part.
-3. "Not attributed" names the kernel memory with no counter (MemTotal minus every meminfo and vmstat counter) and the rest.
-4. The bar keeps 11 blocks. zram pages are used memory outside MemAvailable, so they are not inside "RAM for swap".
+- `kernel_ram(values) -> KernelRam` gives three parts: `compressed_swap` (the sum of `mm_stat` field 3 over `SYS_BLOCK/zram*`; 0 with no zram device), `structures` (SUnreclaim + KernelStack + PageTables) and `counters` (`nr_memmap_pages` × page size + SecPageTables + Percpu + max(0, VmallocUsed − KernelStack)). `KernelRam.total` is `kernel_bytes`; one unavailable part makes it unavailable.
+- `no_counter` = MemTotal − `COUNTED_FIELDS` (MemFree, the four LRU lists, Unevictable, KReclaimable) − the three parts. It is 0 when a reading is missing. The feed sends it clipped to `[0, unattributed]` as `kernel_no_counter_bytes`.
+- The Kernel tooltip lists compressed swap (zram), slab, stacks and page tables, and other kernel counters. Not attributed names kernel memory with no counter and the memory with no program name; with no such kernel memory it keeps the old text.
+- The bar keeps 11 blocks: zram pages are used memory outside MemAvailable, so they are not inside "RAM for swap". On natedev, Not attributed fell from 8.2 GiB to about 1.4 GiB.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/build_queue/test_memory_feed.py`, `scripts/build_queue/test_memory_hover.py`.
+
+**Gotchas:** `VmallocUsed − KernelStack` is correct only with CONFIG_VMAP_STACK (set on natedev). A zswap host would put its pool in the no-counter line.
