@@ -37,8 +37,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
-from scripts.build_hold import build_hold
-from scripts.build_hold.owning_session import OwningSession
+from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.lib.build_steps import read_step_names
 from scripts.message.unit_labels import OwnerRole, UnitLabels
@@ -62,7 +61,7 @@ class CloudWorkerHoldTests(IsolatedBuildHoldTest):
                 command = cloud_gate.service_command('scripts.aws_target.gate_trial',
                     ['--paired-worker', str(self.scratch / 'trial')], 'fixture', paired=paired)
                 environment = {**os.environ, **service_environment(command)}
-                self.assertEqual(build_hold.owning_session(environment), OwningSession('fixture-caller'))
+                self.assertEqual(owning_session(environment), OwningSession('fixture-caller'))
                 holders = Path(environment['BUILD_HOLD_DIR'])
                 holders.mkdir(exist_ok=True)
                 path = write_holder(holders, 'fixture-other', '2026-11-13T12:00:00+00:00', 'fixture work')
