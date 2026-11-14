@@ -1530,13 +1530,13 @@ if kind == "token":
         except (OSError, ValueError):
             pass
 elif kind == "hold":
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import build_hold, owning_session
     from scripts.build_targets import build_targets
 
     resource = "natedev"
     directory = Path(hold_name)
     holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
-                                        build_hold.owning_session(), directory, build_targets.current_caller_lineage())
+                                        owning_session.owning_session(), directory, build_targets.current_caller_lineage())
     if isinstance(holder, build_hold.Holder):
         session = build_hold.holder_session(holder.key)
         try:
