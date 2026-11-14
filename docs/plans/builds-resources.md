@@ -2557,12 +2557,21 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Gotchas:** the sccache server starts a cacheable rustc, so that rustc has no cargo parent. The watch checks only the form of `MAC_PLACEMENT`; the gate checks that the placement is current at call time.
 
-### Phase 126 — The queue tools release on process end, with no signal handler  · status: planned
+### Phase 126 — The queue tools release on process end, with no signal handler  · status: done
 
-User rule, relayed by builds on 2026-11-14: no signal handlers. The reservation and the lock end with the process, and a child ends with its process group.
+#### As-built
 
-1. `scripts/lint/nextest_tokens.py`: remove the handler that forwards a signal to the test child and the handler that raises `Cancelled`. steve takes back the tokens of a process that ends.
-2. `scripts/mac_test/mac_queue_run.py`: remove `interrupt_run`, its install and restore, and the `SIG_IGN` loop. The SSH input stays open while the run lives. The Mac wrapper stops its work group when that input closes.
-3. `scripts/mac_test/cargo_gate/gate.zsh`: remove `trap cleanup_check EXIT` and the TERM, INT and HUP traps.
-4. A guard test fails on a new `signal.signal`, `SIG_IGN` or `trap` in these three files.
-5. `mac_run.sh` cleaned the Mac from the signal path. Now the Mac wrapper ends the work group and then runs the close step (`stop-checkout`, then `scratch.py end`) when the SSH input closes. Each run keeps its state in `~/.local/state/mac-queue/runs/<episode>` under a lock. The next run finishes the cleanup of each folder whose lock is free. Builds approved this shape on 2026-11-14, on the condition that a test proves the Mac work stops at once.
+- `nextest_tokens.py` sets no handler. A signal ends the holder; steve takes back its tokens; the test child ends with the step group.
+- `mac_queue_run.py` sets no handler and starts no new session. The SSH input stays open while the run lives. `status = 1` before `stream_remote`, so a run that ends early reports a failure.
+- `remote_wrapper(work, on_close, grace_polls)`: when the SSH input closes, the watcher sends TERM to every other process of the session group, waits up to `terminate_grace_seconds`, sends KILL, then runs `on_close`.
+- `run_directory(episode)` keeps each run's state in `~/.local/state/mac-queue/runs/<episode>` under an flock (made as `<episode>.new`, locked, then renamed). `clean_ended_runs` runs under each new placement. For a folder whose lock is free it runs the saved cleanup callback, then removes the receipt and the folder. A failed cleanup keeps the folder.
+- `mac_run.sh` prepare writes `argv.json.close`: `stop-checkout`, then on "checkout clear" `scratch.py end` and the Mac copy record removal. Cleanup mode does not need `HANA_TEST_PURPOSE`.
+- `gate.zsh` has no trap. The next recording call removes answer files older than the limit.
+
+**Files:**
+- `scripts/lint/nextest_tokens.py`, `scripts/lint/test_nextest_tokens.py` — `test_a_signal_to_the_step_group_ends_the_holder_and_its_tests`, `test_a_signal_while_the_run_waits_ends_it_before_its_tests`.
+- `scripts/mac_test/mac_queue_run.py`, `scripts/mac_test/test_mac_queue_run.py` — `test_a_signal_ends_the_run_with_its_default_action`, `test_the_mac_work_ends_when_the_ssh_input_closes`, `test_the_queue_files_set_no_signal_handler` (the guard).
+- `scripts/production/mac_run.sh`, `scripts/production/test_mac_run.py` — `test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run`, the clone record tests.
+- `scripts/mac_test/cargo_gate/gate.zsh`.
+
+**Gotchas:** zsh refuses `set -m` without a terminal, so the work shares the SSH session group and the watcher excludes its own pid. A non-interactive zsh gives a background list `/dev/null` as input; the wrapper copies the SSH input to fd 3 first. A FIFO pool (not steve) does not take back the tokens of a holder that a signal ends. In `test_mac_run`, `(z)` reads each wrapper newline as a `;` word.
