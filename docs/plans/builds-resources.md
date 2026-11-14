@@ -2500,71 +2500,20 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 119 — An agent or ssh cargo run on the Mac needs a live queue placement  · status: done
 
-**Depends on:** queue's read-only `placement-status --episode E --attempt A` admission request (queue 44al). Tests use a fake of it. The `offload.py` change waits for queue's 44 re-land on origin/builds, which gives offload its placement. The Mac PATH change is a Mac nixos change with the user's go; it lands after this phase is promoted to the Mac.
+#### As-built
 
-**Source:** 2026-11-13 14:08, the user via builds: "nothing from natedev should get to the mac for running without going through the build queue - it needs to be made impossible". At 15:00 the user chose the simple form (via dwight, natedev and builds): "i am for the simple plan so that's good". builds: "Mac guard is the simple form: 1) a cargo gate on the Mac, in its own folder ahead of ~/.cargo/bin, that refuses an agent or natedev run with no live placement; 2) a detector in memory_feed.py that alerts builds about an unplaced cargo or rustc run on the Mac. Drop macbuild, the broker daemon, the sshd path, the sandbox and the allowlists. The user's own Mac terminal passes the gate." The simple form stops every shortcut and shows every way around it; it does not stop a determined agent.
+- `scripts/mac_test/cargo_gate/gate.zsh`, with `cargo`, `rustc` and `cargo-nextest` links in `cargo_gate/bin/`. It finds the real program on PATH without its own folder and runs it with `exec`; a missing program exits 127.
+- A call with none of `CLAUDECODE`, `CODEX_HOME`, `SSH_CONNECTION` and `SSH_CLIENT` is the user's terminal and passes with no check. Any other call needs `MAC_PLACEMENT=<episode>/<attempt>`; the gate runs `placement_check_command` from `config/mac_gate.conf` (queue `placement-status`: 0 current, 1 closed or unknown, 2 unreachable) inside `placement_check_timeout_seconds`, and fails closed. Refusal: `mac cargo gate refused: <reason>; run it through mac_queue_run.py`, exit `refusal_exit_code` (125).
+- State is under `~/.local/state/mac-gate` on the Mac: `checks/<placement>.live` keeps a live answer for `placement_recheck_seconds`; `records/<pid>` holds pid, start time and label for each root pass. A child under a recorded ancestor with the same start time writes no record. A call that writes a record removes expired checks and records of dead processes.
+- `queue_view.mac_build_script` reads the records with the process table. `MacBuild` carries `gate_label` and `gate_placement`; each cargo, rustc or cargo-nextest run is `user`, `placement <e>/<a>`, `hana-ci` or `unplaced`. `memory_feed` shows unplaced runs and sends builds one message for each.
+- `scripts/mac_test/mac_queue_run.py` takes a Mac placement (`place-step --once --wait-events --target mac`), runs the command over ssh with `MAC_PLACEMENT`, exits with the `mac_exit=` status, and gives the placement back (`finish-step` or `cancel-placement`) on every exit and signal.
+- `mac_run.sh` runs the hana build and the `open -a Terminal` launch under one `mac_queue_run.py` placement. `offload.remote_test_command` sets `MAC_PLACEMENT` from the assignment and puts the gate folder before `$HOME/.cargo/bin`.
+- `commands/build/mac.md` names `mac_queue_run.py` for every Mac build, test, install or run, with a shot build, an install and a probe example.
+- Phase B (not in this repo): the Mac nixos PATH change in `modules/darwin/shell.nix` (`lib.mkAfter` gate folder line) and the tailnet path from the Mac to natedev ssh for the placement check. Both wait for the user's go; the gate does nothing on the Mac until then.
 
-#### Work Order
+**Files:** `scripts/mac_test/cargo_gate/`, `scripts/mac_test/mac_queue_run.py`, `scripts/mac_test/offload.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/memory_feed.py`, `scripts/production/mac_run.sh`, `config/mac_gate.conf`, `commands/build/mac.md`, and tests `test_cargo_gate.py`, `test_mac_queue_run.py`, `test_offload.py`, `test_offload_forward.py`, `test_queue_view.py`, `test_memory_feed.py`, `test_mac_run.py`.
 
-**Goal:** a cargo, rustc or cargo-nextest call on the Mac from an agent or an ssh session runs only under a live queue placement, and builds sees each run that went around the gate.
-
-**Measured:**
-1. natedev reaches the Mac as natemccoy through Tailscale SSH as a zsh login shell, which reports exit 0 for every command. Callers print `mac_exit=N` as the last line and parse it (`offload.py` `stream_mac_run`, `mac_run.sh` `on_mac`).
-2. The Mac login PATH starts `/opt/homebrew/bin:/opt/homebrew/sbin:~/.cargo/bin:~/.local/bin:…`. `~/.cargo/bin` comes from `environment.extraInit` (nixos `modules/common/shell.nix`); Homebrew comes first from `brew shellenv` in `~/.zprofile` (`modules/darwin/shell.nix` `profileExtra`). Homebrew has no cargo, rustc or rustup.
-3. Claude Code sets `CLAUDECODE=1` in each command it runs; a Codex process carries `CODEX_HOME`. An ssh session carries `SSH_CONNECTION`.
-4. hana-ci runs as its own macOS user `hana-ci` from a launchd daemon, with its own PATH, `CARGO_HOME` and rustup (nixos `modules/darwin/hana-macos-runner.nix`). It reads no shell profile.
-5. `queue_view.py` `mac_build_script` reads the Mac process table (pid, ppid, uid, start time, command) in one ssh call. `memory_feed.py` shows the Mac builds from that reading. `scripts/buildlog/mac_idle.py` `notify_outage` sends builds one message for a Mac alert.
-6. `mac_run.sh` runs `cargo build -q -p hana` over ssh in a scratch clone, then starts hana with `open -a Terminal <launch.command>` so hana gets the camera grant. The hana shot builds and the cargo-liner installs run cargo over ssh by hand, with no placement.
-
-**Spec:**
-1. The gate is one zsh script, `scripts/mac_test/cargo_gate/gate.zsh`, with links `cargo`, `rustc` and `cargo-nextest` to it in `scripts/mac_test/cargo_gate/bin/`. The Mac nixos change puts `~/.claude/scripts/mac_test/cargo_gate/bin` first on the login PATH.
-2. The gate finds the real program by its own name on PATH with its own folder removed, and runs it with `exec` and the same arguments.
-3. A call with none of `CLAUDECODE`, `CODEX_HOME`, `SSH_CONNECTION` and `SSH_CLIENT` in its environment is the user's own terminal: it passes with no check.
-4. Any other call passes only with `MAC_PLACEMENT=<episode>/<attempt>` for a live placement whose target is the Mac. The gate asks queue's `placement-status` on natedev over ssh, with a time limit. The command and the limit come from `config/mac_gate.conf`. It never accepts a bare `mac_test.py claim`.
-5. A live answer is kept in a per-user file under the gate's state folder (mode 0600) for `placement_recheck_seconds`. A call with the same placement inside that time passes with no ssh call, so the many rustc calls of one build add no network wait.
-6. A refusal is one line on stderr: `mac cargo gate refused: <reason>; run it through mac_queue_run.py`, then exit with `refusal_exit_code` from config. Reasons: no placement; placement <e>/<a> closed; target is <t>; no answer in <n>s; unreadable answer. No answer refuses: the gate fails closed.
-7. Each passed call that is not under an earlier gate pass writes one record: pid, process start time, and the label (`user` or `placement <e>/<a>`). It sets `MAC_GATE_RECORD=<pid>` for its children; a child call that finds its recorded ancestor writes no record.
-8. The detector: `mac_build_script` also reads the gate records. Each cargo, rustc or cargo-nextest process gets one label: `hana-ci` (uid of `hana-ci`), the label of the nearest recorded ancestor with a matching start time, or `unplaced`.
-9. `memory_feed.py` shows each `unplaced` run on the page and sends builds one message for it, in the way `mac_idle.py` `notify_outage` sends. One run gives one message. `hana-ci` runs give no alert.
-10. `scripts/mac_test/mac_queue_run.py --what "<purpose>" --kind <shot|install|probe|run> --package <name> [--worktree DIR] [--cwd MACDIR] -- argv...` runs on natedev. It takes a queue placement for target mac with `admission_client.py place-step --once --wait-events --target mac --assignment-file <file>`. It runs `ssh <mac host>` with `MAC_PLACEMENT=<episode>/<attempt>` set before the argv, streams the output, and exits with the Mac status from `mac_exit=`. It gives the placement back with `finish-step --assignment-file <file> --status <exit>` after a run, or `cancel-placement --episode E --pid P` before one, on every exit, signal or cancel.
-11. `offload.py` sets `MAC_PLACEMENT` from `request.placement.assignment` (episode and attempt) in its Mac test script. It reads both from the assignment, not from the environment.
-12. `mac_run.sh` runs its hana build and its hana launch under one `mac_queue_run.py` placement. The launch stays `open -a Terminal`.
-13. `commands/build/mac.md` names `mac_queue_run.py` as the way to build, test, install or run built code on the Mac from natedev or from an agent, with one example each for a hana shot build, a cargo install and a probe.
-14. No second path: no caller in this repo runs cargo, rustc, nextest, `lint` or a built binary over plain ssh. A test scans the callers for it.
-15. Delete the broker: `mac_broker.py`, `broker_client.py`, `test_mac_broker.py` and `config/mac_broker.conf`. Their callers move to `MAC_PLACEMENT` and `config/mac_gate.conf`.
-16. Change no admission wire record. Copy no placement logic: the check is queue's call, named in config.
-
-**Tests:**
-1. The gate, with a fake real cargo and a fake placement check: the user's environment passes with no check; each agent or ssh marker with no placement refuses with the named line; a live placement passes and runs the real program with the same arguments and exit status; closed, another target, a slow check past the limit and unreadable output each refuse and start nothing.
-2. A second call with the same live placement inside `placement_recheck_seconds` makes no check call; after that time it checks again.
-3. The gate removes only its own folder from PATH, and a missing real program gives a clear error, not a loop.
-4. Records: a root pass writes one record with the right label; a child under it writes none.
-5. The detector, with a fake process table and records: a placed tree, a user tree and a hana-ci process get no alert; a cargo with no recorded ancestor is `unplaced`; a record whose start time does not match does not count; one run gives one message.
-6. `mac_queue_run.py` gives the placement back after success, a child failure, a refusal and SIGTERM, and sends `MAC_PLACEMENT` with the episode and attempt of the assignment.
-7. `offload.py` and `mac_run.sh` build their Mac commands with the placement's episode and attempt.
-8. The no-second-path scan fails on a fixture caller that runs `ssh mac cargo build`.
-
-**Files:**
-- `scripts/mac_test/cargo_gate/gate.zsh`, `scripts/mac_test/cargo_gate/bin/` (links)
-- `scripts/mac_test/test_cargo_gate.py`
-- `scripts/mac_test/mac_queue_run.py`, `scripts/mac_test/test_mac_queue_run.py`
-- `scripts/mac_test/offload.py`, `scripts/mac_test/test_offload.py`
-- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py`
-- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py`
-- `scripts/production/mac_run.sh`, `scripts/production/test_mac_run.py`
-- `config/mac_gate.conf`
-- `commands/build/mac.md`
-- deleted: `scripts/mac_test/mac_broker.py`, `scripts/mac_test/broker_client.py`, `scripts/mac_test/test_mac_broker.py`, `config/mac_broker.conf`
-
-**Workers:** one implement worker.
-
-**State:** a per-user gate state folder on the Mac (placement checks and pass records), removed automatically: each file is deleted once its process or its recheck time is gone. No new state on natedev.
-
-**Verification:**
-1. Test: `scripts.mac_test.test_cargo_gate`, `scripts.mac_test.test_mac_queue_run`, `scripts.mac_test.test_offload`, `scripts.mac_test.test_offload_lifecycle`, `scripts.build_queue.test_queue_view`, `scripts.build_queue.test_memory_feed`, `scripts.production.test_mac_run`, `scripts.copies.test_copy_guard_sources`.
-2. Lint: `basedpyright` on the changed Python files; `zsh -n` on `gate.zsh` and `scripts/production/mac_run.sh`.
-
-**Speed:** a user terminal call adds one zsh start and no check. An agent call adds one ssh check per placement each `placement_recheck_seconds`; the other calls of that build read one local file.
+**Gotchas:** Tailscale SSH reports exit 0 for every command, so callers read `mac_exit=N`. Tests that run under `systemd-run --scope` need `-E PATH -E HOME`; without them memory_feed and memory_admit tests fail.
 
 ### Phase 120 — Admission counts swapped agent memory as demand  · status: done
 
