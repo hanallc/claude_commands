@@ -9,7 +9,6 @@ import argparse
 import fcntl
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -19,7 +18,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import conf_reads, git_index, main_push_lock
+from scripts.lib import conf_reads, git_index, main_push_lock, registry_rows, waiting_rows
+from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -28,18 +28,11 @@ REGISTRY_PATH = "config/models.conf"
 OPERATION_ENVIRONMENT = ("MODELS_LAUNCH_CONFIGURATION", "MODELS_REGISTRY_EDIT_BASE")
 
 
-class RegistryRow(NamedTuple):
-    section: str
-    key: str
-    value: str
-    line: str
-
-
 class LaunchModelConfiguration(NamedTuple):
     """One configuration for a launch and its child processes."""
     path: Path
     text: str
-    rows: tuple[RegistryRow, ...]
+    rows: tuple[registry_rows.RegistryRow, ...]
 
     def environment(self, environment: Mapping[str, str]) -> dict[str, str]:
         return _environment(environment, OPERATION_ENVIRONMENT[0], self)
@@ -53,7 +46,7 @@ class RegistryEditBase(NamedTuple):
     """The exact text and parsed rows that one editor validates and changes."""
     path: Path
     text: str
-    rows: tuple[RegistryRow, ...]
+    rows: tuple[registry_rows.RegistryRow, ...]
 
     def environment(self, environment: Mapping[str, str]) -> dict[str, str]:
         return _environment(environment, OPERATION_ENVIRONMENT[1], self)
@@ -69,14 +62,14 @@ def _environment(environment: Mapping[str, str], variable: str,
 
 
 def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
-              synchronize: bool = False) -> tuple[Path, str, tuple[RegistryRow, ...]]:
+              synchronize: bool = False) -> tuple[Path, str, tuple[registry_rows.RegistryRow, ...]]:
     if encoded := environment.get(variable, ""):
         path, text = _decoded(encoded)
     else:
         if synchronize:
             _sync_catalog(path, environment)
         text = registry_text(path)
-    return path, text, tuple(_records(text))
+    return path, text, tuple(registry_rows.records(text))
 
 
 def launch_configuration(environment: Mapping[str, str], *, registry: Path | None = None) -> LaunchModelConfiguration:
@@ -199,12 +192,6 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
     return LaunchSettings(kind, values[1], values[2], values[3])
 
 
-class RowChange(NamedTuple):
-    section: str
-    key: str
-    replacement: str  # An empty string deletes the row.
-
-
 class SharedRegistry(NamedTuple):
     repository: Path
 
@@ -220,6 +207,7 @@ class AlreadyContained(NamedTuple):
 class FastForward(NamedTuple):
     target: str
     registry_entry: str
+    waiting: waiting_rows.WaitingRows
 
 
 def registry_path(environment: Mapping[str, str] | None = None) -> Path:
@@ -236,33 +224,7 @@ def registry_text(registry: Path | None = None) -> str:
     return conf_reads.read_text(registry or registry_path())
 
 
-def _records(text: str) -> list[RegistryRow]:
-    records: list[RegistryRow] = []
-    section = ""
-    for line in text.splitlines():
-        content = line.partition("#")[0].strip()
-        if not content:
-            continue
-        if content.startswith("[") and content.endswith("]"):
-            section = content[1:-1]
-            records.append(RegistryRow(section, "", "", line))
-        else:
-            key, separator, value = content.partition("=")
-            records.append(RegistryRow(section, key.strip(), value.strip() if separator else "", line))
-    return records
-
-
-def parse_registry(text: str) -> dict[str, dict[str, str]]:
-    """Parse sections and rows from registry text, including empty sections."""
-    sections: dict[str, dict[str, str]] = {}
-    for row in _records(text):
-        values = sections.setdefault(row.section, {})
-        if row.key:
-            values[row.key] = row.value
-    return sections
-
-
-def _shell_rows(rows: tuple[RegistryRow, ...]) -> str:
+def _shell_rows(rows: tuple[registry_rows.RegistryRow, ...]) -> str:
     return "".join(f"_models_table_{name}=(" + " ".join(shlex.quote(value) for value in values) + ")\n"
                    for name, values in (("sections", [row.section for row in rows]),
                                         ("keys", [row.key for row in rows]), ("values", [row.value for row in rows])))
@@ -273,90 +235,6 @@ def configuration_shell(configuration: LaunchModelConfiguration | RegistryEditBa
             + f"MODELS_REGISTRY_BASE={shlex.quote(configuration.text)}\n"
             + f"{OPERATION_ENVIRONMENT[0]}={shlex.quote(_encoded(configuration))}\n"
             + _shell_rows(configuration.rows))
-
-
-def _rows(text: str) -> dict[tuple[str, str], RegistryRow]:
-    return {(row.section, row.key): row for row in _records(text)
-            if row.key and "=" in row.line.partition("#")[0]}
-
-
-def _changes(before: str, after: str) -> list[RowChange]:
-    previous, wanted = _rows(before), _rows(after)
-    return [RowChange(section, key, wanted[section, key].line if (section, key) in wanted else "")
-            for section, key in dict.fromkeys([*previous, *wanted])
-            if previous.get((section, key), RegistryRow(section, key, "", "")).value
-            != wanted.get((section, key), RegistryRow(section, key, "", "")).value
-            or ((section, key) in previous) != ((section, key) in wanted)]
-
-
-def _values(text: str) -> dict[tuple[str, str], str]:
-    return {address: row.value for address, row in _rows(text).items()}
-
-
-def catalog_text(before: str, after: str) -> str:
-    changes = [change for change in _changes(before, after)
-               if change.section in ("codex.agents", "codex.families")]
-    return _replay(before, changes, True)
-
-
-def _version(model: str) -> tuple[int, ...]:
-    match = re.match(r"gpt-([0-9]+(?:\.[0-9]+)*)-", model)
-    return tuple(int(part) for part in match[1].split(".")) if match else ()
-
-
-def _additive_line(change: RowChange, current: dict[tuple[str, str], RegistryRow]) -> str:
-    """Union efforts and retain the newest family target across machine catalogs."""
-    prior = current.get((change.section, change.key))
-    if not change.replacement:
-        return prior.line if prior else ""
-    value = change.replacement.partition("#")[0].split("=", 1)[1].strip()
-    if prior and change.section == "codex.agents":
-        efforts = dict.fromkeys(item.strip() for item in f"{prior.value},{value}".split(",") if item.strip())
-        value = ",".join(efforts)
-    elif prior and change.section == "codex.families" and _version(prior.value) >= _version(value):
-        return prior.line
-    return f"{change.key}={value}"
-
-
-def _replay(text: str, changes: list[RowChange], additive_catalog: bool) -> str:
-    current = _rows(text)
-    replacements = {(change.section, change.key):
-                    _additive_line(change, current) if additive_catalog and change.section in (
-                        "codex.agents", "codex.families") else change.replacement
-                    for change in changes}
-    lines: list[str] = []
-    section = ""
-
-    def append_new_rows() -> None:
-        for address in list(replacements):
-            if address[0] == section:
-                line = replacements.pop(address)
-                if line:
-                    lines.append(line)
-
-    for line in text.splitlines():
-        content = line.partition("#")[0].strip()
-        if content.startswith("[") and content.endswith("]"):
-            append_new_rows()
-            section = content[1:-1]
-        elif "=" in content:
-            address = section, content.split("=", 1)[0].strip()
-            if address in replacements:
-                replacement = replacements.pop(address)
-                if replacement:
-                    lines.append(replacement)
-                continue
-        lines.append(line)
-    append_new_rows()
-    for address, line in replacements.items():
-        new_section = address[0]
-        if not line:
-            continue
-        if section != new_section:
-            lines.extend(["", f"[{new_section}]"])
-            section = new_section
-        lines.append(line)
-    return "\n".join(lines) + "\n"
 
 
 def _git(repo: Path, *arguments: str, input_text: str | None = None,
@@ -402,16 +280,18 @@ def _preflight_fast_forward(repo: Path, target: str, *, replace_registry: bool,
         return AlreadyContained()
     if ancestor != parent:
         raise OSError("the target diverges from the publishing parent; cannot fast-forward")
+    waiting = waiting_rows.hold(repo, target, skip=(REGISTRY_PATH,))
     index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     with tempfile.TemporaryDirectory(prefix="models-ff-index-") as directory:
         trial_index = Path(directory) / "index"
         git_index.private_copy(index, trial_index)
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial_index)}
+        waiting_rows.give(repo, waiting, environment)
         if replace_registry:
             registry_entry = _git(repo, "ls-tree", target, "--", REGISTRY_PATH) + "\n"
             _ = _git(repo, "update-index", "--index-info", input_text=registry_entry, environment=environment)
         _ = _git(repo, "read-tree", "--dry-run", "-m", "-u", "HEAD", target, environment=environment)
-    return FastForward(target, registry_entry)
+    return FastForward(target, registry_entry, waiting)
 
 
 def _apply_fast_forward(repo: Path, path: Path, plan: AlreadyContained | FastForward) -> None:
@@ -425,7 +305,9 @@ def _apply_fast_forward(repo: Path, path: Path, plan: AlreadyContained | FastFor
             if registry_text(path) != contents:
                 write_text_atomic(path, contents)
             _ = _git(repo, "update-index", "--index-info", input_text=plan.registry_entry)
+        waiting_rows.give(repo, plan.waiting)
         _ = _git(repo, "merge", "--ff-only", plan.target)
+        waiting_rows.restore(repo, plan.waiting)
     except OSError as error:
         raise OSError(f"registry fast-forward failed after its check; local files may have changed: {error}") from error
 
@@ -440,7 +322,7 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
     try:
         plan = _preflight_fast_forward(repo, target, replace_registry=registry_already_shared)
     except OSError as error:
-        raise OSError(f"registry edit refused before writing: fast-forward check failed: {error}") from error
+        raise OSError(f"registry publication refused: fast-forward check failed: {error}") from error
     _apply_fast_forward(repo, path, plan)
 
 
@@ -465,26 +347,29 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
         return commit
 
 
-def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
+def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], description: str,
              additive_catalog: bool) -> bool:
     branch = _git(repo, "symbolic-ref", "--short", "HEAD")
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
     # A previous invocation may have written the file and stopped before push.
     # Keep *all* unshared rows, including edits preceding this operation.
-    pending = _changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", local)
+    pending = registry_rows.changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", local)
     try:
         remote = _fetch(repo, branch)
     except OSError as error:
-        raise OSError(f"registry edit refused before writing: fetch failed: {error}") from error
-    remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-    # Recover a push accepted before its acknowledgement/local fast-forward.
-    registry_already_shared = bool(pending and _values(_replay(remote_text, pending, False)) == _values(remote_text))
-    _fast_forward(repo, path, remote, registry_already_shared=registry_already_shared)
+        raise OSError(f"registry publication refused: fetch failed: {error}") from error
+    # Pending rows move onto the fetched registry, so another writer's commit
+    # cannot block them; a push accepted before its acknowledgement replays as no change.
+    _fast_forward(repo, path, remote, registry_already_shared=bool(pending))
+    # A row commit goes only onto origin/main; a push must never carry other local commits.
+    if foreign := _git(repo, "rev-list", "--abbrev-commit", f"{remote}..HEAD").split():
+        raise OSError(f"registry publication refused: HEAD has {len(foreign)} commits that are not on "
+                      + f"origin/{branch}: {' '.join(foreign[:5])}")
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
-    contents = _replay(local, changes, additive_catalog)
-    pending = _changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", contents)
+    contents = registry_rows.replay(registry_rows.replay(local, pending, False), changes, additive_catalog)
+    pending = registry_rows.changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", contents)
     if not pending:
         return False
     if contents != local:
@@ -499,10 +384,10 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
             try:
                 remote = _fetch(repo, branch)
                 remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-                replayed = _replay(remote_text, pending, additive_catalog)
+                replayed = registry_rows.replay(remote_text, pending, additive_catalog)
                 ancestor = _git(repo, "merge-base", commit, remote)
                 shared = (ancestor == commit
-                          or ancestor == base and _values(replayed) == _values(remote_text))
+                          or ancestor == base and registry_rows.values(replayed) == registry_rows.values(remote_text))
             except OSError as retry_error:
                 last_error = str(retry_error)
                 break
@@ -532,46 +417,85 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
     raise OSError(f"{path} is edited but not shared; publish failed after at most 3 tries: {last_error}")
 
 
+def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
+    if isinstance(target, SharedRegistry):
+        return Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
+    return path.with_name(path.name + ".lock")
+
+
+def _on_main(target: SharedRegistry) -> bool:
+    return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
+
+
+def publish_pending(registry: Path) -> bool:
+    """Publish rows that main does not have yet; return False at once when main is busy."""
+    path = registry.resolve()
+    target = _publish_repository(path)
+    if not isinstance(target, SharedRegistry):
+        return False
+    head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+    if not registry_rows.changes(head, registry_text(path)):
+        return False
+    with ExitStack() as locks:
+        if _on_main(target):
+            try:
+                locks.enter_context(main_push_lock.main_push_lock(target.repository, wait=False))
+            except BlockingIOError:
+                return False
+        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _publish(target.repository, path, [], "rows written while main was busy", False)
+
+
 def store_registry(registry: Path, before: str, after: str, description: str, *,
                    additive_catalog: bool = False) -> str:
-    """Return the published text after atomic replay under the writer lock.
+    """Write the rows live at once under the writer lock, then publish them; return the live text.
 
+    The live write never waits for the main lock. Publication follows: it waits
+    for the main lock, commits and pushes. A failed publication keeps the rows
+    live and raises OSError; publish_pending() publishes them later.
     Publishing is disabled by MODELS_CONFIG_PUBLISH=0 and for every other path.
+    MODELS_CONFIG_PUBLISH=later skips the publication; the notes timer runs it.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
-    The registry commit is parented on local HEAD, so publishing an ahead
-    checkout also pushes its pre-existing local commits.
+    The registry commit goes only onto origin/main; a checkout with local
+    commits that origin does not have refuses publication.
     No other path is staged, committed, stashed, reset or rebased.
     """
     path = registry.resolve()
-    changes = _changes(before, after)
+    changes = registry_rows.changes(before, after)
     if additive_catalog:
         changes = [change for change in changes if change.section in ("codex.agents", "codex.families")]
     target = _publish_repository(path)
-    lock_path = (Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
-                 if isinstance(target, SharedRegistry) else path.with_name(path.name + ".lock"))
-    with ExitStack() as locks:
-        if isinstance(target, SharedRegistry) and _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main":
-            locks.enter_context(main_push_lock.main_push_lock(target.repository))
-        lock = locks.enter_context(lock_path.open("a"))
+    lock_path = _publish_lock_path(target, path)
+    with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if isinstance(target, SharedRegistry):
-            _ = _publish(target.repository, path, changes, description, additive_catalog)
-        elif changes:
+        if changes:
             latest = registry_text(path)
-            result = _replay(latest, changes, additive_catalog)
-            if _values(latest) != _values(result):
+            result = registry_rows.replay(latest, changes, additive_catalog)
+            if registry_rows.values(latest) != registry_rows.values(result):
                 # Preserve formatting when no concurrent edit intervenes.
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
-        return registry_text(path)
+    if isinstance(target, SharedRegistry) and os.environ.get("MODELS_CONFIG_PUBLISH") != "later":
+        try:
+            with ExitStack() as locks:
+                if _on_main(target):
+                    locks.enter_context(main_push_lock.main_push_lock(target.repository))
+                lock = locks.enter_context(lock_path.open("a"))
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                _ = _publish(target.repository, path, changes, description, additive_catalog)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
+                          + "the notes timer tries again") from error
+    return registry_text(path)
 
 
 def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
     path = registry_path()
     before = registry_text(path)
-    after = _replay(before, [RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
+    after = registry_rows.replay(before, [registry_rows.RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
     settings = launch_settings("producers", name,
-                               configuration=LaunchModelConfiguration(path, after, tuple(_records(after))))
+                               configuration=LaunchModelConfiguration(path, after, tuple(registry_rows.records(after))))
     return path, before, after, settings
 
 
@@ -630,11 +554,11 @@ def main() -> int:
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":
-            print(catalog_text(before, after), end="")
+            print(registry_rows.catalog_text(before, after), end="")
         else:
             text = store_registry(arguments.registry, before, after, arguments.description,
                                   additive_catalog=arguments.additive_catalog)
-            print(configuration_shell(RegistryEditBase(arguments.registry, text, tuple(_records(text)))), end="")
+            print(configuration_shell(RegistryEditBase(arguments.registry, text, tuple(registry_rows.records(text)))), end="")
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

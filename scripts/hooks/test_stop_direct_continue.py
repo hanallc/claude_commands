@@ -116,6 +116,20 @@ class DirectorStopTests(unittest.TestCase):
             self.assert_allowed(fixture.call(last_assistant_message="— holding: queue empty"))
             self.assertFalse((fixture.run / "compaction_wake_line").exists())
 
+    def test_live_detached_run_of_the_director_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            record = fixture.run / "detached_runs" / "land.json"
+            record.parent.mkdir()
+            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
+                                              "worker": "fixture-director", "pid": supervisor.pid}))
+            try:
+                self.assert_allowed(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+            finally:
+                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assert_blocked(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
         self.assertIn(

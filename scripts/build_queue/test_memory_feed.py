@@ -1509,6 +1509,21 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(shares["agents_swap"], 10.0)
                 self.assertEqual(shares["shown_agents_swap"], 10.0)
 
+    def test_swapped_demand_stays_right_of_the_cap_when_reserved_fills_free_memory(self) -> None:
+        gib = admission_records.GIB
+        room = gate.memory_room(admission_records.HostMemory(20 * gib, 64 * gib, 32 * gib, 22 * gib), [],
+                                admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        user = self.root / "slices"
+        write_user_slices(user, agents=True, guarantee="2147483648")
+        with mock.patch.dict(os.environ, {"BUILDLOG_USER_CGROUP": str(user)}):
+            shares = memory_feed.memory_shares(64.0, room, 3.0, 0.0, 15.0)
+        cap = room.cap
+        assert isinstance(cap, int)
+        self.assertEqual(shares["shown_agents_swap"], 10.0)
+        self.assertEqual(shares["shown_reserved"], 7.0)
+        self.assertEqual(shares["shown_reserved"], cap / gib)
+
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:

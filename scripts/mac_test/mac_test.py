@@ -2129,7 +2129,8 @@ def free_now(
     not read, since a claim does not consult it; the claim itself still decides
     under its lock. Another repository's claim leaves the answer free. A copy
     claim gives way to a new test, so it holds the scope only for another copy
-    (`copy`).
+    (`copy`). A kept claim leaves the answer free: its holder is gone, and the
+    next claim takes it over and cleans its leftovers.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
@@ -2161,7 +2162,7 @@ def free_now(
         except (OSError, ConfigError):
             return "state"
     held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record)
+        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record) and not run_is_kept(claim.record)
         and (copy or not copy_gives_way(claim.record)) for claim in claims
     ) for candidate in scopes)
     if held:

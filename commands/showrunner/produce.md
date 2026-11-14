@@ -198,8 +198,8 @@ State:
       productions promoting;
     - disk room and quota: the root, always.
   - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or tell that unit to run
-    `/build:hold hold <why> target mac`. Tests skip a held Mac by themselves,
+    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+    Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records
     that, and nothing ends it. On 2026-10-18 such a ruling, a day old, kept a
@@ -490,7 +490,7 @@ Turns come from unit directors' messages and the user. Handle each message:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
+| a nightly red notice or unassigned alert | Assign the fix to the owning unit director of any production, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`; the user push waits for it. |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |
@@ -561,7 +561,8 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit, give the order to it under `commands/unit/merge.md`.
+4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
+   That unit is under this showrunner or under a showrunner above it. The order names this production.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>

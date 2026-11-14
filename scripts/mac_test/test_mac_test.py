@@ -1155,7 +1155,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assert_command(self.command("free-now"), 1, "busy\n")
         self.assert_command(self.release_claim(owner.pid), 0, "")
         record = self.kept_claim()
-        self.assert_command(self.command("free-now"), 1, "busy\n")
+        # The next claim takes a kept claim over, so the kept claim does not make the Mac busy.
+        self.assert_command(self.command("free-now"), 0, "free\n")
         self.assert_command(self.release_claim(record["pid"]), 0, "")
         self.assert_command(self.command("free-now"), 0, "free\n")
 

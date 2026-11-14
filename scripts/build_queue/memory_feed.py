@@ -1025,10 +1025,13 @@ class MemoryShares(TypedDict):
 
 def memory_shares(total: float, room: admission_records.MemoryRoom, safety: float, used: float,
                   reserved: float) -> MemoryShares:
-    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand in free memory."""
+    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand outside the cap."""
     available = gib(room.available)
     shown_safety = min(safety, used + available)
-    shown_reserved = max(0.0, min(reserved, available - safety))
+    # Swapped agent memory is outside the cap: it sits right of the cap line, so reserved stops at the cap.
+    agents_swap = gib(room.agent_swap_demand)
+    shown_agents_swap = max(0.0, min(agents_swap, available - safety))
+    shown_reserved = max(0.0, min(reserved, available - safety - shown_agents_swap))
     outside = max(0.0, total - available - gib(room.cap_use))
     agents = gate.agents_memory()
     guarantee = gate.desktop_guarantee()
@@ -1036,12 +1039,11 @@ def memory_shares(total: float, room: admission_records.MemoryRoom, safety: floa
     desktop = gib(guarantee) if isinstance(guarantee, int) else None
     shown_agents = min(agents_ram or 0.0, outside)
     shown_desktop = min(desktop or 0.0, outside - shown_agents)
-    agents_swap = gib(room.agent_swap_demand)
     return {
         "other": outside - shown_agents - shown_desktop,
         "desktop_guarantee": desktop, "agents_ram": agents_ram, "agents_swap": agents_swap,
         "shown_desktop": shown_desktop, "shown_agents": shown_agents,
-        "shown_agents_swap": max(0.0, min(agents_swap, available - shown_reserved - gib(room.room) - shown_safety)),
+        "shown_agents_swap": shown_agents_swap,
         "slices_unavailable": "; ".join(reading.reason for reading in (agents, guarantee)
                                         if isinstance(reading, admission_records.ReadingUnavailable)),
         "shown_safety": shown_safety, "shown_reserved": shown_reserved,
@@ -1152,9 +1154,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     ci_name = "hana CI"
                     description = memory.diagnostic
                 else:
-                    description = "Memory the compiler cache holds outside the build queue."
+                    description = "Memory the compiler cache holds outside the build queue"
             else:
-                description = "Memory these processes hold outside the build queue."
+                description = "Memory these processes hold outside the build queue"
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
@@ -1179,7 +1181,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
         walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
-                     "queued": False, "keep_text": "Memory these processes hold outside the build queue.",
+                     "queued": False, "keep_text": "Memory these processes hold outside the build queue",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
                      "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", "")}
