@@ -8954,6 +8954,9 @@ class StaffProgressHistoryTests(StaffTestCase):
                                           "fixture", evidence)
                 self.assertEqual(len(evidence), 1)
         self.assertEqual((current["working_dir"], current["branch"]), (str(second), "current-branch"))
+        _ = subprocess.run(["git", "-C", str(second), "symbolic-ref", "HEAD", "refs/heads/next-branch"],
+                           capture_output=True, check=True)
+        self.assertEqual(read(run)["branch"], "next-branch")
         self.assertEqual(unit_runs.director(run), replacement)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
         current["status"] = "custom-outcome"

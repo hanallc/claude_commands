@@ -39,6 +39,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.copies import copies
 from scripts.direct import phase_reservation
 from scripts.lib import berth_board
+from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
 from scripts.style import coverage_report
@@ -264,7 +265,7 @@ def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | Unknown
     # Only the selected proposal needs a footprint at main, where new callers may have appeared.
     if isinstance(changes, MainChanges) and changes.paths and findings:
         try:
-            main_edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
+            main_edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
             files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in main_edits.of(finding)))))
         except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
             changes = UnknownMainChanges(f"cannot read selected footprint at main: {error}")
@@ -310,6 +311,15 @@ class NoUnitBranch:
 
 
 UnitBase = UnitBranchTip | NoUnitBranch
+
+
+class FootprintRole(Enum):
+    """Which commit a footprint reader reads, so readers at different commits keep separate stored footprints."""
+
+    UNIT = "unit"
+    MAIN = "main"
+    CHECKPOINT = "checkpoint"
+    TICKET_BASE = "ticket-base"
 
 
 def unit_base(repo: Path, branch: str) -> UnitBase:
@@ -2715,14 +2725,17 @@ class EditedFiles:
     A plain file-module path string that ends in another file's name does not declare the requested module file.
     This exclusion also applies inside inline modules.
     Other findings include their own file.
+    Each `FootprintRole` keeps its own stored footprints.
     Append recorded need paths for every finding.
     Recorded needs also extend the gate's edit approval.
     """
 
-    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
+    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase,
+                 role: FootprintRole = FootprintRole.UNIT) -> None:
         self.repo: Path = repo
         self.ledger: style_ledger.Ledger = ledger
         self.base: UnitBase = base
+        self.role: FootprintRole = role
         self.tip: str | None = None
         # The blob of each named path at each commit, and the text of each blob.
         self.blobs: dict[tuple[str, str], str] = {}
@@ -2759,7 +2772,7 @@ class EditedFiles:
                 if source_reads:
                     self.ledger.record_finding_sources(self.commits(), tuple(self.required_blobs))
                 return FindingFootprint(files, uncertain)
-            view = ("synced-and-unit" if isinstance(self.base, UnitBranchTip) else "synced") if source_reads else "recorded"
+            view = (f"synced-and-{self.role.value}" if isinstance(self.base, UnitBranchTip) else "synced") if source_reads else "recorded"
             inputs = (self.commits(), self.root_inputs) if source_reads else ()
             self.footprints[finding.finding_id] = self.ledger.finding_footprint(
                 finding, view, inputs, calculate)
@@ -2862,8 +2875,13 @@ class EditedFiles:
 
     @cached_property
     def unread_path_versions(self) -> tuple[tuple[str, str], ...]:
-        """Find unreadable path strings once for the refill."""
-        return tuple(entry for entry in self.named_versions("path") if UNREAD_PATH_STRING.search(self.texts[entry[1]]))
+        """Find unreadable path strings once for each blob that the ledger's readers see."""
+        searched = self.ledger.unread_path_blobs
+        versions = self.named_versions("path")
+        for _, blob in versions:
+            if blob not in searched:
+                searched[blob] = UNREAD_PATH_STRING.search(self.texts[blob]) is not None
+        return tuple(entry for entry in versions if searched[entry[1]])
 
     def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
         """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read
@@ -2985,14 +3003,14 @@ def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketR
     if (not concurrent and base.commit != checkpoint) or subprocess.run(["git", "-C", str(ledger.repo), "merge-base", "--is-ancestor", checkpoint, base.commit],
                                                        capture_output=True, check=False).returncode != 0:
         raise style_ledger.LedgerError("unit branch is not at the waiting checkpoint")
-    edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint))
+    edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint), FootprintRole.CHECKPOINT)
     origin = ledger.ticket_origin(ticket["id"])
     if isinstance(origin, style_ledger.ApprovedProposal):
         if not origin.finding_ids or len(edits.ticket_findings(origin)) != len(origin.finding_ids):
             raise style_ledger.LedgerError("waiting findings cannot be read")
     if edits.uncertain_of_ticket(ticket):
         raise style_ledger.LedgerError("waiting footprint has an uncertain module route")
-    original = EditedFiles(ledger.repo, ledger, UnitBranchTip(ticket["base"]))
+    original = EditedFiles(ledger.repo, ledger, UnitBranchTip(ticket["base"]), FootprintRole.TICKET_BASE)
     if not ticket["base"] or original.uncertain_of_ticket(ticket):
         raise style_ledger.LedgerError("waiting base footprint cannot be proved")
     files = frozenset((*edits.of_ticket(ticket), *original.of_ticket(ticket)))
@@ -3011,7 +3029,7 @@ def checkpoint_selection(work: WaitingCheckpoint | NoCheckpointBlock, ledger: st
     if isinstance(work, NoCheckpointBlock):
         return work
     if isinstance(changes, MainChanges) and changes.paths and findings:
-        edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
+        edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
         if any(edits.uncertain(finding) for finding in findings):
             raise style_ledger.LedgerError("selected footprint at main is uncertain")
         files = (*files, *(path for finding in findings for path in edits.of(finding)))
@@ -3666,9 +3684,12 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
                      "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket_id])
     if passed.get("status") not in ("active", "completed"):
-        commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
-                     "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
-                     "--cwd", str(worktree), "--paths", str(paths)])
+        if quota_state.no_worker_mode():
+            print(f"{slot}: {quota_state.NO_WORKER_START}")
+        else:
+            commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
+                             "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
+                             "--cwd", str(worktree), "--paths", str(paths)])
     for command in commands:
         result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
         if result.returncode:

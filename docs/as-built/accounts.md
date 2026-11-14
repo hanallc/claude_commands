@@ -25,6 +25,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/outage_alerts.py` | Durable alert claims for retained record-driven restart paths. |
 | `scripts/whoami/agent_accounts.py` | Account identity, Codex homes, worker selection, and credit policy. |
 | `scripts/whoami/note_file.py` | Numbered account notes and the shared notes-folder resolver. |
+| `scripts/whoami/quota_state.py` | The quota state file, the no-worker mode read, and the `NO_WORKER_START` refusal text. It is a leaf module. |
 | `scripts/settings/settings_local_keys.sh` | Settings classification, local snapshots, and Git filter transformations. |
 | `scripts/settings/local_key_notices.py` | Deferred notices for new machine-local keys. |
 | `scripts/lib/conf.py` | Validated configuration reads and recovery. |

@@ -410,7 +410,7 @@ The Linux scanner reports unreadable working directories during its single proce
 Both callers raise `ConfigError` for a bad configured value, including an empty value.
 The required `missing` policy applies only when both capacity keys are absent.
 Mac claims still use one slot.
-Offload records use `build_hold.owning_session()` before the shell session fallback.
+Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
 After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.

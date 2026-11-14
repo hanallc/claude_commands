@@ -218,6 +218,12 @@ def aws_snapshot() -> int:
     return snapshot(conf.path('aws_target'), ssh_target_state_directory('aws'))
 
 
+def aws_page() -> int:
+    from scripts.aws_target import aws_page
+
+    return aws_page.publish_configured()
+
+
 def hourly() -> int:
     from scripts.buildlog import ci
     from scripts.buildlog import index
@@ -229,7 +235,7 @@ def hourly() -> int:
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
-                      ("AWS snapshot", aws_snapshot)):
+                      ("AWS snapshot", aws_snapshot), ("AWS prices page", aws_page)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run

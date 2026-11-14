@@ -38,8 +38,7 @@ from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.build_hold.build_hold_test_support import IsolatedBuildHoldTest, invoke_hold, write_holder
-from scripts.build_hold import build_hold
-from scripts.build_hold.owning_session import OwningSession
+from scripts.build_hold.owning_session import OwningSession, owning_session
 from scripts.build_queue import admission_records, queue_evidence
 from scripts.lib.build_steps import read_step_names
 from scripts.message.unit_labels import OwnerRole, UnitLabels
@@ -63,7 +62,7 @@ class CloudWorkerHoldTests(IsolatedBuildHoldTest):
                 command = cloud_gate.service_command('scripts.aws_target.gate_trial',
                     ['--paired-worker', str(self.scratch / 'trial')], 'fixture', paired=paired)
                 environment = {**os.environ, **service_environment(command)}
-                self.assertEqual(build_hold.owning_session(environment), OwningSession('fixture-caller'))
+                self.assertEqual(owning_session(environment), OwningSession('fixture-caller'))
                 holders = Path(environment['BUILD_HOLD_DIR'])
                 holders.mkdir(exist_ok=True)
                 path = write_holder(holders, 'fixture-other', '2026-11-13T12:00:00+00:00', 'fixture work')
@@ -459,6 +458,36 @@ class CloudGateTests(CostFixture):
             rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate',
                          'time': self.now - 9000 + count * 6, 'result': 'launched'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+    def test_a_type_and_region_above_max_gate_minutes_is_not_tried(self) -> None:
+        worker, variants = self.steering_fixture()
+        first, second, third = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
+        cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
+        # The third type is the cheapest per run, but its median gate time is one minute above the cap.
+        self.variant_prices(variants, {(row.region, row.instance_type, row.zone): '.1' if row.instance_type == third else '.5'
+                                       for row in variants})
+        self.gate_history([(first, 'us-east-2', cap - 60), (third, 'us-east-2', cap + 60)])
+        with redirect_stdout(StringIO()) as output:
+            ranked = worker.rank_variants(variants, 'merge-gate')
+        # us-west-2 has no runs of the third type, so it uses the type's time in us-east-2 and is skipped too.
+        self.assertEqual({row.instance_type for row in ranked}, {first, second})
+        self.assertEqual(ranked[0].instance_type, first)
+        self.assertEqual(output.getvalue().count(f'Cloud gate skips {third} in '), 2)
+        # A median at the cap is still tried; a type without runs is never skipped.
+        self.gate_history([(first, 'us-east-2', cap), (third, 'us-east-2', cap)])
+        with redirect_stdout(StringIO()):
+            self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+
+    def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
+        cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
+        self.gate_history([(size, ledger.text(region, 'region'), cap + 60)
+                           for size in conf.read(self.root / 'cloud_gate.conf').words('instance_types')
+                           for region in ledger.rows(self.deployment, 'regions')])
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertIn('Cloud gate skips ', output.getvalue())
+        self.assertEqual(self.fake.launches, [])
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
 
     def test_lowest_expected_cost_per_run_comes_before_hourly_price_and_type_order(self) -> None:
         worker, variants = self.steering_fixture()

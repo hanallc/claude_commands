@@ -432,7 +432,8 @@ def paired_service(command: Sequence[str], unit: str) -> int:
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
-    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes')
+    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes',
+                                     epilog='gate_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
