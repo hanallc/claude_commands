@@ -12,7 +12,7 @@ from scripts.direct import assign_gate
 from scripts.direct.assign_launcher_test_support import ASSIGN, AssignLauncherFixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_worker
-from scripts.whoami import worker_mode
+from scripts.whoami import quota_state
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / 'scripts/lib/py'
@@ -97,10 +97,10 @@ class AssignmentFormsTests(AssignLauncherFixture):
     def test_no_worker_mode_refuses_before_any_run_state(self) -> None:
         state = self.session_dir / "progress_history_state.json"
         before = state.read_text()
-        with patch.object(worker_mode, "no_worker_mode", return_value=True):
+        with patch.object(quota_state, "no_worker_mode", return_value=True):
             result = self.launch("implement")
         self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (2, "", f"assign.sh: {worker_mode.NO_WORKER_START}\n"))
+                         (2, "", f"assign.sh: {quota_state.NO_WORKER_START}\n"))
         self.assertEqual(self.native.fixture.world.launches, [])
         self.assertEqual(self.turn_starts, 0)
         self.assertEqual(state.read_text(), before)

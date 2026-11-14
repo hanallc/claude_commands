@@ -142,6 +142,11 @@ class ProducerTransferTests(unittest.TestCase):
                 self.assertEqual(fixture.settings(), f"{kind}:{model}:{effort}")
                 binding = pane_record.read("agents")[world.pane]
                 self.assertEqual((binding.get("staff_id"), binding.get("producer_binding", False)), (row.id, True))
+                resumed = restart.producer_resume(moved, binding)[2]
+                if kind == "claude":
+                    self.assertEqual(resumed[resumed.index("--remote-control") + 1], "dwight")
+                else:
+                    self.assertNotIn("--remote-control", resumed)
                 self.assertEqual([tab["staff_id"] for space in herdr.saved_layout("agents")["workspaces"]
                                   for tab in space["tabs"]], [row.id])
                 self.assertEqual(output, "dwight: the old conversation stopped; read it with: "

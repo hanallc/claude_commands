@@ -286,7 +286,7 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/hook_dispatch.py\" pre_tool_use",
-            "timeout": 3040
+            "timeout": 3050
           }
         ]
       },

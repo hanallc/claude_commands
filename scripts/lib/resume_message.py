@@ -10,6 +10,7 @@ from typing import NamedTuple, TypedDict
 from scripts.direct import assign_gate, phase_reservation, progress_history
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import staff
+from scripts.whoami import quota_state
 
 
 @dataclass(frozen=True)
@@ -98,10 +99,7 @@ NO_OWN_PASS = NoOwnPass()
 
 def worker_mode() -> ResumeWorkers | WorkersHeld:
     """`WorkersHeld` with the notice in no-worker mode; otherwise no worker lines."""
-    from scripts.whoami import quota_alert
-    from scripts.whoami.worker_mode import no_worker_mode
-
-    return WorkersHeld(quota_alert.no_worker_notice()) if no_worker_mode() else NO_WORKERS
+    return WorkersHeld(quota_state.no_worker_notice()) if quota_state.no_worker_mode() else NO_WORKERS
 
 
 def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:

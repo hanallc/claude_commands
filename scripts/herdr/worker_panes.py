@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
-from scripts.whoami import worker_mode
+from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.direct import recorder_state
@@ -1609,8 +1609,8 @@ def main(arguments: list[str] | None = None) -> int:
             if worker_admission.find_worker(record, owner.id, name.value) is None:
                 return _result(AdmissionRefused(f"no worker named {name.value}"))
             return _result(close(owner.id, name))
-        if worker_mode.no_worker_mode():
-            print(f"worker_panes.py: {worker_mode.NO_WORKER_START}", file=sys.stderr)
+        if quota_state.no_worker_mode():
+            print(f"worker_panes.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
             return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))

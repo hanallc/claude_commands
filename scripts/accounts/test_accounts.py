@@ -93,6 +93,8 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
     _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
+    staged = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())) / "codex_credit_accounts"
+    _ = unittest.enterModuleContext(patch.object(agent_accounts, "staged_credit_accounts_path", return_value=staged))
 
 
 def accounts_reader_calls(source: str) -> dict[str, set[str]]:

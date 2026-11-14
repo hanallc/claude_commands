@@ -1974,6 +1974,16 @@ class CapViewTests(QueueViewFixtureTests):
         self.assertTrue(all(span.tone == "success" for span in bar[:17]))
         self.assertEqual(bar[17].tone, "error")
 
+    def test_swapped_agent_memory_sits_between_the_cap_and_safety(self) -> None:
+        gib = admission_records.GIB
+        room = gate.memory_room(admission_records.HostMemory(20 * gib, 60 * gib, 32 * gib, 27 * gib), [],
+                                admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        self.assertEqual((room.cap, room.agent_swap_demand), (12 * gib, 5 * gib))
+        bar = queue_view.cap_bar(room, 60, colour=False)
+        self.assertEqual(plain([bar]), "·" * 12 + "│" + "▓" * 4 + "▒" * 3 + "█" * 40)
+        self.assertEqual({span.tone for span in bar[13:17]}, {"inactive"})
+
 
     def test_row_styles_and_you_marker_match_the_drawn_page(self) -> None:
         lines = queue_view.render_view(self.fixture.cap_model(), 60, colour=True, you=ASKING_SESSION)

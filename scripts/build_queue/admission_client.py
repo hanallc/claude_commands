@@ -1048,7 +1048,7 @@ def down_alert() -> int:
 
     retained = False
     try:
-        restart = "sudo systemctl restart build-admission.socket build-admission.service"
+        restart = "systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service"
         message = (f"The build queue service has not answered for {configuration.silence_seconds:g} seconds. Builds wait.\n"
                    "The service restarts by itself. Read journalctl -u build-admission.service.\n"
                    f"If the user must act, push the phone with this command: {restart}")

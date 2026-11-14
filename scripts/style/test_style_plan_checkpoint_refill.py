@@ -21,7 +21,7 @@ from scripts.style import style_plan
 from scripts.direct import progress_history
 from scripts.direct.assign_launcher_test_support import AssignLauncherFixture, invoke_assignment
 from scripts.style import style_ledger
-from scripts.whoami import worker_mode
+from scripts.whoami import quota_state
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 
@@ -339,12 +339,12 @@ class TicketWorkerTests(AssignLauncherFixture):
                 submitted.append(args)
                 return invoke_assignment(args[2:], os.environ.copy())
             return original(args, **kwargs)
-        with (mock.patch.object(worker_mode, "no_worker_mode", return_value=True),
+        with (mock.patch.object(quota_state, "no_worker_mode", return_value=True),
               mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(io.StringIO()) as output):
             style_plan.restore_ticket_worker(self.session_dir, self.project, plan, "7", ("src/worker.py",))
         self.assertEqual(submitted, [])
         self.assertEqual(self.turn_starts, 0)
-        self.assertEqual(output.getvalue(), f"style-ticket-7: {worker_mode.NO_WORKER_START}\n")
+        self.assertEqual(output.getvalue(), f"style-ticket-7: {quota_state.NO_WORKER_START}\n")
         record = cast(dict[str, object], json.loads((self.session_dir / "progress_history_state.json").read_text()))
         self.assertNotIn("style-ticket-7", cast(dict[str, object], record.get("pass", {})))
 

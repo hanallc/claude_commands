@@ -31,12 +31,12 @@ from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
 from scripts.lib import atomic_file, conf, detached, unit_runs
-from scripts.whoami import worker_mode
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import display_cells, session_staff, staff, worker_admission
+from scripts.whoami import quota_state
 
 from scripts.herdr import herdr
 
@@ -1088,7 +1088,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
-    workers_held = worker_mode.no_worker_mode()
+    workers_held = quota_state.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
@@ -1623,8 +1623,8 @@ def main(arguments: list[str] | None = None) -> int:
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
-    if args.command in ("add", "assign") and worker_mode.no_worker_mode():
-        print(f"worker.py: {worker_mode.NO_WORKER_START}", file=sys.stderr)
+    if args.command in ("add", "assign") and quota_state.no_worker_mode():
+        print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
         return ExitCode.REFUSED
     try:
         if args.command == "finish-dispatch":
