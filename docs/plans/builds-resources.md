@@ -2542,6 +2542,20 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
 
+### Phase 124 — The Builds page memory bar names every GiB  · status: done
+
+The user found the memory bar confusing (screenshots 16 and 17, 2026-11-14). Fix the bar as one phase:
+
+1. Put the swapped block beside the agents block. Name it for what it is: swap outside builds and CI, which the queue keeps free RAM for.
+2. Use one swapped figure in the bar width, its label, its tooltip and the swap section.
+3. Join safety and the desktop guarantee into one block.
+4. Split "other" into named parts: the largest programs by name, the kernel, file cache and a small "not attributed" rest.
+5. Show queue-placed work in builds.slice (rust-analyzer through queue_place) in the builds block with its name, never in other.
+6. When room is 0 or only one build fits, show one plain line with the reason.
+7. Rewrite every bar tooltip from the astra design: short lines, each line says what its number holds, no page-wide owner lines on a block that is not one build.
+
+Proof: screenshots 16 and 17 are the before proof; the after screenshot shows each element. Run every build_queue test module before the checkpoint.
+
 ### Phase 125 — The Mac watch finds a placed run's compiler under sccache  · status: done
 
 #### As-built

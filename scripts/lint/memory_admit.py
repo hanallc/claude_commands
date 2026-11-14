@@ -2575,6 +2575,15 @@ def agents_memory() -> MeasuredMemory | ReadingUnavailable:
         return ReadingUnavailable(f"{directory}: agents' memory unavailable: {error}")
 
 
+def desktop_memory() -> MeasuredMemory | ReadingUnavailable:
+    """Read the desktop session's working set and swap (session.slice)."""
+    directory = user_manager_cgroup() / "session.slice"
+    try:
+        return slice_working_set(directory)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{directory}: desktop memory unavailable: {error}")
+
+
 def slice_swap_current(directory: Path) -> int:
     """Read one required slice swap counter."""
     path = directory / "memory.swap.current"
