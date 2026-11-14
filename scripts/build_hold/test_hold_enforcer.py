@@ -243,8 +243,15 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
                     NoOwningSession(), self.holders, lineage), expected)
 
+        real_clock = time.clock_gettime_ns
+
+        def clock(clock_id: int) -> int:
+            # The fixture runs start 110 s after boot; a new gate host can be younger than that.
+            return 200_000_000_000 if clock_id == time.CLOCK_BOOTTIME else real_clock(clock_id)
+
         with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
              mock.patch.object(build_hold, "start_hold", side_effect=publish), \
+             mock.patch.object(time, "clock_gettime_ns", side_effect=clock), \
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
              mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
