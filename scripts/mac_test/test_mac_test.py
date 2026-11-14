@@ -3260,6 +3260,52 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             self.assertEqual(transport_calls, 2)
             send.assert_called_once()
 
+    def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
+        from scripts.mac_test import eligibility, offload, claim_state
+
+        # A copy stopped before its final status leaves remote work and a held start fence.
+        for leftovers, released in ((0, True), (1, False)):
+            with self.subTest(leftovers=leftovers):
+                record = self.write_claim()
+                identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                                     cast(str, record["attempt"]))
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                fence_directory = self.root / offload.start_fence_relative(identity, "mac").parent
+                pending = offload.pending_start_path(self.paths.target, identity)
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                _ = pending.write_text("pending")
+                scripts: list[str] = []
+
+                def end_work(repository: eligibility.KnownRepository, target: str, slot: int) -> str:
+                    self.assertEqual((repository.name, target, slot), ("alpha", self.paths.target, 1))
+                    return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
+
+                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+                    scripts.append(arguments[-1])
+                    return self.run_private_shell(arguments[-1], self.root)
+
+                with mock.patch.object(offload, "leftover_check_script", side_effect=end_work), \
+                     mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch.object(mac_test, "start_watcher"):
+                    answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
+                        remote_work=mac_test.EndStoppedWork(eligibility.KnownRepository("alpha")))
+                self.assertEqual(len(scripts), 1)
+                self.assertLess(scripts[0].index("ended-work"), scripts[0].index("dispatch_start_settled"))
+                if released:
+                    self.assertEqual(answer, mac_test.ClaimsReleased(1, ()))
+                    self.assertFalse(self.paths.run.exists())
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(list(fence_directory.iterdir()), [])
+                else:
+                    self.assertEqual(answer, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
+                    self.assertEqual(self.read_claim(), record)
+                    self.assertTrue(pending.exists())
+                    pending.unlink()
+                    self.paths.run.unlink()
+
     def test_process_claim_release_message_keeps_process_bound_claim_command(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))
         _ = record.pop("remote_host")
