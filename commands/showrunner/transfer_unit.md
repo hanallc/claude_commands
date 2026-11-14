@@ -5,12 +5,16 @@ argument-hint: "<unit> <receiving showrunner name>"
 
 # Transfer unit
 
-Run from the giving showrunner session, when the receiving showrunner asks for the unit. `<unit>` is
-the unit's id or its stem. `<receiving showrunner name>` is the receiving showrunner row's `name`. The script lives
-at `~/.claude/scripts/production/transfer_unit.py`:
+Run from the giving showrunner session, when the receiving showrunner asks for the unit.
+All three names are staff row `name` values:
+- `<giving showrunner name>` is your own showrunner row.
+- `<unit>` is the unit row.
+- `<receiving showrunner name>` is the receiving showrunner row.
+
+The script lives at `~/.claude/scripts/production/transfer_unit.py`:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/transfer_unit.py" <plan|apply|verify> <showrunner name> <unit> <receiving showrunner name>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/transfer_unit.py" <plan|apply|verify> <giving showrunner name> <unit> <receiving showrunner name>
 ```
 
 1. Run `plan` to check the unit and the receiving showrunner against their staff rows.
