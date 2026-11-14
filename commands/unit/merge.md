@@ -10,9 +10,11 @@ argument-hint: "[resume]"
 ## Identity and authority
 
 <MergeIdentity>
-Read your unit's staff row and its owning showrunner's staff row.
-Read the owning production's document from its staff `doc`.
-Keep the production's existing destinations and land-order policy.
+Read your unit's staff row and its showrunner's staff row.
+A merge unit serves its showrunner's production and each production attached below that showrunner.
+Each order names its production.
+For each order, read that production's document from its showrunner's staff `doc`.
+Use that production's merge branch, showrunner checkout, merge tests, push, promote, and land-order policy.
 The merge unit type grants no push authority.
 Apply only the cited contracts from `commands/unit/direct.md`; do not enter its phase loop.
 
@@ -29,7 +31,7 @@ Apply <MergeCheckpoint/>, <CIPoint/>, and <PromoteMain/> from `commands/showrunn
 Direct phase modes grant no merge authority.
 Use the unit's staff `worktree` for the director and worker checkout.
 Use that checkout's current branch as the staging branch.
-Read the publication checkout and branch from the document's merge branch and showrunner checkout lines.
+Read the publication checkout and branch from the order's document: its merge branch and showrunner checkout lines.
 Read publication destinations from that document.
 Read current staff paths again after a move or rename.
 The worker's `--cwd` does not replace a wrapper's publication checkout.
@@ -51,19 +53,20 @@ Promotion follows each production's declared destinations.
      --session-dir "$SESSION_DIR" --working-dir "$WORKING_DIR"
    ```
 
-7. Read the production queue, holds, destination tips, and saved operation receipts.
+7. Read each served production's queue, holds, destination tips, and saved operation receipts.
 8. Adopt running operations and their receipts without cancellation during rollout.
 </MergeStartup>
 
 ## Orders
 
 <MergeOrders>
-Accept checkpoint notices only within the owning production's authorization rules.
-Record the source order, unit, phase, exact checkpoint hash, destination, priority, and required gates before dispatch.
-Apply the showrunner's judgments under <MergeCheckpoint/> before execution.
-For sdlc, execute only an explicit showrunner land order; a unit notice only supplies queue information.
+Accept checkpoint notices only within the named production's authorization rules.
+Record the source order, production, unit, phase, exact checkpoint hash, destination, priority, and required gates before dispatch.
+Apply the order showrunner's judgments under <MergeCheckpoint/> before execution.
+Only the showrunner of the named production authorizes its order.
+For sdlc, natedev, and builds, execute only an explicit showrunner land order; a unit notice only supplies queue information.
 For hana, follow the showrunner's checkpoint order, holds, gate scope, and publication instructions.
-Return conflicts to the owning unit through the showrunner.
+Return conflicts to the owning unit through the order's showrunner.
 Request a new exact hash after the unit resolves a conflict.
 </MergeOrders>
 
@@ -71,6 +74,7 @@ Request a new exact hash after the unit resolves a conflict.
 
 <MergeQueue>
 Keep the queue and operation evidence under the existing run directory.
+Run one land at a time across all served productions.
 Permit one mutating merge or promotion operation per destination checkout.
 Serialize operations that publish to the same destination branch, including operations from separate staging checkouts.
 Hold the next merge during validation and smoke checks under <CIPoint/> and <PromoteMain/>.
@@ -151,7 +155,7 @@ For sdlc, the production's merge tests replace CI, smoke, and Mac-run steps.
 ## Bumps
 
 <MergeBumps>
-Apply `commands/showrunner/bump.md` under the owning showrunner's order.
+Apply `commands/showrunner/bump.md` under the order showrunner's bump.
 Dispatch the urgent checkpoint with `--bump` under <MergeCheckpoint/>.
 Keep the existing independent `bump_gate.py` supervisor and its receipt for the pushed tip.
 Require the worker to return that receipt, pushed tip, and gate log.
@@ -198,8 +202,8 @@ Resume pending publication only within the order's destination authorization.
 ## Reporting
 
 <MergeReporting>
-Report to the owning showrunner: unit, phase, checkpoint, result, resulting tip, destination, and evidence paths.
+Report to the order's showrunner: production, unit, phase, checkpoint, result, resulting tip, destination, and evidence paths.
 Include worker and dispatch identities, gate receipts, build artifacts, active holds, and the next authorized order when relevant.
 Use the production's existing reporting schedule.
-Route user reports through the showrunner.
+Route user reports through the order's showrunner.
 </MergeReporting>
