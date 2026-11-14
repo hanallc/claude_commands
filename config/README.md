@@ -47,9 +47,10 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
 `config/models.conf` is the shared registry on both machines; there is no
-local override file. `/default_models` and `/showrunner:effort` edit it atomically,
-then publish a `config(agents): …` commit containing only this path to origin.
-The writer fetches and fast-forwards before editing, and replays all pending
+local override file. `/default_models` and `/showrunner:effort` write the edit live at once,
+then publish a `config(models): …` commit containing only this path to origin.
+A publication that fails keeps the edit live; the notes timer publishes it later.
+The publisher fetches and fast-forwards, and replays all pending
 local row changes on a newer remote tip if a push races another writer (three
 tries). Repeating an interrupted edit finishes its publication, even when the
 requested value is already in the local file. A lost push acknowledgement

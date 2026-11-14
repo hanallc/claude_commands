@@ -163,6 +163,12 @@ A conflict or a merge commit names the commit and preserves main.
 A waiting row is a `config/*.conf` value that differs from HEAD; other edits in those files refuse the move.
 Main synchronization, local promotion, the Mac pull and the registry fast-forward use the same move.
 After publication, the Mac pulls or receives a queued pull.
+`scripts/lib/mac_wake.py` sends a queued pull as soon as the Mac answers.
+Each queue writer and each quota pass call `mac_wake.start()`.
+It starts one detached watcher on natedev while a pull waits; a lock keeps it to one.
+The watcher probes the Mac over ssh and runs `zone.py drain` when the Mac answers.
+`mac_wake_probe_seconds` and `mac_wake_pause_seconds` in `config/live_settings.conf` set its pace.
+The watcher exits when nothing waits. A fixture queue starts no watcher.
 
 `showrunners.timer_scratch` uses the showrunner's fixed staff id to find its timer.
 It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent`, or `TimerScratchFound`.
@@ -550,12 +556,11 @@ Pane labels do not identify a consultation.
   Bare, it prints the configured zone, label, UTC offset, and current time.
   `set NAME` resolves an IANA name, city, or current seasonal label.
   Ambiguous or unknown names exit 2 with the candidate offsets.
-  Publication runs on natedev through `main_publish`, shared with `/tune`.
-  It updates `zone=` while preserving comments, commits only that file, and pushes main.
-  A failed commit keeps the new text when the file already matches HEAD.
-  Otherwise, it restores the previous text and refuses publication.
-  The Mac pulls through the shared helper, and the broadcast reaches both machines.
-  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  It runs on natedev through `live_settings`, the path `/tune` uses.
+  It writes `zone=` live on natedev and on the Mac at once, while preserving comments.
+  The broadcast then reaches both machines. The commit of only that row, the push and the Mac pull follow.
+  A failed publication keeps the zone live and exits 2; the notes timer publishes it later.
+  A failed Mac write queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
   Pending pulls retain each Mac path and source.
   A bare call drains the queue before it returns.
   Promotion runs `zone.py drain --pulled <path>` after a successful pull.

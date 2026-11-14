@@ -22,6 +22,7 @@ from scripts.whoami import agent_notes
 from scripts.whoami import agent_accounts
 from scripts.whoami import five_hour
 from scripts.whoami import note_file
+from scripts.whoami.notes_state_test_support import private_notes_state
 from scripts.accounts import accounts
 
 
@@ -107,7 +108,9 @@ class SessionTableTests(unittest.TestCase):
                 return cls.fromtimestamp(at.timestamp(), tz)
 
         selection = agent_accounts.ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(Path.home() / ".claude", "fixture identity unavailable"), False, (), frozenset())
-        with patch.dict(os.environ, {"HOME": str(root), "AGENT_NOTES_DIR": str(root)}), \
+        with patch.dict(os.environ, {"HOME": str(root), "AGENT_NOTES_DIR": str(root),
+                                     "XDG_STATE_HOME": str(root / "state")}), \
+             private_notes_state(root / "state"), \
              patch.object(roster, "roster", return_value=roster.Roster(local, [])), \
              patch.object(roster, "peer_snapshot", return_value=peer), \
              patch.object(roster, "machine_name", return_value="natedev"), \
