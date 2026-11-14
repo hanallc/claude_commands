@@ -229,5 +229,23 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]
         self.assertEqual((ticket["kind"], ticket["files"], ticket["base"]), ("structure", list(self.sources[:2]), self.tip))
 
+    def test_modules_refill_gives_no_cell_on_a_file_deleted_after_the_synced_tip(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        plan = self.modules_unit()
+        (self.repo / self.sources[1]).unlink()
+        deleted = self.commit()
+        for checkout in (self.style, self.unit, self.root / "modules"):
+            _ = self.git("merge", "-q", "--ff-only", deleted, cwd=checkout)
+        # The ledger reads cells at the synced tip, where the file is still in the tree.
+        self.assertEqual(self.cell_state(structure, self.sources[1]), "open")
+
+        self.assertEqual(style_plan.next_phase("modules", plan, self.repo), style_plan.PhaseWritten("1"))
+        ticket = self.ledger().ticket_open(ticket_owner_id("modules"))[0]
+        self.assertEqual(ticket["base"], deleted)
+        self.assertNotIn(self.sources[1], ticket["files"])
+        self.assertNotIn(self.sources[1], [path for _, path in ticket["cells"]])
+        self.assertIn(self.sources[0], ticket["files"])
+
 if __name__ == "__main__":
     _ = unittest.main()

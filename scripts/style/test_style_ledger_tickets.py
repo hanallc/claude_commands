@@ -2027,7 +2027,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             self.record_removed(ledger, rule, path, "HEAD")
         self.assertEqual(self.cell_rows(ledger, path), [])
 
-    def test_removed_refuses_a_file_deleted_before_the_ticket_start(self) -> None:
+    def test_removed_closes_a_file_deleted_before_the_ticket_start(self) -> None:
         rule = self.rule("read")
         path = self.sources[1]
         (self.repo / path).unlink()
@@ -2037,8 +2037,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [rule])
         ledger.ticket_assign("1", "main")
         self.assertEqual(ledger.ticket_base("1"), base)
-        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: not a file at the ticket's start {base[:7]}$"):
-            self.record_removed(ledger, rule, path, base)
+        # A cell read at a synced tip before the delete closes; the row keeps the commit under the start that deleted it.
+        self.record_removed(ledger, rule, path, base)
+        self.assertEqual(self.cell_rows(ledger, path), [(base, "removed")])
+        self.assertEqual(ledger.unjudged_ticket_cells("1", "HEAD", self.in_worktree), ())
+        never = "crates/alpha/src/never.rs"
+        ledger.ticket_add("2", ticket_owner_id("values"), "read", "names", "crates/alpha", [never], [rule])
+        ledger.ticket_assign("2", "main")
+        self.assertEqual(ledger.ticket_base("2"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(never)}: not a file at the ticket's start {base[:7]}, and no commit deletes it$"):
+            self.record_removed(ledger, rule, never, base, ticket="2")
         # A structure ticket's crate cell is a folder, so its removal is out of scope.
         ledger.ticket_add("3001", ticket_owner_id("modules"), "structure", "names", "crates/alpha", [], [rule])
         ledger.ticket_assign("3001", "main")
