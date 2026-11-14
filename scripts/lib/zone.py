@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo, available_timezones
 
-from scripts.lib import conf as config, live_settings, main_publish, user_zone  # noqa: E402
+from scripts.lib import conf as config, live_settings, mac_wake, main_publish, user_zone  # noqa: E402
 from scripts.lib.main_publish import Refusal as Refusal
 from scripts.lib.main_publish import checkout_of, first_line as _first_line, queue, read_queue
 
@@ -200,6 +200,7 @@ def set_zone(name: str) -> int:
         else:
             since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
             queue(main_publish.PendingMacPull(label=zone, text=text, since=since, reason=mac))
+            _ = mac_wake.start()
             delivered, summary = broadcast(text, here=True)
         print(f"broadcast: {summary}")
     try:

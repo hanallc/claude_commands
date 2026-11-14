@@ -16,8 +16,8 @@ forwards them to natedev. It checks the key and limits, then writes the value
 live on natedev and on the Mac at once. It starts each reader that
 `config/live_settings.conf` names for the file. Then it commits only that row on
 main, pushes, and pulls the Mac. Git fetch, Git push, the Mac write and the Mac
-pull have time limits. A stalled or asleep Mac keeps a queued pull. The
-15-minute sync retries the pull. Run no test or gate. Add no approval step after
+pull have time limits. A stalled or asleep Mac keeps a queued pull. A watcher
+on natedev sends it as soon as the Mac answers. Run no test or gate. Add no approval step after
 the user's go.
 
 If `<key>.<host>` also exists, the script refuses `<key>` and names both lines.
