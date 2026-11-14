@@ -92,9 +92,10 @@ Pending rows replay onto the fetched registry, so a registry commit from another
 `MODELS_CONFIG_PUBLISH=later` writes the shared registry at once under only the registry writer lock.
 It takes no main push lock, so a landing that holds main never delays the edit.
 The quota alert's `edit_registry` uses this mode for its role routing.
+`sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
 It returns `False` at once when another process holds the main push lock.
-Each quota part of the notes timer calls it through `quota_alert.publish_registry()`.
+Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.

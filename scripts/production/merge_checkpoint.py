@@ -32,7 +32,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import change_review, checkpoint_gate
 from scripts.worktree import worktrees
-from scripts.lib import main_publish, main_push_lock, scratch
+from scripts.lib import main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -886,14 +886,20 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
                 _ = good(git(checkout, "push", "origin", "main"), "promote")
                 return PromotionOriginPushed(tip)
             return PromotionAlreadyAtTip(tip)
-        if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
+        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
-        result = git(checkout, "merge", "--ff-only", tip)
-        if result.returncode:
-            status = git(checkout, "status", "--short").stdout.strip()
-            raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or result.stderr.strip()}",
+        contained = not git(checkout, "merge-base", "--is-ancestor", tip, current).returncode
+        if not contained and git(checkout, "merge-base", "--is-ancestor", current, tip).returncode:
+            raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
                        "the showrunner will clear the listed checkout paths and rerun this checkpoint")
+        if not contained:
+            try:
+                waiting_rows.move_to(checkout, tip)
+            except (OSError, UnicodeError) as error:
+                status = git(checkout, "status", "--short").stdout.strip()
+                raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
+                           "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
         unpushed = good(git(checkout, "rev-list", "refs/remotes/origin/main..main"), "promote")
         foreign = good(git(checkout, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
         if foreign:
