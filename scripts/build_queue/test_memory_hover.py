@@ -29,7 +29,8 @@ RAM_FIXTURE: dict[str, object] = {
     "desktop_protection_bytes": 2 * GIB, "other_programs_bytes": 4 * GIB, "smaller_programs_bytes": GIB,
     "smaller_program_count": 5,
     "programs": [{"id": "firefox", "name": "firefox", "bytes": 2 * GIB}, {"id": "zed", "name": "zed", "bytes": GIB}],
-    "kernel_bytes": 3 * GIB, "cache_bytes": 7 * GIB, "unattributed_bytes": 2 * GIB, "missing": [], "agreement": "agree",
+    "kernel_bytes": 3 * GIB, "compressed_swap_bytes": GIB * 3 // 2, "kernel_structures_bytes": GIB,
+    "kernel_counters_bytes": GIB // 2, "kernel_no_counter_bytes": GIB * 3 // 2, "cache_bytes": 7 * GIB, "unattributed_bytes": 2 * GIB, "missing": [], "agreement": "agree",
 }
 SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * GIB, "builds_ci_bytes": GIB,
                                    "outside_bytes": 2 * GIB, "reserve_share_percent": 50}
@@ -545,11 +546,14 @@ function fitLabels() {}
             "programs": ["Other programs · 4.0 GiB",
                          "firefox: 2.0 GiB\nzed: 1.0 GiB\nand 5 smaller programs: 1.0 GiB"],
             "kernel": ["Kernel, measured · 3.0 GiB",
-                       "Measured kernel structures in RAM.\nReclaimable kernel cache appears in the cache block."],
+                       "Compressed swap (zram): 1.5 GiB.\nSlab, stacks and page tables: 1.0 GiB.\n" +
+                       "Other kernel counters: 0.5 GiB.\n" +
+                       "Reclaimable kernel cache appears in the cache block."],
             "cache": ["File and kernel cache · 7.0 GiB", "Estimated cache outside available RAM.\n" +
                       "Includes file cache and reclaimable kernel cache.\nPrograms can close while their file cache remains."],
-            "unattributed": ["Not attributed · 2.0 GiB",
-                             "RAM that the readings do not explain.\nNo program name is available for this amount."],
+            "unattributed": ["Not attributed · 2.0 GiB", "RAM that the readings do not explain.\n" +
+                             "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
+                             "Memory with no program name: 0.5 GiB."],
             "cap": ["Queue cap · 40.0 GiB", "Limit for queued builds and hana CI.\nQueued use counted: 3.0 GiB.\n" +
                     "CI use counted: 2.0 GiB.\nReservations count toward this limit."],
             "budget": ["RAM budget · 64.0 GiB", "Blocks divide this machine's usable RAM.\n" +
@@ -562,10 +566,11 @@ function fitLabels() {}
         ram = {**RAM_FIXTURE, "available_bytes": 5 * GIB, "room_bytes": 0, "shortfall_bytes": 3 * GIB,
                "swap_covered_bytes": GIB, "build_covered_bytes": 0, "swap_missing_bytes": GIB,
                "build_missing_bytes": 6 * GIB, "rust_analyzer_bytes": 0, "sccache_bytes": 20 * MIB,
-               "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"}}
+               "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"},
+               "kernel_no_counter_bytes": 0}
         tips = cast(list[list[str]], self.page_expression(
             "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('builds', data)," +
-            " ramAmount(0)]", {"ram": ram}))
+            " ramAmount(0), tipText('unattributed', data)]", {"ram": ram}))
         self.assertEqual(tips[0], ["Shortfall · 3.0 GiB",
                                    "Swap reserve missing: 1.0 GiB.\nBuild reservation missing: 6.0 GiB."])
         self.assertEqual(tips[1], ["Reserved RAM · 0.0 GiB", "RAM held for running builds and accepted work.\n" +
@@ -573,6 +578,8 @@ function fitLabels() {}
         self.assertEqual(tips[2], ["Kernel, measured · unavailable",
                                    "The latest reading is unavailable.\nThis amount is unknown."])
         self.assertEqual(tips[3][1], "Queued builds: 3.0 GiB.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
+        self.assertEqual(tips[5], ["Not attributed · 2.0 GiB",
+                                   "RAM that the readings do not explain.\nNo program name is available for this amount."])
         self.assertEqual(tips[4], "0.0 GiB")
         empty = {**RAM_FIXTURE, "builds_bytes": 0, "queued_builds_bytes": 0, "rust_analyzer_bytes": 0,
                  "sccache_bytes": 0, "other_build_tools_bytes": 0}

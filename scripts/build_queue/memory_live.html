@@ -457,12 +457,18 @@ const TIPS = {
   programs: (d) => [`Other programs · ${ramAmount(d.ram.other_programs_bytes)}`, lines(
     ...d.ram.programs.map(program => `${program.name}: ${ramAmount(program.bytes)}`),
     d.ram.smaller_program_count ? `and ${d.ram.smaller_program_count} smaller programs: ${ramAmount(d.ram.smaller_programs_bytes)}` : "")],
-  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes,
-    "Measured kernel structures in RAM.\nReclaimable kernel cache appears in the cache block."),
+  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines(amountLines([
+    ["Compressed swap (zram)", d.ram.compressed_swap_bytes], ["Slab, stacks and page tables", d.ram.kernel_structures_bytes],
+    ["Other kernel counters", d.ram.kernel_counters_bytes]]),
+    "Reclaimable kernel cache appears in the cache block.")),
   cache: (d) => measuredTip("File and kernel cache", d.ram.cache_bytes,
     "Estimated cache outside available RAM.\nIncludes file cache and reclaimable kernel cache.\nPrograms can close while their file cache remains."),
-  unattributed: (d) => [`Not attributed · ${ramAmount(d.ram.unattributed_bytes)}`,
-    "RAM that the readings do not explain.\nNo program name is available for this amount."],
+  unattributed: (d) => [`Not attributed · ${ramAmount(d.ram.unattributed_bytes)}`, d.ram.kernel_no_counter_bytes > 0
+    ? lines("RAM that the readings do not explain.",
+      `Kernel memory with no counter, such as driver memory: ${ramAmount(d.ram.kernel_no_counter_bytes)}.`,
+      optional(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes,
+        `Memory with no program name: ${ramAmount(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes)}.`))
+    : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
     "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
     optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`), "Reservations count toward this limit.")],

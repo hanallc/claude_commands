@@ -139,6 +139,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
@@ -1541,7 +1542,10 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(queue_view.leftover_age(minutes), text)
 
     def ram_fixture(self, *, meminfo: bool = True) -> None:
-        """Write private slice, program and meminfo readings: agents 5 GiB, desktop 1.5 GiB, Chrome 3 GiB, system 1 GiB."""
+        """Write private slice, program and kernel readings: agents 5 GiB, desktop 1.5 GiB, Chrome 3 GiB, system 1 GiB.
+
+        The kernel parts are zram 3 GiB, structures 2 GiB and counters 1 GiB; 1 GiB has no counter.
+        """
         gib = admission_records.GIB
         user = self.root / "user"
         write_user_slices(user)
@@ -1552,7 +1556,13 @@ process.stdout.write(JSON.stringify({
             _ = (folder / "memory.stat").write_text(f"anon {anonymous}\nshmem 0\n")
         fields = {"MemTotal": 64 * gib, "MemFree": 10 * gib, "MemAvailable": 20 * gib, "Buffers": gib,
                   "Cached": 12 * gib, "Shmem": gib, "KReclaimable": 2 * gib, "SUnreclaim": gib,
-                  "KernelStack": gib // 4, "PageTables": gib * 3 // 4}
+                  "KernelStack": gib // 4, "PageTables": gib * 3 // 4, "SecPageTables": 0, "Percpu": gib // 4,
+                  "VmallocUsed": gib // 2, "Active(anon)": 10 * gib, "Inactive(anon)": 10 * gib, "Active(file)": 6 * gib,
+                  "Inactive(file)": 19 * gib, "Unevictable": 0}
+        zram = self.root / "sys" / "block" / "zram0"
+        zram.mkdir(parents=True, exist_ok=True)
+        _ = (zram / "mm_stat").write_text(f"{9 * gib} {2 * gib} {3 * gib} 0 {3 * gib} 0 0 0 0\n")
+        _ = (self.root / "proc" / "vmstat").write_text(f"nr_free_pages 1\nnr_memmap_pages {gib // 2 // os.sysconf('SC_PAGE_SIZE')}\n")
         if not meminfo:
             fields = {"MemTotal": 64 * gib}
         _ = (self.root / "proc" / "meminfo").write_text("".join(f"{name}: {amount // 1024} kB\n" for name, amount in fields.items()))
@@ -1589,12 +1599,32 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
                 self.assertEqual((blocks["smaller_program_count"], blocks["smaller_programs_bytes"]), (1, gib))
                 self.assertEqual(blocks["other_programs_bytes"], 4 * gib)
-                self.assertEqual((blocks["kernel_bytes"], blocks["cache_bytes"]), (2 * gib, 4 * gib))
+                self.assertEqual((blocks["kernel_bytes"], blocks["cache_bytes"]), (6 * gib, 4 * gib))
+                self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
+                                  blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
+                                 (3 * gib, 2 * gib, gib, gib))
                 shown = (blocks["builds_bytes"] + blocks["ci_bytes"] + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
-                         + blocks["other_programs_bytes"] + 2 * gib + 4 * gib + blocks["unattributed_bytes"])
+                         + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
                 self.assertEqual(shown, 64 * gib)
                 self.assertEqual((blocks["missing"], blocks["agreement"]), ([], "agree"))
+
+    def test_the_kernel_parts_read_zram_and_the_counters(self) -> None:
+        gib = admission_records.GIB
+        self.ram_fixture()
+        values = memory_feed.meminfo_bytes()
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(3 * gib, 2 * gib, gib, gib))
+        mm_stat = self.root / "sys" / "block" / "zram0" / "mm_stat"
+        mm_stat.unlink()
+        mm_stat.parent.rmdir()
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(0, 2 * gib, gib, 4 * gib))
+        mm_stat.parent.mkdir()
+        _ = mm_stat.write_text("9\n")
+        kernel = memory_feed.kernel_ram(values)
+        self.assertIsInstance(kernel.total, admission_records.ReadingUnavailable)
+        self.assertEqual(kernel.no_counter, 0)
+        (self.root / "proc" / "vmstat").unlink()
+        self.assertIsInstance(memory_feed.kernel_ram(values).counters, admission_records.ReadingUnavailable)
 
     def test_ram_blocks_name_a_missing_reading_and_a_disagreement(self) -> None:
         gib = admission_records.GIB

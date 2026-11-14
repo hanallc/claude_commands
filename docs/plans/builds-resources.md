@@ -2594,3 +2594,12 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/mac_test/cargo_gate/gate.zsh`.
 
 **Gotchas:** zsh refuses `set -m` without a terminal, so the work shares the SSH session group and the watcher excludes its own pid. A non-interactive zsh gives a background list `/dev/null` as input; the wrapper copies the SSH input to fd 3 first. A FIFO pool (not steve) does not take back the tokens of a holder that a signal ends. In `test_mac_run`, `(z)` reads each wrapper newline as a `;` word.
+
+### Phase 127 — The memory bar names compressed swap and the kernel rest  · status: done
+
+Builds asked what the 8.2 GiB "Not attributed" holds. Measured on natedev (16:03 EST): zram 5.45 GiB, memmap 0.36 GiB, other kernel counters 0.57 GiB, kernel memory with no counter about 1.7 GiB.
+
+1. The feed reads the zram compressed pages (`mm_stat` field 3 of each `/sys/block/zram*`), `nr_memmap_pages`, `SecPageTables`, `Percpu` and `VmallocUsed` (less `KernelStack`, which VMAP_STACK puts in vmalloc).
+2. "Kernel, measured" holds them as three parts: compressed swap, kernel structures, and other kernel counters. Its tooltip names each part.
+3. "Not attributed" names the kernel memory with no counter (MemTotal minus every meminfo and vmstat counter) and the rest.
+4. The bar keeps 11 blocks. zram pages are used memory outside MemAvailable, so they are not inside "RAM for swap".

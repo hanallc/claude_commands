@@ -123,6 +123,7 @@ LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 PROC = Path("/proc")
+SYS_BLOCK = Path("/sys/block")
 CGROUP = CI_CGROUP.parents[1]
 SWAP_NAMES = {
     "agents": "agent sessions ({count})", "apps": "other apps: {app}",
@@ -1120,6 +1121,10 @@ class RamBlocks(TypedDict):
     smaller_programs_bytes: int
     smaller_program_count: int
     kernel_bytes: RamReading
+    compressed_swap_bytes: RamReading
+    kernel_structures_bytes: RamReading
+    kernel_counters_bytes: RamReading
+    kernel_no_counter_bytes: int
     cache_bytes: RamReading
     unattributed_bytes: int
     missing: list[str]
@@ -1142,6 +1147,10 @@ RAM_NAMES = {
 }
 RUST_ANALYZER = "rust-analyzer"
 KERNEL_FIELDS = ("SUnreclaim", "KernelStack", "PageTables")
+KERNEL_COUNTER_FIELDS = ("SecPageTables", "Percpu", "VmallocUsed")
+# MemTotal less these fields and the kernel parts leaves the kernel memory that no counter names.
+COUNTED_FIELDS = ("MemFree", "Active(anon)", "Inactive(anon)", "Active(file)", "Inactive(file)",
+                  "Unevictable", "KReclaimable")
 CACHE_FIELDS = ("Buffers", "Cached", "Shmem", "KReclaimable", "MemAvailable", "MemFree")
 
 
@@ -1218,6 +1227,67 @@ def kernel_reading(values: Mapping[str, int] | admission_records.ReadingUnavaila
     if isinstance(fields, admission_records.ReadingUnavailable):
         return fields
     return sum(fields[name] for name in KERNEL_FIELDS)
+
+
+def compressed_swap_reading() -> RamReading:
+    """Read the RAM that holds compressed swap: mem_used_total, field 3 of each zram device mm_stat."""
+    total = 0
+    for path in sorted(SYS_BLOCK.glob("zram*/mm_stat")):
+        try:
+            total += int(path.read_text().split()[2])
+        except (OSError, ValueError, IndexError) as error:
+            return admission_records.ReadingUnavailable(f"{path}: {error}")
+    return total
+
+
+def memmap_reading() -> RamReading:
+    """Read the page descriptors allocated after boot, from /proc/vmstat nr_memmap_pages."""
+    path = PROC / "vmstat"
+    try:
+        pages = dict(line.split() for line in path.read_text().splitlines())["nr_memmap_pages"]
+        return int(pages) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, KeyError) as error:
+        return admission_records.ReadingUnavailable(f"{path}: {error!r}")
+
+
+def kernel_counters_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
+    """Measure the other counted kernel memory: page descriptors, secondary page tables, per-CPU and vmalloc."""
+    fields = meminfo_fields(values, (*KERNEL_COUNTER_FIELDS, "KernelStack"))
+    if isinstance(fields, admission_records.ReadingUnavailable):
+        return fields
+    memmap = memmap_reading()
+    if isinstance(memmap, admission_records.ReadingUnavailable):
+        return memmap
+    # With VMAP_STACK the kernel stacks are vmalloc pages; KernelStack already counts them.
+    vmalloc = max(0, fields["VmallocUsed"] - fields["KernelStack"])
+    return memmap + fields["SecPageTables"] + fields["Percpu"] + vmalloc
+
+
+@dataclass(frozen=True)
+class KernelRam:
+    """Hold the three measured kernel parts and the kernel memory that no counter names."""
+    compressed_swap: RamReading
+    structures: RamReading
+    counters: RamReading
+    no_counter: int
+
+    @property
+    def total(self) -> RamReading:
+        parts = (self.compressed_swap, self.structures, self.counters)
+        unavailable = next((part for part in parts if isinstance(part, admission_records.ReadingUnavailable)), None)
+        return unavailable if unavailable is not None else sum(known_bytes(part) for part in parts)
+
+
+def kernel_ram(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> KernelRam:
+    """Measure the kernel parts; without every reading, the no-counter amount is 0."""
+    structures, counters, compressed = kernel_reading(values), kernel_counters_reading(values), compressed_swap_reading()
+    fields = meminfo_fields(values, ("MemTotal", *COUNTED_FIELDS))
+    no_counter = 0
+    if isinstance(fields, Mapping) and all(isinstance(part, int) for part in (structures, counters, compressed)):
+        counted = sum(fields[name] for name in COUNTED_FIELDS)
+        no_counter = max(0, fields["MemTotal"] - counted - known_bytes(structures) - known_bytes(counters)
+                         - known_bytes(compressed))
+    return KernelRam(compressed, structures, counters, no_counter)
 
 
 def cache_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
@@ -1304,7 +1374,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
     agents = slice_program_bytes(gate.agents_memory())
     desktop = slice_program_bytes(gate.desktop_memory())
     values = meminfo_bytes()
-    kernel, cache = kernel_reading(values), cache_reading(values)
+    kernel, cache = kernel_ram(values), cache_reading(values)
     ranked = sorted(((name, amount) for name, amount in other_programs().items() if amount > 0),
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
@@ -1313,10 +1383,10 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
     named = (builds + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
-             + known_bytes(kernel) + known_bytes(cache))
+             + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
     readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
-                (RAM_NAMES["kernel"], kernel), (RAM_NAMES["cache"], cache))
+                (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
     missing = [f"{name}: {value.reason}" for name, value in readings
                if isinstance(value, admission_records.ReadingUnavailable)]
     return {
@@ -1333,7 +1403,9 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
         "other_programs_bytes": other_programs_bytes,
         "smaller_programs_bytes": sum(amount for _, amount in smaller), "smaller_program_count": len(smaller),
-        "kernel_bytes": kernel, "cache_bytes": cache, "unattributed_bytes": unattributed, "missing": missing,
+        "kernel_bytes": kernel.total, "compressed_swap_bytes": kernel.compressed_swap,
+        "kernel_structures_bytes": kernel.structures, "kernel_counters_bytes": kernel.counters,
+        "kernel_no_counter_bytes": min(kernel.no_counter, max(0, unattributed)), "cache_bytes": cache, "unattributed_bytes": unattributed, "missing": missing,
         "agreement": "disagree" if unattributed < 0 or known_bytes(cache) < 0 else "agree",
     }
 
