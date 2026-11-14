@@ -673,5 +673,154 @@ class ControlTests(CostFixture):
         self.assertNotIn(' -', missing)
 
 
+
+class HoursCheckTests(CostFixture):
+    """Billed Spot hours against the cost ledger's box hours, per type, region and UTC day."""
+    clock: TestClock = TestClock()
+    home: str = ''
+    other: str = ''
+    size: str = ''
+    limit: Decimal = Decimal(0)
+    reservations: list[ledger.GateReservation] = []
+    bills: list[ledger.ChargeRead] = []
+    notices: list[tuple[str, push_texts.RenderedPush]] = []
+    notice_accepted: bool = True
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = TestClock()
+        configuration = conf.read(self.settings)
+        self.home = configuration.text('region')
+        self.other = next(region for region in ledger.REGION_USAGE_PREFIXES if region != self.home)
+        self.size = conf.read_or_repository('cloud_gate').words('instance_types')[0]
+        self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
+        self.reservations, self.bills, self.notices = [], [], []
+        self.notice_accepted = True
+
+        def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
+            return ledger.LedgerEvidence(gate_reservations=list(self.reservations))
+
+        def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
+            return tuple(self.bills)
+
+        _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_snapshot', evidence))
+        _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_bills', bills))
+
+    def day(self, back: int) -> datetime:
+        """Midnight UTC, back days before the clock's day."""
+        today = datetime.fromtimestamp(self.clock.now, UTC).date()
+        return datetime(today.year, today.month, today.day, tzinfo=UTC) - timedelta(days=back)
+
+    def gate(self, size: str, region: str, start: datetime, seconds: int,
+             state: ledger.GateTerminated | ledger.GateAbsent | ledger.GateRunning | None = None) -> None:
+        at = int(start.timestamp())
+        self.reservations.append(ledger.GateReservation(f'gate-{len(self.reservations)}', at, at + seconds,
+            Decimal(1), Decimal(0), state or ledger.GateTerminated(at + seconds, 'i-fixture'),
+            instance_type=size, region='' if region == self.home else region))
+
+    def bill(self, day: datetime, hours: dict[tuple[str, str], Decimal]) -> None:
+        start = int(day.timestamp())
+        self.bills.append(ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
+            Decimal(1), Decimal(0), Decimal(0), tuple(ledger.UsageTypeCost(
+                ledger.REGION_USAGE_PREFIXES[region][-1] + '-SpotUsage:' + size, Decimal(1), quantity, 'Hrs')
+                for (size, region), quantity in hours.items())))
+
+    def checks(self) -> dict[run_cost.DayKey, run_cost.HoursCheck]:
+        end = datetime.fromtimestamp(self.clock.now, UTC)
+        days = conf.read(self.settings).whole('run_cost_days')
+        return run_cost.day_hours_checks(ledger.CostLedger(self.state), end - timedelta(days=days), end, self.home,
+                                         (self.size,), self.limit)
+
+    def notify(self, key: str, push: push_texts.RenderedPush, _timeout: float) -> bool:
+        self.notices.append((key, push))
+        return self.notice_accepted
+
+    def notice_run(self) -> int:
+        with redirect_stderr(StringIO()):
+            return aws_target.hours_gap_notices(self.settings, self.state, clock=self.clock, notify=self.notify)
+
+    def test_box_hours_split_at_utc_midnight_and_count_only_confirmed_gates(self) -> None:
+        two, one = self.day(2), self.day(1)
+        # Half an hour before and after midnight, then one more hour; an open, an absent and another type do not count.
+        self.gate(self.size, self.home, one - timedelta(minutes=30), 3600)
+        self.gate(self.size, self.home, one + timedelta(hours=2), 3600)
+        self.gate(self.size, self.home, one + timedelta(hours=4), 3600, ledger.GateRunning('i-fixture'))
+        self.gate(self.size, self.home, one + timedelta(hours=6), 3600, ledger.GateAbsent(int(one.timestamp())))
+        self.gate(self.size + 'x', self.home, one, 3600)
+        boxes = run_cost.box_hours(ledger.CostLedger(self.state), two, self.day(0), self.home)
+        self.assertEqual(boxes, {(self.size, self.home, two.date().isoformat()): Decimal('0.5'),
+                                 (self.size, self.home, one.date().isoformat()): Decimal('1.5'),
+                                 (self.size + 'x', self.home, one.date().isoformat()): Decimal(1)})
+
+    def test_day_and_window_checks_compare_bill_hours_with_box_hours(self) -> None:
+        two, one = self.day(2), self.day(1)
+        self.gate(self.size, self.home, two, 3600)
+        self.gate(self.size, self.home, one, 3600)
+        self.gate(self.size, self.other, one, 1800)
+        within, above = Decimal(1) + self.limit / 2, Decimal(1) + self.limit * 2
+        self.bill(two, {(self.size, self.home): within})
+        # The second day bills the home region above the limit and the other region not at all.
+        self.bill(one, {(self.size, self.home): above})
+        self.gate(self.size, self.home, self.day(0), 600)
+        checks = self.checks()
+        self.assertEqual(checks[self.size, self.home, two.date().isoformat()],
+                         run_cost.HoursCheck(within, Decimal(1), self.limit / 2, False))
+        self.assertEqual(checks[self.size, self.home, one.date().isoformat()],
+                         run_cost.HoursCheck(above, Decimal(1), self.limit * 2, True))
+        self.assertEqual(checks[self.size, self.other, one.date().isoformat()],
+                         run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
+        # Today has no bill read yet, and the window ends at today's midnight like the bill split.
+        self.assertNotIn((self.size, self.home, self.day(0).date().isoformat()), checks)
+        end = datetime.fromtimestamp(self.clock.now, UTC)
+        window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
+                                       (self.size,), self.limit)
+        self.assertEqual(window[self.size, self.home],
+                         run_cost.hours_check(within + above, Decimal(2), self.limit))
+        self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
+
+    def test_billed_hours_without_a_gate_box_are_over_and_unread_days_have_no_bill(self) -> None:
+        one = self.day(1)
+        self.bill(one, {(self.size, self.home): Decimal(1)})
+        self.gate(self.size, self.other, self.day(2), 3600)
+        checks = self.checks()
+        self.assertEqual(checks[self.size, self.home, one.date().isoformat()],
+                         run_cost.HoursCheck(Decimal(1), Decimal(0), None, True))
+        self.assertEqual(checks[self.size, self.other, self.day(2).date().isoformat()],
+                         run_cost.HoursCheck(None, Decimal(1), None, False))
+
+    def test_gap_sends_one_notice_per_type_region_and_day(self) -> None:
+        one = self.day(1)
+        self.gate(self.size, self.home, one, 3600)
+        self.gate(self.size, self.other, one, 3600)
+        self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2, (self.size, self.other): Decimal(1)})
+        self.assertEqual(self.notice_run(), 0)
+        key = f'aws-hours-gap:{self.size}:{self.home}:{one.date().isoformat()}'
+        self.assertEqual([sent for sent, _push in self.notices], [key])
+        push = self.notices[0][1]
+        self.assertEqual(push.id, 'aws.hours_gap')
+        self.assertIn(f'AWS billed {Decimal(1) + self.limit * 2:.2f} h of {self.size} Spot in {self.home}', push.body)
+        self.assertIn(f'The gap is {self.limit * 2:.0%}, above the {self.limit:.0%} limit.', push.body)
+        # The next hourly run sends nothing again for the same day.
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
+        one = self.day(1)
+        self.gate(self.size, self.home, one, 3600)
+        self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
+        self.notice_accepted = False
+        self.assertEqual(self.notice_run(), 1)
+        self.notice_accepted = True
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notices), 2)
+        claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(len(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed']), 1)
+        # After the window passes the day, its claim is dropped.
+        self.clock.advance((conf.read(self.settings).whole('run_cost_days') + 1) * 86400)
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+
+
 if __name__ == '__main__':
     _ = unittest.main()
