@@ -155,7 +155,7 @@ For sdlc, the production's merge tests replace CI, smoke, and Mac-run steps.
 ## Bumps
 
 <MergeBumps>
-Apply `commands/showrunner/bump.md` under the order showrunner's bump.
+Apply `commands/showrunner/bump.md` when the order's showrunner bumps a checkpoint.
 Dispatch the urgent checkpoint with `--bump` under <MergeCheckpoint/>.
 Keep the existing independent `bump_gate.py` supervisor and its receipt for the pushed tip.
 Require the worker to return that receipt, pushed tip, and gate log.
