@@ -603,3 +603,17 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/direct/phase_reservation.py` — `changed_since_baseline` and the module docstring
 - `scripts/direct/test_phase_reservation.py` — `test_record_active_claims_only_the_paths_a_merge_resolved_by_hand`
+
+### Phase 27 — Stall-watch sees a permission prompt on the screen  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `stall_watch.prompt_on_screen` finds a `PROMPT_QUESTION` line with a `PROMPT_OPTION` answer (`❯ 1. Yes`) under it in the pane's bottom `PROMPT_LINES` lines.
+- `watch_pass` treats a pane that shows one as blocked, whatever herdr's state is. The pass sends no bump and alerts on the usual prompt timing from the pending call's time.
+- rca 261114-1 cause: herdr reads the dialog as idle when an input box shows under it (`live_prompt_box`), so stall-watch saw the prompt only when herdr first reported it blocked.
+
+**Files:**
+- `scripts/production/stall_watch.py` — `prompt_on_screen`, `PROMPT_OPTION` and the blocked decision in `watch_pass`
+- `scripts/production/test_stall_watch.py` — `test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass`; four tests that end a prompt clear it from the screen
