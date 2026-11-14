@@ -129,7 +129,7 @@ def _perform(part: Part) -> int:
                 print(line)
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
-            from scripts.lib import live_settings
+            from scripts.lib import live_settings, mac_wake
             from scripts.whoami import quota_alert
             from scripts.whoami import agent_accounts, usage_store
             # Quota uses the notes' saved usage, never a second live account probe.
@@ -143,7 +143,7 @@ def _perform(part: Part) -> int:
             readings = quota_alert.codex_alert_pass(workers, reports, observed)
             for line in [*agent_notes.watch_usage(reports, selection, workers, readings),
                          *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings),
-                         *live_settings.publish_waiting()]:
+                         *live_settings.publish_waiting(), *mac_wake.start()]:
                 print(line)
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
