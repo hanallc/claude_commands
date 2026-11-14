@@ -86,16 +86,35 @@ def write_config_fault(path: Path, source: str) -> int:
     return path.write_text("\n".join(lines) + "\n")
 
 
+class ConfigFixtureRefused(ValueError):
+    """The configuration folder is not a private folder that only the test owns."""
+
+
 def commit_config_fixture(path: Path) -> None:
-    """Give the private configuration a known-good git revision for fault tests."""
+    """Give the private configuration a known-good git revision for fault tests.
+
+    The folder must be under the temporary root and outside every other git repository.
+    No caller GIT_* variable reaches git, so the commit can go only to the folder's own repository.
+    """
     import subprocess
+    import tempfile
     from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-    environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    folder = path.parent.resolve()
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if folder == temporary_root or not folder.is_relative_to(temporary_root):
+        raise ConfigFixtureRefused(f"{folder} is not a private folder under {temporary_root}")
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment |= {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    enclosing = subprocess.run(["git", "-C", str(folder), "rev-parse", "--show-toplevel"], capture_output=True,
+                               text=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
+    if enclosing.returncode == 0 and Path(enclosing.stdout.strip()).resolve() != folder:
+        raise ConfigFixtureRefused(f"{folder} is inside the git repository {enclosing.stdout.strip()}")
+    environment |= {"GIT_DIR": str(folder / ".git"), "GIT_WORK_TREE": str(folder)}
     for arguments in (("init", "-q"), ("config", "user.name", "Config fixture"),
                       ("config", "user.email", "fixture@example.invalid"),
                       ("add", path.name), ("commit", "-qm", "known good configuration")):
-        _ = subprocess.run(["git", "-C", str(path.parent), *arguments], check=True,
+        _ = subprocess.run(["git", "-C", str(folder), *arguments], check=True,
                            capture_output=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
 
 
