@@ -17,12 +17,14 @@ from scripts.lib import conf, conf_reads, main_publish
 from scripts.lib.conf import Unusable, check
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_hold.override_guard import refuse_overrides
+from scripts.whoami import agent_accounts
 
 SUBJECT = "tune("
 FETCH_LIMIT = main_publish.CommandTimeLimit(10)
 PUSH_LIMIT = main_publish.CommandTimeLimit(10)
 MAC_PULL_LIMIT = main_publish.CommandTimeLimit(20)
 FORWARD_LIMIT = main_publish.CommandTimeLimit(55)
+STAGED_KEY = ("accounts", "codex_credit_accounts")
 
 
 class RequestedValueChange(argparse.Namespace):
@@ -87,6 +89,21 @@ def change(args: RequestedValueChange) -> int:
     source = conf.path(args.file).resolve()
     _ = conf.editable_line(args.file, args.key)
     check(args.file, args.key, args.value)
+    if (args.file, args.key) != STAGED_KEY:
+        return _commit_change(args, source)
+    # Credits cost money: the value is live before the wait for main.
+    agent_accounts.stage_credit_accounts(args.value)
+    print(f"live now: {args.key}={args.value}; main follows")
+    try:
+        published = _commit_change(args, source)
+    except main_publish.Refusal:
+        print(f"tune: {args.key}={args.value} stays live; main does not have it", file=sys.stderr)
+        raise
+    agent_accounts.clear_staged_credit_accounts(args.value)
+    return published
+
+
+def _commit_change(args: RequestedValueChange, source: Path) -> int:
     checkout = main_publish.checkout_of(source)
     main_publish.ready(checkout, fetch_limit=FETCH_LIMIT)
     # Fetch can advance the file. Select the exact key again before the edit.
