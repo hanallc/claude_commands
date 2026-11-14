@@ -2610,9 +2610,14 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 128 — One GPU test slot for hana tests on natedev  · status: done
 
-hana had 5 GPU OutOfMemory failures on natedev when GPU tests from more than one run overlapped. Builds approved one GPU test slot (14:05 EST); queue agreed the shape the same day.
+#### As-built
 
-1. New keys in `config/build_admission.conf` `[memory]`: `gpu_test_slots=1`, `gpu_test_repositories=hana`. They go into `AdmissionPolicy.gpu_tests`.
-2. A GPU test step is a local admission whose repository name is in `gpu_test_repositories` and whose step runs tests (nextest, test, t, targeted-test, merge-gate).
-3. The slot is the admission reservation itself. Used = admitted local reservations that are GPU test steps. Cloud gates, Mac placements and waiters do not count. The slot ends with the reservation, at release or at owner exit. No file, no lock, no signal handler.
-4. `admission_walk` holds a GPU test waiter while the slots are used. The cause is `GpuSlotWait(used, slots)`, in the gate head decision, so the explanation, the queue view and the Builds page show it. The head keeps its protected need, so no step passes it on memory (no backfill).
+- `config/build_admission.conf` `[memory]` has `gpu_test_slots=1` and `gpu_test_repositories=hana`. `read_memory_config` puts them in `AdmissionPolicy.gpu_tests` (`GpuTestSlots`); the default `NO_GPU_TESTS` names no repository.
+- `GpuTestSlots.holds(repository, step)` is true for a listed repository and a step in `GPU_TEST_STEPS` (nextest, test, t, targeted-test, merge-gate).
+- `admission_walk` counts the admitted local reservations that hold a slot (`gpu_test_reservation`: the `queue_waiter` repository name, else `repo`). It adds each GPU test step it admits in the same pass. Cloud reservations, Mac placements and waiters do not count. The slot ends with the reservation; there is no file, lock or signal handler.
+- A held GPU test step gets `AdmissionDecision.gpu = GpuSlotWait(used, slots)` and cannot start. The head keeps its protected need, so no step passes it on memory. A head override does not lift the hold.
+- `queue_wait_reason` gives pressure first, then `GpuSlotWait`. The queue view shows " GPU test slot"; the head text is "waiting for the GPU test slot (U of S in use)"; the Builds page status code `gpu_slot` says "A GPU test waits: another GPU test holds the GPU test slot."; `head_after_steps_end` names "GPU test slot".
+
+**Files:** `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf`, `scripts/build_queue/admission_records.py`, `scripts/lint/memory_admit.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/build_queue/queue_view.py`, and their tests.
+
+**Gotchas:** a hana test run by plain cargo (not nextest) gets the step name from the caller; queue names the step from the cargo subcommand after #93 reaches main. The lint fixture config lists hana, so `admission_policy_fixture()` has the slot on.
