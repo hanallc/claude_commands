@@ -755,6 +755,14 @@ done
             "TEST_RUNNER_BUSY_REASON": "disk"})
         self.addCleanup(fixture.stop_verify, process)
         fixture.wait_for_memory_wait(process)
+        def recorded_disk_exclusion() -> bool:
+            for path in (fixture.root / "verify-steps").glob("*.json"):
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                if row.get("mac_disk_exclusions") == ["mac"]:
+                    return True
+            return False
+
+        fixture.wait_until(recorded_disk_exclusion, "the recorded Mac disk exclusion", (process,))
         records = list((fixture.root / "verify-steps").glob("*.json"))
         self.assertEqual(len(records), 1)
         with mock.patch.dict(os.environ, {
@@ -933,7 +941,7 @@ done
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("file read only")):
             line = mac_idle_alert.alert_line(path, 1180, ZoneInfo("UTC"))
         self.assertLess(time.monotonic() - started, 0.05)
-        self.assertIn("Blocked by research since 00:16 (run)", line or "")
+        self.assertIn("MAC BLOCKED by research since 00:16 (run): ", line or "")
         self.assertNotIn("\u001b", line or "")
         invalid_values: tuple[tuple[str, object], ...] = (("version", True), ("written", float("nan")), ("since", "1000"),
                                ("changed", None), ("changed", True), ("changed", "1000"), ("changed", -1),
