@@ -32,40 +32,10 @@ The showrunner's order on 2026-11-14 09:0x EST (the user saw the owner first): "
 
 ## Phases
 
-### Phase 1 — No worker starts in no-worker mode  · status: todo
+### Phase 1 — No worker starts in no-worker mode  · status: done
 
-#### Work Order
-
-**Goal:** while no-worker mode is on, no assignment or start command starts a worker, and a refill tells the director to do its tickets directly.
-
-**Spec:**
-1. **Reader.** New leaf `scripts/whoami/worker_mode.py` holds `state_path()`, `no_worker_mode()` and the one refusal text `NO_WORKER_START`. `quota_alert` and every caller read the mode there, so `worker_panes.py` has no import cycle.
-2. **Dispatch.** `assign.py main()` refuses with exit 2 before it writes run state when `worker_mode.no_worker_mode()` is on.
-3. **Start commands.** `worker.py add` and `worker.py assign`, and `worker_panes.py start-or-resume`, refuse with exit 2 in the mode.
-4. **Refill.** In the mode, `restore_ticket_worker` restores the run and the phase records, sends no assignment, and prints `<slot>: <refusal text>`.
-5. **Tests** set `XDG_STATE_HOME` to a test folder. Write the refill test and the `assign.sh` test first, and see them fail.
-6. **Docs.** Update `docs/as-built/shutdown-and-restart.md`, `docs/as-built/accounts.md` and `docs/direct/no_worker_mode.md` in the same commit.
-
-**Files:**
-- `scripts/whoami/worker_mode.py` (new)
-- `scripts/whoami/quota_alert.py`
-- `scripts/lib/resume_message.py`
-- `scripts/agents/shutdown.py`
-- `scripts/agents/test_shutdown_status.py`
-- `scripts/whoami/test_quota_alert.py`
-- `scripts/agents/test_restart.py`
-- `scripts/agents/test_stop_resume.py`
-- `scripts/lib/test_relaunch.py`
-- `scripts/direct/assign.py`
-- `scripts/production/worker.py`
-- `scripts/herdr/worker_panes.py`
-- `scripts/style/style_plan.py`
-- `scripts/style/test_style_plan_checkpoint_refill.py`
-- `scripts/direct/test_assign_gate.py`
-- `scripts/production/test_worker.py`
-- `scripts/herdr/test_worker_panes.py`
-- `docs/as-built/shutdown-and-restart.md`
-- `docs/as-built/accounts.md`
-- `docs/direct/no_worker_mode.md`
-
-**Acceptance:** a refill with `--session-dir` in the mode starts no worker and prints the refusal line. `assign.sh`, `worker.py add` and `worker.py assign` exit 2 in the mode and start no worker. The test lane passes. basedpyright reports 0/0/0.
+Checkpoint 30678657892f138a96b97fe6b7ffe15378ca6d5b.
+- `scripts/whoami/worker_mode.py` holds `state_path()`, `no_worker_mode()` and `NO_WORKER_START`; `quota_alert` imports `state_path` from it.
+- `assign.py`, `worker.py add`, `worker.py assign` and `worker_panes.py start-or-resume` refuse with exit 2 in the mode.
+- `restore_ticket_worker` sends no assignment in the mode and prints `<slot>: <refusal text>`.
+- `worker.restore` and account moves do not change.
