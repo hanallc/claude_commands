@@ -3970,22 +3970,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change in `scripts/direct/test_verify_mac_only.py`).
 
-#### Work Order
+#### As-built
 
-**Goal:** `direct/test_verify_mac_only.py` costs less AWS CPU, and every behavior check stays.
-
-**Spec:**
-- a75216621 made `mac_result` a full `verify.sh` call through queue placement. Each call costs about 1.5 CPU s on natedev. The module went from 28 to 92 CPU s on natedev.
-- `test_runner_refusals_never_fall_back_or_retry` checks the text of all 12 reasons through the real `mac_only_refuse` in one shell. Five full calls cover each runner mode (declined, lost, none) and each `placement.retry_decision` class (no retry, an immediate retry, a delayed retry).
-- `test_missing_fetch_result_fails_pass_but_not_mac_failure` keeps one written fetch word and the absent word. `verify.sh` prints the word as the runner wrote it.
-- `test_forwarded_environment_uses_callers_values_despite_shell_bindings` forwards the four shell-binding names in one call, each with a value of its own.
-- `test_readonly_exports_reach_runner_without_shell_assignment` forwards `SHELLOPTS` and `UID` in one call, with one control call.
-
-**Files:** `scripts/direct/test_verify_mac_only.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- basedpyright reports 0 errors and 0 warnings on the file.
-- The module passes on natedev under the gate environment.
-- AWS pair on `direct/test_verify_mac_only.py`. Every behavior check stays.
+- `test_runner_refusals_never_fall_back_or_retry` checks all 12 reason texts through the real `mac_only_refuse` in one shell. Five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class.
+- The fetch test keeps a written word and the absent word. The two environment tests forward all their names in one call each.
+- AWS pair (c7a.4xlarge, 3 rounds, same box): `direct/test_verify_mac_only.py` 59.28 -> 38.39 CPU s.
+- Commit f0a59896a. Test-only change.
