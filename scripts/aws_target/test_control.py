@@ -29,6 +29,7 @@ class ControlTests(CostFixture):
     regions: tuple[str, ...] = ()
     sizes: tuple[str, ...] = ()
     standard: tuple[str, ...] = ()
+    compare: tuple[str, ...] = ()
     gpu: tuple[str, ...] = ()
     failure: str = ''
     failure_reason: str = ''
@@ -55,12 +56,14 @@ class ControlTests(CostFixture):
         # Use different regions and types to detect dependencies on shipped values.
         text_setting(values_path, 'spot_candidate_regions', 'us-east-1 us-west-1 us-east-1')
         text_setting(values_path, 'instance_types', 'c7a.4xlarge m7a.2xlarge')
+        text_setting(values_path, 'price_compare_instance_types', 'm7a.8xlarge c7a.4xlarge')
         text_setting(values_path, 'gpu_instance_types', 'g6.2xlarge g4dn.xlarge')
         values = conf.read(values_path)
         self.regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
         self.standard = values.words('instance_types')
+        self.compare = tuple(size for size in values.words('price_compare_instance_types') if size not in self.standard)
         self.gpu = values.words('gpu_instance_types')
-        self.sizes = (*self.standard, *self.gpu)
+        self.sizes = (*self.standard, *self.compare, *self.gpu)
         self.quota = deploy.largest_gate_vcpus(self.sizes) * 3 + 1
         self.enterContext(mock.patch.dict(os.environ, {
             'AWS_ACCESS_KEY_ID': 'fixture-admin-id', 'AWS_SECRET_ACCESS_KEY': 'fixture-admin-secret',
@@ -314,6 +317,34 @@ class ControlTests(CostFixture):
         self.assertIn('old', missing)
         self.assertNotIn(' -', missing)
         self.assertEqual(before, {path: path.read_bytes() for path in self.state.iterdir()})
+
+    def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        fast, slow = self.standard
+        home, other = self.regions
+        events: list[dict[str, object]] = []
+        for attempt, size, region, box_s in (('fast', fast, home, 360), ('slow', slow, home, 720)):
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': region}
+            events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
+                           {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        table = spot_table.render(self.state, int(self.clock.now), width=200, settings_path=self.settings)
+        lines = table.splitlines()
+        estimate = next(index for index, line in enumerate(lines) if line.startswith('type') and 'region' in line)
+        count = len(self.regions) * (len(self.standard) + len(self.compare))
+        rows = [line.split() for line in lines[estimate + 1:estimate + 1 + count]]
+        # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
+        self.assertEqual([cells[:3] for cells in rows[:4]], [[fast, home, '0.0250'], [fast, other, '0.0250'],
+                                                         [slow, home, '0.0500'], [slow, other, '0.0500']])
+        self.assertIn('(6m 0s, 1 runs)', lines[estimate + 1])
+        self.assertIn('(6m 0s, 1 runs in other regions)', lines[estimate + 2])
+        for cells in rows[4:]:
+            self.assertEqual(cells[2:], ['no', 'runs', 'no', 'runs'])
+        self.assertEqual({cells[0] for cells in rows[4:]}, set(self.compare))
+        billed = lines[next(index for index, line in enumerate(lines) if line.startswith('Billed USD per run')) + 2:]
+        self.assertEqual([line.split()[0] for line in billed], [*self.standard, *self.compare])
+        self.assertIn('not billed yet (1 runs)', billed[0])
+        self.assertTrue(billed[-1].endswith('no runs'))
 
     def test_absent_snapshot_prints_unknown_values_without_creating_files(self) -> None:
         table = spot_table.render(self.state, int(self.clock.now))

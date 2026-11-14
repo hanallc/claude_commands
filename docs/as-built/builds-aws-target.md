@@ -591,6 +591,17 @@ Below the prices, it shows both quotas in vCPUs and the number of boxes each typ
 Standard types use the Standard quota; GPU types use the G and VT quota.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
 An absent snapshot explains missing quotas and box counts without creating files.
+The rows are `instance_types`, then `price_compare_instance_types`, then `gpu_instance_types`.
+The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
+Below the quotas, the table ranks each standard type and region by its estimated USD per run:
+1. The estimate is the lowest zone Spot price times the median box time, from launch to finish, boot included.
+2. Run times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days, split into merge gates and targeted tests.
+3. A region uses its own runs when it has them. Boot and data transfer can differ by region.
+4. A region without its own runs uses the type's runs in other regions, and the cell says so.
+5. The cheapest merge gate comes first; types without runs come last.
+The last table shows the billed USD per run for each type and kind.
+It splits each billed day's `SpotUsage:<type>` cost between the kinds by box time, as the hourly AWS report does.
+Runs on days without a bill show `not billed yet`.
 
 `python3 scripts/aws_target/aws_target.py open-gates` reads only the local cost ledger.
 It prints the ledger path, file write time, age, counts by state, and pending compute request count.

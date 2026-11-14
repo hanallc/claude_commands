@@ -145,7 +145,8 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
     configuration = conf.read(settings_path)
     values = conf.read_or_repository('cloud_gate')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    sizes = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('gpu_instance_types'))))
+    sizes = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
+                                 *values.words('gpu_instance_types'))))
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / 'spot-prices.lock').open('a+') as lock:
         try:

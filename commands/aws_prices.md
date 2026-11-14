@@ -7,10 +7,13 @@ Run `python3 ~/.claude/scripts/aws_target/deploy.py spot-table` and show its lin
 The command reads only the local hourly snapshot. It makes no AWS call.
 The table shows the lowest zone Spot price in USD/h for each type and region, and the snapshot age.
 Under the table, each region shows its Standard and G and VT Spot quotas in vCPUs and the box count of each type that fits.
+Under the quotas, it ranks each type and region by estimated USD per run: Spot price times the median box time of recent gates.
+A region without its own runs uses the type's time from other regions, and the cell says so.
+The last table shows the billed USD per run from the AWS bill, or `not billed yet`.
 `buildlog hourly` refreshes the snapshot with `aws_target.py snapshot`.
 Empty cells say `no snapshot`, `read failed`, or `no offer`.
 Each failed region shows its saved AWS error and the failure time.
 Cached values remain visible with a failure label or an old age.
 A failed hourly snapshot sends one user notice for each failure streak.
-Permission errors request `deploy.py up --workload merge-gates --approve-resources`.
+Permission errors request `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
 A successful read in every region ends the failure streak.

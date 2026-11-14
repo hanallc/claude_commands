@@ -1,12 +1,14 @@
 """Format the local Spot snapshot for a terminal."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import shutil
+import textwrap
+from statistics import median
 
-from scripts.aws_target import ledger
+from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf
@@ -17,7 +19,7 @@ def render(directory: Path, now: int, *, width: int | None = None, settings_path
     values = conf.read_or_repository('cloud_gate')
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    standard = values.words('instance_types')
+    standard = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'))))
     gpu = values.words('gpu_instance_types')
     sizes = tuple(dict.fromkeys((*standard, *gpu)))
     document = read_snapshot(directory)
@@ -83,4 +85,63 @@ def render(directory: Path, now: int, *, width: int | None = None, settings_path
             fit = (f'{int(conf.decimal(ledger.text(reading, field)) // vcpus)} boxes{suffix}'
                    if reading and vcpus else note or 'unknown vCPU count')
             lines.append(f'  {size} ({vcpus or "?"} vCPUs): {fit}')
+    lines.extend(run_cost_lines(directory, now, standard, regions, minimum, configuration.whole('run_cost_days'),
+                                terminal_width))
     return '\n'.join(lines)
+
+
+def run_cost_lines(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
+                   minimum: dict[tuple[str, str], Decimal], days: int, width: int) -> list[str]:
+    """Rank each type and region by its estimated USD per merge gate, then show the billed cost."""
+    end = datetime.fromtimestamp(now, UTC)
+    start = end - timedelta(days=days)
+    book = ledger.CostLedger(directory)
+    runs = run_cost.gate_runs(book, start, end).runs
+    # Boot and data transfer differ by region, so a region uses its own runs when it has them.
+    by_region: dict[tuple[str, str, str], list[Decimal]] = {}
+    by_type: dict[tuple[str, str], list[Decimal]] = {}
+    for run in runs:
+        by_region.setdefault((run.instance_type, run.region, run.mode), []).append(run.box_s)
+        by_type.setdefault((run.instance_type, run.mode), []).append(run.box_s)
+    estimates: list[tuple[list[Decimal | None], list[str], str, str]] = []
+    for size in sizes:
+        for region in regions:
+            price = minimum.get((region, size))
+            if price is None:
+                continue
+            per_run: list[Decimal | None] = []
+            cells: list[str] = []
+            for mode, _label in run_cost.KINDS:
+                own = by_region.get((size, region, mode))
+                seconds = own or by_type.get((size, mode), [])
+                if not seconds:
+                    per_run.append(None)
+                    cells.append('no runs')
+                    continue
+                estimate = price * median(seconds) / 3600
+                per_run.append(estimate)
+                source = f'{len(seconds)} runs' if own else f'{len(seconds)} runs in other regions'
+                cells.append(f'{estimate:.4f} ({run_cost.median_run_time(seconds)}, {source})')
+            estimates.append((per_run, cells, size, region))
+    # A type without runs has no estimate, so it goes last.
+    estimates.sort(key=lambda row: (*((value is None, value or Decimal(0)) for value in row[0]), row[2], row[3]))
+    lines = ['', *textwrap.wrap(f'USD per run, estimate: lowest zone Spot price x median box time (boot included), '
+                                + f'last {days} days, cheapest merge gate first', width)]
+    if estimates:
+        lines.extend(aligned_table(['type', 'region', 'merge gate', 'targeted test'],
+                                   [[size, region, *cells] for _per_run, cells, size, region in estimates]))
+    else:
+        lines.append('no price in the snapshot')
+    allocations = run_cost.billed_allocations(book, runs, start, end)
+    lines.extend(('', *textwrap.wrap('Billed USD per run: the AWS bill split by box time, all regions, same days', width)))
+    billed_rows: list[list[str]] = []
+    for size in sizes:
+        cells = [size]
+        for mode, _label in run_cost.KINDS:
+            selected = [run for run in runs if run.instance_type == size and run.mode == mode]
+            billed = run_cost.billed_runs(selected, allocations)
+            cells.append(f'{run_cost.billed_cost_per_run(billed, allocations):.4f} ({len(billed)} billed runs)' if billed
+                         else f'not billed yet ({len(selected)} runs)' if selected else 'no runs')
+        billed_rows.append(cells)
+    lines.extend(aligned_table(['type', 'merge gate', 'targeted test'], billed_rows))
+    return lines
