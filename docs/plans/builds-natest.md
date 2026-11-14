@@ -4004,27 +4004,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; needs the sdlc go).
 
-#### Work Order
+#### As-built
 
-**Goal:** each `statusline.sh` run starts one staff jq call, not two, so `statusline/test_statusline.py` uses less AWS CPU.
-
-**Decision:** sweep 2026-11-14: `test_statusline.py` 32.4 natedev CPU s; jq 773 starts 17.6 s. Each run started a `printf | jq` pipe for the unit row and a second jq for the showrunner ids.
-
-**Spec:**
-1. One jq call reads `$staff`. It takes the payload with `--arg` and reads `.session_id` through `fromjson` in a `try`.
-2. It prints `unit <id> <session>` for the matched unit row. With no unit row, it prints the showrunner ids.
-3. The shell sets `unit_session` from a `unit ` line and loops over the showrunner ids otherwise.
-4. Keep each output: a bad payload matches no unit row; `/dev/null` staff gives no owners.
-
-**Files:**
-- `scripts/statusline/statusline.sh`
-
-**Workers:** director; one 10-line shell change.
-- impl: all files.
-
-**Constraints from prior phases:**
-- sdlc terms: a production diff needs the sdlc go; land only on a measured aws gain.
-
-**Acceptance gate:**
-- `test_statusline.py` passes with the same tests.
-- `module_cost.py` CPU before and after; aws pair (3 rounds) shows a gain.
+- One jq call in `statusline.sh` reads staff.json. It prints `unit <id> <session>` for the payload session's unit row, or else the showrunner ids.
+- The payload goes in with `--arg` and `fromjson` in a `try`. A bad payload matches no unit row; `/dev/null` staff gives no owners.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_statusline` 45.11 -> 44.66 CPU s.
+- Commit 9d9e95bab. Production change; sdlc go 2026-11-14.
