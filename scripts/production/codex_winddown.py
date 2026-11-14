@@ -37,7 +37,7 @@ from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import conf
-from scripts.whoami import agent_accounts
+from scripts.whoami import agent_accounts, quota_state
 from scripts.production.live_units import live_unit_ids as live_unit_ids
 from scripts.message.sessions import live_sessions
 
@@ -149,6 +149,16 @@ UNIT_CLEAR = (
     "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. Start"
     " using Codex again, starting with what your resume list holds. It is okay to let a running Claude"
     " agent finish up."
+)
+ALL_CLEAR_HELD = (
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over and the"
+    " Codex count has stopped. No-worker mode is still on: Codex stays off until the workers-back notice"
+    " arrives."
+)
+UNIT_CLEAR_HELD = (
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over. No-worker"
+    " mode is still on, so launch no Codex agent. Do your work yourself and keep your resume list until"
+    " the workers-back notice arrives. It is okay to let a running Claude agent finish up."
 )
 
 
@@ -598,7 +608,8 @@ def clear(sender: str) -> int:
     (STATE / PROJECTIONS).unlink(missing_ok=True)
     with quiet_notice_state() as state:
         _ = _cancel_quiet_notice(state)
-    return 0 if announce(sender, ALL_CLEAR, UNIT_CLEAR) and every else 1
+    texts = (ALL_CLEAR_HELD, UNIT_CLEAR_HELD) if quota_state.no_worker_mode() else (ALL_CLEAR, UNIT_CLEAR)
+    return 0 if announce(sender, *texts) and every else 1
 
 
 def main(arguments: list[str]) -> int:

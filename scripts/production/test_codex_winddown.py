@@ -690,6 +690,19 @@ class MessageTests(unittest.TestCase):
         self.assertIn("send --to session:b861068b-66ee-573d-b3be-ec6d4a321e71 --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
+    def test_clear_in_no_worker_mode_ends_the_wind_down_and_keeps_codex_off(self) -> None:
+        state = self.root / ".local/state/quota_alert.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        _ = state.write_text(json.dumps({"no_worker_mode": True}), encoding="utf-8")
+        _ = self.run_script("start", "--from", "natedev")
+        done = self.run_script("clear", "--from", "natedev")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        log = (self.root / "log").read_text(encoding="utf-8")
+        self.assertIn("the wind-down is over and the Codex count has stopped. No-worker mode is still on", log)
+        self.assertIn("so launch no Codex agent", log)
+        self.assertNotIn("Start using Codex again", log)
+        self.assertNotIn("we are back with Codex", log)
+
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
