@@ -1445,13 +1445,15 @@ From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "St
 - `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
 - Checkpoint b62309ba4.
 
-### Phase 78 — The AWS prices page joins the admin console · status: todo
+### Phase 78 — The AWS prices page joins the admin console · status: done
 
-From builds (not the user), 2026-11-14 14:2x: "the user wants the AWS cost tables on the admin console. The AWS page is yours (plan 11-13). sdlc adds the console nav entry about 30 min after your page is on main. … The page shows the same tables as /aws_prices (spot_table.py). Use one source: read the same rows, never a copy of the math. New user ask: a filter on the page for full merge gates, targeted runs, or both together. aws changes the tables now … Agree the row data shape with aws so the page gets these changes too."
+From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the admin console from one source, with a filter for merge gates, targeted runs or both. From aws-unit (not the user), 2026-11-14: write the split on top of main; keep the math in `run_cost.py`; give the region state typed fields; `render()` output must not change.
 
-1. `spot_table.py` has one typed row source, `spot_tables()`, with the shape agreed with aws. `render()` draws the same tables for `/aws_prices`; its output does not change in the split.
-2. The run cost tables come for three scopes: merge gates, targeted runs and both. The math for each scope stays in Python.
-3. `aws_page.py` publishes the page with the tables as data and gives `page_url() -> str` for `config/console.conf`. The hourly AWS snapshot job publishes the page again.
-4. The page draws each table with right-aligned numbers and has one filter: merge gates, targeted runs or both.
-5. Proof: before (the `/aws_prices` terminal text) and after shots of the page with each filter value.
-6. Run every aws_target and buildlog module the change touches before the checkpoint.
+#### As-built
+
+- `spot_table.spot_tables()` returns `SpotTables`: `prices` and `quotas` as `Table` (title, headers, `right` number columns, rows), one `RegionRead` per region (`age_s`, `stale`, `failure`, `failure_age_s`; `note` and `detail` are properties) and one `RunCosts` per scope (explanation, one `Table` per type, `Cheapest`). `render()` draws `/aws_prices` from these values; its output is byte-identical (live snapshot, widths 40–400).
+- `run_cost.SCOPES` holds `RunScope` merge-gate, targeted-test and both (name, filter label, noun, modes). `RunEvidence.box_seconds` and `expected_usd` take `modes: tuple[str, ...]`; `cloud_gate.py` passes `(mode,)`.
+- `aws_page.py` writes `aws_prices.html` with the page data as JSON to `config/aws_page.conf` `output_folder`, and gives `page_url()` for `config/console.conf`. The hourly buildlog job "AWS prices page" publishes it after the AWS snapshot.
+- The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
+- Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
+- Checkpoint 0c64c36b5.
