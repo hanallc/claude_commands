@@ -147,6 +147,8 @@ Busy, blocked, and disk refusals retain normal polling.
 A Mac that `free_now` reports busy is a busy exclusion in placement evidence, even though routing keeps it eligible.
 The step then waits for the Mac, or takes natedev when natedev is a candidate, and no attempt starts until the Mac is free.
 Before this rule, a waiting Mac step made one refused attempt each second.
+A kept Mac claim is not busy, because the next claim takes it over.
+Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
