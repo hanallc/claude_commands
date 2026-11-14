@@ -3976,3 +3976,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The fetch test keeps a written word and the absent word. The two environment tests forward all their names in one call each.
 - AWS pair (c7a.4xlarge, 3 rounds, same box): `direct/test_verify_mac_only.py` 59.28 -> 38.39 CPU s.
 - Commit f0a59896a. Test-only change.
+
+### Phase 272 — Fixture processes read a step row without the step state test imports  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** a fixture process that reads a step row imports only the step record modules.
+
+**Spec:**
+- Fixture runners and cargo stubs in nine places import `read_step_row` from `test_verify_step_state`. That import loads every verify test support module, at about 0.36 CPU s for each fixture start.
+- The new `scripts/direct/step_row_test_support.py` holds `read_step_row` and imports only `step_record` and `step_selection`.
+- `test_verify_step_state` and each fixture import it from there. The row each fixture reads stays the same.
+
+**Files:** `scripts/direct/step_row_test_support.py` (new), `scripts/direct/test_verify_step_state.py`, `scripts/direct/verify_step_routes_test_support.py`, `scripts/direct/test_verify_ssh_targets_routing.py`, `scripts/direct/test_verify_step_routes_results.py`, `scripts/direct/test_verify_step_routes_lint.py`, `scripts/direct/test_verify_step_routes_restart.py`, `scripts/direct/test_verify_token_mac_step.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:**
+- basedpyright reports 0 errors and 0 warnings on the eight files.
+- AWS pair on the seven modules that import it, all passing. Every behavior check stays.
