@@ -3917,3 +3917,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The trim failure subtest keeps its `exit 9` stub.
 - AWS pair (c7a.8xlarge, 3 rounds): `mac_test/test_offload_cleanup.py` 26.76 -> 7.77 CPU s.
 - Commit 6f6840546. Test-only change.
+
+### Phase 267 — A progress state read runs git for the branch only when HEAD changes  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/direct/plan_history.py`; sdlc gives the go).
+
+#### As-built
+
+- `plan_history._worktree_branch` keeps each worktree's branch name with its HEAD file text in the process. `staff_directory` calls it.
+- A changed HEAD text runs git again. No readable HEAD, the reftable stub or a failed git run keeps nothing.
+- The output stays the branch name or `detached@<short commit>`.
+- The branch test in `test_progress_history` also switches the branch with `git symbolic-ref`.
+- AWS pair (c7a, 3 rounds): `direct/test_assign_launcher.py` 33.44 -> 31.43 CPU s; four other progress modules 0.02 to 0.36 CPU s less.
+- Commit 776786ce5. Production change; sdlc gave the go.
