@@ -1444,3 +1444,14 @@ From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "St
 - `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
 - `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
 - Checkpoint b62309ba4.
+
+### Phase 78 — The AWS prices page joins the admin console · status: todo
+
+From builds (not the user), 2026-11-14 14:2x: "the user wants the AWS cost tables on the admin console. The AWS page is yours (plan 11-13). sdlc adds the console nav entry about 30 min after your page is on main. … The page shows the same tables as /aws_prices (spot_table.py). Use one source: read the same rows, never a copy of the math. New user ask: a filter on the page for full merge gates, targeted runs, or both together. aws changes the tables now … Agree the row data shape with aws so the page gets these changes too."
+
+1. `spot_table.py` has one typed row source, `spot_tables()`, with the shape agreed with aws. `render()` draws the same tables for `/aws_prices`; its output does not change in the split.
+2. The run cost tables come for three scopes: merge gates, targeted runs and both. The math for each scope stays in Python.
+3. `aws_page.py` publishes the page with the tables as data and gives `page_url() -> str` for `config/console.conf`. The hourly AWS snapshot job publishes the page again.
+4. The page draws each table with right-aligned numbers and has one filter: merge gates, targeted runs or both.
+5. Proof: before (the `/aws_prices` terminal text) and after shots of the page with each filter value.
+6. Run every aws_target and buildlog module the change touches before the checkpoint.
