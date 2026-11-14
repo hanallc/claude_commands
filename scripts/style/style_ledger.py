@@ -96,6 +96,14 @@ FINDING_REPLACEMENT_GUIDANCE = (
 )
 
 
+# The git objects that the catalog's synced cells read. CROSS JOIN keeps the cells as the outer loop;
+# the planner otherwise walks every stored git-object dependency of every table.
+SYNCED_CELL_OBJECTS = (
+    "SELECT DISTINCT d.source_key FROM refill_cells c CROSS JOIN refill_dependencies d "
+    + "ON d.consumer_table='refill_cells' AND d.consumer_key=c.consumer_key AND d.source_kind='git_object' "
+    + "WHERE c.catalog=? AND c.view='synced'"
+)
+
 UNCOVERED_SUFFIX = "#uncovered"
 
 
@@ -2768,6 +2776,10 @@ class Ledger:
         self._maintaining_findings: bool = False
         self._finding_objects: set[str] = set()
         self._finding_searches: set[tuple[str, str]] = set()
+        # Whether each blob holds a `path` string that the module scan cannot read; a blob's text never changes.
+        self.unread_path_blobs: dict[str, bool] = {}
+        # The local root candidates of each commit set; a commit's tree never changes.
+        self._footprint_roots: dict[tuple[str, ...], tuple[str, ...]] = {}
         self._object_groups: dict[str, tuple[str, ...]] = {}
         self._search_index: refill_findings.SearchIndex = refill_findings.SearchIndex()
         self._finding_metadata: set[tuple[str, str]] = set()
@@ -3046,9 +3058,11 @@ class Ledger:
         return decode_proof(source, types)
 
     def footprint_roots(self, commits: tuple[str, ...]) -> tuple[str, ...]:
-        """Return local root candidates used by the existing footprint readers."""
-        return tuple(sorted({str(parent) for commit in commits for path in self._tip(commit).blobs
-                             if path.endswith(".rs") for parent in PurePosixPath(path).parents}))
+        """Return local root candidates used by the existing footprint readers, once for each commit set."""
+        if commits not in self._footprint_roots:
+            self._footprint_roots[commits] = tuple(sorted({str(parent) for commit in commits for path in self._tip(commit).blobs
+                                                           if path.endswith(".rs") for parent in PurePosixPath(path).parents}))
+        return self._footprint_roots[commits]
 
     def record_finding_sources(self, commits: tuple[str, ...], blobs: tuple[str, ...]) -> None:
         """Record the immutable inputs read by the current finding calculation."""
@@ -7680,6 +7694,9 @@ class Ledger:
             self._follow_evidence[(finding, tip.commit)] = evidence
             self._finding_anchors[finding] = anchor
             for path, blob in metadata:
+                # Findings in one file share its declarations at this tip; read and decode them once.
+                if (tip.commit, path) in self._declared_files:
+                    continue
                 items = results.facts.input_fact("finding_declarations", blob, 1)
                 if not isinstance(items, UnstoredFact):
                     self._declared_files[(tip.commit, path)] = cast(tuple[DeclaredItem, ...], self._decode_finding_proof(items))
@@ -8764,16 +8781,22 @@ class Ledger:
         identity = cell_identity((tip.commit, branch, cells.facts.object_store, rule.rule_id,
                                   rule.blob, rule.judgment_identity, rule.tier, rule.family, rule.input_scope, path))
         def calculate() -> tuple[CellState, str]:
-            previous = self._maintaining_cell
-            self._maintaining_cell = True
-            try:
+            with self._maintained_cell_reads():
                 return self._judgment_state(rule, path, tip)
-            finally:
-                self._maintaining_cell = previous
         return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
                             calculate,
                             lambda: self._cell_dependencies(rule, path, tip),
                             crate=crate, family=rule.family, tier=rule.tier)
+
+    @contextmanager
+    def _maintained_cell_reads(self) -> Generator[None]:
+        """Read and keep the immutable comparison, ancestry and code facts that a judgment reads."""
+        previous = self._maintaining_cell
+        self._maintaining_cell = True
+        try:
+            yield
+        finally:
+            self._maintaining_cell = previous
 
     def _style_branch(self) -> StyleBranch:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -8816,8 +8839,10 @@ class Ledger:
                 if row.declared_scope != rows[0].declared_scope or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
                     continue
                 try:
-                    repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
-                               and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
+                    # The comparisons are immutable facts, so a later refill reads them from the ledger.
+                    with self._maintained_cell_reads():
+                        repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
+                                   and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
                 except GitReadFailed:
                     raise
                 except LedgerError:
@@ -8884,11 +8909,7 @@ class Ledger:
         maintained = JudgmentCells(facts, "synced")
         if self._maintain_judgments:
             facts.observe_sources()
-            objects = cast(list[tuple[str]], self._connection.execute(
-                "SELECT DISTINCT d.source_key FROM refill_dependencies d JOIN refill_cells c "
-                + "ON c.consumer_key=d.consumer_key WHERE d.consumer_table='refill_cells' "
-                + "AND d.source_kind='git_object' AND c.catalog=? AND c.view='synced'",
-                (facts.catalog,)).fetchall())
+            objects = cast(list[tuple[str]], self._connection.execute(SYNCED_CELL_OBJECTS, (facts.catalog,)).fetchall())
             _ = self._judgment_objects_available(tuple(name for (name,) in objects))
         style_branch = self._style_branch()
         branch = ""
