@@ -322,7 +322,7 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
     try:
         plan = _preflight_fast_forward(repo, target, replace_registry=registry_already_shared)
     except OSError as error:
-        raise OSError(f"registry edit refused before writing: fast-forward check failed: {error}") from error
+        raise OSError(f"registry publication refused: fast-forward check failed: {error}") from error
     _apply_fast_forward(repo, path, plan)
 
 
@@ -358,13 +358,13 @@ def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], des
     try:
         remote = _fetch(repo, branch)
     except OSError as error:
-        raise OSError(f"registry edit refused before writing: fetch failed: {error}") from error
+        raise OSError(f"registry publication refused: fetch failed: {error}") from error
     # Pending rows move onto the fetched registry, so another writer's commit
     # cannot block them; a push accepted before its acknowledgement replays as no change.
     _fast_forward(repo, path, remote, registry_already_shared=bool(pending))
     # A row commit goes only onto origin/main; a push must never carry other local commits.
     if foreign := _git(repo, "rev-list", "--abbrev-commit", f"{remote}..HEAD").split():
-        raise OSError(f"registry edit refused before writing: HEAD has {len(foreign)} commits that are not on "
+        raise OSError(f"registry publication refused: HEAD has {len(foreign)} commits that are not on "
                       + f"origin/{branch}: {' '.join(foreign[:5])}")
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
@@ -449,15 +449,17 @@ def publish_pending(registry: Path) -> bool:
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,
                    additive_catalog: bool = False) -> str:
-    """Return the published text after atomic replay under the writer lock.
+    """Write the rows live at once under the writer lock, then publish them; return the live text.
 
+    The live write never waits for the main lock. Publication follows: it waits
+    for the main lock, commits and pushes. A failed publication keeps the rows
+    live and raises OSError; publish_pending() publishes them later.
     Publishing is disabled by MODELS_CONFIG_PUBLISH=0 and for every other path.
-    MODELS_CONFIG_PUBLISH=later writes the shared file at once, without the main
-    lock; publish_pending() commits and pushes those rows when main is free.
+    MODELS_CONFIG_PUBLISH=later skips the publication; the notes timer runs it.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
     The registry commit goes only onto origin/main; a checkout with local
-    commits that origin does not have refuses before any write.
+    commits that origin does not have refuses publication.
     No other path is staged, committed, stashed, reset or rebased.
     """
     path = registry.resolve()
@@ -465,22 +467,27 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     if additive_catalog:
         changes = [change for change in changes if change.section in ("codex.agents", "codex.families")]
     target = _publish_repository(path)
-    later = os.environ.get("MODELS_CONFIG_PUBLISH") == "later"
     lock_path = _publish_lock_path(target, path)
-    with ExitStack() as locks:
-        if isinstance(target, SharedRegistry) and not later and _on_main(target):
-            locks.enter_context(main_push_lock.main_push_lock(target.repository))
-        lock = locks.enter_context(lock_path.open("a"))
+    with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if isinstance(target, SharedRegistry) and not later:
-            _ = _publish(target.repository, path, changes, description, additive_catalog)
-        elif changes:
+        if changes:
             latest = registry_text(path)
             result = registry_rows.replay(latest, changes, additive_catalog)
             if registry_rows.values(latest) != registry_rows.values(result):
                 # Preserve formatting when no concurrent edit intervenes.
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
-        return registry_text(path)
+    if isinstance(target, SharedRegistry) and os.environ.get("MODELS_CONFIG_PUBLISH") != "later":
+        try:
+            with ExitStack() as locks:
+                if _on_main(target):
+                    locks.enter_context(main_push_lock.main_push_lock(target.repository))
+                lock = locks.enter_context(lock_path.open("a"))
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                _ = _publish(target.repository, path, changes, description, additive_catalog)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
+                          + "the notes timer tries again") from error
+    return registry_text(path)
 
 
 def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:

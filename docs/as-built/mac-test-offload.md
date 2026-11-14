@@ -54,6 +54,7 @@ A PID alone cannot release another attempt.
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
   A live claim blocks only its repository.
+  A kept claim, whose holder process is gone, does not answer `busy`: the next claim takes it over and cleans its leftovers.
   A live mirror refusal time also answers `busy` for that repository.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
