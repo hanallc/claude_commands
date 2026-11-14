@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,8 @@ if [[ $command == ssh && $remote == *mac_group=* ]]; then
     wrapper=("${(@Q)${(z)outer[3]}}")
     work=${wrapper[1]#work=}
     printf '%s\0' "$work" >> "$state/placed-commands"
+    # (z) reads each newline of the wrapper as a ";" word.
+    print -rn -- "${wrapper[3]#on_close=}" > "$state/on-close"
     words=("${(@Q)${(z)work}}")
     remote=${words[4]}
     set -- "${@[1,-2]}" "$remote"
@@ -149,13 +152,14 @@ if [[ $remote == *'checkout -q --detach'* ]]; then
     print -rn -- "$MAC_RUN_SHA" > "$clone_head"
 fi
 if [[ $MAC_RUN_HOLD_BUILD == 1 && $remote == *'cargo build -q -p hana'* ]]; then
+    # Like the Mac wrapper, the held build ends when the SSH input closes.
     exec "$MAC_RUN_PYTHON" -c '
-import os
+import os, sys
 from pathlib import Path
-import signal
-signal.signal(signal.SIGTERM, lambda *arguments: os._exit(128 + arguments[0]))
 Path(os.environ["MAC_RUN_STUB_STATE"], "build-started").write_text("started\n")
-signal.pause()
+_ = sys.stdin.read()
+Path(os.environ["MAC_RUN_STUB_STATE"], "input-closed").write_text("closed\n")
+raise SystemExit(255)
 '
 fi
 if (( placed_run )); then
@@ -761,11 +765,19 @@ class MacRunTests(unittest.TestCase):
             if process.poll() is None:
                 send_process_group(process.pid, signal.SIGKILL)
                 _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 143, output + errors)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        # The next run cleans the records of the run that the signal ended.
+        after = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
+        self.assertEqual(after.returncode, cleanup_status and 4, after.stdout + after.stderr)
         for name, settings, before in (("natedev", local_environment["COPIES_CONFIG"], before_local),
                                        ("Mac", remote_environment["COPIES_CONFIG"], before_remote)):
             with self.subTest(registry=name):
-                self.assertEqual(self.clone_registry_records(settings), before if cleanup_status else [])
+                records = self.clone_registry_records(settings)
+                if cleanup_status:
+                    # The failed cleanup keeps the ended run's record; the next run keeps its own too.
+                    self.assertIn(before[0], records)
+                else:
+                    self.assertEqual(records, [])
 
     def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
         self.assert_clone_records_after_cleanup(0)
@@ -779,7 +791,11 @@ class MacRunTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "fixture start failed"):
                 self.wait_for_path(self.stub_state / "build-started", process)
 
-    def test_signals_clean_remote_work_before_releasing_claim(self) -> None:
+    def ended_runs(self) -> list[Path]:
+        runs = self.home / ".local/state/mac-queue/runs"
+        return sorted(runs.iterdir()) if runs.is_dir() else []
+
+    def test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run(self) -> None:
         for signal_number, cleanup_status, whole_group in (
             (signal.SIGTERM, 0, True),
             (signal.SIGHUP, 23, True),
@@ -789,15 +805,10 @@ class MacRunTests(unittest.TestCase):
                 signal_number=signal_number, cleanup_status=cleanup_status, whole_group=whole_group
             ):
                 self.clear_events()
-                (self.stub_state / "build-started").unlink(missing_ok=True)
-                (self.stub_state / "cleanup-called").unlink(missing_ok=True)
-                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
-                process = self.start_mac_run(
-                    extra={
-                        "MAC_RUN_HOLD_BUILD": "1",
-                        "MAC_RUN_CLEANUP_STATUS": str(cleanup_status),
-                    }
-                )
+                for name in ("build-started", "cleanup-called", "checkout-clear", "input-closed", "on-close"):
+                    (self.stub_state / name).unlink(missing_ok=True)
+                extra = {"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)}
+                process = self.start_mac_run(extra={**extra, "MAC_RUN_HOLD_BUILD": "1"})
                 try:
                     self.wait_for_path(self.stub_state / "build-started", process)
                     if whole_group:
@@ -809,57 +820,40 @@ class MacRunTests(unittest.TestCase):
                     send_process_group(process.pid, signal.SIGKILL)
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
-
-                self.assertEqual(
-                    process.returncode, 128 + signal_number, output + errors
-                )
-                self.assertTrue((self.stub_state / "cleanup-called").exists())
-                cleanup_events = [
-                    event
-                    for event in self.events()
-                    if event["command"] == "ssh"
-                    and any(
-                        "kill -TERM" in argument
-                        and "mac_stopped=" in argument
-                        for argument in event["args"]
-                    )
-                ]
-                self.assertEqual(len(cleanup_events), 1, self.events())
-                cleanup = cleanup_events[0]
-                self.assertTrue(cleanup["claimed"], cleanup)
-                self.assertEqual(
-                    cleanup["args"][:3],
-                    [
-                        "-o",
-                        "BatchMode=yes",
-                        "natemccoy@mac",
-                    ],
-                )
-                remote = cleanup["args"][-1]
-                self.assertIn("kill -TERM", remote)
-                self.assertIn("kill -KILL", remote)
-                self.assertIn("ps -axo pgid=", remote)
+                # No handler: the signal ends the run with its default action.
+                self.assertEqual(process.returncode, -signal_number, output + errors)
+                self.assertFalse((self.stub_state / "cleanup-called").exists())
+                if not whole_group:
+                    # The SSH input closes when the run ends, so the Mac work stops at once.
+                    wait_until((self.stub_state / "input-closed").exists, self.stub_state)
+                # The Mac runs this close step when the SSH input closes.
                 checkout = self.environment["MAC_RUN_CHECKOUT"]
-                self.assertIn("mac_stopped=", remote)
-                events = self.events()
-                stops = [event for event in events if event["command"] == "ssh"
+                close_step = (self.stub_state / "on-close").read_text()
+                self.assertIn("hana_instances.py stop-checkout " + shlex.quote(checkout), close_step)
+                self.assertIn("scratch.py end --task gate:mac-run-" + SHA, close_step)
+                self.assertLess(close_step.index("stop-checkout"), close_step.index("scratch.py end"))
+                self.assertEqual(len(self.ended_runs()), 1)
+
+                # The next run finishes the cleanup of the ended run under its own placement.
+                self.clear_events()
+                after = self.mac_run(extra=extra)
+                stops = [event for event in self.events() if event["command"] == "ssh"
                          and "hana_instances.py stop-checkout " in event["args"][-1]]
-                self.assertEqual(len(stops), 1, events)
-                self.assertTrue(stops[0]["claimed"])
-                words = shlex.split(stops[0]["args"][-1])
-                self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"), checkout)
-                self.assertLess(events.index(cleanup), events.index(stops[0]))
-                ends = [event for event in events if event["command"] == "ssh"
+                self.assertEqual(len(stops), 2, self.events())
+                self.assertTrue(all(stop["claimed"] for stop in stops))
+                ends = [event for event in self.events() if event["command"] == "ssh"
                         and "scratch.py end --task " in event["args"][-1]]
                 if cleanup_status == 0:
-                    self.assertEqual(len(ends), 1, events)
-                    self.assertLess(events.index(stops[0]), events.index(ends[0]))
-                    self.assertTrue(ends[0]["claimed"])
+                    self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+                    self.assertEqual(len(ends), 2, self.events())
+                    self.assertEqual(self.ended_runs(), [])
                 else:
-                    self.assertEqual(ends, [], events)
-                    self.assertIn("process exit not confirmed", errors)
+                    self.assertEqual(ends, [], self.events())
+                    self.assertIn("cleanup of an ended run failed", after.stderr)
+                    self.assertEqual(len(self.ended_runs()), 1)
+                    for kept in self.ended_runs():
+                        shutil.rmtree(kept)
                 self.assert_claim_released()
-
 
 if __name__ == "__main__":
     _ = unittest.main()

@@ -1,4 +1,9 @@
-"""Take a Mac queue placement, run through SSH, and return the placement."""
+"""Take a Mac queue placement, run through SSH, and return the placement.
+
+It sets no signal handler. A signal ends it with its default action; its
+children share its process group; the queue ends the placement when this
+process ends; and the Mac work ends when the SSH input closes.
+"""
 from __future__ import annotations
 
 try:
@@ -8,20 +13,21 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Generator
+import contextlib
 import fcntl
 import json
+import math
 from dataclasses import dataclass
 from enum import Enum
 import os
 from pathlib import Path
 import shlex
-import signal
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
-from types import FrameType
-from typing import TextIO, cast
+from typing import TextIO, TypedDict, cast
 import uuid
 
 from scripts.lib import conf
@@ -55,22 +61,43 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
 
 
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str]) -> list[str]:
+def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
+    """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
+
+    zsh refuses job control without a terminal, so the work shares the session's group. When the
+    input closes, the watcher ends every other process of the group, then runs `on_close` (work
+    such as a GUI app that started outside the group).
+    """
+    return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
+            + f"\ngrace_polls={grace_polls}" + r"""
+exec 3<&0
+group=$(ps -o pgid= -p $$)
+group=${group//[[:space:]]/}
+printf 'mac_group=%s\n' "$group"
+{
+    read -r _ <&3
+    zmodload zsh/system zsh/zselect
+    self=$sysparams[pid]
+    members() { reply=(${(f)"$(pgrep -g $group)"}); reply=(${reply:#$self}) }
+    members; (( ! $#reply )) || kill -TERM $reply
+    for _ in {1..$grace_polls}; do members; (( $#reply )) || break; zselect -t 10; done
+    members; (( ! $#reply )) || kill -KILL $reply
+    [[ -z $on_close ]] || /bin/zsh -c "$on_close"
+} </dev/null >/dev/null 2>&1 &
+watcher=$!
+/bin/zsh -c "$work" </dev/null
+code=$?
+kill -TERM "$watcher" 2>/dev/null
+printf '\nmac_exit=%s\n' $code
+""")
+
+
+def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str) -> list[str]:
     work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
     work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
-    wrapper = "work=" + shlex.quote(work) + r"""
-set -m
-/bin/zsh -c 'kill -STOP $$; exec /bin/zsh -c "$1"' mac-queue "$work" &
-group=$!
-while kill -0 "$group" 2>/dev/null; do
-    [[ $(ps -p "$group" -o state=) != *T* ]] || break
-    sleep 0.01
-done
-printf 'mac_group=%s\n' "$group"
-kill -CONT -- -"$group" 2>/dev/null
-wait "$group"
-printf '\nmac_exit=%s\n' $?
-"""
+    # Ten polls a second while the group ends.
+    grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
+    wrapper = remote_wrapper(work, on_close, grace_polls)
     return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
@@ -103,32 +130,18 @@ printf 'mac_stopped=%s\\n' "$group"
     return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
 
 
-class RunInterrupted(Exception):
-    def __init__(self, signum: int) -> None:
-        super().__init__(f"signal {signum}")
-        self.status: int = 128 + signum
-
-
-def interrupt_run(signum: int, frame: FrameType | None) -> None:
-    del frame
-    raise RunInterrupted(signum)
-
-
 def stop_command(process: subprocess.Popen[str]) -> None:
     if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        process.terminate()
         try:
             _ = process.wait(timeout=conf.read("mac_gate").number("terminate_grace_seconds"))
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.kill()
             _ = process.wait()
 
 
 def capture_command(command: list[str]) -> tuple[int, str]:
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, start_new_session=True) as process:
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
         try:
             output, errors = process.communicate()
             del errors
@@ -138,8 +151,9 @@ def capture_command(command: list[str]) -> tuple[int, str]:
 
 
 def stream_remote(command: list[str], remote: RemoteRun) -> int:
-    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                          start_new_session=True) as process:
+    # The SSH input stays open and empty while this process lives; the Mac wrapper stops the work when it closes.
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+                          errors="replace") as process:
         try:
             remote.state = RemoteState.LIVE
             assert process.stdout is not None
@@ -161,12 +175,70 @@ def stream_remote(command: list[str], remote: RemoteRun) -> int:
 
 
 def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str], environment: dict[str, str]) -> int:
-    with subprocess.Popen([script, phase, str(argv_file), *arguments], env=environment, text=True,
-                          start_new_session=True) as process:
+    with subprocess.Popen([script, phase, str(argv_file), *arguments], env=environment, text=True) as process:
         try:
             return process.wait()
         finally:
             stop_command(process)
+
+
+RUNS = ".local/state/mac-queue/runs"
+RECEIPTS = ".local/state/mac-queue/receipts"
+
+
+class SavedRun(TypedDict):
+    lifecycle_script: str
+    arguments: list[str]
+    host: str
+
+
+@contextlib.contextmanager
+def run_directory(episode: str) -> Generator[Path]:
+    """Hold this run's state folder. Its lock ends with the process, so a later run finds a run that a signal ended."""
+    runs = Path.home() / RUNS
+    runs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    starting = runs / (episode + ".new")
+    starting.mkdir(mode=0o700)
+    descriptor = os.open(starting / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        directory = runs / episode
+        _ = starting.rename(directory)
+        try:
+            yield directory
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+    finally:
+        os.close(descriptor)
+
+
+def clean_ended_runs(environment: dict[str, str]) -> None:
+    """Finish the cleanup of each run that ended before its own, such as by a signal."""
+    runs = Path.home() / RUNS
+    for directory in sorted(runs.iterdir()) if runs.is_dir() else []:
+        if directory.name.endswith(".new"):
+            continue
+        try:
+            descriptor = os.open(directory / "lock", os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            record = directory / "run.json"
+            if record.exists():
+                saved = cast(SavedRun, json.loads(record.read_text()))
+                status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
+                                      saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                if status:
+                    print(f"mac queue: cleanup of an ended run failed ({status}); kept {directory}", file=sys.stderr)
+                    continue
+            (Path.home() / RECEIPTS / (directory.name + ".json")).unlink(missing_ok=True)
+            shutil.rmtree(directory, ignore_errors=True)
+        finally:
+            os.close(descriptor)
 
 
 class Arguments(argparse.Namespace):
@@ -192,13 +264,13 @@ def run(args: Arguments) -> int:
     remote = RemoteRun()
     prepared = False
     placement = MacPlacement("", episode, "")
-    receipts = Path.home() / ".local/state/mac-queue/receipts"
+    receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
     _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
     assignment_file.chmod(0o600)
-    with tempfile.TemporaryDirectory(prefix="mac-queue-") as temporary:
-        argv_file = Path(temporary) / "argv.json"
+    with run_directory(episode) as directory:
+        argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
         lease_descriptor = -1
         try:
@@ -215,11 +287,18 @@ def run(args: Arguments) -> int:
             else:
                 placement = parse_placement(output)
                 callback_environment["MAC_QUEUE_HOST"] = placement.host
+                clean_ended_runs(callback_environment)
+                on_close = ""
                 if args.lifecycle_script:
                     prepared = True
+                    saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
+                                       "host": placement.host}
+                    _ = (directory / "run.json").write_text(json.dumps(saved))
                     status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command, callback_environment)
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
+                        close_path = argv_file.with_suffix(".json.close")
+                        on_close = close_path.read_text() if close_path.exists() else ""
                         lease_path = argv_file.with_suffix(".json.lease")
                         if lease_path.exists():
                             lease_descriptor = os.open(lease_path.read_text().strip(), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -227,15 +306,13 @@ def run(args: Arguments) -> int:
                 else:
                     status = 0
                 if status == 0:
-                    status = stream_remote(remote_command(placement, args.cwd, command), remote)
-        except RunInterrupted as error:
-            status = error.status
+                    # A run that ends before the Mac answers reports a failure, not success.
+                    status = 1
+                    status = stream_remote(remote_command(placement, args.cwd, command, on_close), remote)
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
-            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                _ = signal.signal(signum, signal.SIG_IGN)
             safe = remote.state != RemoteState.LIVE
             if not safe:
                 try:
@@ -287,13 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.argv or args.argv == ["--"]:
         parser.error("an argv is required")
-    previous = {signum: signal.signal(signum, interrupt_run)
-                for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        return run(args)
-    finally:
-        for signum, handler in previous.items():
-            _ = signal.signal(signum, handler)
+    return run(args)
 
 
 if __name__ == "__main__":

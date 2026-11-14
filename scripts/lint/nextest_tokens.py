@@ -8,8 +8,9 @@ holds no test token while it compiles. Then it takes `test_token_floor`
 tokens, and waits for them when the pool has fewer free. After that it takes
 free tokens without a wait, up to the step's width. The tests run as a child
 with one thread for each token held. Every token goes back when the child
-ends, on any exit or signal; steve also takes back the tokens of a process
-that dies.
+ends. The holder sets no signal handler: a signal ends it with its default
+action, steve takes back the tokens of a process that ends, and the child
+ends with the step's process group.
 """
 
 from __future__ import annotations
@@ -20,27 +21,14 @@ except FileNotFoundError:
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
 
 from scripts.lib import conf
 from scripts.lint import nextest_budget as budget
-
-SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-
-
-class Cancelled(Exception):
-    """A signal ended the run before its tests finished."""
-
-    def __init__(self, signum: int) -> None:
-        super().__init__(signum)
-        self.signum: int = signum
-
 
 @dataclass(frozen=True)
 class SizedTestRun:
@@ -118,24 +106,9 @@ def exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
-def raise_cancelled(signum: int, _frame: FrameType | None) -> None:
-    raise Cancelled(signum)
-
-
 def run_child(argv: Sequence[str]) -> int:
-    """Run one child; a signal goes on to it, and the run ends when it ends."""
-    child = subprocess.Popen(argv)
-    try:
-        return exit_status(child.wait())
-    except Cancelled as cancel:
-        def forward(signum: int, _frame: FrameType | None) -> None:
-            child.send_signal(signum)
-
-        for signum in SIGNALS:
-            _ = signal.signal(signum, forward)
-        child.send_signal(cancel.signum)
-        _ = child.wait()
-        raise
+    """Run one child in this process group, and end when it ends."""
+    return exit_status(subprocess.run(argv, check=False).returncode)
 
 
 def record_reservation_width(reservation: str, threads: int) -> None:
@@ -196,21 +169,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     pool_path, width_file, reservation, command = args.pool, args.width_file, args.reservation, args.command
     if command[:1] == ["--"]:
         command = command[1:]
-    for signum in SIGNALS:
-        _ = signal.signal(signum, raise_cancelled)
-
     def record_width(threads: int) -> None:
         if reservation:
             record_reservation_width(reservation, threads)
 
-    try:
-        run = test_run(command)
-        if isinstance(run, UnsizedCommand):
-            return run_child(run.argv)
-        floor = conf.read("build_admission").whole("test_token_floor")
-        return run_with_tokens(run, pool_path, floor, width_file, record_width)
-    except Cancelled as cancel:
-        return 128 + cancel.signum
+    run = test_run(command)
+    if isinstance(run, UnsizedCommand):
+        return run_child(run.argv)
+    floor = conf.read("build_admission").whole("test_token_floor")
+    return run_with_tokens(run, pool_path, floor, width_file, record_width)
 
 
 if __name__ == "__main__":

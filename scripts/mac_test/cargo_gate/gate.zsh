@@ -61,15 +61,8 @@ if (( agent_call )); then
         limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
         answer=$state/answer-$$-$EPOCHREALTIME-$RANDOM
         timed_out=$answer.timeout
-        cleanup_check() {
-            [[ -z ${timer_pid:-} ]] || kill -TERM "$timer_pid" 2>/dev/null
-            [[ -z ${check_pid:-} ]] || kill -TERM "$check_pid" 2>/dev/null
-            rm -f -- "$answer" "$timed_out"
-        }
-        trap cleanup_check EXIT
-        trap 'exit 143' TERM
-        trap 'exit 130' INT
-        trap 'exit 129' HUP
+        # No signal handler: the check and its timer share this process group, so a
+        # group signal ends them; a later call removes answer files left past the limit.
         /bin/zsh -c "$check_command --episode ${(q)episode} --attempt ${(q)attempt}" > "$answer" 2>/dev/null &
         check_pid=$!
         ( zmodload zsh/zselect; zselect -t $(( limit * 100 ));
@@ -82,7 +75,6 @@ if (( agent_call )); then
         reason=''
         answer_text=$(< "$answer")
         rm -f -- "$answer" "$timed_out"
-        trap - EXIT TERM INT HUP
         parse_answer "$answer_text" "$check_status" || refuse "no answer in ${limit}s"
         [[ -z $reason ]] || refuse "$reason"
         print -r -- "$EPOCHREALTIME"$'\t'"$placement" > "$cache_file.$$"

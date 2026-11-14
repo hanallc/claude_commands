@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -43,7 +46,7 @@ else:
 '''
 
 SSH = r'''
-import json, os, shlex, signal, sys
+import json, os, shlex, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 args = shlex.split(sys.argv[-1])
@@ -56,8 +59,11 @@ if "mac_stopped=" in args[-1]:
 (root / "remote").write_text(json.dumps(args))
 print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
-    (root / "running").write_text("running")
-    signal.pause()
+    (root / "running").write_text(str(os.getpid()))
+    # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
+    _ = sys.stdin.read()
+    (root / "input_closed").write_text("closed")
+    raise SystemExit(255)
 status = int(os.environ.get("FAKE_MAC_STATUS","0"))
 print("Mac output", flush=True)
 if status == 125:
@@ -78,6 +84,21 @@ def plain_ssh_builds(root: Path) -> list[str]:
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if not line.lstrip().startswith("#") and forbidden.search(line):
                 findings.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
+    return findings
+
+
+# The queue releases on process end, so these files set no signal handler (user rule, 2026-11-14).
+NO_HANDLER_FILES = ("lint/nextest_tokens.py", "mac_test/mac_queue_run.py", "mac_test/cargo_gate/gate.zsh")
+SIGNAL_HANDLER = re.compile(r"\bsignal\.(?:signal|SIG_IGN|SIG_DFL|pthread_sigmask|setitimer)\b|\bfrom signal import\b"
+                            + r"|^\s*trap\b|\bTRAP[A-Z]+\b")
+
+
+def signal_handlers(root: Path, names: tuple[str, ...]) -> list[str]:
+    findings: list[str] = []
+    for name in names:
+        for number, line in enumerate((root / name).read_text().splitlines(), 1):
+            if not line.lstrip().startswith("#") and SIGNAL_HANDLER.search(line):
+                findings.append(f"{name}:{number}: {line.strip()}")
     return findings
 
 
@@ -141,38 +162,94 @@ class QueueRunTests(unittest.TestCase):
                     self.assertEqual(work[4:], self.command(root)[-3:])
                     self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
 
-    def test_sigterm_returns_a_running_or_waiting_placement(self) -> None:
-        for waiting, confirms, signum in ((False, True, signal.SIGTERM), (True, True, signal.SIGTERM),
-                                           (False, False, signal.SIGTERM), (False, True, signal.SIGINT),
-                                           (False, True, signal.SIGHUP)):
-            with self.subTest(waiting=waiting, confirms=confirms, signum=signum), tempfile.TemporaryDirectory() as temporary:
+    def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
+        for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
+                                (False, signal.SIGINT)):
+            with self.subTest(waiting=waiting, signum=signum), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                environment = {**self.fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1", "FAKE_STOP_FAIL": "0" if confirms else "1"}
+                environment = {**self.fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, env=environment) as process:
+                                      text=True, env=environment, start_new_session=True) as process:
                     try:
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
-                        process.send_signal(signum)
+                        if waiting:
+                            # A signal to the group also ends the queue call that waits.
+                            os.killpg(process.pid, signum)
+                        else:
+                            process.send_signal(signum)
                         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
                         if process.poll() is None:
-                            process.kill()
+                            os.killpg(process.pid, signal.SIGKILL)
                             _ = process.communicate()
-                self.assertEqual(process.returncode, 128 + signum, output + errors)
-                events = self.events(root)
-                self.assertEqual([event[0] for event in events],
-                    ["place-step", "cancel-placement" if waiting else "finish-step"] if confirms else ["place-step"])
-                if not waiting:
-                    stop = (root / "stop").read_text()
-                    self.assertIn("kill -TERM", stop)
-                    self.assertIn("kill -KILL", stop)
-                    self.assertIn("ps -axo pgid=", stop)
-                    if confirms:
-                        self.assertEqual(events[-1][-1], str(128 + signum))
-                    else:
-                        self.assertIn("may still be live", errors)
-                        assignment = Path(events[0][events[0].index("--assignment-file") + 1])
-                        self.assertTrue(assignment.exists())
+                self.assertEqual(process.returncode, -signum, output + errors)
+                events = [event[0] for event in self.events(root)]
+                if signum == signal.SIGINT:
+                    # Python's own KeyboardInterrupt runs the finally path, which returns the placement.
+                    self.assertEqual(events, ["place-step", "finish-step"])
+                    self.assertEqual(self.events(root)[-1][-1], "1")
+                    self.assertIn("kill -TERM", (root / "stop").read_text())
+                else:
+                    # The queue ends the placement when this process ends.
+                    self.assertEqual(events, ["place-step"])
+                    if not waiting:
+                        wait_until((root / "input_closed").exists, root)
+                    # The run's state folder stays until the next run cleans it.
+                    runs = root / mac_queue_run.RUNS
+                    self.assertEqual(len(list(runs.iterdir())), 1)
+                    self.assertEqual(len(list((root / mac_queue_run.RECEIPTS).iterdir())), 1)
+                    after = subprocess.run(self.command(root), capture_output=True, text=True,
+                                           env={**environment, "FAKE_SSH_HOLD": "0", "FAKE_QUEUE_WAIT": "0"},
+                                           timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+                    self.assertEqual(list(runs.iterdir()), [])
+                    self.assertEqual(list((root / mac_queue_run.RECEIPTS).iterdir()), [])
+
+    def test_the_mac_work_ends_when_the_ssh_input_closes(self) -> None:
+        zsh, setsid = shutil.which("zsh"), shutil.which("setsid")
+        if zsh is None or setsid is None:
+            self.skipTest("zsh or setsid is not installed")
+        for closes in (True, False):
+            with self.subTest(closes=closes), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                # The app starts outside the group, as Terminal starts hana on the Mac.
+                work = (f"{setsid} -f sh -c 'echo $$ > {root}/app.new; mv {root}/app.new {root}/app; exec sleep 60' </dev/null >/dev/null 2>&1; "
+                        + f"while [[ ! -s {root}/app ]]; do sleep 0.05; done; echo started $$; "
+                        + ("exec sleep 60" if closes else "exit 7"))
+                on_close = (f"kill -0 $(<{root}/work) 2>/dev/null && print alive > {root}/order"
+                            + f" || print ended > {root}/order; kill -TERM $(<{root}/app)")
+                wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
+                # Its own session stands in for the SSH session on the Mac.
+                with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      text=True, start_new_session=True) as process:
+                    try:
+                        assert process.stdout is not None and process.stdin is not None
+                        self.assertEqual(process.stdout.readline(), f"mac_group={process.pid}\n")
+                        started = cast(str, process.stdout.readline())
+                        self.assertRegex(started, r"\Astarted \d+\n\Z")
+                        _ = (root / "work").write_text(started.split()[1])
+                        app_end = os.pidfd_open(int((root / "app").read_text()))
+                        self.addCleanup(os.close, app_end)
+                        if closes:
+                            work_end = os.pidfd_open(int(started.split()[1]))
+                            self.addCleanup(os.close, work_end)
+                            process.stdin.close()
+                            for end in (work_end, app_end):
+                                self.assertEqual(select.select([end], [], [], TEST_HANG_GUARD_SECS)[0], [end])
+                            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
+                            # The group ends first; then the close step stops the app.
+                            self.assertEqual((root / "order").read_text(), "ended\n")
+                        else:
+                            output = cast(str, process.stdout.read())
+                            self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                            self.assertEqual(output.splitlines()[-1], "mac_exit=7")
+                            # A run that ends by itself leaves the close step to its own cleanup.
+                            self.assertFalse((root / "order").exists())
+                            os.kill(int((root / "app").read_text()), signal.SIGTERM)
+                    finally:
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            _ = process.wait()
 
     def test_callers_have_no_plain_ssh_build_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -180,6 +257,16 @@ class QueueRunTests(unittest.TestCase):
             _ = (root / "caller.sh").write_text("ssh mac cargo build\n")
             self.assertEqual(len(plain_ssh_builds(root)), 1)
         self.assertEqual(plain_ssh_builds(Path(__file__).resolve().parents[1]), [])
+
+    def test_the_queue_files_set_no_signal_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lines = ("signal.signal(signal.SIGTERM, stop)", "trap cleanup EXIT", "  trap - INT",
+                     "TRAPINT() { exit }", "for each in (signal.SIG_IGN,): pass")
+            for number, line in enumerate(lines):
+                _ = (root / f"case{number}").write_text("# trap is fine in a comment\n" + line + "\n")
+            self.assertEqual(len(signal_handlers(root, tuple(f"case{number}" for number in range(len(lines))))), len(lines))
+        self.assertEqual(signal_handlers(Path(__file__).resolve().parents[1], NO_HANDLER_FILES), [])
 
 
 if __name__ == "__main__":

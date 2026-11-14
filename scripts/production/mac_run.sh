@@ -21,7 +21,7 @@ if [[ $1 == prepare || $1 == cleanup ]]; then
 fi
 purpose=${HANA_TEST_PURPOSE:-}
 owner=${HANA_TEST_OWNER:-${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}}
-[[ -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
+[[ $callback_mode == cleanup || -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
 # zsh's q flag quotes labels for the generated command without evaluating them.
 purpose_arg=${(q)purpose}
 owner_arg=${(q)owner}
@@ -114,6 +114,9 @@ clone=$(on_mac "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py clon
 [[ $clone == /* && $clone != *$'\n'* ]] || { print -u2 'mac_run: scratch clone returned no absolute checkout'; exit 4 }
 clone_arg=${(q)clone}
 save_state
+# The Mac runs this when the SSH input closes, so the checkout and its task end at once.
+# The natedev record and the bundle wait for the next run's cleanup.
+print -r -- "checkout_out=\$(~/.claude/scripts/lib/py ~/.claude/scripts/hana_instances/hana_instances.py stop-checkout $clone_arg) && [[ \${checkout_out##*\$'\\n'} == 'hana-instances: checkout clear' ]] && ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py end --task $clone_task && ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path $clone_arg" > "$argv_file.close"
 registry_args=(--repository hana --owner $copy_owner --host $host --path $clone --session $copy_session)
 mirror_lease=$("$lib/py" $copies_script register-remote "${registry_args[@]}" --shell-lease) || exit 4
 print -r -- "$mirror_lease" > "$argv_file.lease"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -34,7 +35,7 @@ if [[ " $* " == *" --no-run "* ]]; then
 fi
 case "${FAKE_TEST:-pass}" in
     killed) kill -KILL $$ ;;
-    wait) echo started; exec sleep 60 ;;
+    wait) echo "started $$"; exec sleep 60 ;;
 esac
 echo tested
 """
@@ -85,11 +86,12 @@ class PoolCase(unittest.TestCase):
         return len(taken)
 
     def holder(self, *command: str, extra: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        # Its own process group stands in for the step's scope.
         child = subprocess.Popen(
             [str(PY), str(HOLDER), "--pool", str(self.pool), "--width-file", str(self.root / "width"), "--",
              *command],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
-            env={**self.environment, **(extra or {})},
+            env={**self.environment, **(extra or {})}, start_new_session=True,
         )
         self.addCleanup(close_stream, child.stdout)
         self.addCleanup(stop, child)
@@ -158,26 +160,27 @@ class HolderTests(PoolCase):
         self.assertEqual(child.wait(timeout=30), 128 + signal.SIGKILL)
         self.assertEqual(self.free_tokens(), 4)
 
-    def test_cancelled_run_stops_its_tests_and_gives_every_token_back(self) -> None:
+    def test_a_signal_to_the_step_group_ends_the_holder_and_its_tests(self) -> None:
+        # A FIFO pool cannot take back the tokens of an ended process; steve does.
         self.fill(4)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8", extra={"FAKE_TEST": "wait"})
         self.assertEqual(read_line(child), "built\n")
         _ = read_line(child)
-        self.assertEqual(read_line(child), "started\n")
+        tests = os.pidfd_open(int(read_line(child).removeprefix("started ")))
+        self.addCleanup(os.close, tests)
         self.assertEqual(self.free_tokens(), 0)
-        child.send_signal(signal.SIGTERM)
-        self.assertEqual(child.wait(timeout=30), 128 + signal.SIGTERM)
-        self.assertEqual(self.free_tokens(), 4)
+        os.killpg(child.pid, signal.SIGTERM)
+        self.assertEqual(child.wait(timeout=30), -signal.SIGTERM)
+        self.assertEqual(select.select([tests], [], [], 30)[0], [tests])
 
-    def test_run_cancelled_while_it_waits_gives_back_the_tokens_it_took(self) -> None:
+    def test_a_signal_while_the_run_waits_ends_it_before_its_tests(self) -> None:
         self.fill(1)
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8")
         self.assertEqual(read_line(child), "built\n")
         self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
-        child.send_signal(signal.SIGTERM)
-        self.assertEqual(child.wait(timeout=30), 128 + signal.SIGTERM)
+        os.killpg(child.pid, signal.SIGTERM)
+        self.assertEqual(child.wait(timeout=30), -signal.SIGTERM)
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run"])
-        self.assertEqual(self.free_tokens(), 1)
 
     def test_other_commands_run_as_given_with_no_token(self) -> None:
         self.fill(4)
