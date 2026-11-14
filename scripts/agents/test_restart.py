@@ -36,7 +36,7 @@ from scripts.agents.unit_staff_test_support import unit_host
 from scripts.production import fake_unit_host, session_staff, staff, worker
 from scripts.production import test_worker
 from scripts.accounts import accounts
-from scripts.whoami import agent_accounts, note_file, quota_alert
+from scripts.whoami import agent_accounts, note_file, quota_state
 from scripts.whoami.account import Account, UnknownAccountName
 from scripts.message import codex_daemon
 from scripts.agents import member_account, shutdown_record, stop_resume, pane_record
@@ -2522,8 +2522,8 @@ class RestartTests(RestartTestCase):
                       if held else patch.object(staff, "initial_snapshot", return_value=record),
                       patch.object(restart, "session_launch", return_value=(family, {}, arguments)),
                       patch.object(herdr, "prepare_session_environment", return_value=prepared) as prepare,
-                      patch.object(quota_alert, "no_worker_mode", return_value=workers_held),
-                      patch.object(quota_alert, "no_worker_notice", return_value=notice),
+                      patch.object(quota_state, "no_worker_mode", return_value=workers_held),
+                      patch.object(quota_state, "no_worker_notice", return_value=notice),
                       patch.object(herdr.Herdr, "prompt", side_effect=(
                           herdr_types.HerdrFailure("fixture prompt failed\nsecond error line")
                           if delivery is ContinuationDelivery.FAILED else None)) as prompt,
