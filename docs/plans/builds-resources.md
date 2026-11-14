@@ -2365,50 +2365,16 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 ### Phase 114 — A memory wait line names the build it waits behind  · status: done
 
-**Depends on:** none. Merge queue's phase 44 re-land into this branch when it is on main, before the checkpoint; it edits `scripts/build_queue/admission_service.py` too.
+#### As-built
 
-**Source (2026-11-13, builds showrunner):** "start A now". A is the first item of the plan for hana CI job 131906898560: 173 of its 183 minutes were memory-queue wait, and every wait line said `head  needs N GiB` with a blank name.
+- `admission_service.wait_line_name` names a waiter from `gate.RecordedQueueIdentities`: `hana CI · <unit>` for a hana CI request (`ServiceEstimatedAdmission`), otherwise `gate.waiter_unit_name` (unit, session name, folder, pid), then `· <step>` when the waiter has a step.
+- Each admission pass names the queue head once (`result.policy.queued_head`). Every wait reply carries it in `wire.Wait` and in the snapshot (`head_label`, `head_need`); `_wait_snapshot` takes both as arguments and reads no head itself. The hana CI hold replies carry the same snapshot head.
+- `admission_client.WaitOutput`: position 1 prints `this build is the queue head`; otherwise `head <label> needs N GiB`.
+- No admission decision, wire field type or record format changed.
 
-#### Work Order
+**Files:** `scripts/build_queue/admission_service.py`, `scripts/build_queue/admission_client.py`, and tests `test_admission_service.py`, `test_admission_client.py` (`test_wait_lines_name_the_head_and_identify_the_current_build`), `scripts/lint/test_memory_admit.py` (ShellTests position), `scripts/production/test_merge_gate_suites_admission.py`.
 
-**Goal:** each memory wait line says which build it waits behind. A hana CI front shows as `hana CI · <runner> · <step>`.
-
-**Measured:**
-1. `AdmissionService._wait_snapshot()` (`scripts/build_queue/admission_service.py`) sets `head_label` from the head waiter's `session_name` only. A CI front has no session name, so the label is empty.
-2. `admission_client.py` prints `; head {snapshot.head_label} needs …`. An empty label gives `head  needs 16.0 GiB`.
-3. `wire.Wait` gets a second head name from `inputs.ordered[0][1].get("session_name", "")` (`admission_service.py`, the wait reply loop). It has the same gap.
-4. `gate.waiter_unit_name()` (`scripts/lint/memory_admit.py`) already names a waiter: `unit`, then `session_name`, then the folder name, then the pid. `memory_feed.feed_step_labels()` already shows a CI runner's step as `hana CI` with the runner unit.
-
-**Spec:**
-1. Add one function that names a waiter for a wait line. It returns `hana CI · <runner> · <step>` for a CI front, and otherwise the same name as `gate.waiter_unit_name()`, with the step when the waiter has one.
-2. Find how a CI front is told apart from other waiters in the waiter record. Reuse that rule; add no second rule.
-3. Use the function for `head_label` in `_wait_snapshot()` and for the head name in `wire.Wait`.
-4. When the head is the waiter itself, the line says `this build is the queue head` in place of `head <name> needs`.
-5. Change no admission decision, wire field type or record format.
-
-**Tests:** add rows to the existing wait-snapshot and wait-line tests in `scripts/build_queue/test_admission_service.py` and `scripts/build_queue/test_admission_client.py`, as they fit:
-1. A CI-front head gives `head hana CI · hana-linux-2 · test needs 12.3 GiB`.
-2. A unit head with a session name keeps today's text.
-3. A head with no session name and no unit gives the folder name or the pid, never an empty name.
-4. The waiter that is the head gets the head text of Spec item 4.
-
-**Files:**
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_queue/admission_client.py`
-- `scripts/build_queue/test_admission_service.py`
-- `scripts/build_queue/test_admission_client.py`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-
-**Workers:** one implement worker.
-
-**State:** none.
-
-**Verification:**
-1. Test: `scripts.build_queue.test_admission_service`, `scripts.build_queue.test_admission_client`, `scripts.lint.test_memory_admit` and `scripts.production.test_merge_gate_suites_admission`.
-2. Lint: `basedpyright` on the changed files, once after the edits.
-
-**Speed:** one name lookup for each wait reply; no new read of a file or of `/proc`.
+**Gotchas:** the merge of origin/builds 9a550dbf3 added the hana CI hold loop, which called `_wait_snapshot` with the old arguments; basedpyright found it.
 
 ### Phase 116 — The Mac idle alert counts a running hana CI Mac job as Mac work  · status: done
 
