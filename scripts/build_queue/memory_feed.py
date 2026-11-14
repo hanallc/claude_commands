@@ -411,6 +411,7 @@ class MacBuildRow(RowQueueNotes):
     kind: Literal["mac-build"]
     name: str
     repository: str
+    gate_label: str
     showrunner: str
     unit: str
     pid: int
@@ -778,8 +779,10 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                  identity: unit_labels.UnitLabels, *, names: StepNames) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
-    return {"kind": "mac-build", "name": queue_view.mac_step_name(build, names=names, identity=identity),
-            **page_owner_labels(identity, ci_label=label), "repository": build.repository,
+    gate = queue_view.gate_label_text(build)
+    return {"kind": "mac-build",
+            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + gate if gate else ""),
+            **page_owner_labels(identity, ci_label=label), "gate_label": gate, "repository": build.repository,
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
@@ -1307,8 +1310,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,
-        "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), zone,
-            block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",
+        "mac_idle_alert": "\n".join(text for text in (
+            mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), zone,
+                block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",
+            *(f"Mac unplaced run: pid {run.pid}; {run.command}" for run in mac_reading.unplaced_runs)) if text),
         "targets": target_availability.availability_rows(snapshots, labels, zone),
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
@@ -1322,6 +1327,24 @@ def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
     return json.dumps(codec.snapshot_value(payload))
 
 
+def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[tuple[int, float]]) -> None:
+    """Send builds one message with all new unplaced processes."""
+    from scripts.buildlog import mac_idle
+
+    if reading.error:
+        return
+    new_runs = tuple(run for run in reading.unplaced_runs if (run.pid, run.started_at) not in notified)
+    if not new_runs:
+        return
+    text = "Mac runs have no queue placement:\n" + "\n".join(
+        f"pid {run.pid}; {run.command}" for run in new_runs)
+    text += "\nUse mac_queue_run.py for agent and SSH commands."
+    keys = [f"mac-unplaced-{run.pid}-{run.started_at!r}" for run in new_runs]
+    key = ";".join(keys)
+    if mac_idle.notify_showrunner(text, identity=mac_idle.OutageMessage(int(new_runs[0].started_at), reading.read_at, key)):
+        notified.update((run.pid, run.started_at) for run in new_runs)
+
+
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -1333,6 +1356,7 @@ def main(argv: Sequence[str]) -> int:
     report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
     next_report_at = 0.0
     next_mac_at = 0.0
+    notified_mac_runs: set[tuple[int, float]] = set()
     while True:
         if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
@@ -1344,6 +1368,7 @@ def main(argv: Sequence[str]) -> int:
         try:
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
+                notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
             last_good = payload

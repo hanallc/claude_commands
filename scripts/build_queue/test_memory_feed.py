@@ -144,6 +144,45 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(queue_view, "refresh_mac_builds"))
         _ = self.enterContext(mock.patch.object(target_availability, "read_snapshots", return_value=()))
 
+    def test_unplaced_mac_runs_appear_on_the_page_and_send_one_message(self) -> None:
+        from scripts.buildlog import mac_idle
+
+        baseline = captured_reading()
+        for label in ("placement episode/attempt", "user", "hana-ci", "unplaced"):
+            with self.subTest(label=label):
+                build = queue_view.MacBuild(710001, "/Mac/hana", baseline.explanation.now - 30,
+                    "cargo build -p hana", "hana", gate_label=queue_view.parse_gate_label(label),
+                    gate_placement=label.removeprefix("placement ") if label.startswith("placement ") else "")
+                unplaced = (queue_view.UnplacedMacRun(build.pid, build.started_at, build.command),) if label == "unplaced" else ()
+                reading = queue_view.MacBuildReading(baseline.explanation.now, (build,), unplaced_runs=unplaced)
+                notified: set[tuple[int, float]] = set()
+                with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send,
+                      mock.patch.object(queue_view, "read_mac_builds", return_value=reading),
+                      mock.patch.object(admission_client, "view", return_value=baseline),
+                      mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+                    page = memory_feed.reading()
+                    memory_feed.notify_unplaced_mac_runs(reading, notified)
+                    memory_feed.notify_unplaced_mac_runs(reading, notified)
+                    self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
+                    row = next(row for row in page["walk"] if row["pid"] == build.pid)
+                    self.assertIn(label, row["name"])
+                    if label == "unplaced":
+                        self.assertIn("pid 710001", str(send.call_args))
+                        self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])
+                        first_key = cast(mac_idle.OutageMessage, send.call_args.kwargs["identity"]).key
+                        next_run = queue_view.UnplacedMacRun(build.pid, build.started_at + 0.00001, build.command)
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=(next_run,)), notified)
+                        self.assertEqual(send.call_count, 2)
+                        self.assertNotEqual(first_key, cast(mac_idle.OutageMessage, send.call_args.kwargs["identity"]).key)
+                        newer = (queue_view.UnplacedMacRun(710002, build.started_at, "rustc source.rs"),
+                                 queue_view.UnplacedMacRun(710003, build.started_at, "cargo nextest run"))
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
+                        self.assertEqual(send.call_count, 3)
+                        self.assertIn("pid 710002", cast(str, send.call_args.args[0]))
+                        self.assertIn("pid 710003", cast(str, send.call_args.args[0]))
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
+                        self.assertEqual(send.call_count, 3)
+
     def configure(self, *, seconds: float = 0.125) -> None:
         source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
         text = source.read_text().replace("output_folder=~/.local/share/review-links/h7uj5c", f"output_folder={self.output}")

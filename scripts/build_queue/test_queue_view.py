@@ -186,6 +186,46 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
+    def test_gate_records_classify_process_trees_and_reject_reused_pids(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            records = fixture.root / ".local/state/mac-gate/records"
+            records.mkdir(parents=True)
+            stamp = "Mon Nov 9 12:00:00 2026"
+            born = int(time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")))
+            for pid, label in ((10, "placement episode/attempt"), (20, "user"), (100, "placement stale/attempt")):
+                _ = (records / str(pid)).write_text(f"{pid}\t{stamp}\t{label}\n")
+            processes = {pid: {"parent": parent, "uid": uid, "started_at": started,
+                "resident_bytes": 1024, "command": command, "executable": "/bin/" + command.split()[0]}
+                for pid, parent, uid, started, command in (
+                    (10, 1, 501, born, "zsh"), (11, 10, 501, born + 1, "cargo build"),
+                    (12, 11, 501, born + 2, "rustc --crate-name placed"),
+                    (20, 1, 501, born, "zsh"), (21, 20, 501, born + 1, "cargo test"),
+                    (100, 1, 501, born + 9, "cargo build"),
+                    (40, 1, 502, born, "cargo-nextest run"),
+                    (50, 1, 501, born, "rustc --version"))}
+            script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+                "from unittest.mock import patch\n"
+                + f"read_processes = lambda: {processes!r}\n"
+                + "read_captures = lambda processes: {}\n"
+                + f"output = lambda arguments: 'p11\\nn{fixture.root}\\np21\\nn{fixture.root}\\np40\\nn{fixture.root}'\n"
+                + "import types\n"
+                + f"with patch.dict(os.environ, HOME={str(fixture.root)!r}), patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=502)):\n"
+                + "    print(json.dumps(read_reading()))")
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = cast(dict[str, list[dict[str, object]]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            self.assertEqual([row["pid"] for row in data["unplaced_runs"]], [50, 100])
+            self.assertEqual({row["pid"]: row["gate_label"] for row in data["builds"]},
+                {11: "placement episode/attempt", 21: "user", 40: "hana-ci"})
+            _ = (fixture.root / "mac_test.conf").write_text("host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\n")
+            path = fixture.root / "mac-builds.json"
+            with (mock.patch.object(subprocess, "run", return_value=result),
+                  mock.patch.object(queue_view, "mac_reading_path", return_value=path)):
+                queue_view.refresh_mac_builds()
+                reading = queue_view.read_mac_builds()
+            self.assertEqual([run.pid for run in reading.unplaced_runs], [50, 100])
+            self.assertEqual([build.pid for build in reading.builds], [40, 11, 21])
+
     @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
     def test_project_record_returns_empty_for_an_unreadable_folder(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -193,7 +233,7 @@ class MacQueueViewTests(unittest.TestCase):
             folder.mkdir()
             folder.chmod(0)
             try:
-                script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                     f"print(json.dumps(project_record({str(folder)!r})))")
                 result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
             finally:
@@ -210,7 +250,7 @@ class MacQueueViewTests(unittest.TestCase):
                     record = fixture.root / ".copy-record.json"
                     if operation == "read_text":
                         _ = record.write_text('{}')
-                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                         "from unittest.mock import patch\n"
                         + f"with patch.object(Path, {operation!r}, side_effect=PermissionError('unreadable')):\n"
                         + f"    print(json.dumps(project_record({str(fixture.root)!r})))")
@@ -229,7 +269,7 @@ class MacQueueViewTests(unittest.TestCase):
                         for pid, folder in folders.items()}
             for failed in ("project_record", "repository_name", "running_test_pid", "build_origin"):
                 with self.subTest(failed=failed):
-                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                         f"read_processes = lambda: {processes!r}\n"
                         + f"read_captures = lambda processes: {captures!r}\n"
                         + "output = lambda arguments: ''\n"
@@ -259,16 +299,25 @@ class MacQueueViewTests(unittest.TestCase):
 
     def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
         for origin in queue_view.MacBuildOrigin:
-            with self.subTest(origin=origin):
-                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin,
-                                            ci_runner="hana-mac-1", ci_job="test-hana")
-                row = queue_view.mac_build_record(build)
-                self.assertEqual(queue_view.mac_build_from_record(row), build)
-                del row["origin"]
-                self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
-                del row["ci_runner"], row["ci_job"]
-                self.assertEqual(queue_view.mac_build_from_record(row).ci_runner, "")
-                self.assertEqual(queue_view.mac_build_from_record(row).ci_job, "")
+            for wire, expected in (("user", queue_view.MacGateLabel.USER),
+                    ("placement e/a", queue_view.MacGateLabel.PLACEMENT), ("hana-ci", queue_view.MacGateLabel.CI),
+                    ("unplaced", queue_view.MacGateLabel.UNPLACED), ("", queue_view.MacGateLabel.UNAVAILABLE),
+                    ("future label", queue_view.MacGateLabel.UNAVAILABLE)):
+                with self.subTest(origin=origin, wire=wire):
+                    build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin,
+                                                ci_runner="hana-mac-1", ci_job="test-hana")
+                    row = queue_view.mac_build_record(build)
+                    self.assertEqual(queue_view.mac_build_from_record(row), build)
+                    del row["origin"]
+                    self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
+                    del row["ci_runner"], row["ci_job"]
+                    self.assertEqual(queue_view.mac_build_from_record(row).ci_runner, "")
+                    self.assertEqual(queue_view.mac_build_from_record(row).ci_job, "")
+                    row["gate_label"] = wire
+                    restored = queue_view.mac_build_from_record(row)
+                    self.assertIs(restored.gate_label, expected)
+                    if expected == queue_view.MacGateLabel.PLACEMENT:
+                        self.assertEqual(queue_view.gate_label_text(restored), wire)
 
     def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -290,7 +339,7 @@ class MacQueueViewTests(unittest.TestCase):
                 with self.subTest(command=command, parent=parent):
                     processes[80]["command"] = command
                     processes[80]["parent"] = parent
-                    script = queue_view.mac_build_script().replace("print(json.dumps(read_builds()))",
+                    script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                         f"read_processes = lambda: {processes!r}\n" +
                         "read_captures = lambda processes: {}\n" +
                         f"output = lambda arguments: 'p100\\nn{folder}\\n'\n" +
@@ -336,9 +385,9 @@ class MacQueueViewTests(unittest.TestCase):
             for elapsed, seconds in (("03:04", 184), ("02:03:04", 7384), ("1-02:03:04", 93784)):
                 with self.subTest(elapsed=elapsed):
                     result = subprocess.CompletedProcess(["ssh"], 0,
-                        stdout=json.dumps([{"pid": 710001, "folder": "/Users/nate/mac clone", "started_at": now - seconds,
+                        stdout=json.dumps({"builds": [{"pid": 710001, "folder": "/Users/nate/mac clone", "started_at": now - seconds,
                             "resident_bytes": 1048576, "test_pid": 710002, "command": "cargo nextest run --jobs=4",
-                            "repository": "hana", "progress_tail": "", "recorded_unit": "", "session": ""}]) + "\nrc=0\n", stderr="")
+                            "repository": "hana", "progress_tail": "", "recorded_unit": "", "session": ""}]}) + "\nrc=0\n", stderr="")
                     with (mock.patch.object(queue_view, "mac_reading_path", return_value=path),
                           mock.patch.object(subprocess, "run", return_value=result),
                           mock.patch.object(time, "time", return_value=now)):
@@ -404,7 +453,7 @@ class MacQueueViewTests(unittest.TestCase):
                 env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
-            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n"))["builds"])
             self.assertEqual([row["pid"] for row in rows], [100, 200, 300])
             self.assertEqual([row["resident_bytes"] for row in rows], [100 * 1024, 600 * 1024, 100 * 1024])
             self.assertEqual([row["recorded_unit"] for row in rows], ["trunk", "mirror-unit", "mirror-unit"])
@@ -422,7 +471,7 @@ class MacQueueViewTests(unittest.TestCase):
             result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
                 env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
-            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            rows = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n"))["builds"])
             self.assertEqual([row["pid"] for row in rows], [200, 300])
 
     def test_mac_reader_finds_tests_in_the_selected_target_directory(self) -> None:
@@ -478,7 +527,7 @@ class MacQueueViewTests(unittest.TestCase):
                     data += b"\0TOKEN=not-public\0\0"
                     script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
                         f"CAPTURE_ROOT = Path({str(fixture.root / 'captures')!r})")
-                    script = script.replace("print(json.dumps(read_builds()))",
+                    script = script.replace("print(json.dumps(read_reading()))",
                         f"assert cargo_environment({data!r}) == {environment!r}\n"
                         + f"process_environment = lambda pid: cargo_environment({data!r})\nprint(json.dumps(read_builds()))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,

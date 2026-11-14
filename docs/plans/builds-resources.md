@@ -2498,7 +2498,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Speed:** one extra `--no-run` cargo call per test step, which finds the build fresh; one token read per test thread.
 
-### Phase 119 — An agent or ssh cargo run on the Mac needs a live queue placement  · status: todo
+### Phase 119 — An agent or ssh cargo run on the Mac needs a live queue placement  · status: done
 
 **Depends on:** queue's read-only `placement-status --episode E --attempt A` admission request (queue 44al). Tests use a fake of it. The `offload.py` change waits for queue's 44 re-land on origin/builds, which gives offload its placement. The Mac PATH change is a Mac nixos change with the user's go; it lands after this phase is promoted to the Mac.
 
