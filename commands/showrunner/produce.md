@@ -490,7 +490,7 @@ Turns come from unit directors' messages and the user. Handle each message:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
+| a nightly red notice or unassigned alert | Assign the fix to the owning unit director of any production, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`; the user push waits for it. |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |
