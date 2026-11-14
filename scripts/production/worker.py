@@ -36,6 +36,7 @@ from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_P
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import display_cells, session_staff, staff, worker_admission
+from scripts.whoami import quota_state
 
 from scripts.herdr import herdr
 
@@ -1087,9 +1088,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
-    from scripts.whoami import quota_alert
-
-    workers_held = quota_alert.no_worker_mode()
+    workers_held = quota_state.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,

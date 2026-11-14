@@ -202,8 +202,8 @@ class CloudGateTests(CostFixture):
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 0, 0, 'full', 1)""").close()
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1)""").close()
         self.request['modules'] = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
         self.fake.has_result = False
         self.fake.log = ("Runner: 2 modules, whole machine, 32 CPUs\n"
@@ -234,8 +234,8 @@ class CloudGateTests(CostFixture):
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 0, 0, 'full', 1)""").close()
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1)""").close()
         self.fake.has_result = False
         self.fake.log = "Runner: 1 modules, whole machine, 32 CPUs\nStarting module: fixture/test_ok.py\n"
         numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
