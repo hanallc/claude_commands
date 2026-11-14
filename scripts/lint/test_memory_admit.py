@@ -5585,6 +5585,45 @@ class QueueExplanationTests(MemoryQueueFixture):
                 if scenario == "older fit":
                     self.assertEqual(result.rows[1].reason, admission_records.StartSpacingWait(NOW_EPOCH + 5))
 
+    def test_a_gpu_test_waits_while_another_gpu_test_holds_the_slot(self) -> None:
+        _ = self.running(100, 2, age=30, fields={"repo": "hana"})
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana")
+        _ = self.waiting(400, 2 * GIB, 5, repository_name="other")
+        roomy = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        gpu = replace(admission_policy_fixture(), gpu_tests=admission_records.GpuTestSlots(1, frozenset({"hana"})))
+        held = admission_records.GpuSlotWait(1, 1)
+        result = gate.admission_pass(roomy, roomy.now, policy=gpu)
+        self.assertEqual([row.decision.state for row in result.rows], ["hold", "admit"])
+        self.assertEqual(result.rows[0].decision.gpu, held)
+        self.assertEqual(cast(admission_records.HeadAdmissionStatus, result.rows[0].reason).cause, held)
+        reading = gate.queue_read_from(roomy, policy=gpu)
+        head = reading.explanation.head
+        assert isinstance(head, admission_records.HeadExplanation)
+        self.assertEqual(head.cause, held)
+        status = cast(admission_records.HeadAdmissionStatus, reading.view.waiting[0].reason)
+        self.assertEqual(admission_records.head_wait_text(status, ZoneInfo("UTC")),
+                         "head: waiting for the GPU test slot (1 of 1 in use)")
+        released = replace(roomy, reservations=(), running=())
+        self.assertEqual(gate.admission_pass(released, roomy.now, policy=gpu).rows[0].decision.state, "admit")
+        for name, policy in (("no GPU repository", replace(gpu, gpu_tests=admission_records.NO_GPU_TESTS)),
+                             ("another repository", replace(gpu, gpu_tests=admission_records.GpuTestSlots(1, frozenset({"bevy"})))),
+                             ("two slots", replace(gpu, gpu_tests=admission_records.GpuTestSlots(2, frozenset({"hana"}))))):
+            with self.subTest(name=name):
+                rows = gate.admission_pass(roomy, roomy.now, policy=policy).rows
+                self.assertEqual(rows[0].decision.state, "admit")
+                self.assertEqual(rows[0].decision.gpu, admission_records.GpuSlotFree())
+
+    def test_a_gpu_test_admitted_in_the_pass_holds_the_next_gpu_test(self) -> None:
+        _ = self.waiting(300, 2 * GIB, 20, repository_name="hana")
+        _ = self.waiting(400, 2 * GIB, 5, repository_name="hana", step="build")
+        _ = self.waiting(200, 2 * GIB, 1, repository_name="hana")
+        roomy = replace(self.snapshot_inputs(), host=admission_records.HostMemory(60 * GIB, 60 * GIB))
+        gpu = replace(admission_policy_fixture(), gpu_tests=admission_records.GpuTestSlots(1, frozenset({"hana"})))
+        rows = gate.admission_pass(roomy, roomy.now, policy=gpu).rows
+        self.assertEqual(rows[0].decision.state, "admit")
+        self.assertEqual([row.decision.gpu for row in rows],
+                         [admission_records.GpuSlotFree(), admission_records.GpuSlotFree(), admission_records.GpuSlotWait(1, 1)])
+
     def test_pass_is_pure_and_ignores_reader_environment_and_clock(self) -> None:
         _ = self.waiting(300, 4 * GIB, 1)
         _ = self.waiting(400, 5 * GIB, 0)

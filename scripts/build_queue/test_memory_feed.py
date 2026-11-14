@@ -1654,6 +1654,13 @@ process.stdout.write(JSON.stringify({
                 status = memory_feed.memory_status(changed, captured, 0)
                 self.assertEqual(status["code"], code)
                 self.assertEqual(status["check_room_bytes"], captured.room)
+        waiter: admission_records.Waiter = {"pid": 999, "start_time": "999", "need": gib, "since": inputs.now,
+            "session_id": "waiting", "session_name": "waiting", "unit": "", "step": "check", "folder": "/tree"}
+        waiting = gate.queue_read_from(replace(inputs, ordered=[(Path("waiting"), waiter)]), admission_policy_fixture()).explanation
+        head = waiting.head
+        assert isinstance(head, admission_records.HeadExplanation)
+        gpu_wait = replace(waiting, head=replace(head, cause=admission_records.GpuSlotWait(1, 1)))
+        self.assertEqual(memory_feed.memory_status(gpu_wait, room, 0)["code"], "gpu_slot")
 
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):

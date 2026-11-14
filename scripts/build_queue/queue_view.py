@@ -868,6 +868,8 @@ def head_status(model: QueueModel) -> Line:
         return (*result, Span(" low room", "error"))
     if isinstance(cause, admission_records.BehindHead):
         return (*result, Span(" queue order", "inactive"))
+    if isinstance(cause, admission_records.GpuSlotWait):
+        return (*result, Span(" GPU test slot", "inactive"))
     return result
 
 

@@ -71,6 +71,21 @@ class PeakHold:
 
 
 @dataclass(frozen=True)
+class GpuTestSlots:
+    """Limit the local test steps of GPU repositories that run at once on this host."""
+    slots: int
+    repositories: frozenset[str]
+
+    def holds(self, repository: str, step: str) -> bool:
+        return repository in self.repositories and step in GPU_TEST_STEPS
+
+
+# These steps run test binaries; a GPU repository's tests open render apps.
+GPU_TEST_STEPS = frozenset({"nextest", "test", "t", "targeted-test", "merge-gate"})
+NO_GPU_TESTS = GpuTestSlots(1, frozenset())
+
+
+@dataclass(frozen=True)
 class AdmissionPolicy:
     timing: AdmissionTiming
     pressure: PressurePolicy
@@ -78,6 +93,7 @@ class AdmissionPolicy:
     safety_bytes: int = 3 * GIB
     progress_lookahead_percent: float = field(kw_only=True)
     agent_swap_share_percent: int = field(default=100, kw_only=True)
+    gpu_tests: GpuTestSlots = field(default=NO_GPU_TESTS, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -756,6 +772,18 @@ class HeldBehindHead:
 
 
 @dataclass(frozen=True)
+class GpuSlotFree:
+    pass
+
+
+@dataclass(frozen=True)
+class GpuSlotWait:
+    """A GPU test step waits until a running GPU test step ends."""
+    used: int
+    slots: int
+
+
+@dataclass(frozen=True)
 class AdmissionDecision:
     state: Literal["admit", "hold"]
     threshold: int
@@ -769,6 +797,7 @@ class AdmissionDecision:
     starts_at: float = 0.0
     reused_slot: bool = False
     room: RoomCheck = RoomCheck(0, 0, True, basis=Fits())
+    gpu: GpuSlotFree | GpuSlotWait = GpuSlotFree()
 
 
 @dataclass(frozen=True)
@@ -806,7 +835,8 @@ class ReadingUnavailable:
 class EstimateExpired:
     estimated_at: float
 
-HeadCause = MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired | BehindHead | ReadyForAdmission
+HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
+             | BehindHead | GpuSlotWait | ReadyForAdmission)
 
 
 @dataclass(frozen=True)
@@ -816,7 +846,12 @@ class HeadAdmissionStatus:
     available: int
     cause: HeadCause = field(kw_only=True)
 
-WaitReason = StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
+WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
+              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter)
+
+
+def gpu_slot_text(wait: GpuSlotWait) -> str:
+    return f"waiting for the GPU test slot ({wait.used} of {wait.slots} in use)"
 
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
@@ -831,6 +866,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: estimate expired"
     if isinstance(cause, BehindHead):
         return "head: behind " + cause.head_name
+    if isinstance(cause, GpuSlotWait):
+        return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
     return f"head: needs {reason.need / GIB:.1f} GiB; room {max(0, reason.decision.room.room) / GIB:.1f} GiB"
@@ -1267,7 +1304,9 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
                                        progress_lookahead_percent=number("progress_lookahead_percent"),
-                                       agent_swap_share_percent=whole("agent_swap_share_percent")),
+                                       agent_swap_share_percent=whole("agent_swap_share_percent"),
+                                       gpu_tests=GpuTestSlots(whole("gpu_test_slots"),
+                                                              value("gpu_test_repositories", lambda raw: frozenset(raw.split())))),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
@@ -1424,6 +1463,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "start spacing"
         case NeedsMemory():
             return "free memory"
+        case GpuSlotWait():
+            return "GPU test slot"
         case BehindHead():
             place = behind_place(reason, waiting)
             return f"behind #{place}" if place else "behind the first step"

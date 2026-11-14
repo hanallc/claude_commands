@@ -589,6 +589,7 @@ function fitLabels() {}
     def test_the_status_line_names_the_one_reason_a_start_waits(self) -> None:
         for code, ram, expected in (
             ("unavailable", RAM_FIXTURE, "Memory reading unavailable; build capacity is unknown."),
+            ("gpu_slot", RAM_FIXTURE, "A GPU test waits: another GPU test holds the GPU test slot."),
             ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; room is 18.0 GiB."),
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
              "No room: reserves exceed available RAM by 3.0 GiB."),

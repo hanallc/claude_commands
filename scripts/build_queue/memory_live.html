@@ -508,6 +508,7 @@ function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
   return ({
     unavailable: "Memory reading unavailable; build capacity is unknown.",
+    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot.",
     pressure: `Memory pressure prevents a new start; room is ${room}.`,
     shortfall: `No room: reserves exceed available RAM by ${ramAmount(d.ram.shortfall_bytes)}.`,
     no_room: "No room: safety, swap reserves, and build reservations use available RAM.",

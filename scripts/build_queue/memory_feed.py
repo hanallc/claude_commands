@@ -1131,7 +1131,7 @@ class RamBlocks(TypedDict):
     agreement: Literal["agree", "disagree"]
 
 
-MemoryStatusCode = Literal["unavailable", "pressure", "shortfall", "no_room", "one_running_memory_wait", "none"]
+MemoryStatusCode = Literal["unavailable", "gpu_slot", "pressure", "shortfall", "no_room", "one_running_memory_wait", "none"]
 
 
 class MemoryStatus(TypedDict):
@@ -1405,7 +1405,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "smaller_programs_bytes": sum(amount for _, amount in smaller), "smaller_program_count": len(smaller),
         "kernel_bytes": kernel.total, "compressed_swap_bytes": kernel.compressed_swap,
         "kernel_structures_bytes": kernel.structures, "kernel_counters_bytes": kernel.counters,
-        "kernel_no_counter_bytes": min(kernel.no_counter, max(0, unattributed)), "cache_bytes": cache, "unattributed_bytes": unattributed, "missing": missing,
+        "kernel_no_counter_bytes": min(kernel.no_counter, max(0, unattributed)), "cache_bytes": cache,
+        "unattributed_bytes": unattributed, "missing": missing,
         "agreement": "disagree" if unattributed < 0 or known_bytes(cache) < 0 else "agree",
     }
 
@@ -1422,6 +1423,8 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
             or isinstance(head, admission_records.HeadExplanation)
             and isinstance(head.cause, (admission_records.ReadingUnavailable, admission_records.PressureUnavailable))):
         code = "unavailable"
+    elif isinstance(head, admission_records.HeadExplanation) and isinstance(head.cause, admission_records.GpuSlotWait):
+        code = "gpu_slot"
     elif isinstance(pressure, admission_records.MemoryPressure):
         code = "pressure"
     elif room.room == 0:

@@ -74,6 +74,9 @@ from scripts.build_queue.admission_records import (
     FreeCheck,
     GIB,
     GoneMemory,
+    GpuSlotFree,
+    GpuSlotWait,
+    GpuTestSlots,
     HeadAdmissionOverride,
     HeadAdmissionStatus,
     HeadCause,
@@ -550,7 +553,7 @@ class HeadStartsAt:
 @dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
-    causes: tuple[Literal["free memory", "pressure", "queue order", "start spacing"], ...]
+    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing"], ...]
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
@@ -1654,6 +1657,8 @@ def queue_wait_reason(decision: AdmissionDecision, need: int, available: int,
         return order
     if not isinstance(decision.pressure, NoPressureHold):
         return decision.pressure
+    if isinstance(decision.gpu, GpuSlotWait):
+        return decision.gpu
     if decision.starts_at:
         return StartSpacingWait(decision.starts_at)
     if not decision.free_passes:
@@ -1909,6 +1914,13 @@ def start_spacing_after(now: float, policy: AdmissionPolicy) -> NextStartAt:
     return NextStartAt(now + policy.timing.recovery_start_seconds)
 
 
+def gpu_test_reservation(row: Reservation, gpu: GpuTestSlots) -> bool:
+    """Count an admitted local step of a GPU repository that runs tests."""
+    waiter = row.get("queue_waiter")
+    repository = waiter.get("repository_name", row["repo"]) if waiter is not None else row["repo"]
+    return gpu.holds(repository, row["step"])
+
+
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    head: QueuedHead | NoQueuedHead, room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
@@ -1931,6 +1943,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     has_override = not isinstance(inputs.override, NoHeadAdmissionOverride)
     no_runs = not inputs.reservations and not inputs.slots
     new_started = False
+    gpu = policy.gpu_tests
+    # The reservation is the slot: it ends at release or when its owner exits.
+    gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
     protected_extra = 0
     protected_claim: Waiter | NoWaiter = NoWaiter()
     for _, row in ordered:
@@ -1959,6 +1974,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                    next_start.at if new_started else 0.0)
         can_start = (within or readable and clear and room_passes) and fresh
         can_start = can_start and isinstance(state, QueuedWaiter) and (reused or due and not new_started)
+        gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
+        gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
+        can_start = can_start and isinstance(gpu_wait, GpuSlotFree)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         if not reused and protected_need and not fits:
             if not isinstance(protected_claim, NoWaiter):
@@ -1970,10 +1988,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
             room_passes, order_hold, 0.0 if reused else spacing,
-            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis))
+            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         decisions.append(WaiterAdmission(row, decision, state))
         if can_start:
             remaining += held - need
+            gpu_used += gpu_step
             if not reused:
                 new_started = True
         elif reused:
@@ -2287,6 +2306,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStartsAt(cause.at, ended, charge_drop, freed, growth_drop)
     if isinstance(cause, NeedsMemory):
         return HeadStillHeld(decision, ("free memory",))
+    if isinstance(cause, GpuSlotWait):
+        return HeadStillHeld(decision, ("GPU test slot",))
     if isinstance(cause, (MemoryPressure, PressureUnavailable)):
         return HeadStillHeld(decision, ("pressure",))
     return HeadStillHeld(decision, ("queue order",))

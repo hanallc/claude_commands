@@ -2607,3 +2607,12 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/build_queue/test_memory_feed.py`, `scripts/build_queue/test_memory_hover.py`.
 
 **Gotchas:** `VmallocUsed − KernelStack` is correct only with CONFIG_VMAP_STACK (set on natedev). A zswap host would put its pool in the no-counter line.
+
+### Phase 128 — One GPU test slot for hana tests on natedev  · status: done
+
+hana had 5 GPU OutOfMemory failures on natedev when GPU tests from more than one run overlapped. Builds approved one GPU test slot (14:05 EST); queue agreed the shape the same day.
+
+1. New keys in `config/build_admission.conf` `[memory]`: `gpu_test_slots=1`, `gpu_test_repositories=hana`. They go into `AdmissionPolicy.gpu_tests`.
+2. A GPU test step is a local admission whose repository name is in `gpu_test_repositories` and whose step runs tests (nextest, test, t, targeted-test, merge-gate).
+3. The slot is the admission reservation itself. Used = admitted local reservations that are GPU test steps. Cloud gates, Mac placements and waiters do not count. The slot ends with the reservation, at release or at owner exit. No file, no lock, no signal handler.
+4. `admission_walk` holds a GPU test waiter while the slots are used. The cause is `GpuSlotWait(used, slots)`, in the gate head decision, so the explanation, the queue view and the Builds page show it. The head keeps its protected need, so no step passes it on memory (no backfill).
