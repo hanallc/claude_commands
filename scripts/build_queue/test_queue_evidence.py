@@ -78,7 +78,7 @@ class RoomTextTests(unittest.TestCase):
         for ci_use, swap_free, text in (
             (0, 32 * GIB, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
             (4 * GIB, 32 * GIB, "Cap 24.0 GiB; anonymous use 3.0 GiB + CI use 4.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; room 12.0 GiB"),
-            (0, 22 * GIB, "Cap 20.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB; kept aside 5.0 GiB; − 10.0 GiB swapped outside builds; room 2.0 GiB"),
+            (0, 22 * GIB, "Cap 10.0 GiB; anonymous use 3.0 GiB + free 20.0 GiB − safety 3.0 GiB − 10.0 GiB swapped outside builds; kept aside 5.0 GiB; room 2.0 GiB"),
         ):
             with self.subTest(ci_use=ci_use, swap_free=swap_free):
                 room = gate.memory_room(records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, swap_free),

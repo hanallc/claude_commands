@@ -2632,3 +2632,17 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/lint/test_tmp_sweep.py` — `test_clone_tag_that_the_source_holds_unchanged_is_not_unsaved_work` (same tag removed, moved tag kept).
 
 **Gotchas:** a clone with no local source passes its tag names on argv in place of `--tags`; some hundreds of names stay far below ARG_MAX.
+
+### Phase 123 — The build cap leaves out agents' swapped memory  · status: done
+
+**Why:** the user, via builds, 2026-11-14: the Builds page shows the agents' swapped memory inside the build cap. Live 09:27 EST: cap 27.0 GiB with an 11.5 GiB swapped-agent block left of the cap line. `memory_admit.memory_room` sets cap = used + CI + free − safety, but room also subtracts `agent_swap_demand`, so that part of the cap can never go to builds.
+
+**Work:**
+1. `memory_room`: cap = max(0, used + CI + free − safety − `agent_swap_demand`). Room = cap − used − CI − kept stays true. Admission is unchanged: no start decision reads the cap.
+2. `queue_evidence.room_text`: the swapped term is part of the cap calculation.
+3. `memory_live.html`: the cap line sits left of the swapped-agent block, next to the safety floor. The room equation shows the swapped term. The swapped-memory hover says it is outside the cap.
+4. `queue_view.cap_bar`: the terminal bar draws the swapped block between the cap line and safety.
+5. `memory_feed.memory_shares`: the swapped share comes first, then the reserved share stops at the cap line.
+6. Tests: `memory_room` cap rows, `room_text`, `cap_bar`, `memory_shares`, and the page hover and equation.
+
+**Files:** `scripts/lint/memory_admit.py`, `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/queue_view.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, and their tests.
