@@ -4021,26 +4021,31 @@ class Ledger:
         A kept finding in a crate with no freed finding cannot. In a crate that holds both, each finding of the crate
         must be a plain file rename (`file_rename`), and: no freed file names a kept module, by its old or new name;
         no freed rename and kept rename share a new name, and neither takes the other's old name; and no file of the
-        crate reaches a renamed module by a path that holds none of its names (_hidden_module_paths).
+        crate, or file that the crate mounts from outside its folder, reaches a renamed module by a path that holds
+        none of its names (_hidden_module_paths).
         """
         tip = self._tip(commit)
-        reasons = self._crossing_mounts(tip, frozenset(tip.crate(finding.path) for finding in (*freed, *kept)))
-        for crate in sorted({tip.crate(finding.path) for finding in freed}):
-            shared = tuple(finding for finding in kept if tip.crate(finding.path) == crate)
-            if shared:
-                yielded = tuple(finding for finding in freed if tip.crate(finding.path) == crate)
-                reasons += self._crate_couplings(commit, crate, yielded, shared)
+        shared = frozenset(tip.crate(finding.path) for finding in freed) & frozenset(tip.crate(finding.path) for finding in kept)
+        reasons, mounted = self._crossing_mounts(tip, frozenset(finding.path for finding in (*freed, *kept)), shared)
+        for crate in sorted(shared):
+            yielded = tuple(finding for finding in freed if tip.crate(finding.path) == crate)
+            still = tuple(finding for finding in kept if tip.crate(finding.path) == crate)
+            reasons += self._crate_couplings(commit, crate, yielded, still, tuple(dict.fromkeys(mounted.get(crate, ()))))
         return tuple(dict.fromkeys(reasons))
 
-    def _crossing_mounts(self, tip: RepositoryTip, crates: frozenset[str]) -> list[str]:
-        """Why a `path` attribute in any Rust file of the repository can join a crate of crates to another crate.
+    def _crossing_mounts(self, tip: RepositoryTip, paths: frozenset[str],
+                         shared: frozenset[str]) -> tuple[list[str], dict[str, list[str]]]:
+        """Why a `path` attribute in any Rust file of the repository can join a finding at paths to another crate, and
+        the Rust files that each crate of shared mounts from outside its folder.
 
-        A reading outside the declaring crate's folder mounts a file of one crate into another, so a finding's crate
-        is not all the code that compiles its file. It refuses when the declaring crate or the mounted file's crate
-        is in crates; a folder that an inline module's attribute names is read the same way. An unread attribute, and one
-        that mounts a file not named `.rs`, refuse wherever they are. One `git cat-file --batch` reads every file.
+        A reading outside the declaring crate's folder compiles a file of one crate into another. It refuses only when
+        a finding is in the declaring file, the mounted file or a file under the mounted folder. A crate of shared
+        (one that holds a freed and a kept finding) scans each file it mounts with its own files, so a mount refuses
+        there only when it leaves the repository, where no scan reads. An unread attribute, and one that mounts a file
+        not named `.rs`, refuse wherever they are. One `git cat-file --batch` reads every file.
         """
         reasons: list[str] = []
+        mounted: dict[str, list[str]] = {}
         blobs = {path: blob for path, blob in tip.blobs.items() if path.endswith(".rs")}
         for path, content in blob_contents(self.repo, blobs):
             for attribute in _path_attributes(path, content):
@@ -4054,13 +4059,20 @@ class Ledger:
                                 if not reading.endswith(".rs")]
                 kind = "file" if isinstance(attribute, MountedFile) else "folder"
                 for reading in attribute.readings:
-                    outside = reading.startswith("..") or tip.crate(reading) != home
-                    if outside and (home in crates or (not reading.startswith("..") and tip.crate(reading) in crates)):
-                        reasons.append(f"{path} mounts {reading}, a {kind} outside {home}")
-        return reasons
+                    if not reading.startswith("..") and tip.crate(reading) == home:
+                        continue
+                    reason = f"{path} mounts {reading}, a {kind} outside {home}"
+                    if path in paths or any(found == reading or found.startswith(reading + "/") for found in paths):
+                        reasons.append(reason)
+                    elif home in shared and reading.startswith(".."):
+                        reasons.append(reason)
+                    elif home in shared:
+                        mounted.setdefault(home, []).extend(
+                            file for file in tip.rust_files if file == reading or file.startswith(reading + "/"))
+        return reasons, mounted
 
     def _crate_couplings(self, commit: str, crate: str, freed: tuple[HeldFinding, ...],
-                         kept: tuple[HeldFinding, ...]) -> list[str]:
+                         kept: tuple[HeldFinding, ...], mounted: tuple[str, ...]) -> list[str]:
         moves = {finding.finding_id: file_rename(finding.kind, finding.path, finding.after) for finding in (*freed, *kept)}
         renames = {finding_id: moved for finding_id, moved in moves.items() if isinstance(moved, FileRename)}
         if len(renames) < len(moves):
@@ -4080,10 +4092,12 @@ class Ledger:
                                 for name in sorted(names & set(words))]
                 shared = ({yielded.new_stem} & names) | ({moved.new_stem} & {yielded.old_stem})
                 reasons += [f"{finding.finding_id} and {other.finding_id} both rename to or from {name}" for name in sorted(shared)]
-        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()))
+        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()), mounted)
 
-    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...]) -> list[str]:
-        """Why a file of the crate can reach a renamed module by a path that holds none of its names.
+    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...],
+                             mounted: tuple[str, ...]) -> list[str]:
+        """Why a file of the crate, or a file in mounted that the crate mounts from outside its folder, can reach a
+        renamed module by a path that holds none of its names.
 
         A public use of a module name re-exports it, a glob use of a renamed module's parent imports its name, and an
         `include`, `macro_rules` or `macro` word can build a path that no scan reads. Modules come from the folder
@@ -4100,7 +4114,7 @@ class Ledger:
                 parents.add(module[:-1])
         names = {name for moved in renames for name in (moved.old_stem, moved.new_stem)}
         tip = self._tip(commit)
-        for path in (path for path in tip.rust_files if tip.crate(path) == crate):
+        for path in (*(path for path in tip.rust_files if tip.crate(path) == crate), *mounted):
             words = _code_words(self._commit_file(commit, path))
             if isinstance(words, UnreadableCode):
                 reasons.append(f"{path} does not tokenize")
@@ -4114,6 +4128,10 @@ class Ledger:
                 reasons.append(f"{path} holds a glob use that the scan cannot read")
             globs = [index for index in trees.prefixes if words[index] == "*"]
             if not globs:
+                continue
+            if path in mounted:
+                # The scan does not read the module that the crate mounts the file as, so no glob of the file resolves.
+                reasons.append(f"{path} holds a glob use that the scan cannot resolve")
                 continue
             home = style_footprint.crate_module(path, root)
             scopes = style_footprint.import_context(words).scopes
