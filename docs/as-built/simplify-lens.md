@@ -125,7 +125,9 @@ The showrunner files user questions for the listed categories.
 Approved work returns to the owning unit as a `next` item or a new phase.
 
 `decision --id F001 --answer approved|declined --user-words "<answer>"` records the user's own words.
-It sets the state to `decided` and applies no code change.
+It takes a held, decided or accepted finding and applies no code change.
+It sets a held finding to `decided`. An accepted finding stays `accepted`, because a reviewer already accepted its repair.
+A finding that holds a `decision` has a ruling, whatever its state.
 A changed ruling requires `--withdraw "<reason>"`.
 The old decision enters `decision_history` with `withdrawn_epoch` and `withdraw_reason`.
 The new `finding_decision` event includes that old object as `withdrew`.
