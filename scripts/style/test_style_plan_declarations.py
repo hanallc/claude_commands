@@ -6,6 +6,7 @@ from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
 from typing import final
+from unittest import mock
 
 
 from scripts.production.issues import frontmatter
@@ -87,7 +88,21 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_drop("3002")
         _ = self.git("rm", "-q", second)
         self.commit_files({"crates/alpha/src/moved.rs": "pub struct Other {\n    old: u32,\n}\n"})
-        self.assertNotIn("waived", self.refill_decisions())
+        compute = style_ledger.Ledger._compute_declaration_groups  # pyright: ignore[reportPrivateUsage]
+        queued: list[int] = []
+
+        def declaration_read(ledger: style_ledger.Ledger, *args: object, **kwargs: object) -> style_ledger.DeclarationReading:
+            reading = compute(ledger, *args, **kwargs)  # pyright: ignore[reportArgumentType]
+            batches = ledger._refill_write_batches  # pyright: ignore[reportPrivateUsage]
+            if batches:
+                queued.append(len(batches[-1].operations))
+            return reading
+
+        # A declaration read inside the selection commits its queued results when it ends.
+        with mock.patch.object(style_ledger.Ledger, "_compute_declaration_groups", autospec=True, side_effect=declaration_read):
+            self.assertNotIn("waived", self.refill_decisions())
+        self.assertTrue(queued)
+        self.assertEqual(set(queued), {0})
         self.assertEqual(set(self.ledger().ticket_open(ticket_owner_id("names"))[0]["finding_ids"]), {stays.finding_id, moves.finding_id})
         followed, = self.ledger().proposal_findings(later)
         self.assertEqual((followed.finding_id, followed.path, followed.line), (moves.finding_id, "crates/alpha/src/moved.rs", 2))
