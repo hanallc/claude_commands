@@ -120,6 +120,7 @@ sys.meta_path.insert(0, NoRepositoryModules())
                     merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
+                    merge_gate, "live_state_refusal", return_value=""), mock.patch.object(
                     merge_gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),
                                                             DEVNULL=subprocess.DEVNULL,
                                                             SubprocessError=subprocess.SubprocessError)):
@@ -303,6 +304,41 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('"subject.txt"', result.stderr)
         self.assertEqual(self.git(self.main, "show", ":subject.txt"), "staged main")
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_promotion_refuses_a_tree_that_cannot_read_live_state(self) -> None:
+        self.write(self.unit / "config/merge_gate.conf",
+                   "# text:\nlive_state_checks=state_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
+        self.write(self.unit / "state_reader.py",
+                   "import sys\nprint('stored rows need conversion', file=sys.stderr)\nsys.exit(2)\n")
+        self.checkpoint = self.commit(self.unit, "add a state reader that refuses")
+        _ = self.publish_for_promotion()
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cannot read live state: state_reader: stored rows need conversion", result.stderr)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_promotion_runs_the_target_tree_state_check(self) -> None:
+        self.write(self.unit / "config/merge_gate.conf",
+                   "# text:\nlive_state_checks=state_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
+        self.write(self.unit / "state_reader.py", "import sys\nassert sys.argv[1:] == ['state-check']\n")
+        self.checkpoint = self.commit(self.unit, "add a state reader that reads")
+        _ = self.publish_for_promotion()
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def test_promotion_refuses_a_listed_state_check_absent_from_the_tree(self) -> None:
+        self.write(self.unit / "config/merge_gate.conf",
+                   "# text:\nlive_state_checks=state_reader absent_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
+        self.write(self.unit / "state_reader.py", "import sys\nassert sys.argv[1:] == ['state-check']\n")
+        self.checkpoint = self.commit(self.unit, "list a state reader the tree does not have")
+        _ = self.publish_for_promotion()
+        result = self.run_promote_only()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("promotion refused: live_state_checks names absent_reader, absent from ", result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 

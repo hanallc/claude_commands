@@ -889,6 +889,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
         if conflict := merge_gate.promotion_edit_conflict(checkout, tip):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
+        if refusal := merge_gate.live_state_refusal(checkout, tip):
+            raise checkpoint_gate.Stop("promote", "failed", refusal,
+                       "run the conversion that the refusal names, then rerun this checkpoint")
         result = git(checkout, "merge", "--ff-only", tip)
         if result.returncode:
             status = git(checkout, "status", "--short").stdout.strip()
