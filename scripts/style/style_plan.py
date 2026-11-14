@@ -2762,7 +2762,7 @@ class EditedFiles:
             moved = file_rename(finding.kind, finding.path, finding.after)
             source_reads = (isinstance(moved, FileRename)
                             or isinstance(approved_rename(finding.kind, finding.before, finding.after), ApprovedRename)
-                            or finding.kind == "restructure" and finding.path.endswith(".rs"))
+                            or approved_renames.edits_module_owners(finding.kind, finding.path, finding.after))
             def calculate() -> FindingFootprint:
                 self.required_blobs = set()
                 files = self._computed_files(finding)
@@ -2795,7 +2795,7 @@ class EditedFiles:
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             computed = (finding.path, *named_files)
-        elif finding.kind == "restructure" and finding.path.endswith(".rs"):
+        elif approved_renames.edits_module_owners(finding.kind, finding.path, finding.after):
             owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
                       if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
             computed = (finding.path, *owners)
