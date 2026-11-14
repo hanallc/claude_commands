@@ -107,6 +107,7 @@ For questions, name the showrunner and state the exact decision with a recommend
 For reviews, provide the material or a working review link. For behavior checks, provide steps and the expected result.
 If nothing needs nate and no unread update remains, say so. Continue authorized coordination.
 Do not advance automatically after nate answers. Record the answer and act within its scope.
+Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
 
 ## Lists and unread updates
 
