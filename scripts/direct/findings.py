@@ -1203,23 +1203,27 @@ def _record_decision_event(session_dir: Path, state: dict[str, object], entry: d
 
 
 def _decision(args: argparse.Namespace) -> None:
-    """Record the user's answer without applying the proposed change."""
+    """Record the user's answer without applying the proposed change.
+
+    An accepted finding keeps its state: a reviewer already accepted its repair, so the answer
+    reopens nothing. A ruling is the saved `decision`, whatever state the finding is in.
+    """
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     entry = _finding(state, _arg_string(args, "id"))
     current = _string(entry.get("state"))
     withdrawing = hasattr(args, "withdraw")
-    if current not in (STATE_HELD, STATE_DECIDED):
-        raise SystemExit("Only a held or decided finding can receive an answer")
-    if current == STATE_HELD and withdrawing:
+    if current not in (STATE_HELD, STATE_DECIDED, STATE_ACCEPTED):
+        raise SystemExit("Only a held, decided or accepted finding can receive an answer")
+    previous = _object_dict(entry.get("decision"))
+    if previous is None and withdrawing:
         raise SystemExit("--withdraw requires a decided finding; this finding has no ruling to withdraw")
-    previous = _object_dict(entry.get("decision")) or {}
     answer = _arg_string(args, "answer")
     words = _arg_string(args, "user_words").strip()
-    repeated = (current == STATE_DECIDED and previous.get("answer") == answer
+    repeated = (previous is not None and previous.get("answer") == answer
                 and previous.get("user_words") == words)
-    if current == STATE_DECIDED and not withdrawing and not repeated:
+    if previous is not None and not withdrawing and not repeated:
         raise SystemExit("This finding is decided; use --withdraw to replace its current ruling")
     decision: dict[str, object] = {
         "answer": answer,
@@ -1227,10 +1231,11 @@ def _decision(args: argparse.Namespace) -> None:
         "timestamp_epoch": now,
     }
     if not repeated:
-        if current == STATE_DECIDED:
+        if previous is not None:
             withdrew = {**previous, "withdrawn_epoch": now, "withdraw_reason": _required_text(args, "withdraw")}
             entry["decision_history"] = [*_object_list(entry.get("decision_history")), withdrew]
-        entry["state"] = STATE_DECIDED
+        if current != STATE_ACCEPTED:
+            entry["state"] = STATE_DECIDED
         entry["decision"] = decision
         _write_state(session_dir, state)
     _record_decision_event(session_dir, state, entry)

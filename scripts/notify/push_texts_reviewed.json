@@ -86,6 +86,20 @@
       "time": "2026-11-06T06:23:02.002895-05:00"
     }
   },
+  "aws.snapshot_failed": {
+    "permission": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
+      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
+      "time": "2026-11-14T09:44:39.593642-05:00"
+    },
+    "regional_permissions": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
+      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
+      "time": "2026-11-14T09:44:48.290566-05:00"
+    }
+  },
   "build_hold.blocking": {
     "typical": {
       "objections": [],

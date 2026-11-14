@@ -10,16 +10,14 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 import json
-import math
 import os
 from pathlib import Path
 import re
 import shlex
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -27,7 +25,7 @@ import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger
+from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -497,7 +495,7 @@ class GateWorker:
 
     def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
                       live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
-        """Prefer available capacity, the configured type order, and the lowest total gate cost."""
+        """Prefer available capacity, then the lowest expected USD per run, then the configured type order."""
         values = settings()
         types = values.words('instance_types')
         def type_rank(variant: GateLaunchVariant) -> int:
@@ -506,17 +504,16 @@ class GateWorker:
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
+        days = policy.whole('run_cost_days')
         try:
-            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown))
+            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown, days * 86400))
         except OSError:
             history = ()
         recent = [row for row in history if float(str(row['time'])) <= now]
-        zone_codes = {'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'}
-        quota_codes = {'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'}
         refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
         zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
-                 for row in refused if row.get('error_code') in zone_codes}
-        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in quota_codes}
+                 for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
+        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in run_cost.QUOTA_REFUSALS}
         def cooled(variant: GateLaunchVariant) -> bool:
             return variant.region in regions or (variant.region, variant.instance_type, variant.zone) in zones
         try:
@@ -528,31 +525,24 @@ class GateWorker:
         prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
         if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
             return sorted(variants, key=cooled)
-        durations: list[float] = []
-        for row in recent:
-            if row.get('result') != 'finished' or row.get('mode') != mode or float(str(row['time'])) < now - max_age:
-                continue
-            try:
-                duration = float(str(row['gate_s']))
-                if math.isfinite(duration) and duration > 0:
-                    durations.append(duration)
-            except (ValueError, KeyError, TypeError):
-                continue
-        hours = (Decimal(str(statistics.median(durations))) / 3600 if durations
-                 else Decimal(values.whole('lifetime_minutes')) / 60)
+        moment = datetime.fromtimestamp(now, UTC)
+        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
+        default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
         extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
                          ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
         if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
             raise ValueError('The regional gate delay must be nonnegative')
-        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
+        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, bool, Decimal, int, int]:
             position, variant = item
             key = (variant.region, variant.instance_type, variant.zone)
-            cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
+            # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
+            cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, mode, wait_cost, default_seconds)
+                    + (transfer if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
-            return cooled(variant), type_rank(variant), key not in prices, cost, position
+            return cooled(variant), key not in prices, cost, type_rank(variant), position
         return [variant for _, variant in sorted(enumerate(variants), key=order)]
 
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:

@@ -1434,3 +1434,13 @@ From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period b
 - `memory_feed.py` keep_text descriptions carry no end mark: the compiler cache row, the unowned processes row and the group row.
 - `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
 - Checkpoint e34c01903.
+
+### Phase 77 — The running-row memory sentence starts with a capital · status: done
+
+From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "Started … ago." in the running-row hover.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
+- `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
+- Checkpoint b62309ba4.

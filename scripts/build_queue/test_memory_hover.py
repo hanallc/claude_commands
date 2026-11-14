@@ -214,10 +214,11 @@ class MemoryHoverTests(unittest.TestCase):
             ("", False, "It reserves no memory. Host free memory already accounts for this use."),
         ):
             with self.subTest(keep_text=keep_text, queued=queued):
-                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"read_at": 400, "walk": [{
                     "name": "fixture nextest", "unit": "fixture", "showrunner": "fixture-production", "used": 1,
-                    "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text}]}))
+                    "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text, "started_at": 100}]}))
                 self.assertTrue(hover[1].endswith(expected), hover[1])
+                self.assertTrue(hover[1].startswith("Started 5 min ago. " + (keep_text or "It uses")[0].upper()), hover[1])
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (

@@ -21,8 +21,9 @@ With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` publishes the config file and pulls
-the Mac without a test or release cycle. Moving an unchanged value from code
+on approval, with the user's words. `/tune` makes the value live on both
+machines at once, then commits it on main and pulls the Mac, without a test or
+release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
 ## machines.conf
@@ -46,9 +47,10 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
 `config/models.conf` is the shared registry on both machines; there is no
-local override file. `/default_models` and `/showrunner:effort` edit it atomically,
-then publish a `config(agents): …` commit containing only this path to origin.
-The writer fetches and fast-forwards before editing, and replays all pending
+local override file. `/default_models` and `/showrunner:effort` write the edit live at once,
+then publish a `config(models): …` commit containing only this path to origin.
+A publication that fails keeps the edit live; the notes timer publishes it later.
+The publisher fetches and fast-forwards, and replays all pending
 local row changes on a newer remote tip if a push races another writer (three
 tries). Repeating an interrupted edit finishes its publication, even when the
 requested value is already in the local file. A lost push acknowledgement
