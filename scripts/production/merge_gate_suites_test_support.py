@@ -83,7 +83,8 @@ class GateSuitesFixture(MergeGateFixture):
         def stopped() -> bool:
             try:
                 return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-            except FileNotFoundError:
+            # A process reaped during the read gives ESRCH, not ENOENT.
+            except (FileNotFoundError, ProcessLookupError):
                 return True
 
         if stopped():
@@ -94,7 +95,8 @@ class GateSuitesFixture(MergeGateFixture):
             return
         try:
             readable, _, _ = select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)
-            if not readable or not stopped():
+            # The pidfd reports exit before /proc necessarily reports a zombie.
+            if not readable:
                 self.fail(f"gate left running child {pid}")
         finally:
             os.close(descriptor)

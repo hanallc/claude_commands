@@ -52,7 +52,7 @@ class JudgmentCells:
         objects = tuple(sorted({source for kind, source, _ in edges if kind == "git_object"}))
         # A newer source mutation retains its dirty work.
         verified = available(objects)
-        with self.facts.publication():
+        def publish() -> None:
             if versions == self.facts.source_versions() and verified:
                 _ = self.connection.execute(
                     "INSERT OR REPLACE INTO refill_cells "
@@ -60,17 +60,19 @@ class JudgmentCells:
                     + "VALUES (?,?,?,?,?,?,?,?,0,?,?,?,?)",
                     (key, self.facts.catalog, rule, path, self.view, identity, *result, json.dumps(objects), crate, family, tier))
                 self.facts.dependencies("refill_cells", key, edges)
+        self.facts.publish(publish)
         return result
 
     def finish(self, rules: Iterable[str], crate: str | None, *, all_rules: bool = False) -> None:
         """Remove vanished membership only within the requested coverage domain."""
-        with self.facts.publication():
-            observed = tuple(rules)
+        observed = tuple(rules)
+        def publish() -> None:
+            observed_rules = observed
             if all_rules:
-                observed = tuple(rule for (rule,) in cast(list[tuple[str]], self.connection.execute(
+                observed_rules = tuple(rule for (rule,) in cast(list[tuple[str]], self.connection.execute(
                     "SELECT DISTINCT rule FROM refill_cells WHERE catalog=? AND view=?",
                     (self.facts.catalog, self.view)).fetchall()))
-            for rule in observed:
+            for rule in observed_rules:
                 rows = cast(list[tuple[str, str]], self.connection.execute(
                     "SELECT consumer_key,path FROM refill_cells WHERE catalog=? AND view=? AND rule=? "
                     + "AND (? IS NULL OR crate=?)", (self.facts.catalog, self.view, rule, crate, crate)).fetchall())
@@ -79,6 +81,7 @@ class JudgmentCells:
                         _ = self.connection.execute("DELETE FROM refill_cells WHERE consumer_key=?", (key,))
                         _ = self.connection.execute(
                             "DELETE FROM refill_dependencies WHERE consumer_table='refill_cells' AND consumer_key=?", (key,))
+        self.facts.publish(publish)
 
 
 def cell_identity(inputs: object) -> str:

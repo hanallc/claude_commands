@@ -24,7 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -526,7 +526,7 @@ class DeploymentTests(CostFixture):
         self.set_clock(self.now)
         if self._testMethodName not in self.process_tests:
             process = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)), 'run': FixtureExecutor(self.root).run})
-            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', process))
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', process))
 
     # These tests retain child processes for environment, timeout, exit, and redaction checks.
     process_tests: ClassVar[frozenset[str]] = frozenset({
@@ -956,6 +956,7 @@ sys.exit(7)
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual([row['region'] for row in ledger.rows(saved, 'regions')], ['us-east-2', 'us-west-2'])
         self.assertEqual(ledger.rows(saved, 'regions')[1], west)
+        self.assertEqual(saved['instance_types'], ['m7a.8xlarge', 'm7a.4xlarge'])
 
     def test_prices_lists_all_region_type_zone_combinations_without_ids(self) -> None:
         subject = self.deployment()
@@ -965,6 +966,9 @@ sys.exit(7)
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2')
         text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', 'us-west-2 us-east-1 us-east-2 us-west-2')
         gpu_types = ('g6.xlarge', 'g4dn.xlarge', 'g4ad.xlarge', 'g5.xlarge')
+        # The fixture names its own types, so a tuned live value never changes this test.
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', 'm7a.8xlarge')
+        text_setting(self.root / 'cloud_gate.conf', 'gpu_instance_types', ' '.join(gpu_types))
         price_regions: list[str] = []
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             args = list(arguments)
