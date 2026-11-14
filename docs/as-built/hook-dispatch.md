@@ -20,10 +20,13 @@ separate hooks.
 Each row is a hook file in `scripts/hooks/`, the tool-name matcher it had in
 `settings.json`, and its timeout (600 s unless stated). The original hooks keep
 their old order; push-delivered runs last, for PushNotification only.
+push-alone denies a Bash call that holds `git push` with any other command
+(rca 261114-1). An ask rule such as `Bash(git push * -f *)` matches across
+the whole compound command, so the deny comes before the user gets a prompt.
 
 | Event | Hooks, in order | Matcher |
 | --- | --- | --- |
-| `pre_tool_use` | heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate | `Bash` |
+| `pre_tool_use` | heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate, push-alone (10 s) | `Bash` |
 | | scratch-guard (10 s) | `Bash\|Write\|NotebookEdit` |
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
 | | context-usage (message off in `config/context_usage.conf`), banned-words | all tools |
@@ -32,7 +35,7 @@ their old order; push-delivered runs last, for PushNotification only.
 
 `settings.json` has one dispatcher entry per event:
 
-- PreToolUse: matcher `Bash|Write|NotebookEdit`, timeout 3040 s.
+- PreToolUse: matcher `Bash|Write|NotebookEdit`, timeout 3050 s.
 - PostToolUse: no matcher, timeout 2430 s.
 - Stop: no matcher, timeout 1850 s.
 

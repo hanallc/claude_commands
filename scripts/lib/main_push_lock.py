@@ -36,8 +36,11 @@ def held_environment(checkout: Path) -> dict[str, str]:
 
 
 @contextmanager
-def main_push_lock(checkout: Path) -> Generator[None]:
-    """Hold the repository lock or use an active hold for this process."""
+def main_push_lock(checkout: Path, *, wait: bool = True) -> Generator[None]:
+    """Hold the repository lock or use an active hold for this process.
+
+    With wait=False, a lock held by another process raises BlockingIOError.
+    """
     path = _lock_path(checkout)
     if path in _HELD_LOCKS:
         yield
@@ -50,7 +53,7 @@ def main_push_lock(checkout: Path) -> Generator[None]:
             _HELD_LOCKS.remove(path)
         return
     with Path(path).open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         _HELD_LOCKS.add(path)
         started = time.monotonic()
         try:

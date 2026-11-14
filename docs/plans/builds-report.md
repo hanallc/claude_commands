@@ -1423,3 +1423,14 @@ From builds (not the user), 2026-11-13 23:46: align the colons in the who-ran-it
 - `test_memory_hover.field_values` reads value cells without the colon cells; the who-ran-it test checks one aria-hidden colon per label.
 - `memory_page_proof.mjs --identity` measures each colon's left edge. It captures `before-` and `after-colons-mac-row` and `-queued-row` shots, and requires one edge on the after page and on the showrunner row.
 - Checkpoint 1bd7b8067.
+
+### Phase 76 — The running-row hover closes its memory sentence · status: done
+
+From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period between the running row's memory text and the source sentence. keep_text is data; the page owns the sentence.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? r.keep_text + "." : res} ${src}`: the page always adds the period after `keep_text`. `res` is page text with its own periods.
+- `memory_feed.py` keep_text descriptions carry no end mark: the compiler cache row, the unowned processes row and the group row.
+- `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
+- Checkpoint e34c01903.

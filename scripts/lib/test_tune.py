@@ -5,10 +5,12 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import fcntl
 import shlex
 import socket
 import subprocess
 import sys
+import time
 from typing import override
 import unittest
 from unittest import mock
@@ -16,6 +18,7 @@ from unittest import mock
 from scripts.lib import main_publish, tune
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase
+from scripts.whoami import agent_accounts
 
 SCRIPT = Path(__file__).with_name("tune.py")
 
@@ -117,6 +120,54 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.snapshot(), before)
         self.assertIn("git fetch -q --no-write-fetch-head", self.repository.ssh_log.read_text())
+
+    def credit_switch(self) -> Path:
+        """Add the credit key to the fixture and return the staged value path."""
+        repo = self.repository
+        _ = (repo.config.parent / "accounts.conf").write_text(
+            "# Codex accounts that may spend paid credits.\ncodex_credit_accounts=none\n")
+        _ = repo.git(repo.checkout, "add", "config/accounts.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "credit key")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        repo.env["XDG_STATE_HOME"] = str(repo.root / "xdg")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": repo.env["CONF_DIR"],
+                                                       "XDG_STATE_HOME": repo.env["XDG_STATE_HOME"]}))
+        return agent_accounts.staged_credit_accounts_path()
+
+    def test_credit_switch_is_live_while_main_is_locked_and_main_gets_it_after(self) -> None:
+        repo = self.repository
+        staged = self.credit_switch()
+        lock = (repo.checkout / ".git/main-push.lock").open("a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        running = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "accounts", "codex_credit_accounts", "codex2",
+             "--why", "Allow credits", "--user-words", "yes"],
+            cwd=repo.checkout, env=repo.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        while not staged.exists() and running.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(agent_accounts.codex_credit_accounts(), frozenset({"codex2"}))
+        self.assertIsNone(running.poll())
+        self.assertIn("codex_credit_accounts=none", (repo.config.parent / "accounts.conf").read_text())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        output, errors = running.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(running.returncode, 0, output + errors)
+        self.assertIn("live now: codex_credit_accounts=codex2; main follows", output)
+        self.assertIn("codex_credit_accounts=codex2", repo.git(repo.origin, "show", "main:config/accounts.conf"))
+        self.assertFalse(staged.exists())
+        self.assertEqual(agent_accounts.codex_credit_accounts(), frozenset({"codex2"}))
+
+    def test_credit_switch_stays_live_when_main_refuses_the_change(self) -> None:
+        repo = self.repository
+        staged = self.credit_switch()
+        _ = (repo.checkout / "other.txt").write_text("unrelated local commit\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "unrelated work")
+        result = self.run_tune("accounts", "codex_credit_accounts", "none", "--why", "Stop credits", "--user-words", "yes")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("codex_credit_accounts=none stays live; main does not have it", result.stderr)
+        self.assertEqual(staged.read_text(), "none\n")
+        self.assertEqual(agent_accounts.codex_credit_accounts(), frozenset())
 
     def test_ambiguous_base_key_refuses_without_a_write_and_names_both_lines(self) -> None:
         repo = self.repository

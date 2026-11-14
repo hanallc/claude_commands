@@ -18,6 +18,8 @@ from scripts.message.process_identity import process_start as process_start
 from scripts.message.relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 HEADLESS_ENTRYPOINT_PREFIX = "sdk-"
+# A session at its prompt: idle, or idle while a background command runs.
+INPUT_STATUSES = frozenset({"idle", "shell"})
 
 
 class SessionRecord(TypedDict):

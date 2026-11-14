@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.maintenance.schedule import IntervalHistory
 
 
@@ -96,9 +97,32 @@ class CreditsOff:
 CodexCreditsSetting = CreditsOn | CreditsOff
 
 
+def staged_credit_accounts_path() -> Path:
+    """The value /tune makes live before main has the config change."""
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "accounts/codex_credit_accounts"
+
+
+def stage_credit_accounts(value: str) -> None:
+    """Make an approved value live at once; the config commit follows when main is free."""
+    path = staged_credit_accounts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, value + "\n")
+
+
+def clear_staged_credit_accounts(value: str) -> None:
+    """Remove the staged value once the config file holds it; a newer staged value stays."""
+    path = staged_credit_accounts_path()
+    if path.is_file() and path.read_text(encoding="utf-8").strip() == value:
+        path.unlink(missing_ok=True)
+
+
 def codex_credit_accounts() -> frozenset[str]:
-    """The Codex accounts that the accounts config allows to spend paid credits."""
-    return frozenset(conf.read("accounts").text("codex_credit_accounts").split()) - {"none"}
+    """The Codex accounts that may spend paid credits: a staged /tune value, else the accounts config."""
+    try:
+        value = staged_credit_accounts_path().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        value = conf.read("accounts").text("codex_credit_accounts")
+    return frozenset(value.split()) - {"none"}
 
 
 def codex_credits_setting(label: str) -> CodexCreditsSetting:
