@@ -134,8 +134,11 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
 
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
-             notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
-    """Replace successful regional reads and preserve failed regional reads."""
+             notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
+             force: bool = False) -> int:
+    """Replace successful regional reads and preserve failed regional reads.
+
+    force reads before the refresh interval ends; deploy.py up uses it."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
@@ -155,7 +158,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             last = int(lock.read().strip() or '0')
         except ValueError:
             last = 0
-        if last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
+        if not force and last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
             return 0
         environment = {key: value for key, value in os.environ.items() if key not in (
             'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',

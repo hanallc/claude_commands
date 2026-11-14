@@ -146,6 +146,16 @@ class ControlTests(CostFixture):
         self.assertEqual(self.snapshot(), 0)
         self.assertEqual(len(self.calls), 2 * count)
 
+    def test_forced_snapshot_reads_inside_the_refresh_interval(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        count = len(self.calls)
+        self.clock.advance(1)
+        self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock,
+                                             notify=self.notify, force=True), 0)
+        self.assertEqual(len(self.calls), 2 * count)
+        readings = ledger.rows(aws_target.read_snapshot(self.state), 'regions')
+        self.assertTrue(all(row['read_at'] == self.clock.now for row in readings))
+
     def test_regional_failure_preserves_its_values_and_time_but_refreshes_other_regions(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         original = aws_target.read_snapshot(self.state)
