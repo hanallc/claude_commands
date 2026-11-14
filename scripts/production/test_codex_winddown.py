@@ -9,6 +9,7 @@ import json
 import os
 import io
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -615,7 +616,9 @@ class MessageTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "CONF_DIR": str(self.root / "config"),
         }
+        _ = shutil.copytree(SCRIPT.parents[2] / "config", self.root / "config")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
@@ -697,6 +700,24 @@ class MessageTests(unittest.TestCase):
         ])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
+
+    def test_start_and_triage_say_first_that_paid_credits_stay_on(self) -> None:
+        accounts = self.root / "config/accounts.conf"
+        _ = accounts.write_text(accounts.read_text(encoding="utf-8").replace(
+            "\ncodex_credit_accounts=none\n", "\ncodex_credit_accounts=codex2 codex1\n"), encoding="utf-8")
+        line = ("Paid credits stay on for codex1, codex2. The wind-down does not stop them. "
+                + "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none")
+        before = accounts.read_bytes()
+        for command in ("start", "triage"):
+            with self.subTest(command=command):
+                done = self.run_script(command, "--from", "natedev")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout.splitlines()[0], line)
+        self.assertEqual(accounts.read_bytes(), before)
+
+    def test_start_names_no_credits_when_no_account_may_spend_them(self) -> None:
+        done = self.run_script("start", "--from", "natedev")
+        self.assertNotIn("Paid credits", done.stdout)
 
     def test_a_unit_records_its_answer_and_start_forgets_it(self) -> None:
         owner = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("showrunner::show")))

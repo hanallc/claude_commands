@@ -36,6 +36,8 @@ from scripts.message import process_table
 from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import conf
+from scripts.whoami import agent_accounts
 from scripts.production.live_units import live_unit_ids as live_unit_ids
 from scripts.message.sessions import live_sessions
 
@@ -538,7 +540,26 @@ def start_count(owner: staff.StaffRow) -> bool:
     return done.returncode == 0
 
 
+def credits_line() -> str | None:
+    """The first line of a start or triage while paid credits stay on: the wind-down does not stop them."""
+    stop = "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none"
+    try:
+        accounts = sorted(agent_accounts.codex_credit_accounts())
+    except conf.Unusable as error:
+        return f"Paid credits: codex_credit_accounts cannot be read ({' '.join(str(error).split())}). {stop}"
+    if not accounts:
+        return None
+    return f"Paid credits stay on for {', '.join(accounts)}. The wind-down does not stop them. {stop}"
+
+
+def _show_credits() -> None:
+    line = credits_line()
+    if line is not None:
+        print(line, flush=True)
+
+
 def start(sender: str) -> int:
+    _show_credits()
     STATE.mkdir(parents=True, exist_ok=True)
     (STATE / PROJECTIONS).unlink(missing_ok=True)
     with quiet_notice_state() as state:
@@ -560,6 +581,7 @@ def start(sender: str) -> int:
 
 
 def triage(sender: str) -> int:
+    _show_credits()
     if not instances():
         print("No wind-down is on. Run /codex_winddown start first.", file=sys.stderr)
         return 1
