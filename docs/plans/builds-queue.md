@@ -1920,7 +1920,7 @@ Use the following deploy procedure:
 
 1. Prepare `deploy_convert.py` outside the repository in the director’s Phase 44 record folder.
 2. Prove conversion against private copies of admission state and provider records.
-3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py hold --drain --for 'Phase 44 deploy'` (Phase 44b). Continue only on exit 0 and a last line `drained`. Keep the hold until step 12 ends. The drain covers verify.sh, merge_gate.py and targeted_test.py only: drain standalone offload adapters, copy watchers and manual claim commands separately.
+3. Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_hold/build_hold.py drain --for 'Phase 44 deploy'` (Phase 44aj). Continue only on exit 0 and a last line `drained; natedev stays held until release`. Keep the hold until step 12 ends. The drain lets existing running and queued natedev work finish: drain standalone offload adapters, copy watchers and manual claim commands separately.
 4. Prevent new launches through their units, timers, sockets, and supervising directors.
 5. Stop `build-admission.service`, `build-admission.socket`, and `build-memory-feed.service`.
 6. Keep their activation sources disabled or runtime-masked throughout conversion and installation.
@@ -2340,7 +2340,7 @@ A minor finding from the phase 44 closure review, moved here under the hard-land
 1. Keep the original exception. Attach a cleanup or diagnostic error to it.
 2. Add rows to the existing cleanup test: the exception identity stays, and a failed diagnostic capture is attached.
 
-### Phase 44z — /build:queue is removed; /build:page is the one queue view  · status: todo
+### Phase 44z — /build:queue is removed; /build:page is the one queue view  · status: moved to report-unit (builds, 2026-11-13: work off the critical path goes to a unit off it)
 **Depends on:** none to build; it merges builds again after Phase 44 lands, and lands after it.
 
 User 2026-11-12, change review C1474: "okay - it's time to retire the /build:queue output within the claude sesssion - we will use /build:page going foward - you can remove the skill and any code dedicated to showing the /build:queue view - but keep whatever is needed (obviously) for the build memory page". builds: use `/remove_command build:queue`; remove the skill, the view code, its tests, its doc lines and any plugin pane that only shows that view; keep the bump action only if the page or another caller uses it.
@@ -2426,6 +2426,50 @@ The user, 2026-11-12, after 44ac (`/tmp/claude/scratch/user-shot-31-mac-row.png`
 8. The user, the same day (`/tmp/claude/scratch/user-shot-36-hana-ci-owner.png`, Waiting rows 16 and 18): "hana-linux-2 and hana-linux-1 - pretty sure these are CI - they should not say owner not recorded they should just say hana CI". builds: every hana CI runner step names its owner `hana CI`, in Running and Waiting. One rule in the feed decides that a step belongs to a CI runner; the page does not match names. Proof: the same rows before and after.
 9. The user, the same day (`/tmp/claude/scratch/user-shot-37-mac-counter.png`, row `trunk-p172-assembly-rows`): "it should not be the case that the mac process has no readable counter - i am pretty sure i see the readable counter when i run cargo tile on the mac". Read the Mac build's progress counter the way `cargo tile` does (source: `~/rust/cargo-liner-tile`), and fill Unit from the Mac claim. Proof: this row before and after.
 10. The user, the same day (`/tmp/claude/scratch/user-shot-38-mac-tile.png`, `/tmp/claude/scratch/user-shot-39-page-mac-one-row.png`): "i see progress bars on the mac - additionally i see 3 runs happening on the mac where as the build queue page only shows 1". `cargo tile` showed three runs (a trunk-p172 release build at 60.4%, a hana mirror nextest at 64.7%, a cargo-liner mirror nextest at 98.3%). The page showed one row, `bevy_text-0.20.1`, a crate name, with no counter. Show one Mac row for each run that `cargo tile` shows, named by its run, with the done% that `cargo tile` reads. Proof: these three runs on the page next to a `cargo tile` capture.
+
+### Phase 44ai — The page's time cells say "<1 min" and drop "waits"  · status: done (1c132a7f1, on builds 4c043d6a1)
+**Depends on:** the 44 re-land lands first. Merge report phase 65 (memory_live.html Queued title and hairline) first if it lands before this phase.
+
+User 2026-11-13, via builds: "under duration in the running section - it shouldn't spell out under it should just show <1 min - save column space. similarly under the Queued section remove the \"waits\" word in front of every row entry in that column - the Waiting column header tells us what is happening. assign to queue for after its current work". Shot: `/tmp/claude/scratch/user-shot-duration-waits.png`.
+
+1. `scripts/build_queue/memory_live.html` `ago()` returns `<1 min`, not `under 1 min`. Every use reads the same short form (decision: one format for the table and the tips; a one-line revert if wrong).
+2. The Queued rows show the wait time with no `waits ` prefix (`memory_live.html:828`).
+3. The duration column width measure (`memory_live.html:900`) measures the longest text the column now shows (`99 h 59 min`), not `waits 99 h 59 min`.
+4. The diff holds these three changes only. Update the page tests that assert the old texts.
+5. Proof: a screenshot of the shot's area (Running and Queued sections) before and after.
+
+**Files:** `scripts/build_queue/memory_live.html` and its page tests.
+
+### Phase 44aj — drain finishes existing work, then holds; clear stops all work at once  · status: todo
+**Depends on:** the 44 re-land (44c lets a kept run pass the service hold). The drain part starts on 16a9610e7; the hold part waits for builds' answers to A1–A5.
+
+User 2026-11-13 (item 35, via morty and builds): "hold | drain are two alternatives. hold clears the waiting queue immediately and enters the held state. drain finishes existing queued and running work, then enters the held state. Both prevent new natedev work from running until explicit release. Do not use hold --drain as the new interface. Fast-track this through queue. Update commands, documentation and tests consistently. Preserve the existing immediate hold behavior for running work; report any ambiguity before changing it. Keep the live proof as a separate user-approved step." Proposal: `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/proposals/drain_hold.md`.
+
+1. `build_hold.py drain --for '<why>'` keeps every run live at its start: each outermost gate (working or waiting) and each hana CI `Runner.Worker`. It stops nothing.
+2. The drain command waits until no kept identity is alive, prints progress each 60 s, then `drained; natedev stays held until release`, and exits 0. Ctrl-C leaves the hold.
+3. Status and the build page show `draining (N runs left)` or `held`, derived from the keep list liveness.
+4. `clear` (the new name for `hold`) stops running natedev work as today, clears queued runs, and holds new work until release. User 2026-11-13: "clear | drain ... 'held' names the resulting state"; A1 approved for local runs. A2 (hana CI exception) and A3 approved: clear stops the whole controllable queued verify run, including its planned Mac tests; the release notice tells its session to submit again. A4, A5 and A5b wait for the user.
+5b. A5, user 2026-11-13: `build_hold.py clear --for <why>` and `drain --for <why>`; both accept `--keep`, `--release-eta` and `--zone`; `release`, `quiet` and `status` stay. The slash command stays `/build:hold`, with `clear <why>` or `drain <why>`. A5b (remote targets) waits for the user.
+5. A4, user 2026-11-13: remove the `hold` subcommand and the `hold --drain` form from the grammar. No alias, no old-form detection, no special error: normal parser validation rejects them. Update callers and docs in the same change.
+5a. A2, user 2026-11-13: hana-linux CI jobs that the control cannot stop stay queued until release. Status names each one. GitHub timeouts still apply. Do not expand process permissions for this change. A separate pre-power-off CI check confirms that no active or waiting CI job remains: a checklist step with existing read-only tools (Hana ci.yml queued and in_progress runs, the runner service state), not new code in this plan.
+6. `/build:hold`, its as-built doc and tests match.
+7. Proof: unit tests and a service test for a kept CI lineage. The live proof is a separate step the user approves.
+
+**Files:** `scripts/build_hold/build_hold.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `commands/build/hold.md`, the matching as-built doc.
+
+5c. A5b, user 2026-11-13: `drain [natedev | mac | aws | all]` and `clear [natedev | mac | aws | all]` read target names from the shared build-target configuration; one key names natedev as the default. This delivery supports natedev only. Any other target, and `all`, returns exit 2 "<command> <target> is not supported yet". The Mac hold stays at `/build:mac block`.
+
+### Phase 44al — placement-status: a read-only placement check for the Mac guard  · status: todo
+**Depends on:** 44aj (both change `admission_service.py`). **Consumer:** resources' Mac guard Phase A (checkpoint about 18:30 EST) calls it before and during each Mac cargo run.
+
+builds 2026-11-13: "The check is on the placement, not the bare Mac claim. You own it: build the read-only 'placement-status --episode E --attempt A' request in admission_service.py and admission_wire.py right after 44aj. It answers current or closed, the target, owner, session and provider claim. It changes no state."
+
+1. A new wire request `PlacementStatusRequest(episode, attempt)` and reply. The reply names current or closed (with the close reason), the destination target, the owner, the session and the provider claim reference, or unknown for an id the service never saw.
+2. The service reads its saved assignment and changes no state, no permission and no record.
+3. A client command `placement-status --episode E --attempt A` prints one parseable line and exits 0 for current, 1 for closed or unknown, 2 for an unreachable service.
+4. Tests: current, closed, unknown, unreachable, and a check that the call writes no state.
+
+**Files:** `scripts/build_queue/admission_wire.py`, `admission_service.py`, `admission_client.py`, their tests, `docs/as-built/build-memory-admission.md`.
 
 ### Phase 44k — A hana or cargo-liner step waits for a busy Mac instead of running on natedev  · status: todo
 **Depends on:** 44. Starts after the 14:00 deploy on 2026-11-12. ETA 17:00 EST.
@@ -2525,7 +2569,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 - `commands/build/hold.md` — drain usage
 - Tests: `test_build_hold.py`, `test_hold_enforcer.py`, `test_hold_applies.py`, `test_detached_runs.py`, `test_build_targets.py`, `test_step_record.py`
 
-**Binds later work:** a deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert and continues only on `drained`. The drain covers verify.sh, merge_gate.py and targeted_test.py only. `hold_waited_on` reads the keep lineage from `os.getpid()`, so a caller in another process must pass the requester's lineage. `holds_only_own`, `caller_holds_only_own` and `holds_apply_to_caller` are gone.
+**Binds later work:** a deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert and continues only on its `drained` line (Phase 44aj replaced `hold --drain`). `hold_waited_on` reads the keep lineage from `os.getpid()`, so a caller in another process must pass the requester's lineage. `holds_only_own`, `caller_holds_only_own` and `holds_apply_to_caller` are gone.
 
 **Gotchas:** never take `record_lock` twice in one process: `flock` on a second open file blocks the same process. The deploy stop script keeps its own refusal as the last guard.
 
@@ -2537,7 +2581,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 **Constraints from 44b (architect review of 44b, 2026-11-10).**
 1. The hold check at `merge_gate.py:472` is `build_targets.caller_waits_on_hold(holds, directory)`; `caller_holds_only_own` is gone. Keep this check when gate routing moves to the queue.
 2. Keep the Phase 44c rule: a hold decision uses the checked requesting process's lineage, never the service's.
-3. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
+3. The deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert, as Phase 44 deploy step 3 does.
 
 **Workers:** 2 writers.
 - Queue writer: placement types, protocol, service policy, and their tests.
@@ -2546,7 +2590,7 @@ The "unowned processes" rename moved to Phase 44e on 2026-11-11, because 44e rew
 ### Phase 46 — Every view names the machine a step runs on, and the old route code is gone  · status: todo
 **Depends on:** 45. Checkpoint 4 of section 8 in `docs/plans/builds-queue-placement.md`. The Work Order follows at phase start. It switches the remaining readers first and deletes the old selectors only after their last caller switches. Phase 44 item 4 (claim ownership) applies.
 
-**Constraints from 44b.** The hold-policy helpers in `build_targets.py` (`hold_waited_on`, `caller_waits_on_hold`) are not host selectors: keep them. Status and report readers keep the complete list of holds in force. The deploy runs `build_hold.py hold --drain --for '<purpose>'` before the stop-convert.
+**Constraints from 44b.** The hold-policy helpers in `build_targets.py` (`hold_waited_on`, `caller_waits_on_hold`) are not host selectors: keep them. Status and report readers keep the complete list of holds in force. The deploy runs `build_hold.py drain --for '<purpose>'` before the stop-convert.
 
 **Workers:** 1 writer + 1 tester.
 - Writer: the remaining readers, and deletion of the old selectors after their last caller switches.
