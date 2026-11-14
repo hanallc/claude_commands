@@ -515,6 +515,52 @@ class MergeCheckpointTests(MergeCheckpointFixture):
     def test_handoff_retry_integrates_main_fix_before_finishing_promotion(self) -> None:
         self.assert_interrupted_promotion_keeps_new_main_fix(handoff=True)
 
+    def test_main_move_of_settings_commits_merges_with_no_retest(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        checkpoint = self.checkpoint()
+        with mock.patch.object(merge_checkpoint, "promote", side_effect=checkpoint_gate.Stop(
+                "promote", "failed", "interrupted promotion", "retry")):
+            failed = self.run_checkpoint(checkpoint).process
+        self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+        test_events = self.events("checkpoint-test")
+        setting = self.push_main_change("config/alpha.conf", "limit=2\n", "tune(alpha): limit=2")
+        resumed = self.run_checkpoint(checkpoint).process
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("main moved only by settings commits", resumed.stdout)
+        self.assertEqual(self.events("checkpoint-test"), test_events)
+        tip = self.git("rev-parse", "main", cwd=self.origin)
+        self.assertEqual(self.git("merge-base", "--is-ancestor", setting, tip), "")
+        self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tip), "")
+
+    def test_settings_commits_only_needs_settings_subjects_and_config_paths(self) -> None:
+        repo = self.root / "settings-history"
+        _ = self.git("init", "-q", "-b", "main", str(repo), cwd=self.root)
+        _ = self.git("config", "user.name", "Checkpoint Test", cwd=repo)
+        _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=repo)
+
+        def commit(relative: str, subject: str) -> str:
+            self.write(repo, relative, subject + "\n")
+            _ = self.git("add", relative, cwd=repo)
+            _ = self.git("commit", "-q", "-m", subject, cwd=repo)
+            return self.git("rev-parse", "HEAD", cwd=repo)
+
+        base = commit("README", "base")
+        tuned = commit("config/alpha.conf", "tune(alpha): limit=2")
+        registry = commit("config/models.conf", main_publish.REGISTRY_SUBJECT + "add a model")
+        self.assertTrue(merge_checkpoint.settings_commits_only(repo, registry, base))
+        self.assertFalse(merge_checkpoint.settings_commits_only(repo, tuned, tuned))
+        code = commit("config/beta.conf", "fix(beta): a code change")
+        self.assertFalse(merge_checkpoint.settings_commits_only(repo, code, registry))
+        outside = commit("scripts/alpha.py", "tune(alpha): outside config")
+        self.assertFalse(merge_checkpoint.settings_commits_only(repo, outside, code))
+        _ = self.git("checkout", "-q", "-b", "side", base, cwd=repo)
+        side = commit("config/gamma.conf", "zone(user): side")
+        _ = self.git("checkout", "-q", "main", cwd=repo)
+        _ = self.git("merge", "-q", "--no-ff", "-m", "tune(merge): a merge", side, cwd=repo)
+        merged = self.git("rev-parse", "HEAD", cwd=repo)
+        self.assertFalse(merge_checkpoint.settings_commits_only(repo, merged, outside))
+
     def test_handoff_retest_blocks_main_push_until_promotion_finishes(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()

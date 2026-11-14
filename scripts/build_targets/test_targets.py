@@ -20,6 +20,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 
 from scripts.build_targets import build_targets, targets
 from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
@@ -685,7 +686,7 @@ class ReservationTests(IsolatedTargetTest):
                     write_atomic(path, text)
 
                 with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}), \
-                        mock.patch.object(build_hold, "owning_session", return_value=session), \
+                        mock.patch.object(session_owner, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
                         mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \

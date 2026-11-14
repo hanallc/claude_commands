@@ -804,23 +804,49 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
     return tip
 
 
+def settings_commits_only(checkout: Path, main_commit: str, tested_tip: str) -> bool:
+    """Whether each main commit that the tested tip lacks is a settings commit.
+
+    A settings commit has one parent, a settings subject (main_publish.SETTINGS_SUBJECTS),
+    and changes only config/ paths.
+    """
+    listed = good(git(checkout, "log", "--format=%x01%P%x00%s", "--name-only", main_commit, f"^{tested_tip}"), "push")
+    commits = [entry.strip("\n").split("\n") for entry in listed.split("\x01") if entry.strip()]
+    for header, *paths in commits:
+        parents, _, subject = header.partition("\0")
+        changed = [path for path in paths if path]
+        if (len(parents.split()) != 1 or not subject.startswith(main_publish.SETTINGS_SUBJECTS)
+                or not changed or not all(path.startswith("config/") for path in changed)):
+            return False
+    return bool(commits)
+
+
 @contextmanager
 def tested_main_push(production: ProductionDocument, tested_tip: str,
                      retest: Callable[[tuple[str, ...], str], None], before_merge_tip: str,
                      *, follow_main: bool = True) -> Generator[str]:
-    """Hold the main lock through retests, the push, and main promotion."""
+    """Hold the main lock through retests, the push, and main promotion.
+
+    A main move made only of settings commits merges with no retest (nate, 2026-11-14).
+    """
     checkout = production.checkout
     with ExitStack() as publication_lock:
         with push_rollback(production, before_merge_tip):
-            _ = publication_lock.enter_context(main_push_lock.main_push_lock(checkout))
+            _ = publication_lock.enter_context(
+                main_push_lock.main_push_lock(checkout, "merge_checkpoint.tested_main_push"))
             while follow_main:
                 _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "push")
-                if git(checkout, "merge-base", "--is-ancestor", "refs/remotes/origin/main", tested_tip).returncode == 0:
+                main_commit = good(git(checkout, "rev-parse", "refs/remotes/origin/main"), "push")
+                if git(checkout, "merge-base", "--is-ancestor", main_commit, tested_tip).returncode == 0:
                     break
-                merge_main(production)
+                settings_only = settings_commits_only(checkout, main_commit, tested_tip)
+                merge_main_commit(production, main_commit)
                 tip = good(git(checkout, "rev-parse", "HEAD"), "test")
-                paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
-                retest(paths, tip)
+                if settings_only:
+                    checkpoint_gate.report("test", "ok", f"main moved only by settings commits; merged at {tip} with no retest")
+                else:
+                    paths = tuple(good(git(checkout, "diff", "--name-only", tested_tip, tip), "test").splitlines())
+                    retest(paths, tip)
                 tested_tip = tip
         yield tested_tip
 

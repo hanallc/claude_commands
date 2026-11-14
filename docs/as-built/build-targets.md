@@ -112,8 +112,10 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
   A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
   Without either session, `owning_session` returns `NoOwningSession`.
-  `scripts.build_hold.owning_session` defines both session types and imports no repository module.
-  All callers import the types from this module.
+  `scripts.build_hold.owning_session` defines both functions, both session types and the three run results.
+  It imports no repository module at load; `run_resolution` imports `staff` only when a run variable is set.
+  So a session lookup does not load `build_hold`.
+  All callers import the functions and types from this module.
   `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.

@@ -178,6 +178,7 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 - `held unbuilt --repo <checkout> --id F [--id F ...] --by <who>` clears merged proposal claims and records the reader and time.
 - `held recheck-merged --repo <checkout>` checks filed findings with merged proposal claims.
 - `held fold-test-files --repo <checkout>` folds sibling test file findings and prints each declaring file and the totals.
+- `held unfold-test-files --repo <checkout>` returns item findings that a whole test file move holds although they do not move into its declaring file. It copies the ledger to `ledger.before-unfold-test-files.sqlite` before it writes, and deletes the copy after it verifies the writes. A returned finding goes back to `filed` when its row keeps a proposal, otherwise to `unfiled`. A move that keeps no item finding is withdrawn, and a `fold_withdrawals` row records the time (`FoldUndone`). It skips built moves. It prints `<rule>: restored unfiled N, restored filed N, folds kept N, folds withdrawn N` for each rule, then `unchanged` or the deleted copy.
 
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
@@ -189,6 +190,8 @@ Without `path`, `mod.rs`, `lib.rs`, and `main.rs` use their own directory.
 Another declaring file `foo.rs` uses the `foo/` directory.
 The fold needs exactly one supported declaration of the sibling test file.
 Other forms give no source and keep their item findings.
+A finding folds only when its text and after name the declaring file, and name no Rust file other than it and the test file (`moves_into_test_file_destination`).
+A finding that names no file, or another file, proposes a different change, such as a split of the test file. It keeps its own row.
 A whole-file move gives no item-move proof and requires normal review.
 The ledger reads the finding's anchor commit, or HEAD when no anchor exists.
 The finding prose does not select the destination.
