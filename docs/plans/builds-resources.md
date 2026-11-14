@@ -2542,10 +2542,17 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
 
-### Phase 125 — The Mac watch finds a placed run's compiler under sccache  · status: planned
+### Phase 125 — The Mac watch finds a placed run's compiler under sccache  · status: done
 
-The Mac reading named rustc processes "no queue placement" for a placed hana build. Two proof runs of the worktree feed sent the alerts.
+#### As-built
 
-1. A rustc under sccache, or under a captured cargo, belongs to its build. It is not a run of its own.
-2. A run whose environment, or an ancestor's environment, carries a valid `MAC_PLACEMENT` counts as placed.
-3. A `memory_feed.py --once` run sends no alert.
+- The Mac script `unplaced_runs(processes, records, captures)` stops the parent walk at an `sccache` process or at a cargo-tile captured pid. A compiler under either belongs to its build and is not a root.
+- `gate_label` reads `MAC_PLACEMENT` from the environment of the run and each parent (`cargo_environment` keeps that key). A value of the form `<episode>/<attempt>` gives `placement <value>`. A gate record still wins when it is nearer.
+- `read_reading` reads the captures once and passes them to `read_builds` and `unplaced_runs`.
+- `memory_feed.main` with `--once` reads the Mac but does not call `notify_unplaced_mac_runs`.
+
+**Files:**
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py` — `test_gate_records_classify_process_trees_and_reject_reused_pids` (sccache pid 60, captured pid 70, environment pid 80, bad form pid 90).
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py` — `test_a_one_time_run_reads_the_mac_but_sends_no_alert`.
+
+**Gotchas:** the sccache server starts a cacheable rustc, so that rustc has no cargo parent. The watch checks only the form of `MAC_PLACEMENT`; the gate checks that the placement is current at call time.
