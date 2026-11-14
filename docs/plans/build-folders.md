@@ -105,6 +105,42 @@ The private-config helper supplies test roots and values, not another allocation
 Do not add per-module production fixture keys or a parent lease that blocks its child fixture slots.
 Mac hana's approved count remains two; its size limit still needs user go.
 
+### Proposal #88 (2026-11-14, waits for the user)
+
+The user rejected the first #88 values: "Why are we allocating more than we have? And why have 16 Claude folders?" After Phase 8, nothing deletes at the floor, so the sum of count x size limit on each machine must fit its budget. builds set these rules on 2026-11-14:
+
+1. A machine's budget is the space that build folders use now plus the free space above the floor. natedev: 280.7 GiB used by build folders now, plus 10 GiB free above the 300 GiB floor, is 290.7 GiB. Mac: 91.6 GiB plus 96.8 GiB free above the 150 GiB sweep floor is 188.4 GiB.
+2. A count is the measured 7-day peak of tasks of that repository that built at the same time on that machine (build log, 11-07 to 11-14). A count the user approved stays: Mac hana stays at 2. Mac cargo-liner stays at 2 by the same rule (queue's call).
+3. A size limit is the largest measured folder plus a small margin. When the budget does not hold that, the table names the cost.
+4. Pools are keyed by the origin URL as owner/name. Every worktree of one origin is in one pool. A repository with no origin uses its shared git folder.
+5. Each repository is named. No line covers "every other repository".
+6. A repository with count 0 waits for a slot and prints one line that names the repository and the /tune key to set. A missing key still stops admission with a named config error.
+7. The claude folders are on tmpfs. They count against memory, not disk.
+8. When a slot take deletes a target above its size limit, verify.sh prints one line that names the slot and its measured size. The target is deleted once and the next build starts from nothing; it is not made smaller.
+
+| Machine | Repository | Peak | Count | Largest folder | Limit today | Limit with build disk |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| natedev | hana (all natepiano/hana worktrees and gate caches) | 7 | 7 | 68.9 GiB | 23.5 GiB | 72 GiB |
+| natedev | cargo-liner | 5 | 5 | 29.2 GiB | 24 GiB | 31 GiB |
+| natedev | bevy_brp | 0 | 0, then 1 with build disk | 18.4 GiB | - | 20 GiB |
+| natedev | nateroids | 0 | 0, then 1 with build disk | 16.7 GiB | - | 18 GiB |
+| natedev | obsidian_knife | 0 | 0, then 1 with build disk | not measured | - | 3 GiB (estimate) |
+| natedev | gltf-ibl-sampler-egui | 0 | 0, then 1 with build disk | not measured | - | 5 GiB (estimate) |
+| natedev | claude (tmpfs, memory) | 11 | 11 | 0.05 GiB | 0.25 GiB | 0.25 GiB |
+| Mac | hana | 1 | 2 | 63.8 GiB | 66 GiB | 66 GiB |
+| Mac | cargo-liner | 1 | 2 | 24.7 GiB | 26 GiB | 26 GiB |
+
+Sums:
+
+1. natedev disk today: 164.5 + 120 = 284.5 of 290.7 GiB.
+2. natedev disk with the build disk: 504 + 155 + 20 + 18 + 3 + 5 = 705 GiB above the build disk's floor.
+3. natedev memory: claude 11 x 0.25 = 2.75 GiB.
+4. Mac disk: 132 + 52 = 184 of 188.4 GiB. It does not change with the build disk.
+
+Costs today on natedev: 2 hana folders (68.9 and 42.4 GiB) and 2 cargo-liner folders (29.2 and 29.1 GiB) are above their limits. Each one costs one build from nothing when a task next takes its slot. No Mac folder is above its limit.
+
+Measures: Mac hana was 63.8 GiB in the measure sent at 11:43, taken before 11:21. The Mac sweep trimmed it by 14.2 GiB at 11:21 and 11:29, and it is 53.3 GiB at 12:03. The largest measure sets the limit.
+
 ## Rollout and estimates
 
 Hours include implementation, focused tests, review fixes, and owner coordination.
