@@ -1219,7 +1219,8 @@ class RestartTests(RestartTestCase):
         row = next(row for row in self.rows if row.name == agent)
         expected = ["--resume", str(row.current_session), "--name", row.name]
         if row.kind == "producer":
-            expected.extend(("--model", "opus", "--effort", "max", "--settings", '{"disableAgentView": true}'))
+            expected.extend(("--remote-control", row.name, "--model", "opus", "--effort", "max",
+                             "--settings", '{"disableAgentView": true}'))
         self.assertEqual(arguments, expected)
         if isinstance(_opening, herdr.OpeningPrompt):
             self.assertIn(row.kind, ("unit", "showrunner"))
@@ -1876,6 +1877,19 @@ class RestartTests(RestartTestCase):
                     role.assert_not_called()
                 else:
                     role.assert_called_once_with("showrunner")
+
+    def test_a_claude_producer_starts_and_resumes_with_remote_control(self) -> None:
+        row = replace(self.rows[0], kind="producer", unit_type=staff.NotUnit())
+        _kind, first = restart.producer_first_arguments(row.name)
+        self.assertEqual(first[first.index("--remote-control") + 1], row.name)
+        # A producer that started without the flag gets it at its next restart.
+        entry = pane_record.launch("w1:p0", str(row.current_session), str(self.root), {},
+                                   ["claude", "--resume", str(row.current_session)])
+        self.assertFalse(entry["remote_control"])
+        kind, _environment, arguments = restart.producer_resume(row, entry)
+        self.assertEqual(kind, "claude")
+        self.assertEqual(arguments[arguments.index("--remote-control") + 1], row.name)
+        self.assertFalse(entry["remote_control"])
 
     def test_account_trust_with_the_same_account_keeps_the_file(self) -> None:
         target = self.root / ".claude2"

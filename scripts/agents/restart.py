@@ -416,7 +416,7 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
         if settings.service_tier:
             arguments.extend(("-c", f'service_tier="{settings.service_tier}"'))
     else:
-        arguments = ["--name", name,
+        arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,
                      "--settings", '{"disableAgentView": true}']
     return settings.kind, arguments
@@ -430,8 +430,11 @@ def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], di
 
 def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
-    """Keep saved launch options with the producer's current model settings."""
+    """Keep saved launch options with the producer's current model settings; a Claude producer runs with Remote Control."""
     settings = models_registry.launch_settings("producers", row.name)
+    if settings.kind == "claude":
+        entry = entry.copy()
+        entry["remote_control"] = True
     return settings.kind, {}, pane_record.configured_resume_arguments(entry, str(row.current_session), row.name, settings)
 
 
