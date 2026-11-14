@@ -723,10 +723,10 @@ def _broadcast_worker_mode(active: bool) -> None:
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
     try:
-        producers = conf.read("accounts").words("no_worker_mode_fyi")
+        producers = conf.read("accounts").text("no_worker_mode_fyi").split()
     except conf.Unusable as error:
         print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
-        producers = ()
+        producers = []
     for producer in producers:
         _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
     if active:
