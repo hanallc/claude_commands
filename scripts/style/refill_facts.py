@@ -31,11 +31,42 @@ class CandidatePartition:
     dependencies: tuple[tuple[str, str, str], ...]
 
 
+@dataclass(frozen=True)
+class ImmediateRefillWrites:
+    """Publish each operation before its caller returns."""
+
+
+_IMMEDIATE_REFILL_WRITES = ImmediateRefillWrites()
+
+
+class RefillWriteBatch:
+    """Collect derived writes without holding a source transaction during proofs."""
+
+    def __init__(self) -> None:
+        self.operations: list[Callable[[], None]] = []
+        self.inputs: dict[tuple[str, str, str, int], str] = {}
+        self.writing: bool = False
+
+    def flush(self, facts: RefillFacts) -> None:
+        if not self.operations:
+            return
+        with facts.publication():
+            self.writing = True
+            try:
+                for operation in self.operations:
+                    operation()
+            finally:
+                self.writing = False
+        self.operations.clear()
+        self.inputs.clear()
+
+
 class RefillFacts:
     """Own source facts, candidate partitions, and candidate dependency edges."""
 
     def __init__(self, connection: sqlite3.Connection, object_store: str, catalog: str, *,
-                 on_derived_write: Callable[[int], None] = ignore_derived_writes) -> None:
+                 on_derived_write: Callable[[int], None] = ignore_derived_writes,
+                 writes: RefillWriteBatch | ImmediateRefillWrites = _IMMEDIATE_REFILL_WRITES) -> None:
         self.connection: sqlite3.Connection = connection
         self.object_store: str = object_store
         self.catalog: str = catalog
@@ -43,11 +74,14 @@ class RefillFacts:
         self.failed_reads: int = 0
         self.failed_blobs: set[str] = set()
         self.on_derived_write: Callable[[int], None] = on_derived_write
+        self.writes: RefillWriteBatch | ImmediateRefillWrites = writes
+        self._source_versions: tuple[tuple[str, int], ...] = ()
 
     @contextmanager
     def publication(self) -> Generator[None]:
         """Publish derived facts without committing a caller's source transaction."""
         before = self.connection.total_changes
+        account = not isinstance(self.writes, RefillWriteBatch) or not self.writes.writing
         _ = self.connection.execute("SAVEPOINT refill_publication")
         try:
             yield
@@ -57,17 +91,41 @@ class RefillFacts:
             _ = self.connection.execute("RELEASE refill_publication")
             raise
         finally:
-            self.on_derived_write(self.connection.total_changes - before)
+            if account:
+                self.on_derived_write(self.connection.total_changes - before)
+
+    def publish(self, operation: Callable[[], None]) -> None:
+        """Queue one operation, or publish it immediately outside a maintained read."""
+        if isinstance(self.writes, RefillWriteBatch):
+            self.writes.operations.append(operation)
+        else:
+            with self.publication():
+                operation()
+
+    def publish_input(self, kind: str, identities: object, version: int, result: str) -> None:
+        """Share a pending immutable fact before the batch commits."""
+        if isinstance(self.writes, RefillWriteBatch):
+            key = (self.object_store, kind, input_identity(identities), version)
+            if key in self.writes.inputs:
+                return
+            self.writes.inputs[key] = result
+        self.publish(lambda: self.store_input(kind, identities, version, result))
 
     def source_versions(self) -> tuple[tuple[str, int], ...]:
-        return tuple(cast(list[tuple[str, int]], self.connection.execute(
+        versions = tuple(cast(list[tuple[str, int]], self.connection.execute(
             "SELECT source_table,version FROM refill_tables ORDER BY source_table").fetchall()))
+        # Queued writes share one copy of unchanged versions instead of one copy each.
+        if versions == self._source_versions:
+            return self._source_versions
+        self._source_versions = versions
+        return versions
 
     def observe_sources(self) -> None:
         """Acknowledge versions whose triggers already marked dependent rows."""
-        with self.publication():
+        def publish() -> None:
             _ = self.connection.execute(
                 "UPDATE refill_tables SET applied_version=version WHERE applied_version<>version")
+        self.publish(publish)
 
     def dependencies(self, table: str, key: str, edges: tuple[tuple[str, str, str], ...]) -> None:
         _ = self.connection.execute(
@@ -76,6 +134,9 @@ class RefillFacts:
                                       ((table, key, kind, source, identity) for kind, source, identity in edges))
 
     def input_fact(self, kind: str, identities: object, version: int) -> str | UnstoredFact:
+        key = (self.object_store, kind, input_identity(identities), version)
+        if isinstance(self.writes, RefillWriteBatch) and key in self.writes.inputs:
+            return self.writes.inputs[key]
         row = cast(tuple[str] | None, self.connection.execute(
             "SELECT result FROM refill_inputs WHERE object_store=? AND input_kind=? "
             + "AND input_identity=? AND comparator_version=?",
