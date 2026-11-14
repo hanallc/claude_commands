@@ -97,6 +97,18 @@ def run_job() -> list[PartResult]:
         return [results.get(part, PartResult(part, Outcome.NOT_DUE, 0, 0)) for part in Part]
 
 
+def run_now(part: Part) -> PartResult:
+    """Run one part at once, after a pass that is running; record it as done."""
+    config = settings()
+    with locked_history(schedule_directory("job"), wait=True) as history:
+        if isinstance(history, ScheduleBusy):
+            return PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running")
+        result = run_part(part, config.parts[part], time.monotonic() + config.job.timeout_seconds)
+        if result.outcome is Outcome.SUCCESS:
+            history.record(part.value, time.time())
+        return result
+
+
 def perform(part: Part) -> int:
     from scripts.herdr import herdr
     from scripts.accounts import refusal_watch
@@ -117,6 +129,7 @@ def _perform(part: Part) -> int:
                 print(line)
         elif part is Part.QUOTA:
             from scripts.accounts import accounts
+            from scripts.lib import live_settings
             from scripts.whoami import quota_alert
             from scripts.whoami import agent_accounts, usage_store
             # Quota uses the notes' saved usage, never a second live account probe.
@@ -129,7 +142,8 @@ def _perform(part: Part) -> int:
             observed = saved.observed_at if isinstance(saved, usage_store.RecentTimerUsage) else now
             readings = quota_alert.codex_alert_pass(workers, reports, observed)
             for line in [*agent_notes.watch_usage(reports, selection, workers, readings),
-                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings)]:
+                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings),
+                         *live_settings.publish_waiting()]:
                 print(line)
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
@@ -202,16 +216,20 @@ def _perform(part: Part) -> int:
 
 class Arguments(argparse.Namespace):
     part: str = ""
+    now: str = ""
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--part", choices=[part.value for part in Part])
+    choices = [part.value for part in Part]
+    options = parser.add_mutually_exclusive_group()
+    _ = options.add_argument("--part", choices=choices, help="run one part in this process, with no lock")
+    _ = options.add_argument("--now", choices=choices, help="run one part now, after a running pass")
     args = parser.parse_args(namespace=Arguments())
     try:
         if args.part:
             return perform(Part(args.part))
-        results = run_job()
+        results = [run_now(Part(args.now))] if args.now else run_job()
         for result in results:
             print(f"{result.part.value}: {result.outcome.value}; {result.seconds:.3f} s; exit {result.exit_code}")
             if result.output.strip():

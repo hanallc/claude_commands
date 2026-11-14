@@ -411,7 +411,8 @@ It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
 
-`quota_alert.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`quota_state.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`scripts/whoami/quota_state.py` is a leaf module, so restart, resume and worker code never import `quota_alert`.
 A missing or unreadable state reads as off.
 In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
 `agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.

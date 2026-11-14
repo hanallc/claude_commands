@@ -81,6 +81,7 @@ def seed_rebuild_cache(home: Path) -> None:
 OWNER = staff.StaffRow(staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"), "showrunner", "show", staff.StaffRoot(), current_session=staff.StaffId("9c5e3298-b8da-5d9d-9a8f-1a023259fefd"))
 UNIT = staff.StaffRow(staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), "unit", "trunk", staff.ReportsTo(OWNER.id), current_session=staff.StaffId("d9962532-4f02-5126-b86a-08c69f70031c"), unit_type=staff.UnitDetails("direct"))
 WORKER = staff.StaffRow(staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"), "worker", "impl", staff.ReportsTo(UNIT.id), current_session=staff.StaffId("d78dc003-79c1-56d5-a006-8568ea72bd81"))
+PRODUCER = staff.StaffRow(staff.StaffId("01a18dbb-0000-7000-8000-00000000c0de"), "producer", "morty", staff.StaffRoot(), current_session=staff.StaffId("c27e8199-0000-4000-8000-0000000c1a0d"))
 
 
 def staff_text(*rows: staff.StaffRow) -> str:
@@ -646,10 +647,11 @@ class RoleTests(unittest.TestCase):
                     self.assertEqual(ANSI.sub("", line), f"trunk unit for show | {path} | {branch}")
 
     def test_other_roles_omit_the_repository_branch(self) -> None:
-        _ = self.write_staff(OWNER, UNIT, WORKER)
+        _ = self.write_staff(OWNER, UNIT, WORKER, PRODUCER)
         (self.home / ".git").mkdir()
         _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"), ("unknown", "unassigned")):
+        for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"),
+                                  (PRODUCER.current_session, "morty producer"), ("unknown", "unassigned")):
             for shell in SHELLS:
                 with self.subTest(session_id=session_id, shell=shell):
                     self.assertEqual(self.first_line(session_id, shell=shell), f"{label} | ~")

@@ -82,11 +82,20 @@ Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
-The commit uses local HEAD as its parent, so a push can include pre-existing local commits.
+The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses before any write, so a push never carries another commit.
 The writer stages, commits, stashes, resets, or rebases no other path.
 
 A rejected push fetches and replays the same row changes, for at most three attempts.
 Repeating an interrupted edit publishes all pending local rows, even when the requested value already matches. Recovery recognizes an accepted push without another commit.
+Pending rows replay onto the fetched registry, so a registry commit from another writer does not block them.
+
+`MODELS_CONFIG_PUBLISH=later` writes the shared registry at once under only the registry writer lock.
+It takes no main push lock, so a landing that holds main never delays the edit.
+The quota alert's `edit_registry` uses this mode for its role routing.
+`sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
+`publish_pending(registry)` commits and pushes the rows that HEAD does not have.
+It returns `False` at once when another process holds the main push lock.
+Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.

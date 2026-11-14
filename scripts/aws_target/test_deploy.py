@@ -1,7 +1,7 @@
 """Exercise guarded deployment with a private AWS executable and no network."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -24,7 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, box, config as aws_config, deploy, gate_box, gate_trial, gpu_size_trial, ledger, remote
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, text_setting
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
@@ -526,7 +526,7 @@ class DeploymentTests(CostFixture):
         self.set_clock(self.now)
         if self._testMethodName not in self.process_tests:
             process = SimpleNamespace(**{**cast(Mapping[str, object], vars(subprocess)), 'run': FixtureExecutor(self.root).run})
-            _ = self.enterContext(mock.patch.object(aws_target, 'subprocess', process))
+            _ = self.enterContext(mock.patch.object(aws_cli, 'subprocess', process))
 
     # These tests retain child processes for environment, timeout, exit, and redaction checks.
     process_tests: ClassVar[frozenset[str]] = frozenset({
@@ -939,7 +939,43 @@ sys.exit(7)
             'build-admin', 'us-east-1', 1, execute=execute)))
         _ = self.enterContext(mock.patch.object(subject, '_stack', return_value=outputs))
         _ = self.enterContext(mock.patch.object(gate_trial, 'host_nixpkgs_revision', return_value='fixture-revision'))
+        # A gate deploy reads prices at its end; the fixture keeps that read local.
+        _ = self.enterContext(mock.patch.object(deploy, 'read_price_snapshot', return_value=0))
         return subject, commands
+
+    def test_gate_up_reads_prices_at_once_after_the_stack_update(self) -> None:
+        subject, _commands = self.gate_fixture()
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', return_value=0) as fill, redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        fill.assert_called_once()
+        self.assertEqual(fill.call_args.args, (self.settings, self.state))
+        self.assertIs(cast(bool, fill.call_args.kwargs['force']), True)
+        # The deploy shows the reasons, so it sends no alert; the hourly refresh still can.
+        notify = cast(Callable[[str, object, float], bool], fill.call_args.kwargs['notify'])
+        self.assertFalse(notify('fixture-key', object(), 1.0))
+        self.assertIn('cloud-gate: Spot prices and quotas read', output.getvalue())
+
+    def test_failed_price_read_retries_and_keeps_the_deploy(self) -> None:
+        subject, _commands = self.gate_fixture()
+        pauses: list[float] = []
+        subject.pause = pauses.append
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', return_value=1) as fill, redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        configuration = conf.read(self.settings)
+        attempts = configuration.whole('deploy_price_fill_attempts')
+        self.assertEqual(fill.call_count, attempts)
+        self.assertEqual(pauses, [configuration.number('deploy_price_fill_pause_s')] * (attempts - 1))
+        self.assertIn('the Spot price read failed', output.getvalue())
+
+    def test_price_read_error_names_its_reason_and_keeps_the_deploy(self) -> None:
+        subject, _commands = self.gate_fixture()
+        output = StringIO()
+        with mock.patch.object(deploy, 'read_price_snapshot', side_effect=OSError('fixture lock refusal')), redirect_stdout(output):
+            self.assertTrue(subject.gate_up(approve_resources=True))
+        self.assertIn('the Spot price read did not run: OSError: fixture lock refusal', output.getvalue())
+        self.assertIn('the Spot price read failed', output.getvalue())
 
     def test_gate_up_records_regional_stack_after_home_stack(self) -> None:
         subject, commands = self.gate_fixture()

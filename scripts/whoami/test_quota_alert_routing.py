@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from scripts.lib import live_settings, models_registry
 from scripts.lib.test_models_registry import write_registry
 
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from datetime import timedelta
 from typing import cast
+from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
 from scripts.whoami import agent_accounts
@@ -39,6 +43,16 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "design_roles", "codex"))
         _ = self.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["design_roles"], "codex")
+
+    def test_registry_publication_reports_only_a_publish_or_a_wait(self) -> None:
+        journal = Path(self.enterContext(tempfile.TemporaryDirectory())) / "waiting.json"
+        with mock.patch.object(live_settings, "journal_path", return_value=journal):
+            with mock.patch.object(models_registry, "publish_pending", return_value=False):
+                self.assertEqual(live_settings.publish_waiting(), [])
+            with mock.patch.object(models_registry, "publish_pending", return_value=True):
+                self.assertEqual(live_settings.publish_waiting(), ["registry rows published"])
+            with mock.patch.object(models_registry, "publish_pending", side_effect=OSError("git fetch:\n offline")):
+                self.assertEqual(live_settings.publish_waiting(), ["registry rows not on main yet: git fetch: offline"])
 
     def test_successful_claude_fallback_is_logged_without_a_session_or_phone_push(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]

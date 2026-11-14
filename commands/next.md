@@ -1,12 +1,12 @@
 ---
 description: Review one pending item with the user.
-argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below]"
+argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below] | <change ID>"
 ---
 
 # Next
 
 **Usage:** `/next` · `/next <kind>` · `/next [<kind>] oldest` · `/next [<kind>] newest` ·
-`/next [<kind>] [oldest|newest] all-below` · `/next to the end`
+`/next [<kind>] [oldest|newest] all-below` · `/next to the end` · `/next <change ID>`
 
 Kinds: `change`, `proposal`, `efficiency`, `question`. The words "next", "next change", "next
 proposal", "next efficiency proposal", "next question", "next oldest" and "next newest" mean this
@@ -17,6 +17,9 @@ command too.
 - `oldest` or `newest`, alone or with a kind: the oldest or newest item instead (user,
   2026-10-22).
 - `all-below`, with any of the above: also the items of every production below this one.
+- A change ID, such as `C1535` or `sdlc/C1535`: that one change row. Run
+  `next_item.py show --id <ID>` (with `--production` outside the showrunner session).
+  It pins nothing. A row with a verdict, or an ID on no list, prints one line: show that line and stop.
 
 Any other argument: print the usage line and stop.
 

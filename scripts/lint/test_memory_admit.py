@@ -298,6 +298,7 @@ class BuildBudgetTests(unittest.TestCase):
             ("wait_reply_seconds", lambda: admission_records.read_memory_config().wait_reply_seconds, 60),
             ("query_timeout_seconds", lambda: admission_records.read_memory_config().query_timeout_seconds, 0.5),
             ("replay_retention_seconds", lambda: admission_records.read_memory_config().replay_retention_seconds, 86400),
+            ("ended_placement_seconds", lambda: admission_records.read_memory_config().ended_placement_seconds, 600),
             ("reconnect_seconds", lambda: admission_records.read_memory_config().reconnect_seconds, 2),
             ("silence_seconds", lambda: admission_records.read_memory_config().silence_seconds, 120),
             ("outage_notice_seconds", lambda: admission_records.read_memory_config().outage_notice_seconds, 60),
@@ -434,6 +435,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
             ("only build and CI swapped", 4, 4, 100, 0),
             ("share 0", 15, 0, 0, 0),
             ("share 50", 15, 0, 50, 7.5),
+            ("swapped past the cap", 30, 0, 100, 30),
         ):
             with self.subTest(case=case):
                 host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, int((32 - swap_used) * GIB),
@@ -442,6 +444,11 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 assert isinstance(reading, admission_records.MemoryRoom)
                 self.assertEqual(reading.agent_swap_demand, int(demand * GIB))
                 self.assertEqual(reading.signed_room, 17 * GIB - int(demand * GIB))
+                # The swapped demand is outside the cap, so the cap is the most builds can get.
+                cap = reading.cap
+                assert isinstance(cap, int)
+                self.assertEqual(cap, max(0, 17 * GIB - int(demand * GIB)))
+                self.assertEqual(reading.room, max(0, cap - reading.cap_use - reading.kept))
 
     def test_unavailable_slice_swap_cannot_publish_room(self) -> None:
         missing = admission_records.ReadingUnavailable("builds.slice: memory.swap.current is missing")
@@ -4926,11 +4933,14 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         admission = caller_admission(self, self.root, self.environment)
         grants: list[tuple[str, wire.RunIdentity | wire.NoRun]] = []
+        observed_grants: set[str] = set()
 
         def capture(reply: wire.Reply) -> wire.Reply:
-            if isinstance(reply, wire.Admitted):
+            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
+            if isinstance(grant, wire.Admitted) and grant.reservation not in observed_grants:
                 record, = (record for record in admission.server.reservations.values()
-                    if record.reservation_id == reply.reservation)
+                    if record.reservation_id == grant.reservation)
+                observed_grants.add(grant.reservation)
                 grants.append((record.step, record.run))
             return reply
 
@@ -4938,6 +4948,7 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
         for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
             with self.subTest(command=command):
                 grants.clear()
+                observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
                     env=self.environment, start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)

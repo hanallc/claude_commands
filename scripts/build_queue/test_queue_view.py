@@ -22,6 +22,7 @@ from scripts.build_queue.scope_activity import ScopeProcesses, NoLiveBuildRun, L
 from scripts.buildlog import store
 from scripts.build_queue import head_facts, queue_card, queue_view, queue_evidence
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.build_queue.queue_fixture import (
@@ -64,7 +65,8 @@ class RecordedOwnerQueueTests(unittest.TestCase):
             current = fixture_runtime_id("owner-after-session-restart")
             worker = staff.update_current_session(worker.current_session, staff.native_id(current))
             model = fixture.model()
-            for source, owner in (("detached", worker), ("systemd", unit)):
+            for source, owner, ran_by in (("detached", worker, unit_labels.Runner.WORKER),
+                                          ("systemd", unit, unit_labels.Runner.UNIT_DIRECTOR)):
                 with self.subTest(source=source), mock.patch.dict(os.environ, {
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                     "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(owner.id),
@@ -77,7 +79,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
                     running = replace(model.reading.view.running[0], session_id=identity.session_id,
                                       session_name=identity.name, unit=identity.unit)
                     for step in (waiter, running):
-                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT)
+                        expected = UnitLabels(owner.name, "hana", "demo", unit_labels.OwnerRole.UNIT, ran_by)
                         self.assertEqual(queue_evidence.step_labels(step, labels), expected)
                     cloud = replace(cloud_reading(model.reading).cloud[0], identity=identity)
                     self.assertEqual(queue_view.cloud_step_labels(cloud, replace(model, labels=labels)),
@@ -114,6 +116,27 @@ class RecordedOwnerQueueTests(unittest.TestCase):
 def queue_json_text(data: QueueLines) -> str:
     """Read the text cells from the queue pane's JSON lines."""
     return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
+
+
+def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
+    """Keep a local charge beside host-scoped executions with equal process values."""
+    local = reading.view.running[0]
+    local = replace(local, execution=placement.ObservedExecution(
+        placement.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
+    remote = tuple(replace(local, session_id=f"remote-{host}", session_name=f"remote-{host}",
+        promise=0, measured=admission_records.RemoteMemoryUnavailable("remote memory is unavailable"), pid=900,
+        execution=placement.ObservedExecution(placement.ProcessExecution(host, "remote-generation", 900, "equal-start")),
+        assignment_host=host) for host in ("fixture-mac", "fixture-ssh"))
+    uncertain = replace(remote[0], session_id="remote-uncertain", session_name="remote-uncertain",
+        pid=admission_records.PidNotRecorded(), execution=placement.ExecutionEvidenceUnavailable("transport unavailable", NOW),
+        assignment_host="uncertain-mac")
+    explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
+        0, 0, 0, owner=f"remote-{index}") for index, step in enumerate((*remote, uncertain)))
+    running = (local, *reading.view.running[1:], *remote, uncertain)
+    existing = tuple(replace(row, step=local) if row.step == reading.view.running[0] else row
+                     for row in reading.explanation.running)
+    return replace(reading, view=replace(reading.view, running=running),
+                   explanation=replace(reading.explanation, running=(*existing, *explained)))
 
 
 class BumpRecordsWithVisitCount(tuple[head_facts.BumpRecord, ...]):
@@ -237,11 +260,15 @@ class MacQueueViewTests(unittest.TestCase):
     def test_mac_build_origin_survives_a_record_round_trip_and_old_records_stay_unknown(self) -> None:
         for origin in queue_view.MacBuildOrigin:
             with self.subTest(origin=origin):
-                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin)
+                build = queue_view.MacBuild(100, "/Users/nate/hana", NOW, origin=origin,
+                                            ci_runner="hana-mac-1", ci_job="test-hana")
                 row = queue_view.mac_build_record(build)
                 self.assertEqual(queue_view.mac_build_from_record(row), build)
                 del row["origin"]
                 self.assertIs(queue_view.mac_build_from_record(row).origin, queue_view.MacBuildOrigin.UNKNOWN)
+                del row["ci_runner"], row["ci_job"]
+                self.assertEqual(queue_view.mac_build_from_record(row).ci_runner, "")
+                self.assertEqual(queue_view.mac_build_from_record(row).ci_job, "")
 
     def test_mac_reader_marks_runner_ancestors_and_stops_at_parent_cycles(self) -> None:
         with QueueFixture(captured=False) as fixture:
@@ -268,6 +295,7 @@ class MacQueueViewTests(unittest.TestCase):
                         "read_captures = lambda processes: {}\n" +
                         f"output = lambda arguments: 'p100\\nn{folder}\\n'\n" +
                         "repository_name = lambda folder: 'hana'\n" +
+                        "process_environment = lambda pid: {'RUNNER_NAME': 'hana-mac-1', 'GITHUB_JOB': 'test-hana'}\n" +
                         "print(json.dumps(read_builds()))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -275,6 +303,8 @@ class MacQueueViewTests(unittest.TestCase):
                     self.assertEqual(len(rows), 1)
                     self.assertEqual(rows[0]["pid"], 100)
                     self.assertEqual(rows[0]["origin"], expected)
+                    self.assertEqual(rows[0]["ci_runner"], "hana-mac-1" if expected == "ci" else "")
+                    self.assertEqual(rows[0]["ci_job"], "test-hana" if expected == "ci" else "")
 
     def test_mac_names_use_the_package_then_the_repository(self) -> None:
         for command, repository, expected in (
@@ -527,8 +557,8 @@ class CloudQueueViewTests(unittest.TestCase):
             ("merge-gate", unit_labels.UnitLabels("builds", "builds"), "merge gate"),
             ("targeted-test", UnitLabels("worker", "sdlc", "panes"), "targeted test"),
             ("merge-gate", UnitLabels("worker", "sdlc", "panes"), "merge gate"),
-            ("build", director, "build"),
-            ("literal{step}", director, "literal{step}"),
+            ("build", director, "panes build"),
+            ("literal{step}", director, "panes literal{step}"),
         ):
             with self.subTest(step=step, owner=owner):
                 current = replace(row, identity=replace(row.identity, step=step))
@@ -739,6 +769,22 @@ class QueueViewFixtureTests(QueueFixtureTests):
 
 
 class QueueViewTests(QueueViewFixtureTests):
+
+    def test_converted_hosts_keep_equal_process_values_separate_and_preserve_the_local_charge(self) -> None:
+        self.fixture.write_running(used=admission_records.GIB, need=3 * admission_records.GIB)
+        baseline = self.fixture.model()
+        model = replace(baseline, reading=with_converted_executions(baseline.reading))
+        rows = queue_view.running_builds(model)
+        self.assertEqual(len(rows), len(queue_view.running_builds(baseline)) + 3)
+        self.assertEqual(sum(row.used for row in rows), sum(row.used for row in queue_view.running_builds(baseline)))
+        text = plain(queue_view.render_view(model, 160))
+        for host in ("local-host", "fixture-mac", "fixture-ssh", "uncertain-mac"):
+            self.assertIn(host, text)
+        self.assertEqual(model.reading.explanation.room, baseline.reading.explanation.room)
+        unknown = next(row for row in rows if row.step.session_id == "remote-uncertain")
+        self.assertIsInstance(unknown.step.pid, admission_records.PidNotRecorded)
+        self.assertFalse(unknown.measured)
+        self.assertEqual(unknown.used, 0)
 
     def test_targeted_test_step_uses_its_shown_name(self) -> None:
         model = self.fixture.model()
@@ -1927,6 +1973,16 @@ class CapViewTests(QueueViewFixtureTests):
         self.assertEqual(plain([bar]), "·" * 17 + "│" + "▒" * 2 + "█" * 40)
         self.assertTrue(all(span.tone == "success" for span in bar[:17]))
         self.assertEqual(bar[17].tone, "error")
+
+    def test_swapped_agent_memory_sits_between_the_cap_and_safety(self) -> None:
+        gib = admission_records.GIB
+        room = gate.memory_room(admission_records.HostMemory(20 * gib, 60 * gib, 32 * gib, 27 * gib), [],
+                                admission_policy_fixture())
+        assert isinstance(room, admission_records.MemoryRoom)
+        self.assertEqual((room.cap, room.agent_swap_demand), (12 * gib, 5 * gib))
+        bar = queue_view.cap_bar(room, 60, colour=False)
+        self.assertEqual(plain([bar]), "·" * 12 + "│" + "▓" * 4 + "▒" * 3 + "█" * 40)
+        self.assertEqual({span.tone for span in bar[13:17]}, {"inactive"})
 
 
     def test_row_styles_and_you_marker_match_the_drawn_page(self) -> None:

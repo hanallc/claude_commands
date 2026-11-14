@@ -21,8 +21,9 @@ With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` publishes the config file and pulls
-the Mac without a test or release cycle. Moving an unchanged value from code
+on approval, with the user's words. `/tune` makes the value live on both
+machines at once, then commits it on main and pulls the Mac, without a test or
+release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
 ## machines.conf
@@ -688,7 +689,7 @@ roster.
 
 Colors for each role and account in the status line, plus usage-level colors
 and thresholds for context tokens used and quota percentages left. Role keys are
-`role.showrunner` (purple), `role.unit-director` (yellow),
+`role.showrunner` (purple), `role.unit-director` (yellow), `role.producer` (pink),
 `role.astra-designer` (mauve) and `role.astra-reviewer` (bright-green). Workers and
 unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,

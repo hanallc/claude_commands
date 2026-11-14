@@ -198,8 +198,8 @@ State:
       productions promoting;
     - disk room and quota: the root, always.
   - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or tell that unit to run
-    `/build:hold hold <why> target mac`. Tests skip a held Mac by themselves,
+    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+    Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records
     that, and nothing ends it. On 2026-10-18 such a ruling, a day old, kept a
@@ -490,7 +490,7 @@ Turns come from unit directors' messages and the user. Handle each message:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
+| a nightly red notice or unassigned alert | Assign the fix to the owning unit director of any production, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`; the user push waits for it. |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |

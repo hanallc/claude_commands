@@ -2605,13 +2605,49 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 **Ruled out:** all of app.slice as "Agents" — it also holds browsers and editors.
 
-### Phase 121 — Every floor removal writes its journal line, whichever caller holds the lock  · status: todo
+### Phase 121 — Every floor removal writes its journal line, whichever caller holds the lock  · status: done
 
-**Why:** `scripts/lint/invoke.sh` `sweep_after_step` starts `sweep.py` (budget and floor passes) in the background after each lint step, with its output to /dev/null. On 2026-11-13 from 21:44 to 21:47 that sweep held `floor.lock` and removed 32.2 GiB. The disk-floor service run logged only "another sweep is holding it", and `read_sweep_journal` and the floor alert had no removal lines.
+#### As-built
 
-**Work:**
-1. When `systemd-cat` is on PATH, `sweep_after_step` pipes the background sweep's output to `systemd-cat -t lint-sweep`. The pipeline keeps no fd of the caller.
-2. With no `systemd-cat` (the Mac), the output goes to /dev/null as now.
-3. `SweepStartupTests` in `scripts/lint/test_invoke_scope.py`: a fake `systemd-cat` gets the sweep's lines and the `lint-sweep` identifier; without it the sweep still starts; the caller's output closes before the sweep ends.
+- `scripts/lint/invoke.sh` `sweep_after_step` pipes the detached sweep's output to `systemd-cat -t lint-sweep` when `systemd-cat` is on PATH. `read_sweep_journal` and the floor alert now find removals by a lint step's sweep that holds `floor.lock` while the disk-floor service run skips.
+- The pipe reads `{ systemd-cat -t lint-sweep || cat; }`: when systemd-cat cannot reach the journal (a sandbox), `cat` drains the rest, so a removal never stops on a broken pipe. The pipeline keeps no fd of the caller.
+- With no `systemd-cat` (the Mac), the output goes to /dev/null.
 
-**Files:** `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`.
+**Files:**
+- `scripts/lint/invoke.sh` — the journal pipe in `sweep_after_step`.
+- `scripts/lint/test_invoke_scope.py` — `SweepStartupTests`: fake `systemd-cat` writers (`JOURNAL_WRITER`, `JOURNAL_REFUSED`) and a sweep stand-in held on a release FIFO.
+
+**Gotchas:** systemd-cat inherits the events pipe, so a test reads the journal file after the pipe reaches EOF; a wait loop on the journal file waits the full hang guard.
+
+### Phase 122 — A clone's tag that its local source holds unchanged is not unsaved work  · status: done
+
+#### As-built
+
+- `tmp_sweep.repo_git_work` reads each local source's tags as `refname objectname`. A clone tag with the same name and object is not a tip; HEAD, `--branches` and moved or new tags are checked against `--remotes`, `--alternate-refs` and the sources' branches as before.
+- The first `for-each-ref` of the clone carries the object names, so the clone tags cost no extra git call.
+- A commit that only a source tag holds is still unsaved (`test_source_tag_without_a_branch_does_not_replace_a_remote_copy`).
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `repo_git_work`.
+- `scripts/lint/test_tmp_sweep.py` — `test_clone_tag_that_the_source_holds_unchanged_is_not_unsaved_work` (same tag removed, moved tag kept).
+
+**Gotchas:** a clone with no local source passes its tag names on argv in place of `--tags`; some hundreds of names stay far below ARG_MAX.
+
+### Phase 123 — The build cap leaves out agents' swapped memory  · status: done
+
+#### As-built
+
+- `memory_admit.memory_room`: cap = max(0, used + CI + free − safety − `agent_swap_demand`). Room = cap − cap use − kept while the cap is above zero. No start decision reads the cap, so admission does not change.
+- `queue_evidence.room_text` puts the swapped term in the cap calculation: `… − safety 3.0 GiB − 12.0 GiB swapped outside builds; kept aside …`.
+- `queue_view.cap_bar` draws the swapped block (`▓`, inactive) between the cap line and safety.
+- `memory_feed.memory_shares` places the swapped share first. The reserved share stops at free − safety − swapped, so on the page the reserved block ends at the cap line.
+- `memory_live.html`: the swapped-memory, shortfall and room-equation text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `test_swap_outside_the_build_and_ci_slices_is_demand` (cap and room rows, "swapped past the cap").
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — `RoomTextTests`.
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py` — `test_swapped_agent_memory_sits_between_the_cap_and_safety`.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py` — `test_swapped_demand_stays_right_of_the_cap_when_reserved_fills_free_memory`.
+- `scripts/build_queue/memory_live.html`.
+
+**Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
