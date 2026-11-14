@@ -1475,3 +1475,24 @@ From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws o
 - `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
 - Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
 - Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
+
+### Phase 80 — The Mac idle watch pushes the user only when the user must act · status: todo
+
+From builds (not the user), 2026-11-14 15:10: the user cannot understand the phone push `mac_idle.stuck` ("Waiting tests are not using the Mac", 13:22) and asks for a fix for good. Design from natedev: (1) cause first; (2) the watch never pushes the user an action a session can do, and "ask the builds showrunner" becomes a send.py message to builds; (3) a phone push only when the user must act, in plain words, three short lines: what is wrong, what is already done, what the user does, with no internal words; (4) the same pass for `mac_idle.blocked`; (5) one change review row with the old and new texts. New push texts need the user's approval: send builds the texts and the approve command, and do not run it.
+
+Cause (director, 2026-11-14): the 13:22 push came from a kept claim (holder cargo-liner, "nextest cargo-handler"). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The service restarted at 13:40 and 14:49, so the takeover is live.
+
+Calls sent to builds (each a one-line revert):
+
+1. A free Mac, an idle claim, a block and the disk case send no phone push. The watch's existing message to builds carries them. The texts `mac_idle.stuck` and `mac_idle.blocked` leave the catalog.
+2. A new text `mac_idle.unreachable` pushes the user when steps wait for the Mac and natedev cannot reach it, after `push_seconds`. Today the watch sends nothing in that state.
+3. The unreadable state does not change.
+
+Work:
+
+1. `scripts/buildlog/mac_idle.py`: `push_outage` runs only for the unreachable state. The idle states keep `notify_outage` only.
+2. `scripts/notify/push_catalog.py`: remove `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation`; add `mac_idle.unreachable`. Title "Mac tests stopped"; action "Wake the Mac or check its network."; body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." where tests is "1 test waits" or "N tests wait".
+3. Remove the retired ids from `push_texts_reviewed.json`; the new id waits for the user's approval.
+4. `docs/as-built/mac-test-offload.md` states the new rule.
+5. Tests: the idle states send no push and still message builds; the unreachable state pushes once, with the new text; the text renders as three short lines.
+6. Change-Review row with the old and new texts.
