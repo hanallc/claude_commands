@@ -2632,3 +2632,22 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/lint/test_tmp_sweep.py` — `test_clone_tag_that_the_source_holds_unchanged_is_not_unsaved_work` (same tag removed, moved tag kept).
 
 **Gotchas:** a clone with no local source passes its tag names on argv in place of `--tags`; some hundreds of names stay far below ARG_MAX.
+
+### Phase 123 — The build cap leaves out agents' swapped memory  · status: done
+
+#### As-built
+
+- `memory_admit.memory_room`: cap = max(0, used + CI + free − safety − `agent_swap_demand`). Room = cap − cap use − kept while the cap is above zero. No start decision reads the cap, so admission does not change.
+- `queue_evidence.room_text` puts the swapped term in the cap calculation: `… − safety 3.0 GiB − 12.0 GiB swapped outside builds; kept aside …`.
+- `queue_view.cap_bar` draws the swapped block (`▓`, inactive) between the cap line and safety.
+- `memory_feed.memory_shares` places the swapped share first. The reserved share stops at free − safety − swapped, so on the page the reserved block ends at the cap line.
+- `memory_live.html`: the swapped-memory, shortfall and room-equation text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `test_swap_outside_the_build_and_ci_slices_is_demand` (cap and room rows, "swapped past the cap").
+- `scripts/build_queue/queue_evidence.py`, `scripts/build_queue/test_queue_evidence.py` — `RoomTextTests`.
+- `scripts/build_queue/queue_view.py`, `scripts/build_queue/test_queue_view.py` — `test_swapped_agent_memory_sits_between_the_cap_and_safety`.
+- `scripts/build_queue/memory_feed.py`, `scripts/build_queue/test_memory_feed.py` — `test_swapped_demand_stays_right_of_the_cap_when_reserved_fills_free_memory`.
+- `scripts/build_queue/memory_live.html`.
+
+**Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
