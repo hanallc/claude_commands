@@ -1296,6 +1296,28 @@ class ReplyPublicationTests(unittest.TestCase):
                 finally:
                     reader.close()
 
+    def test_a_reading_finds_build_runs_and_accounts_only_for_the_owners_a_pass_asks_about(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, records.MemoryConfig)
+            original = ScopeActivityReader.run
+            asked: list[int] = []
+
+            def run(reader: ScopeActivityReader, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+                asked.append(pid)
+                return original(reader, pid)
+
+            with mock.patch.object(ScopeActivityReader, "run", run), mock.patch.object(
+                    service, "process_uid", side_effect=AssertionError("a reading reads no account")):
+                evidence = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                                               fixture.readings, fixture.proc, fixture.clock)
+                self.assertIn(request.owner.pid, evidence.processes)
+                self.assertEqual(asked, [])
+                expected = original(ScopeActivityReader(evidence.processes, fixture.proc.path), request.owner.pid)
+                self.assertEqual(evidence.build_run(request.owner.pid), expected)
+                self.assertEqual(asked, [request.owner.pid])
+
     def test_unknown_admit_and_launch_owners_request_one_early_read(self) -> None:
         for launch in (False, True):
             with self.subTest(launch=launch), AdmissionFixture() as fixture:

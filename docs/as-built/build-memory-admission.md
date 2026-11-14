@@ -1669,6 +1669,9 @@ The reader publishes physical memory and sampler observations under a lock and w
 Each reading contains the monotonic time when its read started.
 The loop applies the current peak hold and frozen test-phase need at each pass.
 The reader applies no reservation policy.
+A reading does not find the build run or the account of each process.
+The pass finds them for the owners it checks, from the same process table.
+One pass reads the build target list once, through `target_config.command_configuration()`.
 The loop combines the latest reading with its current reservations and waiters.
 A reading can be one pass cadence old.
 The reader uses `waiting_pass_seconds` while steps wait and `running_pass_seconds` otherwise.
