@@ -1510,6 +1510,18 @@ always=natedev
         self.assertEqual((len(self.prompt_followups()), self.prompt_followups()[-1]["key"], values["since"]), (3, PROMPT_KEY, "12:15 PDT"))
         self.assertEqual(len(self.prompt_notices()), 2)
 
+    def test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass(self) -> None:
+        """rca 261114-1: herdr reported the pane idle for 10 h while its screen showed the prompt."""
+        transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 3 * 3600))
+        self.panes["unit-one"].update(agent_status="idle", pane=OUTSIDE_PROMPT)
+        self.tell_prompt_owner(START)
+        result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspected showrunner/unit-one: permission prompt", result.stdout)
+        self.assertEqual([item["to"] for item in self.prompt_followups()], ["user"])
+        self.assertFalse(any(item["key"].endswith(":bump") for item in self.sent()))
+
     def prompt_state(self) -> Path:
         return self.watches["unit-one"].prompt_path
 
@@ -1525,7 +1537,7 @@ always=natedev
     def test_a_failed_retire_is_sent_again_next_tick_and_no_new_alert_goes(self) -> None:
         self.alerted_at_a_prompt()
         _ = self.fail_file.write_text('["retire"]')
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         failed = self.tick(START + 120)
         self.assertIn("stall-watch: retire:", failed.stderr)
         self.assertTrue(self.prompt_state().exists())
@@ -1559,7 +1571,7 @@ always=natedev
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
         self.assertTrue(self.prompt_state().exists())
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         self.assertEqual(self.tick(START + 30).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse(self.prompt_state().exists())
@@ -1637,7 +1649,7 @@ always=natedev
             self.assertTrue(prompt["alerted"])
             self.assertIn("case_pending", prompt)
             self.assertEqual(self.owner_messages(), [])
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             cleared = self.tick(START + 120)
         self.assertIn("rca: no case opened: OSError: case disk unavailable", cleared.stderr)
         self.assertEqual(self.prompt_followups()[1:], [RETIRE])
@@ -1665,7 +1677,7 @@ always=natedev
         with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
             failed = self.tick(START + 60)
             self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             _ = self.tick(START + 120)
             self.assertEqual(self.prompt_followups()[1:], [RETIRE])
             self.assertFalse(self.prompt_state().exists())
