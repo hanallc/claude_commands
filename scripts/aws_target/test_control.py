@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 import fcntl
@@ -16,11 +16,12 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, aws_target, deploy, ledger, spot_table
+from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spot_table
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
 from scripts.notify import push_texts
+from scripts.review_links import review_link
 
 
 class ControlTests(CostFixture):
@@ -351,6 +352,65 @@ class ControlTests(CostFixture):
             self.assertEqual([cells[2:] for cells in block(size)], [['no', 'runs', '—', 'not', 'billed', 'not', 'billed', '0/0']]
                              * len(self.regions))
         self.assertEqual(lines[-1], f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+
+    def test_each_scope_counts_only_its_run_kinds(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        size = self.standard[0]
+        home = self.regions[0]
+        events: list[dict[str, object]] = []
+        for attempt, mode, box_s in (('gate', 'merge-gate', 360), ('targeted', 'targeted-test', 120)):
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': mode, 'region': home}
+            events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
+                           {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
+        self.assertEqual([costs.scope.name for costs in tables.runs], ['merge-gate', 'targeted-test', 'both'])
+        end = datetime.fromtimestamp(self.clock.now, UTC)
+        evidence = run_cost.run_evidence(events, end - timedelta(days=conf.read(self.settings).whole('run_cost_days')), end, home)
+        # The fixture lowest zone price is 0.25 USD/h: 6 minutes cost 0.0250, 2 minutes 0.0083, and the 4 minute median 0.0167.
+        for costs, run_time, usd in zip(tables.runs, ('6m 0s (1 runs)', '2m 0s (1 runs)', '4m 0s (2 runs)'), ('0.0250', '0.0083', '0.0167')):
+            with self.subTest(scope=costs.scope.name):
+                table = next(table for table in costs.tables if table.title == size)
+                self.assertEqual(table.headers[2], costs.scope.noun)
+                self.assertEqual(table.rows[0][2:4], (run_time, usd))
+                self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0)):.4f}', usd)
+                self.assertEqual(costs.summary, f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
+        # The terminal table shows the merge gate scope only.
+        self.assertIn('6m 0s (1 runs)', spot_table.render(self.state, int(self.clock.now), settings_path=self.settings))
+
+    def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        folder = self.root / 'page'
+        with (mock.patch.object(aws_page, 'output_folder', return_value=folder),
+              mock.patch.object(review_link, 'review_root', return_value=self.root),
+              mock.patch.object(review_link, 'link_host', return_value='127.0.0.1')):
+            with self.assertRaises(FileNotFoundError):
+                _ = aws_page.page_url()
+            page = aws_page.publish(self.state, int(self.clock.now), folder, settings_path=self.settings)
+            self.assertEqual(page, folder / aws_page.PAGE_NAME)
+            self.assertTrue(aws_page.page_url().endswith('/page/' + aws_page.PAGE_NAME))
+        self.assertEqual(page.stat().st_mode & 0o777, 0o644)
+        source = page.read_text()
+        self.assertNotIn('__AWS_PRICES_DATA__', source)
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        data = cast(aws_page.PageData, json.loads(payload))
+        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
+        self.assertEqual(data, aws_page.page_data(tables, int(self.clock.now)))
+        self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
+                         [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
+        self.assertEqual(data['prices']['right'], list(range(1, len(self.regions) + 1)))
+        self.assertEqual([read['region'] for read in data['regions']], list(self.regions))
+
+    def test_page_data_cannot_end_its_script_element(self) -> None:
+        folder = self.root / 'page'
+        cell = 'a</script><b>'
+        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
+        prices = spot_table.Table(cell, tables.prices.headers, tables.prices.right, tables.prices.rows)
+        with mock.patch.object(spot_table, 'spot_tables', return_value=spot_table.SpotTables(
+                tables.regions, prices, tables.quotas, tables.runs)):
+            source = aws_page.publish(self.state, int(self.clock.now), folder).read_text()
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        self.assertEqual(cast(aws_page.PageData, json.loads(payload))['prices']['title'], cell)
 
     def test_absent_snapshot_prints_unknown_values_without_creating_files(self) -> None:
         table = spot_table.render(self.state, int(self.clock.now))

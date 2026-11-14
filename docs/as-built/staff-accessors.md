@@ -164,7 +164,8 @@ The shared pane launch builder uses `set_home`.
 | `scripts/bevy_upgrade/cli_test_support.py` | write | native_id, update_current_session |
 | `scripts/bevy_upgrade/upgrade_schedule.py` | read | snapshot |
 | `scripts/build_targets/working_set.py` | read | local_snapshot |
-| `scripts/build_hold/build_hold.py` | read | local_snapshot, snapshot, initial_snapshot, by_id, by_member_reference, OpenRun; holder keys are fixed staff ids, and the current name, session and message address come from the row |
+| `scripts/build_hold/build_hold.py` | read | snapshot, initial_snapshot, by_id, by_member_reference; holder keys are fixed staff ids, and the current name, session and message address come from the row |
+| `scripts/build_hold/owning_session.py` | read | local_snapshot, OpenRun; `run_resolution` matches the run folder to a row's open run and takes its current session |
 | `scripts/buildlog/mac_idle_test_support.py` | read | snapshot |
 | `scripts/copies/copies.py` | read | local_snapshot, caller_identity; current owner names by row id |
 | `scripts/build_queue/build_queue.py` | read | caller_identity |

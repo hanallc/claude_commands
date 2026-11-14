@@ -1181,7 +1181,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 
         local = refresh_local()
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
-        selection = step_selection.Pinned(args.target) if args.target else step_selection.ROUTED
+        # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
+        selection = (step_selection.Pinned(args.target) if args.target else
+                     step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
         routing = target_config.LocalRequired("local caller") if args.local_only else target_config.ANY_ELIGIBLE_TARGET
         kind = args.kind or local.profile.step
         if kind == "nextest":

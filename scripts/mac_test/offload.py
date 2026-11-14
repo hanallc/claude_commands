@@ -2668,9 +2668,9 @@ def parser() -> argparse.ArgumentParser:
 
 def holder_session() -> str:
     """Use the unit owner session before the shell session."""
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"
