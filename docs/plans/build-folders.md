@@ -82,7 +82,7 @@ This plan has nine phases and an estimate of **64 worker hours**.
 ## Configuration and user decisions
 
 The builds queue unit owns `config/build_folders.conf`.
-The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-14 the user rejected the natedev values (#88); the Mac counts stand. Count x complete size limit:
+The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-14 the user deferred slot work until the build disk is in (#88); the Mac counts stand. Count x complete size limit:
 
 | Machine | Repository | Slots | Size limit |
 | --- | --- | ---: | ---: |
@@ -109,7 +109,7 @@ Mac hana's approved count remains two; its size limit still needs user go.
 
 #88 is closed with no limits set. The user, 2026-11-14 12:15: "We should only implement this after we install the disk." Slot work starts only after the build disk is installed. The values are measured again then and go to the user for approval.
 
-The user rejected the first #88 values: "Why are we allocating more than we have? And why have 16 Claude folders?" After Phase 8, nothing deletes at the floor, so the sum of count x size limit on each machine must fit its budget. builds set these rules on 2026-11-14 for the next measure:
+The user questioned the first #88 values: "Why are we allocating more than we have? And why have 16 Claude folders?" After Phase 8, nothing deletes at the floor, so the sum of count x size limit on each machine must fit its budget. builds set these rules on 2026-11-14 for the next measure:
 
 1. A machine's budget is the space that build folders use at the measure, plus the free space above the floor.
 2. A count is the measured 7-day peak of tasks of that repository that built at the same time on that machine (build log). A count the user approved stays: Mac hana and Mac cargo-liner stay at 2.
