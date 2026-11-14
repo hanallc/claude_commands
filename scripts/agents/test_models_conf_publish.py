@@ -649,23 +649,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         _ = self.git("commit", "--only", "-m", "local work", "--", "local-commit.txt")
         return self.git("rev-parse", "HEAD").strip()
 
-    def test_an_ahead_checkout_publishes_one_registry_commit_on_its_local_tip(self) -> None:
+    def test_an_ahead_checkout_refuses_and_never_pushes_its_local_commits(self) -> None:
         local_head = self.commit_local_work()
-        self.assertEqual(self.git("rev-parse", "origin/main").strip(), self.initial)
-        before = self.dirty_state()
-        unrelated_index = self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf")
+        registry = self.registry.read_bytes()
         unrelated_files = {name: (self.checkout / name).read_bytes()
                            for name in ("dirty.txt", "staged.txt", "local-commit.txt")}
 
-        self.assert_ok(self.edit())
+        result = self.edit()
 
-        self.assert_published(before)
-        self.assertEqual(self.git("rev-parse", "HEAD^").strip(), local_head)
-        self.assertEqual(self.git("rev-list", "--count", f"{local_head}..HEAD").strip(), "1")
-        self.assertEqual(self.git("--git-dir", str(self.remote), "show", "main:local-commit.txt"),
-                         "local history\n")
-        self.assertEqual(self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf"),
-                         unrelated_index)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("commits that are not on origin/main", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.assertEqual(self.registry.read_bytes(), registry)
         for name, contents in unrelated_files.items():
             self.assertEqual((self.checkout / name).read_bytes(), contents)
 
@@ -952,21 +948,6 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "3")
         self.assertRegex(result.stdout + result.stderr, "(?i)edited.*not shared")
         self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
-        self.assertEqual(self.dirty_state(), before)
-
-    def test_an_ahead_checkout_keeps_its_local_parent_when_retrying_a_rejected_push(self) -> None:
-        local_head = self.commit_local_work()
-        count = self.install_push_race(always_refuse=True)
-        before = self.dirty_state()
-
-        refused = self.edit()
-
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertEqual(count.read_text(), "3")
-        self.assertIn("is edited but not shared", refused.stdout + refused.stderr)
-        self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
         self.assertEqual(self.dirty_state(), before)
 

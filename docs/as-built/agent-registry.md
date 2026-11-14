@@ -82,7 +82,7 @@ Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
-The commit uses local HEAD as its parent, so a push can include pre-existing local commits.
+The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses before any write, so a push never carries another commit.
 The writer stages, commits, stashes, resets, or rebases no other path.
 
 A rejected push fetches and replays the same row changes, for at most three attempts.
