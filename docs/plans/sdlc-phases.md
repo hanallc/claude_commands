@@ -622,23 +622,14 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `findings.py decision` records the user's answer on an accepted finding, also after the phase ledger closes.
-
-**Spec:**
-- Case (sdlc, 2026-11-14): tile phase 62 F003 is accepted and its ledger is closed. `decision` refused the user's "Approved", so the word sits only in `user_decision_allow.txt`.
-- `_decision` takes a held, decided or accepted finding. Other states keep the refusal.
-- An accepted finding keeps its `accepted` state. The repair exists and a reviewer accepted it, so the answer applies no change and reopens nothing.
-- A finding has a ruling when it holds a `decision`, whatever its state. `--withdraw` and the repeat rule use that test, so a decided finding that a verdict later accepted can change its ruling with `--withdraw`.
-- The closed-ledger read stays as it is (`closed_phase_ok=True`).
-- Update the decision paragraph in `~/.claude/docs/as-built/simplify-lens.md` in the same commit.
+- `_decision` takes a held, decided or accepted finding, also after the phase ledger closes. Other states keep the refusal.
+- An accepted finding keeps its `accepted` state, because a reviewer already accepted its repair.
+- A ruling is the saved `decision`, whatever the state. `--withdraw` and the repeat rule use that test.
+- Case: tile phase 62 F003 (accepted, ledger closed) refused the user's "Approved". tile records it with `decision --phase 62` after the fix reaches main.
 
 **Files:**
 - `scripts/direct/findings.py` — `_decision`
-- `scripts/direct/test_findings.py` — tests for an accepted finding in a closed phase: approve, repeat, change with and without `--withdraw`
+- `scripts/direct/test_findings.py` — `test_an_accepted_finding_in_a_closed_phase_takes_the_users_decision`, `test_a_decided_finding_a_verdict_accepted_changes_its_ruling_with_withdraw`
 - `docs/as-built/simplify-lens.md` — the decision paragraph
-
-**Workers:** `director only (no Codex workers until the workers-back notice)`
-
-**Acceptance gate:** the `test_findings.py` module passes; basedpyright reports zero errors and zero warnings on both files; targeted_test passes.
