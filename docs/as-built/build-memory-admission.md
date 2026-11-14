@@ -47,6 +47,10 @@ The status and replay paths share the same placement lifetime check.
 An ended local reservation or run returns closed even when its saved assignment still says current.
 Without a terminal report, claim release requires a later provider reading, an ended holder, and no pending start.
 A pending dispatch report keeps the placement current even after an empty provider reading.
+A Mac claim whose holder and submitting owner ended frees its placement at once, even when the Mac keeps the claim.
+The next claim for the scope takes the kept claim over and checks for leftovers.
+A pending start keeps the placement current.
+The service watches each claim holder, so its end wakes the service loop.
 A settled decline requires provider evidence at or after the report time.
 The status check uses cached provider evidence and starts no probe.
 Status and settlement apply the same evidence expiry check.
@@ -149,6 +153,7 @@ The step then waits for the Mac, or takes natedev when natedev is a candidate, a
 Before this rule, a waiting Mac step made one refused attempt each second.
 A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
+The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
 Final command results remain terminal.
 A retry retains the episode, queue time, run place, and priority.
