@@ -1457,3 +1457,16 @@ From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the 
 - The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
 - Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
 - Checkpoint 0c64c36b5.
+
+### Phase 79 — The AWS tables take the user's review changes · status: todo
+
+From builds (not the user), 2026-11-14 14:42, from the user's AWS table review: "1. Terminal: right-align every number column. The terminal quota block becomes the same table as the page. 2. Split refused/launched into two right-aligned columns: refused, launched. 3. Replace 'not billed' with three labels: 'no runs' (no runs of this type and region), 'bill due (N runs)' (runs exist, their day is not billed yet), 'no gate runs' (only other kinds ran, for this scope)." Design check on the phase 78 shots: "4. The cheapest line names only placement candidates (instance_types). 5. '1 runs' -> '1 run'. 6. Snapshot age: one line under the quota table when all regions agree, in minutes ('read 56 min ago'). 7. Phone width: no clipped column: scroll the table inside its card, or stack it." aws owns run_cost.py data changes; report owns spot_table.py and aws_page.py display.
+
+1. The typed source in `spot_table.py` carries each change, so `/aws_prices` and the page show the same text.
+2. `render()` right-aligns every `Table.right` column and draws the quota table like the price table, split to the terminal width.
+3. The run cost tables have `refused` and `launched` columns. A paid cell with no bill says `no runs`, `bill due (N runs)` or `no <scope noun> runs`.
+4. The cheapest line considers `instance_types` only. Counts read `1 run`, `2 runs`.
+5. One snapshot line under the quota table when every region has the same state and minute; otherwise one line per region. Ages are in minutes.
+6. On a phone, each table scrolls inside its card, with the first column fixed and an edge shadow where more columns are.
+7. Proof: before and after `/aws_prices` text, and page shots of each filter value and the phone width.
+8. Run every aws_target and buildlog module before the checkpoint.
