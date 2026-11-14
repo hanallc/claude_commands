@@ -360,7 +360,7 @@ done
             _ = self.claim(working=True)
             mac_idle.watch_once(self.paths, 1240, 100)
         self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["state"], "busy")
-        self.assertFalse((self.paths.state / "idle.json").exists())
+        self.assertNotIn("since", mac_idle.read_record(self.paths.state / "idle.json"))
         self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
 
     def block(self, holder: str = "research", detail: str = "P15 F11 L0 run", *, terminal: bool = False) -> None:
@@ -639,12 +639,24 @@ done
                 f"{mac_idle.SCRIPTS}/lib/py {mac_idle.SCRIPTS}/buildlog/mac_idle.py cleared --since 1000")
             _ = self.claim(working=True)
             mac_idle.watch_once(self.paths, 1700, 100)
+            with mock.patch.object(time, "time", return_value=1700):
+                self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 1)
             (self.paths.mac_state / "claims/research.json").unlink()
             mac_idle.watch_once(self.paths, 1760, 100)
             mac_idle.watch_once(self.paths, 2360, 100)
+            run.assert_called_once()
+            _ = self.claim(working=True)
+            step_record.record_path(self.call.call_id).unlink()
+            self.waiting_steps(2)
+            mac_idle.watch_once(self.paths, 2400, 100)
+            with mock.patch.object(time, "time", return_value=2400):
+                self.assertEqual(mac_idle.main(["cleared", "--since", "1000"]), 0)
+            (self.paths.mac_state / "claims/research.json").unlink()
+            mac_idle.watch_once(self.paths, 2460, 100)
+            mac_idle.watch_once(self.paths, 3060, 100)
             self.assertEqual(run.call_count, 2)
             command = cast(list[str], run.call_args.args[0])
-            self.assertEqual(command[command.index("--key") + 1], "mac-idle-1760")
+            self.assertEqual(command[command.index("--key") + 1], "mac-idle-2460")
         saved = mac_idle.read_record(self.paths.state / "alert.json")
         self.assertEqual((saved["messaged"], saved["pushed"]), (True, True))
 
@@ -944,7 +956,7 @@ done
         self.assertIn("MAC BLOCKED by research since 00:16 (run): ", line or "")
         self.assertNotIn("\u001b", line or "")
         invalid_values: tuple[tuple[str, object], ...] = (("version", True), ("written", float("nan")), ("since", "1000"),
-                               ("changed", None), ("changed", True), ("changed", "1000"), ("changed", -1),
+                               ("changed", None), ("changed", True), ("changed", "1000"), ("changed", -1), ("episode", None),
                                ("changed", float("nan")), ("changed", float("inf")), ("changed", 10 ** 400),
                                ("waiting", True), ("state", "other"), ("cause", "other"), ("holder", 1),
                                ("detail", []), ("until", -1), ("until", 10 ** 400), ("messaged", 1), ("pushed", "no"))
@@ -1042,7 +1054,7 @@ done
         self.assertIn("ignored stale step record stale-call", errors.getvalue())
         self.assertIn("ignored unreadable step record damaged-call", errors.getvalue())
         self.assertEqual([row["call_id"] for row in self.rows()], [self.call.call_id])
-        self.assertEqual(mac_idle.read_record(self.paths.state / "idle.json"), {"since": 1000})
+        self.assertEqual(mac_idle.read_record(self.paths.state / "idle.json")["since"], 1000)
         self.assertTrue(damaged.exists())
 
     def test_verify_argv_and_retry_registration_without_a_step_record_do_not_trigger_repairs(self) -> None:
@@ -1159,7 +1171,7 @@ done
         mac_idle.watch_once(self.paths, 1180, 100)
         self.assertEqual(len(self.rows()), 1)
 
-    def test_own_claim_work_restarts_the_idle_interval(self) -> None:
+    def test_own_claim_work_restarts_the_idle_interval_without_a_second_message(self) -> None:
         _ = self.claim()
         with mock.patch.object(mac_idle, "notify_outage", return_value=True) as notify:
             mac_idle.watch_once(self.paths, 1180, 100)
@@ -1167,9 +1179,8 @@ done
             _ = self.claim(work_idle_since=1200)
             mac_idle.watch_once(self.paths, 1240, 160)
             self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["since"], 1200)
-            self.assertEqual(notify.call_count, 1)
             mac_idle.watch_once(self.paths, 1380, 300)
-            self.assertEqual(notify.call_count, 2)
+            notify.assert_called_once()
 
     def test_other_repository_claim_changes_send_one_message_for_the_idle_episode(self) -> None:
         _ = self.claim()
@@ -1206,11 +1217,29 @@ done
             "mac-idle-showrunner-1000-1780"])
         self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["since"], 1000)
 
-    def test_mac_work_ends_the_episode_and_new_idle_work_sends_a_new_message(self) -> None:
+    def test_other_mac_work_keeps_one_message_while_the_alerted_step_waits(self) -> None:
+        _ = self.claim()
+        with self.outage_sender() as (fixture, push, run):
+            mac_idle.watch_once(self.paths, 1180, 100)
+            for start in (1240, 1600):
+                other = self.claim(name="hana", since=start, working=True)
+                mac_idle.watch_once(self.paths, start, 160)
+                self.assertNotIn("since", mac_idle.read_record(self.paths.state / "idle.json"))
+                other.unlink()
+                mac_idle.watch_once(self.paths, start + 60, 220)
+                mac_idle.watch_once(self.paths, start + 300, 460)
+            self.assertEqual(fixture.count(), 1)
+            push.assert_not_called()
+        self.assertEqual(self.sent_keys(run), ["mac-idle-showrunner-1000-1000"])
+        self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["since"], 1660)
+
+    def test_mac_work_that_ends_the_alerted_wait_starts_a_new_episode(self) -> None:
         _ = self.claim()
         with self.outage_sender() as (fixture, push, run):
             mac_idle.watch_once(self.paths, 1180, 100)
             _ = self.claim(working=True)
+            step_record.record_path(self.call.call_id).unlink()
+            self.waiting_steps(2)
             mac_idle.watch_once(self.paths, 1240, 160)
             self.assertFalse((self.paths.state / "idle.json").exists())
             _ = self.claim(work_idle_since=1300)
@@ -1222,7 +1251,7 @@ done
         self.assertEqual(self.sent_keys(run), [
             "mac-idle-showrunner-1000-1000", "mac-idle-showrunner-1300-1300"])
 
-    def test_blocked_episode_ends_when_a_live_claim_records_mac_work(self) -> None:
+    def test_blocked_outage_keeps_one_message_when_a_live_claim_records_mac_work(self) -> None:
         _ = self.claim()
         self.block()
         with self.outage_sender() as (fixture, push, run):
@@ -1230,13 +1259,11 @@ done
             _ = self.claim(work_idle_since=1700)
             mac_idle.watch_once(self.paths, 1740, 240)
             self.assertEqual(mac_idle.read_record(self.paths.state / "alert.json")["since"], 1700)
-            self.assertEqual(fixture.count(), 1)
             mac_idle.watch_once(self.paths, 1880, 380)
             mac_idle.watch_once(self.paths, 2300, 800)
-            self.assertEqual(fixture.count(), 2)
-            self.assertEqual(push.call_count, 2)
-        self.assertEqual(self.sent_keys(run), [
-            "mac-idle-showrunner-1000-1000", "mac-idle-showrunner-1700-1700"])
+            self.assertEqual(fixture.count(), 1)
+            push.assert_called_once()
+        self.assertEqual(self.sent_keys(run), ["mac-idle-showrunner-1000-1000"])
 
     def test_later_claim_that_sorts_first_keeps_the_idle_episode(self) -> None:
         _ = self.claim(since=1100, work_idle_since=1100)
