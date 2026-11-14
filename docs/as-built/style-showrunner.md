@@ -223,7 +223,7 @@ It reads the retained finding's kind to select the duplicate kind.
   A finished rerun changes no bytes or times and exits 0.
   The migration is removed in Phase 18.
 
-- `record --verdict removed --ticket T` closes a cell whose file the ticket deleted (`record_removed`, which `record` calls for that verdict). The ledger finds the deleting commit with one git call: the newest first-parent commit from the ticket's `base` to `--commit` (the own-commits rule of `checkpoint_restamps`) whose diff against its first parent deletes the path (`git log --first-parent --diff-merges=first-parent --diff-filter=D --no-renames --format='%H %P' -n 1 <commit> ^<base> -- <path>`). That commit must not be a merge (more than one parent): a delete that a merge brings in is not the ticket's. A first-parent merge that only brings in other work deletes nothing in its first-parent diff, so it is not the deleting commit. Commits of other work that changed the file before the delete, such as edits a sync merge of the style branch brings in, do not matter. It refuses a ticket the ledger does not hold, a cell outside the ticket's owned cells (`_ticket_cells`), a ticket with no `base`, a commit not under the base, a path that is not a file at the base (so a crate folder cell and a file deleted before the base refuse), a path still in the tree at the commit, a path whose newest first-parent delete is a merge, a path that no first-parent commit deletes, `--reads`, `--input-scope file`, and, under the write lock, a yielded path. The row keeps the ticket, the deleting commit and the pinned blob. The command prints the cell's state line, `<rule> <path>: removed by ticket <id> at <c7>`; other verdicts print nothing. `TicketRecord.removed` (`RemovedCell`: rule, path, commit, `state` = `removed by ticket <id> at <c7>`) carries each cell whose newest ticket row is removed, so `ticket open` JSON shows it and `coverage_report.ticket_line` puts one `<rule> <path>: removed by ticket <id> at <c7>` line under the ticket. A proposal ticket owns no cells at checkpoint; `record --verdict removed` takes its rule and file cells under the same refusals, for a file rename that deletes a file.
+- `record --verdict removed --ticket T` closes a cell whose file the ticket deleted (`record_removed`, which `record` calls for that verdict). The ledger finds the deleting commit with one git call: the newest first-parent commit from the ticket's `base` to `--commit` (the own-commits rule of `checkpoint_restamps`) whose diff against its first parent deletes the path (`git log --first-parent --diff-merges=first-parent --diff-filter=D --no-renames --format='%H %P' -n 1 <commit> ^<base> -- <path>`). That commit must not be a merge (more than one parent): a delete that a merge brings in is not the ticket's. With no own delete, a path that is not in the tree at the base takes the newest commit under the base that deletes it (`git log --diff-filter=D --no-renames --format=%H -n 1 <base> -- <path>`): a refill read that cell at a synced tip before the delete, so the row closes it at that commit. A first-parent merge that only brings in other work deletes nothing in its first-parent diff, so it is not the deleting commit. Commits of other work that changed the file before the delete, such as edits a sync merge of the style branch brings in, do not matter. It refuses a ticket the ledger does not hold, a cell outside the ticket's owned cells (`_ticket_cells`), a ticket with no `base`, a commit not under the base, a folder at the base (so a crate folder cell refuses), a path still in the tree at the commit, a path whose newest first-parent delete is a merge, a path in the tree at the base that no own commit deletes, a path missing at the base that no commit deletes, `--reads`, `--input-scope file`, and, under the write lock, a yielded path. The row keeps the ticket, the deleting commit and the pinned blob. The command prints the cell's state line, `<rule> <path>: removed by ticket <id> at <c7>`; other verdicts print nothing. `TicketRecord.removed` (`RemovedCell`: rule, path, commit, `state` = `removed by ticket <id> at <c7>`) carries each cell whose newest ticket row is removed, so `ticket open` JSON shows it and `coverage_report.ticket_line` puts one `<rule> <path>: removed by ticket <id> at <c7>` line under the ticket. A proposal ticket owns no cells at checkpoint; `record --verdict removed` takes its rule and file cells under the same refusals, for a file rename that deletes a file.
 - `record --ticket` and `held add --ticket` take the pinned blob, so a judgment on a ticket whose rule changed stays stale against the new text.
 - `ticket checkpoint` refuses while any owned cell is neither recorded nor removed, and names each such cell (`<id>: unjudged cells: <rule> <path>, ...`). A cell with a removed row of any ticket counts as removed only while nothing is at its path in the checkpoint commit. A file there again is unjudged until the ticket records a row that coverage reads after the removals: the same ancestry rule (`_rows_after_removals`) over the rows of every ticket, so a removal by another ticket sets the boundary too, and a row of the ticket on a commit before a delete does not count, whenever it was recorded (`unjudged_ticket_cells`; the gate looks for the path in the worktree and takes the removals in `HEAD`). `ticket merge` needs state `checkpointed` and the checkpoint inside the stored style branch tip. It marks a proposal ticket's findings `built` in the same transaction (only on `AppliedInCode`), prints a `not built` line per other finding, and calls `style_sync.py wake-waiters`. `ticket merge` checks ancestry against the style branch and refuses a successor until its recorded predecessor is merged; `reconcile` processes contained predecessors before successors.
 - `held need --finding F --path P` records an edit path in `finding_needs`. The need belongs to the finding and lasts across drops and refills. The command accepts any finding in the ledger, with or without a build ticket. It refuses an unknown finding id. A repeat changes nothing. The command changes no ticket or finding state. Refill and `Ledger.pipeline_footprint` include these paths. The ticket's gate accepts edits to these paths.
@@ -334,7 +334,9 @@ They make the finding wait when a needed file is busy.
 The ticket's gate accepts edits to these recorded need paths.
 
 A file rename (`file_rename`) includes its own file and its new file.
-It also includes Rust files where `renamed_text` finds a module site for the old stem at either commit.
+It also includes Rust files where `module_site_reading` finds a module site for the old stem at either commit.
+`module_site_reading` shares the module-site scan of `renamed_text` (`_module_renames`) and keeps only a `ModuleSiteReading`.
+It builds no renamed code, so the footprint cache does not hold the canonical code of each file that declares the old stem.
 `Ledger.files_naming` finds the candidate references.
 The renamed file's own text counts.
 Unreadable references and uncertain `path` attributes also count as edited.
@@ -383,7 +385,7 @@ For file renames, `of` and `uncertain` share the same readings.
 On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files.
 Under load 20, `of` takes about 1.2 seconds.
 The read takes 0.02 seconds.
-Scanning 15 files through `renamed_text` takes 1.1 seconds.
+Scanning 15 files for module sites took 1.1 seconds, measured through `renamed_text` before it shared its scan.
 
 Coverage tickets from `_tickets_from` use their own files only.
 Their findings do not exist before judgment.
@@ -413,7 +415,7 @@ It prints `<unit>: <kind> <crate> <rules> — <n> files: <files>`.
 An unavailable board gives exit 4.
 The preview applies no pilot scope.
 
-**Coverage candidates** (`_tickets_from`) use only `open` and `stale` cells. `_refill_cells` leaves out two kinds of stale cell: a held cell whose file blob did not change since its held judgment and whose live findings are all filed on open decisions; and a unit cell whose newest judgment is in the unit tip and the style branch and saw the inputs the unit tip has (`judged_at_base`), because a new ticket would record the same verdict. Ranking and structure blocking still count both.
+**Coverage candidates** (`_tickets_from`) use only `open` and `stale` cells. `_refill_cells` leaves out two kinds of stale cell: a held cell whose file blob did not change since its held judgment and whose live findings are all filed on open decisions; and a unit cell whose newest judgment is in the unit tip and the style branch and saw the inputs the unit tip has (`judged_at_base`), because a new ticket would record the same verdict. Ranking and structure blocking still count both. No ticket takes a cell at a path in `RefillCells.absent_at_base`: the paths that one `git diff --diff-filter=D <synced tip>...<unit tip>` deletes (from their merge base, so a unit tip behind the synced tip deletes nothing), so a ticket never starts on a file that is not at its base.
 
 - Refill selects only from the unit's configured families, with tier D first.
   Structure crates come first by the number of pending cells they block.
@@ -749,7 +751,7 @@ The declaration step (`Ledger.declaration_reading(ids, approved)`, `follow_decla
 
 A crate plan saves its fresh judgments (tip anchor, pinned rule blob, finding/source-history identity and physical input hashes) in `machine_judgments` before writing source. Resume checks these frozen inputs and reuses their authority; it never updates a fingerprint or manufactures a replacement judgment. An empty frozen set is also final. The ordinary rename proof still checks each combined edit plan, including interactions with other findings. A changed tip, rule, finding or physical input refuses the frozen judgment. This evidence is run-local; filing/refill site continuity and historical ledger judgments are unchanged.
 
-The declaration reading groups findings by their judged commit and returns outcomes in input order.
+Cold declaration calculations group findings by their judged commit and return outcomes in input order.
 A finding without an anchor has its own group.
 Within each commit group, consecutive findings from one file share a parsed source scope.
 Site proofs and declaration outcomes share one `DeclaredFile` per blob for the declaration step.
@@ -768,6 +770,7 @@ The scope releases expanded tokens with its source lines.
 `_type_header_conditions` keeps each declaration header's conditional status.
 The source batch also supplies `_commit_files`, so declaration reads reuse its bytes.
 Historical commit groups release their file bytes and comparison data when their findings finish.
+They also release that commit's tree inventory and its search domains. A later group that reads the commit builds them again.
 The step releases all remaining compact file facts after its final outcome.
 `_declared_files` retains compact item facts across commit groups.
 The current tip retains module facts, extern facts, and file bytes until the step ends.
@@ -791,6 +794,9 @@ Insert, update, and delete triggers cover six source tables:
 6. `sync`.
 
 The triggers mark dependent cells in the source transaction.
+Each trigger finds the subscribers of the changed row through `refill_dependency_sources`, not by a scan of every subscriber of the table.
+On the natedev ledger (3.6 million dependency rows), one `held_findings` lookup took 0.29 s with the scan and 0.001 s with the index.
+Migration 43 drops and creates the cell triggers of migration 42 again with this lookup.
 Python and SQLite use the same unescaped Unicode JSON keys for judgment membership.
 A key change records the old key as deleted and the new key as present.
 Cell dependencies include judgment membership, source rows, generations, scope membership, history, and removal barriers.
@@ -815,6 +821,92 @@ Site readers therefore retain their observed rows across comparison-fact publica
 Read-only coverage uses the original calculation.
 Only maintained coverage calculations read or write persistent judgment facts.
 Ticket proofs retain their Git reads and create no comparison facts before their source transaction.
+
+Schema 43 maintains finding results in `refill_findings`.
+Each catalog, finding, and view has its own result and source identity.
+The `synced` view stores the declaration outcome, site evidence, anchor, and current item metadata.
+The `built` view stores rename endpoints without an approval answer.
+Endpoint columns index the crate, old name, new name, and owner.
+Approval observations remain separate from immutable source facts.
+Each read stage checks the decision paths that supplied the stored result.
+An approval change repeats the existing calculation.
+Source versions retain dirty work when a source changes during a calculation.
+
+Thirty-six version triggers cover twelve additional source tables:
+
+1. `held_findings` and `tickets`.
+2. `rule_texts` and `finding_needs`.
+3. `rename_dispositions` and `rename_outer_binding_blocks`.
+4. `rule_body_withdrawals` and `ticket_proposals`.
+5. `ticket_predecessors` and `ticket_yields`.
+6. `ticket_widened_paths` and `ticket_batch_owners`.
+
+Twelve additional triggers invalidate finding results after judgment, generation, invalidation, or correction changes.
+Insertions, deletions, and key changes retain both membership subscriptions and stable source keys.
+Judgment readers retain their existing newest-first order and active-generation predicate.
+`_refresh_site_rows` compares source counters before it discards observed data.
+It loads only the histories, pinned families, and judgment domains requested by finding readers.
+Built findings retain their endpoint facts after unrelated judgment writes.
+Each endpoint records its source rows.
+A trigger propagates a dirty endpoint to subscribers of built membership.
+A change to an endpoint's judging ticket invalidates the dependent finding.
+Finding result version 4 replaces results that stored each search inventory for each finding.
+Proof identities include the search locale.
+Warm observations verify stored object dependencies together through Git's batch reader.
+Each finding records its own proof dependencies and approval observations.
+Each finding also records only the current metadata paths that its proof reads.
+Built endpoint sources remain separate from declaration result sources.
+The read verifies shared endpoint sources before it reads dependent results.
+`RefillWriteBatch` queues derived writes until the source proofs finish.
+A footprint that is calculated commits its queued writes when it ends, also inside a selection, so the selection does not hold them in memory.
+A coverage read commits its queued writes when it ends, also inside a selection, so the declaration stage does not hold its cells in memory.
+A declaration read commits its queued results after each anchor commit group and when it ends, so a large read does not hold them in memory.
+No source proof holds the database write lock.
+Publication checks source versions again inside the final transaction.
+Queued writes share one copy of unchanged source versions, so a large coverage read keeps one copy.
+A refused read discards the queued writes it has not committed; a finished footprint, coverage read or declaration group keeps its results.
+Each result keeps its own savepoint inside the shared transaction.
+Pending immutable facts remain available to later findings in the same read.
+The catalog identity is shared across the read.
+An object group stores a shared object list once in `refill_inputs`, with the kind `object_group`.
+A tip group holds the commit, trees and inputs that one tip read.
+A search group holds the blobs of one commit and one exact pathspec list.
+Each finding and footprint records one reference to each group and each search domain that it read.
+An absent group makes the stored result unavailable.
+Each observation checks the availability of each group once.
+Inside a selection (`finding_reads`), the checks are kept for the whole selection, so each footprint reader does not check every footprint object again.
+Each selection starts with no kept checks.
+A selection also runs the footprint object batch (`prepare_footprints`) once, for its first footprint reader.
+The word index and the stored groups of one ledger are shared across its write batches.
+Word searches query matching objects together instead of querying each file separately.
+Footprints record their required blobs without scanning all earlier source texts.
+Untracked findings verify required objects without reading source bytes that their outcome does not use.
+Missing objects repeat the existing semantic reader and retain its error behavior.
+Ticket mutation proofs use their existing source reads and transactions.
+
+`refill_objects` indexes exact words from each changed Rust or Markdown blob.
+Git supplies the word classification under the current locale.
+The index command disables line numbers, columns, colors, headings, and breaks from Git configuration.
+Word index version 2 replaces words produced with those configuration values.
+Fallback searches record the search group, which holds every searched blob.
+Like Git, an indexed search fails on a missing blob only when no other blob matches.
+Both search readers use `_git_grep` to decide whether a Git search failed.
+Exit status 0 returns the result, including when Git writes warnings.
+Exit status 1 rejects only an explicit unreadable-blob error and otherwise returns no matches.
+`refill_inputs` stores compact declaration and module facts by immutable blob identity.
+Negative name searches retain their revision domain.
+A new declaration changes that domain and repeats the dependent proof.
+The existing readers retain uncertain module attributes, trait identities, forks, cycles, and statement outcomes.
+
+`EditedFiles` stores ordered source footprints and uncertain module paths in finding views.
+It verifies stored footprint objects together before it reads individual findings.
+The inputs include ordered synced and unit commits, local root facts, library names, and recorded needs.
+The selected proposal retains its existing pushed-main observation.
+Busy state does not change a source footprint.
+The existing availability readers intersect current reservations with stored source paths.
+`held_site_cells` and `blob` retain their existing behavior.
+Source scopes release full parses after each calculation group.
+Warm finding and footprint results require no historical source bytes.
 
 The second reading in `follow_declarations` returns the same result when the rows and approvals remain unchanged.
 `run_follow` uses its planned reading directly when no outcome requires a finding write.
