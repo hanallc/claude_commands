@@ -108,7 +108,7 @@ class UnitLabels:
         """Name a copies folder from the owning director's labels.
 
         Look up labels with unit_labels_for([<session id from
-        build_hold.owning_session()>], environment), so a Codex worker
+        owning_session.owning_session()>], environment), so a Codex worker
         resolves to its unit director.
         """
         if self.showrunner == "—":

@@ -1745,9 +1745,9 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
         if isinstance(owner, OwningSession)
