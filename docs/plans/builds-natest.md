@@ -3922,24 +3922,11 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change in `scripts/direct/plan_history.py`; sdlc gives the go).
 
-#### Work Order
+#### As-built
 
-**Goal:** `plan_history.staff_directory` starts no git process when the worktree HEAD is the same as at the last read in the process.
-
-**Spec:**
-- Each `progress_history` state read calls `staff_directory`. It ran `git branch --show-current` each time. In `direct/test_assign_launcher.py` this was 1377 of 2371 git starts.
-- `_worktree_branch(worktree)` keeps the branch name with the HEAD file text, for each worktree, in the process.
-- `_head_text` reads `<worktree>/.git` (a folder, or a `gitdir:` file) and then `HEAD`. It returns None when it cannot read them, or for the reftable stub `ref: refs/heads/.invalid`. None runs git each time and keeps nothing.
-- A changed HEAD text runs git again, so a long-lived process sees a branch switch or a new detached commit.
-- A failed git run keeps nothing, so the next read runs git again (sdlc note at the go).
-- The output stays the same: the branch name, or `detached@<short commit>`.
-- The existing branch test in `test_progress_history` also switches the branch with `git symbolic-ref` and reads the new name.
-
-**Files:** `scripts/direct/plan_history.py`, `scripts/direct/test_progress_history.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- basedpyright reports 0 errors and 0 warnings on both files.
-- `test_progress_history` and `test_phase_table` pass.
-- AWS pair on the progress-heavy modules. Every behavior check stays.
+- `plan_history._worktree_branch` keeps each worktree's branch name with its HEAD file text in the process. `staff_directory` calls it.
+- A changed HEAD text runs git again. No readable HEAD, the reftable stub or a failed git run keeps nothing.
+- The output stays the branch name or `detached@<short commit>`.
+- The branch test in `test_progress_history` also switches the branch with `git symbolic-ref`.
+- AWS pair (c7a, 3 rounds): `direct/test_assign_launcher.py` 33.44 -> 31.43 CPU s; four other progress modules 0.02 to 0.36 CPU s less.
+- Commit 776786ce5. Production change; sdlc gave the go.
