@@ -374,14 +374,19 @@ def on_origin(request: MergeRequest) -> str | None:
     return None
 
 
+def merged(request: MergeRequest) -> bool:
+    """Whether the production's merge branch already contains the checkpoint."""
+    return git(request.production.checkout, "merge-base", "--is-ancestor", request.commit,
+               request.production.merge_branch).returncode == 0
+
+
 def ancestry(request: MergeRequest) -> CheckpointOrigin:
     checkout = request.production.checkout
     origin_branch = on_origin(request)
     if origin_branch is None:
         raise checkpoint_gate.Stop("ancestry", "held", "commit is not on origin",
                    "push your branch to origin and resend the checkpoint")
-    already = git(checkout, "merge-base", "--is-ancestor", request.commit,
-                  request.production.merge_branch).returncode == 0
+    already = merged(request)
     if not isinstance(request.kind, CodeCheckpoint):
         _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "ancestry")
         closing = good(git(checkout, "rev-list", "--first-parent", "--no-merges", "-n", "1",
@@ -1580,11 +1585,50 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
         return 1
 
 
+def later_item_stop(cause: MergeRequest, step: str, state: str) -> checkpoint_gate.Stop:
+    """Stop a unit's later item behind its stopped earlier item."""
+    label = f"{cause.unit.name} phase {cause.phase} ({cause.commit[:12]})"
+    return checkpoint_gate.Stop(step, state, f"later item follows {label}, which {state}",
+                                f"resolve {label}, then resend this checkpoint")
+
+
+def resume_merged_items(requests: tuple[MergeRequest, ...]) -> tuple[tuple[MergeRequest, ...], int]:
+    """Resume each merged item through the single route, and return the items still to merge.
+
+    A merged item's unit drops its later items when the resume fails, as a stopped batch item does.
+    """
+    remaining: list[MergeRequest] = []
+    status = 0
+    failed: dict[str, MergeRequest] = {}
+    for request in requests:
+        cause = failed.get(request.unit.staff_id)
+        if cause is not None:
+            status = report_checkpoint_stop(request, later_item_stop(cause, "ancestry", "failed"))
+            continue
+        try:
+            resolved = resolved_checkpoint(request)
+        except checkpoint_gate.Stop:
+            remaining.append(request)
+            continue
+        if not merged(resolved):
+            remaining.append(request)
+            continue
+        checkpoint_gate.report("batch", "resume", f"{request.unit.name} phase {request.phase} is already merged")
+        resumed = run(resolved)
+        if resumed:
+            status = resumed
+            failed[request.unit.staff_id] = resolved
+    return tuple(remaining), status
+
+
 def run_batch(requests: tuple[MergeRequest, ...]) -> int:
     """Remove stopped items and their unit's later items before each retry."""
     cancel_prior = any(request.cancel_prior for request in requests)
     requests = tuple(request._replace(cancel_prior=cancel_prior) for request in requests)
     production = requests[0].production
+    requests, resumed = resume_merged_items(requests)
+    if not requests:
+        return resumed
     start_tip = good(git(production.checkout, "rev-parse", "HEAD"), "merge")
     merge_in_progress_at_start = git(production.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
     log = requests[0].scratch / f"merge_{requests[0].commit[:7]}_test.log"
@@ -1592,7 +1636,7 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
     _ = log.write_text("", encoding="utf-8")
     while requests:
         try:
-            return run_batch_attempt(requests, start_tip, log)
+            return run_batch_attempt(requests, start_tip, log) or resumed
         except BatchItemStop as error:
             dropped = dict.fromkeys(error.indices, error.stop)
             dropped.update(error.item_stops)
@@ -1601,10 +1645,7 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
                     for cause_index in sorted(error.indices):
                         cause = requests[cause_index]
                         if index > cause_index and request.unit.staff_id == cause.unit.staff_id and index not in dropped:
-                            label = f"{cause.unit.name} phase {cause.phase} ({cause.commit[:12]})"
-                            dropped[index] = checkpoint_gate.Stop(error.stop.step, error.stop.state,
-                                f"later item follows {label}, which {error.stop.state}",
-                                f"resolve {label}, then resend this checkpoint")
+                            dropped[index] = later_item_stop(cause, error.stop.step, error.stop.state)
                             break
             for index in sorted(dropped):
                 _ = report_checkpoint_stop(requests[index], dropped[index])
