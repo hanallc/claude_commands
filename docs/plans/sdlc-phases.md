@@ -603,3 +603,22 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/direct/phase_reservation.py` — `changed_since_baseline` and the module docstring
 - `scripts/direct/test_phase_reservation.py` — `test_record_active_claims_only_the_paths_a_merge_resolved_by_hand`
+
+### Phase 27 — Stall-watch sees a permission prompt on the screen  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** stall-watch classifies a pane at a permission prompt as blocked on its first pass, sends no bump, and alerts the user on the usual prompt timing (rca 261114-1).
+
+**Spec:**
+- `scripts/production/stall_watch.py`: `prompt_on_screen` finds a `PROMPT_QUESTION` line with a `1. Yes` answer under it in the pane's bottom `PROMPT_LINES` lines. `watch_pass` treats such a pane as blocked whatever herdr's state is.
+- Add no new check.
+- Tests: a failing-first test in `scripts/production/test_stall_watch.py`. herdr reports idle and the screen shows the prompt: the first pass decides "permission prompt", the user alert goes, and no bump goes. Tests that end a prompt also clear it from the screen.
+
+**Files:**
+- `scripts/production/stall_watch.py`
+- `scripts/production/test_stall_watch.py`
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`
