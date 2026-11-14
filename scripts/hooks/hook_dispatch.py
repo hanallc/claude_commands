@@ -100,6 +100,7 @@ PRE_TOOL_USE = (
     HookSpec("pre-tool-use-showrunner-move-guard.py", "Bash"),
     HookSpec("pre-tool-use-change-review-gate.py", "Bash"),
     HookSpec("pre-tool-use-checkpoint-doc-gate.py", "Bash"),
+    HookSpec("pre-tool-use-push-alone.py", "Bash", 10),
     CopyPolicyHook(),
 )
 POST_TOOL_USE = (
