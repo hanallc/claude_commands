@@ -376,7 +376,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertEqual(len(upgraded.ticket_open(ticket_owner_id("names"))), 2)
         self.assertEqual(len(ledger.ticket_open(ticket_owner_id("names"))), 1)
 
-        for source_version, route in ((40, "sql"), (40, "ledger"), (41, "sql"), (41, "ledger")):
+        for source_version, route in ((40, "sql"), (40, "ledger"), (41, "sql"), (41, "ledger"),
+                                      (42, "sql"), (42, "ledger")):
             with self.subTest(candidate_migration=route, source_version=source_version):
                 database = self.root / f"phase-one-{source_version}-{route}.sqlite"
                 with closing(sqlite3.connect(database)) as connection:
