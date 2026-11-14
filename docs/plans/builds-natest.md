@@ -3992,20 +3992,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** verify_helper runs the step-routes `targets.py` fixture inside the helper process, as it runs build_targets.py in production.
-
-**Spec:**
-- verify_helper runs a program inside the helper process only when the program has a top-level `def main(`. The `targets.py` fixture had none, so each call started a new Python process. That process then ran the real build_targets.py with `runpy`.
-- test_verify_lint_local_writes started this fixture 171 times, at about 0.13 CPU s for each start. This was 22 of its 39 CPU s.
-- The fixture now has a `main`. It loads the real build_targets.py once for each helper and calls its `main`. Each answer and each route event stays the same.
-- The four tests that edit the fixture text use the new indented layout.
-
-**Files:** `scripts/direct/verify_step_routes_test_support.py`, `scripts/direct/test_verify_step_state.py`, `scripts/direct/test_verify_step_routes.py`, `scripts/direct/test_verify_token_mac_step.py`, `scripts/direct/test_verify_step_routes_results.py`.
-
-**Workers:** director only (no-worker mode).
-
-**Acceptance gate:**
-- basedpyright reports 0 errors and 0 warnings on the five files.
-- AWS pair on the nine modules that use the fixture, all passing. Every behavior check stays.
+- The step-routes `targets.py` fixture has a top-level `main`, so verify_helper runs it inside the helper process.
+- It loads the real `build_targets.py` once for each helper and calls its `main`. Each answer and route event stays the same.
+- The four tests that edit the fixture text use the indented layout.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 9 verify modules 175.06 -> 116.08 CPU s; `test_verify_lint_local_writes` 59.44 -> 31.14.
+- Commit a8e5d997f. Test-only change.
