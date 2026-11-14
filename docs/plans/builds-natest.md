@@ -3930,3 +3930,27 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The branch test in `test_progress_history` also switches the branch with `git symbolic-ref`.
 - AWS pair (c7a, 3 rounds): `direct/test_assign_launcher.py` 33.44 -> 31.43 CPU s; four other progress modules 0.02 to 0.36 CPU s less.
 - Commit 776786ce5. Production change; sdlc gave the go.
+
+### Phase 268 — A staff read parses the staff record only when its text changes  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/production/staff.py`; sdlc gives the go).
+
+#### Work Order
+
+**Goal:** `staff._load` builds the staff rows again only when the staff record text differs from the last clean parse in the process.
+
+**Spec:**
+- `_load` reads the record text each time. When the path and the text are the same as the last kept parse, it returns a new `StaffSnapshot` made from the kept one.
+- The new snapshot finds backends again, because backends follow the session files and not the staff text.
+- `_load` keeps a parse only when it printed no anomaly: no skipped row of unknown kind and no invalid `role` or `home` field. A record with an anomaly prints it on each read, as before.
+- `_local_text` and `_record_fields` split the old `_local_fields`. A bad JSON error keeps its text: `cannot read staff record <path>: invalid staff JSON: …`.
+- The cache holds one record: a parse of another path replaces it.
+
+**Files:** `scripts/production/staff.py`.
+
+**Workers:** director only (no-worker mode).
+
+**Acceptance gate:**
+- basedpyright reports 0 errors and 0 warnings on `staff.py`.
+- The staff modules and the 19 modules that check staff read errors pass on natedev.
+- AWS pair on `message/test_roster.py` and `direct/test_assign_launcher.py`. Every behavior check stays.
