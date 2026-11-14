@@ -617,3 +617,28 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/production/stall_watch.py` — `prompt_on_screen`, `PROMPT_OPTION` and the blocked decision in `watch_pass`
 - `scripts/production/test_stall_watch.py` — `test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass`; four tests that end a prompt clear it from the screen
+
+### Phase 28 — An accepted finding takes the user's decision after close  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `findings.py decision` records the user's answer on an accepted finding, also after the phase ledger closes.
+
+**Spec:**
+- Case (sdlc, 2026-11-14): tile phase 62 F003 is accepted and its ledger is closed. `decision` refused the user's "Approved", so the word sits only in `user_decision_allow.txt`.
+- `_decision` takes a held, decided or accepted finding. Other states keep the refusal.
+- An accepted finding keeps its `accepted` state. The repair exists and a reviewer accepted it, so the answer applies no change and reopens nothing.
+- A finding has a ruling when it holds a `decision`, whatever its state. `--withdraw` and the repeat rule use that test, so a decided finding that a verdict later accepted can change its ruling with `--withdraw`.
+- The closed-ledger read stays as it is (`closed_phase_ok=True`).
+- Update the decision paragraph in `~/.claude/docs/as-built/simplify-lens.md` in the same commit.
+
+**Files:**
+- `scripts/direct/findings.py` — `_decision`
+- `scripts/direct/test_findings.py` — tests for an accepted finding in a closed phase: approve, repeat, change with and without `--withdraw`
+- `docs/as-built/simplify-lens.md` — the decision paragraph
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`
+
+**Acceptance gate:** the `test_findings.py` module passes; basedpyright reports zero errors and zero warnings on both files; targeted_test passes.
