@@ -1290,7 +1290,7 @@ class ClientTests(unittest.TestCase):
                 "The build queue service has not answered for 10 seconds. Builds wait.\n"
                 + "The service restarts by itself. Read journalctl -u build-admission.service.\n"
                 + "If the user must act, push the phone with this command: "
-                + "sudo systemctl restart build-admission.socket build-admission.service")
+                + "systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service")
             self.assertEqual(commands[1], commands[0])
 
     def test_down_alert_retains_sent_or_waiting_messages_and_retries_only_empty_deliveries(self) -> None:
@@ -1316,7 +1316,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--need") + 1], "blocked")
                     values = [command[index + 1] for index, part in enumerate(command) if part == "--value"]
                     self.assertEqual(values, [
-                        "action=On natedev, run: sudo systemctl restart build-admission.socket build-admission.service",
+                        "action=On natedev, run: systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service",
                         "body=The builds session did not take the message. Builds wait until the service answers.",
                         "sender=build-admission", "title=Build queue service is down"])
                     scripts = Path(client.__file__).resolve().parents[1]

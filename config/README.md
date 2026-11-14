@@ -21,8 +21,9 @@ With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` publishes the config file and pulls
-the Mac without a test or release cycle. Moving an unchanged value from code
+on approval, with the user's words. `/tune` makes the value live on both
+machines at once, then commits it on main and pulls the Mac, without a test or
+release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
 
 ## machines.conf
