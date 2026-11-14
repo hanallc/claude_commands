@@ -10,6 +10,32 @@ from scripts.build_queue.admission_code import (
 )
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import cloud_progress, progress_profile
+from scripts.build_queue.placement import (
+    SourceKeyKnown as SourceKeyKnown,
+    SourceKeyUnavailable as SourceKeyUnavailable,
+    SourceIdentity as SourceIdentity,
+    ClaimHolderIdentity as ClaimHolderIdentity,
+    ClaimHolderUnconfirmed as ClaimHolderUnconfirmed,
+    TokenRequired as TokenRequired,
+    TokenHeld as TokenHeld,
+    TokenNotRequired as TokenNotRequired,
+    LocalExecutionPrerequisite as LocalExecutionPrerequisite,
+    NormalStep as NormalStep,
+    SpeculativeCopy as SpeculativeCopy,
+    PlacementPurpose as PlacementPurpose,
+    AttemptRunning as AttemptRunning,
+    AttemptCompleted as AttemptCompleted,
+    PrelaunchRefused as PrelaunchRefused,
+    AttemptDeclined as AttemptDeclined,
+    AttemptCancelled as AttemptCancelled,
+    AttemptOutcomeUnavailable as AttemptOutcomeUnavailable,
+    AttemptOutcome as AttemptOutcome,
+    RetryAt as RetryAt,
+    DoNotRetry as DoNotRetry,
+    RetryDecision as RetryDecision,
+    DispatchPathSettled as DispatchPathSettled,
+    DispatchPathPending as DispatchPathPending,
+)
 from scripts.build_queue.admission_wire import (
     AdmissionUnavailable as AdmissionUnavailable,
     UnsupportedVersion as UnsupportedVersion,
@@ -46,11 +72,18 @@ from scripts.build_queue.admission_wire import (
     Ok as Ok,
     BuildHistoryReply as BuildHistoryReply,
     PlacementRequest as PlacementRequest,
+    LocalAdmissionContext as LocalAdmissionContext,
+    LocalAdmissionUnavailable as LocalAdmissionUnavailable,
+    PrerequisiteReport as PrerequisiteReport,
+    CancelPlacement as CancelPlacement,
     ClaimFailure as ClaimFailure,
     ConsumePermission as ConsumePermission,
     ExecutionReport as ExecutionReport,
     PlacementWait as PlacementWait,
+    PlacementResourceWait as PlacementResourceWait,
+    PlacementEvidenceWait as PlacementEvidenceWait,
     Assignment as Assignment,
+    LocalPlacementGranted as LocalPlacementGranted,
     FirstAuthorization as FirstAuthorization,
     DispatchStatus as DispatchStatus,
     VERSION as VERSION,
@@ -62,6 +95,7 @@ from scripts.build_queue.admission_wire import (
     CLEANUP_STATUS_MAX as CLEANUP_STATUS_MAX,
     CLEANUP_REQUEST_MAX_BYTES as CLEANUP_REQUEST_MAX_BYTES,
     Request as Request,
+    Reply as WireReply,
     admission_socket_path as admission_socket_path,
     encode_record as encode_record,
     parse_record as parse_record,
@@ -117,8 +151,7 @@ class MineReply:
 
 
 
-Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply | ViewReply | ExplainReply | MineReply
-         | PlacementWait | Assignment | FirstAuthorization | DispatchStatus)
+Reply = WireReply | ViewReply | ExplainReply | MineReply
 
 _REPLIES: dict[str, type] = {**REPLY_TYPES, "view": ViewReply, "explain": ExplainReply, "mine": MineReply}
 

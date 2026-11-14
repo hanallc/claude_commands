@@ -16,11 +16,35 @@ from typing import cast, final
 from unittest import mock
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
-from scripts.production import merge_gate
+from scripts.production import merge_gate, merge_gate_suites_test_support
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+@final
+class GateProcessStateTests(unittest.TestCase):
+    def test_process_exit_counts_as_stopped_at_stat_read_or_pidfd_event(self) -> None:
+        fixture = GateSuitesFixture()
+        for initial_state in (FileNotFoundError(), ProcessLookupError(), "1 (fixture) S"):
+            status_read = mock.Mock(side_effect=[initial_state, "1 (fixture) S"])
+            status = mock.Mock(read_text=status_read)
+            opened = mock.Mock(return_value=47)
+            closed = mock.Mock()
+            kernel = mock.Mock(pidfd_open=opened, close=closed)
+            readiness = mock.Mock(select=mock.Mock(return_value=([47], [], [])))
+            with self.subTest(initial_state=initial_state), \
+                    mock.patch.object(merge_gate_suites_test_support, "Path", return_value=status), \
+                    mock.patch.object(merge_gate_suites_test_support, "os", kernel), \
+                    mock.patch.object(merge_gate_suites_test_support, "select", readiness):
+                fixture.assert_process_stopped(1234)
+                status_read.assert_called_once_with()
+                self.assertEqual(opened.call_count, int(isinstance(initial_state, str)))
+                if isinstance(initial_state, str):
+                    closed.assert_called_once_with(47)
+                else:
+                    closed.assert_not_called()
 
 
 @final
@@ -339,6 +363,11 @@ merge_gate.start_gate_job = stop_after_start
                 self.write(self.state / "hold-module", "hold")
                 self.write(self.state / "leak-child", "leak")
                 self.write(self.state / "detached-child", "detached")
+                # Each signal gets its own pool, so a failed subtest leaves no token for the next.
+                pool = self.root / f"jobserver-{sig.name}"
+                os.mkfifo(pool)
+                self.addCleanup(os.close, os.open(pool, os.O_RDWR | os.O_NONBLOCK))
+                self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(pool)
                 self.supply_jobserver(b"Q")
                 parent = self.root / f"interrupted-{sig.name}"
                 parent.mkdir()

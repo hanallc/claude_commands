@@ -34,6 +34,9 @@ class SavedPlacementAssignment:
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
     provider: placement.ProviderClaimReference | placement.NoProviderClaim = placement.NoProviderClaim()
+    holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
+    retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
+    terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -52,7 +55,6 @@ class AdmissionTiming:
 @dataclass(frozen=True)
 class PressurePolicy:
     full_avg10_limit: float
-    swap_used_limit: float
     some_avg10_limit: float
 
 
@@ -75,6 +77,7 @@ class AdmissionPolicy:
     peak_hold: PeakHold
     safety_bytes: int = 3 * GIB
     progress_lookahead_percent: float = field(kw_only=True)
+    agent_swap_share_percent: int = field(default=100, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -452,7 +455,13 @@ def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -
 class GoneMemory:
     pass
 
-StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory
+
+@dataclass(frozen=True)
+class RemoteMemoryUnavailable:
+    reason: str
+
+
+StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | CompilerServiceMemory | UnownedSliceMemory | GoneMemory | RemoteMemoryUnavailable
 
 
 @dataclass(frozen=True)
@@ -476,7 +485,7 @@ class MemoryPressure:
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
     next_start_at: float = 0.0
-    condition: Literal["full", "swap"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
+    condition: Literal["full", "some"] | PressureConditionNotRecorded = PressureConditionNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -490,6 +499,7 @@ class HostMemory:
     total: int | UnknownHostTotal
     swap_total: int = 0
     swap_free: int = 0
+    build_and_ci_swap: int | ReadingUnavailable = field(default=0, kw_only=True)
 
 Pressure = NoPressureHold | MemoryPressure | PressureUnavailable
 
@@ -684,6 +694,7 @@ class MemoryRoom:
     runs: tuple[RunKeepAside, ...]
     total: int | UnknownHostTotal = field(default_factory=UnknownHostTotal, kw_only=True)
     ci_use: int = field(default=0, kw_only=True)
+    agent_swap_demand: int = field(default=0, kw_only=True)
 
     @property
     def cap_use(self) -> int:
@@ -826,6 +837,11 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
 
 
 @dataclass(frozen=True)
+class PackageNotRecorded:
+    """The queue record predates the package field. An empty package means workspace scope."""
+
+
+@dataclass(frozen=True)
 class WaitingStep:
     pid: int
     session_id: str
@@ -838,6 +854,7 @@ class WaitingStep:
     unit: str = ""
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
+    package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -853,6 +870,29 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
+    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    assignment_host: str = ""
+    package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
+
+
+def execution_host(step: RunningStep, local_host: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+    return step.assignment_host or local_host
+
+
+def execution_group(step: RunningStep, fallback: str) -> str:
+    evidence = step.execution
+    if isinstance(evidence, placement.ObservedExecution):
+        identity = evidence.identity
+        if isinstance(identity, placement.ProcessExecution):
+            return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        return repr((identity.target, identity.generation, identity.instance, identity.attempt))
+    if step.assignment_host:
+        return repr((step.assignment_host, fallback))
+    return run_owner(step.run.pid, step.run.start_time) if isinstance(step.run, LiveBuildRun) else fallback
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1176,7 @@ class MemoryConfig:
     wait_reply_seconds: float
     query_timeout_seconds: float
     replay_retention_seconds: float
+    ended_placement_seconds: float
     reconnect_seconds: float
     silence_seconds: float
     outage_notice_seconds: float
@@ -1216,7 +1257,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
             timing = AdmissionTiming(*(whole(key) for key in (
                 "recovery_start_seconds", "estimate_refresh_seconds", "slot_gap_seconds")), fresh_test_seconds=running_interval)
             pressure = PressurePolicy(*(number(key) for key in (
-                "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+                "full_pressure_limit", "some_pressure_limit")))
             kinds = {key.removeprefix("peak_hold_seconds."): whole(key)
                      for key in values if key.startswith("peak_hold_seconds.")}
             first_peaks = {key.removeprefix("program_first_peak_gib."): gib(key)
@@ -1225,7 +1266,8 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 first_peaks["cargo"] = gib("program_first_peak_gib.cargo")
             config = MemoryConfig(
                 policy=AdmissionPolicy(timing, pressure, PeakHold(whole("peak_hold_seconds"), kinds), gib("safety_gib"),
-                                       progress_lookahead_percent=number("progress_lookahead_percent")),
+                                       progress_lookahead_percent=number("progress_lookahead_percent"),
+                                       agent_swap_share_percent=whole("agent_swap_share_percent")),
                 ci_memory_slice=value("ci_memory_slice", _ci_slice_name),
                 ci_label=value("ci_label", _ci_label),
                 test_phase_margin=test_margin(),
@@ -1235,6 +1277,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
+                ended_placement_seconds=number("ended_placement_seconds"),
                 reconnect_seconds=number("reconnect_seconds"), silence_seconds=number("silence_seconds"),
                 outage_notice_seconds=number("outage_notice_seconds"),
                 reading_alert_seconds=number("reading_alert_seconds"),
@@ -1273,8 +1316,8 @@ def pressure_text(pressure: MemoryPressure) -> str:
     if isinstance(pressure.condition, PressureConditionNotRecorded):
         return (f"memory pressure: condition not recorded by service; full avg10 {pressure.full_avg10:.1f}; "
                 f"some avg10 {pressure.some_avg10:.1f}; swap {format_percent(pressure.swap_used_percent)} used")
-    if pressure.condition == "swap":
-        return f"memory pressure: swap {format_percent(pressure.swap_used_percent)} used; some avg10 {pressure.some_avg10:.1f}"
+    if pressure.condition == "some":
+        return f"memory pressure: some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 

@@ -7,6 +7,7 @@ from scripts.style.ledger_test_support import ticket_owner_id
 import os
 import sqlite3
 import subprocess
+import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -18,6 +19,7 @@ from scripts.style import style_ledger
 from scripts.style import rules
 from scripts.style.approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
 from scripts.style import declarations
+from scripts.style import refill_facts
 from scripts.style import style_footprint
 from scripts.style import style_proposals
 from scripts.style import bulk_run
@@ -41,12 +43,30 @@ class StyleLedgerSitesTests(LedgerTestCase):
 
         cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips")).clear()
         builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        flush = refill_facts.RefillWriteBatch.flush
+        batch_versions: list[set[int]] = []
+
+        def flush_batch(batch: refill_facts.RefillWriteBatch, facts: refill_facts.RefillFacts) -> None:
+            versions: list[int] = []
+            for operation in batch.operations:
+                names = cast(types.CodeType, getattr(operation, "__code__")).co_freevars
+                if "versions" in names:
+                    cells = cast(tuple[types.CellType, ...], getattr(operation, "__closure__"))
+                    versions.append(id(cast(object, cells[names.index("versions")].cell_contents)))
+            if len(versions) > 1:
+                batch_versions.append(set(versions))
+            flush(batch, facts)
+
         with (mock.patch.object(style_ledger, "_tip", wraps=builder) as inventories,
               mock.patch.object(style_ledger, "read_declarations", wraps=remember) as reads,
-              mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate):
+              mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate,
+              mock.patch.object(refill_facts.RefillWriteBatch, "flush", autospec=True, side_effect=flush_batch)):
             for _ in range(3):
                 _ = tuple(ledger.cells(rule=finding.rule))
             evidence = ledger.finding_site(finding, checkpoint)
+        # The queued cell writes of one batch share one copy of unchanged source versions.
+        self.assertTrue(batch_versions)
+        self.assertTrue(all(len(versions) == 1 for versions in batch_versions))
         commits = [cast(tuple[Path, str], call.args)[1] for call in inventories.call_args_list]
         self.assertEqual(set(commits), {base, checkpoint})
         self.assertEqual(len(commits), len(set(commits)))
@@ -1718,12 +1738,27 @@ class StyleLedgerSitesTests(LedgerTestCase):
                             lexical_reads.append(text)
                         return result
 
+                    release = cast(Callable[[str], None], getattr(ledger, "_release_declaration_commit"))
+                    released: list[str] = []
+
+                    def release_commit(commit: str) -> None:
+                        tips = cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips"))
+                        self.assertIn(commit, tips)
+                        release(commit)
+                        released.append(commit)
+                        # A finished group keeps no historical tree inventory or search domain.
+                        self.assertNotIn(commit, tips)
+                        domains = cast(dict[tuple[str, tuple[str, ...]], object], getattr(ledger, "_search_domains"))
+                        self.assertFalse([key for key in domains if key[0] == commit])
+
                     with (mock.patch.object(style_footprint, "tokenized_text", wraps=read_tokens) as tokens,
                           mock.patch.object(ledger, "_file_at", wraps=getattr(ledger, "_file_at")) as file_reads,
-                          mock.patch.object(ledger, "_outside_search", wraps=getattr(ledger, "_outside_search")) as searches):
+                          mock.patch.object(ledger, "_outside_search", wraps=getattr(ledger, "_outside_search")) as searches,
+                          mock.patch.object(ledger, "_release_declaration_commit", side_effect=release_commit)):
                         setattr(tokens, "__wrapped__", tokenizer.__wrapped__)
                         tokens.attach_mock(mock.Mock(side_effect=tokenizer.cache_clear), "cache_clear")
                         _ = ledger.declaration_reading((finding_id,), lambda _: True)
+                    self.assertTrue(released)
                     self.assertEqual(lexical_reads.count(source), 1)
                     self.assertEqual(lexical_reads.count(target), 1)
                     coordinates = [cast(tuple[str, str], call.args) for call in file_reads.call_args_list]
