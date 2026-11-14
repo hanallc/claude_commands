@@ -1157,6 +1157,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
+            # No jobserver pool: a test step takes no live /dev/steve token.
+            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),

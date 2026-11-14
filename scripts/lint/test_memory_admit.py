@@ -47,7 +47,6 @@ from scripts.build_queue import admission_client as client, admission_protocol a
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
-from scripts.lint import nextest_budget as budget
 from scripts.lint.build_shape import BuildShape, CompiledCrates, build_shape
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, commit_config_fixture
 from scripts.buildlog import store
@@ -5284,7 +5283,9 @@ class QueueLeaveTests(unittest.TestCase):
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
-                            "LINT_CONFIG_READER": str(config)}
+                            "LINT_CONFIG_READER": str(config),
+                            # No jobserver pool unless a case makes one: test runs take no tokens.
+                            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}"}
         _ = self.environment.pop("LINT_QUEUE_LEAVE_HOOK", None)
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
@@ -5383,15 +5384,13 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(outputs[0][0], "Granted")
 
-    def test_nextest_helper_returns_the_status_and_drops_its_width_claim(self) -> None:
+    def test_nextest_helper_returns_the_status_when_it_leaves_the_queue(self) -> None:
         step = ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; touch "$2"; }; '
                 + 'run_nextest --workspace')
         result = self.run_step("exit 0", ":;", step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
-        # A run still waiting for memory claims no share, so it leaves no marker behind.
-        self.assertEqual(list((self.root / "log/admission/nextest").iterdir()), [])
         self.assertEqual(self.reservations(), [])
 
     def nextest_step(self, ran_args: Path, reservation: Path) -> str:
@@ -5399,38 +5398,36 @@ class QueueLeaveTests(unittest.TestCase):
                 + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"; }}; '
                 + 'run_nextest --workspace')
 
-    def test_a_run_waiting_for_memory_claims_its_share_only_once_admitted(self) -> None:
-        listing, ran_args, reservation = self.root / "listing", self.root / "args", self.root / "reservation"
-        free = (f'ls -A "$BUILDLOG_DIR/admission/nextest" >> "{listing}"; echo waited >> "{listing}"; '
+    def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
+        pool, calls = self.root / "pool", self.root / "cargo-calls"
+        ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
+        os.mkfifo(pool)
+        keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, keeper)
+        _ = os.write(keeper, bytes(6))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        _ = cargo.write_text("#!/usr/bin/env bash\n"
+            + '[[ "$*" == "nextest --version" ]] && exit 0\n'
+            + f'printf "%s\\n" "$*" >> "{calls}"\n'
+            + '[[ " $* " == *" --no-run "* ]] && exit 0\n'
+            + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
+        cargo.chmod(0o755)
+        self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
+        self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
+        free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
-        result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
+        step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
+        result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
-        self.assertEqual(listing.read_text().splitlines(), ["waited"])
-        width = os.sysconf("SC_NPROCESSORS_ONLN")
-        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(width)])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], width)
-        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
-
-    def test_an_admitted_run_shares_the_threads_with_a_run_in_flight(self) -> None:
-        width = os.sysconf("SC_NPROCESSORS_ONLN")
-        shared = budget.shared_width(width, 2)
-        if shared == width:
-            self.skipTest("this machine has too few cores to share")
-        ran_args, reservation = self.root / "args", self.root / "reservation"
-        markers = self.root / "log/admission/nextest"
-        markers.mkdir(parents=True)
-        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
-        with (markers / "other.run").open("a") as other:
-            fcntl.flock(other, fcntl.LOCK_EX)
-            result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout,
-            rf"(?m)^nextest: {shared} of {width} test threads; load \d+\.\d{{2}} on [1-9]\d* CPUs "
-            + r"\([^()\n]+\); shared with the runs in flight$")
-        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
-        self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+        # The memory wait comes before the build, and the build before the tokens.
+        self.assertEqual(waited.read_text().splitlines(), ["waited"])
+        self.assertEqual(calls.read_text().splitlines(), ["nextest run --no-run --workspace",
+                                                          "nextest run --test-threads 6 --workspace"])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 6)
+        self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
         ran_args, reservation = self.root / "args", self.root / "reservation"
