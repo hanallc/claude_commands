@@ -409,6 +409,22 @@ class NextItemTests(unittest.TestCase):
                          (0, "change: moved C434 to the end\n", ""))
         self.assertEqual(urgency.pinned(child_queue.name), "kid/C9")
 
+    def test_an_id_shows_that_change_row_or_one_line_for_a_verdict_or_no_list(self) -> None:
+        doc = self.attached_changes()["kid"]
+        earlier = change_review.list_file("kid")
+        _ = earlier.write_text(earlier.read_text() + "\n## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n"
+                               + "| C11 | Checked change | works | 2026-10-05 |\n")
+        queue = next_item.change_queue(doc)
+        code, output, error = run("show", "--id", "kid/C10", "--production", "kid")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines()[:3], ["change", "kid/C10 Urgent child change", "  How to check: Try urgent"])
+        self.assertEqual(run("show", "--id", "C1", "--production", "kid")[1].splitlines()[:2], ["change", "top/C1 Root-only change"])
+        self.assertEqual(run("show", "--id", "kid/C11", "--production", "kid"), (0, "kid/C11 has its verdict: works\n", ""))
+        self.assertEqual(run("show", "--id", "kid/C99", "--production", "kid"), (0, "kid/C99 is on no review list\n", ""))
+        self.assertEqual(run("show", "--id", "C99", "--production", "kid"), (0, "C99 is on no review list\n", ""))
+        # The row shown by its ID does not take the pin of the queue /next works through.
+        self.assertEqual(urgency.pinned(queue.name), "")
+
     def test_change_review_shows_the_earlier_row_pinned_by_next_and_the_same_queue_count(self) -> None:
         doc = self.attached_changes()["kid"]
         next_code, next_output, next_error = run("show", "--kind", "change", "--order", "oldest",

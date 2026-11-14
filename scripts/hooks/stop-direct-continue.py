@@ -6,6 +6,7 @@ Exit 2 sends the reason from stderr to the agent in a system-reminder.
 The guards permit declared waits, background tasks, and stops without context measurements.
 The hook wakes above the threshold only when the final line differs from the last wake.
 A merge gate with no open order phase has no next action, so it stops without a wake.
+A live detached run that the director owns sends its result later, so the director stops without a wake.
 Paused status lines permit the stop without a wake.
 Exceptions permit the stop without output.
 """
@@ -101,9 +102,14 @@ def main() -> None:
     ):
         return
 
-    # Only live tasks reported by the CLI supply a later request. A worker's
-    # heartbeat can be fresh even after its completion notice has arrived.
+    # Only live tasks reported by the CLI, or the director's own live detached
+    # runs, supply a later request. A worker's heartbeat can be fresh even after
+    # its completion notice has arrived.
     if pending_background_tasks(payload):
+        return
+    from scripts.agents.detached_runs import DETACHED_RUNS_DIR, live_runs_for_staff
+
+    if row is not None and live_runs_for_staff(session_dir / DETACHED_RUNS_DIR, frozenset({row.id})):
         return
 
     wake_line = session_dir / "compaction_wake_line"
