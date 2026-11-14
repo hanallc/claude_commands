@@ -40,8 +40,8 @@ NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
-# A rename of a Rust file at any place in an after, as in `After the moves, rename <a> to <b>.`
-ANY_FILE_RENAME = re.compile(rf"(?<![\w/.-])rename ({RUST_FILE}) to {RUST_FILE}", re.IGNORECASE)
+# A rename of a Rust file at any place in an after, as in `After the moves, rename <a> to <b>.`, with both paths.
+ANY_FILE_RENAME = re.compile(rf"(?<![\w/.-])rename ({RUST_FILE}) to ({RUST_FILE})", re.IGNORECASE)
 # Words after a file rename that name a second file pair: another change.
 SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
 # A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.

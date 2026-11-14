@@ -1742,6 +1742,33 @@ class FindingYield:
     read_commit: str
 
 
+@dataclass(frozen=True)
+class FindingModules:
+    """The files of a crate that a finding of a yield edits, each with its module, and the names that reach them: the
+    name of each module, and both names of each file that the finding renames."""
+
+    finding: HeldFinding
+    modules: tuple[tuple[str, tuple[str, ...]], ...]
+    names: frozenset[str]
+    renames: tuple[tuple[str, str], ...]
+
+
+# A Rust file path in a finding's after, as in `Move run_lock into lint/runtime/command.rs.`
+NAMED_RUST_FILE = re.compile(rf"(?<![\w/.-]){approved_renames.RUST_FILE}(?!\w)")
+
+
+def _named_files(tip: RepositoryTip, crate: str, text: str) -> tuple[str, ...]:
+    """The files of the tip that a Rust file path in an after names, read from the repository root, the crate folder
+    or its `src`, else each file of crate whose path ends with it; a file that is not there yet is a new file."""
+    for candidate in (text, f"{crate}/{text}", f"{crate}/src/{text}"):
+        if candidate in tip.blobs:
+            return (candidate,)
+    found = tuple(path for path in tip.rust_files if tip.crate(path) == crate and path.endswith("/" + text))
+    if found:
+        return found
+    return (text if text.startswith(crate + "/") else f"{crate}/{text}" if text.startswith("src/") else f"{crate}/src/{text}",)
+
+
 def _code_words(content: bytes | Folder | MissingFile) -> tuple[str, ...] | UnreadableCode:
     """The code words of a Rust file, each without its `r#`, with no comment. A missing file has none."""
     if not isinstance(content, bytes):
@@ -1756,20 +1783,98 @@ def _code_words(content: bytes | Folder | MissingFile) -> tuple[str, ...] | Unre
     return tuple(token.value.removeprefix("r#") for token in code)
 
 
-def _glob_sources(prefix: tuple[str, ...], home: style_footprint.CrateModule,
-                  inline: tuple[str, ...]) -> tuple[tuple[str, ...], ...] | style_footprint.UnresolvedPath:
+@dataclass(frozen=True)
+class ModuleReference:
+    """A word of a Rust file at a module position, and the modules of the crate that it can name: UnresolvedPath when
+    the scan cannot tell, as for a first path segment that a glob or an alias can bind."""
+
+    name: str
+    modules: frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath
+    index: int = -1
+
+
+def _path_modules(path: tuple[str, ...], scope: tuple[str, ...],
+                  bound: dict[str, frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath],
+                  open_bindings: bool, library: str | None) -> frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath:
+    """The modules of the crate that a path can name from scope. An anchored path resolves; any other path can start
+    at the crate's library name, at a child of scope, or at a name that a plain `use` binds."""
+    if path[0] in style_footprint.PATH_ANCHORS:
+        target = style_footprint.resolved_module(path, scope)
+        return target if isinstance(target, style_footprint.UnresolvedPath) else frozenset({target})
+    binding = bound.get(path[0], frozenset())
+    if isinstance(binding, style_footprint.UnresolvedPath) or (open_bindings and path[0] not in bound):
+        return style_footprint.UnresolvedPath()
+    named = (path[1:],) if library in (None, path[0]) else ()
+    return frozenset({(*scope, *path), *named, *((*module, *path[1:]) for module in binding)})
+
+
+def _module_references(words: tuple[str, ...], home: style_footprint.CrateModule,
+                       library: str | None) -> tuple[ModuleReference, ...]:
+    """Each word of a Rust file that can name a module, with the modules it can name: a segment of a `use` path, a
+    path segment next to `::`, and the name after `mod`. A word with none of these, such as a local `entry`, names a
+    value or a type. A path after a type, as in `<T>::name`, names an item of the type, not a module."""
+    uses = style_footprint.use_items(words)
+    in_uses = {index for use in uses for index in range(use.start, use.end)}
+    trees = style_footprint.use_trees(words, style_footprint.code_item_starts(words))
+    scopes = style_footprint.import_context(words).scopes
+    # A glob or an alias can bind a first path segment that no use path shows.
+    open_bindings = any(words[index] in {"*", "as"} for index in in_uses)
+    unknown = isinstance(home, style_footprint.OutsideCrate)
+    def scope(index: int) -> tuple[str, ...]:
+        inline = tuple(name.split("@")[0] for name in scopes[index].module)
+        return () if isinstance(home, style_footprint.OutsideCrate) else (*home, *inline)
+    def modules(path: tuple[str, ...], index: int,
+                bound: dict[str, frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath]
+                ) -> frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath:
+        return style_footprint.UnresolvedPath() if unknown else _path_modules(path, scope(index), bound, open_bindings, library)
+    used = {index: (*prefix, words[index]) for index, prefix in trees.prefixes.items()}
+    bound: dict[str, frozenset[tuple[str, ...]] | style_footprint.UnresolvedPath] = {}
+    for index, path in used.items():
+        if words[index + 1:index + 2] != ("::",):
+            found = modules(path, index, {})
+            known = bound.get(words[index], frozenset())
+            bound[words[index]] = (found if isinstance(known, frozenset) and isinstance(found, style_footprint.UnresolvedPath)
+                                   else known if isinstance(known, style_footprint.UnresolvedPath)
+                                   else known | cast(frozenset[tuple[str, ...]], found))
+    references = [ModuleReference(words[index], modules(path, index, bound), index) for index, path in used.items()]
+    for index, word in enumerate(words):
+        if index in in_uses or not style_footprint.IDENTIFIER.fullmatch(word):
+            continue
+        if words[index - 1:index] == ("mod",) and index:
+            references.append(ModuleReference(word, style_footprint.UnresolvedPath() if unknown
+                                              else frozenset({(*scope(index), word)}), index))
+            continue
+        if words[index + 1:index + 2] != ("::",) and (index < 1 or words[index - 1] != "::"):
+            continue
+        start = index
+        while start >= 2 and words[start - 1] == "::" and style_footprint.IDENTIFIER.fullmatch(words[start - 2]):
+            start -= 2
+        if start >= 1 and words[start - 1] == "::":
+            # A path after a type names an item; a path after a lone `::` starts at another crate.
+            if start >= 2 and words[start - 2] == ">":
+                continue
+            references.append(ModuleReference(word, style_footprint.UnresolvedPath(), index))
+            continue
+        references.append(ModuleReference(word, modules(words[start:index + 1:2], index, bound), index))
+    return tuple(references)
+
+
+def _glob_sources(prefix: tuple[str, ...], home: style_footprint.CrateModule, inline: tuple[str, ...],
+                  library: str | None) -> tuple[tuple[str, ...], ...] | style_footprint.UnresolvedPath:
     """The modules of the crate, as paths under `crate`, that a glob use with prefix can import from.
 
     In a module file of the crate, an anchored path resolves from the file's module and the inline modules around the
     glob; any other path can start at the crate's library name or at a child of that module. A file outside the crate
-    root folder is the root of another crate, so only a path from the library name reaches the crate.
+    root folder is the root of another crate, so only a path from the library name reaches the crate. With no library
+    name, any first segment can be it.
     """
     anchored = bool(prefix) and prefix[0] in style_footprint.PATH_ANCHORS
+    named = (prefix[1:],) if prefix and library in (None, prefix[0]) else ()
     if isinstance(home, style_footprint.OutsideCrate):
-        return () if anchored else (prefix[1:],)
+        return () if anchored else named
     scope = (*home, *inline)
     if not anchored:
-        return prefix[1:], (*scope, *prefix)
+        return *named, (*scope, *prefix)
     target = style_footprint.resolved_module(prefix, scope)
     return target if isinstance(target, style_footprint.UnresolvedPath) else (target,)
 
@@ -4086,11 +4191,12 @@ class Ledger:
     def _yield_couplings(self, commit: str, freed: tuple[HeldFinding, ...], kept: tuple[HeldFinding, ...]) -> tuple[str, ...]:
         """Why a kept finding can need a freed one to build, read at commit; none when it cannot.
 
-        A kept finding in a crate with no freed finding cannot. In a crate that holds both, each finding of the crate
-        must be a plain file rename (`file_rename`), and: no freed file names a kept module, by its old or new name;
-        no freed rename and kept rename share a new name, and neither takes the other's old name; and no file of the
-        crate, or file that the crate mounts from outside its folder, reaches a renamed module by a path that holds
-        none of its names (_hidden_module_paths).
+        A kept finding in a crate with no freed finding cannot. In a crate that holds both, each finding edits a set of
+        module files (_finding_modules), and for each freed and kept pair: no file that one edits names a module of the
+        other in a path, a `use` or a `mod` (_module_references), by its name or by either name of a file it renames; no
+        module of one holds a module of the other; and no two file renames share a new name, or take the other's old
+        name. No file of the crate, or file that the crate mounts from outside its folder, reaches a finding module by
+        a path that holds none of its names (_hidden_module_paths).
         """
         tip = self._tip(commit)
         shared = frozenset(tip.crate(finding.path) for finding in freed) & frozenset(tip.crate(finding.path) for finding in kept)
@@ -4139,62 +4245,151 @@ class Ledger:
                             file for file in tip.rust_files if file == reading or file.startswith(reading + "/"))
         return reasons, mounted
 
+    def _finding_modules(self, tip: RepositoryTip, crate: str, finding: HeldFinding) -> FindingModules | list[str]:
+        """The files of crate that finding edits, or why one is not a module file: its own file, its recorded needs,
+        each Rust file that its after names, and the new file of a file rename. A file of another crate is not read."""
+        root = PurePosixPath(crate) / "src"
+        moved = file_rename(finding.kind, finding.path, finding.after)
+        renames = (((moved.old, moved.new),) if isinstance(moved, FileRename) else
+                   tuple((match[1], match[2]) for match in approved_renames.ANY_FILE_RENAME.finditer(finding.after))
+                   if finding.kind == "rename" else ())
+        named = (path for match in NAMED_RUST_FILE.finditer(finding.after) for path in _named_files(tip, crate, match.group()))
+        moves = (moved.new,) if isinstance(moved, FileRename) else ()
+        files = dict.fromkeys((finding.path, *self.finding_needs(finding.finding_id), *named, *moves))
+        modules: list[tuple[str, tuple[str, ...]]] = []
+        reasons: list[str] = []
+        for path in (path for path in files if tip.crate(path) == crate):
+            module = style_footprint.crate_module(path, root)
+            if isinstance(module, style_footprint.OutsideCrate):
+                reasons.append(f"{path} is not a module file of {crate}")
+            else:
+                modules.append((path, module))
+        if reasons:
+            return reasons
+        names = {module[-1] for _, module in modules if module} | {_module_name(path) for pair in renames for path in pair}
+        stems = tuple((_module_name(old), _module_name(new)) for old, new in renames)
+        return FindingModules(finding, tuple(modules), frozenset(names), stems)
+
     def _crate_couplings(self, commit: str, crate: str, freed: tuple[HeldFinding, ...],
                          kept: tuple[HeldFinding, ...], mounted: tuple[str, ...]) -> list[str]:
-        moves = {finding.finding_id: file_rename(finding.kind, finding.path, finding.after) for finding in (*freed, *kept)}
-        renames = {finding_id: moved for finding_id, moved in moves.items() if isinstance(moved, FileRename)}
-        if len(renames) < len(moves):
-            return [f"{finding_id} is not a file rename, and {crate} holds a freed and a kept finding"
-                    for finding_id in moves if finding_id not in renames]
+        tip = self._tip(commit)
         reasons: list[str] = []
-        for finding in freed:
-            yielded = renames[finding.finding_id]
-            words = _code_words(self._commit_file(commit, finding.path))
-            for other in kept:
-                moved = renames[other.finding_id]
-                names = {moved.old_stem, moved.new_stem}
-                if isinstance(words, UnreadableCode):
-                    reasons.append(f"{finding.path} does not tokenize")
-                else:
-                    reasons += [f"{finding.path} names {name}, a module that {other.finding_id} renames"
-                                for name in sorted(names & set(words))]
-                shared = ({yielded.new_stem} & names) | ({moved.new_stem} & {yielded.old_stem})
-                reasons += [f"{finding.finding_id} and {other.finding_id} both rename to or from {name}" for name in sorted(shared)]
-        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()), mounted)
+        modules: dict[str, FindingModules] = {}
+        for finding in (*freed, *kept):
+            read = self._finding_modules(tip, crate, finding)
+            if isinstance(read, FindingModules):
+                modules[finding.finding_id] = read
+            else:
+                reasons += read
+        homes = dict(pair for item in modules.values() for pair in item.modules)
+        library = self._library_name(commit, crate)
+        hidden, exports = self._hidden_module_paths(commit, crate, tuple(modules.values()), mounted)
+        words = {path: _code_words(self._commit_file(commit, path)) for path in homes}
+        # An unreadable file can name any module.
+        references = {path: tuple(ModuleReference(name, style_footprint.UnresolvedPath()) for name in
+                                  {name for item in modules.values() for name in item.names})
+                      if isinstance(read, UnreadableCode) else _module_references(read, homes[path], library)
+                      for path, read in words.items()}
+        for yielded in (modules[finding.finding_id] for finding in freed if finding.finding_id in modules):
+            for still in (modules[finding.finding_id] for finding in kept if finding.finding_id in modules):
+                for one, other in ((yielded, still), (still, yielded)):
+                    renamed = {name for pair in other.renames for name in pair}
+                    targets = {module for _, module in other.modules if module}
+                    # A name with no module path, such as a name in a rename's after, counts by name alone.
+                    loose = other.names - {target[-1] for target in targets}
+                    for path, _ in one.modules:
+                        found = sorted({reference.name for reference in references[path] if reference.name in loose or any(
+                            reference.name == target[-1] and (isinstance(reference.modules, style_footprint.UnresolvedPath)
+                                                              or target in reference.modules) for target in targets)})
+                        reasons += [f"{path} names {name}, a module that {other.finding.finding_id} "
+                                    + ("renames" if name in renamed else "changes") for name in found]
+                        # A public use gives an item of a module a second path that holds no module name.
+                        read = words[path]
+                        reasons += [f"{path} names {leaf}, which {source} re-exports from {'::'.join(target)}"
+                                    for target in sorted(targets) for leaf, source in dict.fromkeys(exports.get(target, ()))
+                                    if isinstance(read, UnreadableCode) or leaf in read]
+                # A path through `super` or `crate` reaches an enclosing module with none of its names.
+                reasons += [f"{first} and {second} are modules where one holds the other"
+                            for first, outer in yielded.modules for second, inner in still.modules
+                            if outer[:len(inner)] == inner or inner[:len(outer)] == outer]
+                shared = {name for old, new in yielded.renames for other_old, other_new in still.renames
+                          for name in ({new} & {other_old, other_new}) | ({other_new} & {old})}
+                reasons += [f"{yielded.finding.finding_id} and {still.finding.finding_id} both rename to or from {name}"
+                            for name in sorted(shared)]
+        return reasons + hidden
 
-    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...],
-                             mounted: tuple[str, ...]) -> list[str]:
+    def _library_name(self, commit: str, crate: str) -> str | None:
+        """The crate's library name, which a path of the crate can start with; None when the manifest does not read."""
+        manifest = self._commit_file(commit, str(PurePosixPath(crate) / "Cargo.toml"))
+        if not isinstance(manifest, bytes):
+            return None
+        try:
+            return style_footprint.library_name(_table(tomllib.loads(manifest.decode())))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return None
+
+    def _hidden_module_paths(self, commit: str, crate: str, modules: tuple[FindingModules, ...],
+                             mounted: tuple[str, ...]) -> tuple[list[str], dict[tuple[str, ...], list[tuple[str, str]]]]:
         """Why a file of the crate, or a file in mounted that the crate mounts from outside its folder, can reach a
-        renamed module by a path that holds none of its names.
+        finding module by a path that holds none of its names, and the names that a public use gives each module's
+        items: for each module path, each exported name with the file that exports it.
 
-        A public use of a module name re-exports it, a glob use of a renamed module's parent imports its name, and an
-        `include`, `macro_rules` or `macro` word can build a path that no scan reads. Modules come from the folder
-        layout under `src` (style_footprint.crate_module), and each file of the crate must tokenize.
+        A public use that names a module re-exports its items by their own names or by their aliases. A public glob
+        use of a module refuses, since the scan cannot list what it exports; so does a public glob use of a finding
+        module's parent, which re-exports the module's name. A private glob use changes only the names of its own
+        file, and an edited file's own globs leave its paths to match by name (`_module_references`). An `include!`
+        reads a file that no scan reads, and a `macro_rules` or `macro` item that holds a module name can put that
+        name in a file that does not hold it. Modules come from the folder layout under `src`
+        (style_footprint.crate_module), and each file of the crate must tokenize.
         """
         root = PurePosixPath(crate) / "src"
+        library = self._library_name(commit, crate)
         reasons: list[str] = []
-        parents: set[tuple[str, ...]] = set()
-        for moved in renames:
-            module = style_footprint.crate_module(moved.old, root)
-            if isinstance(module, style_footprint.OutsideCrate):
-                reasons.append(f"{moved.old} is not a module file of {crate}")
-            else:
-                parents.add(module[:-1])
-        names = {name for moved in renames for name in (moved.old_stem, moved.new_stem)}
+        exports: dict[tuple[str, ...], list[tuple[str, str]]] = {}
+        targets = {module for item in modules for _, module in item.modules if module}
+        parents = {module[:-1] for module in targets}
+        names = {name for item in modules for name in item.names}
         tip = self._tip(commit)
         for path in (*(path for path in tip.rust_files if tip.crate(path) == crate), *mounted):
             words = _code_words(self._commit_file(commit, path))
             if isinstance(words, UnreadableCode):
                 reasons.append(f"{path} does not tokenize")
                 continue
-            reasons += [f"{path} holds {word}" for word in sorted(style_footprint.UNREAD_CODE_WORDS & set(words))]
             uses = style_footprint.use_items(words)
-            reasons += [f"{path} re-exports {name}" for use in uses if "pub" in words[use.start:use.end]
-                        for name in sorted(names & set(words[use.start:use.end]))]
+            in_uses = {index for use in uses for index in range(use.start, use.end)}
+            # A macro builds its output from its own words, so only a macro that holds a module name can carry it. An
+            # `include` reads a file as a macro call, or as the name of one in a `use`; a field named include does not.
+            included = any(word == "include" and (words[index + 1:index + 2] == ("!",) or index in in_uses)
+                           for index, word in enumerate(words))
+            reasons += [f"{path} holds {word}" for word in sorted(style_footprint.UNREAD_CODE_WORDS & set(words))
+                        if (word == "include" and included) or (word != "include" and names & set(words))]
             trees = style_footprint.use_trees(words, style_footprint.code_item_starts(words))
-            if any(words[index] == "*" and index not in trees.prefixes for use in uses for index in range(use.start, use.end)):
+            public = [use for use in uses if "pub" in words[use.start:use.end]]
+            for use in public:
+                named = sorted(names & set(words[use.start:use.end]))
+                if not named:
+                    continue
+                leaves = [index for index in range(use.start, use.end) if index in trees.prefixes
+                          and words[index + 1:index + 2] != ("::",)]
+                if not leaves or any(words[index] == "*" for index in leaves):
+                    reasons += [f"{path} re-exports {name} by a use that the scan cannot list" for name in named]
+                    continue
+                # `self` in a group exports the module above it by that module's own name.
+                exported = {words[index + 2] if words[index + 1:index + 2] == ("as",)
+                            else trees.prefixes[index][-1] if words[index] == "self" and trees.prefixes[index]
+                            else words[index] for index in leaves}
+                # A use path reaches a finding module when it resolves to that module's path, or when the scan cannot
+                # resolve it and the last word is the module's name.
+                references = [reference for reference in _module_references(words, style_footprint.crate_module(path, root),
+                                                                           library) if use.start <= reference.index < use.end]
+                for target in sorted(target for target in targets for reference in references if reference.name == target[-1]
+                                     and (isinstance(reference.modules, style_footprint.UnresolvedPath)
+                                          or target in reference.modules)):
+                    exports.setdefault(target, []).extend((leaf, path) for leaf in sorted(exported))
+            if any(words[index] == "*" and index not in trees.prefixes for use in public for index in range(use.start, use.end)):
                 reasons.append(f"{path} holds a glob use that the scan cannot read")
-            globs = [index for index in trees.prefixes if words[index] == "*"]
+            globs = [index for use in public for index in range(use.start, use.end)
+                     if index in trees.prefixes and words[index] == "*"]
             if not globs:
                 continue
             if path in mounted:
@@ -4204,12 +4399,13 @@ class Ledger:
             home = style_footprint.crate_module(path, root)
             scopes = style_footprint.import_context(words).scopes
             for index in globs:
-                sources = _glob_sources(trees.prefixes[index], home, tuple(name.split("@")[0] for name in scopes[index].module))
+                sources = _glob_sources(trees.prefixes[index], home, tuple(name.split("@")[0] for name in scopes[index].module),
+                                        library)
                 if isinstance(sources, style_footprint.UnresolvedPath):
                     reasons.append(f"{path} holds a glob use that the scan cannot resolve")
                 else:
                     reasons += [f"{path} glob-imports {'::'.join(('crate', *source))}" for source in sources if source in parents]
-        return reasons
+        return reasons, exports
 
     @_ticket_operation("widen")
     def ticket_widen(self, id: str, paths: tuple[str, ...], reason: str, by: str,

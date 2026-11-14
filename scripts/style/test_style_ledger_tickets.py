@@ -2438,6 +2438,54 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         kept, freed, _ = self.yield_proposal(self.kept_rename, self.freed_rename, {**self.yield_files, **mounts})
         self.assertEqual(self.ledger().ticket_yield("7001", self.freed_rename[0]), (freed,))
         self.assertEqual(self.ledger().ticket_open(ticket_owner_id("proposal"))[0]["finding_ids"], [kept])
+        # Each row refused while every finding of a shared crate had to be a file rename, every macro refused, and a
+        # module name refused wherever it stood.
+        cases: tuple[tuple[str, tuple[str, str, str, str], tuple[str, str, str, str], dict[str, str]], ...] = (
+            # Neither a.rs nor b.rs names the other's module, so the variant rename in b.rs cannot reach a.rs.
+            ("a qualified rename beside a file rename", self.kept_rename,
+             ("crates/alpha/src/b.rs", "rename", "Shape::Round", "Shape::Square"), {}),
+            # A macro builds its output from its own words, and these hold no module name.
+            ("a macro_rules item that names no finding module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "macro_rules! made { () => {} }\n"}),
+            # Two type changes in sibling files that do not name each other's module.
+            ("two type changes in files that do not name each other",
+             ("crates/alpha/src/a.rs", "type", "u32", "u64"), ("crates/alpha/src/b.rs", "type", "u32", "u64"), {}),
+            # A restructure of a.rs edits only a.rs, and neither a.rs nor b.rs names the other's module.
+            ("a restructure in the shared crate", ("crates/alpha/src/a.rs", "restructure", "a", "Split a.rs"),
+             self.freed_rename, {}),
+            # A function named first is not the module first: no path, `use` or `mod` names it.
+            ("the yielded file holds a function with the kept new name", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/b.rs": "pub fn first() {}\n"}),
+            # A local variable b is a value, not the module b.
+            ("the kept file holds a local with the yielded module name", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/a.rs": "pub fn alpha() { let b = 1; let _ = b; }\n"}),
+            # lib.rs re-exports alpha from a, and b.rs does not name alpha, so the re-export cannot reach b.rs.
+            ("a public use of a renamed module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/lib.rs": "mod a; mod b; mod c; mod other;\npub use a::alpha;\n"}),
+            # A private glob use changes only the names of other.rs, and no finding edits other.rs.
+            ("a glob use of the renamed modules' parent", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "use super::*;\n"}),
+            # helper.rs re-exports alpha from a, and b.rs does not name alpha.
+            ("a file that the shared crate mounts re-exports a renamed module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
+              "crates/beta/src/helper.rs": "pub use crate::a::alpha;\n"}),
+            # A private glob use in a mounted file changes only that file's names.
+            ("a file that the shared crate mounts holds a glob use", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
+              "crates/beta/src/helper.rs": "use crate::*;\n"}),
+            # A field named include is not the include! macro, so it reads no other file.
+            ("a field named include", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "pub struct Filter { pub include: bool }\n"}),
+            # The path crate::other::b names the module other::b, not the module b that the yield renames.
+            ("the kept file names another module with the same last name", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/a.rs": "pub fn alpha() { crate::other::b::run() }\n"}),
+        )
+        for name, kept_case, freed_case, files in cases:
+            with self.subTest(name):
+                self.setUp()
+                kept, freed, _ = self.yield_proposal(kept_case, freed_case, {**self.yield_files, **files})
+                self.assertEqual(self.ledger().ticket_yield("7001", freed_case[0]), (freed,))
+                self.assertEqual(self.ledger().ticket_open(ticket_owner_id("proposal"))[0]["finding_ids"], [kept])
 
     def test_a_proposal_yield_refuses_a_kept_finding_that_can_need_the_yielded_one(self) -> None:
         library = "crates/alpha/src/lib.rs"
@@ -2448,14 +2496,26 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         cases: tuple[tuple[str, tuple[str, str, str, str], tuple[str, str, str, str], dict[str, str], str], ...] = (
             ("a re-export carries the yielded type", ("crates/alpha/src/consumer.rs", "type", "pub fn take() -> u32", "u64"),
              ("crates/alpha/src/producer.rs", "type", "pub fn make() -> u32", "u64"), reexport,
-             "{kept} is not a file rename, and crates/alpha holds a freed and a kept finding"),
-            ("a qualified rename beside a file rename", self.kept_rename, qualified, {},
-             "{freed} is not a file rename, and crates/alpha holds a freed and a kept finding"),
+             f"crates/alpha/src/consumer.rs names make, which {library} re-exports from producer"),
+            ("the kept file names the module of a qualified rename", self.kept_rename, qualified,
+             {"crates/alpha/src/a.rs": "pub fn alpha() { let _ = crate::b::Shape::Round; }\n"},
+             "crates/alpha/src/a.rs names b, a module that {freed} changes"),
+            ("the yielded file names the kept module of a type change", ("crates/alpha/src/a.rs", "type", "u32", "u64"),
+             ("crates/alpha/src/b.rs", "type", "u32", "u64"), {"crates/alpha/src/b.rs": "pub fn beta() { crate::a::alpha() }\n"},
+             "crates/alpha/src/b.rs names a, a module that {kept} changes"),
+            ("the yielded module is inside the kept module", ("crates/alpha/src/a.rs", "type", "u32", "u64"),
+             ("crates/alpha/src/a/inner.rs", "type", "u32", "u64"),
+             {"crates/alpha/src/a/inner.rs": "pub fn inner() { super::alpha() }\n"},
+             "crates/alpha/src/a/inner.rs and crates/alpha/src/a.rs are modules where one holds the other"),
+            ("a restructure that moves code into the yielded file",
+             ("crates/alpha/src/a.rs", "restructure", "a", "Move alpha into src/b.rs"), self.freed_rename, {},
+             "crates/alpha/src/b.rs and crates/alpha/src/b.rs are modules where one holds the other"),
             ("the yielded file names the kept old module", self.kept_rename, self.freed_rename,
              {"crates/alpha/src/b.rs": "pub fn beta() { crate::a::alpha() }\n"},
              "crates/alpha/src/b.rs names a, a module that {kept} renames"),
             ("the yielded file names the kept new module", self.kept_rename, self.freed_rename,
-             {"crates/alpha/src/b.rs": "pub fn first() {}\n"}, "crates/alpha/src/b.rs names first, a module that {kept} renames"),
+             {"crates/alpha/src/b.rs": "pub fn beta() { crate::first::alpha() }\n"},
+             "crates/alpha/src/b.rs names first, a module that {kept} renames"),
             ("one new name", self.kept_rename, (*self.freed_rename[:3], "Rename src/b.rs to src/first.rs"), {},
              "{freed} and {kept} both rename to or from first"),
             ("the yielded new name is the kept old name", self.kept_rename,
@@ -2463,11 +2523,14 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             ("the kept new name is the yielded old name", (*self.kept_rename[:3], "Rename src/a.rs to src/b.rs"),
              self.freed_rename, {}, "{freed} and {kept} both rename to or from b"),
             ("a public use of a renamed module", self.kept_rename, self.freed_rename,
-             {library: "mod a; mod b; mod c; mod other;\npub use a::alpha;\n"}, f"{library} re-exports a"),
-            ("a glob use of the renamed modules' parent", self.kept_rename, self.freed_rename,
-             {"crates/alpha/src/other.rs": "use super::*;\n"}, "crates/alpha/src/other.rs glob-imports crate"),
-            ("a macro_rules item", self.kept_rename, self.freed_rename,
-             {"crates/alpha/src/c.rs": "macro_rules! made { () => {} }\n"}, "crates/alpha/src/c.rs holds macro_rules"),
+             {library: "mod a; mod b; mod c; mod other;\npub use a::alpha;\n",
+              "crates/alpha/src/b.rs": "pub fn beta() { crate::alpha() }\n"},
+             f"crates/alpha/src/b.rs names alpha, which {library} re-exports from a"),
+            ("a public glob use of the renamed modules' parent", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "pub use super::*;\n"}, "crates/alpha/src/other.rs glob-imports crate"),
+            ("a macro_rules item that names a renamed module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "macro_rules! made { () => { crate::a::alpha() } }\n"},
+             "crates/alpha/src/c.rs holds macro_rules"),
             ("an include call", self.kept_rename, self.freed_rename,
              {"crates/alpha/src/c.rs": "include!(\"made.rs\");\n"}, "crates/alpha/src/c.rs holds include"),
             ("a path attribute mounts the yielded file into the kept crate",
@@ -2508,10 +2571,12 @@ class StyleLedgerTicketsTests(LedgerTestCase):
              "crates/alpha/src/consumer.rs mounts crates/beta/src/helper.rs, a file outside crates/alpha"),
             ("a file that the shared crate mounts re-exports a renamed module", self.kept_rename, self.freed_rename,
              {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
-              "crates/beta/src/helper.rs": "pub use crate::a::alpha;\n"}, "crates/beta/src/helper.rs re-exports a"),
-            ("a file that the shared crate mounts holds a glob use", self.kept_rename, self.freed_rename,
+              "crates/beta/src/helper.rs": "pub use crate::a::alpha;\n",
+              "crates/alpha/src/b.rs": "pub fn beta() { crate::other::helper::alpha() }\n"},
+             "crates/alpha/src/b.rs names alpha, which crates/beta/src/helper.rs re-exports from a"),
+            ("a file that the shared crate mounts holds a public glob use", self.kept_rename, self.freed_rename,
              {"crates/alpha/src/other.rs": "#[path = \"../../beta/src/helper.rs\"]\nmod helper;\n",
-              "crates/beta/src/helper.rs": "use crate::*;\n"},
+              "crates/beta/src/helper.rs": "pub use crate::*;\n"},
              "crates/beta/src/helper.rs holds a glob use that the scan cannot resolve"),
             ("a path attribute leaves the repository", self.kept_rename, self.freed_rename,
              {library: "mod a; mod b; mod c; mod other;\n#[path = \"../../../../outside.rs\"]\nmod outside;\n"},
@@ -2539,7 +2604,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
 
     def test_a_proposal_yield_reads_again_when_the_synced_tip_moves_before_its_lock(self) -> None:
         _ = self.yield_proposal(self.kept_rename, self.freed_rename, self.yield_files)
-        self.write("crates/alpha/src/c.rs", "macro_rules! made { () => {} }\n")
+        self.write("crates/alpha/src/c.rs", "macro_rules! made { () => { crate::a::alpha() } }\n")
         moved = self.commit("Add a macro")
         ledger = self.ledger()
         read = style_ledger.Ledger._yielded_findings  # pyright: ignore[reportPrivateUsage]
