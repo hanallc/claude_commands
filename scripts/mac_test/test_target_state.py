@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from scripts.mac_test import eligibility, mac_test, offload
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session as session_owner
     from scripts.buildlog import record, store
     from scripts.message import sessions
     from scripts.lint.memory_test_support import write_config_fixture, config_environment
@@ -36,6 +37,7 @@ else:
     from scripts.mac_test import eligibility, mac_test, offload
     from scripts.build_targets import targets
     from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session as session_owner
     from scripts.buildlog import record
     from scripts.buildlog import store
     from scripts.message import sessions
@@ -117,7 +119,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("fake-start")))
         _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
                                               return_value=eligibility.KnownRepository("project")))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(mock.patch.object(mac_test, "start_watcher"))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))

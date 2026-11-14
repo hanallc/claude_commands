@@ -36,7 +36,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -401,7 +401,7 @@ class OffloadCommandFixture(unittest.TestCase):
         source = (placement.SourceKeyKnown(source_key) if source_key is not None
                   else placement.SourceKeyUnavailable("the fixture has no tree key"))
         constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
-            build_hold.owning_session(self.environment if environment is None else environment),
+            session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
         request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
             local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)

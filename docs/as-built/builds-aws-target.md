@@ -638,6 +638,12 @@ The live read never writes `spot-prices.json`.
 `launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
 Resumed launches keep the saved ranking and evidence without another live read.
+Placement does not try a type and region whose median box time, boot included, is above `max_gate_minutes=12`.
+The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
+The median uses the type's runs in that region, or its runs in all regions when the region has none.
+A type without runs is tried; `lifetime_minutes` is not a measurement.
+Each skip prints `Cloud gate skips <type> in <region>`.
+When every variant is skipped, the gate falls back to natedev before a launch.
 Available variants precede variants under a capacity cooldown.
 Within each group, variants with a current price come first, ranked by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".
