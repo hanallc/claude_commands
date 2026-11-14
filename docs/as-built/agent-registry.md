@@ -64,10 +64,12 @@ A Claude launch turns that word into the newest model of the family; see [Claude
 ### Registry publication
 
 `store_registry(registry, before, after, description, *, additive_catalog=False)` owns every registry publication.
-It replays the changed rows against the latest text under an exclusive writer lock.
+It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
-It returns the published text while it still holds the lock.
-The `store` command builds `configuration_shell` from that text without a second read.
+The live write never waits for the main push lock, so the new value is in effect at once.
+Publication follows the write. A failed publication keeps the rows live and fails with `the rows are live; main does not have them yet`, as `/tune` exits 2 after its live write.
+The notes timer then publishes them through `publish_pending`.
+It returns the live text after publication. The `store` command builds `configuration_shell` from that text without a second read.
 
 Publication applies only to the real registry under the Git root of `~/.claude`.
 `MODELS_CONFIG_PUBLISH=0` disables publication.
@@ -76,21 +78,21 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) before the registry writer lock.
+Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock), after the live write, before the registry writer lock.
 The hold covers fetch, row replay, commit, push retries, and local reconciliation.
 Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
-The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses before any write, so a push never carries another commit.
+The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses publication, so a push never carries another commit.
 The writer stages, commits, stashes, resets, or rebases no other path.
 
 A rejected push fetches and replays the same row changes, for at most three attempts.
 Repeating an interrupted edit publishes all pending local rows, even when the requested value already matches. Recovery recognizes an accepted push without another commit.
 Pending rows replay onto the fetched registry, so a registry commit from another writer does not block them.
 
-`MODELS_CONFIG_PUBLISH=later` writes the shared registry at once under only the registry writer lock.
-It takes no main push lock, so a landing that holds main never delays the edit.
+`MODELS_CONFIG_PUBLISH=later` writes the shared registry live and skips the publication.
+It never waits for main, so a landing that holds main never delays the caller.
 The quota alert's `edit_registry` uses this mode for its role routing.
 `sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
