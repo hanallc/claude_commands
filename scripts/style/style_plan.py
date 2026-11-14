@@ -39,6 +39,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.copies import copies
 from scripts.direct import phase_reservation
 from scripts.lib import berth_board
+from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
 from scripts.style import coverage_report
@@ -1902,11 +1903,13 @@ class RefillCells:
     """The cells one refill weighs.
 
     Ranking and structure blocking read every cell in cells. No ticket takes a cell in judged_at_base: it is one of
-    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it.
+    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it. No ticket takes a
+    cell at a path in absent_at_base: a commit after the synced tip deleted its file, so the unit tip has no file there.
     """
 
     cells: tuple[style_ledger.Cell, ...]
     judged_at_base: frozenset[style_ledger.Cell]
+    absent_at_base: frozenset[str]
     # The files where the unit's family waits for a family ranked above it; no ticket takes a cell at one.
     waits: Mapping[str, style_proposals.RankWait]
 
@@ -2102,8 +2105,12 @@ def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, .
         context = RefillContext(ledger)
     result = context.eligible_cells(cells, definitions)
     own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))
-    judged = ledger.judged_at_base(own, base.commit) if isinstance(base, UnitBranchTip) else ()
-    return RefillCells(result, frozenset(judged), waits)
+    if not isinstance(base, UnitBranchTip):
+        return RefillCells(result, frozenset(), frozenset(), waits)
+    # Three dots diff from the merge base, so only commits on the unit tip after the synced tip count as deletes.
+    absent = git(ledger.repo, "diff", "-z", "--no-renames", "--name-only", "--diff-filter=D",
+                 f"{synced_tip(ledger)}...{base.commit}").split("\0")
+    return RefillCells(result, frozenset(ledger.judged_at_base(own, base.commit)), frozenset(filter(None, absent)), waits)
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
@@ -2155,7 +2162,8 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
         if structure:
             if family == "modules":
                 manifest = str(PurePosixPath(crate) / "Cargo.toml")
-                ticketed = tuple(cell for cell in structure if cell not in refill.judged_at_base)
+                ticketed = tuple(cell for cell in structure
+                                 if cell not in refill.judged_at_base and cell.path not in refill.absent_at_base)
                 manifest_cells = tuple(cell for cell in ticketed if cell.path == crate)
                 file_cells = tuple(cell for cell in ticketed if cell.path != crate)
                 available = {cell.path for cell in file_cells}
@@ -2175,7 +2183,8 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
                 continue
         own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
-                    and cell not in refill.judged_at_base and cell.path not in refill.waits
+                    and cell not in refill.judged_at_base and cell.path not in refill.absent_at_base
+                    and cell.path not in refill.waits
                     and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
@@ -3675,9 +3684,12 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
                      "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket_id])
     if passed.get("status") not in ("active", "completed"):
-        commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
-                     "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
-                     "--cwd", str(worktree), "--paths", str(paths)])
+        if quota_state.no_worker_mode():
+            print(f"{slot}: {quota_state.NO_WORKER_START}")
+        else:
+            commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
+                             "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
+                             "--cwd", str(worktree), "--paths", str(paths)])
     for command in commands:
         result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
         if result.returncode:

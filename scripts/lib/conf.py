@@ -254,6 +254,11 @@ def _parse(source: str) -> dict[str, Setting]:
     return settings
 
 
+def settings(source: str) -> dict[str, Setting]:
+    """Return each stored key of a config text, with its first value and line."""
+    return _parse(source)
+
+
 def _setting(settings: dict[str, Setting], key: str) -> Setting:
     host = socket.gethostname().split(".", 1)[0]
     for candidate in (f"{key}.{host}", key):

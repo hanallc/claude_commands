@@ -73,7 +73,7 @@ RemoteControlOutcome = SessionGone | AlreadyOn | TurnedOn | Failed
 @dataclass(frozen=True)
 class ConfirmedSession:
     record: sessions.SessionRecord
-    idle: bool
+    at_prompt: bool
     active: bool
 
 
@@ -150,7 +150,7 @@ def _observe(session_id: str, pid: int, proc_start: str) -> ConfirmedSession | R
     if fields.get("pid") != pid or fields.get("sessionId") != session_id or fields.get("procStart") != proc_start:
         return SessionGone()
     bridge = fields.get("bridgeSessionId")
-    return ConfirmedSession(record, fields.get("status") == "idle", isinstance(bridge, str) and bool(bridge))
+    return ConfirmedSession(record, fields.get("status") in sessions.INPUT_STATUSES, isinstance(bridge, str) and bool(bridge))
 
 
 def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteControlOutcome:
@@ -199,14 +199,14 @@ def _fix(session_id: str, pid: int, proc_start: str, clock: Clock) -> RemoteCont
             if not missing_bridge_reported and now >= attempt_until:
                 if attempts >= ATTEMPTS:
                     return failed(f"Remote Control did not become active after {ATTEMPTS} attempts")
-                # Resolve the session's own pane, then recheck identity and idle
+                # Resolve the session's own pane, then recheck identity and prompt
                 # status immediately before the only authorized input.
                 observed = _observe(session_id, pid, proc_start)
                 if isinstance(observed, SessionGone):
                     return observed
                 if isinstance(observed, ConfirmedSession) and observed.active:
                     return TurnedOn() if attempts else AlreadyOn()
-                if isinstance(observed, ConfirmedSession) and observed.idle:
+                if isinstance(observed, ConfirmedSession) and observed.at_prompt:
                     if clock.monotonic() >= deadline:
                         return failed("Remote Control did not become active before the deadline")
                     try:

@@ -433,27 +433,29 @@ It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
 The gate sends no red result push.
 `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
-The record holds the branch, tree, finish time, failure lines, receipt time, assignment, and push acceptance.
+The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 The notice names the failed test files and includes the result ID.
 After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
-The command requires a unit director under sdlc.
-`UNIT` accepts the staff ID or the unit name.
+The command accepts a unit director of any production.
+`UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
 The push places the receipt and assignment status before the failure list.
 The phone retains that status when it truncates a long failure list.
 A rerun prints `unchanged` after the sender accepts the push.
-`merge_gate.py nightly-check` sends `nightly.unassigned` when an unassigned result reaches its deadline.
-`nightly_assign_minutes=30` sets that deadline in `config/merge_gate.conf`.
+Only `nightly-assigned` sends the user push, and the push names the assignee.
+An unassigned red result never sends a user push.
+`merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
+The alert repeats once in each later deadline window until the fix is assigned.
+`nightly_assign_minutes=30` sets that window in `config/merge_gate.conf`.
+The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
+A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
-The fallback push states that sdlc has not assigned the fix yet.
-It reports an unconfirmed receipt when the sdlc notice failed.
-Assignment and fallback use the same file lock and push acceptance state.
-An assignment after a fallback push records the unit without another push.
-A failed send keeps the result pending for the next periodic check.
+Assignment and the check use the same file lock.
+A failed push keeps the result pending; run `nightly-assigned` again to send it.
 Each red result uses the key `nightly-result:<id>`.
 The sender suppresses a second accepted push for the complete `datetime` range.
 This also prevents another push when the gate cannot save its acceptance state.
@@ -645,8 +647,9 @@ A failed Mac advance names the published local commit and leaves retry to main s
 - **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
   The `claude-sync` job runs every 15 minutes on both machines.
   It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  A `config/*.conf` edit that changes only setting values is a waiting row, not a tracked edit; the advance keeps it live.
   An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
-  It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
+  It removes those untracked files, restores those tracked files to HEAD, then advances with `waiting_rows.move_to`.
   A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
   An untracked path that collides with a path origin/main adds also blocks as `dirty`: `dir` blocks an incoming `dir/file`, and `dir/file` blocks an incoming file `dir`.
   The `dirty` detail names each path that blocks the update, or the last line of each git output stream when git cannot list them.
@@ -684,17 +687,22 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
-2. Check each item and make its own merge commit.
-3. Test all code paths changed from the published merge branch tip through HEAD once.
-4. Use one `tested_main_push` hold, one push, and one local promotion.
-5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+1. Take the production merge lock once.
+2. Resume each item that the merge branch already contains through the single command's route, in file order.
+3. Retain the starting tip and whether a merge is unfinished.
+4. Check each remaining item and make its own merge commit.
+5. Test all code paths changed from the published merge branch tip through HEAD once.
+6. Use one `tested_main_push` hold, one push, and one local promotion.
+7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
+A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
-Those paths still select tests when only shrink or as-built items remain.
+An interrupted batch's merged item retests its unpublished paths when it resumes.
+A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
@@ -730,7 +738,7 @@ Full tests, probes, main retests, and all retries append to that log.
 The search restores the starting tip and drops the causing item and that unit's later items.
 A cancelled probe or another non-red stop drops every candidate with that stop.
 A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-Already-merged items receive `resume it alone with the single command`.
+A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
 The push start is the boundary for drop, reset, and retry.
 Once the push starts, a failure drops no items and starts no batch reset or retry.
 Only `push_rollback` can undo a failed push after it checks the live origin.
@@ -738,7 +746,8 @@ Each item receives the stop report.
 
 `test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows include a shrink-only retry.
+The interruption rows resume the merged item alone, including a shrink-only batch.
+The rerun row resumes the promotion of two pushed items and then lands a new item.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
 They also land a clean item after two holds and remove a held unit's later item.
 The history rows merge closing items for an older plan after the configured plan changes.
