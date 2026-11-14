@@ -304,7 +304,7 @@ class ControlTests(CostFixture):
                 self.assertEqual(deploy.main(), 0)
         self.assertIn('Spot prices (USD/h; lowest zone)', output.getvalue())
         # The price table splits its region columns to fit; the cost per run tables below it do not split.
-        self.assertTrue(all(len(line) <= 50 for line in table.split('\nExpected USD per run', 1)[0].splitlines()))
+        self.assertTrue(all(len(line) <= 50 for line in table.split('\nUSD per merge gate', 1)[0].splitlines()))
         self.assertIn('0.2500', table)
         self.assertNotIn('0.3000', table)
         self.assertIn(f'snapshot age {int(self.clock.now - old)}s (stale)', table)
@@ -333,24 +333,24 @@ class ControlTests(CostFixture):
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         table = spot_table.render(self.state, int(self.clock.now), width=200, settings_path=self.settings)
         lines = table.splitlines()
-        estimate = next(index for index, line in enumerate(lines) if line.startswith('type') and 'region' in line)
-        count = len(self.regions) * (len(self.standard) + len(self.compare))
-        rows = [line.split() for line in lines[estimate + 1:estimate + 1 + count]]
+
+        def block(size: str) -> list[list[str]]:
+            # One block per type: the type, a header line, then one line per region.
+            first = lines.index(size) + 2
+            return [line.split() for line in lines[first:first + len(self.regions)]]
+
         # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
-        self.assertEqual([cells[:3] for cells in rows[:4]], [[fast, home, '0.0250'], [fast, other, '0.0250'],
-                                                         [slow, home, '0.0500'], [slow, other, '0.0500']])
-        self.assertIn('(6m 0s, 1 runs)', lines[estimate + 1])
-        self.assertIn('(6m 0s, 1 runs in other regions)', lines[estimate + 2])
-        # One refused request before one launch; the other region has no requests.
-        self.assertTrue(lines[estimate + 1].endswith('1.00 (1/1)'))
-        self.assertTrue(lines[estimate + 2].endswith('no requests'))
-        for cells in rows[4:]:
-            self.assertEqual(cells[2:], ['no', 'runs', 'no', 'runs', 'no', 'requests'])
-        self.assertEqual({cells[0] for cells in rows[4:]}, set(self.compare))
-        billed = lines[next(index for index, line in enumerate(lines) if line.startswith('Billed USD per run')) + 2:]
-        self.assertEqual([line.split()[0] for line in billed], [*self.standard, *self.compare])
-        self.assertIn('not billed yet (1 runs)', billed[0])
-        self.assertTrue(billed[-1].endswith('no runs'))
+        # One refused request came before one launch of the fast type at home; the other region has no requests.
+        self.assertEqual(block(fast), [
+            [home, '0.2500', '6m', '0s', '(1', 'runs)', '0.0250', 'not', 'billed', 'not', 'billed', '1/1'],
+            [other, '0.2500', '6m', '0s', '(1', 'runs', 'in', 'other', 'regions)', '0.0250', 'not', 'billed',
+             'not', 'billed', '0/0']])
+        self.assertEqual([cells[:7] for cells in block(slow)], [[home, '0.2500', '12m', '0s', '(1', 'runs)', '0.0500'],
+                                                               [other, '0.2500', '12m', '0s', '(1', 'runs', 'in']])
+        for size in self.compare:
+            self.assertEqual([cells[2:] for cells in block(size)], [['no', 'runs', '—', 'not', 'billed', 'not', 'billed', '0/0']]
+                             * len(self.regions))
+        self.assertEqual(lines[-1], f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
 
     def test_absent_snapshot_prints_unknown_values_without_creating_files(self) -> None:
         table = spot_table.render(self.state, int(self.clock.now))

@@ -11,6 +11,7 @@ from statistics import median
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import ledger, run_cost
+from scripts.lib import conf
 
 if TYPE_CHECKING:
     from scripts.aws_target.measurement import MeasurementUnavailable, number
@@ -56,7 +57,7 @@ class GateCostReport:
     source: str
 
 
-def run_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[tuple[str, str, str], Decimal]) -> str:
+def run_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[run_cost.BilledKey, Decimal]) -> str:
     if not runs:
         return '—'
     billed = run_cost.billed_runs(runs, allocations)
@@ -65,7 +66,7 @@ def run_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[tuple[
     return f'${run_cost.billed_cost_per_run(billed, allocations):.4f} per run ({len(runs)})'
 
 
-def trend_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[tuple[str, str, str], Decimal]) -> str:
+def trend_cost_cell(runs: list[run_cost.FinishedGateRun], allocations: dict[run_cost.BilledKey, Decimal]) -> str:
     if not runs:
         return '—'
     billed = run_cost.billed_runs(runs, allocations)
@@ -79,10 +80,10 @@ def gate_type_report(directory: Path, day: str, days: int) -> GateCostReport:
     end = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
-    measured = run_cost.gate_runs(book, start, end)
+    measured = run_cost.gate_runs(book, start, end, conf.read_or_repository('aws_target').text('region'))
     runs, omitted, fallbacks = measured.runs, measured.omitted, measured.fallbacks
     kinds = run_cost.KINDS
-    allocations = run_cost.billed_allocations(book, runs, start, end)
+    allocations = run_cost.billed_allocations(run_cost.spot_bills(book, start, end), runs)
     lines = ['| Machine type | Merge gates | Targeted tests | All runs |', '|---|---:|---:|---:|']
     sizes = sorted({run.instance_type for run in runs})
     for size in sizes:

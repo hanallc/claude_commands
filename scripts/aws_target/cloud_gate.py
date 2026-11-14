@@ -526,7 +526,7 @@ class GateWorker:
         if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
             return sorted(variants, key=cooled)
         moment = datetime.fromtimestamp(now, UTC)
-        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment)
+        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
         default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))

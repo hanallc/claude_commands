@@ -593,17 +593,22 @@ The box counts divide the quota by the existing type-size vCPU calculation and r
 An absent snapshot explains missing quotas and box counts without creating files.
 The rows are `instance_types`, then `price_compare_instance_types`, then `gpu_instance_types`.
 The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, the table ranks each standard type and region by its expected USD per run:
-1. The estimate is the lowest zone Spot price times the median box time, from launch to finish, boot included, plus the refusal wait cost.
-2. Run times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days, split into merge gates and targeted tests.
-3. A region uses its own runs when it has them. Boot and data transfer can differ by region.
-4. A region without its own runs uses the type's runs in other regions, and the cell says so.
-5. The cheapest merge gate comes first; types without runs come last.
-6. A column shows the refused requests per launch for each type and region.
-7. These tables do not split for a narrow terminal.
-The last table shows the billed USD per run for each type and kind.
-It splits each billed day's `SpotUsage:<type>` cost between the kinds by box time, as the hourly AWS report does.
-Runs on days without a bill show `not billed yet`.
+Below the quotas, `/aws_prices` shows one block for each type, with one line for each candidate region.
+The user asked for this layout on 2026-11-14 through builds. Each line shows:
+1. The lowest zone Spot price in USD/h.
+2. The median merge gate box time and the run count, from launch to finish, boot included.
+   Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
+3. The estimate: Spot price times that box time, plus the refusal wait cost.
+4. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
+5. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
+6. Refused/launched: capacity and quota refusals, and launches, of the type in the region.
+The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
+`ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
+A launch row without a region ran in the home region, `region` in `aws_target.conf`.
+A region without its own runs uses the type's runs in other regions, and the cell says so.
+Runs on days without a bill show `not billed`.
+The last line names the cheapest merge gate by estimate.
+These blocks do not split for a narrow terminal.
 
 `python3 scripts/aws_target/aws_target.py open-gates` reads only the local cost ledger.
 It prints the ledger path, file write time, age, counts by state, and pending compute request count.

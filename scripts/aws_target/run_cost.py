@@ -21,7 +21,7 @@ QUOTA_REFUSALS = frozenset({'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'}
 @dataclass(frozen=True)
 class FinishedGateRun:
     instance_type: str
-    # Empty for rows written before launches recorded a region.
+    # Rows written before launches recorded a region ran in the home region.
     region: str
     mode: str
     day: str
@@ -37,12 +37,12 @@ class GateRuns:
     fallbacks: list[tuple[datetime, dict[str, object]]]
 
 
-def gate_runs(book: ledger.CostLedger, start: datetime, end: datetime) -> GateRuns:
+def gate_runs(book: ledger.CostLedger, start: datetime, end: datetime, home: str) -> GateRuns:
     """Each finished run in [start, end) with its launch, and the fallbacks in the same window."""
-    return runs_from_rows(book.launches(), start, end)
+    return runs_from_rows(book.launches(), start, end, home)
 
 
-def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: datetime) -> GateRuns:
+def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: datetime, home: str) -> GateRuns:
     launched = {str(row.get('attempt', '')): row for row in rows if row.get('result') == 'launched' and 'mode' in row}
     runs: list[FinishedGateRun] = []
     fallbacks: list[tuple[datetime, dict[str, object]]] = []
@@ -62,42 +62,59 @@ def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: date
             if launch is None or not isinstance(size, str) or not size or not isinstance(mode, str):
                 omitted += 1
                 continue
-            region = str(row.get('region', launch.get('region', '')))
+            region = str(row.get('region') or launch.get('region') or home)
             runs.append(FinishedGateRun(size, region, mode, at.date().isoformat(), number(row['gate_s']),
                                         number(row['time']) - number(launch['time'])))
     return GateRuns(runs, omitted, fallbacks)
 
 
-def billed_allocations(book: ledger.CostLedger, runs: list[FinishedGateRun], start: datetime,
-                       end: datetime) -> dict[tuple[str, str, str], Decimal]:
-    """Split each billed day's Spot cost of a type between its run kinds by box time."""
-    costs: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
-    billed_days: set[str] = set()
+BilledKey = tuple[str, str, str, str]
+
+
+def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
+    """The billed Spot USD and box hours for each type, region and day in [start, end)."""
+    bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]] = {}
     for reading in book.read_bills():
         if not (start.date().isoformat() <= reading.day < end.date().isoformat() and ledger.is_billed_day(reading)):
             continue
-        billed_days.add(reading.day)
         for usage in reading.usage_types:
             size = usage.usage_type.partition('SpotUsage:')[2]
-            if size:
-                costs[size, reading.day] += usage.usd
-    groups: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+            region = ledger.usage_region(usage.usage_type, 'SpotUsage:')
+            if size and region is not None:
+                usd, hours = bills.get((size, region, reading.day), (Decimal(0), Decimal(0)))
+                bills[size, region, reading.day] = usd + usage.usd, hours + usage.quantity
+    return bills
+
+
+def paid_per_hour(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]]) -> dict[tuple[str, str], Decimal]:
+    """The billed Spot USD per box hour of each type and region."""
+    totals: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
+    for (size, region, _day), (usd, hours) in bills.items():
+        paid, used = totals.get((size, region), (Decimal(0), Decimal(0)))
+        totals[size, region] = paid + usd, used + hours
+    return {key: usd / hours for key, (usd, hours) in totals.items() if hours > 0}
+
+
+def billed_allocations(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]],
+                       runs: list[FinishedGateRun]) -> dict[BilledKey, Decimal]:
+    """Split each billed day's Spot cost of a type in a region between its run kinds by box time."""
+    groups: dict[BilledKey, Decimal] = defaultdict(Decimal)
     for run in runs:
-        groups[run.instance_type, run.day, run.mode] += run.box_s
-    allocations: dict[tuple[str, str, str], Decimal] = {}
-    for (size, at, mode), seconds in groups.items():
-        if at in billed_days:
-            total = sum((groups.get((size, at, kind), Decimal(0)) for kind, _label in KINDS), Decimal(0))
-            allocations[size, at, mode] = costs[size, at] * seconds / total
+        groups[run.instance_type, run.region, run.day, run.mode] += run.box_s
+    allocations: dict[BilledKey, Decimal] = {}
+    for (size, region, at, mode), seconds in groups.items():
+        if (size, region, at) in bills:
+            total = sum((groups.get((size, region, at, kind), Decimal(0)) for kind, _label in KINDS), Decimal(0))
+            allocations[size, region, at, mode] = bills[size, region, at][0] * seconds / total
     return allocations
 
 
-def billed_runs(runs: list[FinishedGateRun], allocations: dict[tuple[str, str, str], Decimal]) -> list[FinishedGateRun]:
-    return [run for run in runs if (run.instance_type, run.day, run.mode) in allocations]
+def billed_runs(runs: list[FinishedGateRun], allocations: dict[BilledKey, Decimal]) -> list[FinishedGateRun]:
+    return [run for run in runs if (run.instance_type, run.region, run.day, run.mode) in allocations]
 
 
-def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[tuple[str, str, str], Decimal]) -> Decimal:
-    groups = {(run.instance_type, run.day, run.mode) for run in runs}
+def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[BilledKey, Decimal]) -> Decimal:
+    groups = {(run.instance_type, run.region, run.day, run.mode) for run in runs}
     return sum((allocations[key] for key in groups), Decimal(0)) / len(runs)
 
 
@@ -141,11 +158,11 @@ class RunEvidence:
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
 
 
-def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: datetime) -> RunEvidence:
+def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: datetime, home: str) -> RunEvidence:
     by_region: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     by_type: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     by_mode: dict[str, list[Decimal]] = defaultdict(list)
-    for run in runs_from_rows(rows, start, end).runs:
+    for run in runs_from_rows(rows, start, end, home).runs:
         by_region[run.instance_type, run.region, run.mode].append(run.box_s)
         by_type[run.instance_type, run.mode].append(run.box_s)
         by_mode[run.mode].append(run.box_s)
@@ -159,7 +176,7 @@ def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: dateti
             continue
         result = row.get('result')
         attempts[str(row.get('attempt', ''))].append((at, str(result)))
-        key = str(row.get('instance_type', '')), str(row.get('region', ''))
+        key = str(row.get('instance_type', '')), str(row.get('region') or home)
         if result == 'launched':
             launched[key] += 1
         elif result == 'refused' and row.get('error_code') in ZONE_REFUSALS | QUOTA_REFUSALS:

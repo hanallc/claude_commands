@@ -1008,12 +1008,23 @@ class _BillRates:
                 else _AllowanceRatesUnavailable())
 
 
+# AWS bill usage types start with the region billing code; us-east-1 rows can have no code.
+REGION_USAGE_PREFIXES: dict[str, tuple[str, ...]] = {
+    'us-east-1': ('', 'USE1'), 'us-east-2': ('USE2',), 'us-west-1': ('USW1',), 'us-west-2': ('USW2',),
+    'eu-north-1': ('EUN1',), 'eu-south-2': ('EUS2',)}
+
+
+def usage_region(usage_type: str, usage: str) -> str | None:
+    """The region of a bill usage type such as USE2-SpotUsage:c7a.8xlarge, or None for an unknown code."""
+    code = usage_type.partition(usage)[0].removesuffix('-')
+    return next((region for region, codes in REGION_USAGE_PREFIXES.items() if code in codes), None)
+
+
 def _bill_rates(readings: Sequence[ChargeRead], instance_type: str, now: int, region: str = '', *,
                 root_gib: int = 0,
                 gate_counts: Mapping[str, int] | _GateCountsNotRead = _GATE_COUNTS_NOT_READ) -> _BillRates:
     """Index completed bills once for one type and region."""
-    prefixes = {'us-east-1': ('', 'USE1'), 'us-east-2': ('USE2',),
-                'us-west-1': ('USW1',), 'us-west-2': ('USW2',)}
+    prefixes = REGION_USAGE_PREFIXES
     rates: dict[str, BoxRate] = {}
     allowances: dict[str, _AllowanceRate | _AllowanceRatesUnavailable] = {}
     for reading in sorted(readings, key=lambda row: row.at):

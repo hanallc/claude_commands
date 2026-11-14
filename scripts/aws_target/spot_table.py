@@ -85,65 +85,54 @@ def render(directory: Path, now: int, *, width: int | None = None, settings_path
                    if reading and vcpus else note or 'unknown vCPU count')
             lines.append(f'  {size} ({vcpus or "?"} vCPUs): {fit}')
     lines.extend(run_cost_lines(directory, now, standard, regions, minimum, configuration.whole('run_cost_days'),
-                                terminal_width))
+                                terminal_width, configuration.text('region')))
     return '\n'.join(lines)
 
 
 def run_cost_lines(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
-                   minimum: dict[tuple[str, str], Decimal], days: int, width: int) -> list[str]:
-    """Rank each type and region by its expected USD per merge gate, then show the billed cost."""
+                   minimum: dict[tuple[str, str], Decimal], days: int, width: int, home: str) -> list[str]:
+    """One block per type and one line per region: price, run time, expected and paid cost of a merge gate."""
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
     rows = book.launches()
-    runs = run_cost.runs_from_rows(rows, start, end).runs
-    evidence = run_cost.run_evidence(rows, start, end)
+    mode = run_cost.KINDS[0][0]
+    runs = run_cost.runs_from_rows(rows, start, end, home).runs
+    evidence = run_cost.run_evidence(rows, start, end, home)
+    bills = run_cost.spot_bills(book, start, end)
+    paid_hourly = run_cost.paid_per_hour(bills)
+    allocations = run_cost.billed_allocations(bills, runs)
     values = conf.read_or_repository('cloud_gate')
     wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
     default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
-    estimates: list[tuple[list[Decimal | None], list[str], str, str]] = []
+    lines = ['', *textwrap.wrap(f'USD per merge gate, last {days} days. Estimate: lowest zone Spot price x median box '
+                                + f'time (boot included), plus refusal wait at {wait_cost} USD/min '
+                                + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
+                                + 'split between runs by box time. Refused: capacity and quota refusals.', width)]
+    cheapest: tuple[Decimal, str, str] | None = None
+    headers = ['region', 'Spot USD/h', 'merge gate', 'estimate', 'paid USD/h', 'paid USD/run', 'refused/launched']
     for size in sizes:
+        table: list[list[str]] = []
         for region in regions:
             price = minimum.get((region, size))
-            if price is None:
-                continue
-            per_run: list[Decimal | None] = []
-            cells: list[str] = []
-            for mode, _label in run_cost.KINDS:
-                seconds, own = evidence.box_seconds(size, region, mode)
-                if not seconds:
-                    per_run.append(None)
-                    cells.append('no runs')
-                    continue
-                # The same math as gate placement, without the transfer and delay of a remote region.
-                estimate = evidence.expected_usd(price, size, region, mode, wait_cost, default_seconds)
-                per_run.append(estimate)
-                source = f'{len(seconds)} runs' if own else f'{len(seconds)} runs in other regions'
-                cells.append(f'{estimate:.4f} ({run_cost.median_run_time(seconds)}, {source})')
-            refusals, refused, launched = evidence.refusals_per_launch(size, region)
-            cells.append(f'{refusals:.2f} ({refused}/{launched})' if refusals is not None else 'no requests')
-            estimates.append((per_run, cells, size, region))
-    # A type without runs has no estimate, so it goes last.
-    estimates.sort(key=lambda row: (*((value is None, value or Decimal(0)) for value in row[0]), row[2], row[3]))
-    lines = ['', *textwrap.wrap(f'Expected USD per run: lowest zone Spot price x median box time (boot included), '
-                                + f'plus refusal wait at {wait_cost} USD/min; last {days} days; cheapest merge gate first. '
-                                + 'Refused per launch: capacity and quota refusals / launches '
-                                + f'({evidence.refusal_wait_s:.0f} s each)', width)]
-    if estimates:
-        lines.extend(aligned_table(['type', 'region', 'merge gate', 'targeted test', 'refused per launch'],
-                                   [[size, region, *cells] for _per_run, cells, size, region in estimates]))
-    else:
-        lines.append('no price in the snapshot')
-    allocations = run_cost.billed_allocations(book, runs, start, end)
-    lines.extend(('', *textwrap.wrap('Billed USD per run: the AWS bill split by box time, all regions, same days', width)))
-    billed_rows: list[list[str]] = []
-    for size in sizes:
-        cells = [size]
-        for mode, _label in run_cost.KINDS:
-            selected = [run for run in runs if run.instance_type == size and run.mode == mode]
-            billed = run_cost.billed_runs(selected, allocations)
-            cells.append(f'{run_cost.billed_cost_per_run(billed, allocations):.4f} ({len(billed)} billed runs)' if billed
-                         else f'not billed yet ({len(selected)} runs)' if selected else 'no runs')
-        billed_rows.append(cells)
-    lines.extend(aligned_table(['type', 'merge gate', 'targeted test'], billed_rows))
+            seconds, own = evidence.box_seconds(size, region, mode)
+            duration = (f'{run_cost.median_run_time(seconds)} ({len(seconds)} runs'
+                        + ('' if own else ' in other regions') + ')') if seconds else 'no runs'
+            estimate = (evidence.expected_usd(price, size, region, mode, wait_cost, default_seconds)
+                        if price is not None and seconds else None)
+            if estimate is not None and (cheapest is None or estimate < cheapest[0]):
+                cheapest = estimate, size, region
+            # Allocations split each bill between both kinds, so only the merge gate share counts here.
+            billed = run_cost.billed_runs([run for run in runs if (run.instance_type, run.region, run.mode)
+                                           == (size, region, mode)], allocations)
+            paid = paid_hourly.get((size, region))
+            _refusals, refused, launched = evidence.refusals_per_launch(size, region)
+            table.append([region, f'{price:.4f}' if price is not None else 'no price', duration,
+                          f'{estimate:.4f}' if estimate is not None else '—',
+                          f'{paid:.4f}' if paid is not None else 'not billed',
+                          f'{run_cost.billed_cost_per_run(billed, allocations):.4f} ({len(billed)} runs)' if billed
+                          else 'not billed', f'{refused}/{launched}'])
+        lines.extend(('', size, *('  ' + line for line in aligned_table(headers, table))))
+    lines.extend(('', f'Cheapest merge gate: {cheapest[1]} in {cheapest[2]}, {cheapest[0]:.4f} USD (estimate)'
+                  if cheapest else 'Cheapest merge gate: no estimate; the snapshot has no price or the ledger has no runs'))
     return lines
