@@ -1189,6 +1189,7 @@ class AdmissionServer:
                            or key in live_dispatches
                            or entry.reservation in live_reservations
                            or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
+            self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments)
@@ -2301,6 +2302,13 @@ class AdmissionServer:
         eligibility: placement.HostEligibility = (placement.TemporaryExclusion(answer.reason)
             if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
+        # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
+        # or each pass makes a new attempt that the Mac refuses as busy.
+        if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
+                and target.platform == "macos"
+                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                      session=key.session) == "busy"):
+            eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
         executions: list[tuple[placement.ProviderClaimReference, placement.ExecutionEvidence]] = []
@@ -2379,6 +2387,29 @@ done
         except (OSError, ValueError, subprocess.TimeoutExpired):
             offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
         return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
+
+    def _prune_ended_placements(self, cutoff: float) -> None:
+        """Remove the request and closed attempts of an episode whose owner ended before the cutoff."""
+        last: dict[str, float] = {episode: request.since for episode, request in self.placement_requests.items()}
+        for saved in self.assignments.values():
+            episode = saved.assignment.episode
+            report = saved.terminal_report
+            at = report.received_at if isinstance(report, placement.TerminalAttemptReport) else saved.assignment.since
+            last[episode] = max(last.get(episode, at), at)
+        owners = {saved.assignment.episode: saved.assignment.owner for saved in self.assignments.values()}
+        owners.update((episode, request.owner) for episode, request in self.placement_requests.items())
+        ended = {episode for episode, at in last.items()
+                 if at < cutoff and episode not in self.current_assignments
+                 and not self._placement_owner_live(owners[episode])}
+        if not ended:
+            return
+        self.assignments = {key: saved for key, saved in self.assignments.items()
+                            if saved.assignment.episode not in ended}
+        for episode in ended:
+            _ = self.placement_requests.pop(episode, None)
+            _ = self.prerequisites.pop(episode, None)
+            _ = self.placement_eligibility.pop(episode, None)
+            _ = self.waiters.pop(episode, None)
 
     def _placement_owner_live(self, owner: placement.SubmittingOwner) -> bool:
         return owner.host == self.host and self._live(wire.Owner(owner.pid, owner.start_time))
