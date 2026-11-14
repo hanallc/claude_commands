@@ -224,10 +224,9 @@ Failed regional reads retain applicable hourly prices from `spot-prices.json`.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.
-It prefers larger vCPU counts within each group.
-Within one size, it prefers the lowest expected cost across regions and zones.
-Expected cost includes compute, remote transfer, and the configured regional delay cost.
-Equal costs preserve configured order.
+Within each group, it prefers the lowest expected USD per run across types, regions and zones.
+Expected cost includes compute for the median box time by type and region, remote transfer, the configured regional delay cost and the expected refusal wait.
+Equal costs preserve the `instance_types` order.
 The worker saves its ranking and price evidence before launch.
 A resumed launch keeps that ranking and its client tokens.
 Capacity refusals select the next variant.

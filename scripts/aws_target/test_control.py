@@ -303,7 +303,8 @@ class ControlTests(CostFixture):
             with mock.patch.object(sys, 'argv', argv), redirect_stdout(StringIO()) as output:
                 self.assertEqual(deploy.main(), 0)
         self.assertIn('Spot prices (USD/h; lowest zone)', output.getvalue())
-        self.assertTrue(all(len(line) <= 50 for line in table.splitlines()))
+        # The price table splits its region columns to fit; the cost per run tables below it do not split.
+        self.assertTrue(all(len(line) <= 50 for line in table.split('\nExpected USD per run', 1)[0].splitlines()))
         self.assertIn('0.2500', table)
         self.assertNotIn('0.3000', table)
         self.assertIn(f'snapshot age {int(self.clock.now - old)}s (stale)', table)
@@ -327,6 +328,8 @@ class ControlTests(CostFixture):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': region}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
+        events.append({'attempt': 'fast', 'instance_type': fast, 'mode': 'merge-gate', 'region': home, 'result': 'refused',
+                       'time': self.clock.now - 3600 - 400, 'error_code': 'InsufficientInstanceCapacity'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         table = spot_table.render(self.state, int(self.clock.now), width=200, settings_path=self.settings)
         lines = table.splitlines()
@@ -338,8 +341,11 @@ class ControlTests(CostFixture):
                                                          [slow, home, '0.0500'], [slow, other, '0.0500']])
         self.assertIn('(6m 0s, 1 runs)', lines[estimate + 1])
         self.assertIn('(6m 0s, 1 runs in other regions)', lines[estimate + 2])
+        # One refused request before one launch; the other region has no requests.
+        self.assertTrue(lines[estimate + 1].endswith('1.00 (1/1)'))
+        self.assertTrue(lines[estimate + 2].endswith('no requests'))
         for cells in rows[4:]:
-            self.assertEqual(cells[2:], ['no', 'runs', 'no', 'runs'])
+            self.assertEqual(cells[2:], ['no', 'runs', 'no', 'runs', 'no', 'requests'])
         self.assertEqual({cells[0] for cells in rows[4:]}, set(self.compare))
         billed = lines[next(index for index, line in enumerate(lines) if line.startswith('Billed USD per run')) + 2:]
         self.assertEqual([line.split()[0] for line in billed], [*self.standard, *self.compare])

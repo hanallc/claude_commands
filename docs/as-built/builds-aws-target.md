@@ -407,7 +407,7 @@ The list must start with the home region and must not repeat a region.
 The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-The gate ranks deployed types and public zones by the configured type order and expected cost before launch.
+The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
@@ -593,12 +593,14 @@ The box counts divide the quota by the existing type-size vCPU calculation and r
 An absent snapshot explains missing quotas and box counts without creating files.
 The rows are `instance_types`, then `price_compare_instance_types`, then `gpu_instance_types`.
 The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, the table ranks each standard type and region by its estimated USD per run:
-1. The estimate is the lowest zone Spot price times the median box time, from launch to finish, boot included.
+Below the quotas, the table ranks each standard type and region by its expected USD per run:
+1. The estimate is the lowest zone Spot price times the median box time, from launch to finish, boot included, plus the refusal wait cost.
 2. Run times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days, split into merge gates and targeted tests.
 3. A region uses its own runs when it has them. Boot and data transfer can differ by region.
 4. A region without its own runs uses the type's runs in other regions, and the cell says so.
 5. The cheapest merge gate comes first; types without runs come last.
+6. A column shows the refused requests per launch for each type and region.
+7. These tables do not split for a narrow terminal.
 The last table shows the billed USD per run for each type and kind.
 It splits each billed day's `SpotUsage:<type>` cost between the kinds by box time, as the hourly AWS report does.
 Runs on days without a bill show `not billed yet`.
@@ -632,23 +634,28 @@ The live read never writes `spot-prices.json`.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
 Resumed launches keep the saved ranking and evidence without another live read.
 Available variants precede variants under a capacity cooldown.
-Within each group, types follow the `instance_types` order. The first type is the preferred size; later types are capacity fallbacks.
-Variants of one type compete on expected gate cost.
+Within each group, variants with a current price come first, ranked by the expected USD per run.
+The user, 2026-11-14: "base our spot Requests on lowest price per run".
+Equal costs follow the `instance_types` order.
 Without any current price, the configured region, type, and zone order stays.
-That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
+That cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
 `gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
-Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
-Without recent durations, it uses `lifetime_minutes`.
+It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
+Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
+Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
+A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
+Without any runs, it uses `lifetime_minutes`.
+`/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.
 Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
 The median combined size is 7,107,672 bytes.
 At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
 Equal costs keep configured order.
-Missing or stale prices follow fresh prices for the same vCPU count.
+Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
 `capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.

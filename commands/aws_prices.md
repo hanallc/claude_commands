@@ -7,7 +7,8 @@ Run `python3 ~/.claude/scripts/aws_target/deploy.py spot-table` and show its lin
 The command reads only the local hourly snapshot. It makes no AWS call.
 The table shows the lowest zone Spot price in USD/h for each type and region, and the snapshot age.
 Under the table, each region shows its Standard and G and VT Spot quotas in vCPUs and the box count of each type that fits.
-Under the quotas, it ranks each type and region by estimated USD per run: Spot price times the median box time of recent gates.
+Under the quotas, it ranks each type and region by expected USD per run: Spot price times the median box time of recent gates, plus the refusal wait cost. Gate placement uses the same math.
+A column shows refused requests per launch for each type and region.
 A region without its own runs uses the type's time from other regions, and the cell says so.
 The last table shows the billed USD per run from the AWS bill, or `not billed yet`.
 `buildlog hourly` refreshes the snapshot with `aws_target.py snapshot`.
