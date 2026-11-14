@@ -477,13 +477,12 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
         remote = _fetch(repo, branch)
     except OSError as error:
         raise OSError(f"registry edit refused before writing: fetch failed: {error}") from error
-    remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-    # Recover a push accepted before its acknowledgement/local fast-forward.
-    registry_already_shared = bool(pending and _values(_replay(remote_text, pending, False)) == _values(remote_text))
-    _fast_forward(repo, path, remote, registry_already_shared=registry_already_shared)
+    # Pending rows move onto the fetched registry, so another writer's commit
+    # cannot block them; a push accepted before its acknowledgement replays as no change.
+    _fast_forward(repo, path, remote, registry_already_shared=bool(pending))
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
-    contents = _replay(local, changes, additive_catalog)
+    contents = _replay(_replay(local, pending, False), changes, additive_catalog)
     pending = _changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", contents)
     if not pending:
         return False
@@ -532,11 +531,43 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
     raise OSError(f"{path} is edited but not shared; publish failed after at most 3 tries: {last_error}")
 
 
+def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
+    if isinstance(target, SharedRegistry):
+        return Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
+    return path.with_name(path.name + ".lock")
+
+
+def _on_main(target: SharedRegistry) -> bool:
+    return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
+
+
+def publish_pending(registry: Path) -> bool:
+    """Publish rows that main does not have yet; return False at once when main is busy."""
+    path = registry.resolve()
+    target = _publish_repository(path)
+    if not isinstance(target, SharedRegistry):
+        return False
+    head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+    if not _changes(head, registry_text(path)):
+        return False
+    with ExitStack() as locks:
+        if _on_main(target):
+            try:
+                locks.enter_context(main_push_lock.main_push_lock(target.repository, wait=False))
+            except BlockingIOError:
+                return False
+        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _publish(target.repository, path, [], "rows written while main was busy", False)
+
+
 def store_registry(registry: Path, before: str, after: str, description: str, *,
                    additive_catalog: bool = False) -> str:
     """Return the published text after atomic replay under the writer lock.
 
     Publishing is disabled by MODELS_CONFIG_PUBLISH=0 and for every other path.
+    MODELS_CONFIG_PUBLISH=later writes the shared file at once, without the main
+    lock; publish_pending() commits and pushes those rows when main is free.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
     The registry commit is parented on local HEAD, so publishing an ahead
@@ -548,14 +579,14 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     if additive_catalog:
         changes = [change for change in changes if change.section in ("codex.agents", "codex.families")]
     target = _publish_repository(path)
-    lock_path = (Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
-                 if isinstance(target, SharedRegistry) else path.with_name(path.name + ".lock"))
+    later = os.environ.get("MODELS_CONFIG_PUBLISH") == "later"
+    lock_path = _publish_lock_path(target, path)
     with ExitStack() as locks:
-        if isinstance(target, SharedRegistry) and _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main":
+        if isinstance(target, SharedRegistry) and not later and _on_main(target):
             locks.enter_context(main_push_lock.main_push_lock(target.repository))
         lock = locks.enter_context(lock_path.open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if isinstance(target, SharedRegistry):
+        if isinstance(target, SharedRegistry) and not later:
             _ = _publish(target.repository, path, changes, description, additive_catalog)
         elif changes:
             latest = registry_text(path)

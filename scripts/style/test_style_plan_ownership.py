@@ -11,7 +11,7 @@ from typing import final
 from unittest import mock
 
 
-from scripts.style import style_proposals
+from scripts.style import style_plan, style_proposals
 
 from scripts.lib import berth_board
 from scripts.style import style_ledger
@@ -70,9 +70,12 @@ class StylePlanTests(StylePlanFixture):
         issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),))
         # The busy file holds the word probe, as a function name, not as the renamed module.
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])),
-              mock.patch.object(style_proposals, "proposal_command")):
+              mock.patch.object(style_proposals, "proposal_command"),
+              mock.patch.object(style_plan, "renamed_text", wraps=style_plan.renamed_text) as renamed):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
+        # The footprint reads only whether each file names the module; it does not build renamed code.
+        renamed.assert_not_called()
         self.assertNotIn("waiting", output)
         ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]),
