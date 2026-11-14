@@ -24,6 +24,19 @@ ENTRIES = (
             + "claude4: Mac Tue 12-01, natedev Mon 12-14\nclaude5: Mac Wed 12-02, natedev Tue 12-15"}),
          PushExample("safety", {"accounts": "claude4: Mac Sat 11-28"})),
         purpose="The weekly sitting or safety margin requires a preventive Claude login.", header=False),
+    # These examples use regional permission errors.
+    PushText("aws.snapshot_failed", "buildlog", "note", "Cloud gates use old AWS prices",
+        ActionTemplate("To allow AWS reads, in a terminal on natedev, run ~/.claude/scripts/lib/py "
+                       + "~/.claude/scripts/aws_target/deploy.py up --approve-resources"),
+        "Cloud gates run merge tests on AWS and pick a region from hourly AWS reads.\n{failures}\n"
+        + "With old data, a gate can pick a region that costs more or is full.\n"
+        + "The command only allows these reads and costs nothing. Then the hourly refresh works. "
+        + "It needs your AWS admin passphrase.",
+        (PushExample("permission", {
+            "failures": "AWS refused the us-east-2 price read."}),
+         PushExample("regional_permissions", {
+            "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
+        purpose="AWS denied a regional read that the gate deployment can repair."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
