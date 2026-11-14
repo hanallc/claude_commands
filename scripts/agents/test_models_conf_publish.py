@@ -617,6 +617,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
                          (snapshot.st_ino, snapshot.st_mtime_ns))
         self.assertEqual(self.dirty_state(), before)
 
+    @unittest.skipUnless(sys.platform == "linux", "the Mac publishes its catalog rows in place")
+    def test_catalog_rows_are_live_at_once_on_natedev_and_the_notes_pass_publishes_them(self) -> None:
+        prepare_catalog(self.root, self.environment)
+        _ = self.environment.pop("MODELS_CONFIG_PUBLISH")
+        before = self.dirty_state()
+        self.assert_ok(self.command("bash", str(AGENTS / "sync_codex_catalog.sh")))
+        self.assertIn("gpt-new=high", self.registry.read_text())
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, "gpt-new=high")
+
     def test_a_behind_checkout_fast_forwards_before_applying_the_row_edit(self) -> None:
         path = self.competitor / "config/models.conf"
         _ = path.write_text(path.read_text().replace("review=gpt-a:high", "review=gpt-b:low"))

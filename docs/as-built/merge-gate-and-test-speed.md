@@ -647,8 +647,9 @@ A failed Mac advance names the published local commit and leaves retry to main s
 - **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
   The `claude-sync` job runs every 15 minutes on both machines.
   It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  A `config/*.conf` edit that changes only setting values is a waiting row, not a tracked edit; the advance keeps it live.
   An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
-  It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
+  It removes those untracked files, restores those tracked files to HEAD, then advances with `waiting_rows.move_to`.
   A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
   An untracked path that collides with a path origin/main adds also blocks as `dirty`: `dir` blocks an incoming `dir/file`, and `dir/file` blocks an incoming file `dir`.
   The `dirty` detail names each path that blocks the update, or the last line of each git output stream when git cannot list them.
