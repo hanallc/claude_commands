@@ -1469,6 +1469,7 @@ From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws o
 - The quota table is `Spot quotas and boxes that fit`: standard and G and VT quotas, then boxes per type.
 - `SpotTables.snapshot_lines` gives one `Snapshot read N min ago` line when every region has the same state and minute. Otherwise it gives one line per region. A failed read always gives one line per region.
 - The run cost headers are region, Spot USD/h, the scope noun, estimate, paid USD/h, paid USD/run, refused, launched.
+- Refused and launched count only the requests of the selected scope (repair from builds (not the user), 2026-11-14). `RunEvidence` keys requests by type, region and mode. A request without a mode (`NO_MODE`, written before launch rows recorded a mode) counts only under Both (from builds (not the user), 2026-11-14). The refusal wait in the estimate still counts every request, because capacity refusals do not depend on the run kind.
 - `unbilled()` writes a paid cell without a bill: `bill due (N runs)` when runs of the scope wait for their day's bill, `no <scope noun> runs` when only other kinds ran, else `no runs`. The paid USD/h cell uses only `no runs` and `bill due`.
 - The cheapest line considers only `instance_types`, the types that placement picks. `runs_text()` writes `1 run` and `N runs`.
 - `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.

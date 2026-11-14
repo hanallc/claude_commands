@@ -196,7 +196,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                 # Allocations split each bill between both kinds, so only the share of the scope's kinds counts here.
                 billed = run_cost.billed_runs(scoped, allocations)
                 paid = paid_hourly.get((size, region))
-                _refusals, refused, launched = evidence.refusals_per_launch(size, region)
+                _refusals, refused, launched = evidence.refusals_per_launch(size, region, scope.modes)
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', duration,
                               f'{estimate:.4f}' if estimate is not None else '—',
                               f'{paid:.4f}' if paid is not None else unbilled(len(here), len(here)),

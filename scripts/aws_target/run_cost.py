@@ -12,6 +12,9 @@ from scripts.aws_target import ledger
 from scripts.aws_target.measurement import number
 
 KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
+EVERY_KIND = tuple(mode for mode, _label in KINDS)
+# The mode of a launch request written before launch rows recorded a mode.
+NO_MODE = ''
 
 
 @dataclass(frozen=True)
@@ -27,7 +30,7 @@ class RunScope:
 
 SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
           RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
-          RunScope('both', 'Both', 'run', tuple(mode for mode, _label in KINDS)))
+          RunScope('both', 'Both', 'run', EVERY_KIND))
 
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
@@ -148,8 +151,9 @@ class RunEvidence:
     by_region: dict[tuple[str, str, str], list[Decimal]]
     by_type: dict[tuple[str, str], list[Decimal]]
     by_mode: dict[str, list[Decimal]]
-    refused: dict[tuple[str, str], int]
-    launched: dict[tuple[str, str], int]
+    # Requests by type, region and mode; NO_MODE holds requests without a mode.
+    refused: dict[tuple[str, str, str], int]
+    launched: dict[tuple[str, str, str], int]
     # Median seconds from a refused launch request to the next request of the same attempt.
     refusal_wait_s: Decimal
 
@@ -158,9 +162,14 @@ class RunEvidence:
         own = [time for mode in modes for time in self.by_region.get((size, region, mode), [])]
         return (own, True) if own else ([time for mode in modes for time in self.by_type.get((size, mode), [])], False)
 
-    def refusals_per_launch(self, size: str, region: str) -> tuple[Decimal | None, int, int]:
-        """Refused requests for each launched box, with the counts it comes from."""
-        refused, launched = self.refused.get((size, region), 0), self.launched.get((size, region), 0)
+    def refusals_per_launch(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[Decimal | None, int, int]:
+        """Refused requests for each launched box, with the counts it comes from.
+
+        Requests without a mode count only when the modes cover every kind.
+        """
+        counted = (*modes, NO_MODE) if set(EVERY_KIND) <= set(modes) else modes
+        refused = sum(self.refused.get((size, region, mode), 0) for mode in counted)
+        launched = sum(self.launched.get((size, region, mode), 0) for mode in counted)
         if not refused + launched:
             return None, 0, 0
         return Decimal(refused) / max(launched, 1), refused, launched
@@ -171,7 +180,8 @@ class RunEvidence:
         seconds, _own = self.box_seconds(size, region, modes)
         seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
         box = Decimal(median(seconds)) if seconds else default_seconds
-        refusals = self.refusals_per_launch(size, region)[0] or Decimal(0)
+        # Capacity refusals do not depend on the run kind, so every request counts.
+        refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
 
 
@@ -183,8 +193,8 @@ def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: dateti
         by_region[run.instance_type, run.region, run.mode].append(run.box_s)
         by_type[run.instance_type, run.mode].append(run.box_s)
         by_mode[run.mode].append(run.box_s)
-    refused: dict[tuple[str, str], int] = defaultdict(int)
-    launched: dict[tuple[str, str], int] = defaultdict(int)
+    refused: dict[tuple[str, str, str], int] = defaultdict(int)
+    launched: dict[tuple[str, str, str], int] = defaultdict(int)
     attempts: dict[str, list[tuple[Decimal, str]]] = defaultdict(list)
     low, high = Decimal(str(start.timestamp())), Decimal(str(end.timestamp()))
     for row in rows:
@@ -193,7 +203,7 @@ def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: dateti
             continue
         result = row.get('result')
         attempts[str(row.get('attempt', ''))].append((at, str(result)))
-        key = str(row.get('instance_type', '')), str(row.get('region') or home)
+        key = str(row.get('instance_type', '')), str(row.get('region') or home), str(row.get('mode', NO_MODE))
         if result == 'launched':
             launched[key] += 1
         elif result == 'refused' and row.get('error_code') in ZONE_REFUSALS | QUOTA_REFUSALS:

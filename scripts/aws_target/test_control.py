@@ -370,9 +370,17 @@ class ControlTests(CostFixture):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
                            {**row, 'time': self.clock.now - 3600, 'result': 'finished', 'gate_s': box_s - 60}))
+        refusal: dict[str, object] = {'instance_type': size, 'region': home, 'result': 'refused',
+                                      'time': self.clock.now - 7200, 'error_code': 'InsufficientInstanceCapacity'}
+        events.extend(({**refusal, 'attempt': 'gate', 'mode': 'merge-gate'},
+                       *({**refusal, 'attempt': 'targeted', 'mode': 'targeted-test'} for _ in range(2)),
+                       # A request from before launch rows recorded a mode counts only when every kind counts.
+                       {**refusal, 'attempt': 'old'}, {**refusal, 'attempt': 'old', 'result': 'launched'}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
         self.assertEqual([costs.scope.name for costs in tables.runs], ['merge-gate', 'targeted-test', 'both'])
+        self.assertEqual([next(table for table in costs.tables if table.title == size).rows[0][-2:] for costs in tables.runs],
+                         [('1', '1'), ('2', '1'), ('4', '3')])
         end = datetime.fromtimestamp(self.clock.now, UTC)
         evidence = run_cost.run_evidence(events, end - timedelta(days=conf.read(self.settings).whole('run_cost_days')), end, home)
         # The fixture lowest zone price is 0.25 USD/h: 6 minutes cost 0.0250, 2 minutes 0.0083, and the 4 minute median 0.0167.
