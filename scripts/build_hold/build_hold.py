@@ -277,6 +277,7 @@ class Holder:
     # The fixed staff ID, or the text given for a holder outside staff.
     key: str
     keep: tuple[ProcessIdentity, ...] = ()
+    start_recorded: bool = True
 
 
 @dataclass(frozen=True)
@@ -577,7 +578,7 @@ class HoldEnforcer(Protocol):
     def working_drain_identities(self, proc_root: Path) -> tuple[ProcessIdentity, ...]: ...
     def record_build(self, build: AuditedBuild, holder: Holder, proc_root: Path,
                      action: Literal["audit", "stopped"]) -> None: ...
-    def report(self, proc_root: Path, directory: Path) -> list[str]: ...
+    def report(self, proc_root: Path, directory: Path, *, drain: bool = False) -> list[str]: ...
 
 
 def hold_enforcer() -> HoldEnforcer:
@@ -660,7 +661,7 @@ def audit_hold(directory: Path, proc_root: Path) -> tuple[AuditedBuild, ...]:
     return builds
 
 
-def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = False) -> None:
+def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = False, drain: bool = False) -> None:
     try:
         builds = audit_hold(directory, proc_root)
     except (OSError, ValueError) as error:
@@ -668,7 +669,7 @@ def print_hold_audit(directory: Path, proc_root: Path, *, beginning: bool = Fals
         return
     print("\n".join(audit_lines(builds, beginning=beginning)))
     try:
-        for line in hold_enforcer().report(proc_root, directory):
+        for line in hold_enforcer().report(proc_root, directory, drain=drain):
             print(line)
     except (OSError, ValueError) as error:
         print(f"Hold enforcer report unavailable: {error}")
@@ -747,7 +748,7 @@ def read_holder(path: Path) -> Holder:
     except FileNotFoundError:
         raise
     except (OSError, UnicodeError):
-        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, "unreadable holder file", UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         raw = cast(object, json.loads(content))
         if isinstance(raw, dict):
@@ -774,11 +775,12 @@ def read_holder(path: Path) -> Holder:
         pass
     match = INSTANT.search(content)
     if match is None:
-        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name)
+        return Holder(path.name, fallback, content, UnknownReleaseEta(), path.name, start_recorded=False)
     try:
         since = aware_instant(match.group())
     except ValueError:
-        since = fallback
+        return Holder(path.name, fallback, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name,
+                      start_recorded=False)
     return Holder(path.name, since, content[match.end():].lstrip(" ,;:-").strip(), UnknownReleaseEta(), path.name)
 
 
@@ -889,7 +891,7 @@ HoldFileRecord = TypedDict("HoldFileRecord", {
 
 
 def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = ()) -> str:
+               keep: Sequence[ProcessIdentity] = (), *, drain: bool = False) -> str:
     """Keep a hold under its resolved key and display name."""
     if not purpose.strip() or "\n" in purpose:
         raise ValueError("hold purpose must be one line of text")
@@ -910,7 +912,9 @@ def write_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
     temporary = directory.parent / f"{directory.name}.{path.name}.tmp"
     _ = temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
-    return (f"natedev is held for {purpose.strip()}. verify.sh waits by itself; an app launch is refused until the release, "
+    waiting = ("The drain stops waiting runs. An app launch is refused until the release, "
+               if drain else "verify.sh waits by itself; an app launch is refused until the release, ")
+    return (f"natedev is held for {purpose.strip()}. {waiting}"
             "so launch again after it. Tests that can run on the Mac keep running there. "
             "Every other test and build is stopped with the reason, including runs already started. "
             "Use --keep <pid> to keep a run and its children. Stopped sessions get a release notice; run again then. "
@@ -1381,7 +1385,7 @@ def open_cycle(now: datetime) -> HoldCycle:
 
 
 def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request: ReleaseRequest, now: datetime,
-               keep: Sequence[ProcessIdentity] = ()) -> str:
+               keep: Sequence[ProcessIdentity] = (), *, drain: bool = False) -> str:
     with release_lock():
         at = datetime.now(timezone.utc)
         new_hold = not holder_path(directory, identity.key).is_file()
@@ -1389,7 +1393,7 @@ def start_hold(directory: Path, identity: HolderIdentity, purpose: str, request:
             cycle = open_cycle(now)
         else:
             cycle = read_cycle_for_change()
-        notice = write_hold(directory, identity, purpose, request, now, keep)
+        notice = write_hold(directory, identity, purpose, request, now, keep, drain=drain)
         if new_hold:
             record_hold_event("began", read_holder(holder_path(directory, identity.key)), at)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1779,9 +1783,10 @@ def main(arguments: list[str]) -> int:
             if cast(bool, options.drain):
                 keep.extend(hold_enforcer().working_drain_identities(proc_root))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
-                             datetime.now(timezone.utc), keep))
+                             datetime.now(timezone.utc), keep, drain=cast(bool, options.drain)))
             hold_enforcer().start()
-            print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True)
+            print_hold_audit(holder_directory(), cast(Path, options.proc_root), beginning=True,
+                             drain=cast(bool, options.drain))
             if cast(bool, options.drain):
                 return hold_enforcer().drain(read_holder(holder_path(holder_directory(), identity.key)), proc_root)
         elif action == "quiet":

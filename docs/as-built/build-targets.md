@@ -48,7 +48,7 @@ A held target admits only work that its hold rules permit.
 - natedev is `Held` while `build_hold.natedev_holds` finds a hold in force: `ReleaseEstimated` with an ETA, else `UntilReleased`. The last release removes its file at once and natedev becomes free. Old cycle records still identify files left by a completed hold.
 - The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a live claim (a kept remote claim counts as live), with one `RunningJob` per live claim, oldest first, otherwise `Free`. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
 - `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. A failed-probe record also makes a target `Unreachable`, before any AWS state lookup.
-- `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown or its settings have no `linux_only.<repo>` key, and with `linux_only` when the package is listed there. Each `ssh` target is judged by its own settings file.
+- `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown, its settings have no `linux_only.<repo>` key, or its workspace cannot be read. It is excluded with `linux_only` under the one rule in `eligibility.linux_only_policy`: a named package is checked alone, and no package checks every workspace member. Each `ssh` target is judged by its own settings file.
 
 ### The target command: `scripts/build_targets/build_targets.py`
 
@@ -577,7 +577,7 @@ No configuration maps repositories to unit gates.
 The helper reads JSON on stdin and writes shell-quoted `NAME=value` answers.
 Requests cover members, example features, test targets, check targets, build targets, untested examples, workspace root, and target directory.
 Queries and early doc exits need no metadata helper.
-`DEV_FEATURES_PY` reads the root manifest directly, so an invalid dev-feature list refuses before Cargo.
+`dev_features.py` reads the root manifest directly in the per-run helper, so an invalid dev-feature list refuses before Cargo.
 
 `take_check_targets` includes `--lib` only when a workspace member has a library target.
 A binary-only workspace therefore checks successfully.
@@ -751,7 +751,9 @@ Its idle process holds no caller output pipe.
 
 The background tree watcher keeps its own PID and signal handlers.
 The detached step recorders from `invoke.sh` also keep their own processes.
-Shell fixtures and scripts without `main` use their original process path.
+Shell fixtures and scripts with no line that starts `def main(` use their original process path.
+The helper finds that line with a text search, not a parse.
+The helper changes only the environment names that differ between calls.
 A failed helper request also uses that path.
 The change does not wrap or re-execute `verify.sh`.
 

@@ -55,6 +55,10 @@ class StylePlanTests(StylePlanFixture):
             context = style_plan.RefillContext(ledger)
             definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
             cells = tuple(ledger.cells())
+            # The coverage read commits its cells when it ends; the selection does not hold them.
+            self.assertEqual(ledger._refill_write_batches[-1].operations, [])  # pyright: ignore[reportPrivateUsage]
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                self.assertGreater(cast(tuple[int], connection.execute("SELECT COUNT(*) FROM refill_cells").fetchone())[0], 0)
             busy = style_plan.BusyFiles(self.board(), frozenset())
             scopes: dict[rules.Family, AllCrates] = {"names": AllCrates()}
             base = self.base()

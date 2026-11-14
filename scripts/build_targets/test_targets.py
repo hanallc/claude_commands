@@ -24,7 +24,7 @@ from scripts.mac_test import mac_test
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 
 
 from scripts.build_hold.override_guard import require_checkout
@@ -254,7 +254,7 @@ class EligibilityTests(IsolatedTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)})))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")))
 
     def test_eligibility_table_keeps_linux_and_excludes_each_mac_constraint(self) -> None:
         mac = targets.SshTarget("mac", "macos", self.settings)
@@ -274,8 +274,25 @@ class EligibilityTests(IsolatedTargetTest):
                 self.assertEqual(targets.target_eligibility(self.root, "hana", routing),
                                  (expected, targets.EligibleTarget(local)))
 
+    def test_mac_table_uses_the_offload_linux_only_rule(self) -> None:
+        for name, manifest in (("portable", 'name="portable"\nversion="0.1.0"\n'),
+                               ("linux-part", 'name="linux-part"\nversion="0.1.0"\n')):
+            (self.root / name).mkdir()
+            _ = (self.root / name / "Cargo.toml").write_text("[package]\n" + manifest)
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
+        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\n", template="mac_test")
+        mac = targets.SshTarget("mac", "macos", self.settings)
+        for package, expected in (("portable", targets.EligibleTarget(mac)),
+                                  ("linux-part", targets.ExcludedTarget(mac, "linux_only")),
+                                  ("", targets.ExcludedTarget(mac, "linux_only"))):
+            with self.subTest(package=package):
+                self.assertEqual(targets.target_eligibility(self.root, package, targets.AnyEligibleTarget())[0], expected)
+        _ = (self.root / "Cargo.toml").write_text("[workspace]\nmembers=[\n")
+        self.assertEqual(targets.target_eligibility(self.root, "", targets.AnyEligibleTarget())[0],
+                         targets.ExcludedTarget(mac, "repo"))
+
     def test_unknown_repository_excludes_mac_without_excluding_linux(self) -> None:
-        with mock.patch.object(offload, "repository_identity", return_value=offload.UNKNOWN_REPOSITORY):
+        with mock.patch.object(eligibility, "repository_identity", return_value=eligibility.UNKNOWN_REPOSITORY):
             results = targets.target_eligibility(self.root, "hana", targets.AnyEligibleTarget())
         self.assertEqual(results[0], targets.ExcludedTarget(targets.SshTarget("mac", "macos", self.settings), "repo"))
         self.assertEqual(results[1], targets.EligibleTarget(targets.LocalTarget("natedev", "linux")))
@@ -364,7 +381,8 @@ class TargetStateTests(IsolatedTargetTest):
         block = self.mac_state / "block.json"
         before = block.read_bytes()
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(NOW - timedelta(seconds=1)),
+                                             targets.HolderSession("hana-session")))
         self.assertEqual(block.read_bytes(), before)
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
 
@@ -377,7 +395,7 @@ class TargetStateTests(IsolatedTargetTest):
     def test_pending_blocks_refuse_claims_before_and_after_expiry(self) -> None:
         cases: tuple[tuple[datetime, targets.HoldEnd], ...] = (
             (END, targets.ExpiresAt(END)),
-            (NOW - timedelta(seconds=1), targets.AwaitingBlockRemoval()),
+            (NOW - timedelta(seconds=1), targets.AwaitingBlockRemoval(NOW - timedelta(seconds=1))),
         )
         for expires, end in cases:
             with self.subTest(expires=expires):
@@ -396,8 +414,44 @@ class TargetStateTests(IsolatedTargetTest):
     def test_mac_block_expires_at_current_time(self) -> None:
         self.write_block(NOW)
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(NOW), targets.HolderSession("hana-session")))
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
+
+    def write_backoff(self, text: str) -> None:
+        from scripts.mac_test import eligibility
+
+        path = eligibility.backoff_path("mac")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(text, encoding="utf-8")
+
+    def test_block_precedes_an_unreadable_backoff(self) -> None:
+        self.write_block()
+        self.write_backoff("not a time")
+        snapshot = targets.ssh_target_snapshot(self.mac())
+        self.assertEqual(snapshot.states, (targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END),
+                                                        targets.HolderSession("hana-session")),))
+
+    def test_backoff_without_block_names_its_state(self) -> None:
+        cases = (("not a time", "retry backoff: could not convert string to float: 'not a time'"),
+                 ("nan", "retry backoff: backoff time is not finite"))
+        for text, reason in cases:
+            with self.subTest(text=text):
+                self.write_backoff(text)
+                self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.StateUnreadable(reason),))
+        self.write_backoff(str((NOW + timedelta(minutes=1)).timestamp()))
+        self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.Unreachable("retry backoff"),))
+        self.write_backoff(str((NOW - timedelta(minutes=1)).timestamp()))
+        self.assertEqual(targets.ssh_target_snapshot(self.mac()).states, (targets.Free(),))
+
+    def test_local_snapshot_lists_every_holder_and_an_unrecorded_start(self) -> None:
+        self.write_holder(END.isoformat())
+        _ = (self.holders / "sweep").write_text("cargo sweep without a time", encoding="utf-8")
+        states = sorted(targets.local_hold_states(), key=lambda state: getattr(state, "holder", ""))
+        self.assertEqual(states, [
+            targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END), targets.HolderSession("hana")),
+            targets.Held("sweep", "cargo sweep without a time", targets.StartNotRecorded(), targets.UntilReleased(),
+                         targets.HolderSession("sweep")),
+        ])
 
     def test_live_claim_is_running(self) -> None:
         self.write_claim()
@@ -634,7 +688,7 @@ class ReservationTests(IsolatedTargetTest):
                         mock.patch.object(build_hold, "owning_session", return_value=session), \
                         mock.patch.object(process_identity, "process_start", side_effect=process_start), \
                         mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.WHOLE_MAC), \
-                        mock.patch.object(offload, "repository_identity", return_value=offload.KnownRepository("hana")), \
+                        mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
                         mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
                     with mock.patch.object(atomic_file, "write_text_atomic", side_effect=interrupted_write):
                         with self.assertRaisesRegex(OSError, "publication interrupted"):
@@ -677,6 +731,20 @@ class ValueTests(unittest.TestCase):
             with self.subTest(value=type(value).__name__):
                 with self.assertRaises(FrozenInstanceError):
                     setattr(value, "extra", "changed")
+
+    def test_start_and_end_text_name_each_case(self) -> None:
+        self.assertEqual(targets.start_text(SINCE, timezone.utc), "since 20:05 UTC")
+        self.assertEqual(targets.start_text(targets.StartNotRecorded(), timezone.utc), "start not recorded")
+        cases: tuple[tuple[targets.HoldEnd, str], ...] = (
+            (targets.ExpiresAt(END), "until 22:05 UTC"),
+            (targets.ReleaseEstimated(END), "expected release 22:05 UTC"),
+            (targets.UntilReleased(), "until released"),
+            (targets.AwaitingBlockRemoval(END), "awaiting unblock; requested expiry was 22:05 UTC"),
+            (targets.AwaitingBlockRemoval(), "awaiting unblock"),
+        )
+        for end, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(targets.end_text(end, timezone.utc), expected)
 
 
 if __name__ == "__main__":
