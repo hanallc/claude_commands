@@ -608,17 +608,12 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** stall-watch classifies a pane at a permission prompt as blocked on its first pass, sends no bump, and alerts the user on the usual prompt timing (rca 261114-1).
-
-**Spec:**
-- `scripts/production/stall_watch.py`: `prompt_on_screen` finds a `PROMPT_QUESTION` line with a `1. Yes` answer under it in the pane's bottom `PROMPT_LINES` lines. `watch_pass` treats such a pane as blocked whatever herdr's state is.
-- Add no new check.
-- Tests: a failing-first test in `scripts/production/test_stall_watch.py`. herdr reports idle and the screen shows the prompt: the first pass decides "permission prompt", the user alert goes, and no bump goes. Tests that end a prompt also clear it from the screen.
+- `stall_watch.prompt_on_screen` finds a `PROMPT_QUESTION` line with a `PROMPT_OPTION` answer (`❯ 1. Yes`) under it in the pane's bottom `PROMPT_LINES` lines.
+- `watch_pass` treats a pane that shows one as blocked, whatever herdr's state is. The pass sends no bump and alerts on the usual prompt timing from the pending call's time.
+- rca 261114-1 cause: herdr reads the dialog as idle when an input box shows under it (`live_prompt_box`), so stall-watch saw the prompt only when herdr first reported it blocked.
 
 **Files:**
-- `scripts/production/stall_watch.py`
-- `scripts/production/test_stall_watch.py`
-
-**Workers:** `director only (no Codex workers until the workers-back notice)`
+- `scripts/production/stall_watch.py` — `prompt_on_screen`, `PROMPT_OPTION` and the blocked decision in `watch_pass`
+- `scripts/production/test_stall_watch.py` — `test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass`; four tests that end a prompt clear it from the screen
