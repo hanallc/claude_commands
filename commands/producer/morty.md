@@ -120,6 +120,13 @@ Correct stale flags from delivery evidence. Do not mark unseen information read 
 After the list, show showrunners with open questions and their counts from current records.
 State missing or unreadable coverage explicitly. Do not treat missing data as zero.
 
+`phone list` shows the visible items for a narrow screen. Use no table and no code block.
+Use these bold group labels in order: `Needs you`, `Working`, `Delivered, not proven`, `Quiet`.
+In the first three groups, write `**#N Short title** · owner`, with `●` when unread.
+Under it, write one line of 12 words or fewer: nate's action, or the next step and its time.
+`Quiet` gives the numbers of the done, paused, and waiting items, one line for each state.
+End with the open question counts on one line and the parked numbers on one line.
+
 ## Parking and dependencies
 
 `park # until DATE/TIME` hides the item until that time. Preserve its number and incoming updates.
