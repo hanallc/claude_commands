@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import fcntl
 import io
 import os
 import shutil
@@ -429,6 +430,42 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         before = self.dirty_state()
         self.assert_ok(self.edit())
         self.assert_published(before)
+
+    def publish_pending(self) -> str:
+        program = ("from scripts.lib import models_registry; "
+                   + "print(models_registry.publish_pending(models_registry.registry_path()))")
+        result = self.command(sys.executable, "-c", program)
+        self.assert_ok(result)
+        return result.stdout.strip()
+
+    def test_a_later_edit_is_live_while_main_is_locked_and_publishes_when_main_is_free(self) -> None:
+        before = self.dirty_state()
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+        with (common / "main-push.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.environment["MODELS_CONFIG_PUBLISH"] = "later"
+            self.assert_ok(self.edit("agents_set_assignment direct claude"))
+            self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+            self.assertEqual(self.value("assignments", "direct"), "claude")
+            self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+            self.assertEqual(self.publish_pending(), "False")
+            self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, expected="direct=claude")
+        self.assertEqual(self.publish_pending(), "False")
+
+    def test_pending_rows_publish_onto_another_writers_registry_commit(self) -> None:
+        self.environment["MODELS_CONFIG_PUBLISH"] = "later"
+        self.assert_ok(self.edit("agents_set_assignment direct claude"))
+        self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+        path = self.competitor / "config/models.conf"
+        _ = path.write_text(path.read_text().replace("review=gpt-a:high", "review=gpt-b:max"))
+        _ = self.git("commit", "-am", "peer review row", cwd=self.competitor)
+        _ = self.git("push", "origin", "main", cwd=self.competitor)
+        before = self.dirty_state()
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, expected="direct=claude")
+        self.assertIn("review=gpt-b:max", self.git("show", "HEAD:config/models.conf"))
 
     def assert_obstructed_fast_forward_is_refused(self, obstruction: str, *, accepted_push: bool,
                                                 directory_obstruction: bool = False) -> None:
