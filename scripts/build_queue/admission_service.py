@@ -1148,6 +1148,9 @@ class AdmissionServer:
                 if isinstance(request.prerequisite, placement.TokenNotRequired) else placement.TokenRequired())
             if request.owner.host == self.host and self._live(wire.Owner(request.owner.pid, request.owner.start_time)):
                 self._watch_owner(request.owner)
+        for holder in self._claim_holders():
+            if self._live(holder):
+                self._watch_owner(holder)
 
     def _end_if_finished(self, episode: str, record: ReservationRecord) -> bool:
         lifetime = self._lifetime(record)
@@ -1275,6 +1278,7 @@ class AdmissionServer:
         owners.update(wire.Owner(place.run.pid, place.run.start_time) for place in self.run_places.values())
         owners.update(wire.Owner(request.owner.pid, request.owner.start_time)
                       for request in self.placement_requests.values() if request.owner.host == self.host)
+        owners.update(self._claim_holders())
         for descriptor, watch in list(self.watchers.items()):
             if (isinstance(watch, OwnerWatch) and watch.owner not in owners
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
@@ -2454,8 +2458,11 @@ done
         assignment = saved.assignment
         if (not isinstance(saved.state, placement.CurrentAssignment)
                 or self.current_assignments.get(assignment.episode) != placement.attempt_key(assignment.episode, assignment.attempt)
-                or assignment.episode not in self.placement_requests
-                or not isinstance(evidence, placement.FreshHostEvidence)
+                or assignment.episode not in self.placement_requests):
+            return False
+        if self._claim_holder_ended(saved):
+            return True
+        if (not isinstance(evidence, placement.FreshHostEvidence)
                 or any(claim.reference == saved.provider for claim in (*evidence.claims, *evidence.cleanup_claims))):
             return False
         report = saved.terminal_report
@@ -2463,18 +2470,46 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        if (assignment.destination.provider == "local"
-                or not isinstance(saved.permission, placement.PermissionConsumed)
-                or not isinstance(saved.provider, placement.ProviderClaimReference)
-                or not isinstance(saved.holder, placement.ClaimHolderIdentity)
-                or saved.holder.host != self.host
-                or self._live(wire.Owner(saved.holder.pid, saved.holder.start_time))
-                or evidence.observed_at <= saved.permission.consumed_at):
-            return False
+        return (self._ended_claim_holder(saved)
+            and isinstance(saved.permission, placement.PermissionConsumed)
+            and evidence.observed_at > saved.permission.consumed_at
+            and not self._start_pending(saved))
+
+    def _claim_holder_ended(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A provider claim whose holder and submitting owner ended frees its assignment.
+
+        The Mac can keep the claim after its holder ends. The next claim for the scope takes it
+        over and checks for leftovers, so the old assignment holds nothing. A live owner can still
+        send a terminal report, and a pending start can still launch, so both keep it current.
+        """
+        return (self._ended_claim_holder(saved)
+            and not self._placement_owner_live(saved.assignment.owner)
+            and not self._start_pending(saved))
+
+    def _ended_claim_holder(self, saved: records.SavedPlacementAssignment) -> bool:
+        return (saved.assignment.destination.provider != "local"
+                and isinstance(saved.permission, placement.PermissionConsumed)
+                and isinstance(saved.provider, placement.ProviderClaimReference)
+                and isinstance(saved.holder, placement.ClaimHolderIdentity)
+                and saved.holder.host == self.host
+                and not self._live(wire.Owner(saved.holder.pid, saved.holder.start_time)))
+
+    def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
 
-        identity = claim_state.ClaimIdentity(saved.provider.claim_id, saved.provider.episode, saved.provider.attempt)
-        return not offload.pending_start_path(assignment.destination.target, identity).exists()
+        provider = saved.provider
+        if not isinstance(provider, placement.ProviderClaimReference):
+            return False
+        identity = claim_state.ClaimIdentity(provider.claim_id, provider.episode, provider.attempt)
+        return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
+
+    def _claim_holders(self) -> set[wire.Owner]:
+        """The local holders of current provider claims, which the service watches."""
+        return {wire.Owner(saved.holder.pid, saved.holder.start_time)
+                for key in self.current_assignments.values()
+                if (saved := self.assignments.get(key)) is not None
+                and isinstance(saved.state, placement.CurrentAssignment)
+                and isinstance(saved.holder, placement.ClaimHolderIdentity) and saved.holder.host == self.host}
 
     def _placement_status(self, assignment: placement.PlacementAssignment, reason: str = "") -> wire.DispatchStatus:
         saved = self._saved_assignment(assignment.episode, assignment.attempt)
@@ -2842,6 +2877,7 @@ done
             return self._placement_status(assignment, "the exact claim is not adopted")
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
+        self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
         self.persist()
@@ -2874,33 +2910,34 @@ done
             if self.current_assignments.get(assignment.episode) != key:
                 continue
             report = saved.terminal_report
-            if isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled):
-                outcome = report.outcome
-                if isinstance(outcome, placement.AttemptCompleted):
-                    self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
-                    continue
-                if isinstance(outcome, placement.AttemptCancelled):
-                    self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
-                    continue
-                if isinstance(outcome, placement.PrelaunchRefused):
-                    self._close_placement(saved, outcome.reason,
-                        placement.retry_decision(assignment.destination, outcome.reason, report.received_at))
-                    continue
+            if (isinstance(report, placement.TerminalAttemptReport) and isinstance(report.path, placement.DispatchPathSettled)
+                    and not isinstance(report.outcome, placement.AttemptDeclined)):
+                self._close_for_report(saved, report)
+                continue
             if assignment.destination.provider == "local":
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:
                 continue
-            _ = self._request_host_evidence(submitted, assignment.destination)
-            if not self._provider_claim_released(saved, self._provider_release_evidence(saved)):
-                continue
+            if not self._claim_holder_ended(saved):
+                _ = self._request_host_evidence(submitted, assignment.destination)
+                if not self._provider_claim_released(saved, self._provider_release_evidence(saved)):
+                    continue
             if isinstance(report, placement.NoTerminalReport):
                 report = placement.TerminalAttemptReport(placement.AttemptDeclined("lost"),
                     placement.DispatchPathSettled(), self.clock.now())
                 saved = replace(saved, terminal_report=report)
-            assert isinstance(report.outcome, placement.AttemptDeclined)
-            self._close_placement(saved, report.outcome.reason,
-                placement.retry_decision(assignment.destination, report.outcome.reason, report.received_at))
+            self._close_for_report(saved, report)
+
+    def _close_for_report(self, saved: records.SavedPlacementAssignment, report: placement.TerminalAttemptReport) -> None:
+        outcome = report.outcome
+        if isinstance(outcome, placement.AttemptCompleted):
+            self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
+        elif isinstance(outcome, placement.AttemptCancelled):
+            self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
+        else:
+            self._close_placement(saved, outcome.reason,
+                placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
                           | wire.PrerequisiteReport | wire.CancelPlacement) -> list[wire.Reply]:
