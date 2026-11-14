@@ -686,17 +686,22 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
-2. Check each item and make its own merge commit.
-3. Test all code paths changed from the published merge branch tip through HEAD once.
-4. Use one `tested_main_push` hold, one push, and one local promotion.
-5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+1. Take the production merge lock once.
+2. Resume each item that the merge branch already contains through the single command's route, in file order.
+3. Retain the starting tip and whether a merge is unfinished.
+4. Check each remaining item and make its own merge commit.
+5. Test all code paths changed from the published merge branch tip through HEAD once.
+6. Use one `tested_main_push` hold, one push, and one local promotion.
+7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
+A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
-Those paths still select tests when only shrink or as-built items remain.
+An interrupted batch's merged item retests its unpublished paths when it resumes.
+A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
@@ -732,7 +737,7 @@ Full tests, probes, main retests, and all retries append to that log.
 The search restores the starting tip and drops the causing item and that unit's later items.
 A cancelled probe or another non-red stop drops every candidate with that stop.
 A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-Already-merged items receive `resume it alone with the single command`.
+A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
 The push start is the boundary for drop, reset, and retry.
 Once the push starts, a failure drops no items and starts no batch reset or retry.
 Only `push_rollback` can undo a failed push after it checks the live origin.
@@ -740,7 +745,8 @@ Each item receives the stop report.
 
 `test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows include a shrink-only retry.
+The interruption rows resume the merged item alone, including a shrink-only batch.
+The rerun row resumes the promotion of two pushed items and then lands a new item.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
 They also land a clean item after two holds and remove a held unit's later item.
 The history rows merge closing items for an older plan after the configured plan changes.
