@@ -78,6 +78,8 @@ PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 SENDER = "stall-watch"
 # The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
 PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
+# The first answer under the question, with the cursor mark when it is selected: "❯ 1. Yes".
+PROMPT_OPTION = re.compile(r"^❯?\s*1\.\s*Yes\b")
 # "make this edit to panes.py" reads as "edit panes.py".
 EDIT_ASK = re.compile(r"make (?:this|these) edits? to (?P<file>.+)")
 BASH_PROMPT_TITLE = "Bash command"
@@ -1006,6 +1008,13 @@ def save_prompt(path: Path, prompt: PromptWait) -> None:
     write_text_atomic(path, json.dumps(record) + "\n")
 
 
+def prompt_on_screen(pane: str) -> bool:
+    """Whether a permission prompt's question and its first answer show at the pane's bottom."""
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
+    asked = next((index for index, line in enumerate(lines) if PROMPT_QUESTION.search(line)), None)
+    return asked is not None and any(PROMPT_OPTION.match(line) for line in lines[asked + 1:])
+
+
 def auto_denied(pane: str) -> bool:
     """Whether the permission prompt at the pane's bottom shows the auto-deny banner."""
     return any(AUTO_DENY_BANNER.match(line.strip(FRAME)) for line in pane.splitlines()[-PROMPT_LINES:])
@@ -1439,6 +1448,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 if time.monotonic() >= inspection_deadline:
                     continue
                 blocked = None
+            # herdr's state can miss a prompt for hours while the pane shows it: the screen decides too.
+            if prompt_on_screen(pane):
+                blocked = True
             if not pane_budget_left(name, inspection_deadline):
                 continue
             if blocked:

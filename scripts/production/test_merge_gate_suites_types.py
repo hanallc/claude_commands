@@ -10,7 +10,7 @@ import io
 import json
 import tempfile
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import os
 import shutil
 import subprocess
@@ -318,7 +318,7 @@ class NightlyPushTests(unittest.TestCase):
                 self.assertRegex(values["time"], r"^\d{2}:\d{2} E[SD]T$")
                 self.assertNotIn("--priority", command)
 
-    def test_assignment_and_fallback_send_each_red_result_once(self) -> None:
+    def test_assignment_sends_each_red_result_once(self) -> None:
         from scripts.notify import push_texts
         from scripts.maintenance import herdr_upkeep
         from scripts.herdr import herdr, detection_rules
@@ -326,8 +326,8 @@ class NightlyPushTests(unittest.TestCase):
 
         run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0,
                                  "FAIL: saved branch differs"),), 0, 0)
-        for route in ("assignment", "fallback", "maintenance", "notice failure", "send failure", "assignment race",
-                      "busy lock", "save failure", "long assignment", "long fallback"):
+        for route in ("assignment", "maintenance", "notice failure", "send failure", "assignment race",
+                      "busy lock", "save failure", "long assignment"):
             with self.subTest(route=route), tempfile.TemporaryDirectory() as directory:
                 state = Path(directory)
                 case_run = (merge_gate.GateRun(tuple(merge_gate.GateJobResult("production",
@@ -379,7 +379,7 @@ class NightlyPushTests(unittest.TestCase):
                     assignment = ["nightly-assigned", "--result", record_path.stem, "--unit", str(self.fixer.id)]
                     if route == "save failure":
                         from scripts.message import send, send_result
-                        NightlyClock.current = finished + timedelta(minutes=30)
+                        NightlyClock.current = finished + timedelta(minutes=5)
                         sessions = state / "sessions"
                         sessions.mkdir()
                         def invoke_sender(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -394,45 +394,42 @@ class NightlyPushTests(unittest.TestCase):
                         with (mock.patch.object(send, "STATE", state / "message"),
                               mock.patch.object(send, "SESSIONS", sessions),
                               mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(sessions)}),
-                              mock.patch.object(send, "user", return_value=send.Result("sent", "fixture phone")) as phone):
+                              mock.patch.object(send, "user", return_value=send.Result("sent", "fixture phone")) as phone,
+                              redirect_stderr(io.StringIO())):
                             sent.side_effect = invoke_sender
                             with mock.patch.object(merge_gate, "save_nightly_red", side_effect=fail_acceptance_save):
-                                self.assertEqual(merge_gate.main(["nightly-check"]), 1)
+                                self.assertEqual(merge_gate.main(assignment), 1)
                             self.assertEqual(merge_gate.main(assignment), 0)
                             self.assertEqual(merge_gate.main(["nightly-check"]), 0)
                             phone.assert_called_once()
                         continue
-                    assigned = route.startswith("assignment") or route == "long assignment"
-                    if assigned:
-                        NightlyClock.current = finished + timedelta(minutes=30 if route == "assignment race" else 5)
-                        if route == "assignment race":
-                            def racing_check(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-                                del options
-                                self.assertEqual(merge_gate.main(["nightly-check"]), 1)
-                                return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
-                            sent.side_effect = racing_check
-                        self.assertEqual(merge_gate.main(assignment), 0)
-                    else:
-                        NightlyClock.current = finished + timedelta(minutes=29, seconds=59)
-                        self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                    assigned_minutes = 30 if route in ("assignment race", "maintenance") else 5
+                    NightlyClock.current = finished + timedelta(minutes=assigned_minutes)
+                    if route == "maintenance":
+                        with (mock.patch.object(herdr, "restore_server"),
+                              mock.patch.object(herdr, "live_sessions", return_value=[]),
+                              mock.patch.object(herdr, "save_shared_layout"),
+                              mock.patch.object(detection_rules, "refresh"),
+                              mock.patch.object(accounts, "producer_upkeep_members", return_value=[])):
+                            herdr_upkeep.upkeep()
                         sent.assert_not_called()
-                        NightlyClock.current = finished + timedelta(minutes=30)
-                        if route == "send failure":
-                            sent.return_value = subprocess.CompletedProcess([], 3, "", "sender unavailable")
+                        self.assertEqual(notice.call_count, 2)
+                        self.assertEqual(notice.call_args.args[1], f"merge-gate-nightly-unassigned:{record_path.stem}")
+                    if route == "assignment race":
+                        def racing_check(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                            del options
                             self.assertEqual(merge_gate.main(["nightly-check"]), 1)
-                            pending = cast(dict[str, object], json.loads(record_path.read_text()))
-                            self.assertEqual(pending["delivery"], {})
-                            sent.return_value = subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")
-                            sent.reset_mock()
-                        if route == "maintenance":
-                            with (mock.patch.object(herdr, "restore_server"),
-                                  mock.patch.object(herdr, "live_sessions", return_value=[]),
-                                  mock.patch.object(herdr, "save_shared_layout"),
-                                  mock.patch.object(detection_rules, "refresh"),
-                                  mock.patch.object(accounts, "producer_upkeep_members", return_value=[])):
-                                herdr_upkeep.upkeep()
-                        else:
-                            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                            return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
+                        sent.side_effect = racing_check
+                    if route == "send failure":
+                        sent.return_value = subprocess.CompletedProcess([], 3, "", "sender unavailable")
+                        with redirect_stderr(io.StringIO()):
+                            self.assertEqual(merge_gate.main(assignment), 1)
+                        pending = cast(dict[str, object], json.loads(record_path.read_text()))
+                        self.assertEqual(pending["delivery"], {})
+                        sent.return_value = subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")
+                        sent.reset_mock()
+                    self.assertEqual(merge_gate.main(assignment), 0)
                     sent.assert_called_once()
                     command = cast(list[str], sent.call_args.args[0])
                     text_id = command[command.index("--text-id") + 1]
@@ -442,12 +439,8 @@ class NightlyPushTests(unittest.TestCase):
                     if route.startswith("long "):
                         from scripts.notify import pushover
                         message = pushover.fields({"token": "fixture", "user": "fixture"}, "Nightly", message, "0")["message"]
-                    self.assertIn("sdlc has not confirmed receipt" if route == "notice failure"
-                                  else "sdlc received it at 03:00 EST", message)
-                    if assigned:
-                        self.assertIn("Assigned to fixes at " + ("03:30 EST" if route == "assignment race" else "03:05 EST"), message)
-                    else:
-                        self.assertIn("sdlc has not assigned the fix yet", message)
+                    self.assertIn("sdlc received it at " + ("03:05 EST" if route == "notice failure" else "03:00 EST"), message)
+                    self.assertIn(f"Assigned to fixes at 03:{assigned_minutes:02d} EST", message)
                     with redirect_stdout(io.StringIO()) as repeated:
                         self.assertEqual(merge_gate.main(assignment), 0)
                         self.assertEqual(merge_gate.main(assignment), 0)
@@ -456,6 +449,70 @@ class NightlyPushTests(unittest.TestCase):
                     sent.assert_called_once()
                     saved = cast(dict[str, object], json.loads(record_path.read_text()))
                     self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(self.fixer.id))
+
+    def red_nightly(self, finished: datetime) -> Path:
+        NightlyClock.current = finished
+        self.assertEqual(self.nightly(), 1)
+        record_path, = (self.root / "state/nightly-red").glob("*.json")
+        return record_path
+
+    def test_an_unassigned_red_sends_no_user_push_at_any_age(self) -> None:
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+        with (self.execution(run) as sent, mock.patch.object(merge_gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO())):
+            _ = self.red_nightly(finished)
+            for minutes in (0, 29, 30, 31, 90, 24 * 60):
+                NightlyClock.current = finished + timedelta(minutes=minutes)
+                self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            sent.assert_not_called()
+
+    def test_an_unassigned_red_alerts_the_production_owner_each_window_until_assigned(self) -> None:
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+        with (self.execution(run) as sent, mock.patch.object(merge_gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO())):
+            record_path = self.red_nightly(finished)
+            alerts = cast(mock.MagicMock, showrunners.tell)
+            alerts.reset_mock()
+            for minutes, expected in ((29, 0), (30, 1), (32, 1), (59, 1), (60, 2), (61, 2)):
+                NightlyClock.current = finished + timedelta(minutes=minutes)
+                self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+                self.assertEqual(alerts.call_count, expected, f"minute {minutes}")
+            owner, key, text = cast(tuple[str, str, str], alerts.call_args.args)
+            self.assertEqual(owner, "sdlc")
+            self.assertEqual(key, f"merge-gate-nightly-unassigned:{record_path.stem}")
+            self.assertIn(f"nightly-assigned --result {record_path.stem} --unit UNIT", text)
+            self.assertIn("production/test_staff.py", text)
+            alerts.return_value = "could not tell sdlc: offline"
+            NightlyClock.current = finished + timedelta(minutes=90)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            NightlyClock.current = finished + timedelta(minutes=92)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(alerts.call_count, 4)
+            alerts.return_value = "told sdlc"
+            self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", str(self.fixer.id)]), 0)
+            sent.assert_called_once()
+            NightlyClock.current = finished + timedelta(minutes=180)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(alerts.call_count, 4)
+            sent.assert_called_once()
+
+    def test_a_unit_director_of_another_production_can_take_the_fix(self) -> None:
+        builds = fixture_member("showrunner", name="builds")
+        queue = fixture_member("unit", name="queue", parent=builds.id)
+        run = merge_gate.GateRun((merge_gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        for reference in ("builds/queue", str(queue.id)):
+            with (self.subTest(reference=reference), tempfile.TemporaryDirectory() as directory,
+                  mock.patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": directory}),
+                  self.execution(run) as sent, redirect_stdout(io.StringIO())):
+                self.assertEqual(self.nightly(), 1)
+                self.assertEqual(merge_gate.main(["nightly-assigned", "--unit", reference]), 0)
+                command = cast(list[str], sent.call_args.args[0])
+                self.assertIn("unit=queue", command)
+        with self.execution(run), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(self.nightly(), 1)
+            self.assertNotEqual(merge_gate.main(["nightly-assigned", "--unit", "builds"]), 0)
 
     def test_off_disables_both_push_texts_at_use(self) -> None:
         from scripts.notify import push_texts
