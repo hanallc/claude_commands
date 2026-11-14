@@ -332,18 +332,6 @@
       "time": "2026-11-06T10:40:29.948005-05:00"
     }
   },
-  "nightly.unassigned": {
-    "received": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
-      "time": "2026-11-11T13:40:09.429090-05:00"
-    },
-    "unreceived": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
-      "time": "2026-11-11T13:40:09.429110-05:00"
-    }
-  },
   "nix_heal.failed": {
     "refused": {
       "reviewer": "opus",
