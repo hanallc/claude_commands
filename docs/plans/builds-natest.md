@@ -3999,3 +3999,32 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The four tests that edit the fixture text use the indented layout.
 - AWS pair (c7a.4xlarge, 3 rounds): sum of 9 verify modules 175.06 -> 116.08 CPU s; `test_verify_lint_local_writes` 59.44 -> 31.14.
 - Commit a8e5d997f. Test-only change.
+
+### Phase 274 — The status line reads staff.json with one jq start  · status: done
+**Depends on:** none
+**Owner:** natest (production change; needs the sdlc go).
+
+#### Work Order
+
+**Goal:** each `statusline.sh` run starts one staff jq call, not two, so `statusline/test_statusline.py` uses less AWS CPU.
+
+**Decision:** sweep 2026-11-14: `test_statusline.py` 32.4 natedev CPU s; jq 773 starts 17.6 s. Each run started a `printf | jq` pipe for the unit row and a second jq for the showrunner ids.
+
+**Spec:**
+1. One jq call reads `$staff`. It takes the payload with `--arg` and reads `.session_id` through `fromjson` in a `try`.
+2. It prints `unit <id> <session>` for the matched unit row. With no unit row, it prints the showrunner ids.
+3. The shell sets `unit_session` from a `unit ` line and loops over the showrunner ids otherwise.
+4. Keep each output: a bad payload matches no unit row; `/dev/null` staff gives no owners.
+
+**Files:**
+- `scripts/statusline/statusline.sh`
+
+**Workers:** director; one 10-line shell change.
+- impl: all files.
+
+**Constraints from prior phases:**
+- sdlc terms: a production diff needs the sdlc go; land only on a measured aws gain.
+
+**Acceptance gate:**
+- `test_statusline.py` passes with the same tests.
+- `module_cost.py` CPU before and after; aws pair (3 rounds) shows a gain.
