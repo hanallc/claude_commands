@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
-from scripts.style import refill_findings, style_ledger, style_plan
+from scripts.style import refill_facts, refill_findings, style_ledger, style_plan
 from scripts.style.ledger_test_support import LedgerTestCase, PARENT_FILE, ticket_owner_id
 from scripts.style.refill_findings import encode_proof
 
@@ -52,6 +52,8 @@ class FindingResultsTests(LedgerTestCase):
             connection.set_progress_handler(lambda: steps.append(1) and 0, 1000)
             _ = connection.execute("UPDATE held_findings SET path=?,line=1 WHERE finding_id=?", (self.sources[1], finding.finding_id))
             _ = connection.execute("UPDATE judgments SET verdict=verdict WHERE rule=?", (rule,))
+            # The coverage read walks the dependencies of its own catalog's cells, not every stored git object.
+            _ = connection.execute(style_ledger.SYNCED_CELL_OBJECTS, ("another-catalog",)).fetchall()
             connection.set_progress_handler(None, 0)
             self.assertLess(len(steps), 20)
         _ = self.assert_recomputation(ids, True)
@@ -149,6 +151,19 @@ class FindingResultsTests(LedgerTestCase):
             finally:
                 _ = hidden.rename(object_path)
 
+        with self.subTest(read="findings that share a file"):
+            source = "pub fn first() {}\n\npub fn second() {}\n"
+            _ = self.commit_tip(ledger, {PARENT_FILE: source})
+            _, shared = self.judge_parent(ledger, ((1, "pub fn first() {}"), (3, "pub fn second() {}")),
+                                          before="first", after="primary")
+            current = self.commit_tip(ledger, {PARENT_FILE: "// header\n" + source})
+            _ = self.assert_recomputation(shared, True)
+            # A stored reading reads the declarations of a file once, though two findings name the file.
+            with self.ledger() as reader, mock.patch.object(refill_facts.RefillFacts, "input_fact", autospec=True,
+                                                             side_effect=refill_facts.RefillFacts.input_fact) as facts:
+                _ = reader.declaration_reading(shared, lambda _: True)
+            declared = [call.args[2] for call in facts.call_args_list if call.args[1] == "finding_declarations"]
+            self.assertEqual(declared, [self.git("rev-parse", f"{current}:{PARENT_FILE}")])
         with self.subTest(read="many findings in one declaration group"):
             paths = tuple(f"crates/alpha/src/group_{index}.rs" for index in range(12))
             current = self.commit_tip(ledger, {path: f"fn group_{index}() {{\n    let value = {index};\n}}\n"

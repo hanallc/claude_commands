@@ -18,7 +18,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
-from scripts.lib import conf_reads, git_index, main_push_lock, registry_rows, waiting_rows
+from scripts.lib import conf_reads, git_index, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
@@ -343,7 +343,7 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
         _ = _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{REGISTRY_PATH}",
                  environment=environment)
         tree = _git(repo, "write-tree", environment=environment)
-        commit = _git(repo, "commit-tree", tree, "-p", parent, "-m", f"config(models): {' '.join(description.splitlines())}")
+        commit = _git(repo, "commit-tree", tree, "-p", parent, "-m", main_publish.REGISTRY_SUBJECT + ' '.join(description.splitlines()))
         return commit
 
 
