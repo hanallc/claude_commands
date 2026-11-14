@@ -16,7 +16,7 @@
 - **User zone:** read it with `python3 ~/.claude/scripts/lib/user_zone.py`. user_zone.conf is the one setting, and every time a report gives is in that zone. This doc stores no zone, because a stored copy goes stale when the user moves (it read AST after the move to EST).
 - **Updates:** Use `/showrunner:units` for unit status on request.
   Dailies were retired on 2026-11-11.
-- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout
+- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'`, `python3 -m unittest scripts.accounts.test_accounts` and `basedpyright scripts/buildlog` (exits 0 when clean, with `0 errors, 0 warnings, 0 notes`), run in the showrunner checkout. The accounts module joined on 2026-11-14: no-worker-fyi (766542813) broke it and the buildlog tests did not see it.
 - **Push:** git
 - **Promote:** ~/.claude, mac ~/.claude
 - **Capacity:** five units; `report.py` is shared, and whoever lands second resolves conflicts; its seats share natedev's build slots (steve)
