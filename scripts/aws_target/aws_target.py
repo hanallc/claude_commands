@@ -194,9 +194,7 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     """Name each regional permission error and its repair."""
     lines: list[str] = []
     for failure in failures:
-        code_match = re.search(r'\(([A-Za-z][A-Za-z0-9_.]*)\)|\b([A-Z][A-Za-z0-9_.]*):', failure.reason)
-        code = (code_match[1] or code_match[2]) if code_match else failure.error
-        lines.append(f'AWS denied the {failure.read} read in {failure.region} ({code}).')
+        lines.append(f'AWS refused the {failure.region} {failure.read} read.')
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
