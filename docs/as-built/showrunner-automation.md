@@ -550,12 +550,11 @@ Pane labels do not identify a consultation.
   Bare, it prints the configured zone, label, UTC offset, and current time.
   `set NAME` resolves an IANA name, city, or current seasonal label.
   Ambiguous or unknown names exit 2 with the candidate offsets.
-  Publication runs on natedev through `main_publish`, shared with `/tune`.
-  It updates `zone=` while preserving comments, commits only that file, and pushes main.
-  A failed commit keeps the new text when the file already matches HEAD.
-  Otherwise, it restores the previous text and refuses publication.
-  The Mac pulls through the shared helper, and the broadcast reaches both machines.
-  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  It runs on natedev through `live_settings`, the path `/tune` uses.
+  It writes `zone=` live on natedev and on the Mac at once, while preserving comments.
+  The broadcast then reaches both machines. The commit of only that row, the push and the Mac pull follow.
+  A failed publication keeps the zone live and exits 2; the notes timer publishes it later.
+  A failed Mac write queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
   Pending pulls retain each Mac path and source.
   A bare call drains the queue before it returns.
   Promotion runs `zone.py drain --pulled <path>` after a successful pull.
