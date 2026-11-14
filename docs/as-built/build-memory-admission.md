@@ -914,16 +914,21 @@ The next cut-over imports the polling checker's current priority because the ret
 
 ### Cargo wrapper (natedev only)
 
-`scripts/build_hold/cargo` puts building cargo commands from shells, scripts and TUIs in a `builds.slice` scope.
+`scripts/build_hold/cargo` sends building cargo commands from shells, scripts and TUIs to the build queue.
 This includes `cargo mend`, which builds the workspace.
 The wrapper uses the first other cargo on PATH and keeps its arguments and exit status.
-Non-building commands such as `metadata`, `fmt` and `tree` run immediately.
-A call already in `builds.slice` skips the hold check and a second scope, unless it runs under `builds-detached.slice`.
-A call under `builds-detached.slice` follows the same hold and scope path as a call from a shell.
+Non-building commands such as `metadata`, `fmt` and `tree` run immediately in Bash, with no Python and no queue request.
+`test_cargo_wrapper.test_non_building_commands_start_with_no_python_and_no_queue_request` proves this.
+A call already in `builds.slice` runs at once, unless it runs under `builds-detached.slice`.
+Such a call comes from a queued step or an editor scope, so it has no second queue place.
+A call under `builds-detached.slice` follows the same hold and queue path as a call from a shell.
 These building calls check `hold_applies.py` when the hold directory has an entry.
 An applicable hold refuses the command.
 Unreadable state prints a note and allows the command.
-An empty hold directory starts no Python.
+An empty hold directory starts no hold check.
+The wrapper then runs `scripts/build_queue/queue_place.py -- <cargo> <arguments>`.
+The queue place waits for admission, starts cargo in its own `builds.slice` scope and releases the place when cargo exits.
+A complete cargo command sizes from its step history, as a `verify.sh` step does; `program_first_peak_gib.cargo` is the first peak.
 Without a user bus or `systemd-run`, cargo runs directly.
 
 Install on natedev from the repo root with `scripts/build_hold/install_cargo_wrapper.sh`. It links `~/.local/bin/cargo` to the wrapper and refuses to replace another file. `~/.local/bin` must precede `~/.cargo/bin` on PATH. On macOS, the installer makes no link and the wrapper calls cargo directly. Tests use `BUILD_HOLD_DIR`, `CARGO_WRAPPER_CGROUP_FILE` and `XDG_RUNTIME_DIR` to select temporary state.

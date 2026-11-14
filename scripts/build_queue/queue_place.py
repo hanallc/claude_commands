@@ -465,7 +465,10 @@ class QueuePlace:
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
-    """Use full commands for purpose selection; retain named batch reservations."""
+    """Use full commands for purpose selection; retain named batch reservations.
+
+    A complete Cargo command sizes from its step history, as each Cargo step does.
+    """
     # A name requests a batch place. A complete command permits purpose selection.
     try:
         if isinstance(program, str):
@@ -478,11 +481,14 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         config = step_estimator.memory_config()
     except conf.Unusable as error:
         raise QueuePlaceRefused(str(error)) from error
-    if purpose == ProgramPurpose.BATCH and isinstance(sizing, ConfiguredFirstPeak):
+    estimate: admission_records.HistoryPeakSizing | ConfiguredFirstPeak | admission_records.InferFromArgv = sizing
+    if purpose == ProgramPurpose.BATCH and arguments and name == "cargo" and isinstance(sizing, ConfiguredFirstPeak):
+        estimate = admission_records.INFER_FROM_ARGV
+    if purpose == ProgramPurpose.BATCH and isinstance(estimate, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(name)
         if first is None:
             raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
-        sizing = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
+        estimate = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
     cleanup_program_starts(config)
     cleanup_queue_place_folders()
     pid = os.getpid()
@@ -495,8 +501,9 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         atomic_file.atomic_sample(sidecar, "")
         grant: wire.Admitted | UnreservedProgram = UnreservedProgram()
         if purpose == ProgramPurpose.BATCH:
-            assert not isinstance(sizing, ConfiguredFirstPeak)
-            profile = admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
+            assert not isinstance(estimate, ConfiguredFirstPeak)
+            profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
+                       admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), estimate))
             start = admission_records.process_start_time(pid)
             if start is None:
                 raise QueuePlaceRefused("owner no longer exists")

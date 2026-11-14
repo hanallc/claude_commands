@@ -614,6 +614,20 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertTrue(requests.call_args_list)
             self.assertTrue(all(call.args[0] == argv for call in requests.call_args_list))
 
+    def test_cargo_command_sizes_from_its_step_history(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            argv = ["/tools/cargo", "check", "--workspace"]
+            with mock.patch.object(step_estimator, "program_peak_estimate",
+                                   side_effect=AssertionError("cargo sized from program history")), \
+                 mock.patch.object(client, "step_request", wraps=client.step_request) as requests:
+                with queue.queue_place(argv, fixture.root) as place:
+                    _, row = fixture.reservation()
+                    self.assertEqual((row["step"], row["need"]), ("check", 12 * GIB))
+                    self.assertEqual(place.purpose, queue.ProgramPurpose.BATCH)
+            self.assertTrue(requests.call_args_list)
+            self.assertTrue(all(call.args[0] == argv and call.args[6] is records.INFER_FROM_ARGV
+                                for call in requests.call_args_list))
+
     def require_transient_scope(self) -> None:
         if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             reason = "transient scope test needs cgroup v2 (not available on the Mac)"
