@@ -31,7 +31,6 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.lib import atomic_file, conf, nix_env
 from scripts.herdr import pane_launch
 from scripts.production import staff
-from scripts.message.session_records import INPUT_STATUSES
 from scripts.message import send_result, sessions
 from scripts.message import send_budget
 if TYPE_CHECKING:
@@ -449,7 +448,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
     if held:
         log(directory, session, history, "skip", held)
         return
-    if session.status not in INPUT_STATUSES:
+    if session.status not in sessions.INPUT_STATUSES:
         log(directory, session, history, "skip", "session is not idle")
         return
     now = time.time()
@@ -479,7 +478,7 @@ def heal_one(directory: Path, limits: HealLimits, session: HealSession, history:
         return
     fresh = next((item for item in list_sessions() if item.session_id == session.session_id), None)
     if (fresh is None or fresh.pid != session.pid or fresh.proc_start != session.proc_start
-            or fresh.status not in INPUT_STATUSES or not broken(fresh)):
+            or fresh.status not in sessions.INPUT_STATUSES or not broken(fresh)):
         log(directory, session, history, "skip", "session changed during environment load")
         return
     from scripts.whoami import account
