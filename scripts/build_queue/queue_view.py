@@ -752,10 +752,10 @@ def head_status(model: QueueModel) -> Line:
 
 
 def cap_bar(room: admission_records.MemoryRoom | admission_records.ReadingUnavailable, width: int, *, colour: bool) -> Line:
-    """Draw captured use, keep-aside, room, safety, and other programs."""
+    """Draw captured use, keep-aside, room, swapped agent memory, safety, and other programs."""
     if not isinstance(room, admission_records.MemoryRoom) or not isinstance(room.cap, int):
         return (Span("cap unavailable", "inactive"),)
-    total = room.total if isinstance(room.total, int) else max(1, room.cap + room.safety)
+    total = room.total if isinstance(room.total, int) else max(1, room.cap + room.agent_swap_demand + room.safety)
     cells = max(1, min(width, (total + admission_records.GIB - 1) // admission_records.GIB))
     scale = total / cells
     cap_at = min(cells - 1, max(0, int(room.cap / scale)))
@@ -772,7 +772,9 @@ def cap_bar(room: admission_records.MemoryRoom | admission_records.ReadingUnavai
             result.append(Span("░", "warning"))
         elif point < room.cap:
             result.append(Span("█" if colour else "·", "success"))
-        elif point < room.cap + room.safety:
+        elif point < room.cap + room.agent_swap_demand:
+            result.append(Span("▓", "inactive"))
+        elif point < room.cap + room.agent_swap_demand + room.safety:
             result.append(Span("█" if colour else "▒", "warning"))
         else:
             result.append(Span("█", "inactive"))

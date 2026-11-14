@@ -1025,10 +1025,13 @@ class MemoryShares(TypedDict):
 
 def memory_shares(total: float, room: admission_records.MemoryRoom, safety: float, used: float,
                   reserved: float) -> MemoryShares:
-    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand in free memory."""
+    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand outside the cap."""
     available = gib(room.available)
     shown_safety = min(safety, used + available)
-    shown_reserved = max(0.0, min(reserved, available - safety))
+    # Swapped agent memory is outside the cap: it sits right of the cap line, so reserved stops at the cap.
+    agents_swap = gib(room.agent_swap_demand)
+    shown_agents_swap = max(0.0, min(agents_swap, available - safety))
+    shown_reserved = max(0.0, min(reserved, available - safety - shown_agents_swap))
     outside = max(0.0, total - available - gib(room.cap_use))
     agents = gate.agents_memory()
     guarantee = gate.desktop_guarantee()
@@ -1036,12 +1039,11 @@ def memory_shares(total: float, room: admission_records.MemoryRoom, safety: floa
     desktop = gib(guarantee) if isinstance(guarantee, int) else None
     shown_agents = min(agents_ram or 0.0, outside)
     shown_desktop = min(desktop or 0.0, outside - shown_agents)
-    agents_swap = gib(room.agent_swap_demand)
     return {
         "other": outside - shown_agents - shown_desktop,
         "desktop_guarantee": desktop, "agents_ram": agents_ram, "agents_swap": agents_swap,
         "shown_desktop": shown_desktop, "shown_agents": shown_agents,
-        "shown_agents_swap": max(0.0, min(agents_swap, available - shown_reserved - gib(room.room) - shown_safety)),
+        "shown_agents_swap": shown_agents_swap,
         "slices_unavailable": "; ".join(reading.reason for reading in (agents, guarantee)
                                         if isinstance(reading, admission_records.ReadingUnavailable)),
         "shown_safety": shown_safety, "shown_reserved": shown_reserved,

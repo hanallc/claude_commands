@@ -354,8 +354,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved, not used yet</span><span class="v num" id="v-reserved">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
       <div class="row" data-tip="cap"><span class="sw cap"></span><span class="name">Cap line</span><span class="v num" id="v-cap">–</span></div>
-      <div class="row" data-tip="floor"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-floor">–</span></div>
       <div class="row" data-tip="agents_swap"><span class="sw agents_swap"></span><span class="name">Agents' swapped memory</span><span class="v num" id="v-agents_swap">–</span></div>
+      <div class="row" data-tip="floor"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-floor">–</span></div>
       <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
       <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop guarantee</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="other"><span class="sw other"></span><span class="name">Other programs and the system</span><span class="v num" id="v-other">–</span></div>
@@ -420,11 +420,11 @@ const TIPS = {
     const row = d.walk.find((r) => r.ci);
     return [`hana CI · ${row ? row.detail : `${f1(d.ci_ram)} GiB RAM`}`, row ? row.keep_text : "CI runner memory is not readable."];
   },
-  agents_swap: (d) => [`Agents' swapped memory · ${f1(d.agents_swap)} GiB`, "Agent memory in swap. It can return to RAM at any time, so the queue does not give it to builds."],
+  agents_swap: (d) => [`Agents' swapped memory · ${f1(d.agents_swap)} GiB`, "Agent memory in swap. It can return to RAM at any time, so it is outside the cap and the queue does not give it to builds."],
   agents: (d) => [`Agents · ${sliceAmount(d.agents_ram)}`, recorded(d.agents_ram) ? "Agent sessions and their tools in RAM. This changes as agents start and stop." : d.slices_unavailable],
   desktop: (d) => [`Desktop guarantee · ${sliceAmount(d.desktop_guarantee)}`, recorded(d.desktop_guarantee) ? "Memory the system keeps for the desktop, so the mouse and keyboard stay responsive." : d.slices_unavailable],
   other: (d) => [`Other programs and the system · ${f1(d.other)} GiB`, "Memory that is not builds, agents or the desktop guarantee: editors, browsers and the system."],
-  past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety. The bar shows zero room."],
+  past: (d) => [`Shortfall · ${f1(d.shortfall)} GiB`, "Reserved exceeds free memory minus safety and agents' swapped memory. The bar shows zero room."],
   floor: (d) => [`Safety · ${f1(d.floor)} GiB`, `The queue keeps ${f1(d.floor)} GiB free.`],
 };
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
@@ -638,7 +638,7 @@ function tipText(key, d) {
 function roomEquation(d) {
   const terms = d.room_source === "cap"
     ? [["cap", d.cap], ["builds use", d.used], ["hana CI", d.ci_ram], ["reserved", d.reserved]]
-    : [["free", d.available], ["reserved", d.reserved], ["safety", d.floor]];
+    : [["free", d.available], ["reserved", d.reserved], ["safety", d.floor], ["agents' swapped memory", d.agents_swap]];
   const shown = terms.filter((term, index) => index === 0 || f1(term[1]) !== "0.0");
   const sum = shown.map(([name, amount]) => `${name} ${f1(amount)}`).join(" − ");
   return `Next step room = ${d.shortfall > 0 ? `max(0, ${sum})` : sum} = ${f1(d.room)} GiB`;
