@@ -642,7 +642,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assert_held_in_no_worker_mode(refused=True)
 
     def assert_held_in_no_worker_mode(self, *, refused: bool) -> None:
-        from scripts.whoami import quota_alert
+        from scripts.whoami import quota_state
 
         busy = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
@@ -653,7 +653,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(worker_panes.worker_pass(busy.row, self.run_dir).get("status"), "refused")
         _ = self.fixture.world.stop(busy.row, self.fixture.world)
         launches = len(self.fixture.world.launches)
-        with (patch.object(quota_alert, "no_worker_mode", return_value=True),
+        with (patch.object(quota_state, "no_worker_mode", return_value=True),
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume):
             self.assertEqual(self.command("restore"), (0, f"{busy.row.name}: not resumed: no-worker mode\n"
                                                        + f"{self.fixture.parent.name}: workers unchanged\n", ""))

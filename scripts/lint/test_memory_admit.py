@@ -297,6 +297,7 @@ class BuildBudgetTests(unittest.TestCase):
             ("wait_reply_seconds", lambda: admission_records.read_memory_config().wait_reply_seconds, 60),
             ("query_timeout_seconds", lambda: admission_records.read_memory_config().query_timeout_seconds, 0.5),
             ("replay_retention_seconds", lambda: admission_records.read_memory_config().replay_retention_seconds, 86400),
+            ("ended_placement_seconds", lambda: admission_records.read_memory_config().ended_placement_seconds, 600),
             ("reconnect_seconds", lambda: admission_records.read_memory_config().reconnect_seconds, 2),
             ("silence_seconds", lambda: admission_records.read_memory_config().silence_seconds, 120),
             ("outage_notice_seconds", lambda: admission_records.read_memory_config().outage_notice_seconds, 60),

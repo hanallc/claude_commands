@@ -5,15 +5,17 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import fcntl
 import shlex
 import socket
 import subprocess
 import sys
+import time
 from typing import override
 import unittest
 from unittest import mock
 
-from scripts.lib import main_publish, tune
+from scripts.lib import live_settings, main_publish, models_registry, tune
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase
 
@@ -118,6 +120,85 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertIn("git fetch -q --no-write-fetch-head", self.repository.ssh_log.read_text())
 
+    def waiting(self) -> list[live_settings.WaitingChange]:
+        with mock.patch.dict(os.environ, self.repository.env, clear=True), live_settings._journal() as journal:  # pyright: ignore[reportPrivateUsage]
+            return list(journal)
+
+    def test_a_change_is_live_here_and_on_the_mac_while_main_is_locked_and_main_gets_it_after(self) -> None:
+        repo = self.repository
+        lock = (repo.checkout / ".git/main-push.lock").open("a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        running = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes"],
+            cwd=repo.checkout, env=repo.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        while not (repo.ssh_log.exists() and "live_settings.py" in repo.ssh_log.read_text()) \
+                and running.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNone(running.poll())
+        self.assertIn("amount=3", repo.config.read_text())
+        self.assertIn("amount=2", repo.git(repo.checkout, "show", "HEAD:config/example.conf"))
+        self.assertIn(shlex.join(["example", "amount", "3"]), repo.ssh_log.read_text())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        output, errors = running.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(running.returncode, 0, output + errors)
+        self.assertEqual(output.splitlines()[:2], ["live now: amount=3", "mac: live now: amount=3"])
+        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+        self.assertEqual(self.waiting(), [])
+
+    def test_a_refused_main_keeps_the_value_live_and_the_notes_pass_publishes_it(self) -> None:
+        repo = self.repository
+        _ = (repo.checkout / "other.txt").write_text("unrelated local commit\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "unrelated work")
+        result = self.run_tune("example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("amount=3 stays live; main does not have it", result.stderr)
+        self.assertIn("amount=3", repo.config.read_text())
+        self.assertEqual([change.value for change in self.waiting()], ["3"])
+        _ = repo.git(repo.checkout, "reset", "-q", "--keep", "HEAD^")
+        with mock.patch.dict(os.environ, repo.env, clear=True), \
+                mock.patch.object(models_registry, "publish_pending", return_value=False):
+            lines = live_settings.publish_waiting()
+        self.assertEqual(lines, ["main: pushed", "mac: pulled"])
+        self.assertEqual(repo.git(repo.origin, "log", "-1", "--format=%s", "main"), "tune(example): amount 2 -> 3")
+        self.assertEqual(self.waiting(), [])
+        with mock.patch.dict(os.environ, repo.env, clear=True), \
+                mock.patch.object(models_registry, "publish_pending", return_value=False):
+            self.assertEqual(live_settings.publish_waiting(), [])
+
+    def test_a_superseded_waiting_value_gets_no_commit_and_the_newest_value_reaches_main(self) -> None:
+        repo = self.repository
+        with mock.patch.dict(os.environ, repo.env, clear=True):
+            for value in ("3", "4"):
+                _ = live_settings.stage(live_settings.WaitingChange(
+                    "example", "amount", value, f"tune(example): amount -> {value}"))
+            lines = live_settings.publish(repo.checkout, wait=True)
+        self.assertEqual(lines, ["main: amount=3 has a newer live value; no commit", "main: pushed", "mac: pulled"])
+        self.assertEqual(repo.git(repo.origin, "log", "--format=%s", "-1", "main"), "tune(example): amount -> 4")
+        self.assertIn("amount=4", repo.git(repo.origin, "show", "main:config/example.conf"))
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+
+    def test_the_readers_of_a_changed_file_start_at_once_in_their_own_session(self) -> None:
+        repo = self.repository
+        _ = (repo.config.parent / "live_settings.conf").write_text("readers=example:quota other:notes\n")
+        with mock.patch.dict(os.environ, repo.env, clear=True), mock.patch.object(subprocess, "Popen") as started:
+            self.assertEqual(live_settings.start_readers("example"), ["started now: the quota pass"])
+            self.assertEqual(live_settings.start_readers("missing"), [])
+        self.assertEqual(started.call_count, 1)
+        self.assertEqual(started.call_args.args[0][-2:], ["--now", "quota"])
+        self.assertTrue(started.call_args.kwargs["start_new_session"])
+
+    def test_a_change_starts_the_readers_of_its_file(self) -> None:
+        with mock.patch.dict(os.environ, self.repository.env, clear=True), \
+                mock.patch.object(live_settings, "start_readers", return_value=["started now: the quota pass"]) as readers, \
+                redirect_stdout(io.StringIO()) as output:
+            status = tune.main(["example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes"])
+        self.assertEqual(status, 0, output.getvalue())
+        readers.assert_called_once_with("example")
+        self.assertIn("started now: the quota pass", output.getvalue())
+
     def test_ambiguous_base_key_refuses_without_a_write_and_names_both_lines(self) -> None:
         repo = self.repository
         host = socket.gethostname().split(".", 1)[0]
@@ -194,7 +275,7 @@ class TuneTests(PublicationTestCase):
         first = self.run_tune(*arguments)
         self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertNotEqual(repo.remote_tip(), repo.head())
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         self.assertFalse((repo.root / "state/mac.json").exists())
         head = repo.head()
         contents = repo.config.read_bytes(), repo.config.stat().st_mtime_ns
@@ -218,7 +299,7 @@ class TuneTests(PublicationTestCase):
         self.assertNotEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertTrue(repeated.stdout.startswith("already amount=3\n"))
         self.assertEqual(self.snapshot(), before)
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
 
     def test_same_value_rerun_completes_a_mac_pull_interrupted_after_push(self) -> None:
         repo = self.repository
@@ -228,7 +309,7 @@ class TuneTests(PublicationTestCase):
                 redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             _ = tune.main(arguments)
         self.assertEqual(repo.head(), repo.remote_tip())
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         self.assertFalse((repo.root / "state/mac.json").exists())
         before = self.snapshot()
         repeated = self.run_tune(*arguments)
@@ -258,14 +339,13 @@ class TuneTests(PublicationTestCase):
         _ = repo.git(repo.checkout, "commit", "-qam", "unrelated work")
         remote = repo.remote_tip()
         head = repo.head()
-        config = repo.config.read_bytes()
         result = self.run_tune("example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("other commit", result.stderr)
         self.assertEqual(repo.head(), head)
-        self.assertEqual(repo.config.read_bytes(), config)
+        self.assertIn("amount=3", repo.config.read_text())
         self.assertEqual(repo.remote_tip(), remote)
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         self.assertFalse((repo.root / "state/mac.json").exists())
 
     def test_network_timeouts_refuse_fetch_retain_failed_push_and_queue_stalled_mac_within_one_minute(self) -> None:
@@ -274,33 +354,33 @@ class TuneTests(PublicationTestCase):
         limits: dict[str, float] = {}
         stage = "fetch"
 
-        def network(command: list[str], *, capture_output: bool, text: bool, check: bool,
-                    timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        def network(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             operation = command[3] if command[0] == "git" else "mac"
-            if operation == stage:
-                if timeout is None or timeout <= 0:
+            if operation == stage and command[-1] != "rc=0":
+                timeout = options.get("timeout")
+                if not isinstance(timeout, (int, float)) or timeout <= 0:
                     self.fail(f"{operation} has no positive time limit")
                 limits[operation] = timeout
                 raise subprocess.TimeoutExpired(command, timeout, output=b"connected", stderr=b"stalled")
-            self.assertTrue(text)
-            return original_run(command, capture_output=capture_output, text=True, check=check, timeout=timeout)
+            return original_run(command, **options)  # pyright: ignore[reportArgumentType, reportCallIssue, reportUnknownVariableType]
 
         arguments = ["example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes"]
-        before = self.snapshot()
+        head, remote = repo.head(), repo.remote_tip()
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(subprocess, "run", side_effect=network), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             status = tune.main(arguments)
         self.assertEqual(status, 2)
-        self.assertEqual(self.snapshot(), before)
+        self.assertEqual((repo.head(), repo.remote_tip()), (head, remote))
+        self.assertIn("amount=3", repo.config.read_text())
         stage = "push"
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(subprocess, "run", side_effect=network), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             status = tune.main(arguments)
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 2)
         self.assertNotEqual(repo.head(), repo.remote_tip())
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         stage = "mac"
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(subprocess, "run", side_effect=network), \

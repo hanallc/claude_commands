@@ -142,18 +142,33 @@ The [accounts configuration section](accounts.md#runtime-configuration-and-const
 Its `conf_value` uses shell builtins for valid integer and text settings and calls Python when validation needs it.
 
 `/tune` publishes one user-approved setting through `scripts/lib/tune.py`.
-It validates the requested value and refuses an uncommitted edit to that setting's file.
-It preserves the line's comments and spacing.
-The commit uses `tune(<file>): <key> <old> -> <new>` and a `User-Approved:` trailer.
+It validates the requested value and preserves the line's comments and spacing.
+`scripts/lib/live_settings.py` writes the value live on natedev before any Git step.
+It records the change in `$XDG_STATE_HOME/live-settings/waiting.json` under a lock.
+`/tune` writes the value live on the Mac over ssh in the same step.
+It then starts each notes part that `readers` in `config/live_settings.conf` names for the file.
+The commit holds only that row and uses `tune(<file>): <key> <old> -> <new>` with a `User-Approved:` trailer.
+Other waiting rows in the same file stay live and uncommitted.
+A recorded change whose live value has changed again gets no commit; the newest value reaches main.
+A refused or busy main keeps the value live and the change recorded; the quota part of the notes timer publishes it when main is free.
 A same-value retry finishes publication without another commit.
 `scripts/lib/main_publish.py` supplies the shared publication path for `/tune` and `/zone`.
 Its preparation and push each take a short [main push lock](repair-rounds.md#shared-main-push-lock).
 It accepts unpublished subjects beginning `tune(`, `zone(`, or `user zone: `.
 It refuses another unpublished commit before changing the setting.
-It fetches main and rebases pending publisher commits when a fast-forward fails.
-The rebase uses `--no-autostash --no-update-refs --empty=drop`.
-A conflict names the commit and files, aborts the rebase, and preserves main.
+When a fast-forward fails, it copies each pending publisher commit onto origin/main with `git merge-tree`.
+A copy keeps the author, date and message; a copy with no change is dropped.
+A conflict or a merge commit names the commit and preserves main.
+`scripts/lib/waiting_rows.py` moves the checkout and keeps each waiting row live.
+A waiting row is a `config/*.conf` value that differs from HEAD; other edits in those files refuse the move.
+Main synchronization, local promotion, the Mac pull and the registry fast-forward use the same move.
 After publication, the Mac pulls or receives a queued pull.
+`scripts/lib/mac_wake.py` sends a queued pull as soon as the Mac answers.
+Each queue writer and each quota pass call `mac_wake.start()`.
+It starts one detached watcher on natedev while a pull waits; a lock keeps it to one.
+The watcher probes the Mac over ssh and runs `zone.py drain` when the Mac answers.
+`mac_wake_probe_seconds` and `mac_wake_pause_seconds` in `config/live_settings.conf` set its pace.
+The watcher exits when nothing waits. A fixture queue starts no watcher.
 
 `showrunners.timer_scratch` uses the showrunner's fixed staff id to find its timer.
 It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent`, or `TimerScratchFound`.
@@ -293,7 +308,7 @@ Each local Promote checkout must exist before the command pushes.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
      `ValidateAndPush` uses `validate_and_push.sh --quick --to <merge branch>` with the configured fix subject and optional `--cancel-prior`.
-     Local promotion fast-forwards each main checkout to the pushed tip.
+     Local promotion fast-forwards each main checkout to the pushed tip and keeps its waiting setting rows live.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
@@ -541,12 +556,11 @@ Pane labels do not identify a consultation.
   Bare, it prints the configured zone, label, UTC offset, and current time.
   `set NAME` resolves an IANA name, city, or current seasonal label.
   Ambiguous or unknown names exit 2 with the candidate offsets.
-  Publication runs on natedev through `main_publish`, shared with `/tune`.
-  It updates `zone=` while preserving comments, commits only that file, and pushes main.
-  A failed commit keeps the new text when the file already matches HEAD.
-  Otherwise, it restores the previous text and refuses publication.
-  The Mac pulls through the shared helper, and the broadcast reaches both machines.
-  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  It runs on natedev through `live_settings`, the path `/tune` uses.
+  It writes `zone=` live on natedev and on the Mac at once, while preserving comments.
+  The broadcast then reaches both machines. The commit of only that row, the push and the Mac pull follow.
+  A failed publication keeps the zone live and exits 2; the notes timer publishes it later.
+  A failed Mac write queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
   Pending pulls retain each Mac path and source.
   A bare call drains the queue before it returns.
   Promotion runs `zone.py drain --pulled <path>` after a successful pull.

@@ -3747,14 +3747,14 @@ class StopResumeTests(unittest.TestCase):
     def test_no_worker_mode_resumes_the_director_alone_with_the_notice(self) -> None:
         from scripts.lib.resume_message import IdleWorker, PaneWorkerResume, ResumeWorkers
         from scripts.production import worker
-        from scripts.whoami import quota_alert
+        from scripts.whoami import quota_state
 
         row = staff.StaffRow(staff.StaffId("director"), "unit", "alpha", staff.STAFF_ROOT,
                              current_session=staff.StaffId(self.entry["session_id"]), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
         workers = ResumeWorkers(panes=[PaneWorkerResume(staff.StaffId("idle-worker"), IdleWorker())])
         with (patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
-              patch.object(quota_alert, "no_worker_mode", return_value=True),
-              patch.object(quota_alert, "no_worker_notice", return_value="Codex workers have no capacity. Send no assign."),
+              patch.object(quota_state, "no_worker_mode", return_value=True),
+              patch.object(quota_state, "no_worker_notice", return_value="Codex workers have no capacity. Send no assign."),
               patch.object(worker, "resume_workers", return_value=workers) as listed):
             result = stop_resume.resume(str(row.id), why="maintenance")
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -3767,7 +3767,7 @@ class StopResumeTests(unittest.TestCase):
 
     def test_no_worker_mode_refuses_a_codex_worker_before_any_launch(self) -> None:
         from scripts.message import session_records as sessions
-        from scripts.whoami import quota_alert
+        from scripts.whoami import quota_state
 
         parent = staff.StaffRow(staff.StaffId("director"), "unit", "director", staff.STAFF_ROOT,
                                 current_session=staff.StaffId("native-director"), worktree=staff.PresentWorktree(remote.local_machine(), self.root), unit_type=staff.UnitDetails("direct"))
@@ -3778,7 +3778,7 @@ class StopResumeTests(unittest.TestCase):
                   patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((parent, row))),
                   patch.object(pane_launch, "saved_kind", return_value=kind),
                   patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
-                  patch.object(quota_alert, "no_worker_mode", return_value=held)):
+                  patch.object(quota_state, "no_worker_mode", return_value=held)):
                 self.launched.clear()
                 result = stop_resume.resume(str(row.id), why="maintenance")
                 if kind == "codex" and held:

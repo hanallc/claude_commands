@@ -443,6 +443,42 @@ class PlacementStatusTests(unittest.TestCase):
                             for path in fixture.state_dir.rglob("*") if path.is_file()}, files)
 
 
+class EndedPlacementPruneTests(unittest.TestCase):
+    def test_persist_removes_an_ended_episode_after_its_retention_and_keeps_the_rest(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            config = records.read_memory_config()
+            fixture.server.last_usable_configuration = config
+            server = fixture.server
+            old = fixture.clock.now() - config.ended_placement_seconds - 1
+            requests = {name: replace(placement_request(fixture, since=old), episode=name)
+                        for name in ("ended", "live-owner", "current", "recent")}
+            requests["recent"] = replace(requests["recent"], since=fixture.clock.now())
+            requests["live-owner"] = replace(requests["live-owner"],
+                                             owner=replace(requests["live-owner"].owner, start_time="live-start"))
+            for name, request in requests.items():
+                destination = request.constraints.candidates[0].destination
+                assignment = placement.PlacementAssignment(name, "attempt", destination, request.constraints.source_key,
+                    request.owner, request.constraints.session, request.since)
+                key = placement.attempt_key(name, "attempt")
+                state = placement.CurrentAssignment() if name == "current" else placement.ClosedAssignment("busy")
+                server.placement_requests[name] = request
+                server.assignments[key] = records.SavedPlacementAssignment(assignment, state)
+                if name == "current":
+                    server.current_assignments[name] = key
+            def owner_live(owner: placement.SubmittingOwner) -> bool:
+                return owner.start_time == "live-start"
+
+            with mock.patch.object(server, "_placement_owner_live", side_effect=owner_live):
+                server.persist()
+            kept = {"live-owner", "current", "recent"}
+            self.assertEqual(set(server.placement_requests), kept)
+            self.assertEqual({saved.assignment.episode for saved in server.assignments.values()}, kept)
+            self.assertEqual(set(service.read_state(fixture.state_dir).placement_requests), kept)
+
+
 class ImportTests(unittest.TestCase):
     def test_clean_import_omits_cli_and_reading_alert_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -717,6 +753,29 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertIsInstance(second.executions[0][1], placement.ExecutionEvidenceUnavailable)
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
+
+    def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, mac_test
+
+        for answer, expected in (("busy", placement.TemporaryExclusion("busy")), ("free", placement.AllowedHost())):
+            with self.subTest(answer=answer), AdmissionFixture() as fixture:
+                target = target_config.SshTarget("mac", "macos", fixture.root / "mac_test.conf")
+                request = placement_request(fixture)
+                destination = request.constraints.candidates[0].destination
+                with mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                     mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.EligibleTarget(target)), \
+                     mock.patch.object(claim_state, "state_paths", return_value=claim_state.StatePaths(fixture.root / "claims")), \
+                     mock.patch.object(claim_state, "read_claims", return_value=()), \
+                     mock.patch.object(mac_test, "free_now", return_value=answer) as free_now:
+                    key = fixture.server.host_evidence_key(request, destination)
+                    fixture.server.host_requests[key] = request
+                    evidence = fixture.server.read_provider_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual(evidence.eligibility, expected)
+                self.assertEqual(free_now.call_args.args[1], target.settings)
 
     def test_hanging_or_failing_target_readers_do_not_delay_a_view(self) -> None:
         from scripts.build_queue import placement

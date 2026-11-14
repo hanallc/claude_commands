@@ -45,6 +45,7 @@ class PublicationRepository:
             **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
+            "XDG_STATE_HOME": str(root / "xdg"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
@@ -72,6 +73,12 @@ class PublicationRepository:
 
     def remote_tip(self) -> str:
         return self.git(self.origin, "rev-parse", "refs/heads/main")
+
+    def mac_pulls(self) -> int:
+        """Count the Mac pulls; a live write on the Mac also uses ssh."""
+        if not self.ssh_log.exists():
+            return 0
+        return self.ssh_log.read_text().count("git fetch -q --no-write-fetch-head")
 
     def change(self, value: str = "3") -> str:
         before = self.config.read_text()
@@ -319,6 +326,19 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.head(), repo.remote_tip())
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "remote work\n")
 
+    def test_ready_keeps_a_waiting_value_live_when_origin_changes_the_same_file(self) -> None:
+        repo = self.repository
+        clone = self.other_writer()
+        path = clone / "config/example.conf"
+        _ = path.write_text(path.read_text().replace("mode=fast", "mode=slow"))
+        _ = repo.git(clone, "commit", "-qam", "tune(example): mode fast -> slow")
+        _ = repo.git(clone, "push", "-q", "origin", "main")
+        _ = repo.change()
+        main_publish.ready(repo.checkout)
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertEqual(repo.config.read_text(), "# whole: 1..10\namount=3\n# one of: fast, slow\nmode=slow\n")
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "M config/example.conf")
+
     def other_writer(self) -> Path:
         repo = self.repository
         clone = repo.root / "other-writer"
@@ -350,10 +370,11 @@ class MainPublishTests(PublicationTestCase):
         _ = hook.write_text("#!/bin/sh\necho fixture-rejected >&2\nexit 1\n")
         hook.chmod(0o755)
         first = self.retry_tune()
-        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-        self.assertIn("not pushed", first.stdout)
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertIn("not pushed", first.stderr)
+        self.assertIn("amount=3 stays live", first.stderr)
         self.assertNotEqual(repo.head(), repo.remote_tip())
-        self.assertFalse(repo.ssh_log.exists())
+        self.assertEqual(repo.mac_pulls(), 0)
         hook.unlink()
         return repo.git(repo.checkout, "log", "-1", "--format=%B")
 
