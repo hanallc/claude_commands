@@ -439,6 +439,12 @@ def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: 
         raise herdr_types.HerdrFailure(str(error)) from error
 
 
+def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) -> ExitCode:
+    print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
+          file=sys.stderr)
+    return ExitCode.BUSY
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -460,6 +466,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return ExitCode.BUSY
         matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
             prompt=prompt, launcher_command=launcher_command)
+        if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+            return _prompt_conflict(matched)
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
                 and row is not None and worker_panes.worker_pass(row, session_dir).get("status") == "completed"):
@@ -503,9 +511,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             _ = cleanup.pop_all()
             _ = on_submission()
 
-        instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-            fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+        try:
+            instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
+                worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+        except progress_history.DispatchPromptRefused as refused:
+            return _prompt_conflict(refused.conflict)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -822,6 +833,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command)
+            if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+                return _prompt_conflict(matched)
             if isinstance(matched, progress_history.MatchedDispatch):
                 name = matched.worker_name
         record = staff.snapshot()
@@ -1074,6 +1087,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
+    from scripts.whoami import quota_alert
+
+    workers_held = quota_alert.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
@@ -1120,6 +1136,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             changed = True
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
+                        continue
+                    if workers_held and isinstance(staff.backend(state.row), staff.CodexBackend):
+                        print(f"{state.row.name}: not resumed: no-worker mode")
                         continue
                     resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
