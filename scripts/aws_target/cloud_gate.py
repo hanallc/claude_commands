@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+from statistics import median
 import sys
 import tempfile
 import time
@@ -495,7 +496,9 @@ class GateWorker:
 
     def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
                       live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
-        """Prefer available capacity, then the lowest expected USD per run, then the configured type order."""
+        """Prefer available capacity, then the lowest expected USD per run, then the configured type order.
+
+        A type and region whose median box time is above max_gate_minutes is not tried."""
         values = settings()
         types = values.words('instance_types')
         def type_rank(variant: GateLaunchVariant) -> int:
@@ -523,10 +526,21 @@ class GateWorker:
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
             prices = {}
         prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
-        if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
-            return sorted(variants, key=cooled)
         moment = datetime.fromtimestamp(now, UTC)
         evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
+        cap = values.whole('max_gate_minutes')
+        def median_box_s(variant: GateLaunchVariant) -> Decimal | None:
+            # A type with no measured runs has no median; the lifetime_minutes default is not a measurement.
+            seconds, _own = evidence.box_seconds(variant.instance_type, variant.region, (mode,))
+            return Decimal(median(seconds)) if seconds else None
+        slow = {(variant.instance_type, variant.region): box for variant in variants
+                if (box := median_box_s(variant)) is not None and box > cap * 60}
+        for (size, region), box in sorted(slow.items()):
+            print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
+                  + f'is above max_gate_minutes={cap}.', flush=True)
+        variants = [variant for variant in variants if (variant.instance_type, variant.region) not in slow]
+        if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
+            return sorted(variants, key=cooled)
         default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
@@ -573,6 +587,9 @@ class GateWorker:
                 readings = self.live_spot_prices(variants)
                 live_prices = [price for reading in readings if reading.used for price in reading.prices]
                 variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
+                if not variants:
+                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                    return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes')
                 launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
                     'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
             save(path, launch)
