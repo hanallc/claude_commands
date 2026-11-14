@@ -1686,3 +1686,54 @@ class HeldReservationTests(unittest.TestCase):
         service_admit.assert_called_once()
         self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
         release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
+
+
+QUEUE_ENTRY_CALLS = frozenset({"admit", "launch", "service_admit", "release", "wait_for_admission", "wait_for_launch"})
+
+
+def queue_entry_uses(path: Path) -> list[str]:
+    """Name each admission_client queue entry call in a module, with its enclosing function."""
+    import ast
+    tree = ast.parse(path.read_text(), str(path))
+    aliases = {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+               and node.module == "scripts.build_queue" for alias in node.names if alias.name == "admission_client"}
+    uses = [f"{path.name}: imports {alias.name}" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+            and node.module == "scripts.build_queue.admission_client" for alias in node.names
+            if alias.name in QUEUE_ENTRY_CALLS]
+    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr in QUEUE_ENTRY_CALLS
+                and isinstance(node.value, ast.Name) and node.value.id in aliases):
+            owner = min((function for function in functions
+                         if function.lineno <= node.lineno <= (function.end_lineno or function.lineno)),
+                        key=lambda function: (function.end_lineno or function.lineno) - function.lineno, default=None)
+            uses.append(f"{path.name}:{owner.name if owner else '<module>'}: {node.attr}")
+    return uses
+
+
+class OneQueueEntryTests(unittest.TestCase):
+    """The build queue has one way in: queue_place requests and releases every place."""
+
+    def test_only_queue_place_requests_or_releases_a_place(self) -> None:
+        scripts = Path(__file__).resolve().parents[1]
+        outside = [use for path in sorted(scripts.rglob("*.py"))
+                   if not path.name.startswith("test_") and not path.name.endswith(("_test_support.py", "_fixture.py"))
+                   and path.name not in ("admission_client.py", "queue_place.py")
+                   and "admission_client" in path.read_text(errors="replace")
+                   for use in queue_entry_uses(path)]
+        self.assertEqual(outside, [])
+        self.assertEqual(sorted(queue_entry_uses(scripts / "build_queue/queue_place.py")), [
+            "queue_place.py:release_place: release", "queue_place.py:request_place: service_admit",
+            "queue_place.py:request_place: wait_for_admission", "queue_place.py:request_place: wait_for_launch"])
+
+    def test_the_admission_client_command_has_no_admit_launch_or_release_action(self) -> None:
+        for action in ("admit", "launch", "release"):
+            with self.subTest(action=action), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+                _ = client.main([action, "reservation-1", "0"])
+            self.assertEqual(refused.exception.code, 2)
+
+    def test_memory_gate_sends_admit_launch_and_release_to_queue_place(self) -> None:
+        gate_text = (Path(__file__).resolve().parents[1] / "lint/memory_gate.sh").read_text()
+        self.assertIn('"$BUILDLOG_QUEUE_PLACE_SCRIPT" "$action" --pid', gate_text)
+        self.assertIn('"$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation"', gate_text)
+        self.assertNotRegex(gate_text, r'BUILDLOG_MEM_ADMIT_SCRIPT" ("\$action"|admit|launch|release)\b')

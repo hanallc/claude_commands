@@ -6,6 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
+import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import dataclass, field
@@ -467,7 +468,33 @@ class RefreshedRequest:
     refresh: Callable[[], wire.AdmitRequest]
 
 
+@dataclass(frozen=True)
+class RefreshedLaunch:
+    """A launch request: the service admits the start and keeps no reservation."""
+    refresh: Callable[[], wire.LaunchRequest]
+
+
 QueueRequest = RefreshedRequest | wire.ServiceEstimateRequest
+QueueReply = wire.Admitted | wire.LaunchAdmitted | wire.Refused | admission_client.LeftQueue
+
+
+def request_place(request: QueueRequest | RefreshedLaunch, output: admission_client.WaitOutput, *,
+                  before_check: Callable[[], None] = no_hold_wait) -> QueueReply:
+    """Send a queue request and wait for its answer.
+
+    This is the one place that requests a build queue place.
+    """
+    if isinstance(request, RefreshedRequest):
+        return admission_client.wait_for_admission(request.refresh, output, attempt=before_check)
+    if isinstance(request, RefreshedLaunch):
+        return admission_client.wait_for_launch(request.refresh, output)
+    return admission_client.service_admit(request, output)
+
+
+def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
+    """End a reservation with its holder's status. This is the one place that releases."""
+    with cancellation.defer_cleanup_signals():
+        return admission_client.release(reservation, status, timing)
 
 
 @dataclass
@@ -479,27 +506,20 @@ class HeldReservation:
 @contextmanager
 def held_reservation(request: QueueRequest, *,
                      before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
-    """Wait for admission, then release the grant with the holder's status.
-
-    This is the one place that requests and releases build queue reservations.
-    """
-    if isinstance(request, RefreshedRequest):
-        output = admission_client.WaitOutput()
-        reply = admission_client.admit(request.refresh(), output, request.refresh, _attempt=before_check)
-    else:
-        output = admission_client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
-        reply = admission_client.service_admit(request, output)
+    """Wait for admission, then release the grant with the holder's status."""
+    # service_admit sets the service estimate timing on the output.
+    output = admission_client.WaitOutput()
+    reply = request_place(request, output, before_check=before_check)
     if isinstance(reply, wire.Refused):
         raise QueuePlaceRefused(reply.reason)
-    if isinstance(reply, admission_client.LeftQueue):
+    if not isinstance(reply, wire.Admitted):
         raise QueuePlaceRefused("left the admission queue")
     output.finished()
     held = HeldReservation(reply)
     try:
         yield held
     finally:
-        with cancellation.defer_cleanup_signals():
-            _ = admission_client.release(reply.reservation, held.status, reply.cleanup_timing)
+        _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
 
 
 @contextmanager
@@ -571,19 +591,133 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                     grant.status = place.status
 
 
+class ShellArguments(argparse.Namespace):
+    command: str = ""
+    pid: int = 0
+    since: float = 0.0
+    sidecar: str = ""
+    shell_state: Path | None = None
+    wait_events: bool = False
+    argv: list[str] = []
+    reservation: str = ""
+    status: int = 0
+
+
+SHELL_ACTIONS = ("admit", "launch", "release")
+
+
+def shell_arguments(argv: list[str]) -> ShellArguments:
+    parser = argparse.ArgumentParser(prog="queue_place.py",
+                                     description="Wait for a shell step's queue place, or release it.")
+    actions = parser.add_subparsers(dest="command", required=True)
+    for name in ("admit", "launch"):
+        wait = actions.add_parser(name)
+        _ = wait.add_argument("--pid", type=int, default=os.getppid())
+        _ = wait.add_argument("--since", type=float, default=0.0)
+        _ = wait.add_argument("--sidecar", default="")
+        _ = wait.add_argument("--shell-state", type=Path)
+        _ = wait.add_argument("--wait-events", action="store_true")
+        _ = wait.add_argument("argv", nargs=argparse.REMAINDER)
+    release = actions.add_parser("release")
+    _ = release.add_argument("reservation")
+    _ = release.add_argument("status", type=int)
+    return parser.parse_args(argv, namespace=ShellArguments())
+
+
+def shell_wait(args: ShellArguments) -> int:
+    """Wait for a shell step's place and write the grant as shell assignments.
+
+    The step's shell releases the reservation later with the release action.
+    """
+    output = admission_client.WaitOutput(on_event=(lambda event: print(event, flush=True))
+                                         if args.wait_events else lambda _event: None)
+    launching = args.command == "launch"
+    outcome = "Refused"
+    try:
+        owner_start = admission_records.process_start_time(args.pid)
+        if owner_start is None:
+            print("memory admission check failed (owner no longer exists); step refused", file=sys.stderr)
+            return 2
+        owner, episode = wire.Owner(args.pid, owner_start), uuid.uuid4().hex
+        since = args.since or admission_client.CLOCK.now()
+        run = admission_client.parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
+        step_argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+
+        def refresh() -> wire.AdmitRequest:
+            return admission_client.step_request(step_argv, os.getcwd(), owner, since, args.sidecar, episode, run=run)
+
+        def refresh_launch() -> wire.LaunchRequest:
+            request = refresh()
+            return wire.LaunchRequest(episode, owner, since, request.identity, request.profile)
+
+        grant = request_place(RefreshedLaunch(refresh_launch) if launching else RefreshedRequest(refresh), output)
+        if isinstance(grant, admission_client.LeftQueue):
+            outcome = "LeftQueue"
+            output.finished(left=True)
+            if args.shell_state is not None:
+                _ = args.shell_state.write_text("BUILDLOG_MEM_OUTCOME=LeftQueue\nBUILDLOG_MEM_WAIT_S="
+                    + str(output.elapsed_seconds()) + "\n")
+            return 75
+        if isinstance(grant, wire.Refused):
+            output.deadline_reached = launching and grant.reason == admission_client.LAUNCH_WAIT_LIMIT_REASON
+            return 2
+        if args.shell_state is not None:
+            try:
+                admission_client.write_shell_grant(args.shell_state, grant, output.elapsed_seconds())
+            except BaseException:
+                if isinstance(grant, wire.Admitted):
+                    _ = release_place(grant.reservation, 1, grant.cleanup_timing)
+                raise
+        outcome = "Granted"
+        output.finished()
+        if not args.wait_events:
+            print(wire.encode_reply(grant), end="")
+        return 0
+    except wire.AdmissionUnavailable as error:
+        print(f"admission service unavailable: {error.reason}", file=sys.stderr)
+        return 2
+    except (ValueError, OSError) as error:
+        print(f"memory admission check failed ({str(error) or 'checker returned an error'}); step refused", file=sys.stderr)
+        return 2
+    finally:
+        if output.held:
+            output.on_event("done")
+        if args.shell_state is not None:
+            try:
+                with args.shell_state.open("a") as state:
+                    _ = state.write(f"BUILDLOG_MEM_WAIT_S={output.elapsed_seconds()}\n"
+                                    + f"BUILDLOG_MEM_OUTCOME={outcome}\n")
+            except OSError:
+                pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run a program in its queue place, or serve a shell step's admit, launch or release."""
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) >= 5 and argv[0] == "--scope-start":
+        scope_start(Path(argv[1]), int(argv[2]), argv[3], argv[5:], record=Path(argv[4]))
+        return 0
+    if len(argv) >= 5 and argv[0] == "--program-start":
+        program_start(Path(argv[1]), wire.Owner(int(argv[2]), argv[3]), argv[4:])
+        return 0
+    if argv[:1] and argv[0] in SHELL_ACTIONS:
+        args = shell_arguments(argv)
+        if args.command == "release":
+            reply = release_place(args.reservation, args.status, admission_client.saved_cleanup_timing())
+            if isinstance(reply, wire.Refused):
+                return 2
+            print(wire.encode_record(reply))
+            return 0
+        return shell_wait(args)
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    try:
+        with queue_place(argv, Path.cwd()) as place:
+            return place.popen(argv).wait()
+    except QueuePlaceRefused as error:
+        print(f"queue place: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    if len(sys.argv) >= 6 and sys.argv[1] == "--scope-start":
-        scope_start(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[6:], record=Path(sys.argv[5]))
-    elif len(sys.argv) >= 6 and sys.argv[1] == "--program-start":
-        program_start(Path(sys.argv[2]), wire.Owner(int(sys.argv[3]), sys.argv[4]), sys.argv[5:])
-    else:
-        argv = sys.argv[1:]
-        if argv[:1] == ["--"]:
-            argv = argv[1:]
-        try:
-            with queue_place(argv, Path.cwd()) as place:
-                status = place.popen(argv).wait()
-            raise SystemExit(status)
-        except QueuePlaceRefused as error:
-            print(f"queue place: {error}", file=sys.stderr)
-            raise SystemExit(1) from error
+    raise SystemExit(main())
