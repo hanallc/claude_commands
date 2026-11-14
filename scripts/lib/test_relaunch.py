@@ -80,7 +80,7 @@ class UnitResumeCommandTests(StaffTestCase):
     def test_relaunch_in_no_worker_mode_gives_the_notice_and_no_worker_lines(self) -> None:
         from scripts.agents import pane_record
         from scripts.production.staff_test_support import fixture_session
-        from scripts.whoami import quota_alert
+        from scripts.whoami import quota_alert, worker_mode
 
         runner = fixture_member("showrunner", name="demo")
         row = staff.ensure("unit", name="held", parent=staff.ReportsTo(runner.id),
@@ -90,7 +90,7 @@ class UnitResumeCommandTests(StaffTestCase):
         environment = {"HERDR_ENV": "1", "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2"}
         notice = "Codex workers have no capacity. Send no assign."
         with (patch.object(pane_record, "matching_launch", return_value=entry),
-              patch.object(quota_alert, "no_worker_mode", return_value=True),
+              patch.object(worker_mode, "no_worker_mode", return_value=True),
               patch.object(quota_alert, "no_worker_notice", return_value=notice),
               patch.object(worker, "resume_workers", return_value=ResumeWorkers()) as listed):
             arguments, _ = relaunch.restored_launch(["claude", "--resume", str(row.current_session)], environment)

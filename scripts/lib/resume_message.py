@@ -99,8 +99,9 @@ NO_OWN_PASS = NoOwnPass()
 def worker_mode() -> ResumeWorkers | WorkersHeld:
     """`WorkersHeld` with the notice in no-worker mode; otherwise no worker lines."""
     from scripts.whoami import quota_alert
+    from scripts.whoami.worker_mode import no_worker_mode
 
-    return WorkersHeld(quota_alert.no_worker_notice()) if quota_alert.no_worker_mode() else NO_WORKERS
+    return WorkersHeld(quota_alert.no_worker_notice()) if no_worker_mode() else NO_WORKERS
 
 
 def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:

@@ -221,7 +221,7 @@ class ShutdownStatusTests(ShutdownTestCase):
                 self.assertEqual(shutdown_record.read(), ["earlier"] if proven else ["earlier", str(row.id)])
 
     def test_paused_resume_removes_the_row_only_after_a_delivered_continuation(self) -> None:
-        from scripts.whoami import quota_alert
+        from scripts.whoami import quota_alert, worker_mode
 
         owner = fixture_member("showrunner", name="resume-owner")
         row = fixture_member("unit", name="resume-unit", parent=owner.id)
@@ -233,7 +233,7 @@ class ShutdownStatusTests(ShutdownTestCase):
                 outcome = {"kind": "sent"} if delivered else {"kind": "unconfirmed", "reason": "fixture failure"}
                 with (patch.object(stop_resume, "running_on_account",
                                    return_value=stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2")),
-                      patch.object(quota_alert, "no_worker_mode", return_value=held),
+                      patch.object(worker_mode, "no_worker_mode", return_value=held),
                       patch.object(quota_alert, "no_worker_notice", return_value=notice),
                       patch.object(shutdown, "_message", return_value=outcome) as message):
                     self.assertEqual(shutdown.main(["resume", str(row.id)]), 0 if delivered else 1)

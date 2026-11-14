@@ -38,6 +38,7 @@ from scripts.lib.process_failure import failure_detail
 from scripts.message import send_result, send_budget, session_send
 from scripts.agents import remote
 from scripts.whoami import note_file
+from scripts.whoami.worker_mode import state_path
 
 from scripts.lib import conf, models_registry  # noqa: E402
 
@@ -286,11 +287,6 @@ from scripts.production.showrunners import (
 
 
 Config = ShowrunnerSettings
-def state_path() -> Path:
-    """The quota state file under the current XDG_STATE_HOME."""
-    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-
-
 STATE = state_path()
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
@@ -695,18 +691,6 @@ def _write_state(state: State) -> None:
     tmp = STATE.with_name(f".{STATE.name}.tmp")
     _ = tmp.write_text(json.dumps(_stored_state(state), indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, STATE)
-
-
-def no_worker_mode() -> bool:
-    """Whether Codex workers have no capacity now; a missing or unreadable state reads as False.
-
-    The path is read at each call, so a test with its own XDG_STATE_HOME never reads the live state.
-    """
-    try:
-        saved = cast(StoredState, json.loads(state_path().read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return False
-    return saved.get("no_worker_mode", False)
 
 
 def no_worker_notice() -> str:

@@ -642,7 +642,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assert_held_in_no_worker_mode(refused=True)
 
     def assert_held_in_no_worker_mode(self, *, refused: bool) -> None:
-        from scripts.whoami import quota_alert
+        from scripts.whoami import worker_mode
 
         busy = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
@@ -653,7 +653,7 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(worker_panes.worker_pass(busy.row, self.run_dir).get("status"), "refused")
         _ = self.fixture.world.stop(busy.row, self.fixture.world)
         launches = len(self.fixture.world.launches)
-        with (patch.object(quota_alert, "no_worker_mode", return_value=True),
+        with (patch.object(worker_mode, "no_worker_mode", return_value=True),
               patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK) as resume):
             self.assertEqual(self.command("restore"), (0, f"{busy.row.name}: not resumed: no-worker mode\n"
                                                        + f"{self.fixture.parent.name}: workers unchanged\n", ""))
@@ -3639,6 +3639,18 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual((code, output), (2, ""))
         self.assertIn("caller is not a unit or showrunner", errors)
         self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)), 1)
+
+    def test_add_and_assign_refuse_in_no_worker_mode(self) -> None:
+        from scripts.whoami import worker_mode
+
+        launches = len(self.fixture.world.launches)
+        for arguments in (("add", "review"),
+                          ("assign", "impl", str(self.prompt), "--session-dir", str(self.run_dir), "--slot", "impl",
+                           "--phase", "8", "--kind", "impl", "--launcher-command", "[]")):
+            with self.subTest(command=arguments[0]), patch.object(worker_mode, "no_worker_mode", return_value=True):
+                self.assertEqual(self.command(*arguments), (2, "", f"worker.py: {worker_mode.NO_WORKER_START}\n"))
+        self.assertEqual(len(self.fixture.world.launches), launches)
+        self.assertEqual(self.agent.submitted, [])
 
     def test_showrunner_native_identity_selects_only_its_own_children(self) -> None:
         other = fixture_member("showrunner", name="other")

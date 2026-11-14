@@ -18,6 +18,7 @@ from unittest import mock
 
 from scripts.whoami import quota_alert_test_support as support
 from scripts.whoami import quota_alert
+from scripts.whoami import worker_mode
 from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import Quota, Report
@@ -675,13 +676,13 @@ class NoWorkerModeReadTests(unittest.TestCase):
         folder = self.enterContext(tempfile.TemporaryDirectory())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_STATE_HOME": folder})))
         state = Path(folder) / "quota_alert.json"
-        self.assertFalse(quota_alert.no_worker_mode())
+        self.assertFalse(worker_mode.no_worker_mode())
         for text, expected in (("not json", False), ('{"episodes": {}}', False),
                                ('{"episodes": {}, "no_worker_mode": false}', False),
                                ('{"episodes": {}, "no_worker_mode": true}', True)):
             with self.subTest(text=text):
                 _ = state.write_text(text)
-                self.assertEqual(quota_alert.no_worker_mode(), expected)
+                self.assertEqual(worker_mode.no_worker_mode(), expected)
 
 
 if __name__ == "__main__":

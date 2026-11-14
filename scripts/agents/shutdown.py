@@ -583,9 +583,9 @@ def _lifecycle(options: CommandLine) -> int:
                 started = False
                 if _paused_resume_needs_message(row):
                     _ = staff.resume(str(row.id))
-                    from scripts.whoami import quota_alert
+                    from scripts.whoami import quota_alert, worker_mode
 
-                    workers = (quota_alert.no_worker_notice() if quota_alert.no_worker_mode()
+                    workers = (quota_alert.no_worker_notice() if worker_mode.no_worker_mode()
                                else "Resume your existing workers. Do not open new workers.")
                     delivery = _message(row, f"Continue where you stopped. {workers}")
                     if restart_support.message_was_delivered(delivery):
