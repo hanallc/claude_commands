@@ -26,6 +26,8 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
         return f"{row.name} showrunner", "showrunner"
     if row.kind == "worker":
         return "worker", "worker"
+    if row.kind == "producer":
+        return f"{row.name} producer", "producer"
     parent = record.parent_of(row)
     label = f"{row.name} unit"
     if parent is not None:

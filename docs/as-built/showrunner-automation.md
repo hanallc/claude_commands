@@ -559,6 +559,7 @@ Pane labels do not identify a consultation.
   `StaffSnapshot.by_current_session` selects the row.
   The row supplies the current name, kind, and parent name.
   A showrunner displays `<name> showrunner`; a worker displays `worker`.
+  A producer displays `<name> producer`.
   A unit displays `<name> unit`, with `for <parent>` when the parent exists.
   Its first line displays `<assignment> | <folder> | <branch>` when the branch is available.
   Branch lookup starts at `workspace.current_dir`, else `cwd`, else the process folder from `--arg pwd`.
