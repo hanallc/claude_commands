@@ -2541,3 +2541,11 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/memory_live.html`.
 
 **Gotchas:** with a shortfall, the reserved block is shorter than the reserved amount; the legend and the walk chart show the full amount ("25.9 of 14.2 GiB taken").
+
+### Phase 125 — The Mac watch finds a placed run's compiler under sccache  · status: planned
+
+The Mac reading named rustc processes "no queue placement" for a placed hana build. Two proof runs of the worktree feed sent the alerts.
+
+1. A rustc under sccache, or under a captured cargo, belongs to its build. It is not a run of its own.
+2. A run whose environment, or an ancestor's environment, carries a valid `MAC_PLACEMENT` counts as placed.
+3. A `memory_feed.py --once` run sends no alert.

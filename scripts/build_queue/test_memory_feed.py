@@ -679,6 +679,16 @@ process.stdout.write(JSON.stringify({
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
 
+    def test_a_one_time_run_reads_the_mac_but_sends_no_alert(self) -> None:
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+              mock.patch.object(memory_feed, "notify_unplaced_mac_runs") as notify):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+            notify.assert_not_called()
+            with (mock.patch.object(time, "sleep", side_effect=FeedStopped),
+                  self.assertRaises(FeedStopped)):
+                _ = memory_feed.main([])
+        notify.assert_called_once()
+
     def test_restart_replaces_the_served_page_with_configured_timing(self) -> None:
         self.output.mkdir()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))

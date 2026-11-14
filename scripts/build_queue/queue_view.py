@@ -260,6 +260,7 @@ def mac_build_script() -> str:
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
 import ctypes
 import json
+import re
 import struct
 import sys
 import os
@@ -400,7 +401,7 @@ def repository_name(folder):
 
 
 def process_environment(pid):
-    """Read only Cargo paths and CI labels from the Mac environment."""
+    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
     if sys.platform != "darwin":
         return {}
     try:
@@ -422,7 +423,7 @@ def process_environment(pid):
 
 
 def cargo_environment(data):
-    """Keep only Cargo paths and CI labels from the environment."""
+    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
     if len(data) < 4:
         return {}
     argc = struct.unpack_from("i", data)[0]
@@ -441,7 +442,7 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
@@ -517,8 +518,11 @@ def read_gate_records():
     return records
 
 
+PLACEMENT_FORM = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
 def gate_label(pid, processes, records, ci_uid):
-    """Use the nearest record whose process start time still matches."""
+    """Use the nearest gate record whose start time matches, or the nearest MAC_PLACEMENT."""
     if processes[pid].get("uid") == ci_uid:
         return "hana-ci"
     seen = set()
@@ -528,6 +532,10 @@ def gate_label(pid, processes, records, ci_uid):
         record = records.get(pid)
         if record and record[0] == process["started_at"]:
             return record[1]
+        # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
+        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        if PLACEMENT_FORM.fullmatch(placement):
+            return "placement " + placement
         pid = process["parent"]
     return "unplaced"
 
@@ -540,26 +548,29 @@ def ci_user_id():
         return -1
 
 
-def unplaced_runs(processes, records):
+def unplaced_runs(processes, records, captures):
+    """Name each cargo or rustc root with no placement; a compiler under sccache or a build is not a root."""
     candidates = {pid for pid, process in processes.items()
                   if Path(process["executable"]).name in ("cargo", "rustc", "cargo-nextest")}
+    roots = candidates | set(captures)
     runs = []
     ci_uid = ci_user_id()
     for pid in candidates:
-        if gate_label(pid, processes, records, ci_uid) != "unplaced":
-            continue
         cursor, seen = processes[pid]["parent"], {pid}
-        while cursor in processes and cursor not in seen and cursor not in candidates:
+        while (cursor in processes and cursor not in seen and cursor not in roots
+               and Path(processes[cursor]["executable"]).name != "sccache"):
             seen.add(cursor)
             cursor = processes[cursor]["parent"]
-        if cursor not in candidates:
+        if cursor in processes and cursor not in seen:
+            continue
+        if gate_label(pid, processes, records, ci_uid) == "unplaced":
             runs.append(dict(pid=pid, started_at=processes[pid]["started_at"], command=processes[pid]["command"]))
     return sorted(runs, key=lambda run: (run["started_at"], run["pid"]))
 
 
-def read_builds(processes=None, records=None):
+def read_builds(processes=None, records=None, captures=None):
     processes = read_processes() if processes is None else processes
-    captures = read_captures(processes)
+    captures = read_captures(processes) if captures is None else captures
     records = read_gate_records() if records is None else records
     ci_uid = ci_user_id()
     candidates = set(captures)
@@ -641,7 +652,9 @@ def read_builds(processes=None, records=None):
 def read_reading():
     processes = read_processes()
     records = read_gate_records()
-    return dict(builds=read_builds(processes, records), unplaced_runs=unplaced_runs(processes, records))
+    captures = read_captures(processes)
+    return dict(builds=read_builds(processes, records, captures),
+                unplaced_runs=unplaced_runs(processes, records, captures))
 
 
 print(json.dumps(read_reading()))

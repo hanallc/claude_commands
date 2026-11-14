@@ -202,11 +202,16 @@ class MacQueueViewTests(unittest.TestCase):
                     (20, 1, 501, born, "zsh"), (21, 20, 501, born + 1, "cargo test"),
                     (100, 1, 501, born + 9, "cargo build"),
                     (40, 1, 502, born, "cargo-nextest run"),
-                    (50, 1, 501, born, "rustc --version"))}
+                    (50, 1, 501, born, "rustc --version"),
+                    (60, 1, 501, born, "sccache"), (61, 60, 501, born + 3, "rustc --crate-name served"),
+                    (70, 1, 501, born, "cargo-tile build"), (71, 70, 501, born + 3, "rustc --crate-name captured"),
+                    (80, 1, 501, born, "cargo build"), (81, 80, 501, born + 3, "rustc --crate-name environment"),
+                    (90, 1, 501, born + 5, "cargo build"))}
             script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                 "from unittest.mock import patch\n"
                 + f"read_processes = lambda: {processes!r}\n"
-                + "read_captures = lambda processes: {}\n"
+                + f"read_captures = lambda processes: {{70: dict(folder={str(fixture.root)!r}, command='cargo build', progress_tail='')}}\n"
+                + "process_environment = lambda pid: {80: {'MAC_PLACEMENT': 'episode-2/attempt'}, 90: {'MAC_PLACEMENT': 'no placement'}}.get(pid, {})\n"
                 + f"output = lambda arguments: 'p11\\nn{fixture.root}\\np21\\nn{fixture.root}\\np40\\nn{fixture.root}'\n"
                 + "import types\n"
                 + f"with patch.dict(os.environ, HOME={str(fixture.root)!r}), patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=502)):\n"
@@ -214,17 +219,17 @@ class MacQueueViewTests(unittest.TestCase):
             result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             data = cast(dict[str, list[dict[str, object]]], json.loads(result.stdout.removesuffix("rc=0\n")))
-            self.assertEqual([row["pid"] for row in data["unplaced_runs"]], [50, 100])
+            self.assertEqual([row["pid"] for row in data["unplaced_runs"]], [50, 90, 100])
             self.assertEqual({row["pid"]: row["gate_label"] for row in data["builds"]},
-                {11: "placement episode/attempt", 21: "user", 40: "hana-ci"})
+                {11: "placement episode/attempt", 21: "user", 40: "hana-ci", 70: "unplaced"})
             _ = (fixture.root / "mac_test.conf").write_text("host=fixture-mac\n# range: 5e-324..\nconnect_timeout_s=2\n")
             path = fixture.root / "mac-builds.json"
             with (mock.patch.object(subprocess, "run", return_value=result),
                   mock.patch.object(queue_view, "mac_reading_path", return_value=path)):
                 queue_view.refresh_mac_builds()
                 reading = queue_view.read_mac_builds()
-            self.assertEqual([run.pid for run in reading.unplaced_runs], [50, 100])
-            self.assertEqual([build.pid for build in reading.builds], [40, 11, 21])
+            self.assertEqual([run.pid for run in reading.unplaced_runs], [50, 90, 100])
+            self.assertEqual([build.pid for build in reading.builds], [40, 70, 11, 21])
 
     @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
     def test_project_record_returns_empty_for_an_unreadable_folder(self) -> None:

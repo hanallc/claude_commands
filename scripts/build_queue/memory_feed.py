@@ -1368,7 +1368,9 @@ def main(argv: Sequence[str]) -> int:
         try:
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
-                notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
+                if not args.once:
+                    # A one-time proof run reads the Mac but sends no alert.
+                    notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
             last_good = payload
