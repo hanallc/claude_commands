@@ -362,6 +362,10 @@ def _publish(repo: Path, path: Path, changes: list[registry_rows.RowChange], des
     # Pending rows move onto the fetched registry, so another writer's commit
     # cannot block them; a push accepted before its acknowledgement replays as no change.
     _fast_forward(repo, path, remote, registry_already_shared=bool(pending))
+    # A row commit goes only onto origin/main; a push must never carry other local commits.
+    if foreign := _git(repo, "rev-list", "--abbrev-commit", f"{remote}..HEAD").split():
+        raise OSError(f"registry edit refused before writing: HEAD has {len(foreign)} commits that are not on "
+                      + f"origin/{branch}: {' '.join(foreign[:5])}")
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
     contents = registry_rows.replay(registry_rows.replay(local, pending, False), changes, additive_catalog)
@@ -452,8 +456,8 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     lock; publish_pending() commits and pushes those rows when main is free.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
-    The registry commit is parented on local HEAD, so publishing an ahead
-    checkout also pushes its pre-existing local commits.
+    The registry commit goes only onto origin/main; a checkout with local
+    commits that origin does not have refuses before any write.
     No other path is staged, committed, stashed, reset or rebased.
     """
     path = registry.resolve()
