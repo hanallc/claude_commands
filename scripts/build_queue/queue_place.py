@@ -461,6 +461,47 @@ class QueuePlace:
                 program.sampler.join()
 
 
+@dataclass(frozen=True)
+class RefreshedRequest:
+    """A step or program request that the client rebuilds while it waits."""
+    refresh: Callable[[], wire.AdmitRequest]
+
+
+QueueRequest = RefreshedRequest | wire.ServiceEstimateRequest
+
+
+@dataclass
+class HeldReservation:
+    grant: wire.Admitted
+    status: int = 1
+
+
+@contextmanager
+def held_reservation(request: QueueRequest, *,
+                     before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
+    """Wait for admission, then release the grant with the holder's status.
+
+    This is the one place that requests and releases build queue reservations.
+    """
+    if isinstance(request, RefreshedRequest):
+        output = admission_client.WaitOutput()
+        reply = admission_client.admit(request.refresh(), output, request.refresh, _attempt=before_check)
+    else:
+        output = admission_client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+        reply = admission_client.service_admit(request, output)
+    if isinstance(reply, wire.Refused):
+        raise QueuePlaceRefused(reply.reason)
+    if isinstance(reply, admission_client.LeftQueue):
+        raise QueuePlaceRefused("left the admission queue")
+    output.finished()
+    held = HeldReservation(reply)
+    try:
+        yield held
+    finally:
+        with cancellation.defer_cleanup_signals():
+            _ = admission_client.release(reply.reservation, held.status, reply.cleanup_timing)
+
+
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
@@ -496,10 +537,11 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     if start is None:
         raise QueuePlaceRefused("owner no longer exists")
     prefix = f"{build_folders.FOLDER_PREFIXES['queue-place']}{pid}-{start}-"
-    with queue_place_folder(prefix) as temporary:
+    # The reservation ends before its folder: the service can read the sidecar until release.
+    with queue_place_folder(prefix) as temporary, ExitStack() as reservation:
         sidecar = temporary / "program.cgroup"
         atomic_file.atomic_sample(sidecar, "")
-        grant: wire.Admitted | UnreservedProgram = UnreservedProgram()
+        grant: HeldReservation | UnreservedProgram = UnreservedProgram()
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
             profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
@@ -510,15 +552,9 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
             def refresh() -> wire.AdmitRequest:
                 return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
-            output = admission_client.WaitOutput()
-            reply = admission_client.admit(refresh(), output, refresh, _attempt=before_check)
-            if isinstance(reply, wire.Refused):
-                raise QueuePlaceRefused(reply.reason)
-            if isinstance(reply, admission_client.LeftQueue):
-                raise QueuePlaceRefused("left the admission queue")
-            grant = reply
-            output.finished()
-        sample_path = Path(grant.max_path).with_suffix("") if isinstance(grant, wire.Admitted) else temporary / "program"
+            grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))
+        sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
+                       else temporary / "program")
         place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
         failed = False
         try:
@@ -531,8 +567,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         finally:
             with cancellation.defer_cleanup_signals():
                 place.finish(failed=failed)
-                if isinstance(grant, wire.Admitted):
-                    _ = admission_client.release(grant.reservation, place.status, grant.cleanup_timing)
+                if isinstance(grant, HeldReservation):
+                    grant.status = place.status
 
 
 if __name__ == "__main__":

@@ -1635,3 +1635,54 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertIsNone(child.poll())
                     reservation_id = str(row.get("reservation_id", ""))
             fixture.assert_released(self, reservation_id)
+
+
+class HeldReservationTests(unittest.TestCase):
+    """held_reservation is the one admit and release path for every queue entry."""
+
+    grant: wire.Admitted = wire.Admitted("reservation-1", GIB, "fallback", "/nonexistent/max", "/nonexistent/wave", {})
+
+    def step_request(self) -> queue.RefreshedRequest:
+        return queue.RefreshedRequest(lambda: cast(wire.AdmitRequest, object()))
+
+    def test_release_carries_the_holder_status_after_success_and_failure(self) -> None:
+        for failure in (False, True):
+            with self.subTest(failure=failure), \
+                 mock.patch.object(client, "admit", return_value=self.grant), \
+                 mock.patch.object(client, "release", return_value=wire.Ok()) as release, \
+                 redirect_stderr(io.StringIO()):
+                try:
+                    with queue.held_reservation(self.step_request()) as held:
+                        self.assertIs(held.grant, self.grant)
+                        held.status = 7
+                        if failure:
+                            raise RuntimeError("holder failed")
+                except RuntimeError:
+                    self.assertTrue(failure)
+                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
+
+    def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
+        replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
+            (wire.Refused("no room"), "no room"),
+            (client.LeftQueue(), "left the admission queue"),
+        )
+        for reply, reason in replies:
+            with self.subTest(reason=reason), \
+                 mock.patch.object(client, "admit", return_value=reply), \
+                 mock.patch.object(client, "release", side_effect=AssertionError("released a refusal")), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(queue.QueuePlaceRefused, reason):
+                    with queue.held_reservation(self.step_request()):
+                        self.fail("a refused request entered its holder")
+
+    def test_service_estimate_request_uses_the_service_estimate(self) -> None:
+        request = cast(wire.ServiceEstimateRequest, object())
+        with mock.patch.object(client, "admit", side_effect=AssertionError("service request used a step request")), \
+             mock.patch.object(client, "service_admit", return_value=self.grant) as service_admit, \
+             mock.patch.object(client, "release", return_value=wire.Ok()) as release, \
+             redirect_stderr(io.StringIO()):
+            with queue.held_reservation(request) as held:
+                held.status = 0
+        service_admit.assert_called_once()
+        self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
+        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
