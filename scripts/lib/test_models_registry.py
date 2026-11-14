@@ -209,27 +209,24 @@ class LaunchSettingsTests(unittest.TestCase):
                             self.assertEqual((settings.kind, settings.model, settings.effort, settings.service_tier),
                                              self.shell_settings(reference_section, reference_key))
 
-    def test_registry_changes_affect_the_next_launch_without_changing_caller_context(self) -> None:
+    def test_registry_changes_affect_the_next_launch(self) -> None:
         from scripts.lib import models_registry
 
-        with patch.dict(os.environ, {"AGENTS_CALLER_FAMILY": "claude", "AGENTS_CALLER_ASSIGNMENT": "caller"}):
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            first = models_registry.launch_settings("direct", "impl")
-            _ = write_registry(self.path, {"assignments": {"direct": "caller"},
-                                          "direct.claude": {"impl": "sonnet:max"}})
-            second = models_registry.launch_settings("direct", "impl")
-            self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
-            self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
-                             self.shell_settings("direct", "impl"))
-            self.assertEqual(os.environ["AGENTS_CALLER_FAMILY"], "claude")
-            self.assertEqual(os.environ["AGENTS_CALLER_ASSIGNMENT"], "caller")
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        first = models_registry.launch_settings("direct", "impl")
+        _ = write_registry(self.path, {"assignments": {"direct": "claude"},
+                                      "direct.claude": {"impl": "sonnet:max"}})
+        second = models_registry.launch_settings("direct", "impl")
+        self.assertNotEqual((first.kind, first.model), (second.kind, second.model))
+        self.assertEqual((second.kind, second.model, second.effort, second.service_tier),
+                         self.shell_settings("direct", "impl"))
 
-            configuration = models_registry.launch_configuration(os.environ)
-            _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
-            for inherited, expected in ((False, first), (True, second)):
-                environment = configuration.environment(os.environ) if inherited else dict(os.environ)
-                with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
-                    self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
+        configuration = models_registry.launch_configuration(os.environ)
+        _ = write_registry(self.path, {"assignments": {"direct": "codex"}})
+        for inherited, expected in ((False, first), (True, second)):
+            environment = configuration.environment(os.environ) if inherited else dict(os.environ)
+            with self.subTest(inherited=inherited), patch.dict(os.environ, environment):
+                self.assertEqual(models_registry.launch_settings("direct", "impl"), expected)
 
     def test_launch_settings_starts_no_python_registry_process(self) -> None:
         from scripts.lib import models_registry
@@ -285,6 +282,29 @@ class LaunchSettingsTests(unittest.TestCase):
                 _ = write_registry(self.path, rows)
                 with self.assertRaises(ValueError):
                     _ = models_registry.launch_settings(section, key)
+
+    def test_a_producer_row_is_validated_before_the_write_and_an_equal_row_changes_nothing(self) -> None:
+        from scripts.lib import models_registry
+
+        _ = write_registry(self.path, {"producers": {"morty": "codex:gpt-test:high", "brain": "codex:gpt-test:medium"}})
+        unchanged = self.path.read_bytes()
+        checked = models_registry.producer_settings("morty", "claude", "sonnet", "max")
+        self.assertEqual(self.path.read_bytes(), unchanged)
+        stored = models_registry.store_producer("morty", "claude", "sonnet", "max")
+        self.assertEqual(stored, checked)
+        self.assertEqual((stored.kind, stored.model, stored.effort), ("claude", "sonnet", "max"))
+        self.assertEqual(models_registry.launch_settings("producers", "morty"), stored)
+        self.assertEqual(models_registry.parse_registry(self.path.read_text())["producers"],
+                         {"morty": "claude:sonnet:max", "brain": "codex:gpt-test:medium"})
+        before = self.path.read_bytes(), self.path.stat().st_mtime_ns
+        self.assertEqual(models_registry.store_producer("morty", "claude", "sonnet", "max"), stored)
+        for family, model, effort in (("claude", "missing-agent", "max"), ("claude", "sonnet", "invalid-effort"),
+                                      ("unknown-family", "sonnet", "max"), ("claude", "sonnet", "")):
+            with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
+                _ = models_registry.store_producer("morty", family, model, effort)
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
+        added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
+        self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
 
 
 @final

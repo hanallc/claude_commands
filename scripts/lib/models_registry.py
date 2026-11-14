@@ -74,14 +74,15 @@ def _snapshot(environment: Mapping[str, str], variable: str, path: Path, *,
         path, text = _decoded(encoded)
     else:
         if synchronize:
-            _sync_catalog(path)
+            _sync_catalog(path, environment)
         text = registry_text(path)
     return path, text, tuple(_records(text))
 
 
-def launch_configuration(environment: Mapping[str, str]) -> LaunchModelConfiguration:
+def launch_configuration(environment: Mapping[str, str], *, registry: Path | None = None) -> LaunchModelConfiguration:
     """Use the parent's operation configuration, or read a new configuration."""
-    return LaunchModelConfiguration(*_snapshot(environment, OPERATION_ENVIRONMENT[0], registry_path(), synchronize=True))
+    return LaunchModelConfiguration(*_snapshot(
+        environment, OPERATION_ENVIRONMENT[0], registry or registry_path(), synchronize=True))
 
 
 def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
@@ -89,20 +90,20 @@ def edit_base(environment: Mapping[str, str]) -> RegistryEditBase:
     return RegistryEditBase(*_snapshot(environment, OPERATION_ENVIRONMENT[1], registry_path(), synchronize=True))
 
 
-def _sync_catalog(path: Path) -> None:
-    if os.environ.get("MODELS_CONFIG_TIER_ONLY") == "1":
+def _sync_catalog(path: Path, environment: Mapping[str, str]) -> None:
+    if environment.get("MODELS_CONFIG_TIER_ONLY") == "1":
         return
-    home = Path.home()
+    home = Path(environment.get("HOME", str(Path.home())))
     script = Path(__file__).resolve().parents[1] / "agents/sync_codex_catalog.sh"
-    state = Path(os.environ.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
-    sources = (Path(os.environ.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
-               Path(os.environ.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
+    state = Path(environment.get("CODEX_CATALOG_SYNC_STATE_FILE") or home / ".local/state/codex-agent-catalog-sync/last_success")
+    sources = (Path(environment.get("CODEX_CONFIG_FILE") or home / ".codex/config.toml"),
+               Path(environment.get("CODEX_MODELS_CACHE_FILE") or home / ".codex/models_cache.json"))
     if not path.is_file() or not os.access(script, os.X_OK):
         return
     if state.is_file() and not any(source.exists() and source.stat().st_mtime > state.stat().st_mtime for source in sources):
         return
     try:
-        result = subprocess.run([str(script)], env={**os.environ, "MODELS_CONFIG_FILE": str(path)},
+        result = subprocess.run([str(script)], env={**environment, "MODELS_CONFIG_FILE": str(path)},
                                 stdout=subprocess.DEVNULL, check=False)
         if result.returncode == 0:
             return
@@ -135,11 +136,15 @@ class LaunchSettings(NamedTuple):
 def claude_model(model: str, environment: Mapping[str, str]) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
+        configuration = LaunchModelConfiguration(*_snapshot(
+            environment, OPERATION_ENVIRONMENT[0], registry_path(environment)))
         result = subprocess.run(
-            ["bash", "-c", 'source "$1" && _agents_model_slug claude "$2"', "claude-model",
+            ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
+             + '_agents_model_slug claude "$2"', "claude-model",
              str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
+            input=configuration_shell(configuration),
             env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return model
     return result.stdout.strip()
 
@@ -157,17 +162,22 @@ def claude_arguments(arguments: Sequence[str], environment: Mapping[str, str]) -
     return resolved
 
 
-def launch_settings(section: str, key: str) -> LaunchSettings:
-    """Read launch settings through the existing shell resolver."""
-    configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
-    resolver = 'agents_resolve "$2.$3"'
-    producer_arguments: list[str] = []
+def launch_settings(section: str, key: str, family: Literal["claude", "codex", "assigned"] = "assigned", *,
+                    configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
+    """Read launch settings through the existing shell resolver.
+
+    A named family reads that family's row; a writer passes its candidate text.
+    """
+    if configuration is None:
+        configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
+    resolver = 'agents_resolve "$2.$3"' if family == "assigned" else '_agents_resolve_in_family "$2.$3" "$4"'
+    resolver_arguments: list[str] = [] if family == "assigned" else [family]
     if section == "producers":
         value = next((row.value for row in reversed(configuration.rows)
                       if row.section == section and row.key == key), "")
         match value.split(":"):
-            case ["claude" | "codex" as family, model, effort] if model and effort:
-                producer_arguments = [family, f"{model}:{effort}"]
+            case ["claude" | "codex" as producer_family, model, effort] if model and effort:
+                resolver_arguments = [producer_family, f"{model}:{effort}"]
             case _:
                 raise ValueError(f"invalid producer settings for {key}; expected <family>:<model>:<effort>")
         resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
@@ -177,7 +187,7 @@ def launch_settings(section: str, key: str) -> LaunchSettings:
          + '{ ' + resolver + '; } && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
          "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
-         *producer_arguments],
+         *resolver_arguments],
         input=configuration_shell(configuration), text=True, capture_output=True, check=False,
         env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
@@ -212,9 +222,14 @@ class FastForward(NamedTuple):
     registry_entry: str
 
 
-def registry_path() -> Path:
-    configured = os.environ.get("MODELS_CONFIG_FILE")
-    return Path(configured) if configured else DEFAULT_PATH
+def registry_path(environment: Mapping[str, str] | None = None) -> Path:
+    configured = (os.environ if environment is None else environment).get("MODELS_CONFIG_FILE")
+    if configured:
+        return Path(configured)
+    if environment is None:
+        return DEFAULT_PATH
+    home = Path(environment.get("HOME", str(Path.home())))
+    return home / ".claude/config/models.conf"
 
 
 def registry_text(registry: Path | None = None) -> str:
@@ -462,13 +477,12 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
         remote = _fetch(repo, branch)
     except OSError as error:
         raise OSError(f"registry edit refused before writing: fetch failed: {error}") from error
-    remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
-    # Recover a push accepted before its acknowledgement/local fast-forward.
-    registry_already_shared = bool(pending and _values(_replay(remote_text, pending, False)) == _values(remote_text))
-    _fast_forward(repo, path, remote, registry_already_shared=registry_already_shared)
+    # Pending rows move onto the fetched registry, so another writer's commit
+    # cannot block them; a push accepted before its acknowledgement replays as no change.
+    _fast_forward(repo, path, remote, registry_already_shared=bool(pending))
     base = _git(repo, "rev-parse", "HEAD")
     local = registry_text(path)
-    contents = _replay(local, changes, additive_catalog)
+    contents = _replay(_replay(local, pending, False), changes, additive_catalog)
     pending = _changes(_git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n", contents)
     if not pending:
         return False
@@ -517,11 +531,43 @@ def _publish(repo: Path, path: Path, changes: list[RowChange], description: str,
     raise OSError(f"{path} is edited but not shared; publish failed after at most 3 tries: {last_error}")
 
 
+def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
+    if isinstance(target, SharedRegistry):
+        return Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
+    return path.with_name(path.name + ".lock")
+
+
+def _on_main(target: SharedRegistry) -> bool:
+    return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
+
+
+def publish_pending(registry: Path) -> bool:
+    """Publish rows that main does not have yet; return False at once when main is busy."""
+    path = registry.resolve()
+    target = _publish_repository(path)
+    if not isinstance(target, SharedRegistry):
+        return False
+    head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+    if not _changes(head, registry_text(path)):
+        return False
+    with ExitStack() as locks:
+        if _on_main(target):
+            try:
+                locks.enter_context(main_push_lock.main_push_lock(target.repository, wait=False))
+            except BlockingIOError:
+                return False
+        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _publish(target.repository, path, [], "rows written while main was busy", False)
+
+
 def store_registry(registry: Path, before: str, after: str, description: str, *,
                    additive_catalog: bool = False) -> str:
     """Return the published text after atomic replay under the writer lock.
 
     Publishing is disabled by MODELS_CONFIG_PUBLISH=0 and for every other path.
+    MODELS_CONFIG_PUBLISH=later writes the shared file at once, without the main
+    lock; publish_pending() commits and pushes those rows when main is free.
     Rejected pushes replay every pending local row on the fetched tip, at most
     three tries. An identical command recovers unfinished publication first.
     The registry commit is parented on local HEAD, so publishing an ahead
@@ -533,14 +579,14 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     if additive_catalog:
         changes = [change for change in changes if change.section in ("codex.agents", "codex.families")]
     target = _publish_repository(path)
-    lock_path = (Path(_git(target.repository, "rev-parse", "--absolute-git-dir")) / "models-config.publish.lock"
-                 if isinstance(target, SharedRegistry) else path.with_name(path.name + ".lock"))
+    later = os.environ.get("MODELS_CONFIG_PUBLISH") == "later"
+    lock_path = _publish_lock_path(target, path)
     with ExitStack() as locks:
-        if isinstance(target, SharedRegistry) and _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main":
+        if isinstance(target, SharedRegistry) and not later and _on_main(target):
             locks.enter_context(main_push_lock.main_push_lock(target.repository))
         lock = locks.enter_context(lock_path.open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if isinstance(target, SharedRegistry):
+        if isinstance(target, SharedRegistry) and not later:
             _ = _publish(target.repository, path, changes, description, additive_catalog)
         elif changes:
             latest = registry_text(path)
@@ -549,6 +595,27 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
                 # Preserve formatting when no concurrent edit intervenes.
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
         return registry_text(path)
+
+
+def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:
+    path = registry_path()
+    before = registry_text(path)
+    after = _replay(before, [RowChange("producers", name, f"{name}={family}:{model}:{effort}")], False)
+    settings = launch_settings("producers", name,
+                               configuration=LaunchModelConfiguration(path, after, tuple(_records(after))))
+    return path, before, after, settings
+
+
+def producer_settings(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+    """Validate one producer's candidate settings without a write."""
+    return _producer_candidate(name, family, model, effort)[3]
+
+
+def store_producer(name: str, family: str, model: str, effort: str) -> LaunchSettings:
+    """Validate one producer's settings, then publish its row; an equal row changes nothing."""
+    path, before, after, settings = _producer_candidate(name, family, model, effort)
+    _ = store_registry(path, before, after, f"{name} producer uses {family}:{model}:{effort}")
+    return settings
 
 
 @final

@@ -27,7 +27,7 @@ from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, ScopeActivityReader, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses)
 
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
@@ -109,6 +109,7 @@ from scripts.build_queue.admission_records import (
     NoWaiter,
     NormalOrder,
     OverrideRoom,
+    PackageNotRecorded,
     PeakDecayed,
     PeakFileUnreadable,
     PeakHistory,
@@ -377,7 +378,18 @@ def priority_labels(session_ids: list[str] | RosterUnits) -> Mapping[str, UnitMe
     if isinstance(session_ids, RosterUnits):
         labels = roster.unit_labels(roster.roster(os.environ, roster.ThisMachine()).entries)
     else:
-        labels = roster.unit_labels_for(session_ids, os.environ)
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        recorded: dict[str, UnitMembership] = {}
+        try:
+            recorded.update(unit_labels.recorded_owner_labels(set(session_ids), staff.snapshot()))
+        except (OSError, ValueError):
+            pass
+        missing = [session for session in session_ids if session not in recorded]
+        if missing:
+            recorded.update(roster.unit_labels_for(missing, os.environ))
+        labels = recorded
     no_unit = roster.UnitLabels("").unit
     return {session: label for session, label in labels.items() if label.unit and label.unit != no_unit}
 
@@ -616,6 +628,10 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     """Calculate room once from swap-backed use and accepted promises."""
     if isinstance(host, ReadingUnavailable):
         return host
+    if isinstance(host.build_and_ci_swap, ReadingUnavailable):
+        return host.build_and_ci_swap
+    swapped_outside = max(0, host.swap_total - host.swap_free - host.build_and_ci_swap)
+    agent_swap_demand = (swapped_outside * policy.agent_swap_share_percent + 99) // 100
     safety = policy.safety_bytes
     holds = tuple(RunKeepAside(run,
                   max(0, run.need - run.use.bytes) + run.held
@@ -623,11 +639,12 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
     kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
+    # Swapped agent memory can return to RAM at any time, so it is outside the cap and the room.
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
-                                 else max(0, used + ci_use + host.available - safety))
+                                 else max(0, used + ci_use + host.available - safety - agent_swap_demand))
     return MemoryRoom(host.available, safety, used, kept,
-                      host.available - safety - kept, cap, holds, total=host.total,
-                      ci_use=ci_use)
+                      host.available - safety - kept - agent_swap_demand, cap, holds, total=host.total,
+                      ci_use=ci_use, agent_swap_demand=agent_swap_demand)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -1117,8 +1134,7 @@ def member_programs(members: Iterable[int], proc: Path, *, skip_unreadable: bool
 
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
     """Charge the compiler service once, outside all step process trees."""
-    directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
-        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    directory = builds_slice_cgroup()
     try:
         reading = slice_working_set(directory / "sccache.service")
         try:
@@ -1177,8 +1193,10 @@ def read_meminfo(path: Path) -> HostMemory:
         values.update(kib_fields(line.split()))
     if "MemAvailable" not in values:
         raise ValueError(f"cannot read MemAvailable from {path}")
+    swap_total, swap_free = values.get("SwapTotal", 0), values.get("SwapFree", 0)
+    excluded = read_build_and_ci_swap() if swap_total > swap_free else 0
     return HostMemory(values["MemAvailable"], values.get("MemTotal", UnknownHostTotal()),
-                      values.get("SwapTotal", 0), values.get("SwapFree", 0))
+                      swap_total, swap_free, build_and_ci_swap=excluded)
 
 
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
@@ -1210,9 +1228,9 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
 
 def pressure_from_readings(full: float, some: float, swap: float, policy: AdmissionPolicy) -> Pressure:
     """Use one pressure predicate for live admission and replay estimates."""
-    if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
-        return MemoryPressure(full, some, swap, condition="swap")
-    return MemoryPressure(full, some, swap, condition="full") if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
+    if full > policy.pressure.full_avg10_limit:
+        return MemoryPressure(full, some, swap, condition="full")
+    return MemoryPressure(full, some, swap, condition="some") if some > policy.pressure.some_avg10_limit else NO_PRESSURE_HOLD
 
 
 def admission_dir(root: Path) -> Path:
@@ -1932,7 +1950,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         checked_room = remaining - protected_need
         override = first and has_override
         if override:
-            checked_room = available - safety
+            checked_room = available - safety - (room.agent_swap_demand if isinstance(room, MemoryRoom) else 0)
         fits = extra <= checked_room
         basis: StartBasis = (WithinSlot() if within else OverrideRoom() if override and fits else
                              Fits() if fits else StartsAlone() if alone else DoesNotFit())
@@ -2017,8 +2035,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         if isinstance(entry.state, TokenWaitingWaiter):
             reason: WaitReason = entry.state
         else:
-            if isinstance(inputs.host, ReadingUnavailable) and not within:
-                cause: HeadCause = inputs.host
+            if isinstance(resolved.room, ReadingUnavailable) and not within:
+                cause: HeadCause = resolved.room
             elif estimate_expired(row, now, policy):
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:
@@ -2050,7 +2068,7 @@ def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[i
 
 def running_has_reservation(step: RunningStep) -> bool:
     """Identify running rows that consume one reservation in the same order."""
-    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory))
+    return not isinstance(step.measured, (CompilerServiceMemory, UnownedSliceMemory, records.RemoteMemoryUnavailable))
 
 
 def inputs_after_steps_end(inputs: QueueInputs, ended: frozenset[int], policy: AdmissionPolicy) -> QueueInputs:
@@ -2170,7 +2188,8 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                            identity["folder"], row["since"], row["need"], admission.reason, row.get("unit", ""),
                            project=step_project(row.get("repository_name", "")),
-                           run=row.get("build_run", NoLiveBuildRun()))
+                           run=row.get("build_run", NoLiveBuildRun()),
+                           package=row["package"] if "package" in row else PackageNotRecorded())
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
@@ -2491,17 +2510,19 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    identity["step"], identity["folder"], row["need"], memory,
                                    run=row.get("build_run", NoLiveBuildRun()), started_at=step_estimator.epoch(row["admitted_at"]),
                                    unit=identity.get("unit", ""), pid=row["pid"],
-                                   project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"])))
+                                   project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"]),
+                                   package=row["package"] if "package" in row else PackageNotRecorded()))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value,
                    pid=value.pid if isinstance(value, CompilerServiceMemory) else PidNotRecorded())
                    for value in readings.compilers)
     for value in unowned:
         activity = value.activity
-        if not isinstance(value.job_state, NotServiceSlice):
+        state = records.recorded_service_state(value)
+        if not isinstance(state, NotServiceSlice):
             running.append(RunningStep("", value.owner, "service", value.cgroup, 0, value,
                 pid=value.pid,
-                started_at=value.job_state.started_at if isinstance(value.job_state, RunningServiceJob) else 0.0))
+                started_at=state.started_at if isinstance(state, (RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob)) else 0.0))
             continue
         running.append(RunningStep(
             activity.session_id if isinstance(activity, ScopeProcesses) else "",
@@ -2525,7 +2546,64 @@ def inputs_after_reservations_end(inputs: QueueInputs, live_reservations: set[st
         running=tuple(step for step in inputs.running if not running_has_reservation(step) or id(step) in kept_steps))
 
 
-def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
+def user_manager_cgroup() -> Path:
+    return Path(os.environ.get("BUILDLOG_USER_CGROUP",
+        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service"))
+
+
+def builds_slice_cgroup() -> Path:
+    return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", str(user_manager_cgroup() / "builds.slice")))
+
+
+def desktop_guarantee() -> int | ReadingUnavailable:
+    """Read the memory the desktop session keeps protected (session.slice memory.min)."""
+    path = user_manager_cgroup() / "session.slice" / "memory.min"
+    try:
+        check_memory_reading(path)
+        amount = int(path.read_text())
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{path}: desktop guarantee unavailable: {error}")
+    return amount if amount >= 0 else ReadingUnavailable(f"{path}: negative desktop guarantee")
+
+
+def agents_memory() -> MeasuredMemory | ReadingUnavailable:
+    """Read the agents' working set and swap (app.slice/app-agents.slice)."""
+    directory = user_manager_cgroup() / "app.slice" / "app-agents.slice"
+    try:
+        return slice_working_set(directory)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{directory}: agents' memory unavailable: {error}")
+
+
+def slice_swap_current(directory: Path) -> int:
+    """Read one required slice swap counter."""
+    path = directory / "memory.swap.current"
+    check_memory_reading(path)
+    amount = int(path.read_text())
+    if amount < 0:
+        raise ValueError(f"{path}: negative swap bytes")
+    return amount
+
+
+@dataclass(frozen=True)
+class InactiveSlice:
+    """systemd names no cgroup for a slice that holds no process."""
+
+
+def read_build_and_ci_swap() -> int | ReadingUnavailable:
+    """Read the build and CI slice swap that is not agent demand; an absent slice holds none."""
+    try:
+        name = conf.read("build_admission").text("ci_memory_slice")
+        ci = systemd_slice_group(name) if name else InactiveSlice()
+        if isinstance(ci, ReadingUnavailable):
+            return ci
+        groups = [builds_slice_cgroup()] if isinstance(ci, InactiveSlice) else [builds_slice_cgroup(), ci]
+        return sum(slice_swap_current(group) for group in groups if group.is_dir())
+    except (OSError, UnicodeError, ValueError, conf.Unusable) as error:
+        return ReadingUnavailable(f"swap demand unavailable: {error}")
+
+
+def systemd_slice_group(name: str) -> Path | InactiveSlice | ReadingUnavailable:
     private = os.environ.get("BUILDLOG_CI_CGROUP", "")
     if private:
         return Path(private)
@@ -2533,11 +2611,20 @@ def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
         reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
                                capture_output=True, text=True, check=True, timeout=5)
         group = reply.stdout.strip()
+        if not group:
+            return InactiveSlice()
         if not group.startswith("/") or group == "/" or ".." in Path(group).parts:
             raise ValueError("systemd returns no slice cgroup")
         return Path("/sys/fs/cgroup") / group.lstrip("/")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return ReadingUnavailable(f"{name}: cannot read ControlGroup: {error}")
+
+
+def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
+    group = systemd_slice_group(name)
+    if isinstance(group, InactiveSlice):
+        return ReadingUnavailable(f"{name}: cannot read ControlGroup: systemd returns no slice cgroup")
+    return group
 
 def slice_working_set(directory: Path) -> MeasuredMemory:
     """Read the working set, anonymous plus shared memory, and swap separately."""
@@ -2554,7 +2641,7 @@ def slice_working_set(directory: Path) -> MeasuredMemory:
         raise ValueError(f"{stat}: expected inactive_file bytes") from error
     swap = directory / "memory.swap.current"
     check_memory_reading(swap)
-    swapped = int(swap.read_text()) if swap.exists() else 0
+    swapped = slice_swap_current(directory) if swap.exists() else 0
     try:
         anon = int(fields["anon"])
         shmem = int(fields["shmem"])
@@ -2572,12 +2659,25 @@ def owned_scope_roots(scopes: Iterable[Path], parent: Path) -> set[Path]:
     return {scope for scope in inside if inside.isdisjoint(scope.parents)}
 
 
+def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdentity],
+                      reserved_pids: set[int], waiters: Sequence[Waiter], started_at: float = 0.0) -> ServiceJobState:
+    """Match worker process trees to admitted and waiting step identities."""
+    trees = [process_tree({pid: processes[pid].start}, processes) for pid in workers if pid in processes]
+    if not trees:
+        return IdleService()
+    if any(tree.intersection(reserved_pids) for tree in trees):
+        return RunningServiceJob(started_at)
+    waiting_pids = process_tree({row["pid"]: row["start_time"] for row in waiters}, processes)
+    if any(tree.intersection(waiting_pids) for tree in trees):
+        return WaitingServiceJob(started_at)
+    return UnmatchedServiceJob(started_at)
+
+
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "") -> tuple[UnownedSliceMemory, ...]:
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
-    directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
-        f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
+    directory = builds_slice_cgroup()
     owned: set[Path] = set()
     tree_pids: set[int] = set()
     for row in rows:
@@ -2627,8 +2727,10 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             row_pid: int | PidNotRecorded = (activity.members[0].pid
                 if isinstance(activity, ScopeProcesses) and activity.members else PidNotRecorded())
             job_state: RunningServiceJob | IdleService | NotServiceSlice = NotServiceSlice()
+            current_state: ServiceJobState = NotServiceSlice()
             if required:
                 job_state = IdleService()
+                current_state = IdleService()
                 programs = member_programs(members.intersection(processes), proc)
                 workers = [pid for pid, program in programs.items() if program == "Runner.Worker"]
                 listeners = [pid for pid, program in programs.items() if program == "Runner.Listener"]
@@ -2636,18 +2738,19 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                 if candidates:
                     oldest = min(candidates, key=lambda pid: (int(processes[pid].start), pid))
                     row_pid = oldest
-                    if workers:
-                        unregistered = [pid for pid in workers
-                            if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
-                        if unregistered:
-                            first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
-                            job_state = RunningServiceJob(activity_reader.started_at(first))
+                    current_state = service_job_state(workers, processes, tree_pids | scoped_pids, waiters,
+                                                      activity_reader.started_at(oldest))
+                    unregistered = [pid for pid in workers
+                        if not process_tree({pid: processes[pid].start}, processes).intersection(tree_pids | scoped_pids)]
+                    if unregistered:
+                        first = min(unregistered, key=lambda pid: (int(processes[pid].start), pid))
+                        job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
                                                  swap_bytes=swapped,
                                                  cgroup=str(child), owner=child.name,
                                                  activity=activity, pid=row_pid,
-                                                 job_state=job_state))
+                                                 job_state=job_state, service_job_state=current_state))
         except (OSError, ValueError) as error:
             if required:
                 result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), cgroup=str(child),

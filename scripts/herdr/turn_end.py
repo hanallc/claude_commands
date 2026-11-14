@@ -218,6 +218,11 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
         _ = scratch.end(scratch.worker_task(row.id))
     except Exception as error:
         details.append(f"scratch cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
+    from scripts.agents import detached_runs
+    try:
+        _ = detached_runs.prune_finished(run / detached_runs.DETACHED_RUNS_DIR)
+    except OSError as error:
+        details.append(f"detached run cleanup failed for {row.name}: {' '.join(str(error).splitlines())}")
     try:
         if not completion.pane_closed:
             with redirect_stderr(io.StringIO()) as diagnostics:
@@ -253,7 +258,13 @@ def _finish_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path, p
             details.append(reason)
     completion = replace(completion, details=tuple(details))
     progress_history.save_hook_completion(run, instance, completion)
-    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, path.read_text(), "\n".join(details))
+    try:
+        reply = path.read_text()
+    except FileNotFoundError:
+        if outcome != TurnOutcome.ERROR:
+            raise
+        reply = "\n".join(completion.details)
+    decision = _prepare_notice(row.name, parent, run, passed, instance, outcome, path, reply, "\n".join(details))
 
     def send_notice() -> None:
         decision.send_notice()
@@ -389,6 +400,9 @@ def _handle_locked(event: WorkerEvent) -> TurnOutcome | TurnDecision:
         if isinstance(receipt, worker.DispatchSubmitted) and not receipt.reply:
             if event.kind == EventKind.STAGE_READY:
                 return TurnOutcome.SUBMITTED
+            if event.kind == EventKind.TURN_END and not event.reply and receipt.compacted_after_prompt:
+                return _prepare_notice(row.name, parent, run, passed, instance, TurnOutcome.NO_DONE,
+                                       Path(delivery.reply_file), "", "")
             return _ignored(event, "the submitted dispatch has no final reply", row.name)
         anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
         if event.kind == EventKind.TURN_END and (not reply or reply != event.reply):

@@ -15,6 +15,7 @@ import unittest
 
 from scripts.lib.shell_test_support import shell_function
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
+from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -38,11 +39,41 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
-        # The builds signal-status guard removes one stopped-step query.
-        self.assertEqual(counts["tree_watch.py"], 11, rows)
+        # The trace counts interpreter starts, not calls inside the helper.
+        self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
-        self.assertEqual(counts["step_context.py"], 1, rows)
-        self.assertEqual(len(rows), 24, counts)
+        self.assertEqual(counts["step_context.py"], 0, rows)
+        # The live helper serves context and folder calls without new interpreters.
+        self.assertEqual(counts["build_folders.py"], 0, rows)
+        # The dev features read also runs in the helper, so no inline Python starts for it.
+        self.assertEqual(len(rows), 6, counts)
+        # The per-run helper reads the dev features; no Python process of its own starts.
+        in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
+        self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
+        for target, mode in (("unknown", "passed"), ("linux", "disk")):
+            with self.subTest(target=target, mode=mode):
+                routing = VerifySshTargetsFixture()
+                routing.setUp()
+                try:
+                    routing.configure("natedev,linux")
+                    routing_trace = routing.root / "routing-python.tsv"
+                    detached_record = routing.root / "detached.json"
+                    _ = detached_record.write_text('{"run_id": "routing-test", "command": [], "status": "finished"}')
+                    refused = routing.verify("test", "sample", "--target", target, extra={
+                        "VERIFY_PY_TRACE": str(routing_trace),
+                        "UNIT_DETACHED_RECORD": str(detached_record),
+                        "TEST_SSH_MODES": json.dumps({"linux": mode}),
+                    })
+                    self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+                    self.assertEqual(routing.local_runs(), [])
+                    entries = Counter(line.split("\t")[0] for line in routing_trace.read_text().splitlines())
+                    calls = Counter(line.split("\t")[0]
+                                    for line in Path(str(routing_trace) + ".calls").read_text().splitlines())
+                    for program in ("build_targets.py", "build_folders.py", "detached_runs.py"):
+                        self.assertGreater(calls[program], 0, (target, program, entries, calls))
+                        self.assertEqual(entries[program], 0, (target, program, entries, calls))
+                finally:
+                    routing.doCleanups()
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

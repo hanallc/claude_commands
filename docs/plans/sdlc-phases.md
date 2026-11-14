@@ -545,3 +545,91 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `docs/production_format.md`, `commands/showrunner/produce.md`, `commands/unit/checkpoint.md`, `docs/direct/phase_end.md`, `commands/plan/to_phased_plan.md`, `docs/as-built/phase-tables.md`, `docs/as-built/showrunner-automation.md` — notice format and phase-start rules
 
 **Ruled out:** a replacement check for independent phases (user order).
+
+### Phase 23 — Transcript lookups do not resolve each file  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `transcript_paths(root, pattern)` calls no `resolve()` on each file. It keys each match by `uncompressed_path(path)`, so a plain file and its `.zst` copy give one entry, with the plain file preferred.
+- `distinct_files(paths)` in `scripts/lib/transcripts.py` merges symlink aliases in a small list of matches. A caller that counts or picks among the matches of one session uses it: `read_director_transcripts` in `phase_process.py`.
+- `showrunner_transcripts` in `nightly_review.py` resolves each path as it enters its result set, so a recorded path and a discovered path give one entry.
+- `_found_backends` in `staff.py` lists each real session folder once and reuses the list for each home that links to it. A row gets `CodexBackend(home)` only for its recorded home.
+- Paired CPU per call on natedev, 662 rows: `_found_backends` 0.08–0.10 s against 0.45–0.52 s before; `transcript_paths` over three homes 0.16 s against 0.42 s.
+
+**Files:**
+- `scripts/lib/transcripts.py` — transcript discovery and `distinct_files`
+- `scripts/production/staff.py` — Codex backend lookup, one scan for each real folder
+- `scripts/direct/phase_process.py`, `scripts/nightly_review/nightly_review.py` — callers that merge aliases
+- `scripts/lib/test_transcripts.py`, `scripts/production/test_staff.py`, `scripts/direct/test_phase_process.py` — alias, shared-folder and plain-preferred rows
+
+### Phase 24 — Phase start names an unclosed phase  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- When `start-phase` sets aside the current phase and no open pass belongs to it, `_report_unclosed_phase` prints one line to stderr: `anomaly: start-phase: <unit>: phase <id> set aside unclosed, started <YYYY-MM-DD HH:MM zone>`. It stops nothing.
+- A set-aside phase with an open pass prints no line. A run with no unit row names the unit as `unit not recorded (<reason>)`.
+
+**Files:**
+- `scripts/direct/progress_history.py` — `_report_unclosed_phase` and its call in `_start_phase`
+- `scripts/direct/test_progress_history.py` — rows in `test_a_phase_started_while_another_is_open_leaves_the_older_one_open`
+
+### Phase 25 — A reservation released without a checkpoint clears  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.clear` deletes an `Active` record when berth's board in `repo` shows its reservation `released_without_checkpoint` (`RELEASED_WITHOUT_CHECKPOINT`). That clear writes no release marker.
+- Every other `Active` lifecycle (`active`, `outstanding`, unreadable) stays refused, as before.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `clear`
+- `scripts/direct/test_phase_reservation.py` — rows in `test_a_held_reservation_is_never_replaced_or_cleared_by_hand`, board answer patched
+
+### Phase 26 — Record-active ignores paths a merge brought  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.changed_since_baseline` lists the paths of the branch's first-parent commits from the baseline to `HEAD`, the uncommitted changes against `HEAD`, and the untracked files.
+- With `--diff-merges=dense-combined`, a merge commit adds only a path its result changes from every parent, as a conflict resolved by hand. A plain merge adds nothing, at phase start or later.
+- A path the phase changed and later changed back still counts.
+
+**Files:**
+- `scripts/direct/phase_reservation.py` — `changed_since_baseline` and the module docstring
+- `scripts/direct/test_phase_reservation.py` — `test_record_active_claims_only_the_paths_a_merge_resolved_by_hand`
+
+### Phase 27 — Stall-watch sees a permission prompt on the screen  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `stall_watch.prompt_on_screen` finds a `PROMPT_QUESTION` line with a `PROMPT_OPTION` answer (`❯ 1. Yes`) under it in the pane's bottom `PROMPT_LINES` lines.
+- `watch_pass` treats a pane that shows one as blocked, whatever herdr's state is. The pass sends no bump and alerts on the usual prompt timing from the pending call's time.
+- rca 261114-1 cause: herdr reads the dialog as idle when an input box shows under it (`live_prompt_box`), so stall-watch saw the prompt only when herdr first reported it blocked.
+
+**Files:**
+- `scripts/production/stall_watch.py` — `prompt_on_screen`, `PROMPT_OPTION` and the blocked decision in `watch_pass`
+- `scripts/production/test_stall_watch.py` — `test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass`; four tests that end a prompt clear it from the screen
+
+### Phase 28 — An accepted finding takes the user's decision after close  · status: done
+
+**Depends on:** none
+
+#### As-built
+
+- `_decision` takes a held, decided or accepted finding, also after the phase ledger closes. Other states keep the refusal.
+- An accepted finding keeps its `accepted` state, because a reviewer already accepted its repair.
+- A ruling is the saved `decision`, whatever the state. `--withdraw` and the repeat rule use that test.
+- Case: tile phase 62 F003 (accepted, ledger closed) refused the user's "Approved". tile records it with `decision --phase 62` after the fix reaches main.
+
+**Files:**
+- `scripts/direct/findings.py` — `_decision`
+- `scripts/direct/test_findings.py` — `test_an_accepted_finding_in_a_closed_phase_takes_the_users_decision`, `test_a_decided_finding_a_verdict_accepted_changes_its_ruling_with_withdraw`
+- `docs/as-built/simplify-lens.md` — the decision paragraph

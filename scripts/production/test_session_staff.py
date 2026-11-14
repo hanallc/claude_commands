@@ -60,12 +60,13 @@ class StatusDiscoveryTests(StaffTestCase):
     def test_run_workers_follow_the_staff_owner_without_a_roster(self) -> None:
         fixture = self.row_production()
         showrunner_worker = replace(fixture.worker, parent=staff.ReportsTo(fixture.runner.id))
+        resumed_unit = replace(fixture.unit, current_session=fixture_runtime_id("resumed-run-owner"))
         rows = (fixture.runner, fixture.unit, fixture.worker)
         before = self.staff_state()
         for state, membership, expected in (
             ({"owner_staff_id": fixture.unit.id}, rows, (fixture.worker,)),
             ({"owner_staff_id": fixture.runner.id}, (*rows[:-1], showrunner_worker), (showrunner_worker,)),
-            ({"main_agent": {"session_id": fixture.unit.current_session}}, rows, (fixture.worker,)),
+            ({"owner_staff_id": fixture.unit.id}, (fixture.runner, resumed_unit, fixture.worker), (fixture.worker,)),
             ({}, rows, ()),
         ):
             with self.subTest(state=state):
@@ -289,12 +290,10 @@ class StatusDiscoveryTests(StaffTestCase):
         unknown = labels.LabeledSession("", labels.ClaudeUnknown("no identity"), place,
                                         labels.ObservedProcess(198033, "codex"))
         morty = fixture_runtime_id("retained-pane-morty")
+        _ = fixture_member("producer", name="morty", runtime_id=morty)
         from scripts.message import codex_daemon
 
         sessions = [codex_daemon.DaemonSession(morty, str(self.root), "idle")]
-
-        def configured_morty(identity: str) -> bool:
-            return identity == morty
 
         with (mock.patch.object(herdr, "shared_session", return_value=place.session),
               mock.patch.object(herdr, "process_environment", return_value={}),
@@ -303,7 +302,6 @@ class StatusDiscoveryTests(StaffTestCase):
                   "pane": {"terminal_title_stripped": "morty | idle"},
                   "process_info": {"foreground_processes": [{"pid": 198033, "argv": ["codex"]}]}}),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=sessions),
-              mock.patch.object(labels, "morty_thread", side_effect=configured_morty),
               labels.anomalies(staff_sources.CodexProcessThreads().check) as lines):
             grouped = labels.group_labeled_sessions([unknown], record=staff.snapshot(),
                                                     sources=labels.MemberSources((launch,)))

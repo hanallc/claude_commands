@@ -129,7 +129,8 @@ def _perform(part: Part) -> int:
             observed = saved.observed_at if isinstance(saved, usage_store.RecentTimerUsage) else now
             readings = quota_alert.codex_alert_pass(workers, reports, observed)
             for line in [*agent_notes.watch_usage(reports, selection, workers, readings),
-                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings)]:
+                         *quota_alert.alert(list(note_file.read_notes()), selection=selection, codex_readings=readings),
+                         *quota_alert.publish_registry()]:
                 print(line)
         else:
             agent_notes.mark_tier(codex_pacer.tick(list(note_file.read_notes())))
@@ -153,6 +154,10 @@ def _perform(part: Part) -> int:
     elif part is Part.WATCHDOG:
         from scripts.accounts import unit_watchdog
         for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
+            print(line)
+    elif part is Part.LOGINS:
+        from scripts.accounts import login_sittings
+        for line in login_sittings.run(datetime.now(timezone.utc)):
             print(line)
     elif part is Part.PRUNE:
         from scripts.production.prune_phase_notes import main

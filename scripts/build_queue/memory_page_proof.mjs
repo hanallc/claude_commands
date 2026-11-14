@@ -1,4 +1,12 @@
 // Run with node scripts/build_queue/memory_page_proof.mjs [temporary-output-folder].
+// The optional third argument names the previous page for comparison images.
+// Add --queued as the fourth argument for the queued-section comparison.
+// Add --console as the fourth argument for the Builds title comparison.
+// Add --step-names as the fourth argument for owner-based step names.
+// Add --owners as the fourth argument for machine owners and table spacing.
+// Add --cloud-owner as the fourth argument for cloud worker owner images.
+// Add --blocks as the fourth argument for the target block and hold images.
+// Add --identity as the fourth argument for the row hover identity block images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -14,15 +22,27 @@ const callerFolder = process.argv[2];
 const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
 try {
   await mkdir(folder, {recursive:true});
-  execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1]))', folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, stdio:'pipe'});
+  const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
+    'from pathlib import Path; import sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
+  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+    .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
+  const queuedComparison = process.argv[4] === '--queued';
+  const consoleComparison = process.argv[4] === '--console';
+  const stepNamesComparison = process.argv[4] === '--step-names';
+  const ownersComparison = process.argv[4] === '--owners';
+  const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
+  const blocksComparison = process.argv[4] === '--blocks';
+  const identityComparison = process.argv[4] === '--identity';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
     const shift = now - reading.read_at;
-    for (const row of reading.walk) if (row.started_at) row.started_at += shift;
+    for (const row of reading.walk) {
+      if (row.started_at) row.started_at += shift;
+      if (row.read_at) row.read_at += shift;
+    }
     for (const waiter of reading.waiters) waiter.since += shift;
     reading.read_at = now;
   }
@@ -85,23 +105,38 @@ try {
   const server = createServer((req, res) => {
     const isData = req.url.startsWith('/memory.json');
     res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : page);
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
-    const profile = await mkdtemp(join(tmpdir(), 'memory-proof-chrome-'));
+    // Chrome needs a short path for its Unix sockets.
+    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
     try {
+      const temporary = join(profile, 'tmp');
+      await mkdir(temporary);
       const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
         '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
         '--no-first-run', '--disable-extensions', '--disable-background-networking',
         '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {stdio:['ignore','ignore','pipe']});
+      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);
       });
       let ws;
+      let debuggerError;
+      const pending = new Map();
+      const events = new Map();
+      const rejectPending = error => {
+        debuggerError ||= error;
+        for (const request of pending.values()) request.reject(debuggerError);
+        for (const event of events.values()) event.reject(debuggerError);
+        pending.clear();
+        events.clear();
+      };
+      chrome.once('exit', () => rejectPending(new Error('Chrome closed during a debugger request.')));
+      chrome.once('error', rejectPending);
       try {
         const endpoint = await new Promise((resolve, reject) => {
           let output = '';
@@ -114,10 +149,9 @@ try {
           chrome.once('exit', () => reject(new Error('Chrome closed before its debugger started.')));
         });
         ws = new WebSocket(endpoint);
-        await once(ws, 'open');
+        ws.addEventListener('close', () => rejectPending(new Error('Chrome debugger connection closed.')));
+        await Promise.race([once(ws, 'open'), exited.then(() => { throw debuggerError; })]);
         let id = 0;
-        const pending = new Map();
-        const events = new Map();
         ws.addEventListener('message', event => {
           const message = JSON.parse(event.data);
           if (message.id) {
@@ -128,10 +162,11 @@ try {
             else request.resolve(message.result);
           } else {
             const key = `${message.sessionId || ''}:${message.method}`;
-            if (events.has(key)) { events.get(key)(message.params); events.delete(key); }
+            if (events.has(key)) { events.get(key).resolve(message.params); events.delete(key); }
           }
         });
         const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+          if (debuggerError) { reject(debuggerError); return; }
           const next = ++id;
           pending.set(next, {resolve,reject});
           ws.send(JSON.stringify({id:next,method,params,...(sessionId ? {sessionId} : {})}));
@@ -149,10 +184,10 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const loaded = new Promise(resolve => events.set(`${sessionId}:Page.loadEventFired`, resolve));
-        await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/memory_live.html`});
-        await loaded;
-        await evaluate(`(async () => {
+        const navigate = async path => {
+          const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
+          await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
+          await evaluate(`(async () => {
           const style = document.createElement('style');
           style.textContent = '* { transition: none !important; }';
           document.head.append(style);
@@ -162,7 +197,9 @@ try {
           window.render = () => {};
           await document.fonts.ready;
           fitLabels();
-        })()`);
+          })()`);
+        };
+        await navigate('memory_live.html');
 
         const proofs = [];
         const show = async (reading, clearTip=true) => evaluate(`(async () => {
@@ -182,6 +219,13 @@ try {
           for (const width of [1400,900,390]) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
             await show(base);
+            const timeCells = await evaluate(`({
+              short:ago(latest.read_at-15,latest.read_at),
+              waiting:[...document.querySelectorAll('tr[data-tip^="wait:"] .duration')].map(cell=>cell.textContent)
+            })`);
+            assert.equal(timeCells.short,'<1 min');
+            assert.ok(timeCells.waiting.length>0);
+            assert.ok(timeCells.waiting.every(text=>!text.startsWith('waits ')));
             const proof = await evaluate(`(() => {
               const rect = element => {
                 const r = element.getBoundingClientRect();
@@ -228,7 +272,7 @@ try {
                 queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
                 queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
-                stages:[...table.querySelectorAll('tbody tr[data-tip] .stage')].map(e=>e.textContent),
+                stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
                 layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',
                 rowOffsets:[...table.querySelectorAll('tbody tr[data-tip]')].map(metadata=>{
                   const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
@@ -267,12 +311,12 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
             assert.equal(proof.answer,'Next step room');
-            assert.deepEqual(proof.queueHeaders,['#','Step','Waiting','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
-            assert.ok(proof.stages.at(-1)==='');
+            assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
             for(const offsets of proof.rowOffsets)
               assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
             assert.equal(proof.machine, 'fixture');
@@ -315,7 +359,6 @@ try {
             const shot = await call('Page.captureScreenshot', {format:'png', captureBeyondViewport:true,
               clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
             const pixels = Buffer.from(shot.data,'base64');
-            await writeFile(join(folder, `${theme}-${width}.png`),pixels);
             const pixel=pngPixels(pixels);
             const expected=proof.progressColor.match(/[0-9.]+/g).slice(0,3).map(Number);
             const x=Math.floor(proof.progress.left+proof.progress.width/2);
@@ -401,6 +444,43 @@ try {
               unit.dispatchEvent(new Event('change'));
             })()`);
 
+            for(const [name,detail] of [
+              ['cloud_stage','tools ready'],
+              ['cloud_region','tests start · eu-south-2, zone a'],
+              ['cloud_zone','eu-south-2, zone us-east-1b'],
+              ['cloud_empty','']]) {
+              await show(readings[name]);
+              const detailProof=await evaluate(`(() => {
+                const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
+                const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
+                const amounts=chart.querySelector('.amounts');
+                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                  ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
+                  rootFont:getComputedStyle(document.documentElement).fontSize,
+                  beside:document.querySelector('#walk').classList.contains('beside'),
+                  detailRight:amounts.getBoundingClientRect().right,
+                  tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
+              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
+              assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
+              if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
+                'The AWS detail text crosses into the table.');
+              assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
+              assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
+              if(name==='cloud_region' && process.env.MEMORY_PAGE_SHOT) {
+                const clip=await evaluate(`(() => {
+                  const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                  return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,`${theme}-${width}-aws.png`),Buffer.from(shot.data,'base64'));
+              }
+            }
+
             for(const [name,lateAge,modules,failed] of [
               ['cloud','2 min','7 of 12 modules','1 failed module'],
               ['cloud_zero','2 d','123456 of 999999 modules','123456 failed modules']]) {
@@ -442,10 +522,10 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:document.querySelector('#walk').closest('.card').textContent,
+                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['#','Step','Duration','Stage','Unit','Pid','Machine','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -497,17 +577,111 @@ try {
               assert.equal(alert.text,readings[name].mac_idle_alert);
               assert.equal(alert.hidden,!present);
               if(present) {
-                assert.match(alert.text,/^MAC IDLE 10 min: 7 steps wait for the Mac\./);
+                assert.match(alert.text,/^MAC BLOCKED by research since \d\d:\d\d \(P15 F11 L0 run\): 7 steps wait for the Mac, idle 10 min;/);
                 assert.equal(alert.color,alert.errorColor,'The Mac idle alert is not red.');
                 assert.ok(alert.height>0 && alert.bottom<=alert.titleTop,'The alert is not above the title.');
                 assert.ok(alert.scroll<=alert.client,'The Mac idle alert overflows the page.');
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
-            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],['good','']]) {
+            for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
+              ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
-              assert.equal(await evaluate("document.querySelector('#priority-line').textContent"),expected);
+              const priority=await evaluate(`(() => {
+                const index=latest.walk.findIndex(row=>row.queued);
+                return tipText('row:'+index,latest).join(' ');
+              })()`);
+              assert.equal(priority.includes("queue priority:"),!!expected);
+              if(expected) assert.ok(priority.includes(expected));
+              const heading=await evaluate("tipText('walkhead',latest).join(' ')");
+              const unmatched=name==='priority_unmatched';
+              assert.equal(heading.includes("queue priority:"),unmatched);
+              if(unmatched) assert.equal(heading.split("queue priority: research (the user's bump)").length-1,1);
+              if(unmatched && theme==='dark' && width===1400) {
+                const clip=await evaluate(`(() => {
+                  const heading=document.querySelector('[data-tip="walkhead"]');
+                  heading.scrollIntoView({block:'start'});
+                  const h=heading.getBoundingClientRect();
+                  heading.dispatchEvent(new MouseEvent('click',{bubbles:true,clientX:h.left+10,clientY:h.bottom}));
+                  const tip=document.querySelector('#tip');
+                  if(!tip.classList.contains('on') || !tip.textContent.includes(latest.unmatched_priority_text))
+                    throw new Error('The heading click loses the unmatched priority.');
+                  const r=heading.closest('.card').getBoundingClientRect();
+                  return {x:0,y:r.top+scrollY,width:document.documentElement.clientWidth,height:r.height,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'unmatched-priority-1400.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
+            await show(base);
+
+            for (const state of ['idle','waiting','unmatched','busy']) {
+              const ciReading=structuredClone(base);
+              ciReading.walk.push({name:'hana CI',ci:true,admitted:state==='busy',queued:false,used:0.125,reserved:0,
+                counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
+                progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
+              ciReading.ci_ram=0.125;
+              ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
+              await show(ciReading);
+              const ciProof=await evaluate(`(() => {
+                const key='row:'+(latest.walk.length-1);
+                const table=document.querySelector('.walk-table tr[data-tip="'+key+'"]');
+                const chart=document.querySelector('.wrow[data-tip="'+key+'"]');
+                return {table:!!table,chart:!!chart,stage:table?.querySelector('.place').textContent,
+                  taken:document.querySelector('#walk-sum').textContent,ci:latest.ci_ram};
+              })()`);
+              assert.equal(ciProof.table,state==='busy');
+              assert.equal(ciProof.chart,state==='busy');
+              if(state==='busy') assert.equal(ciProof.stage,'—');
+              assert.equal(ciProof.ci,0.125);
+              assert.equal(ciProof.taken,ciReading.taken.toFixed(1)+' of '+ciReading.cap.toFixed(1)+' GiB taken');
+            }
+            await show(base);
+
+            await show(readings.mac_three);
+            const macProof=await evaluate(`(() => {
+              const rows=latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build');
+              const unit=document.querySelector('#barwrap').getBoundingClientRect().width/latest.total;
+              return rows.map(({row,index})=>{
+                const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+                const table=document.querySelector('.walk-table tr[data-tip="row:'+index+'"]');
+                return {name:row.name,stage:table.querySelector('.place').textContent,
+                  unit:table.querySelector('.unit').textContent,percent:table.querySelector('.done').textContent,
+                  underBar:!!chart.querySelector('.progress-amount'),
+                  used:chart.querySelector('.seg-remote').getBoundingClientRect().width,
+                  color:getComputedStyle(chart.querySelector('.seg-remote')).backgroundColor,
+                  expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
+                  tip:tooltipHtml('row:'+index,latest),
+                  chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
+                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead').getBoundingClientRect().bottom};
+              });
+            })()`);
+            assert.equal(macProof.length,3);
+            assert.deepEqual(macProof.map(row=>row.name),['hana build','hana nextest','cargo-liner nextest']);
+            assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
+            assert.deepEqual(macProof.map(row=>row.unit),['—','trunk','—']);
+            const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
+              repository:document.querySelector('.wrow[data-run="'+index+'"] .owner').textContent,
+              jobs:document.querySelector('tr[data-tip="row:'+index+'"] .vcpus').textContent}))`);
+            assert.deepEqual(macLabels.map(row=>row.repository),['','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
+            for(const row of macProof) {
+              assert.equal(row.stage,'building');
+              assert.ok(Math.abs(row.used-row.expected)<1);
+              assert.equal(row.hatched,false);
+              assert.equal(row.underBar,false);
+              assert.ok(Math.abs(row.chartTop-row.tableTop)<1);
+              assert.ok(row.tip.includes('Mac memory does not count against natedev.'));
+            }
+            await show(readings.mac_failed);
+            const failedMac=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
+              text:document.querySelector('#walk').textContent,
+              unknown:document.querySelector('.walk-table tr[data-tip="row:'+latest.walk.findIndex(row=>row.kind==='mac-unavailable')+'"] .place').textContent})`);
+            assert.ok(failedMac.text.includes('Mac reading is old'));
+            assert.ok(!failedMac.text.includes('private raw error'));
+            assert.ok(!failedMac.text.includes('Progress unavailable: Mac process'));
+            assert.equal(failedMac.unknown,'—');
             await show(base);
 
             const positions=()=>evaluate(`(() => {
@@ -541,9 +715,9 @@ try {
 
             for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
               await show(readings[name]);
-              const state=await evaluate(`({text:document.querySelector('#wait-reasons').textContent,
+              const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
-              assert.ok(state.text.includes(expected), name+' has no visible reason.');
+              assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
             }
@@ -650,7 +824,570 @@ try {
           assert.match(states[name].status,/^Live · read at /);
           assert.ok(!states[name].stale && !states[name].unavailable);
         }
-        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,failures},null,2)+'\n');
+        const capture = async (name, selector) => {
+          await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
+          const clip=await evaluate(`(() => {
+            const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+            return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
+          })()`);
+          const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+          await writeFile(join(folder,`${name}.png`),Buffer.from(shot.data,'base64'));
+        };
+        const comparisons = [];
+        if (cloudOwnerComparison) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            const reading=structuredClone(readings.step_owners);
+            reading.walk=reading.walk.filter(row=>row.kind==='cloud');
+            reading.waiters=reading.waiters.filter(row=>row.kind==='cloud');
+            assert.equal(reading.walk.length,1);
+            assert.equal(reading.waiters.length,1);
+            if(version==='before') for(const row of [...reading.walk,...reading.waiters]) {
+              row.name='nextest';row.unit='owner not recorded';row.showrunner='owner not recorded';
+            }
+            await show(reading);
+            const row=await evaluate(`(() => {
+              const chart=document.querySelector('.wrow[data-run="0"]');
+              const table=document.querySelector('tr[data-tip="row:0"]');
+              return {name:chart.querySelector('.name').textContent,
+                small:chart.querySelector('.owner').textContent,
+                unit:table.querySelector('.unit').textContent,
+                machine:table.querySelector('.machine').textContent};
+            })()`);
+            assert.equal(row.machine,'aws');
+            assert.equal(row.name,version==='before'?'nextest':'research nextest');
+            assert.equal(row.unit,version==='before'?'owner not recorded':'research');
+            if(version==='after') assert.equal(row.small,'hana');
+            await capture(version+'-aws-row','#walk');
+            await evaluate(`showTip('row:0',180,160)`);
+            const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+            if(version==='after') {
+              assert.match(tooltip,/showrunner\s*:?\s*hana/);
+              assert.match(tooltip,/unit\s*:?\s*research/);
+            } else assert.match(tooltip,/owner not recorded/);
+            await capture(version+'-aws-tooltip','#tip');
+            comparisons.push({version,...row,tooltip});
+          }
+        }
+        if (ownersComparison) {
+          assert.ok(beforePage, 'The owner comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            await navigate(version==='before' ? 'before.html' : 'memory_live.html');
+            const reading=structuredClone(readings.step_ci);
+            const mac=reading.walk.find(row=>row.kind==='mac-build');
+            if(version==='before') {
+              mac.name='hana nextest';mac.unit='—';mac.showrunner='—';delete mac.ci_label;
+              for(const row of [...reading.walk,...reading.waiters]) if(row.kind==='cloud') row.name='nextest';
+            }
+            await show(reading);
+            const state=await evaluate(`(() => {
+              const index=latest.walk.findIndex(row=>row.kind==='mac-build');
+              const chart=document.querySelector('.wrow[data-run="'+index+'"]');
+              const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
+              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
+              const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
+                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
+                .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
+              const table=document.querySelector('tr[data-tip="row:'+index+'"]');
+              return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
+                unit:table.querySelector('.unit').textContent,
+                waitingUnit:document.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
+                tip:tooltipHtml('row:'+index,latest)};
+            })()`);
+            if(version==='after') {
+              assert.equal(state.name,'CI nextest');
+              assert.equal(state.unit,'CI');
+              assert.equal(state.waitingUnit,'CI');
+              assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
+              assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
+              assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
+              assert.ok(state.scroll<=state.client, 'The owner table overflows.');
+            }
+            await capture(version+'-running-queued','#walk');
+            await capture(version+'-table-columns','.walk-table');
+            await capture(version+'-mac-ci','.wrow[data-run="'+state.index+'"]');
+            await evaluate(`showTip('row:'+${state.index},700,420)`);
+            if(version==='after') {
+              const ciTip=await evaluate(`document.querySelector('#tip').textContent`);
+              assert.match(ciTip,/hana CI/);
+            }
+            await capture(version+'-mac-ci-tooltip','#tip');
+            const owners=structuredClone(readings.step_owners);
+            if(version==='before') owners.walk.find(row=>row.kind==='mac-build').name='hana nextest';
+            await show(owners);
+            const key=await evaluate(`'row:'+latest.walk.findIndex(row=>row.kind==='mac-build')`);
+            await evaluate(`showTip(${JSON.stringify(key)},700,420)`);
+            if(version==='after') {
+              const tips=await evaluate(`[...latest.walk.map((row,index)=>'row:'+index),...latest.waiters.map((row,index)=>'wait:'+index)].map(key=>tooltipHtml(key,latest))`);
+              for(const tip of tips) {
+                assert.match(tip,/<dl class="identity"><dt>showrunner<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>hana<\/dd><dt>unit<\/dt><dd class="colon" aria-hidden="true">:<\/dd><dd>research<\/dd>/);
+              }
+              const allTips=await evaluate(`(() => {
+                const keys=[...new Set([...document.querySelectorAll('[data-tip]')].map(node=>node.dataset.tip))];
+                return keys.map(key=>({key,html:tooltipHtml(key,latest)}));
+              })()`);
+              for(const tip of allTips) assert.ok(/showrunner/i.test(tip.html) && /unit/i.test(tip.html) || /CI/.test(tip.html), tip.key);
+              const nativeTips=await evaluate(`[...document.querySelectorAll('[title],svg title')].map(node=>node.localName==='title'?node.textContent:node.getAttribute('title'))`);
+              assert.ok(nativeTips.length>0);
+              for(const tip of nativeTips) {assert.match(tip,/Showrunner/);assert.match(tip,/Unit/);}
+              const swap=await evaluate(`tooltipHtml('swap:'+latest.swap_by.findIndex(row=>row.unit==='research'),latest)`);
+              assert.match(swap,/hana/);assert.match(swap,/research/);
+            }
+            await capture(version+'-owner-tooltip','#tip');
+            comparisons.push({version,...state});
+          }
+          for(const width of [600,800,1200,1600]) {
+            await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.step_unknown);
+            const unitCells=await evaluate(`(() => {
+              const cells=[...document.querySelectorAll('.walk-table .unit .cell-text')].filter(cell=>cell.textContent==='owner not recorded');
+              return cells.map(cell=>({text:cell.textContent,scroll:cell.scrollWidth,width:cell.clientWidth}));
+            })()`);
+            assert.ok(unitCells.length>0);
+            for(const cell of unitCells) assert.ok(cell.scroll<=cell.width, 'The Unit cell cuts its text. '+JSON.stringify({width,cell}));
+          }
+          await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.step_ci);
+          await capture('after-narrow-owner-ci','#walk');
+          const live=await readFile(join(folder,'live-mac-ci.json'),'utf8').then(JSON.parse).catch(error=>{
+            if(error.code==='ENOENT') return {row:null};
+            throw error;
+          });
+          if(live.row) {
+            const reading=structuredClone(readings.step_ci);
+            reading.walk=[live.row];reading.waiters=[];
+            await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(reading);
+            const displayed=await evaluate(`({pid:latest.walk[0].pid,
+              name:document.querySelector('.wrow[data-run="0"] .name').textContent,
+              small:document.querySelector('.wrow[data-run="0"] .owner').textContent,
+              unit:document.querySelector('tr[data-tip="row:0"] .unit').textContent,
+              tooltip:tooltipHtml('row:0',latest)})`);
+            assert.match(displayed.name,/^CI /);assert.match(displayed.small,/hana CI/);
+            assert.equal(displayed.unit,'CI');assert.match(displayed.tooltip,/hana CI/);
+            await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
+            await capture('live-mac-ci','#walk');
+            await evaluate(`showTip('row:0',700,420)`);
+            await capture('live-mac-ci-tooltip','#tip');
+            console.log('LIVE_MAC_CI:',JSON.stringify(displayed));
+          }
+        }
+        if (stepNamesComparison) {
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          for (const version of ['before','after']) {
+            await show(readings['owner_names_'+version]);
+            const names = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.walk-table tbody tr')];
+              return {running:rows.filter(row=>row.dataset.tip?.startsWith('row:')).map(row=>row.querySelector('.step').textContent),
+                waiting:rows.filter(row=>row.dataset.tip?.startsWith('wait:')).map(row=>row.querySelector('.step').textContent)};
+            })()`);
+            const expected = version === 'before' ? ['targeted test','merge gate'] : ['panes targeted','showrunner merge'];
+            assert.deepEqual(names.running,expected);
+            assert.deepEqual(names.waiting,expected);
+            await capture(version+'-running-step-names','#walk');
+            comparisons.push({version,...names});
+          }
+        }
+        if (consoleComparison) {
+          assert.ok(beforePage,'The console comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          for (const version of ['before','after']) {
+            await navigate(version==='before'?'before.html':'memory_live.html');
+            await show(base);
+            const state=await evaluate(`(() => ({
+              title:document.title,heading:document.querySelector('h1').textContent,
+              navigation:document.querySelectorAll('nav').length,
+              outbound:[...document.querySelectorAll('a[href]')].filter(a=>!a.getAttribute('href').startsWith('#'))
+                .map(a=>({href:a.getAttribute('href'),target:a.target}))
+            }))()`);
+            if(version==='after') {
+              assert.equal(state.title,'Builds');
+              assert.equal(state.heading,'Builds');
+              assert.equal(state.navigation,0);
+              for(const link of state.outbound) assert.equal(link.target,'_top');
+            } else {
+              assert.equal(state.heading,'Build memory on natedev');
+            }
+            const clip=await evaluate(`(() => {
+              const status=document.querySelector('.status').getBoundingClientRect();
+              return {x:0,y:0,width:innerWidth,height:Math.ceil(status.bottom+16),scale:1};
+            })()`);
+            const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+            await writeFile(join(folder,`${version}-dark-title.png`),Buffer.from(shot.data,'base64'));
+            comparisons.push({version,...state});
+          }
+        }
+        if (queuedComparison) {
+          assert.ok(beforePage, 'The queued comparison needs the previous page.');
+          const cases = [
+            ['queued_none','Queued, in order of submission'],
+            ['queued_one','Queued, research first, then in submission order'],
+            ['queued_two','Queued, research followed by cables and then in submission order'],
+          ];
+          readings.queued_long = structuredClone(readings.queued_two);
+          readings.queued_long.queued_priority_units = ['research-with-a-long-unit-name'.repeat(4),'cables'.repeat(8)];
+          cases.push(['queued_long',`Queued, ${readings.queued_long.queued_priority_units.join(' followed by ')} and then in submission order`]);
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const width of [1400,900,390]) {
+              await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+              await navigate('memory_live.html');
+              for (const [name,title] of cases) {
+                await show(readings[name]);
+                const state=await evaluate(`(() => {
+                  const walk=document.querySelector('#walk');
+                  const heading=walk.querySelector('.walk-chart .queue-title');
+                  const header=heading.parentElement;
+                  const columns=walk.querySelector('.walk-table tr.queue-head');
+                  const room=walk.querySelector('.wrow.room');
+                  const after=getComputedStyle(room,'::after'),before=getComputedStyle(room,'::before');
+                  const running=getComputedStyle(document.querySelector('.section-head'));
+                  const rows=[...walk.querySelectorAll('.walk-table tr[data-tip]')];
+                  const textBottom=element=>{
+                    const range=document.createRange();range.selectNodeContents(element);
+                    return range.getBoundingClientRect().bottom;
+                  };
+                  return {title:heading.textContent,font:getComputedStyle(heading).font,
+                    hover:heading.title,truncated:heading.scrollWidth>heading.clientWidth,
+                    clipped:getComputedStyle(heading).textOverflow==='ellipsis' && getComputedStyle(heading).overflow==='hidden',
+                    withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
+                    headerHeight:header.getBoundingClientRect().height,
+                    headerOffset:header.getBoundingClientRect().top-columns.getBoundingClientRect().top,
+                    bottomOffset:textBottom(heading)-textBottom(columns.querySelector('th')),
+                    nextGap:header.nextElementSibling.getBoundingClientRect().top-header.getBoundingClientRect().bottom,
+                    noEmptyRow:!walk.querySelector('tr.queue-title'),
+                    noOverlap:heading.getBoundingClientRect().right<=columns.getBoundingClientRect().left ||
+                      heading.getBoundingClientRect().bottom<=columns.getBoundingClientRect().top,
+                    runningFont:running.font,afterWidth:after.borderTopWidth,beforeWidth:before.borderTopWidth,
+                    afterColor:after.borderTopColor,beforeColor:before.borderTopColor,
+                    roomTop:room.getBoundingClientRect().top,headingTop:heading.getBoundingClientRect().top,
+                    roomBottom:room.getBoundingClientRect().bottom,
+                    pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
+                    aligned:walk.classList.contains('beside') && rows.every(row=>{
+                      const chart=walk.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]') || room;
+                      return Math.abs(row.getBoundingClientRect().top-chart.getBoundingClientRect().top)<=1;
+                    }),beside:walk.classList.contains('beside')};
+                })()`);
+                assert.equal(state.title,title);
+                assert.ok(state.hover.startsWith(title+'\n'));
+                assert.match(state.hover,/Showrunner:/);
+                assert.match(state.hover,/Unit:/);
+                assert.equal(state.font,state.runningFont);
+                assert.equal(state.headerHeight,30);
+                assert.equal(state.nextGap,0);
+                assert.equal(state.noEmptyRow,true);
+                assert.equal(state.withinChart,true);
+                assert.equal(state.noOverlap,true,JSON.stringify({theme,width,name,...state}));
+                if(name==='queued_long') {
+                  assert.equal(state.truncated,true);
+                  assert.equal(state.clipped,true);
+                }
+                assert.equal(state.afterWidth,'1px');
+                assert.equal(state.afterWidth,state.beforeWidth);
+                assert.equal(state.afterColor,state.beforeColor);
+                assert.ok(state.headingTop>=state.roomBottom);
+                assert.equal(state.pageOverflow,false);
+                if(state.beside) {
+                  assert.equal(state.aligned,true);
+                  assert.ok(Math.abs(state.headerOffset)<=1,'The title and columns use different rows.');
+                  assert.ok(Math.abs(state.bottomOffset)<=2,'The title and columns have different text bottoms.');
+                }
+                comparisons.push({theme,width,name,...state});
+              }
+            }
+            await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+            let beforeRoomTop, beforeWaitTop;
+            for (const version of ['before','after']) {
+              await navigate(version==='before'?'before.html':'memory_live.html');
+              await show(readings.queued_two);
+              const state=await evaluate(`(() => {
+                const walk=document.querySelector('#walk');
+                return {roomTop:walk.querySelector('.wrow.room').getBoundingClientRect().top,
+                  waitTop:walk.querySelector('.wrow.wait').getBoundingClientRect().top,
+                  title:walk.querySelector('.walk-chart .queue-title')?.textContent || ''};
+              })()`);
+              if(version==='before') {
+                beforeRoomTop=state.roomTop;
+                beforeWaitTop=state.waitTop;
+                assert.equal(state.title,cases[2][1]);
+              } else {
+                assert.ok(Math.abs(state.roomTop-beforeRoomTop)<=1,'The room row moved.');
+                assert.equal(state.title,cases[2][1]);
+                assert.ok(state.waitTop<beforeWaitTop,'The separate title row remains.');
+              }
+              await capture(`${version}-${theme}-queued`,'#walk');
+            }
+          }
+        }
+        if (blocksComparison) {
+          assert.ok(beforePage, 'The block comparison needs the previous page.');
+          const blockReason='research P16 Hana palette Command-shortcut shots (kept binary, no cargo)';
+          const blockLine='Mac: blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST';
+          const blocked=structuredClone(readings.spacing);
+          Object.assign(blocked,{room:1.0,pressure:'some stall above its limit',psi:{some:31.0,full:6.2},
+            mac_idle_alert:'MAC IDLE 8 min: 1 steps wait for the Mac. Blocked by research since 15:32 ('+blockReason
+              +'); /build:mac unblock clears it.',
+            targets:[
+              {target:'mac',state:'Blocked',reason:blockReason,holder:'research',unit:'research',showrunner:'hana',
+               since:'since 15:32 EST',until:'awaiting unblock; requested expiry was 16:30 EST'},
+              {target:'natedev',state:'Held',reason:'disk walk of ~/.local/state',holder:'report',unit:'report',showrunner:'builds',
+               since:'since 15:20 EST',until:'expected release 16:00 EST'},
+              {target:'natedev',state:'Held',reason:'cargo sweep of the shared target folder',holder:'cables',unit:'cables',
+               showrunner:'builds',since:'start not recorded',until:'until released'}]});
+          blocked.waiters[0].mac_text=blockLine;
+          const after=structuredClone(blocked);
+          after.mac_idle_alert='';
+          const contrast=`(() => {
+            const channel=value=>{value/=255;return value<=0.03928?value/12.92:((value+0.055)/1.055)**2.4;};
+            const luminance=text=>{const [r,g,b]=text.match(/\\d+(\\.\\d+)?/g).map(Number);
+              return 0.2126*channel(r)+0.7152*channel(g)+0.0722*channel(b);};
+            const state=document.querySelector('.target-state');
+            const ground=getComputedStyle(state.closest('.card')).backgroundColor;
+            const [high,low]=[luminance(getComputedStyle(state).color),luminance(ground)].sort((a,b)=>b-a);
+            return (high+0.05)/(low+0.05);
+          })()`;
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const version of ['before','after']) {
+              await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+              await navigate(version==='before'?'before.html':'memory_live.html');
+              await show(version==='before'?blocked:after);
+              const state=await evaluate(`(() => {
+                const alert=document.querySelector('#mac-idle-alert');
+                const targets=document.querySelector('#targets');
+                const memory=document.querySelector('#room').closest('.card');
+                return {alert:alert.hidden?'':alert.textContent,
+                  targets:targets?targets.hidden?'hidden':targets.innerText:'absent',
+                  rows:targets?[...targets.querySelectorAll('.target-row')].map(row=>row.innerText):[],
+                  bottom:memory.getBoundingClientRect().bottom+scrollY,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              if(version==='after') {
+                assert.equal(state.alert,'');
+                assert.equal(state.rows.length,3);
+                assert.match(state.rows[0],/mac[\s\S]*Blocked[\s\S]*Unit research · Showrunner hana/);
+                assert.match(state.rows[2],/Start not recorded/);
+                assert.ok(!/idle/i.test(state.targets),'The block card says idle.');
+                const ratio=await evaluate(contrast);
+                assert.ok(ratio>=4.5,'The state label contrast is '+ratio+' in '+theme+'.');
+                state.contrast=ratio;
+              } else assert.match(state.alert,/^MAC IDLE 8 min/);
+              assert.equal(await evaluate(`document.querySelector('#pill-t').textContent`),'pressure: queue holds');
+              assert.ok(state.scroll<=state.client,'The page overflows.');
+              await evaluate('scrollTo(0,0)');
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+                clip:{x:0,y:0,width:1400,height:Math.ceil(state.bottom)+16,scale:1}});
+              await writeFile(join(folder,`${version}-${theme}-blocks.png`),Buffer.from(shot.data,'base64'));
+              await evaluate(`showTip('wait:0',700,420)`);
+              const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+              if(version==='after') assert.ok(tooltip.includes(blockLine),tooltip);
+              else assert.ok(!tooltip.includes('Mac:'),tooltip);
+              await capture(`${version}-${theme}-waiter-tooltip`,'#tip');
+              comparisons.push({version,theme,...state,tooltip});
+            }
+            await call('Emulation.setDeviceMetricsOverride',{width:390,height:1200,deviceScaleFactor:1,mobile:false});
+            await navigate('memory_live.html');
+            await show(after);
+            const narrow=await evaluate(`(() => {
+              const rows=[...document.querySelectorAll('.target-row')].map(row=>{
+                const top=selector=>row.querySelector(selector).getBoundingClientRect().top;
+                return {owner:top('.target-owner'),since:top('.target-since'),until:top('.target-until'),
+                  reason:top('.target-reason')};
+              });
+              return {rows,scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+            })()`);
+            assert.ok(narrow.scroll<=narrow.client,'The narrow page overflows.');
+            for(const row of narrow.rows) assert.ok(row.reason<row.owner && row.owner<row.since && row.since<row.until,
+              'The narrow row order is wrong: '+JSON.stringify(row));
+            await capture(`after-${theme}-narrow-targets`,'#targets');
+            comparisons.push({version:'after',theme,width:390,...narrow});
+          }
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const lines=[blockLine,'Mac: busy with nextest hana','Mac: natedev only, makes natedev artifacts',
+            'Mac: kind not offloaded','Mac: excluded, linux_only; package not recorded','Mac: unreachable, retry backoff',
+            'Mac: state unreadable, retry backoff: backoff time is not finite',
+            'Mac: no recorded block or claim; availability not checked'];
+          for (const [index,line] of lines.entries()) {
+            const reading=structuredClone(after);
+            reading.waiters[0].mac_text=line;
+            await show(reading);
+            await evaluate(`showTip('wait:0',700,420)`);
+            const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+            assert.ok(tooltip.includes(line),tooltip);
+            await capture(`after-mac-line-${index+1}`,'#tip');
+            comparisons.push({line,tooltip});
+          }
+        }
+        if (identityComparison) {
+          assert.ok(beforePage, 'The identity comparison needs the previous page.');
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const reading=structuredClone(readings.step_owners);
+          const mac=reading.walk.findIndex(row=>row.kind==='mac-build');
+          const local=reading.walk.findIndex(row=>!row.kind);
+          assert.ok(mac>=0 && local>=0 && reading.waiters.length>0);
+          Object.assign(reading.walk[mac],{name:'hana nextest',showrunner:'hana',unit:'research',runner:'worker',worker:'impl2',
+            used:9.7,started_at:reading.read_at-13*60,read_at:reading.read_at,stage:{kind:'MacTesting'},
+            progress:{kind:'RowProgress',phase:'testing',done:891,total:894,percent:100*891/894,unit:'units'}});
+          Object.assign(reading.walk[local],{name:'builds merge gate',showrunner:'builds',unit:'—',runner:'showrunner',worker:''});
+          Object.assign(reading.waiters[0],{name:'report nextest',showrunner:'builds',unit:'report',runner:'unit director',worker:''});
+          // A colon is its own cell on the after page; the before page draws it after the label.
+          const identity=key=>evaluate(`(() => {
+            showTip(${JSON.stringify(key)},700,420);
+            const tip=document.querySelector('#tip');
+            const block=tip.querySelector('.identity');
+            const colonLeft=cell=>{
+              const colon=cell.nextElementSibling;
+              if(colon?.classList.contains('colon')) return colon.getBoundingClientRect().left;
+              const style=getComputedStyle(cell,'::after');
+              const probe=document.createElement('span');
+              probe.textContent=':';
+              probe.style.font=style.font;
+              document.body.append(probe);
+              const width=probe.getBoundingClientRect().width;
+              probe.remove();
+              return cell.getBoundingClientRect().right-width;
+            };
+            return {text:tip.innerText,fields:block?[...block.querySelectorAll('dt')].map(cell=>[cell.textContent,
+              (cell.nextElementSibling?.classList.contains('colon')?cell.nextElementSibling.nextElementSibling:cell.nextElementSibling).textContent,
+              colonLeft(cell)]):[],
+              first:tip.children[1]?.className||''};
+          })()`);
+          const lefts=state=>[...new Set(state.fields.map(([, , left])=>left.toFixed(2)))];
+          for (const [key,name,expected] of [
+            ['row:'+mac,'mac-row',[['showrunner','hana'],['unit','research'],['worker','impl2']]],
+            ['wait:0','queued-row',[['showrunner','builds'],['unit','report'],['worker','this run is from the unit director']]]]) {
+            for (const version of ['before','after']) {
+              await navigate(version==='before'?'before.html':'memory_live.html');
+              await show(reading);
+              const state=await identity(key);
+              assert.equal(state.first,'identity');
+              assert.deepEqual(state.fields.map(([field,value])=>[field,value]),expected);
+              if(version==='after') assert.equal(lefts(state).length,1,`The colons do not align: ${lefts(state)}`);
+              await capture(`${version}-colons-${name}`,'#tip');
+              comparisons.push({version,row:name,colonLefts:lefts(state),...state});
+            }
+          }
+          await navigate('memory_live.html');
+          await show(reading);
+          const showrunnerState=await identity('row:'+local);
+          assert.deepEqual(showrunnerState.fields.map(([field,value])=>[field,value]),
+            [['showrunner','builds'],['unit','this run is from the showrunner']]);
+          assert.equal(lefts(showrunnerState).length,1);
+        }
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
+          const review = structuredClone(readings.spacing);
+          review.priority_text = "queue priority: port (the user's bump)";
+          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          const local = review.walk.find(row => row.queued);
+          local.machine = 'natedev';
+          const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
+          Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
+            progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
+          const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
+          Object.assign(aws, {machine:'aws',used:1.5});
+          const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
+            started_at:now-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
+            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
+          review.walk = [local, mac, aws, ci];
+          review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
+            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
+            head_text:review.head_text,priority_text:review.priority_text}];
+          review.ci_ram = 0.125;
+          review.taken = review.used + review.ci_ram + review.reserved;
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const version of ['before','after']) {
+              await call('Emulation.setDeviceMetricsOverride', {width:1800,height:1200,deviceScaleFactor:1,mobile:false});
+              await navigate(version === 'before' ? 'before.html' : 'memory_live.html');
+              await show(review);
+              const comparison = await evaluate(`(() => {
+                const table=document.querySelector('.walk-table');
+                const mac=document.querySelector('.wrow[data-run="1"]');
+                const macBar=mac.querySelector('.seg-remote,.seg-used');
+                const awsBar=document.querySelector('.wrow[data-run="2"] .seg-remote');
+                return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
+                  done:table.querySelector('tr[data-tip="row:1"] .done')?.textContent,
+                  underBar:!!mac.querySelector('.progress-amount'),
+                  remoteColor:getComputedStyle(macBar).backgroundColor,
+                  awsColor:awsBar?getComputedStyle(awsBar).backgroundColor:null,
+                  localColor:getComputedStyle(document.querySelector('.wrow[data-run="0"] .seg-used')).backgroundColor,
+                  machineColors:[...table.querySelectorAll('tr[data-tip^="row:"] .machine')].map(cell=>getComputedStyle(cell).color),
+                  ciVisible:!!table.querySelector('tr[data-tip="row:3"]'),
+                  waiting:table.querySelector('tr[data-tip="wait:0"] .unit').textContent,
+                  pageOverflow:document.documentElement.scrollWidth>document.documentElement.clientWidth};
+              })()`);
+              if(version==='after') {
+                assert.deepEqual(comparison.headers.slice(0,2),['Stage','Done']);
+                assert.equal(comparison.done,'99.3%');
+                assert.equal(comparison.underBar,false);
+                assert.notEqual(comparison.remoteColor,comparison.localColor);
+                assert.equal(comparison.remoteColor,comparison.awsColor);
+                const rgb = hex => 'rgb('+hex.slice(1).match(/../g).map(part=>parseInt(part,16)).join(', ')+')';
+                assert.equal(comparison.remoteColor,rgb(review.colors[theme].remote_memory));
+                assert.deepEqual(comparison.machineColors,['natedev','mac','aws'].map(machine=>rgb(review.colors[theme].machines[machine])));
+                assert.equal(new Set(comparison.machineColors).size,3);
+                assert.equal(comparison.ciVisible,false);
+                assert.equal(comparison.waiting,'CI');
+                assert.equal(comparison.pageOverflow,false);
+              } else {
+                assert.equal(comparison.ciVisible,true);
+                assert.equal(comparison.underBar,true);
+                assert.equal(comparison.remoteColor,comparison.localColor);
+              }
+              await capture(`${version}-${theme}-c1507-b`,'#walk');
+              await capture(`${version}-${theme}-hanaci-row`,'#walk');
+              await evaluate(`showTip('row:1',180,160)`);
+              const note = await evaluate(`(() => {
+                const tip=document.querySelector('#tip');
+                const note=tip.querySelector('span');
+                const fields=tip.querySelector('dl');
+                return {last:tip.lastElementChild===note,nowrap:getComputedStyle(note).whiteSpace,
+                  note:note.textContent,fieldsBottom:fields.getBoundingClientRect().bottom,noteTop:note.getBoundingClientRect().top};
+              })()`);
+              if(version==='after') {
+                assert.equal(note.last,true);
+                assert.equal(note.nowrap,'nowrap');
+                assert.ok(note.noteTop>=note.fieldsBottom);
+              }
+              await capture(`${version}-${theme}-c1507-a`,'#tip');
+              const responsive = [];
+              if(version==='after') {
+                for(const width of [1400,390]) {
+                  await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+                  await show(review);
+                  const layout = await evaluate(`(() => {
+                    const walk=document.querySelector('#walk'),card=walk.closest('.card');
+                    return {tables:walk.querySelectorAll('table').length,
+                      lists:card.querySelectorAll('#priority-line,#head-line,#wait-reasons').length,
+                      layout:walk.classList.contains('beside')?'beside':'stacked',
+                      head:tipText('wait:0',latest).join(' ')};
+                  })()`);
+                  assert.equal(layout.tables,1);
+                  assert.equal(layout.lists,0);
+                  assert.equal(layout.layout,width===1400?'beside':'stacked');
+                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                    assert.equal(layout.head.split(value).length-1,1);
+                  responsive.push({width,...layout});
+                }
+              }
+              comparisons.push({version,theme,...comparison,note,responsive});
+            }
+          }
+        }
+
+        await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
+          failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
       } finally {
         if(ws) ws.close();

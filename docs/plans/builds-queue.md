@@ -609,7 +609,7 @@ Phase 18c makes the staff row id the copy owner, under its `RoleOwner` boundary 
 #### As-built
 
 - A long outage of the build queue service sends one message. `down_alert` in `scripts/build_queue/admission_client.py` sends it to session `builds` with `session_send_argv`, sender `build-admission`. The text names the journal command and the restart command.
-- A send result other than `sent` adds one blocked phone push through `alert.blocked`, with the action "On natedev, run: sudo systemctl restart build-admission.socket build-admission.service". `--clears-when` runs `admission_client.py view`, which exits nonzero while the service is down.
+- A send result other than `sent` adds one blocked phone push through `alert.blocked`, with the action "On natedev, run: systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service". `--clears-when` runs `admission_client.py view`, which exits nonzero while the service is down.
 - The claim stays when a send sent or kept a message. It releases only when both sends return `failed`, `refused` or `retry`.
 - `_check_outage_alert()` in `scripts/build_queue/admission_service.py` runs from `run_once`. It clears the `build-admission` claim once, after `silence_seconds` of listener uptime, with the last usable config. A failed clear prints one line and retries. Listener setup clears nothing.
 - `build_admission.down` is not in the push catalog.

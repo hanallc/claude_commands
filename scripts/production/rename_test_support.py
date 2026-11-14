@@ -39,6 +39,7 @@ from scripts.production import unit_names
 from scripts.production import unit_lookup
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 
 SCRIPT = Path(__file__).resolve().parents[1] / "agents/shutdown.py"
 READ_HERDR_PANES = herdr.Herdr.panes
@@ -131,10 +132,14 @@ class FolderMoveBackend:
     def publish_process_state(self) -> None:
         """Expose the process generation and its resume arguments."""
         environment = {"HERDR_PROC": str(self.fixture.root / "folder-processes")}
-        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
         arguments = [self.kind] if self.kind == "claude" else [self.kind, "resume", self.fixture.owner.current_session]
-        fake_unit_host.process(environment, self.pid, self.shell_pid if self.live else 1, arguments if self.live else [],
-                               self.environment(self.pid), cwd=self.cwd)
+        process = Path(environment["HERDR_PROC"]) / str(self.pid)
+        if self.live:
+            fake_unit_host.process(environment, self.pid, self.shell_pid, arguments,
+                                   self.environment(self.pid), cwd=self.cwd)
+        elif process.exists():
+            shutil.rmtree(process)
+        fake_unit_host.process(environment, self.shell_pid, 1, ["zsh"], {}, cwd=self.cwd)
 
     def scan_row_panes(self, record: staff.StaffSnapshot, panes: list[dict[str, object]]) -> herdr.RowPaneScan:
         """Use the shared scan with this fixture's process replies."""
@@ -201,6 +206,7 @@ class FolderMoveBackend:
         words = shlex.split(command[1])
         self.cwd = Path(words[words.index("cd") + 2])
         self.fixture.assertTrue(self.cwd.is_dir())
+        self.publish_process_state()
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
@@ -241,7 +247,7 @@ class FolderMoveFixture(StaffTestCase):
     records: Path = Path()
     owner: staff.StaffRow = staff.StaffRow(
         staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "unit", "fixture", staff.StaffRoot(),
-        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"), unit_type=staff.UnitDetails("direct"))
 
     @override
     def setUp(self) -> None:
@@ -269,6 +275,7 @@ class FolderMoveFixture(StaffTestCase):
         _ = self.enterContext(mock.patch("scripts.production.stall_watch.STATE_DIR", self.root / "stall-watch"))
         _ = self.enterContext(mock.patch.object(progress_history, "SESSION_ROOTS", (self.run_dir.parent,)))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.run_dir.parent))
+        bind_private_run_roots(self, self.root)
         _ = self.folder_git(self.checkout, "init", "-b", "kept-branch")
         _ = self.folder_git(self.checkout, "config", "user.name", "Folder Move Test")
         _ = self.folder_git(self.checkout, "config", "user.email", "move@example.invalid")
@@ -289,7 +296,7 @@ class FolderMoveFixture(StaffTestCase):
         sibling = pane_record.launch("w1:p2", fixture_runtime_id("folder-move-neighbour"),
             str(self.root / "neighbour"), {}, ["claude", "-n", "neighbour"])
         pane_record.write("agents", sibling)
-        fields: dict[str, object] = {
+        fields: dict[str, object] = {"owner_staff_id": self.owner.id,
             "run_id": "move-run", "main_agent": {"session_id": self.owner.current_session},
             "branch": "unit-branch", "plan_doc": "plan.md",
             "history_file": str(self.history), "production": "production", "unit": "kept-name",
@@ -307,6 +314,22 @@ class FolderMoveFixture(StaffTestCase):
     def folder_backend(self, kind: Literal["claude", "codex"] = "claude", *, live: bool = False) -> FolderMoveBackend:
         backend = FolderMoveBackend(self, kind, live)
         backend.publish_process_state()
+        move = unit_move.main
+
+        def move_from_shell(arguments: Sequence[str] | None = None) -> int:
+            environment = {"HERDR_PROC": str(self.root / "folder-processes")}
+            caller = Path(environment["HERDR_PROC"]) / str(os.getpid())
+            fake_unit_host.process(environment, os.getpid(), backend.shell_pid, [sys.executable], {}, cwd=self.root)
+            try:
+                return move(arguments)
+            finally:
+                shutil.rmtree(caller)
+                row = staff.by_id(self.owner.id)
+                if row is not None and isinstance(row.worktree, staff.PresentWorktree):
+                    backend.cwd = row.worktree.path
+                backend.publish_process_state()
+
+        _ = self.enterContext(mock.patch.object(unit_move, "main", side_effect=move_from_shell))
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(
             os.environ, {"HERDR_PROC": str(self.root / "folder-processes"), "SHUTDOWN_PROOF_WORKSPACE": "w1"})))
         account_key = "CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"

@@ -194,7 +194,7 @@ CODEX_ROLE = "workers"
 NO_VALUE = "—"
 TABLE_HEADINGS = (
     "Folder", "Label", "Role", "Weekly left", "Weekly resets",
-    "On credits", "Credits left", "Read",
+    "On credits", "Credits left", "Read", "Login ends",
 )
 
 
@@ -2353,34 +2353,38 @@ class InvalidProducerSettings:
     """The producer has no usable launch settings for this operation."""
 
 
-_reported_producer_settings: ContextVar[set[staff.StaffId]] = ContextVar("reported_producer_settings")
+_scoped_producer_settings: ContextVar[dict[staff.StaffId, models_registry.LaunchSettings | InvalidProducerSettings]] = (
+    ContextVar("scoped_producer_settings"))
 
 
 @contextmanager
 def settings_report_scope() -> Generator[None]:
-    """Report each invalid producer once within an operation."""
+    """Resolve and report each producer's settings once within an operation."""
     try:
-        _ = _reported_producer_settings.get()
+        _ = _scoped_producer_settings.get()
     except LookupError:
-        token = _reported_producer_settings.set(set())
+        token = _scoped_producer_settings.set({})
         try:
             yield
         finally:
-            _reported_producer_settings.reset(token)
+            _scoped_producer_settings.reset(token)
     else:
         yield
 
 
 def producer_settings(member: staff.StaffRow) -> models_registry.LaunchSettings | InvalidProducerSettings:
     """Read one producer's settings and exclude it when its settings are invalid."""
+    resolved = _scoped_producer_settings.get({})
+    if member.id in resolved:
+        return resolved[member.id]
     try:
-        return models_registry.launch_settings("producers", member.name)
+        settings: models_registry.LaunchSettings | InvalidProducerSettings = (
+            models_registry.launch_settings("producers", member.name))
     except ValueError as error:
-        reported = _reported_producer_settings.get(set())
-        if member.id not in reported:
-            reported.add(member.id)
-            account_anomaly(f"{member.name}: {error}")
-        return InvalidProducerSettings()
+        account_anomaly(f"{member.name}: {error}")
+        settings = InvalidProducerSettings()
+    resolved[member.id] = settings
+    return settings
 
 
 def eligible_producers(membership: staff.StaffSnapshot, family: str) -> tuple[staff.StaffRow, ...]:
@@ -2881,8 +2885,13 @@ class AccountWorkerActivity(Protocol):
     def row(self) -> staff.StaffRow: ...
 
 
+class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
+    @property
+    def status(self) -> str: ...
+
+
 class AccountPaneReader(Protocol):
-    OpenWorker: type[AccountWorkerActivity]
+    OpenWorker: type[AccountOpenWorkerActivity]
 
     def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
@@ -3099,6 +3108,34 @@ def _resolve_worker_move_target(destination: FollowWorkersRole | FixedClaudeWork
     return _current_workers_target() if isinstance(destination, FollowWorkersRole) else destination.label
 
 
+@dataclass(frozen=True)
+class TargetCanWork:
+    """The target account can take workers."""
+
+
+@dataclass(frozen=True)
+class CreditsOffTarget:
+    """The target may not spend credits and has no included usage left."""
+
+    reason: str
+
+
+def _codex_target_credit_block(label: str, now: datetime) -> TargetCanWork | CreditsOffTarget:
+    """A worker move never sends work to an account that may not spend credits and has no included usage."""
+    if not isinstance(agent_accounts.codex_credits_setting(label), agent_accounts.CreditsOff):
+        return TargetCanWork()
+    try:
+        login = _codex_home_login(_codex_account_home(label))
+    except AccountsError:
+        return TargetCanWork()
+    reading = refusals.stored_reading("codex", login, now) if login else NoReading()
+    if not isinstance(reading, (FreshReading, StaleReading)) or not isinstance(reading.weekly, ReadingWindow):
+        return TargetCanWork()
+    if _codex_reading_can_work(FreshReading(reading.weekly, reading.five_hour, "0"), now, agent_accounts.CreditsOff()):
+        return TargetCanWork()
+    return CreditsOffTarget(f"{label}: it may not spend credits and its included usage is gone; the worker stays")
+
+
 @settings_report_scope()
 def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                       why: str) -> GroupMoveStarted | GroupMoveStartFailed:
@@ -3119,7 +3156,9 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 target = _resolve_worker_move_target(destination)
                 if attempted.get(row.id) == target:
                     continue
-                results[row.id] = _move_worker_row(pane_moves, row, record, target, why)
+                block = _codex_target_credit_block(target, datetime.now(timezone.utc)) if family == "codex" else TargetCanWork()
+                results[row.id] = (SessionMoveRefused(row.id, block.reason) if isinstance(block, CreditsOffTarget)
+                                   else _move_worker_row(pane_moves, row, record, target, why))
                 attempted[row.id] = target
             with _workers_move_lock("schedule") if isinstance(destination, FollowWorkersRole) else nullcontext():
                 target = _resolve_worker_move_target(destination)
@@ -3129,7 +3168,8 @@ def _run_worker_moves(destination: FollowWorkersRole | FixedClaudeWorkersTarget,
                 if isinstance(destination, FollowWorkersRole):
                     pending = _read_pending_worker_moves()
                     if isinstance(pending, PendingWorkerMoves):
-                        _complete_worker_move_requests(pending.requests, target)
+                        _complete_worker_move_requests(pending.requests, target,
+                                                       _codex_target_credit_block(target, datetime.now(timezone.utc)))
                         _workers_move_file().unlink()
                 break
     outcomes = tuple(results.values())
@@ -3462,7 +3502,8 @@ def _queue_worker_moves(
     atomic_file.write_text_atomic(_workers_move_file(), json.dumps(document) + "\n", new_file_mode=0o600)
 
 
-def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> None:
+def _complete_worker_move_requests(requests: tuple[str, ...], target: str,
+                                   block: TargetCanWork | CreditsOffTarget) -> None:
     pending = _pending_workers_requests()
     home = str(_codex_account_home(target) if _label_is(target, "codex") else claude_account_dir(target))
     for identity in requests:
@@ -3471,7 +3512,9 @@ def _complete_worker_move_requests(requests: tuple[str, ...], target: str) -> No
             continue
         common = moves.MoveCommon(at=datetime.now(timezone.utc).isoformat(), tool=request["tool"],
                                   subject="workers", move_id=identity)
-        if request["to"] == target:
+        if isinstance(block, CreditsOffTarget):
+            moves.append_move(moves.FailedMove(**common, kind="failed", reason=block.reason))
+        elif request["to"] == target:
             moves.append_move(moves.ConfirmedMove(**common, kind="confirmed", home=home))
         else:
             moves.append_move(moves.FailedMove(**common, kind="failed", reason=f"superseded by {target}"))
@@ -4252,6 +4295,7 @@ class StatusRow:
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
     selected_roles: tuple[str, ...] = ()
     sessions: tuple[AccountSessionDocument, ...] = ()
+    login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
 
 
 @dataclass(frozen=True)
@@ -4276,6 +4320,7 @@ class StatusAccountDocument(TypedDict):
     role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
+    login_ends_at: str | None
     credits: float | Literal["unlimited"] | None
     use_credits: bool
     read_at: str | None
@@ -4358,7 +4403,9 @@ def _status_row(
         tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
         read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
         else agent_accounts.UsageReadOutcome.OK,
-        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable(),
+        login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
+        if login and tool == "claude" else agent_accounts.LoginEndUnknown())
 
 
 def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[str, ...]:
@@ -4388,7 +4435,9 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
         reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
         row.on_credits,
         credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
-        read_cell)
+        read_cell,
+        row.login_ends_at.at.astimezone(zone).strftime("%a %m-%d %H:%M %Z")
+        if row.tool == "claude" and isinstance(row.login_ends_at, agent_accounts.LoginEndKnown) else NO_VALUE)
 
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -4404,6 +4453,7 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            login_ends_at=agent_accounts.login_end_iso(row.login_ends_at) if row.tool == "claude" else None,
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
@@ -5174,14 +5224,21 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
+    warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
-        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
-            ProblemCause("warning", line), NoUserStep())))
+        session_warning = re.fullmatch(r"anomaly: [A-Za-z0-9_.-]+: (.+)", line)
+        key = ("session", session_warning[1]) if session_warning else ("line", line)
+        warning_groups.setdefault(key, []).append(line)
+    for (kind, cause), lines in warning_groups.items():
+        warning = f"{cause} ({len(lines)} sessions)" if kind == "session" and len(lines) > 1 else lines[0]
+        rendered = render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", warning), NoUserStep()))
+        notes.append(rendered)
     return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
@@ -5226,7 +5283,7 @@ class LocalRoleSessions:
 @dataclass(frozen=True)
 class CodexRoleProcess:
     pid: int
-    activity: Literal["busy", "idle"]
+    activity: Literal["busy", "idle", "starting"]
 
 
 def _local_codex_processes() -> dict[str, CodexRoleProcess]:
@@ -5237,8 +5294,9 @@ def _local_codex_processes() -> dict[str, CodexRoleProcess]:
         agents = herdr.Herdr(herdr.shared_session()).agents()
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         agents = []
-    activities: dict[str, Literal["busy", "idle"]] = {
-        agent["agent_session"].session_id: "busy" if agent["agent_status"] == herdr.AgentStatus.WORKING else "idle"
+    activities: dict[str, Literal["busy", "idle", "starting"]] = {
+        agent["agent_session"].session_id: ("busy" if agent["agent_status"] == herdr.AgentStatus.WORKING
+            else "starting" if agent["agent_status"] == herdr.AgentStatus.STARTING else "idle")
         for agent in agents if agent.get("agent") == "codex"
         and isinstance(agent["agent_session"], herdr.ReportedAgentSession)
     }
@@ -5276,6 +5334,14 @@ def _moving_role_suffix(role: str, label: str, groups: GroupAccounts) -> str:
 @settings_report_scope()
 def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = True) -> LocalRoleSessions:
     """Read local membership, processes, and activity for counts and moves."""
+    from scripts.herdr import herdr
+
+    # One pane and process read serves every member in this read.
+    with herdr.observation_snapshot():
+        return _observed_role_sessions(groups, include_workers=include_workers)
+
+
+def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool) -> LocalRoleSessions:
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
@@ -5382,7 +5448,8 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
                 if not isinstance(evidence, session_staff.RecordedWorker):
                     session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = worker_panes.worker_state(state)
+                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
+                          else worker_panes.worker_state(state))
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
@@ -5443,6 +5510,7 @@ def _session_counts_machine() -> str:
 
 
 def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]]) -> MachineSessionCounts:
+    """Publish the four session states for each account and role."""
     mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
@@ -5455,14 +5523,15 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
     for (label, role), members in mapped.items():
         tool = "codex" if label.startswith("codex") else "claude"
         count = _role_session_counts(tuple(members.values()), tool)
-        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
-            idle=count.idle, paused=count.paused, exited=count.exited, total=count.total)
+        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy, idle=count.idle,
+            paused=count.paused, exited=count.exited, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     return document
 
 
 def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
+    """Count an older peer's starting sessions as busy; its busy count already holds waiting."""
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("invalid session counts")
@@ -5479,13 +5548,15 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
             if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
                 raise ValueError("invalid role counts")
             count = cast(dict[str, object], raw)
+            starting = count.get("starting", 0)
             busy, idle, paused, exited, total = (count.get(key) for key in ("busy", "idle", "paused", "exited", "total"))
-            if any(type(value) is not int for value in (busy, idle, paused, exited, total)):
+            if any(type(value) is not int for value in (busy, starting, idle, paused, exited, total)):
                 raise ValueError("invalid activity counts")
+            starting = cast(int, starting)
             busy, idle, paused, exited, total = (cast(int, value) for value in (busy, idle, paused, exited, total))
-            if min(busy, idle, paused, exited, total) < 0 or busy + idle + paused + exited != total:
+            if min(busy, starting, idle - starting, paused, exited, total) < 0 or busy + idle + paused + exited != total:
                 raise ValueError("invalid count total")
-            checked[label][role] = RoleSessionCountsDocument(busy=busy, idle=idle, paused=paused, exited=exited, total=total)
+            checked[label][role] = RoleSessionCountsDocument(busy=busy + starting, idle=idle - starting, paused=paused, exited=exited, total=total)
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
@@ -5493,8 +5564,9 @@ def _fetch_session_counts() -> int:
     """Fetch only the other machine's local counts through the shared transport."""
     try:
         machine = remote.other_machine()
-        document = _decode_session_counts(role_map.ssh_role_map(("session-counts-read",), machine=machine), machine)
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps(document))
+        text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
+        _ = _decode_session_counts(text, machine)
+        atomic_file.write_text_atomic(_session_counts_cache(), text)
     except (OSError, ValueError, subprocess.SubprocessError):
         atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
         return 1

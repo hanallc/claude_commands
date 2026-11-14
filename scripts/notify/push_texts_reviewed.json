@@ -1,4 +1,16 @@
 {
+  "accounts.login_sitting": {
+    "safety": {
+      "reviewer": "claude-opus-5-5",
+      "sha256": "37c7f2434717100db2c2fbbefe50f90541565757e8af08c257239b0a837be2be",
+      "time": "2026-11-13T14:34:47.281665-05:00"
+    },
+    "weekly": {
+      "reviewer": "claude-opus-5-5",
+      "sha256": "37c7f2434717100db2c2fbbefe50f90541565757e8af08c257239b0a837be2be",
+      "time": "2026-11-13T14:34:39.189148-05:00"
+    }
+  },
   "alert.blocked": {
     "typical": {
       "objections": [],
@@ -72,6 +84,20 @@
       "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
       "sha256": "088c1d614eb3e320acd4e8278c73fde0b417acf4f19d9d4030346930b8905846",
       "time": "2026-11-06T06:23:02.002895-05:00"
+    }
+  },
+  "aws.snapshot_failed": {
+    "permission": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
+      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
+      "time": "2026-11-14T09:44:39.593642-05:00"
+    },
+    "regional_permissions": {
+      "objections": [],
+      "reviewer": "user-spec: user 2026-11-14: the message is approved; reviewer: claude-opus-5-5",
+      "sha256": "aa77f0f9dcc20d36a47be050a09c1a2bf8f560f2e4e6e9a155f384eceb18f32a",
+      "time": "2026-11-14T09:44:48.290566-05:00"
     }
   },
   "build_hold.blocking": {
@@ -318,18 +344,6 @@
       "reviewer": "user-spec: User 2026-11-06 via sdlc and natedev: 'i want a pushover sent when the nightly type check is done and whether it passed or not ... i may remvoe this in the future but for now i want to see that it ran'. Wording by messaging-unit; the user has not read these texts; reviewer: opus",
       "sha256": "9354706854e28a29248db222dc0163aafde6b40158a114491ad14b51b509a396",
       "time": "2026-11-06T10:40:29.948005-05:00"
-    }
-  },
-  "nightly.unassigned": {
-    "received": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
-      "time": "2026-11-11T13:40:09.429090-05:00"
-    },
-    "unreceived": {
-      "reviewer": "user-spec: User 2026-11-11 via sdlc: notify sdlc first; send the result after assignment or its deadline.",
-      "sha256": "c349ae65e8da4fa2b0a519c74ec08a85863671e9c2aab229cfd449fc5368710f",
-      "time": "2026-11-11T13:40:09.429110-05:00"
     }
   },
   "nix_heal.failed": {
@@ -802,21 +816,25 @@
           "rule": "title-names-the-stake"
         },
         {
+          "quote": "Thu 10-29 07:00 AST",
+          "rule": "times-carry-zone"
+        },
+        {
           "quote": "codex1 has 6,370 paid credits left.",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "until Sat 10-24 16:40 AST",
-          "rule": "times-carry-zone"
+          "quote": "codex1 has 6,370 paid credits left. Its plan refills Thu 10-29 07:00 AST.",
+          "rule": "what-happened-why-what-you-do"
         },
         {
           "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
-      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
-      "time": "2026-10-25T13:42:24.199895-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
+      "time": "2026-11-13T16:42:08.391255-05:00"
     },
     "typical": {
       "objections": [
@@ -825,21 +843,21 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Turn off: work moves to Claude until Sat 10-24 16:40 AST.",
+          "quote": "Its plan refills Tue 10-27 02:33 AST.",
           "rule": "times-carry-zone"
         },
         {
           "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "what-happened-why-what-you-do"
+          "rule": "reader-starts-cold"
         },
         {
-          "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "reader-starts-cold"
+          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
-      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
-      "time": "2026-10-25T13:42:06.252454-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "5a67accfbf836cbf2f7dacb08126c37ec74fca41ebf34ef7765141ec71c926ad",
+      "time": "2026-11-13T16:41:50.535280-05:00"
     }
   },
   "quota.paid_credits_queued": {
@@ -850,21 +868,21 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "To stop it, set use_credits: off",
-          "rule": "first-150-stand-alone"
+          "quote": "Tue 10-27 02:33 AST",
+          "rule": "times-carry-zone"
         },
         {
-          "quote": "codex2 has 25,345 paid credits left.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "workers spend these credits until your queued move runs",
+          "quote": "your queued move",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Leave on (recommended): workers spend these credits until your queued move runs.",
+          "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21: approved whatever messaging and accounts decide on paid credits; text agreed with accounts-unit; reviewer: opus",
-      "sha256": "5ea0c1dd6ea4e5c01c8436fdb2344b7f9801ab24af834edda4bd55d63b505500",
-      "time": "2026-10-21T18:19:20.767262-04:00"
+      "reviewer": "user-spec: user 2026-11-13: the credits setting moves to the accounts config; only the action line changed; reviewer: claude-opus-5-5",
+      "sha256": "e30d61127cd3bf1485f8c1ac674604c5c0b5f424067f08fa58abb0012e712bc6",
+      "time": "2026-11-13T16:42:20.376803-05:00"
     }
   },
   "review_watch.acknowledge": {

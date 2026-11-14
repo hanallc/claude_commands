@@ -19,7 +19,7 @@ Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
 A green nightly sends a result push unless merge_gate.conf disables it.
-A red nightly records its result and notifies sdlc before an assignment push.
+A red nightly records its result and notifies sdlc. Only its assignment sends the user push.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -37,7 +37,8 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
@@ -46,6 +47,7 @@ import hashlib
 import inspect
 from importlib import import_module
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -55,6 +57,7 @@ import shutil
 import signal
 import stat
 import statistics
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,8 +65,9 @@ import time
 from typing import Literal, Protocol, TextIO, cast
 
 from scripts.lib import process_group
+from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, conf, main_push_lock
+from scripts.lib import build_folders, cancellation, conf, main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review  # noqa: E402
@@ -84,10 +88,11 @@ from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
+    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
+TEST_HERDR_BIN = "/nonexistent/herdr"
 # The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
 UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -113,10 +118,15 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 # Restore dispositions and the mask in every child, including types. The runner
 # defers cancellation until the child is registered for cleanup.
-SUITE_BOOTSTRAP = """import os, signal, sys
+SUITE_BOOTSTRAP = """import ctypes, os, signal, sys
+if sys.platform == "linux":
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "cannot set the gate parent death signal")
+    if os.getppid() != int(os.environ["MERGE_GATE_PARENT_PID"]):
+        os.kill(os.getpid(), signal.SIGKILL)
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
         signal.signal(disposition, signal.SIG_DFL)
@@ -237,11 +247,12 @@ class GateRun:
     # A valid affected selection may have no test modules at all.
     selection_certified: bool = False
     executions: tuple[GateJobResult, ...] = ()
+    time_limit_report: str = ""
 
     @property
     def passed(self) -> bool:
         return ((bool(self.jobs) or self.tests_reused or self.selection_certified)
-                and all(job.returncode == 0 for job in self.jobs))
+                and not self.time_limit_report and all(job.returncode == 0 for job in self.jobs))
 
 
 @dataclass
@@ -336,10 +347,14 @@ class SharedCPUSlot:
 
     def release(self) -> None:
         if not self.returned:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 if os.write(self.descriptor, self.token) != 1:
                     raise GateRefused("could not return the shared CPU slot")
                 self.returned = True
+                recovery = ACTIVE_GATE_RECOVERY.get()
+                if isinstance(recovery, GateRecovery):
+                    recovery.tokens.remove(recovery.token(self.descriptor, self.token))
+                    recovery.save()
 
 
 @dataclass
@@ -347,6 +362,7 @@ class SharedCPUPool:
     descriptor: int
     blocking: int
     owned: list[SharedCPUSlot] = field(default_factory=list)
+    deadline: float = math.inf
 
     def acquire(self) -> SharedCPUSlot:
         """Wait for a CPU slot or cancellation while no module runs."""
@@ -354,19 +370,23 @@ class SharedCPUPool:
         print("waits for a CPU slot", flush=True)
         try:
             with ExitStack() as cleanup:
-                with build_folders.defer_signals():
+                with cancellation.defer_cleanup_signals():
                     reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
                     _ = cleanup.callback(os.close, reader)
                     _ = cleanup.callback(os.close, writer)
                     previous = signal.set_wakeup_fd(writer)
                     _ = cleanup.callback(signal.set_wakeup_fd, previous)
                 while True:
-                    readable, _, _ = select.select([self.blocking, reader], [], [])
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("gate time limit while waiting for a CPU slot")
+                    readable, _, _ = select.select([self.blocking, reader], [], [],
+                                                    None if math.isinf(remaining) else remaining)
                     if reader in readable:
                         _ = os.read(reader, 4096)
                     if self.blocking in readable:
                         # Another gate can take the token after select returns.
-                        with build_folders.defer_signals():
+                        with cancellation.defer_cleanup_signals():
                             slot = self.try_acquire()
                         if isinstance(slot, SharedCPUSlot):
                             return slot
@@ -374,7 +394,7 @@ class SharedCPUPool:
             print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
     def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
-        with defer_cleanup_signals():
+        with cancellation.defer_cleanup_signals():
             # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
             if not select.select([self.descriptor], [], [], 0)[0]:
                 return WaitingForCPU()
@@ -386,6 +406,10 @@ class SharedCPUPool:
                 raise GateRefused("shared CPU pool returned no byte")
             slot = SharedCPUSlot(self.descriptor, token)
             self.owned.append(slot)
+            recovery = ACTIVE_GATE_RECOVERY.get()
+            if isinstance(recovery, GateRecovery):
+                recovery.tokens.append(recovery.token(self.descriptor, token))
+                recovery.save()
             return slot
 
 
@@ -408,7 +432,7 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
         try:
             yield pool
         finally:
-            with defer_cleanup_signals():
+            with cancellation.defer_cleanup_signals():
                 try:
                     for slot in pool.owned:
                         slot.release()
@@ -504,28 +528,20 @@ class BuildHoldWait:
                 events.wait(15.0)
 
 
-def interrupted(signum: int, _frame: object) -> None:
-    raise GateRefused(f"interrupted by {signal.Signals(signum).name}")
-
-
-@contextmanager
-def rollback_signals() -> Generator[None, None, None]:
-    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
-    try:
-        yield
-    finally:
-        for sig, handler in previous.items():
-            _ = signal.signal(sig, handler)
-
-
 def fetch_branches(repo: Path, *branches: str) -> None:
     _ = checked_git(repo, "fetch", "origin", *(f"+refs/heads/{branch}:refs/remotes/origin/{branch}" for branch in dict.fromkeys(branches)))
 
 
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
-    with subprocess.Popen(arguments, cwd=repo, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, errors="replace", start_new_session=True) as process:
+    with ExitStack() as cleanup:
+        with cancellation.defer_cleanup_signals():
+            process = cleanup.enter_context(subprocess.Popen(
+                arguments, cwd=repo, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors="replace", start_new_session=True))
+            recovery = ACTIVE_GATE_RECOVERY.get()
+            if isinstance(recovery, GateRecovery):
+                recovery.add_group(process.pid)
         try:
             output, errors = process.communicate()
         except BaseException:
@@ -535,7 +551,10 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
                 pass
             _ = process.wait()
             raise
-        return subprocess.CompletedProcess(arguments, process.returncode, output, errors)
+        finally:
+            if isinstance(recovery, GateRecovery) and process.returncode is not None:
+                recovery.remove_group(process.pid)
+        return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
 
 
 def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -627,6 +646,276 @@ def gate_state_dir() -> Path:
     return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
 
 
+@dataclass(frozen=True)
+class HeldGateToken:
+    path: str
+    device: int
+    inode: int
+    value: str
+
+
+@dataclass
+class GateRecovery:
+    """Own the resources and merge baseline of one gate process."""
+    path: Path
+    repo: str
+    pid: int
+    start: str
+    groups: dict[int, str] = field(default_factory=dict)
+    folders: list[str] = field(default_factory=list)
+    tokens: list[HeldGateToken] = field(default_factory=list)
+    rollback: str = ""
+    rollback_head: str = ""
+    rollback_source: str = ""
+
+    def save(self) -> None:
+        write_text_atomic(self.path, json.dumps({
+            "repo": self.repo, "pid": self.pid, "start": self.start,
+            "groups": self.groups, "folders": self.folders,
+            "tokens": [asdict(token) for token in self.tokens], "rollback": self.rollback,
+            "rollback_head": self.rollback_head, "rollback_source": self.rollback_source}) + "\n")
+
+    def add_group(self, pid: int) -> None:
+        identity = process_start(pid)
+        if isinstance(identity, (Started, Zombie)):
+            self.groups[pid] = identity.start
+            self.save()
+
+    def remove_group(self, pid: int) -> None:
+        if pid in self.groups:
+            del self.groups[pid]
+            self.save()
+
+    def token(self, descriptor: int, value: bytes) -> HeldGateToken:
+        status = os.fstat(descriptor)
+        return HeldGateToken(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"),
+                             status.st_dev, status.st_ino, value.hex())
+
+    def recover(self) -> None:
+        """Stop recorded groups before removing their folders and undoing the merge."""
+        stopping: set[int] = set()
+        for pid, start in self.groups.items():
+            identity = process_start(pid)
+            if isinstance(identity, Unreadable):
+                raise GateRefused(f"cannot recover gate group {pid}: {identity.reason}")
+            if isinstance(identity, (Started, Zombie)) and identity.start != start:
+                continue
+            try:
+                process_group.send_process_group(pid, signal.SIGTERM)
+                stopping.add(pid)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds
+        for pid in stopping:
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+                finally:
+                    os.close(descriptor)
+            try:
+                process_group.send_process_group(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        # A dead leader can leave writers in its group. Wait before deleting their files.
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
+                if int(fields[2]) not in stopping or fields[0] == b"Z":
+                    continue
+                descriptor = os.pidfd_open(int(entry.name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            try:
+                if not select.select([descriptor], [], [], admission_records.read_memory_config().program_stop_seconds)[0]:
+                    raise GateRefused(f"gate group member {entry.name} did not stop")
+            finally:
+                os.close(descriptor)
+        self.groups.clear()
+        self.save()
+        while self.tokens:
+            token = self.tokens[-1]
+            with cancellation.defer_cleanup_signals():
+                try:
+                    descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+                except FileNotFoundError:
+                    descriptor = -1
+                try:
+                    if descriptor >= 0:
+                        status = os.fstat(descriptor)
+                        if (status.st_dev, status.st_ino) == (token.device, token.inode):
+                            _ = os.write(descriptor, bytes.fromhex(token.value))
+                    _ = self.tokens.pop()
+                    self.save()
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+        for folder in self.folders:
+            path = Path(folder)
+            try:
+                if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)):
+                    raise GateRefused(f"gate recovery kept held folder {path}")
+            except FileNotFoundError:
+                pass
+        self.folders.clear()
+        self.save()
+        if self.rollback:
+            repo = Path(self.repo)
+            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                    return
+                _ = cleanup.enter_context(scratch.copy_lock(repo))
+                head = checked_git(repo, "rev-parse", "HEAD")
+                if head not in (self.rollback, self.rollback_head):
+                    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+                    if parents != [self.rollback, self.rollback_source]:
+                        raise GateRefused(f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
+                rollback_merge(repo, self.rollback)
+                self.rollback = ""
+                self.save()
+            print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
+        self.path.unlink()
+
+
+@dataclass(frozen=True)
+class NoGateRecovery:
+    """No gate owns resources in this calling context."""
+
+
+ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
+    "merge_gate_recovery", default=NoGateRecovery())
+
+
+def gate_run_directory(repo: Path) -> Path:
+    identity = hashlib.sha256(os.fsencode(repo.resolve())).hexdigest()
+    return gate_state_dir() / "active-runs" / identity
+
+
+def recover_gate_runs(repo: Path) -> None:
+    current = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+        return
+    root = gate_state_dir() / "active-runs"
+    if not root.exists():
+        return
+    for directory in sorted(root.iterdir()):
+        if directory.is_dir():
+            recover_gate_directory(directory)
+
+
+def recover_gate_directory(directory: Path) -> None:
+    """Recover dead owners while holding the directory lock."""
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for path in sorted(directory.glob("*.json")):
+            data = cast(dict[str, object], json.loads(path.read_text()))
+            pid, start = cast(int, data["pid"]), cast(str, data["start"])
+            owner = process_start(pid)
+            if isinstance(owner, Unreadable):
+                raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
+            if isinstance(owner, Started) and owner.start == start:
+                continue
+            groups = cast(dict[str, str], data["groups"])
+            tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
+                                    cast(int, token["inode"]), cast(str, token["value"]))
+                      for token in cast(list[dict[str, object]], data["tokens"])]
+            recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
+                                    {int(group): identity for group, identity in groups.items()},
+                                    cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
+                                    cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
+            active = ACTIVE_GATE_RECOVERY.set(recovery)
+            try:
+                recovery.recover()
+            finally:
+                ACTIVE_GATE_RECOVERY.reset(active)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def gate_operation_lock(repo: Path) -> Generator[int]:
+    """Keep one operation lock file for each checkout."""
+    directory = gate_run_directory(repo)
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(directory / "operation.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def gate_recovery(repo: Path) -> Generator[GateRecovery]:
+    current = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+        yield current
+        return
+    recover_gate_runs(repo)
+    identity = process_start(os.getpid())
+    if not isinstance(identity, Started):
+        raise GateRefused("the gate has no readable process start")
+    with gate_operation_lock(repo) as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        directory = gate_run_directory(repo)
+        path = directory / f"{os.getpid()}-{hashlib.sha256(identity.start.encode()).hexdigest()[:12]}.json"
+        recovery = GateRecovery(path, str(repo.resolve()), os.getpid(), identity.start)
+        recovery.save()
+        token = ACTIVE_GATE_RECOVERY.set(recovery)
+        try:
+            yield recovery
+        finally:
+            ACTIVE_GATE_RECOVERY.reset(token)
+            if not (recovery.groups or recovery.folders or recovery.tokens or recovery.rollback):
+                path.unlink(missing_ok=True)
+
+
+@contextmanager
+def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
+    """Keep a whole-machine run's recovery files in its own temporary directory."""
+    current = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+        yield current
+        return
+    identity = process_start(os.getpid())
+    if not isinstance(identity, Started):
+        raise GateRefused("the gate has no readable process start")
+    with tempfile.TemporaryDirectory(prefix="merge-gate-recovery-", dir=parent) as folder:
+        directory = Path(folder)
+        with (directory / "operation.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+            recovery.save()
+            token = ACTIVE_GATE_RECOVERY.set(recovery)
+            try:
+                yield recovery
+            finally:
+                ACTIVE_GATE_RECOVERY.reset(token)
+
+
+@contextmanager
+def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
+    with ExitStack() as cleanup:
+        with cancellation.defer_cleanup_signals():
+            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+            recovery.folders.append(str(folder))
+            recovery.save()
+        try:
+            yield folder
+        finally:
+            cleanup.close()
+            recovery.folders.remove(str(folder))
+            recovery.save()
+
+
 def typecheck_venv_path() -> Path:
     return gate_state_dir() / "typecheck-venv"
 
@@ -699,7 +988,7 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with build_folders.defer_signals():
+    with cancellation.defer_cleanup_signals():
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
         if pid:
             job.process.returncode = os.waitstatus_to_exitcode(status)
@@ -714,6 +1003,9 @@ def kill_job_group(job: RunningGateJob) -> None:
     except ProcessLookupError:
         pass
     reap_gate_job(job, block=True)
+    recovery = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(recovery, GateRecovery):
+        recovery.remove_group(job.process.pid)
 
 
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
@@ -736,6 +1028,48 @@ def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
         kill_job_group(job)
 
 
+def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
+                    targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
+    """Read the report index and rebuild an index without the vCPU column."""
+    from scripts.buildlog import index
+
+    path = index.index_path()
+    if not path.exists() and not any(store.root().glob("*/*.jsonl")):
+        with closing(sqlite3.connect(":memory:")) as connection:
+            index.create_schema(connection)
+            return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+    _ = index.update()
+    with closing(sqlite3.connect(index.read_only_path_uri(path), uri=True)) as connection:
+        return gate_record.history_time_limit(connection, vcpus, modules, jobs, targeted)
+
+
+def failure_log_tail(output: str) -> str:
+    """Keep the same output limit as the saved failure log."""
+    limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+    return output.encode("utf-8")[-limit:].decode("utf-8", errors="replace")
+
+
+def stop_at_time_limit(running: Sequence[RunningGateJob], failed: Sequence[GateJobResult],
+                       began: float, deadline: float) -> str:
+    """Stop our groups and retain the names and tracebacks for the owner."""
+    elapsed = time.monotonic() - began
+    if began + elapsed < deadline:
+        return ""
+    limit = deadline - began
+    names = ", ".join(f"{job.suite}/{job.module}" for job in running) or "(none)"
+    report = f"time limit: limit {limit:g} s; elapsed {elapsed:.3f} s; running modules: {names}"
+    for job in running:
+        job.killed_for = report
+    stop_gate_jobs(running)
+    details = [f"--- {job.suite}/{job.module} exit={job.returncode} ---\n{failure_log_tail(job.output)}"
+               for job in failed if job.returncode]
+    details.extend(f"--- {job.suite}/{job.module} stopped ---\n{failure_log_tail(job.log.read_text(errors="replace"))}"
+                   for job in running)
+    report = "\n".join([report, *details])
+    print(report, flush=True)
+    return report
+
+
 def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
@@ -754,10 +1088,14 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started = time.monotonic()
     started_at = time.time()
     try:
-        process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                   cwd=repo, env=environment, stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=subprocess.STDOUT, text=True,
-                                   start_new_session=True)
+        with cancellation.defer_cleanup_signals():
+            process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
+                                       cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
+                                       stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
+                                       start_new_session=True)
+            recovery = ACTIVE_GATE_RECOVERY.get()
+            if isinstance(recovery, GateRecovery):
+                recovery.add_group(process.pid)
     except BaseException:
         output.close()
         raise
@@ -784,6 +1122,7 @@ raise SystemExit(99)
         _ = executable.write_text(script)
         executable.chmod(0o755)
     return {**environment, "TMPDIR": str(root),
+            "HERDR_BIN": TEST_HERDR_BIN,
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
@@ -828,7 +1167,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status == 0 and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    if job.memory_stopped and status == 0:
+    if (job.memory_stopped or job.killed_for.startswith("time limit")) and status == 0:
         status = 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
@@ -1030,6 +1369,7 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "wall_s": wall_s, "hold_wait_s": hold_wait_s,
             "selection": "reused" if reused else "affected" if isinstance(selection, AffectedSelection) else "full",
             "reason": reason,
+            "vcpus": os.cpu_count() or 1,
             "status": status, "max_jobs": max_jobs, "peak_mib": peak_mib, "cap_mib": cap_mib,
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": ledger.tree.tree if isinstance(ledger.tree, CleanTestTree) else "",
@@ -1067,8 +1407,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.MERGE_GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
-               selected: AllModules | SelectedModules = ALL_MODULES) -> GateRun:
+               selected: AllModules | SelectedModules = ALL_MODULES,
+               time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
+    if shared:
+        recover_gate_runs(repo)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
     try:
         memory_stop_reruns = conf.read("merge_gate").whole("memory_stop_reruns") if shared else 0
@@ -1099,7 +1442,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
-    initial_hold_seconds = hold.seconds if hold is not None else 0.0
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
@@ -1134,6 +1476,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
+    if isinstance(time_limit, gate_record.ReadGateTimeLimit):
+        try:
+            time_limit = read_time_limit(
+                os.cpu_count() or 1, [str(path.relative_to(repo)) for _, path in modules],
+                max_running_jobs, mode is SuiteMode.TARGETED_TEST and not full)
+        except conf.Unusable as error:
+            raise GateRefused(str(error)) from error
+    if isinstance(time_limit, gate_record.NoGateTimeLimit):
+        print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
     scope_prefix = suite_scope_prefix() if shared else []
     state_directory = gate_state_dir() if shared else tmpfs
     timings_path = state_directory / "module_seconds.json"
@@ -1166,11 +1517,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     largest_module = ""
     starting_load = one_minute_load()
     maximum_load = starting_load
-    began = time.monotonic()
-    started_at = datetime.now(UTC).timestamp()
     python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
+    time_limit_report = ""
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
@@ -1195,12 +1545,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    with (record_on_abort(),
-          build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
+          gate_temporary(recovery, build_folders.UniqueBuildFolder(
               build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+        # The wall time and the time limit start here, after the queue admits the gate.
+        began = time.monotonic()
+        started_at = datetime.now(UTC).timestamp()
+        deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
+        initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
@@ -1223,74 +1578,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         publish_progress()
         try:
             while pending or running:
-                now = time.monotonic()
-                if admission is not None and admission.sample_due(now):
-                    maximum_load = max(maximum_load, one_minute_load())
-                    sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
-                    admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
-                                      {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
-                    if reservation is not None:
-                        reservation.observe(int(admission.peak_mib * (1 << 20)), int(admission.latest_mib * (1 << 20)))
-                    for job in running:
-                        measured = sample.get(job.process.pid, 0.0)
-                        job.peak_memory_mib = max(job.peak_memory_mib, measured)
-                        if job.kind is GateJobKind.TEST_MODULE and measured > largest_module_peak_mib:
-                            largest_module_peak_mib = measured
-                            largest_module = f"{job.suite}/{job.module}"
-                        if (job.kind is GateJobKind.TEST_MODULE and not job.killed_for
-                                and measured > admission.governor_mib):
-                            job.memory_stopped = True
-                            job.killed_for = (f"killed: peak memory {job.peak_memory_mib / 1024:.3f} GiB "
-                                              f"exceeds the memory limit of {governor_gib:g} GiB")
-                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
-                            stop_gate_jobs([job])
-                while (pending and len(running) < max_running_jobs
-                       and (admission is None or admission.admits(recorded_peaks.reservation_mib(pending[0])))
-                       and (not rerunning or not running)):
-                    if hold is not None and not hold.admits():
-                        if not running:
-                            hold.wait_until_free()
-                        break
-                    if isinstance(cpu_pool, SharedCPUPool):
-                        slot = cpu_pool.try_acquire()
-                        if isinstance(slot, WaitingForCPU):
-                            if running:
-                                break
-                            slot = cpu_pool.acquire()
-                            if hold is not None and not hold.admits():
-                                slot.release()
-                                hold.wait_until_free()
-                                break
-                    else:
-                        slot = cpu_pool
-                    request = pending.popleft()
-                    suite, path = request.suite, request.path
-                    folder_cleanup = ExitStack()
-                    _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
-                    log = root / "output.log"
-                    job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
-                                       else test_module_environment(root, environment))
-                    if request.kind is GateJobKind.TYPE_CHECK:
-                        _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
-                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
-                             *type_dirs]
-                            if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with build_folders.defer_signals():
-                        if request.kind is GateJobKind.TYPE_CHECK:
-                            job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
-                        else:
-                            job = start_gate_job(suite, path, argv, repo, job_environment, log)
-                        job.folder_cleanup = folder_cleanup
-                        job.cpu_slot = slot
-                        running.append(job)
-                        job_started = True
-                    if job.kind is GateJobKind.TEST_MODULE:
-                        _ = suite_started.setdefault(suite, job.started)
-                    if admission is not None:
-                        admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
                 for job in running[:]:
                     reap_gate_job(job)
                     status = job.process.returncode
@@ -1312,6 +1599,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         admission.release(job.process.pid)
                     if result.memory_stopped:
                         tell_memory_stop(repo, job, governor_gib, mode, can_retry_memory_stop(result))
+                    if not shared and result.returncode:
+                        print(f"--- {result.suite}/{result.module} exit={result.returncode} ---\n"
+                              + failure_log_tail(result.output) + "\n--- end module failure ---", flush=True)
                     if not shared:
                         print(f"{result.suite}/{result.module} exit={result.returncode} seconds={result.seconds:.2f}"
                               + (" stopped" if result.killed_for else ""), flush=True)
@@ -1352,7 +1642,96 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         results.append(result)
                     if job.kind is GateJobKind.TEST_MODULE:
                         suite_finished[job.suite] = job.started + result.seconds
-                if (shared or isinstance(selected, SelectedModules)) and not pending and not running:
+                now = time.monotonic()
+                hold_seconds_now = hold.waited_s() - initial_hold_seconds if hold is not None else 0.0
+                if (pending or running) and now >= deadline + hold_seconds_now and not time_limit_report:
+                    time_limit_report = stop_at_time_limit(running, results, began + hold_seconds_now,
+                                                           deadline + hold_seconds_now)
+                    reason = "time limit"
+                    for request in pending:
+                        result = GateJobResult(request.suite, request.module, 124, 0,
+                                               "did not start before the time limit", time_limit_report, kind=request.kind)
+                        position = next((i for i, previous in enumerate(results)
+                                         if (previous.kind, previous.suite, previous.module)
+                                         == (result.kind, result.suite, result.module)), len(results))
+                        if position == len(results):
+                            results.append(result)
+                        executions.append(result)
+                    pending.clear()
+                if admission is not None and admission.sample_due(now):
+                    maximum_load = max(maximum_load, one_minute_load())
+                    sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
+                    admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
+                                      {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
+                    if reservation is not None:
+                        reservation.observe(int(admission.peak_mib * (1 << 20)), int(admission.latest_mib * (1 << 20)))
+                    for job in running:
+                        measured = sample.get(job.process.pid, 0.0)
+                        job.peak_memory_mib = max(job.peak_memory_mib, measured)
+                        if job.kind is GateJobKind.TEST_MODULE and measured > largest_module_peak_mib:
+                            largest_module_peak_mib = measured
+                            largest_module = f"{job.suite}/{job.module}"
+                        if (job.kind is GateJobKind.TEST_MODULE and not job.killed_for
+                                and measured > admission.governor_mib):
+                            job.memory_stopped = True
+                            job.killed_for = (f"killed: peak memory {job.peak_memory_mib / 1024:.3f} GiB "
+                                              f"exceeds the memory limit of {governor_gib:g} GiB")
+                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
+                            stop_gate_jobs([job])
+                while (pending and len(running) < max_running_jobs
+                       and (admission is None or admission.admits(recorded_peaks.reservation_mib(pending[0])))
+                       and (not rerunning or not running)):
+                    if hold is not None and not hold.admits():
+                        if not running:
+                            hold.wait_until_free()
+                        break
+                    if isinstance(cpu_pool, SharedCPUPool):
+                        slot = cpu_pool.try_acquire()
+                        if isinstance(slot, WaitingForCPU):
+                            if running:
+                                break
+                            cpu_pool.deadline = deadline + hold_seconds_now
+                            try:
+                                slot = cpu_pool.acquire()
+                            except TimeoutError:
+                                break
+                            if hold is not None and not hold.admits():
+                                slot.release()
+                                hold.wait_until_free()
+                                break
+                    else:
+                        slot = cpu_pool
+                    request = pending.popleft()
+                    suite, path = request.suite, request.path
+                    folder_cleanup = ExitStack()
+                    _ = module_folders.callback(folder_cleanup.close)
+                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
+                    log = root / "output.log"
+                    job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
+                                       else test_module_environment(root, environment))
+                    if request.kind is GateJobKind.TYPE_CHECK:
+                        _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
+                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
+                             *type_dirs]
+                            if request.kind is GateJobKind.TYPE_CHECK else
+                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
+                    with cancellation.defer_cleanup_signals():
+                        if request.kind is GateJobKind.TYPE_CHECK:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
+                        else:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.folder_cleanup = folder_cleanup
+                        job.cpu_slot = slot
+                        running.append(job)
+                        if not shared:
+                            print(f"Starting module: {job.suite}/{job.module}", flush=True)
+                        job_started = True
+                    if job.kind is GateJobKind.TEST_MODULE:
+                        _ = suite_started.setdefault(suite, job.started)
+                    if admission is not None:
+                        admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
+                if not time_limit_report and (shared or isinstance(selected, SelectedModules)) and not pending and not running:
                     failed = [] if rerunning else [result for result in results
                               if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
@@ -1374,7 +1753,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with build_folders.defer_signals():
+            with cancellation.defer_cleanup_signals():
                 stop_gate_jobs(running)
                 for job in running:
                     job.output.close()
@@ -1392,7 +1771,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     peak_mib = admission.peak_mib if admission is not None else 0.0
     elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
     run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, AffectedSelection) or isinstance(selected, SelectedModules), tuple(executions))
+                  isinstance(selection, AffectedSelection) or isinstance(selected, SelectedModules), tuple(executions), time_limit_report)
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -1678,6 +2057,12 @@ def merge_checkpoint(args: GateArguments) -> int:
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
+    recovery = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(recovery, GateRecovery):
+        recovery.rollback = baseline
+        recovery.rollback_head = baseline
+        recovery.rollback_source = checkpoint
+        recovery.save()
     try:
         hold.wait_until_free()
         result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
@@ -1687,6 +2072,9 @@ def merge_checkpoint(args: GateArguments) -> int:
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
         merged = checked_git(repo, "rev-parse", "HEAD")
+        if isinstance(recovery, GateRecovery):
+            recovery.rollback_head = merged
+            recovery.save()
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
@@ -1703,14 +2091,24 @@ def merge_checkpoint(args: GateArguments) -> int:
             else:
                 os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
         if not suites.passed:
-            raise GateRefused("RED: types or suites failed")
+            if suites.time_limit_report:
+                tell_time_limit(args.unit, repo, suites)
+            raise GateRefused("RED: " + (suites.time_limit_report or "types or suites failed"))
         fetch_branches(repo, "main")
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException as error:
         rollback_merge(repo, baseline)
+        if isinstance(recovery, GateRecovery):
+            recovery.rollback = ""
+            recovery.save()
         raise GateRefused(f"{error or type(error).__name__}; merge undone, not pushed") from error
+    if isinstance(recovery, GateRecovery):
+        recovery.rollback = ""
+        recovery.save()
     _ = checked_git(repo, "push", "origin", str(args.merge_branch))
     notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
@@ -1780,6 +2178,14 @@ def nightly_owner(args: GateArguments) -> str:
             return copies.fallback_owner("nightly")
         doc = matching[0]
     return str(unit_lookup.doc_owner(doc, staff.snapshot()).id)
+
+
+def nightly_owner_name(args: GateArguments) -> str:
+    from scripts.production import staff
+
+    owner = nightly_owner(args)
+    row = staff.snapshot().by_id(staff.StaffId(owner))
+    return row.name if row is not None else owner
 
 
 def type_check_summaries(output: str) -> list[str]:
@@ -1858,8 +2264,18 @@ class NightlyFixAssigned:
 
 
 @dataclass(frozen=True)
+class NightlyAlertUnsent:
+    """The production owner has no alert about the missing assignment."""
+
+
+@dataclass(frozen=True)
+class NightlyAlertSent:
+    at: str
+
+
+@dataclass(frozen=True)
 class NightlyPushPending:
-    """Assignment or its deadline must release the result push."""
+    """Assignment must release the result push."""
 
 
 @dataclass(frozen=True)
@@ -1879,6 +2295,7 @@ class NightlyRedResult:
     received: NightlyNoticeUnreceived | NightlyNoticeReceived = NightlyNoticeUnreceived()
     assignment: NightlyFixUnassigned | NightlyFixAssigned = NightlyFixUnassigned()
     delivery: NightlyPushPending | NightlyPushAccepted = NightlyPushPending()
+    alerted: NightlyAlertUnsent | NightlyAlertSent = NightlyAlertUnsent()
 
 
 @contextmanager
@@ -1923,38 +2340,32 @@ def read_nightly_red(path: Path) -> NightlyRedResult:
     if identity != path.stem or not re.fullmatch(r"[a-zA-Z0-9_-]+", identity):
         raise GateRefused(f"{path}: nightly result identity differs")
     received, assignment, delivery = (fields(saved.get(key)) for key in ("received", "assignment", "delivery"))
+    # A result saved before the owner alert existed has no alert table.
+    alerted = fields(saved.get("alerted", {}))
     return NightlyRedResult(identity, text(saved, "branch"), text(saved, "tree"), at(saved, "finished"),
         tuple(cast(list[str], failures)), text(saved, "types"), text(saved, "tests"),
         NightlyNoticeReceived(at(received, "at")) if received else NightlyNoticeUnreceived(),
         NightlyFixAssigned(text(assignment, "unit"), at(assignment, "at")) if assignment else NightlyFixUnassigned(),
-        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending())
+        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending(),
+        NightlyAlertSent(at(alerted, "at")) if alerted else NightlyAlertUnsent())
 
 
 def nightly_time(at: str) -> str:
     return datetime.fromisoformat(at).astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def send_nightly_red(directory: Path, result: NightlyRedResult) -> bool:
+def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: NightlyFixAssigned) -> bool:
     from scripts.message import send_budget
     from scripts.notify import push_texts, review
     from scripts.production import staff
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
         return False
-    values = {"branch": result.branch, "time": nightly_time(result.finished), "types": result.types,
-              "tests": result.tests, "outcome": "failed"}
-    if isinstance(result.assignment, NightlyFixAssigned):
-        row = staff.snapshot().by_id(staff.StaffId(result.assignment.unit))
-        values.update(unit=row.name if row is not None else result.assignment.unit,
-                      assigned=nightly_time(result.assignment.at),
-                      received=nightly_time(result.received.at) if isinstance(result.received, NightlyNoticeReceived)
-                      else nightly_time(result.assignment.at))
-        text_id = "nightly.assigned"
-    else:
-        values["notice"] = ("sdlc received it at " + nightly_time(result.received.at)
-                            if isinstance(result.received, NightlyNoticeReceived) else "sdlc has not confirmed receipt")
-        text_id = "nightly.unassigned"
-    rendered = push_texts.render(text_id, **values)
+    row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
+    rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
+        types=result.types, tests=result.tests, outcome="failed",
+        unit=row.name if row is not None else assignment.unit, assigned=nightly_time(assignment.at),
+        received=nightly_time(result.received.at if isinstance(result.received, NightlyNoticeReceived) else assignment.at))
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
@@ -1972,9 +2383,8 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
 
     record = staff.snapshot()
     row = record.by_member_reference(unit) or record.by_path(unit if "/" in unit else f"sdlc/{unit}")
-    parent = record.parent_of(row) if row is not None else None
-    if row is None or row.kind != "unit" or parent is None or parent.name != "sdlc":
-        raise GateRefused(f"{unit}: choose an sdlc unit director")
+    if row is None or row.kind != "unit" or record.parent_of(row) is None:
+        raise GateRefused(f"{unit}: choose a unit director by staff ID or <production>/<unit> path")
     with nightly_red_lock() as directory:
         results = [read_nightly_red(path) for path in sorted(directory.glob("*.json"))]
         if identity:
@@ -1985,18 +2395,41 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
         if len(results) != 1:
             raise GateRefused("choose one saved red result with --result ID")
         result = results[0]
-        changed = isinstance(result.assignment, NightlyFixUnassigned)
-        if isinstance(result.assignment, NightlyFixAssigned) and result.assignment.unit != str(row.id):
+        assignment = result.assignment
+        if isinstance(assignment, NightlyFixAssigned) and assignment.unit != str(row.id):
             raise GateRefused(f"{result.id}: another unit already owns this fix")
-        if changed:
-            at = datetime.now(UTC).isoformat()
-            result = replace(result, assignment=NightlyFixAssigned(str(row.id), at),
+        changed = isinstance(assignment, NightlyFixUnassigned)
+        if isinstance(assignment, NightlyFixUnassigned):
+            assignment = NightlyFixAssigned(str(row.id), datetime.now(UTC).isoformat())
+            result = replace(result, assignment=assignment,
                              received=result.received if isinstance(result.received, NightlyNoticeReceived)
-                             else NightlyNoticeReceived(at))
+                             else NightlyNoticeReceived(assignment.at))
             save_nightly_red(directory, result)
-        changed = send_nightly_red(directory, result) or changed
+        changed = send_nightly_red(directory, result, assignment) or changed
         print("done" if changed else "unchanged")
     return 0
+
+
+def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
+    """Tell the production owner once in each assignment window that a red result has no assigned fix."""
+    from scripts.production import showrunners
+
+    window = timedelta(minutes=conf.read("merge_gate").whole("nightly_assign_minutes"))
+    now = datetime.now(UTC)
+    since = datetime.fromisoformat(result.alerted.at if isinstance(result.alerted, NightlyAlertSent) else result.finished)
+    if now - since < window:
+        return False
+    owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
+    minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
+    outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
+        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+        + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
+        + f"The user gets the result push only after assignment: merge_gate.py nightly-assigned --result {result.id} --unit UNIT.")
+    print(f"Nightly assignment alert: {outcome}", flush=True)
+    if outcome != f"told {owner}":
+        return False
+    save_nightly_red(directory, replace(result, alerted=NightlyAlertSent(now.isoformat())))
+    return True
 
 
 def check_nightly_assignments() -> int:
@@ -2009,12 +2442,8 @@ def check_nightly_assignments() -> int:
         for path in sorted(directory.glob("*.json")):
             try:
                 result = read_nightly_red(path)
-                if isinstance(result.delivery, NightlyPushAccepted):
-                    continue
-                age = (datetime.now(UTC) - datetime.fromisoformat(result.finished)).total_seconds()
-                if isinstance(result.assignment, NightlyFixUnassigned) and age < 60 * conf.read("merge_gate").whole("nightly_assign_minutes"):
-                    continue
-                changed = send_nightly_red(directory, result) or changed
+                if isinstance(result.assignment, NightlyFixUnassigned):
+                    changed = alert_nightly_unassigned(directory, result) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
@@ -2024,7 +2453,7 @@ def check_nightly_assignments() -> int:
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                      type_failures: Sequence[GateJobResult] = (), result_id: str = "") -> NightlyNoticeReceived | NightlyNoticeUnreceived:
-    from scripts.production import showrunners, staff
+    from scripts.production import showrunners
 
     requires_full = bool(failed) or not type_failures
     try:
@@ -2041,10 +2470,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                 detail += "\n" + summaries[-1]
         if result_id:
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
-        owner = nightly_owner(args)
-        row = staff.snapshot().by_id(staff.StaffId(owner))
-        if row is not None:
-            owner = row.name
+        owner = nightly_owner_name(args)
         outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
@@ -2115,7 +2541,8 @@ def nightly(args: GateArguments) -> int:
             result = NightlyRedResult(identity, args.merge_branch, tree, at, failures, values["types"], values["tests"])
             with nightly_red_lock(wait=True) as directory:
                 save_nightly_red(directory, result)
-                received = tell_nightly_red(args, tree, failed, type_failures=type_failures, result_id=identity)
+                received = tell_nightly_red(args, tree, [*failed, run.time_limit_report] if run.time_limit_report else failed,
+                                            type_failures=type_failures, result_id=identity)
                 save_nightly_red(directory, replace(result, received=received))
                 print(f"Assign the fix: merge_gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
@@ -2179,20 +2606,41 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
     remote = outcome
-    if not type_dirs:
+    if not type_dirs or remote.time_limit_report:
         return remote
     local = run_suites(repo, type_dirs, module_time_limit_s, source=source, full=True,
                        mode=mode, selected=SelectedModules(()))
     return GateRun(remote.jobs + local.jobs, remote.seconds + local.seconds,
                    max(remote.peak_memory_mib, local.peak_memory_mib), selection_certified=True,
-                   executions=remote.executions + local.executions)
+                   executions=remote.executions + local.executions, time_limit_report=remote.time_limit_report or local.time_limit_report)
+
+
+def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
+    """Use the failed gate owner message path for a stopped run."""
+    from scripts.message import send_budget, session_send
+
+    try:
+        sent = subprocess.run(session_send.send_argv("--to", owner, "--from", "merge_gate",
+                              "--key", f"gate-time-limit:{repo}", "--text", run.time_limit_report),
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              check=False, timeout=send_budget.seconds())
+        if sent.returncode:
+            raise ValueError(failure_detail(sent))
+        print(f"Gate time limit notice: {sent.stdout.strip()}", flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
-        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
-            return 0 if run_gate_suites(Path(args.repo).resolve(), args.type_dirs,
-                                   module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode).passed else 1
+        with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
+            repo = Path(args.repo).resolve()
+            with gate_recovery(repo):
+                run = run_gate_suites(repo, args.type_dirs,
+                                      module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode)
+            if run.time_limit_report:
+                tell_time_limit(copies.source_owner(repo), repo, run)
+            return 0 if run.passed else 1
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
@@ -2249,7 +2697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_tests_only(args, SuiteMode.MERGE_GATE)
     try:
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
-        with rollback_signals(), scratch.copy_lock(checkout):
+        with scratch.copy_lock(checkout):
             if args.nightly:
                 return nightly(args)
             if args.promote_only:
@@ -2258,7 +2706,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if review_list is not None:
                     record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
-            return merge_checkpoint(args)
+            with gate_recovery(checkout):
+                return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1

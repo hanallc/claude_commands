@@ -46,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.maintenance.schedule import IntervalHistory
 
 
@@ -86,7 +87,6 @@ def codex_account(home: Path) -> RefusingCodexAccount:
 @dataclass(frozen=True)
 class CreditsOn:
     """This account may pay for work after its allowance is used."""
-    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,21 +97,37 @@ class CreditsOff:
 CodexCreditsSetting = CreditsOn | CreditsOff
 
 
-def codex_credits_setting(label: str) -> CodexCreditsSetting:
-    from scripts.whoami.note_file import Note, note_path, read_note
+def staged_credit_accounts_path() -> Path:
+    """The value /tune makes live before main has the config change."""
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "accounts/codex_credit_accounts"
 
+
+def stage_credit_accounts(value: str) -> None:
+    """Make an approved value live at once; the config commit follows when main is free."""
+    path = staged_credit_accounts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, value + "\n")
+
+
+def clear_staged_credit_accounts(value: str) -> None:
+    """Remove the staged value once the config file holds it; a newer staged value stays."""
+    path = staged_credit_accounts_path()
+    if path.is_file() and path.read_text(encoding="utf-8").strip() == value:
+        path.unlink(missing_ok=True)
+
+
+def codex_credit_accounts() -> frozenset[str]:
+    """The Codex accounts that may spend paid credits: a staged /tune value, else the accounts config."""
     try:
-        path = note_path(label)
-    except ValueError:
-        # An unnamed home's display label has no account note or explicit setting.
-        return CreditsOn()
-    note = read_note(path)
-    value = note.get("use_credits") if isinstance(note, Note) else None
-    if value == "off":
-        return CreditsOff()
-    if value is None or value == "on":
-        return CreditsOn()
-    return CreditsOn(f"{label}: use_credits must be on or off; reading it as on")
+        value = staged_credit_accounts_path().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        value = conf.read("accounts").text("codex_credit_accounts")
+    return frozenset(value.split()) - {"none"}
+
+
+def codex_credits_setting(label: str) -> CodexCreditsSetting:
+    """An account not named in codex_credit_accounts uses only its included allowance."""
+    return CreditsOn() if label in codex_credit_accounts() else CreditsOff()
 
 
 @dataclass(frozen=True)
@@ -362,6 +378,18 @@ class UsageSaveFailed:
 UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
 
 
+@dataclass(frozen=True)
+class LoginEndKnown:
+    """The server time limit for a Claude login."""
+
+    at: datetime
+
+
+@dataclass(frozen=True)
+class LoginEndUnknown:
+    """The reading has no login end date."""
+
+
 def usage_store_warning_line(warning: UsageStoreWarning) -> str:
     if isinstance(warning, UsageClaimFailed):
         return f"usage store: could not claim the read; {warning.reason}; read without a hold"
@@ -392,6 +420,7 @@ class Report:
     usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
     store_warnings: tuple[UsageStoreWarning, ...] = ()
+    login_ends_at: LoginEndKnown | LoginEndUnknown = field(default_factory=LoginEndUnknown)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -424,6 +453,7 @@ class ClaudeOauth(TypedDict, total=False):
     subscriptionType: str
     # Epoch milliseconds.
     expiresAt: int
+    refreshTokenExpiresAt: int | None
 
 
 class ClaudeCredentials(TypedDict, total=False):
@@ -523,6 +553,17 @@ def parse_reset(value: object) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+def login_end_from_iso(value: object) -> LoginEndKnown | LoginEndUnknown:
+    """Decode a stored login end date without using the machine's zone."""
+    at = parse_reset(value) if isinstance(value, str) else None
+    return LoginEndKnown(at.astimezone(timezone.utc)) if at is not None and at.tzinfo is not None else LoginEndUnknown()
+
+
+def login_end_iso(value: LoginEndKnown | LoginEndUnknown) -> str | None:
+    """Encode a known login end date as UTC for stored and public JSON."""
+    return value.at.astimezone(timezone.utc).isoformat() if isinstance(value, LoginEndKnown) else None
 
 
 def executable(name: str) -> str:
@@ -815,6 +856,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             if not stored_credentials:
                 stored_credentials = claude_credentials() if config_dir is None else claude_credentials(config_dir)
             oauth = stored_credentials.get("claudeAiOauth", {})
+            login_end = oauth.get("refreshTokenExpiresAt")
+            if login_end is not None:
+                report.login_ends_at = LoginEndKnown(datetime.fromtimestamp(login_end / 1000, timezone.utc))
             token = oauth.get("accessToken")
             expires = oauth.get("expiresAt")
             # Only a Claude session refreshes a stored token, so an idle account's goes stale.

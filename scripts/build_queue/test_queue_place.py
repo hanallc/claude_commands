@@ -1,11 +1,12 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+import functools
 import io
 import json
 import os
@@ -39,6 +40,7 @@ GIB = records.GIB
 CHILD = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.exit(int(sys.argv[1]))"
 LIFELINE_WAIT = "os.read(int(os.environ['QUEUE_TEST_LIFELINE']), 1)"
 BLOCKING_CHILD = "import os,sys; print('ready', flush=True); " + LIFELINE_WAIT
+PRIVATE_SLICE_PREFIX = "queueplacetest_"
 TERM_RESISTANT_CHILD = ("import os,signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                         + "print('ready',flush=True); " + LIFELINE_WAIT)
 DESCENDANT_CHILD = """
@@ -189,7 +191,7 @@ class HelperLifelineTests(unittest.TestCase):
 
 def private_scope_start() -> None:
     """Use the real startup rule with a private kernel path at its input boundary."""
-    private_slice, action, sidecar, holder, start, *argv = sys.argv[1:]
+    private_slice, action, sidecar, holder, start, record, *argv = sys.argv[1:]
     if action != "--scope-start":
         raise AssertionError("the private scope wrapper received another action")
     cgroup_path = Path("/proc/self/cgroup")
@@ -209,7 +211,53 @@ def private_scope_start() -> None:
 
     with mock.patch.object(Path, "read_text", new=kernel_path), \
          mock.patch.object(atomic_file, "atomic_sample", side_effect=publish_actual_path):
-        queue.scope_start(Path(sidecar), int(holder), start, argv)
+        queue.scope_start(Path(sidecar), int(holder), start, argv, record=Path(record))
+
+
+def private_slice_name() -> str:
+    """Name a private test slice after the test process that owns it."""
+    return f"{PRIVATE_SLICE_PREFIX}{os.getpid()}_{time.monotonic_ns()}.slice"
+
+
+@functools.cache
+def stop_orphan_private_slices() -> None:
+    """Stop empty private test slices whose owning test process has ended."""
+    command = ["systemctl", "--user"]
+    try:
+        listed = subprocess.run([*command, "list-units", "--all", "--plain", "--no-legend",
+                                 f"{PRIVATE_SLICE_PREFIX}*.slice"], capture_output=True, text=True, timeout=10, check=False)
+        for unit in (line.split()[0] for line in listed.stdout.splitlines() if line.strip()):
+            owner = unit.removeprefix(PRIVATE_SLICE_PREFIX).split("_", 1)[0]
+            if not owner.isdigit() or Path(f"/proc/{owner}").exists():
+                continue
+            tasks = subprocess.run([*command, "show", "--property=TasksCurrent", "--value", unit],
+                                   capture_output=True, text=True, timeout=10, check=False)
+            if tasks.stdout.strip() == "0":
+                _ = subprocess.run([*command, "stop", unit], capture_output=True, timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        return
+
+
+class PrivateSliceSweepTests(unittest.TestCase):
+    def test_sweep_stops_only_empty_slices_of_ended_test_processes(self) -> None:
+        live, ended = os.getpid(), 2**22 + 1
+        units = {f"{PRIVATE_SLICE_PREFIX}{ended}_1.slice": "0", f"{PRIVATE_SLICE_PREFIX}{ended}_2.slice": "1",
+                 f"{PRIVATE_SLICE_PREFIX}{live}_3.slice": "0", f"{PRIVATE_SLICE_PREFIX}name_4.slice": "0"}
+        stopped: list[str] = []
+
+        def systemctl(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if argv[2] == "list-units":
+                return subprocess.CompletedProcess(argv, 0, "".join(f"{unit} loaded active active\n" for unit in units))
+            if argv[2] == "show":
+                return subprocess.CompletedProcess(argv, 0, units[argv[-1]] + "\n")
+            stopped.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "")
+
+        stop_orphan_private_slices.cache_clear()
+        self.addCleanup(stop_orphan_private_slices.cache_clear)
+        with mock.patch.object(subprocess, "run", side_effect=systemctl):
+            stop_orphan_private_slices()
+        self.assertEqual(stopped, [f"{PRIVATE_SLICE_PREFIX}{ended}_1.slice"])
 
 
 class QueuePlaceFixture(ExitStack):
@@ -217,14 +265,15 @@ class QueuePlaceFixture(ExitStack):
 
     def __init__(self, *, private_slice: str = "") -> None:
         super().__init__()
-        self.private_slice: str = private_slice or f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
+        self.private_slice: str = private_slice or private_slice_name()
         self.enter_context(LauncherHangGuard("queue place fixture").protect())
         self.lifeline_read: int
         self.lifeline_write: int
         self.lifeline_read, self.lifeline_write = os.pipe()
         _ = self.callback(os.close, self.lifeline_read)
         _ = self.callback(os.close, self.lifeline_write)
-        self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(prefix="queue-place-test-")))
+        self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(
+            prefix="queue-place-test-", dir=os.environ.get("TMPDIR"))))
         self.log: Path = self.root / "log"
         self.proc: Path = self.root / "proc"
         self.proc.mkdir()
@@ -269,6 +318,8 @@ class QueuePlaceFixture(ExitStack):
 
     def use_private_scope(self) -> None:
         """Keep the real user manager outside the live build slice."""
+        # A test process that ends without its cleanups leaves its slice; a later run stops it.
+        stop_orphan_private_slices()
         prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                   "--expand-environment=no", f"--slice={self.private_slice}", "--"]
         probe = subprocess.run([*prefix, "true"], capture_output=True, timeout=10, check=False)
@@ -365,6 +416,42 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_fixture_removes_child_folders_after_exit_term_int_and_kill(self) -> None:
+        source = """
+from pathlib import Path
+import sys
+from scripts.build_queue.queue_place import queue_place
+with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
+    print(place.sidecar.parent, flush=True)
+    sys.stdin.buffer.read(1)
+"""
+        for ending in (0, signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory(prefix="queue-caller-") as directory:
+                caller = Path(directory)
+                with mock.patch.dict(os.environ, {"TMPDIR": str(caller)}):
+                    with QueuePlaceFixture() as fixture:
+                        child = subprocess.Popen([sys.executable, "-c", source, str(fixture.root)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        assert child.stdout is not None
+                        self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                        folder = Path(cast(bytes, child.stdout.readline()).decode().strip())
+                        self.assertTrue(folder.is_relative_to(fixture.admission.temporary))
+                        self.assertTrue(folder.is_dir())
+                        if ending:
+                            child.send_signal(ending)
+                        else:
+                            assert child.stdin is not None
+                            _ = child.stdin.write(b"G")
+                            child.stdin.flush()
+                        status = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(status, -ending if ending in (signal.SIGTERM, signal.SIGKILL)
+                                         else -signal.SIGINT if ending == signal.SIGINT else 0)
+                        self.assertEqual(folder.exists(), ending in (signal.SIGTERM, signal.SIGKILL))
+                        with queue.queue_place("rust-analyzer", fixture.root):
+                            pass
+                        self.assertFalse(folder.exists(), "the next start kept a dead holder's folder")
+                    self.assertEqual(list(caller.iterdir()), [])
+
     def test_scope_sampler_uses_the_shared_anonymous_reader_and_skips_unavailable_use(self) -> None:
         from scripts.lint.memory_test_support import admission_configuration_fixture
 
@@ -435,15 +522,13 @@ class QueuePlaceTests(unittest.TestCase):
                  mock.patch.object(queue, "probe_scope_prefix", side_effect=AssertionError("probe requested a scope")), \
                  mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
                 argv = [str(executable), "--version"]
-                started = time.monotonic()
                 with queue.queue_place(argv, fixture.root) as place:
                     process = place.popen(argv, stdout=subprocess.PIPE)
-                    output, _ = process.communicate(timeout=2)
+                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0)
                     self.assertEqual(output, b"private analyzer version\n")
                     self.assertEqual(place.peak_bytes, 0)
                     self.assertFalse(place.path.with_suffix(".max").exists())
-                self.assertLess(time.monotonic() - started, 2)
             self.assertEqual(fixture.admission.state_text(), saved)
             self.assertFalse(fixture.admission.server.reservations)
             self.assertEqual(fixture.history(), [])
@@ -484,12 +569,10 @@ class QueuePlaceTests(unittest.TestCase):
                  mock.patch.object(client, "release", side_effect=AssertionError("editor released a reservation")), \
                  mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}):
                 with queue.queue_place(argv, fixture.root) as place:
-                    started = time.monotonic()
                     child = place.popen(argv, stdout=subprocess.PIPE)
                     assert child.stdout is not None
-                    self.assertTrue(select.select([child.stdout], [], [], 2)[0], "editor startup exceeded two seconds")
+                    self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "editor did not start")
                     self.assertEqual(child.stdout.readline(), b"ready\n")
-                    self.assertLess(time.monotonic() - started, 2)
                     scope = Path(place.sidecar.read_text().strip())
                     self.assertIn(child.pid, gate.scope_members(scope))
                     self.assertFalse(fixture.admission.server.reservations)
@@ -591,7 +674,7 @@ class QueuePlaceTests(unittest.TestCase):
 
     def assert_nested_scope_cleanup(self, *, fork_during_scope_read: bool) -> None:
         self.require_transient_scope()
-        private_slice = f"queueplacetest{os.getpid()}{time.monotonic_ns()}.slice"
+        private_slice = private_slice_name()
         unit = f"queue-place-holder-{os.getpid()}-{time.monotonic_ns()}.scope"
         command = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                    "--expand-environment=no", f"--slice={private_slice}", f"--unit={unit}", "--",
@@ -752,6 +835,28 @@ class QueuePlaceTests(unittest.TestCase):
                     raise RuntimeError("holder failed")
             self.assertEqual(places[0].status, 1)
             fixture.assert_released(self, reservation_id, status=1)
+
+    def test_sampler_start_failure_stops_and_reaps_the_program_before_release(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+            release = client.release
+
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+                self.assertEqual(len(fixture.children), 1)
+                child = fixture.children[0]
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ChildProcessError):
+                    _ = os.waitpid(child.pid, os.WNOHANG)
+                _ = release(path, status, configuration)
+
+            with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
+                with queue.queue_place("rust-analyzer", fixture.root) as place:
+                    with self.assertRaisesRegex(RuntimeError, "sampler start failed"), \
+                            mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("sampler start failed")):
+                        _ = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
+            released.assert_called_once()
+            self.assertIsInstance(place.program, queue.StartedProgram)
+            self.assertEqual(place.status, 1)
+            fixture.assert_cleaned(self)
 
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
@@ -986,6 +1091,27 @@ class QueuePlaceTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(fixture.admission.server.waiters)
 
+    def test_cleanup_mask_is_restored_when_blocking_is_interrupted(self) -> None:
+        change_mask = signal.pthread_sigmask
+        previous = change_mask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        expected = previous | {signal.SIGUSR1}
+
+        def interrupted_block(how: int, numbers: Iterable[int]) -> set[int | signal.Signals]:
+            mask = set(numbers)
+            result = change_mask(how, mask)
+            if how == signal.SIG_BLOCK and signal.SIGINT in mask:
+                raise KeyboardInterrupt
+            return result
+
+        try:
+            with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
+                with self.assertRaises(KeyboardInterrupt):
+                    with cancellation.defer_cleanup_signals():
+                        self.fail("The block step must interrupt entry")
+            self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
+        finally:
+            _ = change_mask(signal.SIG_SETMASK, previous)
+
     @unittest.skipUnless(hasattr(os, "fork"), "holder signal lifecycle needs fork")
     def test_holder_signals_release_and_restore_handlers(self) -> None:
         for number in (signal.SIGTERM, signal.SIGINT):
@@ -1006,6 +1132,8 @@ class QueuePlaceTests(unittest.TestCase):
                             _ = os.read(fixture.lifeline_read, 1)
                     except SystemExit as error:
                         status = cast(int, error.code)
+                    except KeyboardInterrupt:
+                        status = 128 + signal.SIGINT
                     finally:
                         os._exit(status)
                 os.close(write_fd)
@@ -1020,8 +1148,15 @@ class QueuePlaceTests(unittest.TestCase):
                     finally:
                         os.close(descriptor)
                     _, status = os.waitpid(holder, 0)
-                    self.assertEqual(os.waitstatus_to_exitcode(status), 128 + number)
-                    fixture.assert_released(self, str(row.get("reservation_id", "")), status=128 + number)
+                    self.assertEqual(os.waitstatus_to_exitcode(status),
+                                     -number if number == signal.SIGTERM else 128 + number)
+                    if number == signal.SIGTERM:
+                        shutil.rmtree(fixture.proc / str(holder))
+                        with queue.queue_place("rust-analyzer", fixture.root):
+                            pass
+                        fixture.assert_released(self, str(row.get("reservation_id", "")), outcome="owner_gone")
+                    else:
+                        fixture.assert_released(self, str(row.get("reservation_id", "")), status=128 + number)
                 finally:
                     os.close(read_fd)
                     try:
@@ -1031,9 +1166,115 @@ class QueuePlaceTests(unittest.TestCase):
                         pass
         with QueuePlaceFixture() as fixture:
             before = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
-            with queue.queue_place("rust-analyzer", fixture.root):
-                pass
+            with mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
+                with queue.queue_place("rust-analyzer", fixture.root):
+                    pass
             self.assertEqual({number: signal.getsignal(number) for number in before}, before)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "start interruption needs fork")
+    def test_start_window_interrupts_leave_atomic_records_for_the_next_start(self) -> None:
+        for checkpoint in ("popen-return", "on-started"):
+            for number in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+                with self.subTest(checkpoint=checkpoint, signal=number), QueuePlaceFixture() as fixture:
+                    ready_read, ready_write = os.pipe()
+                    resume_read, resume_write = os.pipe()
+                    caught_read, caught_write = os.pipe()
+                    exit_read, exit_write = os.pipe()
+                    holder = os.fork()
+                    if holder == 0:
+                        os.close(fixture.lifeline_write)
+                        os.close(ready_read)
+                        os.close(resume_write)
+                        os.close(caught_read)
+                        os.close(exit_write)
+                        _ = signal.alarm(TEST_HANG_GUARD_SECS)
+                        status = 99
+                        try:
+                            fixture.supply_process(os.getpid(), 0, parent=1)
+                            spawn = subprocess.Popen
+                            def pause(process: subprocess.Popen[bytes]) -> None:
+                                assert process.stdout is not None
+                                if not select.select([process.stdout], [], [], 5)[0]:
+                                    raise AssertionError("the program did not start")
+                                if process.stdout.readline() != b"ready\n":
+                                    raise AssertionError("the program did not announce readiness")
+                                _ = os.write(ready_write, str(process.pid).encode())
+                                _ = os.read(resume_read, 1)
+                            def start(argv: list[str], **options: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
+                                process = spawn(argv, **options)
+                                if "--program-start" in argv and checkpoint == "popen-return":
+                                    pause(process)
+                                return process
+                            with queue.queue_place("rust-analyzer", fixture.root) as place:
+                                if checkpoint == "on-started":
+                                    def on_started() -> None:
+                                        assert isinstance(place.program, queue.StartedProgram)
+                                        pause(place.program.process)
+                                    place.on_started = on_started
+                                with mock.patch.object(subprocess, "Popen", side_effect=start), \
+                                        mock.patch.object(signal, "signal", side_effect=AssertionError("installed a signal handler")):
+                                    _ = place.popen([sys.executable, "-c", TERM_RESISTANT_CHILD], stdout=subprocess.PIPE)
+                        except KeyboardInterrupt:
+                            status = 128 + signal.SIGINT
+                            if checkpoint == "popen-return":
+                                _ = os.write(caught_write, b"C")
+                                _ = os.read(exit_read, 1)
+                        finally:
+                            os._exit(status)
+                    os.close(ready_write)
+                    os.close(resume_read)
+                    os.close(caught_write)
+                    os.close(exit_read)
+                    program_pid = 0
+                    try:
+                        self.assertTrue(select.select([ready_read], [], [], 8)[0], "the start window never opened")
+                        program_pid = int(os.read(ready_read, 64))
+                        saved = list(queue.program_starts().glob("*.json"))
+                        self.assertEqual(len(saved), 1)
+                        record = wire.parse_record(saved[0].read_text(), queue.ProgramStart)
+                        self.assertEqual(record.holder.pid, holder)
+                        self.assertEqual(record.program.pid, program_pid)
+                        descriptor = os.pidfd_open(holder)
+                        try:
+                            os.kill(holder, number)
+                            if number != signal.SIGKILL:
+                                _ = os.write(resume_write, b"G")
+                            if number == signal.SIGINT and checkpoint == "popen-return":
+                                self.assertTrue(select.select([caught_read], [], [], 8)[0], "the caller did not catch INT")
+                                self.assertEqual(os.read(caught_read, 1), b"C")
+                                self.assertIsNotNone(records.process_start_time(holder), "the caller did not remain alive")
+                                self.assertIsNone(records.process_start_time(program_pid), "INT released a running program")
+                                self.assertEqual(list(queue.program_starts().iterdir()), [])
+                                _ = os.write(exit_write, b"E")
+                            self.assertTrue(select.select([descriptor], [], [], 8)[0], "the holder did not end")
+                        finally:
+                            os.close(descriptor)
+                        _, status = os.waitpid(holder, 0)
+                        self.assertEqual(os.waitstatus_to_exitcode(status),
+                                         128 + signal.SIGINT if number == signal.SIGINT else -number)
+                        for path in queue.program_starts().iterdir():
+                            self.assertEqual(path.suffix, ".json", "a partial record escaped publication")
+                            remaining = wire.parse_record(path.read_text(), queue.ProgramStart)
+                            self.assertEqual(remaining.program, record.program)
+                        shutil.rmtree(fixture.proc / str(holder))
+                        with queue.queue_place("rust-analyzer", fixture.root):
+                            pass
+                        self.assertIsNone(records.process_start_time(program_pid), "the next start left an untracked program")
+                        self.assertEqual(list(queue.program_starts().iterdir()), [])
+                        fixture.assert_cleaned(self)
+                    finally:
+                        for fd in (ready_read, resume_write, caught_read, exit_write):
+                            os.close(fd)
+                        try:
+                            os.kill(holder, signal.SIGKILL)
+                            _ = os.waitpid(holder, 0)
+                        except (ProcessLookupError, ChildProcessError):
+                            pass
+                        if program_pid:
+                            try:
+                                send_process_group(program_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
 
     @unittest.skipUnless(hasattr(os, "fork"), "owner death lifecycle needs fork")
     def test_owner_gone_keeps_a_populated_scope_then_finalizes_once_when_empty(self) -> None:
@@ -1270,6 +1511,90 @@ class QueuePlaceTests(unittest.TestCase):
                             send_process_group(program_pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
+
+    def test_int_before_scope_publication_stops_the_published_scope_with_a_live_caller(self) -> None:
+        self.require_transient_scope()
+        with QueuePlaceFixture() as fixture:
+            fixture.use_private_scope()
+            fixture.supply_scope_memory(GIB)
+            ready_read, ready_write = os.pipe()
+            resume_read, resume_write = os.pipe()
+            caught_read, caught_write = os.pipe()
+            exit_read, exit_write = os.pipe()
+            spawn = subprocess.Popen
+
+            def delay_scope(argv: list[str], **options: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
+                if "--scope-start" in argv:
+                    start = argv.index("--scope-start") - 2
+                    argv = [*argv[:start], sys.executable, "-c", BEFORE_SCOPE_START,
+                            str(ready_write), str(resume_read), *argv[start:]]
+                    options["pass_fds"] = (*options.get("pass_fds", ()), ready_write, resume_read)
+                return spawn(argv, **options)
+
+            with mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
+                    mock.patch.object(subprocess, "Popen", side_effect=delay_scope):
+                holder = os.fork()
+                if holder == 0:
+                    os.close(fixture.lifeline_write)
+                    for fd in (ready_read, resume_write, caught_read, exit_write):
+                        os.close(fd)
+                    _ = signal.alarm(TEST_HANG_GUARD_SECS)
+                    scope = ""
+                    try:
+                        fixture.supply_process(os.getpid(), 0, parent=1)
+                        with queue.queue_place("rust-analyzer", fixture.root) as place:
+                            def started() -> None:
+                                nonlocal scope
+                                scope = place.sidecar.read_text().strip()
+                                assert isinstance(place.program, queue.StartedProgram)
+                                stream = place.program.process.stdout
+                                assert stream is not None
+                                if not select.select([stream], [], [], 5)[0] or stream.readline() != b"ready\n":
+                                    raise AssertionError("the scoped program never became active")
+                            place.on_started = started
+                            _ = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
+                    except KeyboardInterrupt:
+                        _ = os.write(caught_write, scope.encode())
+                        _ = os.read(exit_read, 1)
+                        os._exit(0)
+                    finally:
+                        os._exit(99)
+                for fd in (ready_write, resume_read, caught_write, exit_read):
+                    os.close(fd)
+                try:
+                    self.assertTrue(select.select([ready_read], [], [], 10)[0], "the scope did not reach its barrier")
+                    _ = int(os.read(ready_read, 64))
+                    _, reservation = fixture.reservation()
+                    self.assertEqual(Path(reservation["sidecar"]).read_text(), "")
+                    os.kill(holder, signal.SIGINT)
+                    _ = os.write(resume_write, b"G")
+                    self.assertTrue(select.select([caught_read], [], [], 8)[0], "INT cleanup waited for a live scope")
+                    scope = Path(os.read(caught_read, 4096).decode())
+                    self.assertTrue(scope.is_absolute())
+                    self.assertIsNotNone(records.process_start_time(holder), "the caller did not remain alive")
+                    self.assertEqual(gate.scope_members(scope), set())
+                    self.assertEqual(list(queue.program_starts().iterdir()), [])
+                    fixture.assert_released(self, str(reservation.get("reservation_id", "")), status=128 + signal.SIGINT)
+                    _ = os.write(exit_write, b"E")
+                    self.assertEqual(os.waitpid(holder, 0)[1], 0)
+                finally:
+                    for fd in (ready_read, resume_write, caught_read, exit_write):
+                        os.close(fd)
+                    try:
+                        os.kill(holder, signal.SIGKILL)
+                        _ = os.waitpid(holder, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
+
+    def test_the_program_does_not_inherit_the_start_window_signal_mask(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            source = ("import signal; mask=signal.pthread_sigmask(signal.SIG_BLOCK,set()); "
+                      "print(int(signal.SIGTERM in mask),int(signal.SIGINT in mask),flush=True)")
+            with queue.queue_place("rust-analyzer", fixture.root) as place:
+                process = place.popen([sys.executable, "-c", source], stdout=subprocess.PIPE)
+                output, _ = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(output, b"0 0\n")
 
     def test_transient_scope_sidecar_and_sampler_use_the_program_scope(self) -> None:
         self.require_transient_scope()

@@ -364,19 +364,11 @@ assert_equal "background worker ignored the named Claude account" "$HOME/.claude
 assert_equal "background worker did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-worker)"
 assert_equal "background worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 
-# A caller's helper does not opt in to the workers route.
-export FAKE_CLAUDE_SESSION_ID=abcdef12-0000-4000-8000-000000000002
-CLAUDE_BIN="$TEST_DIR/bin/claude-bg" run_background_fixture \
-    fixture-friend "$WORKING_DIR" "$WORKING_DIR" "$PROMPT_FILE" "$TEST_DIR/friend-summary" "$LOG_FILE" 0
-assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
-assert_equal "friend did not launch" "$FAKE_CLAUDE_SESSION_ID" "$(recorded_worker_session fixture-friend)"
-assert_equal "friend used the worker catalog" "claude-opus-claude2-fixture" "$(recorded_claude_model)"
-
 # CLI assignments also come from the registry.
-write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
+write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/merge_branch=opus:max
 cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
-write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
-MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
+write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.merge_branch=claude
+MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" merge_branch < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "CLI worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 "$SCRIPT_DIR/../lib/py" - "$SCRIPT_DIR/../.." <<'PYTHON'

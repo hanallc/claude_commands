@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import io
@@ -178,7 +179,7 @@ raise SystemExit(1)
         self.projects.mkdir()
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
-        self.send_log = self.root / "sends.jsonl"
+        self.send_log = self.root / "sends.txt"
         self.rca_log = self.root / "rca-sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
@@ -186,9 +187,12 @@ raise SystemExit(1)
         self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
-        executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
+        # Shell builtins print the rows; a cat child would double the starts for each snapshot.
+        executable(self.bin / "ps", "#!/bin/sh\nwhile IFS= read -r row; do printf '%s\\n' \"$row\"; done < \"$STALL_TEST_PS_FILE\"\n")
+        # The record is a Python literal, and json loads only for a fail list. A json import adds
+        # about 60% to the start time of this stub, and stall_watch starts it for each delivery.
         executable(self.bin / "send.py", """#!/usr/bin/env python3
-import json, os, sys, time
+import os, sys, time
 args = sys.argv[1:]
 retire = args[:1] == ['retire']
 record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
@@ -197,7 +201,7 @@ if retire:
     record['command'] = 'retire'
 if '--value' in args:
     record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
-line = (json.dumps(record) + '\\n').encode()
+line = (repr(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
@@ -207,7 +211,13 @@ while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < ex
     if time.monotonic() >= deadline:
         raise SystemExit('send barrier did not receive every concurrent delivery')
     time.sleep(0.01)
-fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
+with open(os.environ['STALL_TEST_FAIL_FILE']) as targets:
+    text = targets.read()
+if text == '[]':
+    fail = []
+else:
+    import json
+    fail = json.loads(text)
 # A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
 if retire:
     raise SystemExit(3 if 'retire' in fail else 0)
@@ -572,7 +582,7 @@ always=natedev
     def sent(self) -> list[dict[str, str]]:
         if not self.send_log.exists():
             return []
-        return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+        return [ast.literal_eval(line) for line in self.send_log.read_text().splitlines()]
 
     def moved_director_run(self, *, finished: bool = False) -> Path:
         """Keep stale staff and document paths while the held run uses another worktree."""
@@ -1500,6 +1510,18 @@ always=natedev
         self.assertEqual((len(self.prompt_followups()), self.prompt_followups()[-1]["key"], values["since"]), (3, PROMPT_KEY, "12:15 PDT"))
         self.assertEqual(len(self.prompt_notices()), 2)
 
+    def test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass(self) -> None:
+        """rca 261114-1: herdr reported the pane idle for 10 h while its screen showed the prompt."""
+        transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 3 * 3600))
+        self.panes["unit-one"].update(agent_status="idle", pane=OUTSIDE_PROMPT)
+        self.tell_prompt_owner(START)
+        result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspected showrunner/unit-one: permission prompt", result.stdout)
+        self.assertEqual([item["to"] for item in self.prompt_followups()], ["user"])
+        self.assertFalse(any(item["key"].endswith(":bump") for item in self.sent()))
+
     def prompt_state(self) -> Path:
         return self.watches["unit-one"].prompt_path
 
@@ -1515,7 +1537,7 @@ always=natedev
     def test_a_failed_retire_is_sent_again_next_tick_and_no_new_alert_goes(self) -> None:
         self.alerted_at_a_prompt()
         _ = self.fail_file.write_text('["retire"]')
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         failed = self.tick(START + 120)
         self.assertIn("stall-watch: retire:", failed.stderr)
         self.assertTrue(self.prompt_state().exists())
@@ -1549,7 +1571,7 @@ always=natedev
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
         self.assertTrue(self.prompt_state().exists())
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         self.assertEqual(self.tick(START + 30).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse(self.prompt_state().exists())
@@ -1627,7 +1649,7 @@ always=natedev
             self.assertTrue(prompt["alerted"])
             self.assertIn("case_pending", prompt)
             self.assertEqual(self.owner_messages(), [])
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             cleared = self.tick(START + 120)
         self.assertIn("rca: no case opened: OSError: case disk unavailable", cleared.stderr)
         self.assertEqual(self.prompt_followups()[1:], [RETIRE])
@@ -1655,7 +1677,7 @@ always=natedev
         with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
             failed = self.tick(START + 60)
             self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             _ = self.tick(START + 120)
             self.assertEqual(self.prompt_followups()[1:], [RETIRE])
             self.assertFalse(self.prompt_state().exists())
@@ -1850,23 +1872,48 @@ always=natedev
             ("holding: waiting on the unit tests\nLogin reached its time limit\n",
              "unit-one: the Claude login reached its time limit and needs /login.", "login limit"),
             ("holding: waiting on the unit tests\nLogin reached its time limit\n", "", "fresh"),
+            ("● Login reached its time limit · Please run /login\n"
+             + "❯ You were moved from claude4 to claude2.\n● The gate is running.\n", "", "resumed"),
+            ("holding: waiting on the unit tests\nLogin reached its time limit\n", "", "restarted"),
+            (PANE, "", "missing transcript"),
         )
         for pane, notice, decision in cases:
             with self.subTest(decision=decision):
                 self.send_log.unlink(missing_ok=True)
                 self.watches["unit-one"].stretch_path.unlink(missing_ok=True)
+                (self.root / "usage.json").unlink(missing_ok=True)
                 self.panes["unit-one"]["pane"] = pane
-                if decision == "fresh":
-                    transcript = self.projects / "project" / f"{unit_session('unit-one')}.jsonl"
-                    _ = transcript.write_text(json.dumps({"type": "system", "error": "Login reached its time limit"}) + "\n")
+                transcript = self.projects / "project" / f"{unit_session('unit-one')}.jsonl"
+                _ = transcript.write_text("{}\n")
+                os.utime(transcript, (START - 3600, START - 3600))
+                record_path = self.sessions / f"{self.panes['unit-one']['pid']}.json"
+                record = cast(dict[str, object], json.loads(record_path.read_text()))
+                _ = record.pop("startedAt", None)
+                error = stall_watch.TranscriptEntry(type="assistant", isApiErrorMessage=True,
+                    timestamp=datetime.fromtimestamp(START - 60, ZoneInfo("UTC")).isoformat(),
+                    message={"content": [{"type": "text", "text": "Login reached its time limit · Please run /login"}]})
+                if decision != "waiting":
+                    _ = transcript.write_text(json.dumps(error) + "\n")
                     os.utime(transcript, (START - 60, START - 60))
-                    at = datetime.fromtimestamp(START - 1, ZoneInfo("UTC")).isoformat()
+                if decision == "restarted":
+                    record["startedAt"] = (START - 30) * 1000
+                _ = record_path.write_text(json.dumps(record))
+                if decision in ("fresh", "resumed", "restarted", "missing transcript"):
+                    if decision == "resumed":
+                        with transcript.open("a") as output:
+                            _ = output.write(json.dumps({**self.said({"type": "text", "text": "The gate is running."}),
+                                "timestamp": datetime.fromtimestamp(START - 2, ZoneInfo("UTC")).isoformat()}) + "\n")
+                        os.utime(transcript, (START - 2, START - 2))
+                    at = datetime.fromtimestamp(START - (1 if decision == "fresh" else 120), ZoneInfo("UTC")).isoformat()
                     _ = (self.root / "usage.json").write_text(json.dumps({
                         "_directory_logins": {usage_store.directory_key("Claude", str(self.root / ".claude")):
                                               "fixture@example.invalid"},
                         "fixture@example.invalid": {"read_outcome": UsageReadOutcome.OK,
                                                      "weekly": {"left": 50, "resets": "", "at": at}},
                     }))
+                    if decision == "missing transcript":
+                        transcript.unlink()
+                        (self.root / "usage.json").unlink()
                     result = self.tick(START)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("inspected showrunner/unit-one: fresh", result.stdout)
@@ -1879,7 +1926,17 @@ always=natedev
                     self.assertIn("nothing running; bumped", tell["text"])
                     continue
                 notices = [notice] if notice else []
-                for at in (START, START + 3600):
+                for at in (START, START + 60, START + 90, START + 120, START + 3600):
+                    if notice:
+                        self.panes["unit-one"]["pane"] = PANE if at == START + 60 else pane
+                        if at == START + 90:
+                            saved = self.watches["unit-one"].stretch_path.read_bytes()
+                            with mock.patch.object(stall_watch, "lines_from_end", side_effect=OSError("fixture read failed")):
+                                result = self.tick(at)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(self.watches["unit-one"].stretch_path.read_bytes(), saved)
+                            self.assertEqual([item["text"] for item in self.sent()], notices)
+                            continue
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(f"inspected showrunner/unit-one: {decision}", result.stdout)
@@ -1888,13 +1945,39 @@ always=natedev
                     tell, = self.sent()
                     self.assertTrue(tell["key"].endswith(":tell"))
                     self.assertEqual(tell["to"], f"uds:{self.root / '54c9fdb8-6dfc-55dd-8242-a523c2e9f81f.sock'}")
+                    good_read = datetime.fromtimestamp(START + 3600, ZoneInfo("UTC")).isoformat()
+                    for offset, outcome in ((0.1, UsageReadOutcome.OK), (0.2, UsageReadOutcome.RATE_LIMITED_429)):
+                        with self.subTest(usage_outcome=outcome):
+                            _ = (self.root / "usage.json").write_text(json.dumps({
+                                "_directory_logins": {usage_store.directory_key("Claude", str(self.root / ".claude")):
+                                                      "fixture@example.invalid"},
+                                "fixture@example.invalid": {"read_outcome": outcome,
+                                                             "weekly": {"left": 50, "resets": "", "at": good_read}},
+                            }))
+                            result = self.tick(START + 3600 + offset)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual([item["text"] for item in self.sent()], notices)
+                            saved_stretch = cast(stall_watch.Stretch, json.loads(self.watches["unit-one"].stretch_path.read_text()))
+                            self.assertNotIn("login_since", saved_stretch)
                 self.panes["unit-one"]["pane"] = pane + "holding: waiting on the unit tests\n"
+                if notice:
+                    _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": "I resumed the unit tests."})) + "\n")
+                    os.utime(transcript, (START + 3601, START + 3601))
                 self.assertEqual(self.tick(START + 3601).returncode, 0)
                 self.assertEqual([item["text"] for item in self.sent()], notices)
                 self.assertEqual(self.tick(START + 3901).returncode, 0)
                 resumed = self.sent()[len(notices):]
                 self.assertEqual(len(resumed), 2)
                 self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in resumed}, {"bump", "tell"})
+                if notice:
+                    error["timestamp"] = datetime.fromtimestamp(START + 4200, ZoneInfo("UTC")).isoformat()
+                    _ = transcript.write_text(json.dumps(error) + "\n")
+                    self.panes["unit-one"]["pane"] = PANE
+                    for at in (START + 4200, START + 7800):
+                        self.assertEqual(self.tick(at).returncode, 0)
+                        login_notices = [item for item in self.sent() if item["text"] == notice]
+                        self.assertEqual(len(login_notices), 2)
+                        self.assertNotEqual(login_notices[0]["key"], login_notices[1]["key"])
 
     def test_status_vocabulary_is_reread_without_restarting_the_watcher(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: budget nap\n"

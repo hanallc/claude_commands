@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -16,11 +17,16 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.production import staff
+from scripts.production.production_doc import read_production
+from scripts.production.update_registration import scheduled_prompt
 from scripts.production.staff_test_support import isolated_staff_file, fixture_runtime_id, recorded_showrunner
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.checkout_test_support import copy_runtime
+from scripts.lib import user_zone
+from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -64,28 +70,17 @@ class NotifierTests(unittest.TestCase):
         launcher_dir = self.root / "launcher-bin"
         launcher_dir.mkdir()
         launcher = launcher_dir / "systemd-run"
-        monitor = """import os
-import subprocess
-import sys
-from pathlib import Path
-code = 127
-try:
-    code = subprocess.run(sys.argv[2:], check=False).returncode
-finally:
-    Path(sys.argv[1], 'run-exit-' + str(os.getpid())).write_text(str(code))
-"""
+        # The caller installs the inherited ownership marker before launch.
+        # set -m starts the monitor shell in its own process group on Linux and macOS; $! is its pid and group.
         _ = launcher.write_text(
             "\n".join((
-                "#!/usr/bin/env python3",
-                "import subprocess, os",
-                "from pathlib import Path",
-                "import sys",
-                "# The caller installs the inherited ownership marker before launch.",
-                f"monitor = {monitor!r}",
-                f"child = subprocess.Popen([sys.executable, '-c', monitor, {str(self.root)!r}, *sys.argv[sys.argv.index('--') + 1:]], "
-                + "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-                + "stderr=subprocess.DEVNULL, start_new_session=True)",
-                f"with Path({str(self.launch_pids)!r}).open('a') as marker: marker.write(str(child.pid) + '\\n')",
+                "#!/bin/sh",
+                "set -m",
+                'while [ "$1" != -- ]; do shift; done',
+                "shift",
+                """/bin/sh -c '"$@"; code=$?; printf %s "$code" > "$0/run-exit-$$"' """
+                + f'{shlex.quote(str(self.root))} "$@" </dev/null >/dev/null 2>&1 &',
+                f'printf "%s\\n" "$!" >> {shlex.quote(str(self.launch_pids))}',
             )) + "\n"
         )
         launcher.chmod(0o755)
@@ -105,29 +100,38 @@ finally:
         return owner, doc
 
     def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
-        owner = self.scheduled_owner()[0]
+        owner, doc = self.scheduled_owner()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         current = staff.native_id(fixture_runtime_id("timer-after-clear"))
         _ = self.successful("new", "example", "--to", "session:" + owner.id,
                             "--every", "2", "--prompt", "scheduled")
         configuration = self.state_dir / "example" / "conf"
         before = configuration.read_bytes(), configuration.stat().st_mtime_ns
-        for index, change in enumerate(("session", "name"), start=1):
+        for index, change in enumerate(("session", "name", "document"), start=1):
             with self.subTest(change=change):
                 if change == "session":
                     owner = staff.update_current_session(owner.current_session, current)
                     self.record(current)
-                else:
+                elif change == "name":
                     owner = staff.rename(owner.id, "renamed-demo")
+                else:
+                    moved = doc.with_name("moved-production.md")
+                    _ = doc.rename(moved)
+                    _ = moved.write_text(moved.read_text().replace("every 2 minutes", "every 7 minutes"))
+                    assert isinstance(owner.doc, staff.LiveDoc)
+                    owner = staff.set_doc(owner.id, staff.LiveDoc(owner.doc.machine, moved))
                 _ = self.successful("tick", now=MINUTE + 120 * index)
                 arguments = self.send_args.read_text().splitlines()
                 self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+                self.assertEqual(arguments[arguments.index("--from") + 1], "showrunner-timer-" + owner.name)
                 prompt = arguments[arguments.index("--text") + 1:]
                 delivered = "\n".join(prompt)
                 self.assertIn("--production " + owner.name, delivered)
-                self.assertIn("every 2 minutes", delivered)
+                self.assertIn("every 7 minutes" if change == "document" else "every 2 minutes", delivered)
                 self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
                 self.assertEqual(self.conf()["PROMPT"], "scheduled")
                 self.assertNotIn("PROMPT_FILE", self.conf())
+                self.assertNotIn("FROM", self.conf())
                 self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
         retained = staff.by_id(owner.id)
         assert retained is not None
@@ -138,14 +142,13 @@ finally:
         pending.mkdir()
         launched = self.root / "drain.argv"
         launcher = self.launcher_dir / "systemd-run"
-        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
-            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        _ = launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(launched))}\n')
         config = self.root / "selected.conf"
         with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
                                          "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
             _ = self.successful("tick")
             _ = self.successful("tick")
-        arguments = cast(list[str], json.loads(launched.read_text()))
+        arguments = launched.read_text().splitlines()
         self.assertIn("--no-block", arguments)
         self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
         self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
@@ -166,18 +169,32 @@ finally:
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
         owned = OwnedTestProcesses()
         command = ["zsh", str(SCRIPT), *args]
+        environment = self.owned.environment({
+            **os.environ,
+            "NOTIFIER_STATE_DIR": str(self.state_dir),
+            "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
+            "NOTIFIER_SEND": str(self.fake_send),
+            "NOTIFIER_NOW_EPOCH": str(now),
+            "FAKE_SEND_ARGS": str(self.send_args),
+            "FAKE_SEND_RC": str(send_rc),
+            "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
+        })
+        if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
+            config = environment.get("USER_ZONE_CONF") or str(
+                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
+            if not Path(config).is_absolute():
+                config = str(Path.cwd() / config)
+            try:
+                with mock.patch.object(user_zone, "CONF", config):
+                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+            except Exception:
+                # The shell ignores helper failures and uses the machine zone.
+                environment["SHOWN_ZONE"] = ""
+            else:
+                environment["SHOWN_ZONE"] = zone.stdout.rstrip("\n") if zone.returncode == 0 else ""
         child = subprocess.Popen(
             command,
-            env=self.owned.environment({
-                **os.environ,
-                "NOTIFIER_STATE_DIR": str(self.state_dir),
-                "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
-                "NOTIFIER_SEND": str(self.fake_send),
-                "NOTIFIER_NOW_EPOCH": str(now),
-                "FAKE_SEND_ARGS": str(self.send_args),
-                "FAKE_SEND_RC": str(send_rc),
-                "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
-            }),
+            env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         owned.track(child, group=True)
@@ -321,6 +338,7 @@ finally:
         _ = self.successful("tick", now=MINUTE + 180)
         self.assertEqual(len(self.lines()), 1)
 
+    @process_boundary
     def test_aligned_schedule_lands_on_the_clock(self) -> None:
         def at(zone: str, hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 5, hour, minute, 30, tzinfo=ZoneInfo(zone)).timestamp())
@@ -376,6 +394,7 @@ finally:
         _ = self.successful("tick", now=NOW + 600)
         self.assertEqual(self.state()["PAUSED"], "1")
 
+    @process_boundary
     def test_due_tick_send_arguments_and_log_format(self) -> None:
         _ = self.new("--from", "sender", "--timeout", "7")
         _ = self.successful("tick", now=MINUTE + 120)
@@ -390,26 +409,97 @@ finally:
 
     def test_scheduled_prompt_fire_ignores_schedule_and_hold(self) -> None:
         owner = self.scheduled_owner()[0]
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
                             "--prompt", "scheduled", "--hold")
-        _ = self.successful("fire", "example")
+        configuration = self.state_dir / "example" / "conf"
+        with configuration.open("a") as output:
+            _ = output.write("FROM=showrunner-timer-old-name\n")
+        before = configuration.read_bytes()
+        scripts = self.root / "scripts"
+        (scripts / "message").mkdir(parents=True)
+        (scripts / "lib").mkdir()
+        notifier = scripts / "message/notifier.sh"
+        _ = notifier.write_text(SCRIPT.read_text())
+        calls = self.root / "delivery.calls"
+        python = scripts / "lib/py"
+        source = SCRIPT.parents[1]
+        _ = python.write_text(
+            "#!/bin/sh\n"
+            + 'case "$1" in */production/update_registration.py) '
+            + f'printf "%s\\n" "$2" >> {shlex.quote(str(calls))} ;; esac\n'
+            + f'script=${{1#{shlex.quote(str(scripts))}/}}\nshift\n'
+            + f'exec {shlex.quote(str(source / "lib/py"))} {shlex.quote(str(source))}/"$script" "$@"\n'
+        )
+        python.chmod(0o755)
+        with mock.patch(__name__ + ".SCRIPT", notifier):
+            _ = self.successful("fire", "example")
+        self.assertEqual(calls.read_text().splitlines(), ["delivery"])
         arguments = self.send_args.read_text().splitlines()
         self.assertIn("--text", arguments)
+        self.assertEqual(arguments[arguments.index("--from") + 1], "showrunner-timer-" + owner.name)
         self.assertIn("--production " + owner.name, "\n".join(arguments[arguments.index("--text") + 1:]))
+        self.assertEqual("\n".join(arguments[arguments.index("--text") + 1:]),
+                         scheduled_prompt(2, read_production(owner.id)))
         self.assertEqual(self.state()["NEXT_DUE"], str(MINUTE + 120))
-        _ = self.successful("fire", "example", now=NOW + 1)
+        with mock.patch(__name__ + ".SCRIPT", notifier):
+            _ = self.successful("fire", "example", now=NOW + 1)
+        self.assertEqual(calls.read_text().splitlines(), ["delivery", "delivery"])
         self.assertEqual(len([line for line in self.lines() if " | exit 0 | " in line]), 2)
+        self.assertEqual(configuration.read_bytes(), before)
 
     def test_failed_scheduled_prompt_skips_delivery_with_one_error_line(self) -> None:
         owner, doc = self.scheduled_owner()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         _ = self.successful("new", "example", "--to", "session:" + owner.id, "--every", "2",
                             "--prompt", "scheduled")
+        document = doc.read_bytes()
         doc.unlink()
         result = self.run_cli("tick", now=MINUTE + 120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
         self.assertIn("prompt", result.stderr)
         self.assertFalse(self.send_args.exists())
+        _ = doc.write_bytes(document)
+        scripts = self.root / "scripts"
+        (scripts / "message").mkdir(parents=True)
+        (scripts / "production").mkdir()
+        (scripts / "lib").mkdir()
+        notifier = scripts / "message/notifier.sh"
+        _ = notifier.write_text(SCRIPT.read_text())
+        source = SCRIPT.parents[1]
+        _ = shutil.copyfile(source / "production/update_registration.py", scripts / "production/update_registration.py")
+        (scripts / "message/sessions.py").symlink_to(source / "message/sessions.py")
+        template = self.root / "commands/showrunner/produce.md"
+        template.parent.mkdir(parents=True)
+        _ = template.write_text("The prompt:\n\n> \n>\n\n**A tick**\n")
+        copy_runtime(self.root)
+        python = scripts / "lib/py"
+        wrapper = ("#!/bin/sh\n"
+                   + f'exec {shlex.quote(str(source / "lib/py"))} "$@"\n')
+        _ = python.write_text(wrapper)
+        python.chmod(0o755)
+        for defect in ("empty template", "missing separator", "empty framed prompt", "old command"):
+            with self.subTest(defect=defect):
+                self.send_args.unlink(missing_ok=True)
+                if defect != "empty template":
+                    output = "showrunner-timer-demo" + ("\n\n" if defect == "empty framed prompt" else "")
+                    response = ("printf '%s\\n' 'invalid choice: delivery' >&2; exit 2" if defect == "old command"
+                                else f"printf '%s' {shlex.quote(output)}; exit 0")
+                    _ = python.write_text(
+                        "#!/bin/sh\n"
+                        + 'case "$1" in */production/update_registration.py) '
+                        + response + " ;; esac\n"
+                        + wrapper.removeprefix("#!/bin/sh\n")
+                    )
+                with mock.patch(__name__ + ".SCRIPT", notifier):
+                    result = self.run_cli("fire", "example")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn("prompt", result.stderr)
+                self.assertFalse(self.send_args.exists())
+                if defect == "old command":
+                    self.assertIn("invalid choice: delivery", result.stderr)
 
     def test_check_exit_one_skips_and_exit_two_removes(self) -> None:
         _ = self.new("--check", "/bin/sh -c 'exit 1'")
@@ -638,46 +728,35 @@ finally:
         """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
         launcher = self.launcher_dir / "launchctl"
         _ = launcher.write_text(
-            """#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import time
-
-state = Path(os.environ["FAKE_LAUNCHCTL_STATE"])
-action = sys.argv[1]
-if action == "submit":
-    label = sys.argv[sys.argv.index("-l") + 1]
-    (state / "submitted").write_text(label)
-    (state / f"{label}.command").write_text(json.dumps(sys.argv[sys.argv.index("--") + 1:]))
-elif action == "kickstart":
-    target = sys.argv[2]
-    (state / "kickstarted").write_text(target)
-    kickstart_rc = int(os.environ["FAKE_LAUNCHCTL_KICKSTART_RC"])
-    if kickstart_rc:
-        sys.exit(kickstart_rc)
-    label = target.split("/", 2)[2]
-    command = json.loads((state / f"{label}.command").read_text())
-    job = subprocess.Popen(
-        [sys.executable, __file__, "loop", label, *command],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True,
-    )
-    (state / "pid.tmp").write_text(str(job.pid))
-    os.replace(state / "pid.tmp", state / "pid")
-elif action == "loop":
-    label = sys.argv[2]
-    removed = state / f"{label}.removed"
-    while not removed.exists():
-        subprocess.run(sys.argv[3:], check=False)
-        time.sleep(0.05)
-elif action == "remove":
-    label = sys.argv[2]
-    fire_log = Path(os.environ["FAKE_LAUNCHCTL_FIRE"])
-    result = "after-fire" if fire_log.exists() and "run exit 7" in fire_log.read_text() else "before-fire"
-    (state / f"{label}.removed").write_text(result)
+            """#!/usr/bin/env -S zsh -f
+zmodload -F zsh/files b:zf_mv
+zmodload zsh/zselect
+state=$FAKE_LAUNCHCTL_STATE
+case $1 in
+  submit)
+    label=${@[${@[(i)-l]}+1]}
+    print -rn -- $label > $state/submitted
+    print -r -- ${(qq)@[${@[(i)--]}+1,-1]} > $state/$label.command ;;
+  kickstart)
+    print -rn -- $2 > $state/kickstarted
+    (( FAKE_LAUNCHCTL_KICKSTART_RC )) && exit $FAKE_LAUNCHCTL_KICKSTART_RC
+    label=${2#*/*/}
+    command=(${(Q)${(z)"$(<$state/$label.command)"}})
+    # zsh cannot start a job group without a terminal; /bin/sh set -m can on Linux and macOS.
+    /bin/sh -c 'set -m; "$@" </dev/null >/dev/null 2>&1 & echo $!' sh $0 loop $label $command > $state/pid.tmp
+    zf_mv $state/pid.tmp $state/pid ;;
+  loop)
+    label=$2
+    shift 2
+    while [[ ! -e $state/$label.removed ]]; do
+      "$@"
+      zselect -t 5
+    done ;;
+  remove)
+    result=before-fire
+    [[ -e $FAKE_LAUNCHCTL_FIRE && "$(<$FAKE_LAUNCHCTL_FIRE)" == *"run exit 7"* ]] && result=after-fire
+    print -rn -- $result > $state/$2.removed ;;
+esac
 """
         )
         launcher.chmod(0o755)

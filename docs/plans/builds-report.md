@@ -491,7 +491,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 
 #### As-built
 
-- `offload.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
+- `eligibility.repository_identity` reads `repository.repository_key(str(source.parent))`: the normalized origin URL, else `git-root:<root commit>`, else `store.UNKNOWN_IDENTITY`, which maps to `KnownRepository(name)` with no key. A lookup runs 1 git process in place of 3. Keys are unchanged; offload CPU per lookup drops by about 75 ms.
 - `persist_attempt` writes `repository.key`, else `store.UNKNOWN_IDENTITY`. A keyless repository no longer writes an empty `repo_identity` that `index.py` reads as a real identity.
 - `memory_admit.git_identity` reads the same function and keeps only its name and legacy-name rules, so one place holds the key rule. `git_output` is gone.
 - `offload.py` imports `record` and `store` at module top; it calls no `memory_admit` function.
@@ -1068,48 +1068,369 @@ The build log index uses WAL mode, so a spilled update takes no exclusive lock a
 - `scripts/buildlog/report.py` — the `disk_section` closing line.
 - `scripts/buildlog/test_disk.py`, `scripts/buildlog/test_report.py` — refresh, quiet-hour, old-snapshot, gone-path and report-line cases.
 
-### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: todo
+### Phase 53 — Floor alerts keep folder choices with a daily disk walk · status: done
 
-Found by the Phase 52 reviews (finding F001, routed here).
+From the user (via the builds showrunner), 2026-11-12: "approve. Question: allow a 28-hour-old folder snapshot for the disk floor alert (sweep_snapshot_max_age_seconds 900 -> 100800)."
 
-**Pending decision: raise `sweep_snapshot_max_age_seconds` from 900 to 100800**
+#### As-built
 
-Actual problem:
-`scripts/lint/sweep.py` `folder_choices` (line 3316) offers folders in a floor-crossing alert only when the last folder walk is under `sweep_snapshot_max_age_seconds` old. After Phase 52 the walk runs once a day, so the alert almost never offers folders, and `disk_measurement_lines` (line 3150) marks the measurement "stale".
-
-What exists now:
-- `config/lint.conf`: `sweep_snapshot_max_age_seconds=900`.
-- `buildlog disk` walks once a day in the 03:00 hour (user's zone) and refreshes only free and used space at other times.
-- Two walks can be more than 25 hours apart: on the day clocks go back, 03:08 EDT to 03:10 EST the next day is 90,120 seconds, and a walk takes about 8 minutes.
-
-What should change:
-- Raise the value to 100800 (28 hours) through `/tune`. Then "stale" means a missed daily walk, with room for the clock change, timer drift and the walk time.
-
-Recommendation:
-Raise it to 100800. A changed config value needs the user's go. Sent to the builds showrunner 2026-11-12.
-
-#### Work Order
-
-**Goal:** A floor-crossing alert offers folder choices from the last daily disk walk, and calls the measurement stale only when a daily walk was missed.
-
-**Spec:**
-- `config/lint.conf`: set `sweep_snapshot_max_age_seconds` to the approved value through `/tune`. Update its Basis line: the disk walk runs once a day (Phase 52), and the value covers a 25-hour day plus timer drift and the walk time.
-- Folder freshness stays on `measured_at` (the walk time). `capacity_measured_at` does not make folder sizes fresh. No code change in `sweep.py` is expected.
-- `docs/as-built/build-followups.md` **Measuring** paragraph: say that `snapshot()` walks only when no full previous snapshot exists, or when the last walk is at least `DISK_WALK_MINUTES` old and the hour is `DISK_WALK_HOUR` (user's zone). Other runs refresh free and used space only and set `capacity_measured_at`. Add the two-time report line beside the one-time example.
-- Add rows to the existing tests in `scripts/lint/test_sweep.py` (do not add a new test):
-  - in `test_unavailable_crossing_measurement_names_no_folder`'s neighbor that checks offered choices: a measurement 26 hours old under the approved limit offers its folders;
-  - a measurement older than the limit offers none and says "stale".
+- `/tune` set `sweep_snapshot_max_age_seconds=100800` on main (d83275f72). Two daily walks can be 90,120 seconds apart on the day clocks go back; the limit adds timer drift and the walk time.
+- `folder_choices` and `disk_measurement_lines` read the limit at use, so no code changed. Folder freshness uses `measured_at`; `capacity_measured_at` does not make folder sizes fresh.
+- `config/lint.conf`: the comment above the value states the daily walk.
+- `docs/as-built/build-followups.md` **Measuring**: the walk rule (no full snapshot, or `DISK_WALK_MINUTES` old in the `DISK_WALK_HOUR` hour, or a newer walk request) and the two-time report line.
 
 **Files:**
-- `config/lint.conf`
-- `scripts/lint/test_sweep.py`
-- `docs/as-built/build-followups.md`
+- `config/lint.conf` — the comment.
+- `scripts/lint/test_sweep.py` — `test_crossing_session_keeps_trash_and_scratch_effects` rows with their own 100800 limit: a 26-hour-old walk offers its folders; an older one offers none and says "stale".
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
 
-**Workers:** `1 writer`
-- writer: the config value and the sweep test rows.
+### Phase 54 — The tmp sweep judges each entry of a kept run's tmp/ · status: done
 
-**State:** none.
+From builds (not the user), 2026-11-12: go on this phase; `tmp_sweep.py` is resources' file, and the builds showrunner gave the go for this unit to write the fix.
 
-**Acceptance gate:**
-- `scripts.lint.test_sweep` passes, with the two new rows.
-- `basedpyright` reports 0 errors and 0 warnings on `scripts/lint/test_sweep.py`.
+#### As-built
+
+- `tmp_sweep.judge_entries`: a run keep reason from `run_folder_guards` keeps the run folder and its `tmp/` folder. It no longer keeps the entries inside `tmp/`.
+- Each run `tmp/` entry goes by the 4 h rule, process use (`IN_USE`), `WORKER_USES` and the git check.
+- `RunKeepReason.UNREADABLE_RECORD` and an unreadable session registry (`NO_SESSIONS`) still keep run `tmp/` entries.
+- The module docstring states the rule once.
+- Cause: killed test runs left temp folders in run `tmp/` folders (verify.sh's TMPDIR). On 2026-11-12 the sweep kept 925 such entries in one run; the dry run after the fix selects 55,100 across all runs.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, the module docstring.
+- `scripts/lint/test_tmp_sweep.py` — `assert_run_tmp_entries` covers `DIRECTOR`, `OPEN_RUN` and `SESSION_WORKTREE` runs.
+
+### Phase 55 — A large unnamed disk fall starts one folder walk · status: done
+
+From builds (not the user), 2026-11-12: put the 2 h limit and the fall size in config as new keys; start the walk only on an unnamed fall beyond cache growth.
+
+Problem: after Phase 52 the folder walk runs once a day, so the 15:23 EST floor alert on 2026-11-12 could not name a 13.9 GiB fall.
+
+#### As-built
+
+- New keys in `config/lint.conf`: `sweep_walk_request_fall_bytes=10737418240` and `sweep_walk_request_interval_seconds=7200`.
+- `store.py`: `DISK_WALK_REQUEST_NAME`, the `DiskWalkRequest` TypedDict (`requested_at`, `alert_at`, `unnamed_bytes`), `DiskWalkRequestState` (`ABSENT`, `UNREADABLE`), `read_disk_walk_request` and an atomic `write_disk_walk_request`.
+- `sweep.py` `unnamed_disk_fall` holds the fall arithmetic that `disk_measurement_lines` also uses.
+- The natedev floor pass writes a request when all of these are true:
+  - the previous floor record is recent, with the same build holds and filesystem (the checks the growth alert uses, computed once);
+  - no request file exists;
+  - the unnamed fall is over `sweep_walk_request_fall_bytes`;
+  - the last walk is at least `sweep_walk_request_interval_seconds` old.
+- `disk.py` `snapshot()` walks when the request's `requested_at` is later than the previous `measured_at`. The 03:00 daily walk stays.
+- `finish_disk_walk_request` sends "Folder walk for the <alert_at> fall:" with the growth lines through `send_floor_alert`. It deletes the request only after the send is accepted. It runs only on a natedev root-scope sweep.
+- An unreadable request file prints one stderr line and blocks a new request.
+- Review: F001 (blocker) — a changed build hold could request a walk with no free-space change; fixed by the shared checks above.
+
+**Files:**
+- `config/lint.conf` — the two keys.
+- `scripts/buildlog/store.py` — the request file types and I/O.
+- `scripts/buildlog/disk.py` — the request walk.
+- `scripts/lint/sweep.py` — `unnamed_disk_fall`, the request gate, `finish_disk_walk_request`.
+- `scripts/buildlog/test_disk.py`, `scripts/lint/test_sweep.py` — request, no-request and follow-up rows.
+- `docs/as-built/build-followups.md` — the Measuring paragraph.
+
+### Phase 56 — Old buildlog indexes go by change time only · status: done
+
+From builds (not the user), 2026-11-12: prune indexes by mtime only; go now, ahead of Phase 55.
+
+#### As-built
+
+- `cleanup_unused_indexes` compares `st_mtime` alone with the `INDEX_UNUSED_DAYS` cutoff. It does not read `st_atime`.
+- Cause: `complete_gate_index_in` reads every index and refreshes its atime, so the old `max(atime, mtime)` test kept every index (37 GiB held on 2026-11-12).
+- `update_in` sets an index mtime at least each `INDEX_TOUCH_MINUTES`, so an index that a tree updates stays.
+- `config/buildlog.conf` keeps `INDEX_UNUSED_DAYS=2`; its Basis states the mtime rule.
+
+**Files:**
+- `scripts/buildlog/index.py` — `cleanup_unused_indexes`.
+- `scripts/buildlog/test_index.py` — an old mtime with a fresh atime goes; a fresh mtime stays.
+- `config/buildlog.conf` — the `INDEX_UNUSED_DAYS` Basis.
+
+### Phase 57 — Floor alerts name the owner of a worker's detached run · status: done
+
+From builds (not the user), 2026-11-12: the floor alert said "no session found" for 15 of 17 live `verify.sh` pids; fix the lookup so the alert names each owner.
+
+#### As-built
+
+- Cause: a worker's `verify.sh` runs under `detached_runs.py supervise <record>`, whose parent is `systemd --user`, so no ancestor is a Claude session.
+- `sweep.holder_sessions`: when `process_table.nearest_named` finds no session, the nearest `detached_runs.py supervise` ancestor gives the record path.
+- The record names an owner only when its `pid` is that supervisor and its `status` is `running`. Its `staff_id` gives the worker; the worker's `parent_of` name is the owner. The holder message goes to that director.
+- A missing or unreadable record, staff row or parent leaves the pid unnamed. Each record and the staff snapshot are read once per call.
+- Live check, 2026-11-12 19:40 EST: the new lookup named 113 of 113 `verify.sh` pids; main named 17 of 115.
+
+**Files:**
+- `scripts/lint/sweep.py` — `holder_sessions`.
+- `scripts/lint/test_sweep.py` — rows in `test_a_pid_belongs_to_its_nearest_named_session`: owner, wrong pid, missing worker, missing parent, finished run, missing record, invalid JSON.
+
+### Phase 58 — The tmp sweep judges closed phase folders of a run that is not open · status: done
+
+From builds (not the user), 2026-11-12: "TOP PRIORITY. … The user approved deleting folders of finished runs in /tmp/claude/unit (open runs stay). … Fix tmp_sweep where it lives: a closed phase folder whose run has ended is a candidate, with the normal process and unsaved-git checks. Then run --plan and --apply with the fix."
+
+#### As-built
+
+- Cause: `run_folder_guards` kept a whole run folder for `SESSION_WORKTREE` or `DIRECTOR`, so every `phases/<id>/` folder of a finished run stayed while its director session lived.
+- `tmp_sweep.judge_entries`: a run kept only by `SESSION_WORKTREE` or `DIRECTOR` adds its `phases/` folder (not a link) to the judged parents. The `phases/` folder itself stays.
+- Open phase ids from `recorder_state.read_open_phase_ids`, mapped through `phase_reservation.phase_directory_name` (`ad hoc` is `adhoc`), keep their folders with the reason "its phase is open". An unreadable recorder state keeps every phase folder of that run.
+- `OPEN_RUN`, `UNREADABLE_RECORD`, an unreadable session registry and `UNENDED_WORKER` keep every phase folder. `run_folder_guards` no longer lets `SESSION_WORKTREE` replace `UNENDED_WORKER`.
+- Other phase folders use the run `tmp/` rules: the 4-hour idle rule, `IN_USE`, `WORKER_USES` and the git check.
+- `ClosedPhaseEntry` carries `CleanupEndReason.CLOSED_PHASE` into `--plan` and `--apply`. Removal checks again that the parent is a real folder at the judged root; otherwise the entry stays with "its phases parent changed".
+- Director ruling on review finding F003: the window between the parent recheck and `rmtree` stays. Every other sweep removal has the same window; a file-descriptor delete for all removals is a separate change.
+- Live run, 2026-11-12 20:18 EST: `--apply` deleted 641 closed phase folders, 5.5 GiB. Most of the 35 GiB in the first plan was gone before apply.
+
+**Files:**
+- `scripts/lint/tmp_sweep.py` — `judge_entries`, `run_folder_guards`, `ClosedPhaseEntry`, `CleanupEndReason.CLOSED_PHASE`, `remove_entry`.
+- `scripts/lint/test_tmp_sweep.py` — rows in `assert_run_tmp_entries`, `OwnerTests`, `RunFolderTests` and `PaneRunTests`: both eligible guards, open and older open phases, `ad hoc`, fresh and used folders, unreadable state, an unended worker with a live worktree, a replaced parent, and `--plan`/`--apply`.
+
+### Phase 59 — The disk walk measures ~/.local/state · status: done
+
+From builds (not the user), 2026-11-12: the GPU size trial wrote 49 GiB under `~/.local/state/gpu-size-trial` in 90 min, and neither the disk walk nor the floor alert saw it; measure the large writers under `~/.local/state` too.
+
+#### As-built
+
+- `disk.FOLDERS` includes `~/.local/state`. Its walk rows (levels 0 to 3, cargo targets excluded) and growth total reach `read_disk_measurement` and the floor alert with no other change.
+- Measured 2026-11-12 20:25 EST: `~/.local/state` held 92 GiB in about 291,000 files; `gpu-size-trial` 45 GiB, `buildlog` 27 GiB, `nightly-review` 11 GiB.
+- The checkpoint also carries the package import block for `scripts/aws_target/gpu_size_trial.py`, which bootstrap added after the builds merge.
+
+**Files:**
+- `scripts/buildlog/disk.py` — `FOLDERS`.
+- `scripts/buildlog/test_disk.py` — `test_outside_directories_compare_previous_snapshot_and_count_new_directory` runs for `/tmp` and the configured `~/.local/state` root, with folder bytes, growth and totals.
+
+### Phase 60 — The build memory page colors remote memory and machines, adds a done column, and hides a waiting hana CI row · status: done
+
+**Reverted 2026-11-13, landed again in phase 62.** From builds (not the user): at 02:02 EST the live admission service sent the new `WaitingServiceJob` and `UnmatchedServiceJob` job states. Admission clients on older code (hana CI runners pinned at claude-commands `7fdfd9a6a`, and verify.sh clients started before 02:02) refused the snapshot as "invalid snapshot variant" and stopped their steps. The revert removes all phase 60 code and its config keys. Phase 61 fixes the wire format; phase 62 lands phase 60 again on top of it. The as-built below holds again, with the job state change in phase 62.
+
+From builds (not the user), 2026-11-12 23:00 EST, relaying two user items on C1507 and the hana CI row. From the user (via the showrunner): give memory that does not count against natedev its own bar color; put the Mac note last and unwrapped; add a % done column right after Stage; color each machine name; and "hana ci still shows as a row when ci isn't running". Colors come from config, not code.
+
+#### As-built
+
+- `config/memory_feed.conf` holds eight colors as six hex digits: `remote_memory_light`/`_dark` and `machine_{natedev,mac,aws}_light`/`_dark`. `memory_feed.FeedConfiguration.colors` reads them once and checks each value; `memory.json` carries them as `colors` (`PageColors`, by theme).
+- `memory_live.html` draws a Mac or AWS used bar in the remote color, colors the Machine text by machine, and shows a Done column after Stage in the Running and Waiting tables (`—` without a percent). The "N% done" text under the bar is gone, and the Mac note is the last tooltip line, on one line.
+- `scope_activity.py` adds `WaitingServiceJob` and `UnmatchedServiceJob`; `ServiceJobState` is the closed union. `memory_admit.service_job_state` matches each `Runner.Worker` process tree against reservation pids (Running), then waiter pid and start time (Waiting), else Unmatched. `memory_admit.py` and `admission_service.py` both classify through it; `admission_records.py` and `queue_evidence.py` read every state.
+- `build_ci_row` sets `admitted` only for `RunningServiceJob`, so a hana CI row shows in Running only for a matched reservation. A waiting job stays in the Waiting table. CI amounts, `duplicate_use`, the taken total and the cap do not change.
+- Text colors exceed 5.55:1 contrast in light and 7.79:1 in dark. `memory_page_proof.mjs` saves before and after screenshots of the three user-shot elements in both themes and keeps the after-page table, note list, layout and tooltip checks.
+
+**Files:**
+- `config/memory_feed.conf`, `config/README.md` — the eight color keys.
+- `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs` — colors, Done column, note position, CI row.
+- `scripts/build_queue/scope_activity.py`, `admission_records.py`, `admission_service.py`, `queue_evidence.py`; `scripts/lint/memory_admit.py` — service job states and `service_job_state`.
+- `scripts/build_queue/test_memory_feed.py`, `test_memory_hover.py`, `test_admission_service.py`; `scripts/lint/test_memory_admit.py` — rows for colors from config, the Done column, the note position, and waiting, unmatched and running CI workers.
+
+### Phase 61 — Older admission clients parse a newer service snapshot · status: done
+
+From builds (not the user), 2026-11-13: after phase 60 went live at 02:02 EST, admission clients on older code refused the snapshot with "invalid snapshot variant" and stopped about a dozen waiting steps and three hana CI jobs (runners pinned at claude-commands `7fdfd9a6a`). From queue (not the user): keep the old wire shape, add one new optional field per record, add no value to an existing enum on the wire, and keep every used field strict.
+
+#### As-built
+
+- `admission_records.UnownedSliceMemory.job_state` keeps its three old variants. A new keyword-only `service_job_state` field defaults to `ServiceJobStateNotRecorded`; phase 62 puts the waiting and unmatched states there. The old codec ignores the extra key.
+- `snapshot_codec.SnapshotReadPolicy` (`ALL_FIELDS`, `ACQUISITION_FIELDS`) is set by the `snapshot_read_policy` context manager. Under `ACQUISITION_FIELDS`, fields with `acquisition_unused` metadata and a default are not decoded, so an unknown variant there does not stop the client. All other readers keep `ALL_FIELDS`.
+- `admission_client` parses each reply under `ACQUISITION_FIELDS`. Decisions, reasons, amounts and reply types stay strict and refuse an unknown value with the named error.
+
+**Files:**
+- `scripts/build_queue/admission_records.py`, `snapshot_codec.py`, `admission_client.py` — the optional field, the read policy and its use.
+- `scripts/build_queue/test_snapshot_codec.py` — `test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` loads the codec and records from `7fdfd9a6a` with `git show`; rows for unused-field defaults and used-field refusal.
+- `scripts/build_queue/test_admission_client.py` — unknown unused variants keep the wait, an unknown used variant keeps the named error, and the silent-queue deadline does not change.
+
+### Phase 62 — The build memory page work from phase 60 lands again on the phase 61 wire format · status: done
+
+From builds (not the user), 2026-11-13: land phase 60 again on top of phase 61, with a test that the client at `7fdfd9a6a` parses the new service snapshot.
+
+#### As-built
+
+- The phase 60 as-built above applies again, with one change: `WaitingServiceJob` and `UnmatchedServiceJob` go only in `UnownedSliceMemory.service_job_state`, beside `ServiceJobStateNotRecorded`.
+- `job_state` keeps `RunningServiceJob`, `IdleService` and `NotServiceSlice`. A waiting or unmatched worker keeps the `job_state` value the code before phase 60 wrote, so older clients see no change.
+- `build_ci_row`, `queue_evidence` and `admission_service` read `service_job_state`. The hana CI row shows in Running only for a worker matched to a reservation.
+- `test_snapshot_codec.test_pinned_client_schema_ignores_new_service_states_in_the_optional_field` encodes real waiting and unmatched states and parses them with the codec and records from `7fdfd9a6a` (`git show`). The review checked 18 service-state combinations against the pinned code.
+
+**Files:** the 14 phase 60 files, plus `scripts/build_queue/test_snapshot_codec.py`.
+
+### Phase 63 — The disk floor alert compares build caches over the same folders · status: done
+
+From builds (not the user), 2026-11-13: the 02:05 EST sweep said "build caches shrank 151.6 GiB" while free space fell 0.9 GiB. The cache total must count the same folders before and after each sweep.
+
+#### As-built
+
+- Cause: the old `scripts/lint/sweep.py` subtracted two cache totals without matching folder paths. A folder that left the list counted as shrinkage.
+- `cache_folder_growth` compares only folders in both readings (`common_cache_bytes`). A folder in only one reading adds no growth and no shrinkage. A record from before phase 63 gives no growth.
+- `MeasuredCacheFolders` keeps one total per folder and a `SharedCacheInode` only for an inode in two or more folders. `CacheFoldersNotMeasured` marks a reading with no folder sizes.
+- `CacheFolderWalk` holds a map in memory from each inode to the first folder that saw it. A second folder registers both as owners, whatever `st_nlink` says. So a link made or removed during the walk counts once. The map is not saved, and it carries across the protected and CI measurements of one sweep.
+- On 37 real folders the saved snapshot is 3,255 bytes and process peak memory is 203.0 MiB.
+- Tests in `test_sweep.py` cover a folder that leaves or joins the list, a real shrink, a shared inode, a link removed or made between folders, the next stable sweep, protected and CI folders, and many private files with no saved identity.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`.
+
+### Phase 64 — A slow admission answer under load does not fail a lint run · status: done
+
+From builds (not the user), 2026-11-13: verify.sh lint and hana test runs exited 2 with "admission service unavailable: no answer in 0.5 s" while the service was alive and slow under load. A live service that answers slowly must not fail a run.
+
+#### As-built
+
+- Cause: the placement requests used `_query`, which gives up after one `query_timeout_seconds` answer. Queue phase 44 (`e825b83e2`) added the lint and hana calls that failed. Builds reverted phases 44 and 44c as `9aa7fa219`; phase 64 is built on that tree.
+- `request_placement`, `claim_failure`, `consume_permission` and `report_execution` in `admission_client.py` now go through the shared `_call`/`_acquire` wait. The shared unreachable deadline bounds silence and repeated connection resets.
+- A missing socket or a refused connection still fails at once with the same message.
+- `view`, `explain` and `mine` keep the one-answer limit. They are diagnostics.
+- On `9aa7fa219` no caller in `verify.sh` or `offload.py` reaches the four requests. Queue lands phase 44 again with its calls on this wait.
+- Two tests in `test_admission_client.py` cover 28 cases: slow replies, both dead-service errors, and silence and resets stopping at 3 s and 60 s. The `7fdfd9a6a` pinned client test stays green.
+
+**Files:** `scripts/build_queue/admission_client.py`, `scripts/build_queue/test_admission_client.py`.
+
+### Phase 65 — The build page titles the waiting section by its order · status: done
+
+From builds (not the user), 2026-11-13, a user ask with the shot `/tmp/claude/scratch/user-shot-queued-title.png`: a hairline after the Next step room row, and a title for the waiting section that names its order.
+
+#### As-built
+
+- The Next step room row keeps its place. A 1px hairline after it matches the one before it.
+- The waiting section has a title in the style of "Running, in start order":
+  - "Queued, in order of submission" with no bump.
+  - "Queued, <unit> first, then in submission order" for one bumped unit.
+  - "Queued, <unit> followed by <unit> and then in submission order" for more than one.
+- `memory_feed.py` sends `queued_priority_units`. It reads the queue's own `QueuePriority.entries` (written by `build_queue.py` bump) and the captured waiting order. It does not sort the queue. It drops absent units and duplicates.
+- Tests in `test_memory_feed.py` and `test_memory_hover.py` cover zero, one and two units, removed priorities, source order and escaped text. `memory_page_proof.mjs` checks 18 title cases at three widths in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `memory_feed.py`, `test_memory_feed.py`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 67 — The Queued title shares the waiting header row · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-queued-title-space.png`: "eliminate the vertical space under the title - it should be the font it is but it can align bottom with the column headers".
+
+#### As-built
+
+- The phase 65 title sits on the waiting header row, bottom-aligned with the column headers. It keeps its `.section-head` font.
+- The empty title row and its height code are gone. The Next step room row and its hairline do not move.
+- A long title ends in an ellipsis before the header columns and shows its full text on hover. The stacked phone layout does not change.
+- `test_memory_hover.py` checks that the header row follows the room row. `memory_page_proof.mjs` checks bottom alignment and no overlap at 1400, 900 and 390 px in both themes.
+
+**Files:** `scripts/build_queue/memory_live.html`, `test_memory_hover.py`, `memory_page_proof.mjs`.
+
+### Phase 66 — Retire /build:queue · status: todo
+
+From builds (not the user), 2026-11-13, moved from queue 44z (user ask C1474): retire `/build:queue`. Remove the skill (`commands/build/queue.md` and its plugin entry), the terminal view code (`queue_card.py` and the terminal-only parts of `queue_view.py` and `build_queue.py`), and their tests. Keep everything the build page and `memory_feed.py` use. Start after the queue 44 re-land is on builds, because 44 changes `queue_card.py`. A deletion landing needs the full tests-only gate.
+
+### Phase 68 — The build page joins the admin console as Builds · status: done
+
+From builds (not the user), 2026-11-13: the user wants one admin console with a collapsible left navigation: Changes and Builds. sdlc's admin-console unit builds the console and adds the builds block to `config/console.conf`.
+
+#### As-built
+
+- The page title and heading read "Builds". `/build:page` uses the same name.
+- `memory_feed.page_url() -> str` returns the page URL. `page_link` prints it. A missing page raises `FileNotFoundError`, a `review_link.SNAPSHOT_ERRORS` member, with no publication.
+- The page allows same-origin framing and draws no site navigation. Links that leave the page use `target=_top`.
+- `test_memory_feed.py` checks the URL, the missing-page error and the unchanged published bytes. `test_memory_hover.py` and `memory_page_proof.mjs` check the title and the framed console view.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `test_memory_feed.py`, `test_memory_hover.py`; `commands/build/page.md`.
+
+### Phase 69 — A Mac build in a hand-made clone takes its repository's one claim · status: done
+
+From builds (not the user), 2026-11-13, shot `/tmp/claude/scratch/user-shot-mac-unit-dash.png`: the Mac row "hana build" showed Unit "—". Its build ran in a hand-made clone outside the claim worktree and every copies mirror. The claim also recorded `remote_host` as `natemccoy@mac`.
+
+#### As-built
+
+- The Mac reading marks each build with `MacBuildOrigin`: `CI` when a `Runner.Worker` or `Runner.Listener` process is an ancestor, else `NON_CI`. A saved record without the field reads `UNKNOWN`.
+- `memory_feed.mac_build_units` gives a `NON_CI` build with no session and no worktree or mirror match the unit of its repository's one Mac claim. A build with another session, two claims for one repository, or a `CI` or `UNKNOWN` origin takes no unit from this rule.
+- A claim whose host part after any `user@` is `mac` counts as a Mac claim.
+- Tests cover the ancestor walk, the record round trip and each match rule. A fixture proof shows the Unit cell "—" before and "research" after.
+
+**Files:** `scripts/build_queue/memory_feed.py`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`.
+
+### Phase 70 — Cloud step names carry their unit · status: done
+
+From the user (via builds), 2026-11-13, shot `/tmp/claude/scratch/user-shot-aws-step-names.png`: a targeted test should read "<unit> targeted", and a merge gate "showrunner merge" or "<unit> merge".
+
+#### As-built
+
+- `make_labels` sets `OwnerRole` on `UnitLabels`. `SHOWRUNNER`: a session that runs a production, or a showrunner's own staff worker with no unit. `UNIT`: a unit director or a worker under one, running or not. `UNKNOWN`: every other path.
+- `StepNames.for_owner(step, unit, role)` reads new `owned.*` keys in `config/build_steps.conf`: `{unit} targeted`, `{unit} merge` and `showrunner merge`. `UNKNOWN` keeps the current name. The `names.*` and `prose.*` values do not change.
+- One cloud naming helper in `queue_view.py` names both the Running and the Queued rows.
+- A worker's step belongs to its owner (director decision, 2026-11-13). sdlc's merge worker, staff kind unit, reads "sdlc-merge-gate merge".
+- Tests cover each role mapping and name, in both tables. A fixture proof shows both tables before and after.
+- Repair (merge test red, from builds): live Claude workers take their labels through `staff_relationships` and `make_labels`, so the live, recorded and roster readers give the same role. `priority_labels` order does not change.
+
+**Files:** `scripts/message/unit_labels.py`, `test_unit_labels.py`; `scripts/build_queue/test_admission_service.py`; `scripts/message/test_roster.py`; `scripts/production/test_unit_lookup.py`; `scripts/lib/build_steps.py`; `config/build_steps.conf`; `scripts/build_queue/queue_view.py`, `memory_feed.py`, `memory_page_proof.mjs`, `test_queue_view.py`, `test_memory_feed.py`.
+
+### Phase 69f — The Mac reading survives an unreadable folder · status: done
+
+From builds (not the user), 2026-11-13, urgent: phase 69 broke the Mac reading at 13:20. `project_record` called `Path.exists()` on `/Users/hana-ci/actions-runner/_work/hana/hana/.git`, which natepiano cannot read, so a `PermissionError` failed the whole read.
+
+1. `project_record` returns the empty record on `OSError`, so an unreadable folder reads as unknown.
+2. `read_builds` keeps a row when one field fails, and the other rows stay.
+3. No folder rule and no config key: the phase 69 ancestry rule alone marks the CI row as CI. From builds (not the user), 2026-11-13.
+4. Landed alone as 4c434349d, on main as f3e703de9, ahead of the phase 70 repair. The live Mac reading has the CI row and no error.
+
+### Phase 71 — Every row names its unit and showrunner · status: done
+
+From the user (via builds), 2026-11-13, with screenshots /tmp/claude/scratch/user-shot-mac-showrunner-names.png, user-shot-done-duration-gap.png and user-shot-mac-ci-unattributed.png: show the unit and step on top and the showrunner in small text under it, name both in every tooltip, make the column gaps equal, and rename Machine to Target and Duration to Dur. From builds (not the user): the item list and the Mac CI case.
+
+#### As-built
+
+- New `owned.*` keys in `config/build_steps.conf`: `owned.default={unit} {step}`, `owned.showrunner-default=showrunner {step}` and `owned.ci-default=CI {step}`. `StepNames.for_owner` reads them through the one phase 70 naming path. An unknown owner keeps its current name.
+- Every Running and Queued row on natedev, the Mac and AWS uses these names. The small text is the showrunner name, or the CI label for a CI row.
+- A CI row's Unit cell reads "CI" (director decision). A missing CI field (runner, job) is left out, so a live Mac CI row reads "hana CI": the Mac script cannot read the runner environment (director decision).
+- Every tooltip, swap tooltips included, names the showrunner and the unit, or CI. The custom and native tooltips share one owner field list.
+- Column gaps are equal in both tables. The headers read Target and Dur, and the freed space goes to Unit.
+- Proof: before and after shots of both tables, a Mac CI row and its tooltip, an owner tooltip and a 600px view. A live read rendered Mac CI pid 69040 as "CI nextest" over "hana CI".
+- Repair (merge test red, from builds): `test_memory_hover.py` expects the phase 71 text and checks the owner lines in each tooltip. Its page data supplies `walk`, `waiters` and `swap_by`, as the live feed does. The page does not change.
+
+**Files:** `config/build_steps.conf`; `scripts/lib/build_steps.py`; `scripts/build_queue/memory_feed.py`, `memory_live.html`, `memory_page_proof.mjs`, `queue_view.py`, `test_memory_feed.py`, `test_queue_view.py`, `test_memory_hover.py`.
+
+### Phase 72 — AWS rows name their owner · status: done
+
+From builds (not the user), 2026-11-13: AWS rows on the Builds page read "owner not recorded" (user shot /tmp/claude/scratch/user-shot-done-duration-gap.png). A gate worker and a paired-trial worker start as a `systemd-run` unit without the caller's session id or unit.
+
+#### As-built
+
+- `cloud_gate.service_command` forwards `CODEX_THREAD_ID`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_NAME` and `BUILDLOG_UNIT` with `--setenv`, each only when the caller sets it. An empty value stays empty.
+- The gate worker and the paired-trial worker both use `service_command`, so `gate_trial.py` does not change.
+- The existing `admission_records.waiter_identity` reads the forwarded values. The worker's step record names its session and unit, and the AWS row reads "{unit} {step}" over the showrunner name.
+- The AWS `UnsetEnvironment` list does not change, and no new credential data is read. A hold owned by another session still refuses the worker (exit 10).
+- `memory_page_proof.mjs --cloud-owner` saves before and after shots of an AWS row and its tooltip.
+- aws-unit's conditions are met. A live check of the owner on the next gate worker and paired-trial worker goes to builds.
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `test_cloud_gate.py`; `scripts/build_queue/memory_page_proof.mjs`.
+
+### Phase 73 — The Builds page shows each block and hold · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/user-shot-mac-block-banner.png: "this design is not quite what i had in mind although it does tell me that the mac is idle - although it should say that it is blocked. i want you to ask that whoever implements showing the mac block should do an astra design review to make it more beautiful than what we're currently doing". No AWS hold exists, so the page has no AWS row (director decision).
+
+#### As-built
+
+- `target_availability.py` reads `targets.target_snapshots()` once for each page reading. `availability_rows` gives one row for each Mac block ("Blocked") and each natedev hold ("Held"), with holder, unit, showrunner, reason, since and until. An unreachable or unreadable target gives an "Unavailable" row. A free or busy target has no row.
+- The "Target availability" card on the Builds page shows these rows. A narrow view puts the reason, owner, since and until in that order.
+- `MacRoutes.line` gives the "Mac: ..." tooltip line for natedev rows and waiters: kind not offloaded, natedev only, excluded (policy), blocked, busy, unreachable, state unreadable, or no recorded block or claim. It reads `build_targets.step_policy` once for each (folder, package, kind) in a reading. Backoff and unreadable state are not policy; the state line names them.
+- Cost: `step_policy` runs local git reads, 5–25 ms for each repository in each 3 s reading. Accepted, because a cache across readings would hide a config change.
+- `ssh_target_snapshot` puts a block before a failed probe, running jobs and backoff. `read_backoff(strict=True)` returns `UnreadableBackoff`; the non-strict read does not change.
+- The idle alert says "MAC BLOCKED by ...". When the card shows the block, the page omits the block sentence from the alert (`BlockText.OMITTED`); admission diagnostics stay.
+- The astra design review came before the build. Its findings and rulings are in the phase notice to builds.
+- `memory_page_proof.mjs --blocks` saves before and after shots with the user shot's values, a narrow view with two natedev holders, and one tooltip for each Mac line form.
+
+### Phase 74 — Every row hover names who ran it · status: done
+
+From the user (via builds), 2026-11-13, with user shot /tmp/claude/scratch/until-2026-11-16T0500Z-hover-shot-a361af/user-hover-identity.png: "this hover panel is going in the right direction - i want to make sure we non-redundantly indentify the showrunner: {showrunner} unit : {unit} worker : {worker} if the showrunner is the only thing that ran it, then it should say showrunner: {showrunner} unit : this run is from the showrunner and don't show the unit similarly if it is something run from the unit it should be showrunner: {showrunner} unit : {unit} worker : this run is from the unit director This should be a standard at the beginning of each hover over every running and queued row". From builds (not the user), 2026-11-13: a showrunner run has no worker line; use the user's label texts exactly; one shared block from one place in the code; a run with no recorded owner keeps "owner not recorded"; a showrunner's worker shows "unit: this run is from the showrunner".
+
+#### As-built
+
+- `unit_labels.Runner` records who ran the step: showrunner, unit director, worker, or unknown. `make_labels` sets it through `runner_of`. It is the only place that builds labels from the relationships, so the fast and full readers agree.
+- `memory_feed.page_owner_labels` sends `runner` and `worker` on every running and queued row. Cloud rows use it too. A CI row sends runner unknown and keeps its CI line.
+- `identityHtml` on the Builds page is the one place for the block. Every walk and waiter hover, Mac rows included, starts with it: showrunner, unit, then worker, with the user's label texts. The labels are lowercase and the colons align.
+- Row headings and the local row body no longer repeat the owner that the block names. A hover with the block is up to 24rem wide, so the values do not wrap.
+- `memory_page_proof.mjs --identity` saves before and after shots of the Mac row hover, plus one showrunner-run row and one unit-director-run row.
+
+### Phase 75 — The hover colons line up exactly · status: done
+
+From builds (not the user), 2026-11-13 23:46: align the colons in the who-ran-it hover block exactly.
+
+#### As-built
+
+- `identityHtml` gives each line three cells: `<dt>` label, `<dd class="colon" aria-hidden="true">:</dd>` and `<dd>` value. The `.identity` grid columns are `max-content max-content minmax(0, 1fr)`, so all colons share one left edge. The Mac fields list keeps two cells per line.
+- `test_memory_hover.field_values` reads value cells without the colon cells; the who-ran-it test checks one aria-hidden colon per label.
+- `memory_page_proof.mjs --identity` measures each colon's left edge. It captures `before-` and `after-colons-mac-row` and `-queued-row` shots, and requires one edge on the after page and on the showrunner row.
+- Checkpoint 1bd7b8067.
+
+### Phase 76 — The running-row hover closes its memory sentence · status: done
+
+From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period between the running row's memory text and the source sentence. keep_text is data; the page owns the sentence.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? r.keep_text + "." : res} ${src}`: the page always adds the period after `keep_text`. `res` is page text with its own periods.
+- `memory_feed.py` keep_text descriptions carry no end mark: the compiler cache row, the unowned processes row and the group row.
+- `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
+- Checkpoint e34c01903.

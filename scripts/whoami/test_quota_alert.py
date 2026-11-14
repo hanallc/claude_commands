@@ -7,15 +7,17 @@ import json
 import os
 import subprocess
 import shutil
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
 from scripts.whoami import quota_alert_test_support as support
-from scripts.whoami import quota_alert
+from scripts.whoami import quota_alert, quota_state
 from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import Quota, Report
@@ -548,7 +550,6 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
         self.assertEqual((routing[0]["fallback_at"], routing[0]["moved"], routing[0]["why"]),
                          (stamp, ["direct", "design_roles"], "auto: rerun-entry"))
         self.assertEqual(routing[0].get("claude_account"), "claude4")
-        self.assertEqual(self.read_assignments()["ask_a_friend"], "caller")
 
     def test_failed_restore_keeps_only_failed_keys_for_the_next_pass(self) -> None:
         class Killed(BaseException):
@@ -666,6 +667,21 @@ class QuotaAlertRerunTests(support.CodexRerunFixture):
                     requested = [row for row in moves.read_moves() if row["kind"] == "requested"
                                  and row["why"] == f"auto: {head.id}"]
                     self.assertEqual({row["move_id"] for row in requested}, {original_move_id})
+
+
+
+class NoWorkerModeReadTests(unittest.TestCase):
+    def test_only_a_saved_true_mode_reads_as_on(self) -> None:
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_STATE_HOME": folder})))
+        state = Path(folder) / "quota_alert.json"
+        self.assertFalse(quota_state.no_worker_mode())
+        for text, expected in (("not json", False), ('{"episodes": {}}', False),
+                               ('{"episodes": {}, "no_worker_mode": false}', False),
+                               ('{"episodes": {}, "no_worker_mode": true}', True)):
+            with self.subTest(text=text):
+                _ = state.write_text(text)
+                self.assertEqual(quota_state.no_worker_mode(), expected)
 
 
 if __name__ == "__main__":

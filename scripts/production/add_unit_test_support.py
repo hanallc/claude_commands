@@ -14,6 +14,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.test_names import fixture_names
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import sessions as runtime_sessions
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
 
@@ -287,6 +288,7 @@ class AddUnitTestCase(ShutdownTestCase):
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        bind_private_run_roots(self, self.root)
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
         ))
@@ -651,7 +653,7 @@ def submit_command(argv):
     def prepare_herdr_launch(self, *args: str) -> None:
         parser = argparse.ArgumentParser()
         _ = parser.add_argument("name")
-        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact"):
+        for flag in ("plan", "brief", "port", "resume", "attach", "cwd", "restart-note", "session-name", "host-session", "account", "config-dir", "model", "autocompact", "unit-type"):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
@@ -667,6 +669,7 @@ def submit_command(argv):
             launch = add_unit.UnitLaunch(production=requested.production, branch=requested.branch,
                 worktree=requested.worktree, plan=requested.plan, port=requested.port,
                 session=requested.session, timeout=requested.timeout, responsibilities=requested.responsibilities,
+                unit_type=requested.unit_type,
                 identity=add_unit.UnitIdentity(requested.unit, requested.requested_name))
             self.configure_herdr(launch)
         except (Refusal, OSError, ValueError):

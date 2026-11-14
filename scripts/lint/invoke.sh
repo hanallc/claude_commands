@@ -335,9 +335,24 @@ run_step_attempt() {
     fi
     printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
-        build_hold_wait_local || return $?
+        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+            local hold_status=0
+            build_hold_check_local || hold_status=$?
+            if (( hold_status != 0 )); then
+                source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory "$hold_status"
+                if (( hold_status == 10 )); then return "$LINT_LEFT_QUEUE_STATUS"; fi
+                return "$hold_status"
+            fi
+        else
+            build_hold_wait_local || return $?
+        fi
     fi
-    buildlog_begin "$@" || true
+    if [[ "${BUILDLOG_PLACEMENT_PREPARED:-0}" != 1 ]]; then
+        buildlog_begin "$@" || true
+    fi
+    BUILDLOG_PLACEMENT_PREPARED=0
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
         while :; do
@@ -361,6 +376,11 @@ run_step_attempt() {
                 break
             else
                 status=$?
+            fi
+            if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+                buildlog_release_memory 0
+                return "$LINT_LEFT_QUEUE_STATUS"
             fi
             buildlog_release_memory 0
             if [[ "$status" != 10 ]]; then
@@ -500,11 +520,20 @@ sweep_after_step() {
     fi
     printf '%s\n' "$now" > "$stamp" || return 0
     # Cargo locks protect the sweep. It must not take the board token.
+    # Its removal lines go to the journal, where read_sweep_journal and the
+    # floor alert find them: this sweep can hold floor.lock while the
+    # disk-floor service run skips. The pipeline keeps no fd of the caller.
+    # When systemd-cat cannot reach the journal (a sandbox), cat reads the
+    # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
         TOKEN_HELD=0
         run() { run_once "$@"; }
-        invoke_sweep </dev/null >/dev/null 2>&1 &
+        if command -v systemd-cat >/dev/null 2>&1; then
+            invoke_sweep </dev/null 2>&1 | { systemd-cat -t lint-sweep || cat; } >/dev/null 2>&1 &
+        else
+            invoke_sweep </dev/null >/dev/null 2>&1 &
+        fi
     )
 }
 
@@ -642,8 +671,10 @@ nextest_share_end() {
 }
 
 run_nextest() {
-    require_nextest
-    build_hold_wait_local || return $?
+    if [[ "${LINT_QUEUE_PLACEMENT:-0}" != 1 ]]; then
+        require_nextest
+        build_hold_wait_local || return $?
+    fi
 
     local arg arm="" width=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then

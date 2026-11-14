@@ -1,513 +1,293 @@
-# AWS cloud gates and former build target
+# AWS cloud gates and trials
 
-## What it is
+## Current model
 
-The user removed the permanent AWS build box.
-Its instance, Tailscale device, and data volumes are gone.
-Build jobs use `mac` and `natedev` only, in that order.
-Cloud gates still run merge gates and targeted tests on temporary AWS instances.
+AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
+Normal build jobs use `mac` and `natedev`, in that order.
+AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-Cloud gates boot the official NixOS image and fetch their tools at boot.
-A saved gate image was taken out of use. Five gates with it had a 32 s median; gates without it had 29 s.
-`deploy.py remove-images --approve-destroy` switches the gates to the official image. It deletes the saved gate image, the former builder image, and their snapshots.
+The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The saved deployment record identifies the regions available for launch.
+Boxes boot the official NixOS image and fetch their tools at boot.
+GPU trial boxes then import the prepared GPU system and reboot.
 
-The former builder used host `aws-build` and one persistent Spot `m7a.4xlarge` instance.
-It used NixOS and a retained, encrypted 500 GiB gp3 data volume at `/home`.
-The repository retains its controller and deployment code.
-
-The spending caps remain in `config/aws_target.conf`: `monthly_limit_usd=400` and `daily_limit_usd=20`.
-The user approved the monthly cap on 2026-11-01 and the daily cap on 2026-11-03.
-The daily cap derives from the monthly cap divided by 20.
-No code may raise either cap or copy it.
-
-The user approved these former builder settings on 2026-11-03.
-The settings remain in `config/aws_target.conf`:
-
-1. `limit_reserve_usd=3`: the spend reserve below each cap.
-2. `drain_max_minutes=60`: at a cap, no new steps start, and the box stops within 60 minutes.
-3. `spot_max_usd_per_hour=0.483`: the Spot maximum price.
-4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
-5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
-
-The user approved `notification_email_file=~/.config/aws-build/notification-email` on 2026-11-03. aws wrote that private file on natedev (mode 0600) from the address the user gave.
-The user approved `deployment_price_file=~/.config/aws-build/deployment-price` on 2026-11-03. `deploy.py price` writes the Spot price and its read time there (mode 0600), outside the repository.
-
-The shipped registry contains `targets=mac,natedev`.
-The old `offload=on` setting does not register the former AWS target.
-The user approved its historical activation on 2026-11-03.
-[The runbook](../plans/builds-aws-runbook.md) and [source design](../plans/builds-aws-design.md) record the earlier setup.
-The design's Phase 4, lint with write-back, was not built.
-
-## Current state and removal
+`config/aws_target.conf` supplies the account spending caps and billing settings.
+`config/cloud_gate.conf` supplies launch, expiry, trial, and artifact settings.
+The ledger reserves spending before launch and records confirmed termination.
+The configuration files remain the source for cap values.
 
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
-`sync.hosts.aws=aws-build` maps historical steps to those comparisons without registering the former builder.
-The AWS section shows no sync status because the permanent box no longer exists.
+`sync.hosts.aws=aws-build` identifies historical steps.
+The report shows no synchronization status for the removed builder.
 
-`deploy.py down --approve-destroy` can remove the remaining gate resources without restoring the former target registration.
-Teardown resolves the former builder's claim and lock paths directly from the AWS state folder.
-It preserves the existing lock and live claim checks.
-
-The controller no longer releases claims after a box stop or generation change.
-The code no longer writes `release-evidence/` through that path.
-
-## Retained builder implementation
-
-The following sections describe retained code and the historical builder setup.
-No permanent box runs these services.
-Legacy activation requires an explicit target registration.
-
-### Target state, slots and records
-
-- `mac_test.state_paths(target)` is the one map from a target to its state folder. The Mac keeps `~/.local/state/mac-test`. Every other target uses `~/.local/state/build-targets/<target>/` for claims, locks, block and unreachable backoff.
-- `mac_test.configured_ssh_target(target)` checks every target, the Mac too, against `config/build_targets.conf`. It refuses an unknown or non-ssh name before any state write. `build_hold.py` accepts `target <name>` and `--target <name>`.
-- `offload.repository_identity` returns `KnownRepository(name, key)`. `name` is the source folder name. `repository.repository_key` supplies the normalized origin URL, or `git-root:<root commit>` when no origin exists. The key is empty when the repository has no commits. `path_key` encodes the identity for local claim and affinity files. The Mac keeps `mirror_name`, the source folder name. Linux mirrors use the build queue rule in `config/build_folders.conf`: `~/.local/state/build-target/mirror/<repository>/<target>-s<slot>`. `build_folders.repository_name` joins the policy name and the identity hash. `names.repository_key_length` sets the hash length, which is eight characters. Worktrees and gate copies with the same policy name and identity share one mirror per target and slot. Different identities with the same policy name have separate mirrors.
-- A claim carries a slot. `mac_test.py` allocates it under the target lock from `slots.<repo>`, then `slots`, and prefers the free slot that last ran the same worktree. Affinity grants no ownership. Claim records hold `repo_name`, `repo_key`, `slot` and `cleanup_pending`. Status 13 means cleanup must come before execution.
-- `buildlog sync` pulls from every configured SSH peer. Each peer gives back only its own host folders. `sync.hosts.<target>` in `config/build_targets.conf` is the one host-to-target map. Step records carry `target` (index schema 27). The `ssh_attempts` table (schema 28) keeps target, repository identity, queue time, departure time, slot, outcome and evidence.
-
-### Linux execution: `scripts/mac_test/linux_runner.py`
-
-1. Tracked scripts transfer first. Then `rsync --delete` copies the source, with untracked files, and protects ignored paths, `.git` and `target`.
-   Both copies use `copies.RSYNC_RECEIVER_WRITE_TIME_FLAGS` (`-rlpc`).
-   Checksums skip files with equal content and keep their destination modification times.
-   Changed files get the receiver write time, so Cargo detects changed source with an old source modification time.
-2. Each slot caches the shell exports. The cache key is `flake.nix`, `flake.lock`, `nix/` and the shell selector. Reuse checks that the referenced store paths exist.
-3. The execution probe evaluates the shell and checks Rust, nextest and mend parity inside it. `probe_timeout_s` covers reachability. `shell_timeout_s` covers shell evaluation.
-4. `.linux-run.json` records ownership before shell evaluation. Unconfirmed cleanup keeps the marker and the claim. `linux_startup=unresolved` starts no work and maps to `BusyMacDecline(LostRunLeftovers())` with no backoff.
-5. Execution keeps caller arguments, staged doc snapshots, the sent tree key and the real failure status. `verify-linux` passes never count as natedev pass evidence.
-
-Tool parity uses one form for the sender, the probe, execution, and refusal messages.
-The normalizer strips each version line and joins nonempty lines with one space.
-This includes all lines from `cargo nextest --version`.
-
-Linux cleanup reads the real UID from `/proc/<pid>/status` before it reads process ownership evidence.
-It excludes processes from other users.
-Cleanup excludes processes that started before the recorded run and ancestors of the checking process.
-It also excludes direct children of another user, except children of PID 1.
-Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
-Other same-user processes with unreadable evidence keep the slot busy.
-
-`verify-linux` steps use the target slots and build budget for admission.
-They do not contact natedev's admission service or obey natedev's hold.
-The controller still checks spending before AWS admission.
-
-A missing completion marker reports the runner exit status when available.
-It does not prove a link failure.
-The attempt record keeps the reason.
-An interruption marker reports the instance generation.
-
-### Routing: `scripts/direct/verify.sh`, `scripts/build_targets/build_targets.py`
-
-- The retained routing code supports `verify.sh <command> [PACKAGE] --target aws` only with an explicit AWS target registration.
-  This includes test, check, staged doc, example, build, final, and lint judgments.
-  Tree-writing lint repairs remain on natedev.
-  A pinned final runs its check and tests on AWS and saves no local pass.
-  A pin keeps admission, spending, and version checks. It takes no natedev grant or cargo token.
-  A refusal ends the step with a nonzero status. Remote step records include `target=aws`, `host=aws-build`, and `pinned=true`.
-- Unpinned test, check, doc, example, and lint judgments try eligible SSH targets in configured order. `ssh_target_eligibility` checks configuration, backoff, capacity and reachability, with no shell evaluation.
-- `build_targets.py reserve` returns 0 (reserved or recovered), 11 (busy macOS target) or 1 (no reservation). `--recover-only` recovers only an existing claim. `MacClaimFromWait` moves ownership from the wait to the claim with no unclaimed interval.
-- `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` keep the first queue time across remote loss and local fallback. Local fallback needs admission. A confirmed remote failure does not cause a local rerun.
-- A natedev hold permits a process that holds a live Mac or AWS claim, plus its ancestors and descendants.
-  The reason is `holds a live Mac or AWS claim`, even when the step record is stale or unreadable.
-  The enforcer reads the process table before it reads claims once per pass during a hold.
-  It uses the same claims for decisions and signals.
-  A claim or target config read error prevents TERM and KILL for that pass.
-  The enforcer reports the error once and reports recovery once.
-  Audits and reports show the error and list builds without claim protection.
-  The drain reports the error once and stops no waiting run until claims are readable.
-  If the initial claim read fails, the drain hold keeps every outermost gate.
-  After claims become readable, the drain stops waiting gates and keeps working gates alive.
-  A new claim cancels a pending kill. An ended claim permits the next pass to stop the family.
-  `hold_enforcer.protected_reason` keeps live step controllers and route children alive in `waiting_hold` and `waiting_mac`.
-  `--drain` also waits for cargo children and admission reservations. It still stops waiting runs.
-
-### Cost ledger and spending guard: `scripts/aws_target/`
-
-- `config.py` reads the spending settings into `SpendingSettings`.
-  Only a usable live limit permits spend.
-  `ConfigRead.origin` returns `UsableLiveValue`, `RecoveredValue`, or `UnavailableValue`.
-  A recovered value never permits spend.
-- `ledger.CostLedger` is a locked, atomic JSON ledger. It records instance-state observations, price samples, charged intervals, compute requests, reconciliations and limit events. Times are integers and money is `Decimal`. Intervals split at day and month boundaries in the accounting zone. A corrupt ledger keeps its evidence and refuses new spend.
-- The estimate uses Spot price history, `fallback_usd_per_hour` when no sample exists, and the fixed costs (retained and root storage, IPv4, gp3 performance, Cost Explorer reads). Fixed costs continue while the instance is stopped.
-- `spending_guard` returns `SpendingAllowed`, `SpendingRefused` or `SpendingUnavailable`. It refuses when the estimate plus `limit_reserve_usd` reaches either cap. Each decision is written through `ledger._decision_record`. Readers decode that record and never compute the decision again.
-- `ComputeRequest` is recorded before the compute deploy call. Until confirmed state ends it, it is charged at `max(fallback_usd_per_hour, SpotMaxPrice)`.
-- `CostLedger.refresh_charges` reads Cost Explorer once a day for whole UTC days. Each reconciliation stores `established_days`, the amount it set for each accounting day. A day is charged the higher of its computed total and its established total. Only `guard` and `estimate` save these amounts, through `_save_estimate`. Status and report write nothing.
-- A limit event is `PENDING` until delivery. `cost-notice.lock` serializes delivery, `notification_retry_s` bounds retries, and the send key `aws-limit:<event_id>` stops duplicates.
-- Target selection excludes AWS as `off` while offload is off, as `spending_limit` on a refusal and as `spending_unavailable` on unusable settings. Selection then tries the next target. `cleanup_refused_claims` still cleans retained AWS claims.
-
-### Control: `aws_target.py`, `remote.py`
-
-- `aws_target.py tick|start|stop|serve` runs `Controller` under `control_lock`. `AwsCli` is the one AWS CLI adapter. `controller.json` holds the state (`off`, `refused`, `stopped`, `starting`, `running`, `draining`, `stopping`), `generation`, `permitted_generation`, the drain deadline and the capacity backoff.
-- `tick` starts the box for one live pinned waiting step or enough eligible rows in `admission/queue.json`.
-  Both paths require guard permission and an ended backoff. Unpinned steps keep their queue thresholds. A drain keeps its deadline (`drain_max_minutes`). The tick also runs `refresh_charges`.
-- Natedev compares the tree's tool versions with `box-tools.json` before it claims a Linux target slot, so a version decline never reaches the box and does not reset the idle timer.
-  The comparison uses only the keys in the saved `versions` map. A missing or unreadable file leaves the probe and runner checks in control. It does not read the saved `instance_id`.
-  A mismatch writes its time to `version-decline-<repository name>` in the target's local state directory. A later attempt without a mismatch removes that file before the claim.
-- `tick` does not count queued or pinned work of a repository for `version_decline_hold_s=3600` after its decline. The controller only reads the file and runs no tool.
-  A job reaches the comparison only after the box is up. So a repository with other tool versions still gets one paid start each hold, about 15 idle minutes.
-  A corrected repository can wait until the hold ends for its own start. It still runs when the box is up for other work.
-- `remote.py` publishes an `AdmissionEnvelope` (target, purpose, generation, decision time, expiry) only after a confirmed guard write. The runner checks it before and after shell preparation. Other Linux targets use `IndependentLinuxExecution` and need no AWS permission.
-- On the box, `RemoteAgent` stops the instance after `idle_stop_minutes` idle and polls IMDSv2 every `interruption_poll_s`. An interrupted slot prints `aws_interrupted=<generation>` once, after `mac_exit` and `mac_cleanup`, and exits with the child status. Offload reads it as `InterruptedTargetRun` and records `ON_NATEDEV` before local work.
-- The controller also stops a running instance after `idle_stop_minutes` without published permission when no target claim remains.
-  It saves the first unpublished time for each generation in `controller.json`.
-  A successful publication or a new generation resets the timer. The stop reason is `unpublished_idle`.
-- `copy_tracked_scripts` sends every tracked file under `scripts/` and `config/`, including `config/build_folders.conf`.
-  The remote service and Linux runner need this config during import.
-- A version refusal names the target, each mismatched tool, both versions, and the file set by `version_pin_file`.
-  The verify output and the step attempt record keep this reason.
-- The box has `rustup`, `rustc`, `cargo` and `rustdoc` as rustup proxies. The Nix compiler builds only cargo-mend and cargo-tile. It does not select a job's compiler.
-  The Linux runner keeps the caller PATH after the development shell PATH, then runs `shellHook`.
-  Each job installs its toolchain in the mirror, before the parity checks and the work, in the job's process group.
-  rustup's order selects the toolchain, the same as on natedev: `RUSTUP_TOOLCHAIN`, then the tree's toolchain file. With neither, a plain `x.y.z` version from natedev becomes `RUSTUP_TOOLCHAIN`. Other forms leave it unset, and parity declines the job.
-  The runner passes the step's selected `RUSTUP_TOOLCHAIN` to the disk measurement and cleanup. A toolchain file still applies when that variable is unset.
-  One `flock` per toolchain protects the install. The lock name is `RUSTUP_TOOLCHAIN`, or the file's channel, or the SHA-256 of a file with no channel. A second job waits on the lock and downloads nothing.
-  An install failure declines the attempt with its error text, and the job goes to normal routing.
-  Toolchains stay in `~/.rustup` on `/home`, not in the image. A new volume downloads each version once, about 1.6 GB and 20 s.
-  The probe measures the checkout filesystem and runs no cargo or rustc. It reads nextest and mend through `cargo-nextest` and `cargo-mend`. The runner compares rustc after it enters the mirror.
-- The controller keeps claim files after a confirmed stop or generation change.
-
-### Status and report
-
-- `targets.read_aws_status` and `build_targets.format_aws_status` show state, spending decision, month dollars against the cap, slots per repository, cleanup state and recovery action. Status makes no AWS call, probe or write.
-- `report.py` renders `### AWS` from the AWS state folder without an SSH target registration.
-  The section shows a cost headline, daily spend, a cost matrix, a daily time trend, and notes.
-  Bill rows and headlines use `provisional bill` for provisional readings and `bill` for final readings.
-  The daily spend table shows bill days and estimate days after the newest bill day.
-  Historical reports omit estimate days after the report date.
-  `aws_report.estimate_wait_saved` compares natedev steps from the same day, kind, and repository.
-  The report shows one AWS section before the Mac copies section.
-  The worker records `mode` in each launch, refusal, and finish event in `cloud-gate-launches.jsonl`.
-  After result validation, the worker records `gate_s` in the finish event.
-  `gate_type_window_days` sets the matrix and trend window; the trend ends with totals and median times for all shown days.
-
-### Deployment: `deploy.py`, `docs/plans/builds-aws/`
-
-- `deploy.py up --approve-resources` runs twelve stages.
-  They run in this order: price, bootstrap, stacks, scaler-key, Tailscale policy, box join, box configuration, checks, image, idle stop, activation, and routing proof.
-  Each stage checks live state and records its last result and times in `up.json`.
-  A retry continues from incomplete stages. The price stage always refreshes the public price.
-  The stacks stage preserves the guard, ledger, and retained-volume checks.
-  A completed foundation wait renews preparation for unchanged inputs.
-  `REVIEW_IN_PROGRESS` counts as absent because that stack has no resources.
-- `deployment.json` holds the stack, instance, and data volume IDs outside the repository.
-  The controller reads its instance ID from that record.
-  Replacement reads the saved retained volume from the same record.
-- The scaler-key stage verifies the configured profile through STS.
-  It writes a new key atomically to the private credential file with mode `0600`.
-  It keeps other profiles. It verifies the new key before it deletes old keys.
-  A failed new key is deleted. The secret appears only in the private credential file.
-- `deploy.py price` reads the current Spot price with the encrypted administrator key.
-  It writes the price and its read time to the state file named by `deployment_price_file`.
-  The default path is `~/.config/aws-build/deployment-price`. The file stays outside the repository and has mode `0600`.
-  `prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
-
-- `prepare` and `apply` read the Budget address from the private file named by `notification_email_file`.
-  The default path is `~/.config/aws-build/notification-email`.
-  The file must stay outside the public repository. `bootstrap` needs no address file.
-  Prepared parameters and their fingerprint retain `NotificationEmail`. `setup-start` uses that prepared value.
-- `deploy.py prepare` writes the CloudFormation parameters, priced inventory and preflight evidence locally, with no AWS command. `apply` and `setup_start` run only at the user's terminal. They create the monthly Budget (emails at 50, 80 and 100 percent, a stop action at 100 percent) before any chargeable resource.
-- `cloudformation.json` defines the Spot instance, the root volume and the retained data volume. Shutdown behavior is `stop`, IMDSv2 is required and inbound is UDP 41641 only. The scaler IAM policy allows start and stop on the one instance, the needed describe calls and `ce:GetCostAndUsage`.
-- `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. `/etc/nixos` main 25966d8 adds sccache (one shared module with natedev), mold, natedev's cargo config and cargo-tile to `hosts/aws-build.nix`. The box is not built.
-
-### Box setup stages
-
-Device names in `config/aws-build-tailscale.json` must equal a machine name (first label of `DNSName` in `tailscale status`); `up` checks this first.
-
-1. `tailscale-policy` reads `config/aws-build-tailscale.json` and the live policy.
-   It resolves the natedev and Mac addresses from local Tailscale status.
-   The network rule permits only these addresses on port 22.
-   The SSH rule permits `autogroup:member` as `natepiano` and `root`; the network rule still limits access to these devices.
-   It changes only `tag:build-aws` owners and destination rules.
-   It prints each proposed change and uses the policy ETag to prevent concurrent overwrites.
-   It refuses mixed destination rules and broad outbound access that requires an unrelated policy change.
-   HTTP refusals include the status and validation details without user fields; network refusals include the failure reason.
-2. `box-join` checks SSM and the instance's Tailscale identity.
-   `box-join` writes the box host keys from Tailscale to `~/.ssh/known_hosts` for the host name and address; box setup refusals show the last stderr line.
-   It starts a stopped instance through the existing guarded setup path.
-   If AWS reports `InsufficientInstanceCapacity`, `up` waits `capacity_backoff_s` between start attempts until AWS accepts the start or the user interrupts.
-   It creates a single-use, pre-approved key and revokes it after the join attempt.
-   SSM disables terminal echo before the helper sends the key through stdin.
-   The command reads the key from stdin and writes no key file.
-3. `box-configuration` reads the clean `main` checkout named by `nixos_configuration_directory`.
-   It compares `/run/current-system` with the `aws-build` output.
-   It builds the output locally and copies the closure with destination substitutes.
-   It waits for `/var/lib/aws-build/bootstrap-complete` before changing the box.
-   It copies the closure and runs the box configuration commands as `root` without `sudo`.
-   It holds the controller lock and stops the remote idle service during the copy.
-   A bounded poweroff timer protects a failed reconnect.
-   A transient systemd unit runs the switch independently of SSH.
-   The helper resets the old idle timestamp before it restarts the remote service.
-   It waits for the expected system and an active `aws-build-remote` service.
-4. `checks` confirms SSM, the EBS serial under `/home`, ext4, and the remote service.
-   It compares `cargo-nextest nextest --version` and `cargo-mend mend --version` in the plain environment on both hosts.
-   It does not compare rustc: each job uses its tree's toolchain.
-   Non-interactive SSH uses the box tools from `environment.systemPackages` in `/etc/nixos/hosts/aws-build.nix`.
-   The stage reads no other source repository and copies no shell inputs.
-   It uses `normalize_tool_version` for both results.
-   `box-tools.json` records the instance ID and normalized tool versions.
-   Each build still checks the tools inside its own repository shell.
-
-5. `image` saves an image of the configured system before the idle stop proof.
-   It checks the saved system path and the image state before creating an image.
-
-### Box image cache
-
-`image.json` records the image ID, system path, and completed idle stop system proof.
-The image holds the root filesystem and the Nix store.
-The helper excludes the `/dev/sdf` data volume from the image.
-It moves the Tailscale identity and both bootstrap markers to `/home` while the root snapshot starts.
-It restores these items after EC2 reports the root snapshot ID, including after a failed request.
-`image-scrub.json` records the need to restore these items before the scrub starts.
-A rerun restores the items through SSM before it resumes image creation or cleanup.
-The helper deletes the marker only after a successful restore.
-The helper copies each item to a `.partial` path before it renames the complete copy and removes the original.
-The restore removes partial copies before it restores complete copies.
-The moved files leave no live path in the image, but their deleted blocks can stay in the snapshot.
-The image is private and encrypted, and is never shared.
-`down` deletes the Tailscale node, which ends that key.
-The helper holds the controller lock during this operation and stops no service.
-A changed desired system refreshes the image.
-The helper tags both the image and its snapshots with `aws-build-image=true` beside the cost tag.
-The helper waits for the image to become available and removes other images with that ownership tag.
-It lists snapshots with that ownership tag separately and deletes each snapshot outside the current image mappings.
-The stage stays incomplete while either list holds an item to delete.
-A rerun without a restore marker resumes a pending or available image and repeats cleanup without changing the box.
-Only one image remains.
-A 32 GiB root snapshot costs at most $1.60 per month at $0.05 per GB-month.
-`down` keeps the image and its system proof.
-The next `up` selects the available image for a new instance.
-The unchanged bootstrap prepares the new data volume and installs the remote scripts.
-Every stage still runs in the same order.
-A completed idle stop proof also covers a new instance with the same desired system.
-
-`admin_secret_file` names `~/.config/aws-build/admin.gpg` outside the repository, with mode `0600`.
-The encrypted JSON holds `aws_access_key_id`, `aws_secret_access_key`, `tailscale_client_id`, and `tailscale_client_secret`.
-`deploy.py secrets` uses symmetric AES256 encryption and hidden terminal input.
-It can import the administrator profile and the old OAuth file.
-It removes those plain credentials only after the encrypted write succeeds.
-It preserves the scaler profile and all unrelated sections.
-Enter retains a stored value during replacement.
-
-One resolver selects the scaler credential file for deployment, key creation, and teardown.
+One resolver selects the scaler credential file for deployment, services, key creation, and teardown.
 It uses a nonempty `AWS_SHARED_CREDENTIALS_FILE` override before `credential_file` from `cloud_gate.conf`.
 It expands `~` in either path.
-Every `deploy.py` command sets the resolved path in its environment before dispatch.
-AWS CLI subprocesses inherit the same path.
-User deployment commands need no credential environment prefix.
+Deployment uses encrypted administrator credentials for resource changes.
+Gate services use the private scaler profile.
+Boxes receive signed URLs and no scaler credential file.
 
-`price`, `apply`, `setup-start`, and `up` decrypt at the first administrator request.
-`prepare` decrypts only when it must reconcile existing AWS resources.
-`bootstrap` needs no administrator credentials.
-`up` shares one decryption across all twelve stages.
-The price stage refresh and the live checks require credentials even when every stage reports `present`.
-The policy check uses the same decrypted OAuth client for its token request.
-AWS subprocesses receive the administrator key through their environment without an administrator profile argument.
-The SSM subprocess uses that same environment.
-Inherited AWS session tokens cause a refusal.
-The unattended controller continues to use the plain scaler profile without a prompt.
+## Hana guest safety files
 
-The helper reads the passphrase from `/dev/tty` without echo.
-A process without a terminal cannot decrypt through the helper.
-GPG receives the passphrase through a private descriptor with `--no-symkey-cache` and loopback pinentry.
-The helper never uses public-key encryption.
-Decrypted values remain in process memory until the run ends.
-AWS subprocesses contain the AWS key in their environment during their lifetime.
-A process with sufficient access can inspect that memory or environment.
-Administrator subprocesses ignore the AWS configuration file to prevent CLI history from storing secret responses.
-The helper redacts administrator values from reported AWS errors.
-Administrator commands refuse a remaining plain administrator profile or legacy OAuth file and name `deploy.py secrets`.
-`deploy.py down --approve-destroy` uses the same encrypted administrator session.
-No deployment stage edits or pushes the NixOS checkout.
-The controller activation and routing proof remain separate plan stages.
+`scripts/aws_target/hana_guest.py` renders safety files for the planned kept Hana box.
+These files do not provision a machine or add a deployment command.
+Phase D must install and enable the units before the box accepts work.
+`config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
 
-## Invariants
+The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
+It has no ordering or requirement dependency on the data disk, network, or tool setup.
+Tool setup runs after the guard and requires the bounded data mount.
+A failed setup or missing disk cannot prevent the guard from requesting poweroff.
+The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-1. No AWS resource and no AWS call exist before the user's go-live gate.
-2. Read every tunable at use from `config/aws_target.conf` or `config/build_targets.conf`, through `scripts/lib/conf.py`.
-3. The guard runs before every AWS start, admission, deployment and first boot. Derive the Budget amount from `monthly_limit_usd`.
-4. No password, AWS key or Tailscale auth key passes through a session. The scaler key is not on the box. `build-scaler` credentials remain in the private credential file. The helper never prints them.
-5. Use Tailscale SSH. Store no GitHub credential on the box; `ci_repo=` stays empty.
-6. An empty `OffloadRequest.target` selects the legacy Mac default. Mac paths and output do not change.
-7. Unresolved process ownership never adds an unattributed PID to the kill list. Missing completion stays `LostMacRun`.
-8. `permitted_generation`, not `generation`, protects against restarts.
-9. Tests fake every AWS call, SSH, clock and process state.
+Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
+The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
+The boot ID must match `/proc/sys/kernel/random/boot_id`.
+The guard and watchdog only read the permit and identity files.
+Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
+`permit_max_seconds=1800` bounds one renewal window.
+A permit beyond that window grants no permission.
+Phase C reserves permission for longer steps.
+Phase D must deliver renewals through `write_permit()`.
+The writer uses a private temporary file and atomic rename.
 
-## Calibration and gotchas
+On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
+An unchanged permit retains that deadline across later reads and service restarts.
+A renewal with a changed expiry records a new bounded deadline when safety next reads it.
+The watchdog stops at the earlier of wall-clock expiry and the boot-clock deadline.
+A backward wall-clock change cannot extend the boot-clock deadline.
 
-- `conf.decimal` is the one finite-number parser. It accepts a value only when the `Decimal` and its `float()` are both finite. Its error text is `expected a finite number`; callers match that text.
-- Full `offload.read_config` validates the AWS spending keys. AWS must be excluded before it runs, or one bad limit stops selection for every target.
-- Cost Explorer `DateInterval` takes `YYYY-MM-DD`, and DAILY granularity reports UTC days.
-- An established day total can exceed a later bill or estimate. That is the cost of a total that never falls.
-- `limit_reserve_usd` covers one drain and one idle interval. The Budget action is the late backstop, not the cap.
-- A user stop disables the persistent Spot request until the next start. AWS restarts only a box it interrupted.
-- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit. On 2026-11-03 the encoded bootstrap measured 3908 bytes. `aws-build-base.nix` is copied into it, so put new box packages and services in `hosts/aws-build.nix` (`modules/linux/aws-build.nix` is the natedev `aws-target` unit).
-- A pending notice that keeps failing delays each guard call by up to `notification_timeout_s`.
-- A verify module that hits the 1800 s test limit has so far been a route defect, not machine load.
-- Fake AWS tests do not prove real bootstrap or persistent-request behavior. The runbook's user checks prove them.
+Safety, permit renewal, and command admission share `/run/hana-aws/permit.lock` through `fcntl.flock`.
+Safety holds the lock from the permit read through the shutdown decision.
+Before killing work, safety writes `/run/hana-aws/shutdown.json` under the lock.
+This fence refuses later renewals and command admission for that boot.
 
-## Why
+The independent watchdog starts after the guard and reads no controller or command state.
+At expiry, it sends SIGKILL to all command cgroups under `hana-work.slice`, then requests poweroff.
+A failed kill request still triggers the poweroff request.
+The watchdog checks at `watchdog_check_seconds` intervals and shortens its next interval to the permit deadline.
+Systemd also requests poweroff if a safety service fails.
 
-- Mac mirrors and claims key on the source folder name, because the origin name can differ (`.claude` and `claude_commands`).
-- Each peer returns only its own host folders, because a multi-peer pull otherwise overwrites fresher records.
-- Charges reconcile by UTC day, because Cost Explorer reports UTC days.
-- An unconfirmed compute request is charged at the Spot maximum price. A historical price is not an upper bound, and the fallback rate under-counts.
-- A stateless per-day floor was ruled out: it over-counts the common uneven case, a $10 bill becoming $17.92 across two days.
-- Refusal cleanup reuses `take_over_kept_claim` and `check_leftovers`, so no second cleanup path exists.
+`admit_command()` requires enabled configuration, a fresh bounded permit, and a mounted data disk.
+It checks the shutdown fence and starts the command under the shared lock.
+Its start callback spawns the process and returns immediately.
+The caller waits for command completion outside the lock.
+It prepares an unprivileged command with a separate slice under `hana-work.slice`.
+Both the parent slice and each command enforce `step_cpu_limit` and `step_memory_gib` from configuration.
+The initial limits are 4 vCPUs and 24 GiB RAM.
+Phase F2 must use this command path after checking the actual data mount.
+`test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
+No safety test needs AWS or a running systemd manager.
 
-### Activation and proof
+## Hana spending permits
 
-Configuration, image creation, and the idle stop proof close AWS routing before they change the box.
-Each stage waits without a time limit for AWS jobs that still run.
-Kept claims do not delay the wait.
-A stage with a valid proof leaves routing unchanged.
-Activation opens routing after the idle stop proof.
-An interrupted `up` leaves routing closed until the next `up` reaches activation.
-Jobs use natedev and the Mac while AWS routing stays closed.
+`scripts/aws_target/hana_spend.py` reserves spending before it returns a guest permit.
+`HanaSpending` uses the account ledger lock for starts, renewals, lifecycle observations, and storage deletion.
+It makes no AWS call and delivers no permit to a guest.
+Phase D must deliver permits and schedule lifecycle reconciliation without an active caller.
+Placement remains disabled.
 
-1. `idle-stop` observes EC2 until the box stops within `idle_stop_minutes` plus `idle_stop_margin_s`.
-   Without a saved proof, the stage waits for pending or stopping instances to reach a stable state.
-   It starts a stopped instance through the existing spending checks and waits for health.
-   It holds the controller lock so the controller cannot satisfy the proof.
-   A job that starts before routing closes resets the proof deadline to the full duration.
-   A deadline failure requests an EC2 stop, confirms the stop, and refuses the stage.
-2. `activation` writes `routing.json` under `~/.local/state/build-targets/aws`.
-   This record enables routing for the configured AWS settings file.
-   The controller and the sender read the same record before the legacy `offload` value.
-   The stage enables and starts `aws-target.service` with `systemctl --user`.
-   It requires the reviewed AWS registry rows and edits no tracked file.
-3. `routing-proof` runs `verify.sh test aws-routing-proof --target aws --no-cache` in a scratch Git repository.
-   The folder uses task `gate:aws-routing-proof`.
-   The next `up` removes a folder left by a dead run.
-   `scripts/aws_target/routing_proof.py` supplies the crate files.
-   The crate has its own workspace, no Rust dependencies, and one test that runs the compiler.
-   The runner requires `flake.nix` and `flake.lock`, so the crate supplies a small locked shell.
-   The `default` shell retains the host tools on PATH.
-   Git identifies the temporary folder as the source root.
-   The stage deletes the folder after the command ends.
-   The crate needs no other source repository.
-   The normal queue retains admission, spending, and version checks.
-   The stage requires a new successful pinned buildlog step with `target=aws` and `host=aws-build`.
+`reserve_storage()` reserves the root and data volumes before provisioning.
+It checks current account caps and the Hana budget before returning a saved reservation.
+`issue()` reserves compute through the deadline at the configured bid ceiling.
+It includes retained storage when no storage reservation exists.
+Each issued permit has an increasing generation.
+A renewal must name the current generation and extend an unexpired deadline.
+A refused renewal leaves the saved deadline unchanged.
+The guest watchdog then stops the box when its existing permit expires.
 
-Both proofs record the current instance ID and completion time in `up.json`.
-A replacement instance invalidates the routing proof.
-The idle stop proof remains valid when `image.json` records the same desired system.
-A later run skips completed proofs without another idle wait or test.
-A stopped instance retains its completed setup evidence for the same instance ID.
-The price stage still refreshes the public price.
+The shared ledger checks account policy, account evidence, gate exposure, bills, and the existing daily and monthly caps.
+The account daily limit remains USD 35.
+The Hana daily budget includes Hana compute and storage within that account limit.
+Open compute exposure remains reserved after permit expiry until a lifecycle observation confirms `stopped` or `terminated`.
+Storage remains reserved after stop and termination until volume deletion is confirmed.
+Storage estimates use a 30-day month.
+The ledger reserves the remaining storage cost for every day that a permit reaches.
+`reconcile()` records an automatic restart even when Hana placement is disabled.
+It reserves the boot guard interval and retains exposure until a confirmed stop.
+Unknown lifecycle state releases no exposure.
+Each lifecycle observation names the generation that the observer read before its request.
+An observation for an older generation changes no exposure or observation time.
+The ledger saves `hana_lifecycle_fence` with the latest accepted observation or permit issue time.
+An older observation cannot close a newer permit or replace a later running observation.
+The fence survives controller restarts.
+Observations at the same time as the fence leave exposure unchanged.
 
-### Target removal
+The existing `cost-ledger.json` version remains 1.
+The optional `hana_compute` and `hana_storage` collections hold Hana exposure records.
+Older records have no Hana exposure when these collections are absent.
+A missing `hana_lifecycle_fence` remains absent until a fresh observation arrives.
+The first stop confirmation saves the missing fence and retains the compute exposure.
+A newer confirmation for the same generation can then close that exposure without a running observation.
+Missing fields within a Hana exposure record make that record unusable.
+The reader never invents a zero price or deadline.
+Account guards and gate reservations include Hana exposure.
+Ledger estimates include accrued Hana compute and storage.
 
-`deploy.py down` prints the removal plan without reading credentials or changing state.
-`deploy.py down --approve-destroy` removes the target in this order.
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `region` | `us-east-2` | Use Ohio for the box and retained storage. |
+| `instance_type` | `m7a.2xlarge` | Provide 32 GiB of memory. |
+| `spot_max_usd_per_hour` | `0.15` | Bound reserved compute exposure. |
+| `root_gib` | `40` | Reserve the retained root volume. |
+| `data_gib` | `300` | Reserve the retained data volume. |
+| `daily_budget_usd` | `6` | Bound Hana spending within the account limit. |
+| `gp3_usd_per_gib_month` | `0.08` | Price standard gp3 storage without extra performance. |
 
-1. Write disabled `routing.json` and disable `aws-target.service` with `systemctl --user`.
-2. Refuse while an AWS job still runs. Kept claims do not delay removal.
-3. Save public resource identities in `down.json` before removing any resource.
-4. Delete the tagged `aws-build` Tailscale device and keep the policy rules.
-5. Delete every scaler access key and remove only its credential profile.
-6. Update the existing stack with `EnableCompute=false` and wait for compute removal.
-7. Delete the foundation stack and wait for its removal.
-8. Delete the retained data volume and Budget.
-9. Remove deployment records, setup proofs, and the prepared bundle files.
+The account configuration has storage totals, but no shared gp3 price per GiB.
+The new rate therefore belongs to the Hana configuration.
+`test_hana_spend.py` uses private files and fake lifecycle observations.
 
-The template implements compute and foundation as two phases of one stack.
-The helper uses the previous template and parameter values during compute removal.
-It does not read the private notification address file.
-The helper excludes new claims and controller actions throughout resource removal.
-The helper reports the removed resource kinds.
-Deleting the data volume loses the `/home` build cache.
-The helper preserves `admin.gpg`, disabled routing, claims, the spend ledger, and charge history.
-It records confirmed termination without removing past spending evidence.
-It retains the conservative fixed cost inventory.
-The existing spending caps remain unchanged.
+## Hana lifecycle controller
 
-A repeated command checks live state and skips each completed removal.
-`down.json` preserves identities after an interruption and prevents `up` until removal completes.
-A successful removal deletes this temporary record.
-The next `up` creates a new target and uses the existing monthly spending history.
-The helper shares one administrator decryption across AWS and Tailscale requests.
-The Tailscale OAuth client needs device deletion access for `tag:build-aws`.
+`aws_target.py serve` supervises bounded `tick` child processes for the existing `aws-target.service`.
+Each child attempts Hana lifecycle recovery before account charge refresh.
+Either operation can fail without suppressing the other operation.
+The supervisor continues after a failed or timed-out child.
+It releases all child-owned locks when the child exits.
 
+`hana_box.HanaController` stores its journal in `hana/lifecycle.json` beneath the account directory.
+`controller_lock.py` holds the existing `controller.lock` implementation.
+`aws_target.control_lock` remains available through the same import.
+Claims, lifecycle decisions, and operation intents take that lock before any ledger lock.
+The controller releases both locks before each provider call.
+It checks the saved deployment identity and operation token before applying the response.
+Each tick performs at most one provider step.
 
-### Deployment ownership and changed setup inputs
+The journal stores these lifecycle states:
 
-Preparation saves a deployment ID in deployment.json.
-The helper records the caller account and region before creating resources.
-A CREATE change set reserves the StackId before the foundation deploy creates resources.
-The helper saves that StackId before resource creation.
-The helper records the scaler resource's IAM name, ARN, and UserId from the verified stack.
-The confirmed Tailscale node ID stays with its instance ID in the deployment record.
-The data volume has a DeploymentId tag.
-A new Budget name includes the deployment ID.
-Migration preserves the existing Budget name.
-The deployment record saves the actual volume ID and Budget name.
+| State | Meaning |
+| --- | --- |
+| Unprovisioned | No setup has registered a deployment. |
+| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Interrupted | Only EC2 can restart the interrupted Spot instance. |
+| Stopped-unknown | An unknown stop cause forbids a manual restart. |
+| Starting | A committed claim owns the unresolved demand start. |
+| Ready | A verified boot can accept a permit for its current claim. |
+| Stopping | A saved stop intent blocks new claims. |
+| Replacement-pending | A terminated instance needs the later replacement path. |
 
-Removal checks the saved account, region, and StackId before changing routing or deleting resources.
-Missing or mismatched ownership evidence causes a refusal.
-Removal uses the StackId for every stack mutation.
-Removal deletes only the saved Tailscale node after checking tag:build-aws.
-Removal checks all required saved identities before changing routing or writing `down.json`.
-A missing identity causes a refusal that names `deploy.py up` as the recovery command.
-This refusal leaves `up` available to record the missing identity.
-One exception applies when the box never joined Tailscale.
-The record must have no node ID, and `up.json` must have no successful box-join stage.
-The Tailscale API must list no device with hostname `aws-build` and tag `tag:build-aws`.
-Then removal reports `tailscale-device: no device` and deletes no device.
-Any matching device without a saved node ID causes a refusal before routing changes.
-Removal resolves ScalerUser through the verified stack and checks its saved ARN and UserId before deleting keys.
-Removal requires the saved volume ID and a matching DeploymentId tag.
-Removal uses the saved Budget name after a live check confirms that name.
-Removal never selects a device or resource through a name or tag alone.
-Removal refuses a stale down.json with another deployment ID.
-A completed removal keeps a public down-complete.json receipt for repeated commands.
-The next up creates a new deployment identity.
-A reused volume requires its previous DeploymentId receipt, or no DeploymentId tag.
-The helper verifies the volume and sets its new DeploymentId before attachment.
+The journal records deployment, instance, Spot request, operation, boot, generation, and execution identities.
+A claim records whether work is committed incoming work or active work.
+The initial controller allows one claim.
+A caller timeout retains an unresolved start claim.
+The controller refuses claim release while a start or provider operation remains unresolved.
+Idle stop and claim creation use the same lock.
+A committed claim prevents idle stop.
+A saved idle-stop intent refuses a later claim until stop confirmation.
+A confirmed interruption takes priority over a pending idle stop.
+The controller records `INTERRUPTED` and refuses a manual restart.
 
-An interrupted removal can leave a retained volume that continues to incur charges.
-AWS status shows down incomplete, the retained resource IDs, and their daily storage cost.
-It shows the action deploy.py down --approve-destroy.
-The spend ledger keeps counting retained storage during the interruption.
-The helper does not create a background removal job.
+Phase C reserves compute before the next boot identity exists through `reserve_start()`.
+`check_start()` rechecks current caps before bootstrap, start, and permit publication.
+A cap refusal preserves the pending mutation and its token until the provider confirms the outcome.
+The controller calls the read-only `HanaProvider.recover()` when spending refuses another mutation attempt.
+Recovery continues after a cap refusal or reservation expiry.
+`MutationUnresolved` means the original request can still complete.
+Its stopped observation cannot close the compute exposure or replace the pending mutation.
+`MutationSettled` confirms that the original request cannot produce further changes.
+A settled stopped observation can close exposure and permit claim release.
+An unknown stop cause still forbids a manual restart.
+Recovery records exposure for a running box before it schedules a stop.
+Recovery never starts the box or publishes a permit.
+Each bootstrap, start, or publication attempt still needs accepted spending.
+`bind_start()` checks spending after the provider verifies the boot identity.
+A publication includes the expected prior generation and the current execution identity.
+Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
+Renewal retains the execution identity and advances the permit generation.
+A refused or lost publication does not extend the guest deadline.
+The controller reserves exposure until stop confirmation through the Phase C ledger.
+It reconciles automatic restarts without a caller, including while placement is disabled.
+An automatic restart cannot reuse an interrupted execution's boot challenge.
 
-The box-configuration proof includes the evaluated desired system path from /etc/nixos.
-The helper evaluates that path once during each up run.
-The box-tools proof includes natedev's normalized tool versions.
-Changed inputs invalidate that stage and every later proof.
-A stopped instance must complete the changed checks before the helper accepts its old proofs.
+`HanaProvider.step()` defines the typed provider boundary.
+A provider must bound its calls and use the saved operation tokens.
+Its `recover()` method reads status without repeating a mutation.
+It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
+The provider refreshes bootstrap access before a demand start.
+It must verify root receiver responses against deployment and demand-start identities.
+It must install a renewed generation and permit together before acknowledging publication.
+`hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
+The controller constructs it with the scaler profile and a sanitized credential environment.
+An unprovisioned tick makes no provider call.
+`Deployment.prepare_hana` and `Deployment.hana_setup` in `deploy.py` prepare and provision a separate Hana stack through the existing deployment helpers.
+The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
+Without approval, `hana-setup` prints only its local plan.
+The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
+The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
+It creates a retained data volume, retained root disk, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
+Its Spot interruption behavior is `stop`.
+Setup uses Hana sizes and prices from `config/hana_aws.conf`.
+It reserves setup costs within both account and workload limits before the stack request.
+`reserve_setup()` permits only approved resource setup while placement remains disabled.
+It does not permit demand starts or guest command admission.
+Setup resumes an existing stack through reads before another mutation.
+It refuses changed resource inputs or an expired reservation before another stack request.
+It registers the deployment only after the Spot request and stopped state match.
+Setup adds no route, target, or slot capacity.
 
-### Legacy identity migration and reservation recovery
+The provider maps every remote operation through `PROVIDER_OPERATIONS`.
+A policy test derives its required IAM actions from that mapping.
+Start and stop actions require this deployment's Hana instance tags.
+User-data changes also require `ec2:Attribute=userData`.
+EC2 describe actions use the required wildcard resource.
+Object reads and writes apply only to this deployment's control prefix.
+No guest instance role or SSH key is created.
+Every provider AWS request uses the configured `aws_timeout_s` bound.
+Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
-An existing deployment without StackId can migrate through up.
-The helper checks the configured region and the caller account against the live StackId.
-The helper requires a complete stack and the saved physical InstanceId.
-The helper checks the volume, Budget, and scaler identities before it changes state.
-The helper saves these identities and tags the verified volume with DeploymentId.
-The existing Budget name and ExistingDataVolumeId parameter stay the same during the update.
-The box-join stage records the confirmed Tailscale node ID.
-A failed migration check changes no resource or deployment record.
-A missing deletion identity requires deploy.py up before deploy.py down.
+The provider persists its operation before dispatch and holds a separate mutation lock.
+Recovery takes that lock without blocking an active mutation.
+Recovery fences an operation that has not reached dispatch.
+A late worker cannot dispatch that fenced operation.
+A successful remote response remains saved when the controller response is lost.
+Recovery verifies lost bootstrap writes through `DescribeInstanceAttribute`.
+A lost start remains unresolved while the observed instance is stopped.
+A pending, running, or stopping instance confirms that the start reached EC2.
+Permit recovery remains unresolved until the permit deadline passes.
+No recovery call starts the instance or publishes another permit.
 
-Before CREATE, the helper checks identity-<deployment_id> for a previous reservation.
-It verifies the saved DeploymentId and the StackId account before it saves the StackId.
-It resumes the change-set waiter without a second CREATE request.
+The root receiver reads signed control objects and writes scoped acknowledgements.
+Each demand start has new signed URLs and a separate control prefix.
+The provider writes those URLs only into private runtime files and EC2 user data.
+The root receiver verifies the deployment, demand start, current boot, prior generation, and permit deadline.
+It acknowledges only an installed permit.
+The guest shutdown fence rejects renewals.
+The image must deny non-root IMDS access because user data contains runtime signed URLs.
+The image must install the guard, watchdog, data mount, receiver, and runtime settings before setup.
+The Natedev owner must provide that reviewed image through the separate `/etc/nixos` workflow.
+The empty image and network settings prevent setup before that image review.
 
-Existing stack updates preserve the previous Bootstrap and AmiId when an InstanceId exists. These values apply only when the stack creates an instance.
-The box-configuration stage changes a live box.
+| New setting | Value | Reason |
+| --- | --- | --- |
+| `idle_stop_seconds` | `600` | Retain short bursts before a deliberate idle stop. |
+| `start_timeout_seconds` | `120` | Bound caller waiting while retaining unresolved claims. |
+| `tick_interval_s` | `5` | Reconcile before the independent boot guard expires. |
+| `controller_tick_timeout_s` | `45` | Bound each supervisor child and failed provider step. |
 
-The helper inspects an UPDATE change set before execution. It refuses protected resource removals and replacements, including conditional replacements.
-The protected types include the instance, volumes, volume attachments, network interfaces, interface attachments, Elastic IPs, IP associations, and Budget.
-Use `deploy.py down --approve-destroy`, then `deploy.py up --approve-resources` when replacement is required.
-A refusal deletes an unexecuted change set. A cleanup failure preserves the original error and names the remaining change set.
-An empty change set succeeds without execution. A new stack uses the current Bootstrap and the existing CREATE reservation path.
+The controller validates these intervals against the guest guard and permit windows.
+Renewal starts with enough margin for two bounded steps and three tick intervals.
+Tests use private journals, injected clocks, and a fake provider.
+They verify that neither the controller lock nor the ledger lock remains held during provider work.
+Regression tests cover expired bootstrap, start, and publication recovery.
+They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
 
-Before a new compute request, the helper reconciles every outstanding request against the live stack.
-A completed rollback with an InstanceId confirms the instance. An operation in progress or a failed rollback refuses with its status.
-CREATE reservation failures and UPDATE failures include current failed resource events, the change-set reason, and the final stack status.
-A stable failure reconciles the compute request at once. A timeout or uncertain stack status keeps the request pending.
-The helper redacts the notification address from the prepared parameters. It does not read the private address file during failure reporting.
-The same administrator session reads failure details without another passphrase prompt.
+## Removed builder: 2026-11-04
+
+`builder-removal.json` records the removal on 2026-11-04.
+The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
+`routing.json` records `enabled: false`.
+The target registry contains `mac,natedev`.
+The builder configuration and offload route have been removed.
+Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
+Only historical cost, ownership, and teardown compatibility remain.
+
+`deploy.py down --approve-destroy` can remove the remaining gate resources without registering the former target.
+Teardown resolves former builder claim and lock paths directly from the AWS state folder.
+It preserves the existing lock and live claim checks.
+The builder controller and remote agent have been removed.
+Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
@@ -581,7 +361,7 @@ The default remains three measured rounds.
 The reserved box lifetime includes both warm-up runs and all measured rounds.
 The guest divides the available time across warm-up runs and measured rounds.
 Odd rounds run base first; even rounds run changed first.
-The installed guest supplies the environment and memory sampler.
+The changed candidate supplies the supervisor, environment, and memory sampler.
 Each tested tree supplies `module_run.py` and the test module.
 Periodic log transfers stop before measurement.
 The guest transfers each sample between measurements.
@@ -627,10 +407,22 @@ The list must start with the home region and must not repeat a region.
 The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
-The gate ranks deployed types and public zones by size and expected cost before launch.
+The gate ranks deployed types and public zones by the expected USD per run before launch.
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
-A normal gate uses natedev after every regional variant refuses.
+A normal gate uses natedev after all capacity choices refuse.
+A confirmed Spot interruption before a final result starts another cloud attempt.
+`spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
+The retry uses the next choice in the saved launch order.
+The route keeps its cloud slot across retries.
+The route saves the interruption count and the next choice in `current.json` before each retry.
+Resume restores both values, so a crash cannot reset the retry budget.
+Each retry gets a new attempt ID and passes the existing spend and attempt checks.
+The worker confirms cleanup of the interrupted box and reservation before the retry.
+The final natedev fallback row includes the interruption count when retries or capacity choices end.
+A complete gate failure keeps its failed result and gets no retry.
+An unconfirmed termination or another controller error retains the existing fallback behavior.
+The launch path uses Spot only; it has no on-demand choice.
 Paired trials use the same regional launch and cleanup path.
 
 The home stack owns the artifact bucket and the global gate role and instance profile.
@@ -647,7 +439,7 @@ The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
-The controller searches every configured region for an expired reservation without a recorded region.
+Reconciliation searches every configured region for an expired reservation without a recorded region.
 After a valid final result, the controller books the box end at the result receipt time.
 It still requests termination and requires AWS to confirm termination before it books that time.
 A box without a valid final result uses the termination confirmation time.
@@ -655,6 +447,19 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The live `gate_box.GUEST` program contains the bootstrap code.
+The bootstrap downloads or clones the candidate and verifies its requested tree.
+It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.
+The entry point accepts the box directory, links, and mutable result dictionary.
+The candidate supplies its own suite, timing, and record code.
+The guest installs no signal handler.
+The module time limit and process groups stop the gate.
+The bootstrap names no `merge_gate` attribute and copies no host function source.
+A paired trial uses the changed candidate's entry point to supervise both verified trees.
+A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
+The controller then uses the normal natedev fallback.
+The result fields and transfer links keep their existing format.
+
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.
 The current source checkout occurs after `nix_ready_at`, so results omit `source_ready_at`.
@@ -695,22 +500,134 @@ Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
-The controller reads gate Spot prices every `price_refresh_seconds=3600`.
-It reads prices after the tick releases `controller.lock`, in the same process.
-It takes `spot-prices.lock` without blocking and skips the refresh when that lock is held.
-The price lock stores the last refresh attempt time.
-Slow price reads leave start and stop commands free to acquire the controller lock.
-It reads each region in `spot_candidate_regions` and the gate deployment once per refresh.
-Each read requests all configured gate `instance_types` for Linux/UNIX.
-The controller keeps the latest price for each zone and type.
-It atomically replaces `spot-prices.json` in the AWS state folder only after every region has complete prices.
-Each row contains `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
-An error, missing type, missing deployed zone, or incomplete page preserves the previous file.
-The price refresh does not change `controller.json`.
-Failed attempts use the same refresh interval.
-The price read remains active when the former builder route is disabled or removed.
+`buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
+The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
+The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+No systemd unit change or NixOS rebuild is required.
+The old `aws-target.service` remains disabled.
+`aws_target.py tick` reads account charges only.
+`price_refresh_seconds` limits snapshot attempts to one per configured interval.
+`deploy.py up` runs the same reader with `force=True` after the stack update, so prices fill at once.
+It tries `deploy_price_fill_attempts=3` times, `deploy_price_fill_pause_s=10` seconds apart, while IAM shows the new policy.
+The deploy prints the reasons and sends no alert; a failed fill does not fail the deploy, and the hourly refresh sends the alert.
+The snapshot takes `spot-prices.lock` without blocking.
+It reads each distinct `spot_candidate_regions` region once.
+Each regional read requests all `instance_types` and `gpu_instance_types` prices for Linux/UNIX.
+The AWS CLI reads all pages, and the reader selects the latest price for each type and zone.
+The reader also reads applied Standard Spot and G and VT Spot quotas.
+It uses the scaler `credentials_profile` and the private `credential_file` without an administrator passphrase.
+It removes inherited administrator keys and profiles from the AWS process environment.
+The only API actions are `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
+The CLI service name is `service-quotas`; the IAM prefix is `servicequotas`.
+See the [AWS authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_service-quotas.html).
+The snapshot test derives IAM actions from every request in the real snapshot path.
+It checks the scaler policy for each action, all resources, and no regional condition.
+A missing deployed policy requires `deploy.py up --workload merge-gates --approve-resources`.
+The table and snapshot commands never deploy a policy.
+The snapshot atomically writes prices and quota values together in `spot-prices.json`.
+The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
+The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
+A regional failure preserves that region's previous prices, quotas, and read time.
+Other regions still refresh, and the command returns a failure status.
+The `failures` array saves the latest failed attempt for each region.
+Each record contains `region`, `at`, `read`, `error`, and the bounded, redacted `reason`.
+A successful regional read removes that region's failure record.
+Old snapshots without failure records remain readable.
+The `failure_streak` record stores `since` and `notice_claimed` while any candidate region fails.
+The reader also accepts the previous `notified` field.
+The snapshot saves each failure before it attempts a user notice.
+It renders the registered `aws.snapshot_failed` text and sends it through `push_texts.user_send_argv`.
+The message key comes from the streak's start time.
+The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
+`AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
+The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
+That command updates permissions but does not replace scaler credentials.
+Credential errors, timeouts, network errors, and throttling send no phone notice.
+`deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
+The table continues to show each regional failure.
+A failure without a notice preserves the streak without claiming a notice.
+A later permission error in that streak can send one notice.
+The registry requires user approval for the new text.
+The approval file remains unchanged.
+The snapshot saves the notice claim before it calls the message process.
+The claim prevents another send for that streak after a crash.
+A crash before delivery can suppress that streak's notice.
+A normal delivery failure clears the claim for the next snapshot attempt with the same key.
+Success in every candidate region ends the streak and drops any unsent notice because no user action remains.
+A later failure starts a new streak and permits a new notice.
+`snapshot_notification_timeout_s=120` bounds message review and delivery in seconds.
+Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
+The read name is `price`, `Standard quota`, or `G and VT quota`.
+The shared `admin_secrets.redact` helper removes AWS account ids, ARNs, access key ids, and instance, subnet, AMI, volume, and snapshot ids.
+The helper first removes credential field values and all following text, including wrapped values.
+It preserves credential fields that already contain `[redacted]`, so repeated redaction keeps appended deployment reports.
+It then removes known credentials and AWS identifiers, including wrapped account ids, access key ids, and ARNs.
+The snapshot first removes request dumps, response dumps, headers, structured dump lines, and all lines after each dump marker.
+It redacts the remaining raw text and selects the first AWS or CLI error line that matches `SNAPSHOT_ERROR_PATTERNS`.
+Every pattern matches only at the start of a line.
+The patterns accept both CLI error formats, `aws: error:` and `aws: [ERROR]:`, with any letter case for `error`.
+They also accept standalone `Invalid choice` and `Parameter validation failed` lines.
+If no line matches, it selects the first non-empty line.
+It discards all other lines, including usage text and request dumps.
+It normalizes that line's whitespace and redacts it again.
+`snapshot_error_reason_max_chars=240` limits the reason after both redaction passes.
+A successful regional read removes previous prices for types or zones absent from the new reply.
+The snapshot does not change `controller.json`.
+
+`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
+It prints machine types as rows and candidate regions as columns.
+Each cell shows the lowest zone price in USD/h.
+An empty cell says `no snapshot`, `read failed`, or `no offer`.
+Cached prices and quotas remain visible after a read failure.
+Their cells include `read failed`, and the regional detail gives the last good age.
+Old values include `old <age>s` in their cells.
+Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
+Each region without evidence says `no snapshot was ever taken`.
+The table never uses a bare `-` for an unavailable value.
+It splits wide tables into groups of region columns to fit the terminal.
+Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
+The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
+Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
+Standard types use the Standard quota; GPU types use the G and VT quota.
+The box counts divide the quota by the existing type-size vCPU calculation and round downward.
+An absent snapshot explains missing quotas and box counts without creating files.
+The rows are `instance_types`, then `price_compare_instance_types`, then `gpu_instance_types`.
+The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
+Below the quotas, `/aws_prices` shows one block for each type, with one line for each candidate region.
+The user asked for this layout on 2026-11-14 through builds. Each line shows:
+1. The lowest zone Spot price in USD/h.
+2. The median merge gate box time and the run count, from launch to finish, boot included.
+   Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
+3. The estimate: Spot price times that box time, plus the refusal wait cost.
+4. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
+5. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
+6. Refused/launched: capacity and quota refusals, and launches, of the type in the region.
+The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
+`ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
+A launch row without a region ran in the home region, `region` in `aws_target.conf`.
+A region without its own runs uses the type's runs in other regions, and the cell says so.
+Runs on days without a bill show `not billed`.
+The last line names the cheapest merge gate by estimate.
+These blocks do not split for a narrow terminal.
+
+`python3 scripts/aws_target/aws_target.py open-gates` reads only the local cost ledger.
+It prints the ledger path, file write time, age, counts by state, and pending compute request count.
+It lists each open attempt, state, reservation time, expiry, instance type, region, and mode.
+It never prints an instance id.
+`ledger.gate_is_open` defines open entries as `GateLaunchPending` or `GateRunning`.
+The spending report uses the same function for open reservations.
+Expired reservations remain open until AWS confirms their closure.
+The command calls `CostLedger.read_snapshot()` and `pending_compute_requests()` without locks, writes, or AWS calls.
+It returns 1 when a gate reservation is open and 0 when none is open.
+Missing or unreadable evidence returns 2.
 
 A new gate ranks only variants from its deployment.
+`deploy.py up` saves the deployed `instance_types` in `gate-deployment.json`.
+A gate skips a configured type that this list does not name, and prints `Run deploy.py up`.
+When the list names no configured type, the gate falls back to natedev before any launch.
+A manifest without the list keeps every configured type.
+An `UnauthorizedOperation` refusal skips that type for the rest of the launch while another type remains.
+`launch.json` saves the skipped types in `unauthorized_types`.
 Before its first ranking, it reads live Spot prices in parallel from each deployed region.
 Each region receives one Linux/UNIX request for all configured `instance_types`.
 `spot_price_live_read_timeout_s=3` bounds the whole parallel read in seconds.
@@ -722,22 +639,28 @@ The live read never writes `spot-prices.json`.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
 Resumed launches keep the saved ranking and evidence without another live read.
 Available variants precede variants under a capacity cooldown.
-Within each group, larger vCPU sizes precede smaller sizes.
-Types with equal vCPU counts compete on expected gate cost.
-That cost includes the hourly Spot price times expected gate hours and the remote region transfer charge.
+Within each group, variants with a current price come first, ranked by the expected USD per run.
+The user, 2026-11-14: "base our spot Requests on lowest price per run".
+Equal costs follow the `instance_types` order.
+Without any current price, the configured region, type, and zone order stays.
+That cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
 `gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
-Expected duration uses the median finished `gate_s` for the same mode within `price_max_age_seconds=7200`.
-Without recent durations, it uses `lifetime_minutes`.
+It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
+Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
+Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
+A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
+Without any runs, it uses `lifetime_minutes`.
+`/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.
 Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
 The median combined size is 7,107,672 bytes.
 At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
 Equal costs keep configured order.
-Missing or stale prices follow fresh prices for the same vCPU count.
+Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
 
 `capacity_cooldown_seconds=1800` moves recently refused capacity to the end without removing it.
@@ -759,8 +682,7 @@ It preserves the configured order within each list.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
 `deploy.py prices` shows the Standard Spot vCPU quota (`L-34B43A08`) for every region in its combined list.
-The price stage of `up` shows this quota for each gate region.
-Only `deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
+`deploy.py prices` also shows the G and VT Spot vCPU quota (`L-3819A6DF`) for each region in its list.
 The reads use the encrypted administrator key through the admin executor.
 A region whose quota is below the largest configured type prints a request for a quota increase.
 The vCPU count comes from the type size: `large` is 2, `xlarge` is 4, and `<N>xlarge` is 4 × N.
@@ -783,8 +705,141 @@ A failed call prints only the AWS error code or Python error class and does not 
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 Both quota codes use these same three IAM actions.
+`python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
+It shares the quota codes and region lists with `quota-request`.
+Each region starts one terminal block with its name as the heading.
+Each quota shows its applied vCPUs once, above an aligned request table.
+The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
+Dates use the user's zone and the last update time, with the creation time as a fallback.
+A quota with no requests prints `No requests.`
+The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
+The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
+It does not use the requested quota as proof of an applied quota.
+When every applied quota is too small, the summary says `no region has enough applied quota`.
+An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
+An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
+The report omits account IDs, ARNs, and request IDs.
+Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
+Any regional failure makes the command exit with status 1.
+The command uses only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota`, including every history page.
+It makes no quota request, paid API call, or local state write.
+The administrator IAM action list in the runbook already includes both read actions.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
 `remove-images` changes the home image and keeps regional stacks and copied images.
 Copied image records permit cleanup after an interrupted deployment.
+
+## GPU size trial
+
+`gpu_size_trial.py` provides local preparation, a transient scaler service, cleanup, and local comparison.
+The session prepares and compares the trial without AWS calls:
+
+```sh
+python3 -m scripts.aws_target.gpu_size_trial prepare --commit SHA
+python3 -m scripts.aws_target.gpu_size_trial compare --trial-folder DIR
+```
+
+The user installs the policy and starts the service:
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py gpu-size-trial run --trial-folder DIR --approve-resources
+```
+
+Preparation uses build admission and natedev holds.
+It builds one archive and one NixOS GPU system closure.
+The Rust tools and nextest come from Nix store paths.
+The Hana toolchain output takes precedence when it exists.
+Otherwise, the pinned host nixpkgs supplies Rust through its locked overlay.
+A Hana `rust-toolchain.toml` selects the Rust version when that file exists.
+Preparation uses a private Cargo cache.
+It never copies the user's Rust or Cargo directories.
+It checks toolchain wrappers for home paths and tests Cargo with an empty `HOME`.
+Preparation builds all features and discovers shared libraries in the Cargo target directory.
+A nextest archive profile inherits `ci` and includes each shared library through `archive.include`.
+The archive retains the workspace's existing archive includes.
+Nextest lists the extracted tests before preparation builds the NixOS closure.
+An archive validation error includes nextest's diagnostic, which names a missing shared library.
+Each measurement run creates its extraction directory before passing it to nextest through `--extract-to`.
+Nextest 0.9.143 returns setup exit 96 when that directory does not exist.
+A failed preparation copies up to 200 final lines of each failed `nextest.log` into `prepare.log`.
+The reader seeks backward in 64 KiB chunks and reads at most 1 MiB per log.
+It retains diagnostics when a run has no valid status record.
+It then keeps only `prepare.log` and removes the other files and GC root links.
+Host trial folders must be canonical direct children of `~/.local/state/gpu-size-trial`.
+The commands refuse nested paths, outside paths, and paths through directory links before deletion.
+A new preparation removes earlier trial folders under `~/.local/state/gpu-size-trial` when no live run holds their locks.
+It refuses to create another folder while a live run holds an earlier folder.
+Preparation, its worker, the service launcher, and the online worker hold folder locks.
+The locks remain outside the trial folders.
+A successful preparation keeps only these inputs and records:
+
+1. `hana-tests.tar.zst`, `closure.export`, and `source.tar`.
+2. `cargo-home/`, `runtime.env`, `gpu-trial.nix`, and `gpu_trial_wrapper.py`.
+3. `closure.json`, `request.json`, `manifest.json`, and `inventory.json`.
+4. `machines/` with baseline reports, samples, and logs, plus `prepare.log`.
+
+After the archive and closure exist, preparation replaces the build tree with the source tar's clean contents.
+It removes that source copy and the temporary Nix profile links after baseline measurement.
+Each measurement removes its extraction directory, source copy, and Cargo target directory when the run ends, including failures.
+Reports, samples, and logs remain.
+The measured inputs imply an estimated peak near 32 GiB during preparation and about 12 GiB after preparation.
+Local measurement needs about 19 GiB because only one extracted archive remains at a time.
+These estimates cover the trial folder; Nix store use is separate.
+
+The service checks candidate regions in their configured order.
+It selects the first region whose applied G and VT Spot quota fits the largest type the trial launches (`gpu_size_trial_spot_max_usd_per_hour`).
+It uses the existing type-size vCPU calculation and refuses a type whose vCPU count is unknown.
+If no region fits, the refusal reports the required vCPUs and each region's applied value.
+The quota request size remains separate from this selection rule.
+It checks regional offerings and current Spot prices.
+It uses the regional gate template and its NixOS image.
+A separate policy statement permits the configured GPU types with the existing tags and a `GpuSizeTrial` tag.
+The CPU gate statement remains unchanged.
+
+Each box imports the signed closure download and reboots once.
+The prepared system enables NVIDIA Vulkan and starts the trial runner.
+The runner uploads each run's report and memory rows separately.
+The wrapper records `ru_maxrss` for the largest single process of each test.
+The report excludes GPU memory.
+
+The ledger stores the mode, trial budget, and root size with each reservation.
+The USD6 check includes completed costs and full open reservations under the accounting lock.
+The daily and monthly limits still apply.
+A restart retains the trial ID, limit, region, and type order.
+A saved budget stop ends the trial.
+After an online run ends, the worker saves its result or error before removing the archive, closure export, source tar, and Cargo cache.
+It removes the temporary upload payload after upload, including an upload failure.
+Metadata, results, and logs remain for comparison.
+A restart uses saved hashes and uploaded inputs when upload completed.
+A failure before upload requires a new preparation.
+
+The service confirms termination before another launch.
+The guest stops five minutes before the lifetime ends.
+The expiry tag triggers two minutes before the lifetime ends.
+`ExecStopPost` cleans known boxes and uncertain launches.
+It saves an error and removes the large inputs if an interrupted worker leaves no final result.
+The service uses no new signal handler.
+
+`gpu_size_trial_root_gib=100` is an estimated disk requirement.
+It includes the GPU driver, runtime, archive extraction, and two test runs.
+The service reserves the configured maximum compute cost plus `gpu_size_trial_box_extra_usd` for each box.
+The default extra is USD0.05.
+
+
+### Hana setup configuration
+
+Existing configuration values remain unchanged.
+
+| New key | Value | Reason |
+| --- | --- | --- |
+| `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
+| `availability_zone` | `us-east-2b` | Keep the retained disk in one zone. |
+| `ami_id` | Empty | Require the reviewed Hana safety image. |
+| `ami_owner_id` | Empty | Require the reviewed image owner. |
+| `vpc_id` | Empty | Require an explicit network. |
+| `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
+| `aws_timeout_s` | `10` | Bound each provider and receiver request. |
+| `control_url_seconds` | `3600` | Bound signed access for one boot. |
+| `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |

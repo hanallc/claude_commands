@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
 import os
@@ -38,7 +38,6 @@ class AwsReportTests(MeasurementFixture):
             + "# range: 0..5\nvault.lock_retry_delay_s=3\n")
         self.state: Path = self.root / ".local/state/build-targets/aws"
         self.seed_cost()
-        self.text_setting("host", "aws-build")
         mac_settings = self.root / "mac_test.conf"
         source = mac_settings.read_text().splitlines()
         _ = mac_settings.write_text("\n".join(
@@ -52,8 +51,14 @@ class AwsReportTests(MeasurementFixture):
             output = report.report(connection, day)
         return output
 
+    def add_spare_peer(self) -> None:
+        path = self.root / 'build_targets.conf'
+        _ = path.write_text(path.read_text().replace('targets=natedev,mac', 'targets=natedev,mac,spare')
+            + 'kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n')
+        _ = (self.root / 'spare.conf').write_text('host=fixture-spare\n')
+
     def exchange(self, target: str, *, ok: bool, at: int) -> None:
-        host = "aws-build" if target == "aws" else "fixture-mac"
+        host = "fixture-spare" if target == "spare" else "fixture-mac"
         with mock.patch.object(time, "time", return_value=float(at)):
             sync.write_status(host, ok, target)
 
@@ -76,7 +81,7 @@ class AwsReportTests(MeasurementFixture):
         _ = registry.write_text(registry.read_text().replace(
             "sync.hosts.natedev=natedev", "sync.hosts.natedev=natedev,local-alias")
             + "kind.worker=local\nplatform.worker=linux\nsync.hosts.worker=worker-host\n")
-        _ = registry.write_text(registry.read_text().replace("targets=natedev,mac,aws", "targets=natedev,worker,mac,aws"))
+        _ = registry.write_text(registry.read_text().replace("targets=natedev,mac", "targets=natedev,worker,mac"))
         identity = record.local_step_identity()
         self.assertEqual(set(identity.hosts), {"natedev", "local-alias", "worker-host"})
         for number, host in enumerate((*identity.hosts, "aws-build")):
@@ -208,7 +213,8 @@ class AwsReportTests(MeasurementFixture):
         charges.mkdir(exist_ok=True)
         reading = ledger.ChargeRead('2026-01-14', NOW, MIDNIGHT - 86400, MIDNIGHT,
             Decimal('1.10'), Decimal(0), Decimal('.02'), (
-                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
+                # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
+                ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
@@ -247,6 +253,19 @@ class AwsReportTests(MeasurementFixture):
             self.assertIn('| 2026-01-15 | $0.30 | $0.30 | $0.00 | $0.00 | $0.00 | 1 | bill |',
                           aws_report.daily_spend_lines([renamed], Decimal(20), DAY))
         print('AWS layout fixture:\n### AWS\n' + section)
+
+    def test_spend_analysis_forecasts_the_month_from_billed_days(self) -> None:
+        def spend(day: str, source: str, gate: str, storage: str) -> ledger.DailySpend:
+            return ledger.DailySpend(day, source, (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(gate)),
+                                                   ledger.SpendGroupCost('storage', Decimal(storage))), 1)
+        spends = [spend('2026-01-15', 'estimated from the newest bill', '1', '0'),
+                  spend('2026-01-14', 'AWS bill', '3', '1'), spend('2026-01-13', 'AWS bill', '1', '1'),
+                  spend('2025-12-31', 'AWS bill', '9', '1')]
+        lines = report.spend_analysis(spends, Decimal(100), date(2026, 1, 15), 2)
+        self.assertEqual(lines[0], '**Month to date (UTC 2026-01): $7.00 of the $100.00 monthly limit. '
+                         + 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days.**')
+        self.assertIn('32-CPU gate compute is 67% of the spend on those days.', lines)
+        self.assertEqual(report.spend_analysis(spends[:1], Decimal(100), date(2026, 1, 15), 2), [])
 
     def test_daily_spend_shows_estimates_after_the_newest_bill(self) -> None:
         spends = tuple(
@@ -291,7 +310,8 @@ class AwsReportTests(MeasurementFixture):
             ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
         ):
             launches.extend((
-                {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched'},
+                {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched',
+                 'region': 'us-east-2'},
                 {'time': at, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'finished', 'gate_s': gate_s}))
         launches.extend((
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
@@ -312,19 +332,58 @@ class AwsReportTests(MeasurementFixture):
             reading = ledger.ChargeRead(day, NOW, at, at + 86400, Decimal('11.20'), Decimal(0), Decimal(0), usage)
             _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
         output = self.render()
+        # The runs launched in us-east-2, so the USW2 bill goes to no run.
         self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
-        self.assertIn('| m7a.8xlarge | $0.1000 per run (2) | $0.2000 per run (1) | $0.1500 per run (3) |', output)
+        self.assertIn('| m7a.8xlarge | $0.0667 per run (2) | $0.1333 per run (1) | $0.1000 per run (3) |', output)
         self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
-        self.assertIn('| All types | $0.3875 per run (3) | $0.2125 per run (3) | $0.3000 per run (6) |', output)
+        self.assertIn('| All types | $0.3708 per run (3) | $0.1792 per run (3) | $0.2750 per run (6) |', output)
         self.assertNotIn('Median test time:', output)
-        self.assertIn('| All shown days | 3 | 2m 0s | 5m 0s | 3 | 1m 30s | 3m 20s | $0.3000 |', output)
+        self.assertIn('| All shown days | 3 | 2m 0s | 5m 0s | 3 | 1m 30s | 3m 20s | $0.2750 |', output)
         self.assertIn('| 2026-01-15 | 1 | 2m 0s | 10m 0s | 1 | 2m 30s | 6m 40s | not billed yet |', output)
-        self.assertIn('| 2026-01-14 | 2 | 2m 0s | 3m 20s | 2 | 1m 0s | 2m 30s | $0.3000 |', output)
+        self.assertIn('| 2026-01-14 | 2 | 2m 0s | 3m 20s | 2 | 1m 0s | 2m 30s | $0.2750 |', output)
         self.assertLess(output.index('| 2026-01-15 |'), output.index('| 2026-01-14 |'))
         for size in ('legacy.8xlarge', 'old.8xlarge', 'future.8xlarge', 'refused.8xlarge', 'orphan.8xlarge', 'excluded.8xlarge'):
             self.assertNotIn(f'| {size} |', output)
         self.assertIn('Source: cloud-gate-launches.jsonl and charges/<day>.json; UTC 2026-01-14 through 2026-01-15 (2 days)', output)
         self.assertIn('billed days only; 4 rows omitted with no kind or matching launch.', output)
+
+    def test_gate_fallback_lines_show_one_short_reason_per_event_in_the_window(self) -> None:
+        events: list[dict[str, object]] = [
+            {'time': NOW, 'attempt': 'fixture-attempt', 'mode': 'targeted-test', 'result': 'fallback',
+             'reason': 'The checkout changed after the test selection\nfixture traceback'},
+            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'image or stack is absent'},
+            {'time': MIDNIGHT - 86401, 'attempt': 'old', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture old reason'},
+            {'time': MIDNIGHT + 86400, 'attempt': 'future', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture future reason'},
+        ]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        numeric_settings(self.settings, {'gate_type_window_days': '1'})
+        output = self.render()
+        lines = [line for line in output.splitlines() if line.startswith('- Cloud gate uses natedev:')]
+        self.assertEqual(len(lines), 2)
+        at = datetime.fromtimestamp(NOW, UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+        self.assertEqual(lines[0], '- Cloud gate uses natedev: The checkout changed after the test selection '
+                         + f'({at}, targeted-test).')
+        self.assertIn('image or stack is absent', lines[1])
+        for hidden in ('fixture traceback', 'fixture old reason', 'fixture future reason'):
+            self.assertNotIn(hidden, output)
+
+    def test_gate_fallback_line_handles_missing_and_long_reasons(self) -> None:
+        events: list[dict[str, object]] = [
+            {'time': NOW, 'attempt': '', 'result': 'fallback'},
+            {'time': NOW - 1, 'attempt': '', 'mode': 'merge-gate', 'result': 'fallback',
+             'reason': 'fixture ' * 100},
+        ]
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        comparison = aws_report.gate_type_report(self.state, DAY, 1)
+        lines = [line for line in comparison.tables if line.startswith('- Cloud gate uses natedev:')]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('Reason unavailable', lines[0])
+        self.assertIn('unknown mode', lines[0])
+        self.assertIn('...', lines[1])
+        self.assertLess(len(lines[1]), len(str(events[1]['reason'])))
 
     def test_gate_type_comparison_shows_unbilled_and_empty_cells_for_one_type(self) -> None:
         launches = [
@@ -438,56 +497,61 @@ class AwsReportTests(MeasurementFixture):
                 self.assertIn('| estimate |', output)
 
     def test_aws_failure_preserves_mac_success_without_an_aws_data_sync_line(self) -> None:
+        self.add_spare_peer()
         self.exchange("mac", ok=True, at=NOW - 180)
-        self.exchange("aws", ok=True, at=NOW - 120)
-        self.exchange("aws", ok=False, at=NOW - 60)
+        self.exchange("spare", ok=True, at=NOW - 120)
+        self.exchange("spare", ok=False, at=NOW - 60)
         output = self.render()
-        aws, mac = self.peer_line(output, "aws"), self.peer_line(output, "mac")
-        self.assertIn("failed", aws)
-        self.assertIn("last successful exchange", aws)
-        self.assertIn("latest failure", aws)
-        self.assertIn("buildlog sync", aws)
+        spare, mac = self.peer_line(output, "spare"), self.peer_line(output, "mac")
+        self.assertIn("failed", spare)
+        self.assertIn("last successful exchange", spare)
+        self.assertIn("latest failure", spare)
+        self.assertIn("buildlog sync", spare)
         self.assertIn("current", mac)
         self.assertIn("latest failure none", mac)
         self.assertNotIn("AWS report data synchronized at", output)
         self.assertNotIn("AWS report data never synchronized", output)
 
     def test_mac_failure_does_not_mark_the_aws_exchange_as_failed(self) -> None:
-        self.exchange("aws", ok=True, at=NOW - 120)
+        self.add_spare_peer()
+        self.exchange("spare", ok=True, at=NOW - 120)
         self.exchange("mac", ok=True, at=NOW - 180)
         self.exchange("mac", ok=False, at=NOW - 60)
         output = self.render()
         self.assertIn("failed", self.peer_line(output, "mac"))
-        self.assertIn("current", self.peer_line(output, "aws"))
-        self.assertIn("latest failure none", self.peer_line(output, "aws"))
+        self.assertIn("current", self.peer_line(output, "spare"))
+        self.assertIn("latest failure none", self.peer_line(output, "spare"))
 
     def test_first_failure_and_never_synchronized_peers_show_the_recovery_action(self) -> None:
-        self.exchange("aws", ok=False, at=NOW - 60)
+        self.add_spare_peer()
+        self.exchange("spare", ok=False, at=NOW - 60)
         output = self.render()
-        aws = self.peer_line(output, "aws")
-        self.assertIn("last successful exchange never", aws)
-        self.assertIn("latest failure", aws)
-        self.assertIn("buildlog sync", aws)
+        spare = self.peer_line(output, "spare")
+        self.assertIn("last successful exchange never", spare)
+        self.assertIn("latest failure", spare)
+        self.assertIn("buildlog sync", spare)
         self.assertIn("never synchronized; run buildlog sync", self.peer_line(output, "mac"))
         self.assertNotIn("AWS report data never synchronized", output)
 
     def test_global_pause_names_resume_for_each_active_peer(self) -> None:
-        self.exchange("aws", ok=True, at=NOW - 120)
+        self.add_spare_peer()
+        self.exchange("spare", ok=True, at=NOW - 120)
         paused = self.root / "buildlog" / store.SYNC_PAUSED_NAME
         _ = paused.write_text(json.dumps({"since": store.utc_iso(NOW - 60), "why": "fixture maintenance"}))
         output = self.render()
-        for target in ("mac", "aws"):
+        for target in ("mac", "spare"):
             line = self.peer_line(output, target)
             self.assertIn("globally paused", line)
             self.assertIn("fixture maintenance", line)
             self.assertIn("buildlog sync resume", line)
 
     def test_recovery_keeps_the_latest_failure_and_the_legacy_mac_status(self) -> None:
+        self.add_spare_peer()
         self.exchange("mac", ok=True, at=NOW - 180)
-        self.exchange("aws", ok=False, at=NOW - 120)
-        self.exchange("aws", ok=True, at=NOW - 60)
+        self.exchange("spare", ok=False, at=NOW - 120)
+        self.exchange("spare", ok=True, at=NOW - 60)
         output = self.render()
-        line = self.peer_line(output, "aws")
+        line = self.peer_line(output, "spare")
         self.assertIn("recovered", line)
         self.assertNotIn("latest failure none", line)
         expected = sync.sync_time(store.utc_iso(NOW - 120), datetime.now())

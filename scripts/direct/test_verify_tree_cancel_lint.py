@@ -11,12 +11,15 @@ import sys
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast
+from unittest.mock import patch
 
+from scripts.agents import detached_runs
 from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.production import staff
 
 
 class CompletedLintRun(TypedDict):
@@ -43,12 +46,23 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         try:
             output, errors = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            self.fail("lint kept a verify process after its group received SIGTERM")
-        self.assertEqual(process.returncode, 0, output + errors)
+            surviving: list[dict[str, object]] = []
+            for group in sorted(self.started_groups):
+                for pid in self.live_group_processes(group):
+                    try:
+                        surviving.append({"pid": pid, "pgid": os.getpgid(pid),
+                            "argv": Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")})
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+            saved = (self.control / "lint-run.json").read_text()
+            log = (self.control / "lint-run.log").read_text()[-4000:]
+            self.fail("lint kept a verify process after its group received SIGTERM: "
+                      + json.dumps(surviving) + "\n" + saved + "\n" + log)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        self.wait_for_group_exit(process.pid, timeout=5)
         record = cast(CompletedLintRun, json.loads((self.control / "lint-run.json").read_text()))
         log = (self.control / "lint-run.log").read_text()
         self.assertEqual(record["exit_code"], 143, log)
-        self.wait_for_group_exit(process.pid, timeout=5)
         for group in self.started_groups:
             self.assertEqual(self.live_group_processes(group), [], "lint kept a verify process")
         with self.admission.loop_turn():
@@ -59,6 +73,14 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [])
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assert_no_cache_verdict()
+        with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
+              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
+            finished = cast(detached_runs.RunRecord, json.loads((self.control / "lint-run.json").read_text()))
+            self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            delivery.assert_called_once()
 
     def test_group_term_stops_lint_and_releases_admission(self) -> None:
         for stage in ("mend", "clippy"):
@@ -78,17 +100,49 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
                 self.assert_resources_released()
                 self.assert_no_cache_verdict()
 
-    def pause_state_move(self, *, after_first_natedev: bool = False) -> None:
+    def test_reaping_waits_for_cleanup_before_delivering_the_saved_status(self) -> None:
+        self.pause_state_move()
+        release = self.control / "cleanup-release"
+        self.addCleanup(release.touch)
+        process = self.start_supervised_verify("lint", TEST_BLOCK_STAGE="mend")
+        self.wait_for_running(self.control / "running", process)
+        self.assert_resources_held()
+        _ = (self.control / "cleanup-armed").touch()
+        send_process_group(process.pid, signal.SIGTERM)
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5)
+        path = self.control / "lint-run.json"
+        with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
+              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual(pending["status"], "running")
+            self.assertNotIn("exit_code", pending)
+            delivery.assert_not_called()
+            _ = release.touch()
+            self.wait_for_group_exit(process.pid, timeout=5)
+            self.assert_resources_released()
+            self.assert_no_cache_verdict()
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
+            finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+            self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+            delivery.assert_called_once()
+            delivered = cast(detached_runs.CompletedCommand, delivery.call_args.args[1])
+            self.assertEqual(delivered.code, 143)
+            self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
+            delivery.assert_called_once()
+
+    def pause_state_move(self, *, on_natedev: bool = False) -> None:
         move = self.root / "stubs/mv"
         real_move = shutil.which("mv")
         assert real_move is not None
         move.unlink(missing_ok=True)
         arm = (
             'case "$(cat "$3" 2>/dev/null)" in *on_natedev*)\n'
-            + '    if [ -e "$TEST_CONTROL/publication-seen" ]; then\n'
-            + '        touch "$TEST_CONTROL/cleanup-armed"\n'
-            + '    else touch "$TEST_CONTROL/publication-seen"; fi;;\nesac\n'
-        ) if after_first_natedev else ""
+            + '    touch "$TEST_CONTROL/cleanup-armed";;\nesac\n'
+        ) if on_natedev else ""
         self.write_shell_tool(move, arm +
             'if [ -e "$TEST_CONTROL/cleanup-armed" ]; then\n'
             + '    case "$*" in *.state*)\n'
@@ -115,7 +169,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assert_no_cache_verdict()
 
     def test_term_during_state_publication_removes_the_record_state_and_temporary_file(self) -> None:
-        self.pause_state_move(after_first_natedev=True)
+        self.pause_state_move(on_natedev=True)
         release = self.control / "cleanup-release"
         self.addCleanup(release.touch)
         process = self.start_verify("lint", TEST_BLOCK_STAGE="mend")

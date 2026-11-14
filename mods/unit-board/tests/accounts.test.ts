@@ -356,21 +356,45 @@ describe('accounts table', () => {
     });
   }
 
-  test('activity columns preserve busy, idle, paused, exited, and total order', async ($, on) => {
-    const fake = accountsHost(on);
-    const data = statusFixture();
-    data.accounts = [{ ...data.accounts[0]!, roles: ['units'], selected_roles: ['units'],
-      role_counts: [{ busy: 1, idle: 2, paused: 3, exited: 4, total: 10 }] }];
-    data.problems = [];
-    fake.replace(data);
-    await $.command.run(command());
-    const ui = await mount($);
-    const lines = rowLines(await ui.drawn());
-    expect(lines[0]!.trim().split(/\s+/)).toEqual([
-      'account', 'left', 'role', 'busy', 'idle', 'paused', 'exited', 'total', 'resets', 'credits', 'enabled']);
-    expect(normalized(accountLines(await ui.drawn(), 'Low'))).toContain('units ✓ 1 2 3 4 10');
-    expect(lines.join(' ')).not.toContain('shell');
-  });
+  for (const [name, count, expected, total] of [
+    ['current status', { busy: 1, idle: 2, paused: 3, exited: 4, total: 10 }, '1 2 3 4 10', '2 4 6 8 20'],
+    ['older status', { busy: 1, starting: 5, waiting: 6, idle: 2, paused: 3, exited: 4, total: 21 }, '12 2 3 4 21', '24 4 6 8 42'],
+    ['older starting only', { busy: 1, starting: 5, idle: 2, paused: 3, exited: 4, total: 15 }, '6 2 3 4 15', '12 4 6 8 30'],
+    ['older waiting only', { busy: 1, waiting: 6, idle: 2, paused: 3, exited: 4, total: 16 }, '7 2 3 4 16', '14 4 6 8 32'],
+  ] as const) {
+    for (const columns of [170, 100, 50, 30]) {
+      test(`${name}, ${columns} cells: activity columns preserve the status order and totals`, async ($, on) => {
+        const fake = accountsHost(on);
+        const data = statusFixture();
+        data.accounts = [{ ...data.accounts[0]!, roles: ['units', 'showrunners'], selected_roles: ['units'],
+          role_counts: [count, count] }];
+        data.problems = [];
+        fake.replace(data);
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts', component: 'Pane',
+          surface: 'terminal', props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        const headings = ['busy', 'idle', 'paused', 'exited', 'total'];
+        const facts = (values: string) => values.split(' ').map((value, index) => `${headings[index]} ${value}`).join(' ');
+        const row = normalized(accountLines(tree, 'Low')).replace(/ · /g, ' ');
+        if (columns >= 100) {
+          expect(lines.slice(0, lines.findIndex(line => line.startsWith('● '))).join(' ').trim().split(/\s+/)).toEqual([
+            'account', 'left', 'role', ...headings, 'resets', 'credits', 'enabled']);
+          expect(row).toContain(`units ✓ ${expected}`);
+          expect(row).toContain(`showrunners ${expected}`);
+        } else {
+          expect(row).toContain(`role units ✓ ${facts(expected)}`);
+          expect(row).toContain(`role showrunners ${facts(expected)}`);
+        }
+        const totalIndex = lines.findIndex(line => line === 'total' || line.startsWith('   total '));
+        expect(normalized(lines.slice(totalIndex)).replace(/ · /g, ' ')).toBe(
+          columns >= 100 ? `total ${total}` : `total ${facts(total)}`);
+        expect(lines.join(' ')).not.toContain('shell');
+        for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+      });
+    }
+  }
 
   for (const upcoming of [
     ['Upcoming moves:', 'showrunners 1: at 1% → claude3, else claude2', '', 'units 1: at 1% → claude4', '', 'workers 1: at 1% → codex2'],
@@ -457,7 +481,7 @@ describe('accounts table', () => {
       const lines = rowLines(tree);
       if (columns === 140) expect(lines.find(line => line.trim().startsWith('total'))!.trim().replace(/\s+/g, ' '))
         .toBe('total 7 6 0 3 16');
-      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain(columns === 30 ? 'total busy 7 · idle 6 · paused 0 exited 3' : 'total busy 7 · idle 6 · paused 0 · exited 3');
+      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain(columns === 30 ? 'total busy 7 · idle 6 · paused 0 exited 3 · total 16' : 'total busy 7 · idle 6 · paused 0 · exited 3 · total 16');
       expect(JSON.stringify(data)).toBe(before);
       data.accounts[1]!.role_counts_by_machine = {};
       expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
@@ -563,8 +587,8 @@ describe('accounts table', () => {
       expect(header.indexOf('role')).toBe(18);
       expect(header.indexOf('left')).toBe(12);
       expect(header.indexOf('busy')).toBe(34);
-      expect(header.indexOf('exited')).toBe(54);
       expect(header.indexOf('idle')).toBe(40);
+      expect(header.indexOf('exited')).toBe(54);
       expect(header.indexOf('total')).toBe(62);
       const firstRows = lines.filter(line => line.startsWith('● '));
       for (const [i, row] of firstRows.entries()) {
@@ -574,8 +598,8 @@ describe('accounts table', () => {
         expect(row.slice(12, 16).trim()).toBe(['60%', '20%', '8%', '25%', '—', '90%', '74%'][i]);
         expect(row[15]).toBe(i === 4 ? '—' : '%');
         expect(row.slice(34, 38).trim()).toBe(['1', '7', '0', '', '0', '', '1'][i]);
-        expect(row.slice(54, 60).trim()).toBe(['1', '0', '0', '', '0', '', '1'][i]);
         expect(row.slice(40, 44).trim()).toBe(['0', '5', '1', '', '0', '', '2'][i]);
+        expect(row.slice(54, 60).trim()).toBe(['1', '0', '0', '', '0', '', '1'][i]);
         expect(row.slice(62, 67).trim()).toBe(['2', '12', '1', '', '0', '', '4'][i]);
       }
       const detail = columns === 140 ? firstRows : firstRows.map(row => lines[lines.indexOf(row) + 1]!);
@@ -591,7 +615,7 @@ describe('accounts table', () => {
     }
   });
 
-  for (const columns of [140, 80, 50]) {
+  for (const columns of [140, 100, 50]) {
     test(`all columns remain at ${columns} cells when no balance exists`, async ($, on) => {
       const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
       const data = readableFixture();
@@ -699,7 +723,7 @@ describe('accounts table', () => {
       "●  Unknown     —",
       "●  Zero       0%                                                         0",
       "   total                   0     0       0       0      0"
-]);
+    ]);
     const text = rowLines(tree).join(' ');
     for (const missing of ['no reading', 'null', 'undefined', 'Problems']) expect(text).not.toContain(missing);
   });

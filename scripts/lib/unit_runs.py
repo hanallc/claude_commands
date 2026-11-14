@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, cast
@@ -64,7 +64,7 @@ class RunOwnerUnrecorded:
 
 
 def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnrecorded:
-    """Resolve a fixed owner first; older runs can still name their director."""
+    """Resolve the run owner through its fixed staff reference."""
     from scripts.production import staff
 
     reference = fields.get(OWNER_FIELD)
@@ -73,11 +73,7 @@ def run_owner(fields: Mapping[str, object], record: staff.StaffSnapshot) -> staf
         if row is None or row.kind not in ("unit", "showrunner"):
             raise staff.StaffUnreadable(f"run owner {reference}: unit staff row is unavailable")
         return row
-    identity = fields.get("main_agent")
-    agent = cast(dict[str, object], identity) if isinstance(identity, dict) else {}
-    reference = agent.get("session_id") or fields.get("owner_session") or fields.get("director_session")
-    row = record.owner_of(reference) if isinstance(reference, str) and reference else None
-    return row if row is not None and row.kind in ("unit", "showrunner") else RunOwnerUnrecorded("run has no unit staff owner")
+    return RunOwnerUnrecorded("run has no unit staff owner")
 
 
 def environ(name: str) -> str:
@@ -154,11 +150,9 @@ def run_is_open(folder: Path, *, record: staff.StaffSnapshot | None = None) -> b
         return "status" not in fields
     record = staff.local_snapshot() if record is None else record
     reference = fields.get(OWNER_FIELD)
-    agent = fields.get("main_agent")
-    identity = cast(dict[str, object], agent).get("session_id") if isinstance(agent, dict) else None
-    identity = identity or fields.get("owner_session") or fields.get("director_session")
-    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str)
-             else record.by_member_reference(identity) if isinstance(identity, str) else None)
+    owner = (record.by_id(staff.StaffId(reference)) if isinstance(reference, str) else
+             next((row for row in record.rows if isinstance(row.run, staff.OpenRun)
+                   and row.run.path.resolve() == folder), None))
     return (isinstance(owner, staff.StaffRow) and isinstance(owner.run, staff.OpenRun)
             and owner.run.path.resolve() == folder)
 
@@ -274,6 +268,12 @@ def held_by_session(root_override: str | Path | None = None, *,
     return found
 
 
+@lru_cache(maxsize=4096)
+def _real_path(folder: str) -> Path:
+    """Resolve a scanned run folder once per process; one board read compares each folder many times."""
+    return Path(folder).resolve()
+
+
 def held(session_id: str, root_override: str | Path | None = None,
          *,
          scanned: dict[str, list[str]] | None = None,
@@ -287,16 +287,16 @@ def held(session_id: str, root_override: str | Path | None = None,
     if target is not None:
         resolved = target.resolve()
         owner = next((session for session, paths in folders.items()
-                      if any(Path(path).resolve() == resolved for path in paths)), None)
+                      if any(_real_path(path) == resolved for path in paths)), None)
         if owner is None:
             owner = director(target, record=record)
             if owner == session_id:
                 folders.setdefault(owner, []).append(str(target))
         if owner == session_id:
             runs.append(str(target))
-    seen = {Path(run).resolve() for run in runs}
+    seen = {_real_path(run) for run in runs}
     for folder in folders.get(session_id, ()):
-        resolved = Path(folder).resolve()
+        resolved = _real_path(folder)
         if resolved not in seen:
             seen.add(resolved)
             runs.append(folder)
