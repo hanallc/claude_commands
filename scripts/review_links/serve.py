@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
-from scripts.disks import disks_page, slots
+from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
 from scripts.review_links import branch_page, change_page, change_browser, console, image_store, images
@@ -544,7 +544,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return False
 
     def disks_measure_post(self) -> None:
-        """Start a Disks page measure in the background and answer at once with the slots' current use."""
+        """Start a Disks page measure in the background and answer at once with the slots and sessions in use now."""
         now = time.time()
         try:
             started = disks_page.start_measure(now)
@@ -556,7 +556,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks slots: {error}", file=sys.stderr)
             report = None
-        self.json_response(200, {"state": started.value, "slots": report})
+        try:
+            folders = sessions.session_report()
+        except (OSError, ValueError) as error:
+            print(f"review-links disks sessions: {error}", file=sys.stderr)
+            folders = None
+        self.json_response(200, {"state": started.value, "slots": report, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

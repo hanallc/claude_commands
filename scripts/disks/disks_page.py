@@ -37,6 +37,7 @@ class PageSettings(TypedDict):
     cache_seconds: int
     poll_seconds: int
     wait_seconds: int
+    sessions_shown: int
     names: dict[str, str]
 
 
@@ -51,7 +52,8 @@ def page_settings() -> PageSettings:
     names = {mount: name for mount in drives if (name := settings.values().get(NAME_KEY + mount))}
     return {"slider_min_gib": settings.number("slider.min_gib"), "slider_default_gib": settings.number("slider.default_gib"),
             "cache_seconds": settings.whole("cache_seconds"), "poll_seconds": settings.whole("page.poll_seconds"),
-            "wait_seconds": settings.whole("measure.timeout_seconds") * len(drives), "names": names}
+            "wait_seconds": settings.whole("measure.timeout_seconds") * len(drives),
+            "sessions_shown": settings.whole("page.sessions_shown"), "names": names}
 
 
 def publish(folder: Path, settings: PageSettings) -> Path:

@@ -1671,7 +1671,7 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
 
-### Phases 95–99 — The Disks page · status: in progress (95 to 98 done)
+### Phases 95–99 — The Disks page · status: done
 
 From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
 1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
@@ -1791,3 +1791,19 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 1. The card reads the session root from config when verify adds it. With no such key, the card does not show.
 2. Each session row shows its size, the held folders from verify's hold records, and its state.
 3. An ended session shows when its folder is deleted, from the same records.
+
+##### Phase 99 as-built
+
+Builds asked for verify's folder layout phase 4 (10c25b033) in this branch before it merges, so the card reads verify's own readers.
+
+- `scripts/disks/sessions.py`:
+  - `session_report` reads the root from `session_folder.session_root`. Until that folder exists, it returns nothing and the page shows no card.
+  - `read_sessions` lists each folder under the root, largest first. Dot folders, links and files are not sessions.
+  - Size: `measure.tree_size` of the folder at `measure.drive_path`. On natedev `/session` is a mount of `/build/session`, so the size comes from the build drive's tree.
+  - Held folders: each `scratch.holds()` path inside the folder, by its path in the folder. A hold that ended with unsaved work shows "(unsaved work)".
+  - State: `session_records.session_liveness` of the session id in `.session.json`: running, ended, or unknown ("—").
+  - No code deletes a session folder yet, so the card shows no delete time (condition 5). The held folders go when their task ends (`scratch.end`); the task name is the tooltip of each held folder.
+- `scripts/disks/measure.py`: `tree_size` moved here from `slots.py`, with `read_data`, `read_mounts` (`/proc/self/mountinfo`, none on the Mac) and `drive_path`.
+- `scripts/review_links/serve.py`: the measure answer adds `sessions`.
+- `scripts/disks/disks.html`: the Sessions card follows mockup 2: Session, Size, a bar on the largest session's scale, Held folders and State. `page.sessions_shown` in `disks.conf` (10) names the largest sessions; one row adds up the rest. On a phone the bar does not show.
+- Tests: `test_sessions` (sizes through the mount, held folders, states, no root), `test_measure` (the mount table and `drive_path`), `test_disks_page` (the card HTML), `test_serve` (the answer). Chrome check with fixture sessions: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.

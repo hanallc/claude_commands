@@ -8,7 +8,7 @@ from pathlib import Path, PurePath
 from typing import Literal
 from unittest import mock
 
-from scripts.disks import slots
+from scripts.disks import measure, slots
 from scripts.disks.measure import DisksData, Folder
 from scripts.lib import build_slots, conf
 
@@ -36,8 +36,8 @@ class TreeSizeTests(unittest.TestCase):
         cases = {"/build/cargo/hana-slot1": 70 * GIB, "/build/cargo": 200 * GIB, "/home/natepiano/slot": 3 * GIB,
                  "/build/cargo/hana-slot2": 40 * GIB, "/build/cargo/hana-slot2/debug": 40 * GIB,
                  "/build/cargo/hana-slot3": 0, "/data/slot": None, "/build": 500 * GIB}
-        self.assertEqual({path: slots.tree_size(DATA, PurePath(path)) for path in cases}, cases)
-        self.assertIsNone(slots.tree_size(None, PurePath("/build")))
+        self.assertEqual({path: measure.tree_size(DATA, PurePath(path)) for path in cases}, cases)
+        self.assertIsNone(measure.tree_size(None, PurePath("/build")))
 
 
 class ReadSlotsTests(unittest.TestCase):

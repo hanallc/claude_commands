@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stdout
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import cast
 
 from scripts.disks import disks_page, measure
@@ -71,6 +71,27 @@ class TreeTests(unittest.TestCase):
         self.assertEqual(command[:7], ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=2G", "--"])
         self.assertEqual(command[7:], ["nice", "-n", "19", "ionice", "-c3", "du", "-x", "-B1",
                                        f"--threshold={KEEP}", "/build"])
+
+
+class MountTests(unittest.TestCase):
+    def test_a_path_under_a_mount_of_a_subfolder_is_found_under_its_whole_file_system(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            table = Path(directory) / "mountinfo"
+            _ = table.write_text("\n".join((
+                "1 0 259:2 / / rw - ext4 /dev/root rw",
+                "2 1 254:0 / /build rw - ext4 /dev/mapper/build rw",
+                "3 1 254:0 /session /session rw - ext4 /dev/mapper/build rw",
+                "4 1 254:0 /my\\040disk /space\\040here rw - ext4 /dev/mapper/build rw",
+                "short line")) + "\n")
+            mounts = measure.read_mounts(table)
+            self.assertEqual(measure.read_mounts(Path(directory) / "absent"), ())
+        self.assertEqual(len(mounts), 4)
+        cases = {"/session/fps/run": "/build/session/fps/run", "/session": "/build/session", "/build/cargo": "/build/cargo",
+                 "/home/natepiano": "/home/natepiano", "/space here/x": "/build/my disk/x"}
+        self.assertEqual({path: str(measure.drive_path(PurePath(path), mounts)) for path in cases}, cases)
+        # With no mount of the whole file system, the path stays as it is.
+        self.assertEqual(measure.drive_path(PurePath("/session/fps"), mounts[2:3]), PurePath("/session/fps"))
+        self.assertEqual(measure.drive_path(PurePath("/session/fps"), ()), PurePath("/session/fps"))
 
 
 class MeasureTests(unittest.TestCase):
