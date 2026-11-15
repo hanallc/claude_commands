@@ -142,18 +142,33 @@ The [accounts configuration section](accounts.md#runtime-configuration-and-const
 Its `conf_value` uses shell builtins for valid integer and text settings and calls Python when validation needs it.
 
 `/tune` publishes one user-approved setting through `scripts/lib/tune.py`.
-It validates the requested value and refuses an uncommitted edit to that setting's file.
-It preserves the line's comments and spacing.
-The commit uses `tune(<file>): <key> <old> -> <new>` and a `User-Approved:` trailer.
+It validates the requested value and preserves the line's comments and spacing.
+`scripts/lib/live_settings.py` writes the value live on natedev before any Git step.
+It records the change in `$XDG_STATE_HOME/live-settings/waiting.json` under a lock.
+`/tune` writes the value live on the Mac over ssh in the same step.
+It then starts each notes part that `readers` in `config/live_settings.conf` names for the file.
+The commit holds only that row and uses `tune(<file>): <key> <old> -> <new>` with a `User-Approved:` trailer.
+Other waiting rows in the same file stay live and uncommitted.
+A recorded change whose live value has changed again gets no commit; the newest value reaches main.
+A refused or busy main keeps the value live and the change recorded; the quota part of the notes timer publishes it when main is free.
 A same-value retry finishes publication without another commit.
 `scripts/lib/main_publish.py` supplies the shared publication path for `/tune` and `/zone`.
 Its preparation and push each take a short [main push lock](repair-rounds.md#shared-main-push-lock).
 It accepts unpublished subjects beginning `tune(`, `zone(`, or `user zone: `.
 It refuses another unpublished commit before changing the setting.
-It fetches main and rebases pending publisher commits when a fast-forward fails.
-The rebase uses `--no-autostash --no-update-refs --empty=drop`.
-A conflict names the commit and files, aborts the rebase, and preserves main.
+When a fast-forward fails, it copies each pending publisher commit onto origin/main with `git merge-tree`.
+A copy keeps the author, date and message; a copy with no change is dropped.
+A conflict or a merge commit names the commit and preserves main.
+`scripts/lib/waiting_rows.py` moves the checkout and keeps each waiting row live.
+A waiting row is a `config/*.conf` value that differs from HEAD; other edits in those files refuse the move.
+Main synchronization, local promotion, the Mac pull and the registry fast-forward use the same move.
 After publication, the Mac pulls or receives a queued pull.
+`scripts/lib/mac_wake.py` sends a queued pull as soon as the Mac answers.
+Each queue writer and each quota pass call `mac_wake.start()`.
+It starts one detached watcher on natedev while a pull waits; a lock keeps it to one.
+The watcher probes the Mac over ssh and runs `zone.py drain` when the Mac answers.
+`mac_wake_probe_seconds` and `mac_wake_pause_seconds` in `config/live_settings.conf` set its pace.
+The watcher exits when nothing waits. A fixture queue starts no watcher.
 
 `showrunners.timer_scratch` uses the showrunner's fixed staff id to find its timer.
 It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratchAbsent`, or `TimerScratchFound`.
@@ -277,7 +292,20 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
-  8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
+     A red names its failed nextest tests, or the red modules of a merge gate command (`--- <suite>/<module> exit=<rc> ---`).
+     A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
+  8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
+     The run is limited to its red names, with `--filter`, `-E test(=<name>)` or the merge gate's `--module <suite>/<module>`.
+     The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
+     A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
+     The unit gets a repair line only for its own red names.
+     When every red name is also red on the base, the stop is `red: held`, and the unit's line tells it to send nothing.
+     A command with no red names is the base's red only when the whole command is red on the base.
+     A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
+     A command that cannot start on the base, and a main conflict, also leave the red with the unit.
+     A resumed merge whose restored tip already holds the checkpoint runs no base check.
+     A batch runs the base check before its bisect. A base red holds every item, and the bisect runs only the units' own red names.
+  9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
@@ -293,19 +321,19 @@ Each local Promote checkout must exist before the command pushes.
      An interrupted promotion and a child handoff use the same test loop.
      Each caller retains its own rollback rule for a failed push.
      `ValidateAndPush` uses `validate_and_push.sh --quick --to <merge branch>` with the configured fix subject and optional `--cancel-prior`.
-     Local promotion fast-forwards each main checkout to the pushed tip.
+     Local promotion fast-forwards each main checkout to the pushed tip and keeps its waiting setting rows live.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
      It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
-  9. Record the code checkpoint's review ledger row and production log line.
+  10. Record the code checkpoint's review ledger row and production log line.
      `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
      The ledger key includes unit, plan, and phase.
      The LOG line identifies the checkpoint, merge, tests, push, and promotion.
      An existing matching log line skips the write.
-- **Merge report.** Step 8 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
+- **Merge report.** Step 9 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
 - **Change review** (`scripts/production/change_review.py`).
   A visible checkpoint line has three fields: `<what changed> | <how to try> | <what you see>`.
@@ -541,12 +569,11 @@ Pane labels do not identify a consultation.
   Bare, it prints the configured zone, label, UTC offset, and current time.
   `set NAME` resolves an IANA name, city, or current seasonal label.
   Ambiguous or unknown names exit 2 with the candidate offsets.
-  Publication runs on natedev through `main_publish`, shared with `/tune`.
-  It updates `zone=` while preserving comments, commits only that file, and pushes main.
-  A failed commit keeps the new text when the file already matches HEAD.
-  Otherwise, it restores the previous text and refuses publication.
-  The Mac pulls through the shared helper, and the broadcast reaches both machines.
-  A failed pull queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
+  It runs on natedev through `live_settings`, the path `/tune` uses.
+  It writes `zone=` live on natedev and on the Mac at once, while preserving comments.
+  The broadcast then reaches both machines. The commit of only that row, the push and the Mac pull follow.
+  A failed publication keeps the zone live and exits 2; the notes timer publishes it later.
+  A failed Mac write queues its notice in `<XDG_STATE_HOME>/zone/mac.json` and broadcasts locally.
   Pending pulls retain each Mac path and source.
   A bare call drains the queue before it returns.
   Promotion runs `zone.py drain --pulled <path>` after a successful pull.
@@ -584,6 +611,7 @@ Pane labels do not identify a consultation.
   Showrunner sessions retain the full production counts.
   `counts_row.py --unit <staff id>` writes `<showrunner state>/counts/<unit staff id>`.
   Each cache retains the counts line, deadline, and watched paths.
+  A refresh reads each proposal issue file once; the watched paths and the proposals count use that one read.
   A unit cache ends with `source=unit:<staff id>`.
   A source marker mismatch forces a refresh, even when the cache is newer than staff.
   The status line refreshes only that unit's cache when a watched path changes or the deadline passes.

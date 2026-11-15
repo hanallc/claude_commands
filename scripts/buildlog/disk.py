@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf
-from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+from scripts.lib import conf, copy_record
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.lib.user_zone import user_zone
 
 from scripts.buildlog import store
@@ -88,6 +88,14 @@ FOLDERS: list[tuple[str, str]] = [
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
 ]
+
+
+def scanned_folders() -> list[tuple[str, str]]:
+    """FOLDERS plus the scratch root when no folder holds it; task checkouts build there."""
+    scratch = copy_record.root()
+    if any(scratch.is_relative_to(Path(path).expanduser()) for _, path in FOLDERS):
+        return list(FOLDERS)
+    return [*FOLDERS, ("scratch", str(scratch))]
 
 
 @dataclass(frozen=True)
@@ -265,23 +273,30 @@ def capacity_rows(paths: list[Path], measured: tuple[tuple[int, filesystem.Files
 
 
 def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], list[str]]:
-    """Read current mappings and retain saved output roots for older workspaces."""
+    """Use the saved output roots, and ask Cargo only for checkouts that no saved row maps."""
     from scripts.lint import sweep
 
     saved = sweep.saved_cargo_output_roots()
     mappings = list((*saved.workspaces, *saved.history))
     checkouts: list[str] = []
     _ = sweep.target_dirs([path for _, path in folders], checkouts=checkouts)
-    checkouts.extend(str(item.workspace_root) for item in saved.workspaces
-                     if (item.workspace_root / "Cargo.toml").is_file())
+    mapped = {item.workspace_root.resolve() for item in saved.workspaces}
+    found: list[CargoOutputRoots] = []
     unavailable: list[str] = []
-    for checkout in sorted(set(checkouts)):
-        roots = read_cargo_output_roots(Path(checkout))
+    # A member crate sorts after its workspace, so one read covers the workspace.
+    for checkout in sorted({Path(path).resolve() for path in checkouts}):
+        if checkout in mapped or not mapped.isdisjoint(checkout.parents):
+            continue
+        roots = read_cargo_output_roots(checkout)
         if isinstance(roots, CargoOutputUnavailable):
             unavailable.append(f"{checkout}: {roots.reason}")
         else:
-            mappings.append(roots)
-    return sorted({path for roots in mappings
+            found.append(roots)
+            mapped.add(roots.workspace_root)
+    if found:
+        # The next walk reads these rows and skips the Cargo reads.
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex(tuple(found)))
+    return sorted({path for roots in (*mappings, *found)
                    for path in (roots.target_directory, roots.build_directory)}), unavailable
 
 
@@ -317,7 +332,7 @@ def snapshot() -> MeasuredDiskSnapshot:
                 "previous_measured_at": previous_snapshot["previous_measured_at"],
             }
     previous = previous_outside_measurement(previous_snapshot)
-    folders = list(FOLDERS)
+    folders = scanned_folders()
     outputs, unavailable = mapped_output_paths(folders)
     for output in outputs:
         if not any(output.is_relative_to(Path(path).expanduser().resolve()) for _, path in folders):

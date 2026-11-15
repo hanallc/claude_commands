@@ -23,8 +23,8 @@ it changes, and say so in one line.
    normal checkpoint notice, with the line `bump: lint and related tests only`.
 3. **First in the merge queue.** Take the bumped notice before every other
    notice that waits.
-   - When the production has a merge unit, read its identity from staff.
-     Tell the production's merge unit to merge this checkpoint next under `commands/unit/merge.md`, before its queue.
+   - When a merge unit serves the production, read its identity from staff.
+     Tell that merge unit to merge this checkpoint next under `commands/unit/merge.md`, before its queue.
    - Otherwise run <MergeCheckpoint/> (`/showrunner:produce`) with `--bump`
      for it yourself now.
 

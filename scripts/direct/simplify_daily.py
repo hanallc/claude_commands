@@ -105,8 +105,8 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             if launched.returncode and not reason:
                 reason = simplify_result.failure_reason(log, launched.returncode)
         finally:
-            with scratch.removal_lock(clone.parent):
-                scratch.remove_marked(clone.parent, scratch.remove)
+            with scratch.removal_lock(clone):
+                scratch.remove_marked(clone, scratch.remove)
         if not reason:
             write_text_atomic(status, "reviewed\n")
             _ = git(cwd, "push", "origin", f"--force-with-lease=refs/simplify/last:{last}", f"{tip}:refs/simplify/last")

@@ -40,7 +40,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, mac_idle_alert
+from scripts.buildlog import charts, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -572,16 +572,13 @@ def cargo_job(command: tuple[str, ...]) -> str:
     for index, argument in enumerate(command):
         if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
             continue
-        arguments = iter(command[index + 1:])
-        for argument in arguments:
-            if argument in ("--color", "--config", "--manifest-path", "--lockfile-path", "-C", "-Z"):
-                _ = next(arguments, "")
-            elif not argument.startswith(("-", "+")):
-                if argument in ("test", "nextest"):
-                    return "tests"
-                if argument == "build" and any(flag in command for flag in ("--release", "-r")):
-                    return "release build"
-                return argument
+        subcommand = parse.cargo_subcommand(command[index + 1:])
+        if subcommand in ("test", "nextest"):
+            return "tests"
+        if subcommand == "build" and any(flag in command for flag in ("--release", "-r")):
+            return "release build"
+        if subcommand:
+            return subcommand
     return ""
 
 
@@ -1025,10 +1022,13 @@ class MemoryShares(TypedDict):
 
 def memory_shares(total: float, room: admission_records.MemoryRoom, safety: float, used: float,
                   reserved: float) -> MemoryShares:
-    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand in free memory."""
+    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand outside the cap."""
     available = gib(room.available)
     shown_safety = min(safety, used + available)
-    shown_reserved = max(0.0, min(reserved, available - safety))
+    # Swapped agent memory is outside the cap: it sits right of the cap line, so reserved stops at the cap.
+    agents_swap = gib(room.agent_swap_demand)
+    shown_agents_swap = max(0.0, min(agents_swap, available - safety))
+    shown_reserved = max(0.0, min(reserved, available - safety - shown_agents_swap))
     outside = max(0.0, total - available - gib(room.cap_use))
     agents = gate.agents_memory()
     guarantee = gate.desktop_guarantee()
@@ -1036,12 +1036,11 @@ def memory_shares(total: float, room: admission_records.MemoryRoom, safety: floa
     desktop = gib(guarantee) if isinstance(guarantee, int) else None
     shown_agents = min(agents_ram or 0.0, outside)
     shown_desktop = min(desktop or 0.0, outside - shown_agents)
-    agents_swap = gib(room.agent_swap_demand)
     return {
         "other": outside - shown_agents - shown_desktop,
         "desktop_guarantee": desktop, "agents_ram": agents_ram, "agents_swap": agents_swap,
         "shown_desktop": shown_desktop, "shown_agents": shown_agents,
-        "shown_agents_swap": max(0.0, min(agents_swap, available - shown_reserved - gib(room.room) - shown_safety)),
+        "shown_agents_swap": shown_agents_swap,
         "slices_unavailable": "; ".join(reading.reason for reading in (agents, guarantee)
                                         if isinstance(reading, admission_records.ReadingUnavailable)),
         "shown_safety": shown_safety, "shown_reserved": shown_reserved,

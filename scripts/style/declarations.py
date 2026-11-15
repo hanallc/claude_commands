@@ -804,22 +804,38 @@ def item_body(file: DeclaredFile, item: DeclaredItem) -> ReadableBody | Unreadab
     return file.body_readings[item]
 
 
-def preserved_body(old: ReadableBody, new: ReadableBody, before: str, after: str) -> int:
-    """Count equal lines once, in order, after replacing only the renamed identifier."""
+@dataclass(frozen=True)
+class NameSites:
+    """An old body's source and the offsets of each code identifier that is the item's old name."""
+
+    source: str
+    sites: tuple[tuple[int, int], ...]
+
+
+def name_sites(old: ReadableBody, before: str) -> NameSites | UnreadableBody:
+    """Tokenize the old body once for every candidate that `preserved_body` compares it with."""
     source = "\n".join(old.lines)
     try:
         spans = source_spans(source)
     except style_footprint.UnreadableTokenSpans:
-        return 0
+        return UnreadableBody()
     # A comment-only body needs no replacements; unreadable code supplies no proof.
     if not spans and source_tokens(source):
+        return UnreadableBody()
+    return NameSites(source, tuple((span.start, span.end) for span in spans
+                                   if span.token.kind == "identifier" and span.token.value == before))
+
+
+def preserved_body(old: NameSites | UnreadableBody, new: ReadableBody, after: str) -> int:
+    """Count equal lines once, in order, after replacing only the renamed identifier."""
+    if isinstance(old, UnreadableBody):
         return 0
+    source = old.source
     fragments: list[str] = []
     cursor = 0
-    for span in spans:
-        if span.token.kind == "identifier" and span.token.value == before:
-            fragments.extend((source[cursor:span.start], after))
-            cursor = span.end
+    for start, end in old.sites:
+        fragments.extend((source[cursor:start], after))
+        cursor = end
     fragments.append(source[cursor:])
     lines = tuple("".join(fragments).splitlines())
     lengths = [0] * (len(new.lines) + 1)

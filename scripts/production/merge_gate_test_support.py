@@ -549,10 +549,12 @@ class MergeGateFixture(unittest.TestCase):
         history.mkdir(parents=True, exist_ok=True)
         with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
             index.create_schema(connection)
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
-                VALUES ('fixture-normal', '2000-01-01', 'merge-gate', ?, 0, 0, 'full', 1000000)""",
-                (os.cpu_count() or 1,)).close()
+            # A full run's limit reads runs with its own job count, so seed every count a gate can use.
+            vcpus = os.cpu_count() or 1
+            connection.executemany("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
+                VALUES (?, '2000-01-01', 'merge-gate', ?, ?, 0, 0, 'full', 1000000)""",
+                [(f"fixture-normal-{jobs}", vcpus, jobs) for jobs in range(1, vcpus + 1)]).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"

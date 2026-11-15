@@ -44,7 +44,7 @@ from scripts.lib import conf, models_registry  # noqa: E402
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
-from scripts.whoami import usage_store
+from scripts.whoami import quota_state, usage_store
 
 from scripts.notify import review
 
@@ -286,12 +286,7 @@ from scripts.production.showrunners import (
 
 
 Config = ShowrunnerSettings
-def state_path() -> Path:
-    """The quota state file under the current XDG_STATE_HOME."""
-    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
-
-
-STATE = state_path()
+STATE = quota_state.state_path()
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -300,6 +295,7 @@ REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 NO_WORKER_MODE_SENDER = "quota-alert"
+NO_WORKER_MODE_FYI = "FYI, no action:"
 KILL_GRACE = 10
 
 
@@ -697,23 +693,6 @@ def _write_state(state: State) -> None:
     os.replace(tmp, STATE)
 
 
-def no_worker_mode() -> bool:
-    """Whether Codex workers have no capacity now; a missing or unreadable state reads as False.
-
-    The path is read at each call, so a test with its own XDG_STATE_HOME never reads the live state.
-    """
-    try:
-        saved = cast(StoredState, json.loads(state_path().read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return False
-    return saved.get("no_worker_mode", False)
-
-
-def no_worker_notice() -> str:
-    """The notice that starts no-worker mode."""
-    return conf.read("accounts").text("no_worker_mode_on")
-
-
 def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) -> None:
     """Start one transient unit for a script; a failed start prints one line."""
     try:
@@ -729,15 +708,36 @@ def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) 
             print(f"quota-alert: {what} failed: exit {result.returncode}")
 
 
+def _worker_mode_text(active: bool) -> str:
+    return quota_state.no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
+
+
 def _broadcast_worker_mode(active: bool) -> None:
-    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers."""
+    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers.
+
+    Each producer in `no_worker_mode_fyi` gets one copy marked as information only.
+    """
     def notice() -> list[str]:
-        text = no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
+        text = _worker_mode_text(active)
         return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
+    try:
+        producers = conf.read("accounts").text("no_worker_mode_fyi").split()
+    except conf.Unusable as error:
+        print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
+        producers = []
+    for producer in producers:
+        _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
     if active:
         _start_detached("Codex worker stop", "production/worker_capacity.py", lambda: ["stop"])
+
+
+def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
+    def arguments() -> list[str]:
+        return ["--to", producer, "--from", NO_WORKER_MODE_SENDER,
+                "--text", f"{NO_WORKER_MODE_FYI} {_worker_mode_text(active)}"]
+    return arguments
 
 
 def _start_no_worker_mode(state: State) -> bool:
@@ -918,13 +918,16 @@ def registry_assignments() -> dict[str, str]:
 def edit_registry(editor: str, *args: str) -> str | None:
     """Run a validated registry editor and return its failure cause.
 
+    The edit is live at once and never waits for main; publish_registry() pushes it later.
     A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
     timeout = conf.read("accounts").whole("quota_edit_timeout_seconds")
+    publish = "0" if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" else "later"
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY),
+                                        "MODELS_CONFIG_PUBLISH": publish}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:

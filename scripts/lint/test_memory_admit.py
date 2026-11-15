@@ -44,6 +44,7 @@ from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, queue_view, queue_evidence
+from scripts.build_queue import queue_place as shell_place
 from scripts.build_queue.admission_test_support import queue_decision, AdmissionFixture, InjectedCrash, only_admitted, caller_admission
 from scripts.build_queue.queue_fixture import write_memory_config as write_memory_config, fixture_queue_inputs, fixture_reservation, write_process, write_scope, ci_step
 from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture, VERIFY, workspace_metadata
@@ -435,6 +436,7 @@ class MemoryRoomRulesTests(unittest.TestCase):
             ("only build and CI swapped", 4, 4, 100, 0),
             ("share 0", 15, 0, 0, 0),
             ("share 50", 15, 0, 50, 7.5),
+            ("swapped past the cap", 30, 0, 100, 30),
         ):
             with self.subTest(case=case):
                 host = admission_records.HostMemory(20 * GIB, 64 * GIB, 32 * GIB, int((32 - swap_used) * GIB),
@@ -443,6 +445,11 @@ class MemoryRoomRulesTests(unittest.TestCase):
                 assert isinstance(reading, admission_records.MemoryRoom)
                 self.assertEqual(reading.agent_swap_demand, int(demand * GIB))
                 self.assertEqual(reading.signed_room, 17 * GIB - int(demand * GIB))
+                # The swapped demand is outside the cap, so the cap is the most builds can get.
+                cap = reading.cap
+                assert isinstance(cap, int)
+                self.assertEqual(cap, max(0, 17 * GIB - int(demand * GIB)))
+                self.assertEqual(reading.room, max(0, cap - reading.cap_use - reading.kept))
 
     def test_unavailable_slice_swap_cannot_publish_room(self) -> None:
         missing = admission_records.ReadingUnavailable("builds.slice: memory.swap.current is missing")
@@ -3359,7 +3366,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
                      test_hang_guard.LauncherHangGuard(self.id()).protect(), fixture.serving():
                     with self.assertRaises(RefreshChecked):
-                        _ = client.main(["admit", "--pid", str(owner.pid), "--since", str(NOW_EPOCH),
+                        _ = shell_place.main(["admit", "--pid", str(owner.pid), "--since", str(NOW_EPOCH),
                                          "--", *RELEASE_BUILD])
                 self.assertEqual(len(replies), 3)
 
@@ -5008,7 +5015,7 @@ class ShellTests(unittest.TestCase):
         before = self.admission.readings.counts.copy()
         result = self.shell('unset BUILDLOG_MEMINFO; OSTYPE=darwin; '
             + 'buildlog_wait_for_memory "$@"; printf "%s|%s\\n" "$?" "$BUILDLOG_MEM_OUTCOME"',
-            BUILDLOG_MEM_ADMIT_SCRIPT="/nonexistent/admission_client.py", BUILDLOG_PROC="/nonexistent/proc")
+            BUILDLOG_QUEUE_PLACE_SCRIPT="/nonexistent/queue_place.py", BUILDLOG_PROC="/nonexistent/proc")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "0|Granted\n")
         self.assertEqual(result.stderr, "")
@@ -5193,7 +5200,7 @@ class ShellTests(unittest.TestCase):
     def test_python_failure_refuses_the_step_and_names_the_checker_error(self) -> None:
         broken = self.admission.root / "broken.py"
         _ = broken.write_text('raise RuntimeError("broken lookup")\n')
-        result = self.shell('BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_BROKEN; buildlog_wait_for_memory "$@"; printf "step started\\n"',
+        result = self.shell('BUILDLOG_QUEUE_PLACE_SCRIPT=$TEST_BROKEN; buildlog_wait_for_memory "$@"; printf "step started\\n"',
             TEST_BROKEN=str(broken))
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -5216,7 +5223,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
     """Advance the client clock at its first held answer."""
     import time
     from unittest.mock import patch
-    from scripts.build_queue import admission_client as client, admission_records
+    from scripts.build_queue import admission_client as client, admission_records, queue_place
 
     class HeldWaitClock:
         def __init__(self) -> None:
@@ -5243,7 +5250,7 @@ def queue_leave_client_main(argv: list[str]) -> int:
             advanced = True
 
     with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
-        return client.main(argv)
+        return queue_place.main(argv)
 
 
 class QueueLeaveTests(unittest.TestCase):
@@ -5322,7 +5329,7 @@ class QueueLeaveTests(unittest.TestCase):
             _ = (self.root / "pressure").write_text("full avg10=0\nsome avg10=0\n")
         self.admission.server.reply_filter = advance_memory
         command = ('source "$1"; buildlog_memory_python() { '
-                   + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then shift; '
+                   + 'if [[ "$1" == "$BUILDLOG_QUEUE_PLACE_SCRIPT" ]]; then shift; '
                    + '"$TEST_PY" "$TEST_QUEUE_CLIENT" "$@"; else "$TEST_PY" "$@"; fi; }; '
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')

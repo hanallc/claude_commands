@@ -411,9 +411,16 @@ It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
 
-`quota_alert.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`quota_state.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`scripts/whoami/quota_state.py` is a leaf module, so restart, resume and worker code never import `quota_alert`.
 A missing or unreadable state reads as off.
 In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
+In no-worker mode, no command starts new worker work. Each refuses with exit 2 and the `quota_state.NO_WORKER_START` text:
+- `assign.sh`, before it writes run state;
+- `worker.py add` and `worker.py assign`;
+- `worker_panes.py start-or-resume`.
+In the mode, `style_plan.py next-phase --session-dir` restores the run and phase records of each ticket and sends no assignment. It prints `style-ticket-<id>: <the refusal text>`, and the director does the ticket directly.
+`worker.restore` and account moves keep work that started before the mode, so a Claude worker with an open pass resumes.
 `agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
 A skipped worker leaves the restart record. The next assignment resumes it.
 `stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.

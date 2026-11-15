@@ -160,6 +160,10 @@ class ChangeReviewError(Exception):
     """A list that cannot take rows, or a git read that failed."""
 
 
+class RowNotListed(ChangeReviewError):
+    """A row ID that no review list holds."""
+
+
 def parse(value: str) -> Entry:
     text = value.strip()
     if (none := _NONE.match(text)) is not None:
@@ -1943,7 +1947,7 @@ def resolve_row(value: str, *, production: str = "", review_list: Path | None = 
         raise ChangeReviewError(f"{value} matches several lists; pass --list: {choices}")
     if review_list is not None or selected_list_only:
         raise ChangeReviewError(f"--row {value} differs from --list {path}; no matching row belongs to that showrunner")
-    raise ChangeReviewError(f"{value} is not on a review list")
+    raise RowNotListed(f"{value} is not on a review list")
 
 
 def _row_id(name: str, value: str) -> str:

@@ -462,7 +462,7 @@ def _stored_fields(fields: dict[str, object]) -> dict[str, object]:
 
 
 def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
-                resolve_staff: bool = True) -> dict[str, object]:
+                resolve_staff: bool = True, pass_agents: bool = True) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
         state = _json_object(path.read_text(encoding="utf-8"))
@@ -472,7 +472,8 @@ def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
         raise SystemExit(f"Invalid progress state: {path}")
     if not resolve_staff:
         return state
-    return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record)
+    return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record,
+                                        pass_agents=pass_agents)
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
@@ -5595,7 +5596,8 @@ def _holder_from_args(args: argparse.Namespace, kind: str) -> NamedHolder | Hold
 def _wait_holder(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
-    state = _read_state(_session_dir(args))
+    # A holder event copies its recorded wait; it reads only the history file.
+    state = _read_state(_session_dir(args), resolve_staff=False)
     wait_id = _arg_string(args, "wait_id")
     events = _run_events(state)
     wait = _waits_by_id(events).get(wait_id)
@@ -5865,7 +5867,8 @@ def _wait_phase(state: dict[str, object], args: argparse.Namespace) -> (
 def _start_wait(args: argparse.Namespace) -> None:
     if cast(bool, args.probe) or os.environ.get(PROBE_ENV) == "1":
         return
-    state = _read_state(_session_dir(args))
+    # A wait event names its phase, so it carries no pass and needs no worker backend.
+    state = _read_state(_session_dir(args), pass_agents=False)
     result = _record_wait(state, args)
     if isinstance(result, StartedWait):
         print(result.wait_id)
@@ -5943,7 +5946,8 @@ def _end_wait(state: dict[str, object], wait: dict[str, object], now: float, *, 
 def _finish_wait(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
-    state = _read_state(_session_dir(args))
+    # A finish event copies its recorded wait; it reads only the history file.
+    state = _read_state(_session_dir(args), resolve_staff=False)
     wait_id = _arg_string(args, "wait_id")
     wait = _waits_by_id(_run_events(state)).get(wait_id)
     if wait is None:

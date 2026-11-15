@@ -58,14 +58,16 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The gate regions in `regions` are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1` and `eu-south-1`.
+The price reads in `spot_candidate_regions` add `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
 `us-east-2` is the home region for shared artifacts.
-Before European deployment:
+Before deployment:
 
-1. Enable `eu-south-2` on the AWS Account page.
-2. Confirm that its status is `ENABLED`.
-3. Add both European regions to the Organizations `RegionFloor` policy.
-4. Preserve the home and US region permissions.
+1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
+2. Confirm that each status is `ENABLED`.
+3. Allow all 19 regions in the `RegionFloor` statement of the Organizations policy `AdvancedModeRegionRestrictionSecurityControlPolicy`: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+4. Make sure that no other statement in that policy denies EC2 in one of these regions.
+5. Preserve the current region permissions.
 
 Use these commands at your terminal:
 
@@ -83,7 +85,7 @@ python3 scripts/aws_target/deploy.py spot-table
 
 The rows show configured Standard and GPU machine types.
 The columns show candidate regions and the lowest zone price in USD/h.
-A `-` means the snapshot has no offer for that type and region.
+A `not sold here` cell means AWS sells no Spot of that type in that region.
 Wide tables use separate groups of region columns.
 Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
 GPU types use the G and VT quota; other configured types use the Standard quota.
@@ -108,9 +110,10 @@ After this change reaches the installed scripts:
 2. Run `python3 scripts/aws_target/deploy.py spot-table`, or `/aws_prices` in a session, to inspect the snapshot.
 
 Later reads run through the existing timer.
-`GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.
-The deployed stack gets this policy only from `python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources`.
-Until the user runs that command, each hourly read logs `UnauthorizedOperation` for `ec2:DescribeSpotPriceHistory`.
+`GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota` in every candidate region.
+The deployed stack gets this policy only from `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
+Until the user runs that command, each hourly read logs the refused read and sends the `aws.snapshot_failed` alert.
+The command reads prices and quotas at its end, so `/aws_prices` shows them at once.
 The snapshot makes only these two read calls.
 It does not use Cost Explorer or create resources.
 
@@ -121,7 +124,8 @@ It prints no resource identities.
 
 `quota-request` requests Standard Spot quota in each configured gate region.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-It requests G and VT Spot quota in each candidate region.
+It requests G and VT Spot quota in each configured gate region.
+A region with only a price read gets no quota request.
 It uses `gpu_spot_quota_request_vcpus` from the same file.
 It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.
@@ -191,6 +195,12 @@ It requires the saved foundation ownership record.
 It does not activate the removed builder route.
 The home stack supplies the bucket, role, instance profile, and home launch resources.
 Each additional region has a separate gate stack and expiry function.
+A regional stack holds only the security group, the launch template and the expiry function.
+The home stack's two scaler policies cover every gate region, so regional stacks create no IAM policy.
+The scaler user then holds 2 gate policies and keeps a free slot for the budget block policy.
+AWS attaches at most 10 managed policies to one IAM user.
+When a regional stack fails, `up` prints the failed resource events of that run.
+`up` deletes a regional stack in `ROLLBACK_COMPLETE` before it deploys that stack again.
 Deployment records each completed regional stack in `gate-deployment.json`.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
@@ -223,10 +233,9 @@ Failed regional reads retain applicable hourly prices from `spot-prices.json`.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.
-It prefers larger vCPU counts within each group.
-Within one size, it prefers the lowest expected cost across regions and zones.
-Expected cost includes compute, remote transfer, and the configured regional delay cost.
-Equal costs preserve configured order.
+Within each group, it prefers the lowest expected USD per run across types, regions and zones.
+Expected cost includes compute for the median box time by type and region, remote transfer, the configured regional delay cost and the expected refusal wait.
+Equal costs preserve the `instance_types` order.
 The worker saves its ranking and price evidence before launch.
 A resumed launch keeps that ranking and its client tokens.
 Capacity refusals select the next variant.

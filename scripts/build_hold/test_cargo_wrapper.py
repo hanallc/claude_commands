@@ -1,4 +1,4 @@
-"""Cargo routing checks use a temporary PATH, hold state and user bus."""
+"""Cargo routing checks use a temporary PATH, hold state, user bus and queue place."""
 
 from __future__ import annotations
 
@@ -22,10 +22,6 @@ require_checkout(Path(__file__))
 
 
 SCRIPTS = Path(__file__).resolve().parent
-SCOPE_FLAGS = [
-    "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-    "--slice=builds.slice", "--",
-]
 CARGO_STUB = """import json, os, sys
 from pathlib import Path
 Path(os.environ['CARGO_LOG']).write_text(json.dumps({
@@ -39,6 +35,12 @@ sys.exit(int(os.environ.get('CARGO_EXIT', '0')))
 SCOPE_STUB = """import json, os, sys
 from pathlib import Path
 Path(os.environ['SCOPE_LOG']).write_text(json.dumps(sys.argv[1:]))
+command = sys.argv[sys.argv.index('--') + 1:]
+os.execv(command[0], command)
+"""
+QUEUE_STUB = """import json, os, sys
+from pathlib import Path
+Path(os.environ['QUEUE_LOG']).write_text(json.dumps(sys.argv[1:]))
 command = sys.argv[sys.argv.index('--') + 1:]
 os.execv(command[0], command)
 """
@@ -76,6 +78,7 @@ class CargoWrapperTest(unittest.TestCase):
     scope_log: Path = Path()
     hold_log: Path = Path()
     python_log: Path = Path()
+    queue_log: Path = Path()
     env: dict[str, str] = {}
 
     @override
@@ -92,6 +95,9 @@ class CargoWrapperTest(unittest.TestCase):
         self.installer = self.wrapper.with_name("install_cargo_wrapper.sh")
         _ = shutil.copy2(SCRIPTS / self.installer.name, self.installer)
         _ = self.wrapper.with_name("hold_applies.py").write_text(HOLD_STUB)
+        queue = self.root / "build_queue"
+        queue.mkdir()
+        _ = (queue / "queue_place.py").write_text(QUEUE_STUB)
         self.front = self.root / "front"
         self.real_bin = self.root / "real"
         self.tools = self.root / "tools"
@@ -123,6 +129,7 @@ class CargoWrapperTest(unittest.TestCase):
         self.scope_log = self.root / "scope.json"
         self.hold_log = self.root / "hold.log"
         self.python_log = self.root / "python.log"
+        self.queue_log = self.root / "queue.json"
         self.env = {
             "HOME": str(self.home),
             "PATH": os.pathsep.join(map(str, (self.front, self.real_bin, self.tools))),
@@ -136,6 +143,7 @@ class CargoWrapperTest(unittest.TestCase):
             "SCOPE_LOG": str(self.scope_log),
             "HOLD_LOG": str(self.hold_log),
             "PYTHON_LOG": str(self.python_log),
+            "QUEUE_LOG": str(self.queue_log),
             "CARGO_TEST_VALUE": "spaces and $variables ${HOME} $$",
         }
 
@@ -145,7 +153,7 @@ class CargoWrapperTest(unittest.TestCase):
         path.chmod(0o755)
 
     def invoke(self, *args: str) -> subprocess.CompletedProcess[str]:
-        for log in (self.cargo_log, self.scope_log, self.hold_log, self.python_log):
+        for log in (self.cargo_log, self.scope_log, self.hold_log, self.python_log, self.queue_log):
             log.unlink(missing_ok=True)
         return subprocess.run(
             [str(self.front / "cargo"), *args], env=self.env, cwd=self.cwd,
@@ -159,12 +167,12 @@ class CargoWrapperTest(unittest.TestCase):
             "env": self.env["CARGO_TEST_VALUE"], "stdin": "cargo input\n",
         }))
 
-    def assert_scope(self, args: list[str]) -> None:
-        self.assertEqual(self.scope_log.read_text(), json.dumps([
-            *SCOPE_FLAGS, str(self.real_cargo), *args,
-        ]))
+    def assert_queue(self, args: list[str]) -> None:
+        self.assertEqual(self.queue_log.read_text(), json.dumps(["--", str(self.real_cargo), *args]))
+        self.assertTrue(self.python_log.exists())
+        self.assertFalse(self.scope_log.exists())
 
-    def test_non_building_commands_skip_scope_and_python(self) -> None:
+    def test_non_building_commands_start_with_no_python_and_no_queue_request(self) -> None:
         _ = (self.hold / "holder").write_text("held")
         for args in (
             [], ["metadata"], ["fmt"], ["tree"], ["--version"], ["--help"],
@@ -181,8 +189,9 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertFalse(self.scope_log.exists())
                 self.assertFalse(self.hold_log.exists())
                 self.assertFalse(self.python_log.exists())
+                self.assertFalse(self.queue_log.exists())
 
-    def test_building_commands_use_builds_slice(self) -> None:
+    def test_building_commands_request_a_queue_place(self) -> None:
         calls = [[command, "--", "$HOME", "${HOME}", "$$", "two words", ""] for command in (
             "build", "b", "check", "c", "clippy", "test", "t", "nextest",
             "run", "r", "bench", "doc", "d", "rustc", "rustdoc", "fix",
@@ -194,8 +203,8 @@ class CargoWrapperTest(unittest.TestCase):
                 done = self.invoke(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assert_cargo(args)
-                self.assert_scope(args)
-                self.assertFalse(self.python_log.exists())
+                self.assert_queue(args)
+                self.assertFalse(self.hold_log.exists())
                 self.assertEqual(done.stdout, "cargo stdout\n")
                 self.assertEqual(done.stderr, "cargo stderr\n")
 
@@ -211,9 +220,9 @@ class CargoWrapperTest(unittest.TestCase):
                 done = self.invoke(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assert_cargo(args)
-                self.assert_scope(args)
+                self.assert_queue(args)
 
-    def test_existing_build_scope_skips_hold_and_new_scope(self) -> None:
+    def test_existing_build_scope_skips_hold_and_queue(self) -> None:
         _ = self.cgroup.write_text("0::/user.slice/builds.slice/run-42.scope\n")
         _ = (self.hold / "holder").write_text("held")
         done = self.invoke("test")
@@ -222,6 +231,7 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertFalse(self.scope_log.exists())
         self.assertFalse(self.hold_log.exists())
         self.assertFalse(self.python_log.exists())
+        self.assertFalse(self.queue_log.exists())
 
     def test_hold_refuses_build(self) -> None:
         _ = (self.hold / "holder").write_text("held")
@@ -234,7 +244,7 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertTrue(self.hold_log.exists())
                 self.assertTrue(self.python_log.exists())
                 self.assertFalse(self.cargo_log.exists())
-                self.assertFalse(self.scope_log.exists())
+                self.assertFalse(self.queue_log.exists())
 
     def test_hold_allows_build(self) -> None:
         # A hidden entry must also cause a hold check.
@@ -251,7 +261,7 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertEqual(done.stderr, "cargo stderr\n")
                 self.assertTrue(self.hold_log.exists())
                 self.assert_cargo(["test"])
-                self.assert_scope(["test"])
+                self.assert_queue(["test"])
 
     def test_unreadable_hold_prints_one_note_and_builds(self) -> None:
         _ = (self.hold / "holder").write_text("held")
@@ -261,9 +271,9 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertEqual(done.stderr, "cargo: note: hold state cannot be read\ncargo stderr\n")
         self.assertTrue(self.hold_log.exists())
         self.assert_cargo(["build"])
-        self.assert_scope(["build"])
+        self.assert_queue(["build"])
 
-    def test_empty_or_absent_hold_directory_starts_no_python(self) -> None:
+    def test_empty_or_absent_hold_directory_skips_the_hold_check(self) -> None:
         for hold_exists in (True, False):
             with self.subTest(hold_exists=hold_exists):
                 if not hold_exists:
@@ -271,8 +281,8 @@ class CargoWrapperTest(unittest.TestCase):
                 done = self.invoke("build")
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assert_cargo(["build"])
+                self.assert_queue(["build"])
                 self.assertFalse(self.hold_log.exists())
-                self.assertFalse(self.python_log.exists())
 
     def test_exit_status_passes_through(self) -> None:
         self.env["CARGO_EXIT"] = "37"
@@ -288,14 +298,14 @@ class CargoWrapperTest(unittest.TestCase):
         done = self.invoke("build")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_cargo(["build"])
-        self.assertFalse(self.scope_log.exists())
+        self.assertFalse(self.queue_log.exists())
 
     def test_missing_systemd_run_runs_cargo_directly(self) -> None:
         (self.tools / "systemd-run").unlink()
         done = self.invoke("build")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_cargo(["build"])
-        self.assertFalse(self.scope_log.exists())
+        self.assertFalse(self.queue_log.exists())
 
     def test_macos_skips_hold_and_scope(self) -> None:
         self.env["OSTYPE"] = "darwin"
@@ -303,7 +313,7 @@ class CargoWrapperTest(unittest.TestCase):
         done = self.invoke("build")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assert_cargo(["build"])
-        self.assertFalse(self.scope_log.exists())
+        self.assertFalse(self.queue_log.exists())
         self.assertFalse(self.python_log.exists())
 
     def test_skips_all_paths_that_resolve_to_wrapper(self) -> None:
