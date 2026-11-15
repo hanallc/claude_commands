@@ -4046,3 +4046,36 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - In `test_assign_claude_follow`, the delivery retry test runs its three launches in process. The catalog retry part is the `@process_boundary` test `test_failed_catalog_switch_retries_on_the_first_model`.
 - AWS pair (3 rounds, median CPU s): `test_assign_claude_follow` 30.98 -> 20.51; `test_assign_claude_workers` 10.76 -> 8.33; `test_claude_worker` 9.08 -> 6.93.
 - Commit dd647b551. Test-only change.
+
+### Phase 278 — Python starts reuse the compiled dataclass method code  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 2026-11-14 with six conditions).
+
+#### Work Order
+
+**Goal:** each Python start reads the compiled dataclass method code from a shared cache, so the AWS gate uses less CPU.
+
+**Decision:** on 7d085e2fe, the compile of the generated dataclass methods was 45-80% of the import CPU of the hot CLIs (direct.assign 278 of 428 ms, admission_protocol 146 of 183 ms, progress_history 74 of 133 ms). Probe trial 7565fb4ec: AWS pair 299.0 -> 274.9 CPU s on 8 modules.
+
+**Spec:**
+1. `sitecustomize.start_process` inserts a `DataclassCodeFinder` in `sys.meta_path` before `dataclasses` loads. When a process imports `dataclasses`, the finder sets the module global `exec` to `dataclass_exec`.
+2. `dataclass_code(source, folder)` keys an entry by the sha1 of the compile flags, `sys.flags.optimize` and the source, in `/var/tmp/dataclass-code-<uid>/<sys.implementation.cache_tag>`. It compiles with the filename `<string>`, flags 0 and `dont_inherit=True`, as the dataclasses exec does.
+3. A missing, truncated or corrupt entry compiles again and replaces the file atomically; it never raises.
+4. The root must be a folder that the user owns with mode 0700. Any other root turns the cache off with no error.
+5. A read refreshes the entry time once a day. `tmp_sweep.sweep` prunes the entries that no process read in lint.conf `dataclass_code_days` days, and each emptied cache tag folder.
+6. `lib/test_dataclass_code.py` fails when the startup hook does not give `dataclasses` the cached exec on the current Python.
+
+**Files:**
+- `scripts/lib/python_startup/sitecustomize.py`
+- `scripts/lint/tmp_sweep.py`
+- `config/lint.conf`
+- `scripts/lib/test_dataclass_code.py`
+
+**Workers:** director; no-worker mode.
+- impl: all files.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:**
+- The startup, sweep and new modules pass; basedpyright 0 errors and 0 warnings.
+- AWS pair (3 rounds) shows a gain; the checkpoint names the live CLI start gains.
