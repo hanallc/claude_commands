@@ -36,6 +36,7 @@ The phase status table and the style table add **Machine** after **Status** only
 The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
 
 Each table omits a column when every row has `—` in that column.
+The phase work table keeps **Workers** even when every row has `—`.
 A table without rows keeps its columns.
 The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
 Claude Code sets their column widths from the terminal width.
@@ -51,8 +52,8 @@ Style column headers set the minimum text widths.
 Fixed style columns and minimum text widths can exceed a smaller configured width.
 
 For units outside the `Style units` table in a production without `Kind: style`, the command prints two tables.
-Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
-Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
+Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
+Table 2 shows `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
 Both tables use the same unit order.
 Each open phase of the selected run gets one row in each table.
 The staff current run selects the run when present; otherwise, the newest run supplies the rows.
@@ -121,6 +122,10 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A running run without a start time omits the elapsed time.
    A busy worker without a run shows `<name> waiting` or `<name> starting` when its tile activity ends in that word, else `<name> working`.
    Idle workers add `+<n> idle` after other workers.
+   A unit with no running worker shows the reason in its first row, from one word list:
+   `no-worker mode` when the quota state records no-worker mode, else `none running`.
+   The reason keeps `+<n> idle` for idle workers.
+   A failed census, or a machine that the census did not scan, shows `—`.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
    A row without a recorded phase instance keeps the existing summary for work outside the plan.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
@@ -133,9 +138,8 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    It uses the configured plan when that plan has phases; otherwise, it uses the selected run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
 
-Workers first limits each cell to 80 characters.
-Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
-Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
+Notes, Workers, Non-Phase Work, and Queued retain every word of each displayed item or title.
+Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`, except Workers.
 At the pane width, or the floor without one, a cell that needs more lines than the cap continues on extra rows.
 A split uses ` · ` first, then `; `, then a word boundary.
 Unit, Status, Machine, and Progress never split.

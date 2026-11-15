@@ -749,8 +749,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Every row repeats Unit.
     Only the first row carries Status, Machine, Progress, ETA Plan, and Queued.
     Later rows use `—` for those unit-wide cells.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
-    The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
+    The work table prints `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
     Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
@@ -852,7 +852,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
     A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
     `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
-    Its cell keeps the existing 80-character limit.
+    Its cell keeps every word and wraps in the work table like Notes (user, 2026-11-15).
+    With no running worker, `workers_cell` shows the reason from `NO_WORKER_REASONS`, plus `+<n> idle`.
+    `no_worker_reason` reads `quota_state.no_worker_mode()` once for each table: `no-worker mode`, else `none running`.
+    Only a unit's first row carries the reason. A failed census or an unscanned machine gives `—` (user, 2026-11-15).
+    `display_cells.wrapped(keep=...)` keeps the Workers column when every cell is `—`.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.
