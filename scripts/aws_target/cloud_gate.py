@@ -916,14 +916,15 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
     at = datetime.fromisoformat(ledger.text(record, 'started_at')).timestamp()
-    destination = store.host_file(host, at)
+    # The record keeps the box host; the file is the one AWS place.
+    destination = store.host_file(store.CLOUD_GATE_PLACE, at)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with store.locked_append(destination) as handle:
         _ = handle.seek(0)
         records = [ledger.mapping(cast(object, json.loads(line))) for line in handle if line.endswith(b'\n')]
         if not any(previous.get('id') == record['id'] for previous in records):
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(ledger.text(record, 'id'), host, at,
+            gate_record.keep_failure_logs(ledger.text(record, 'id'), store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
     save(folder / 'imported.json', {'id': record['id']})

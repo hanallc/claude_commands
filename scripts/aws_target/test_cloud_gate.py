@@ -1482,7 +1482,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         decision = self.book.guard(self.settings, 'admission', int(self.now) + 60, notify=lambda _event: True)
         self.assertIsInstance(decision, ledger.SpendingRefused)
 
-    def test_import_uses_real_remote_host_and_appends_once(self) -> None:
+    def test_import_files_under_aws_keeps_remote_host_and_appends_once(self) -> None:
         buildlog = self.root / 'buildlog'
         destination = buildlog / 'fixture-guest.jsonl'
         destination.parent.mkdir()
@@ -1501,7 +1501,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                       mock.patch.object(store, 'host_file', return_value=destination) as host_file):
                     cloud_gate.import_record(self.folder, result)
                     cloud_gate.import_record(self.folder, result)
-                self.assertEqual(host_file.call_args.args[0], 'fixture-guest')
+                self.assertEqual(host_file.call_args.args[0], 'aws')
                 records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
                 self.assertEqual([row['id'] for row in records], ['gate-attempt'])
                 self.assertEqual(records[0]['host'], 'fixture-guest')

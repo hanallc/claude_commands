@@ -149,8 +149,13 @@ class IndexedMonthlySource:
 
 
 def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMonthlySource, ...]:
-    """Keep nonempty indexed sources, including missing or incomplete files."""
+    """Keep nonempty indexed sources, including missing or incomplete files.
+
+    A file of cloud gate runs is the AWS place, also when an older import named it after its box.
+    """
     rows = cast(list[tuple[str, int]], connection.execute("SELECT path, offset FROM files").fetchall())
+    cloud_gate_files = {path for (path,) in cast(list[tuple[str]], connection.execute(
+        "SELECT DISTINCT src FROM gate_runs WHERE source = ?", (store.CLOUD_GATE_SOURCE,)).fetchall())}
     sources: list[IndexedMonthlySource] = []
     legacy_hosts: dict[str, str] = {}
     for name, offset in rows:
@@ -166,7 +171,8 @@ def indexed_monthly_sources(connection: sqlite3.Connection) -> tuple[IndexedMont
             complete = (store.root()/path).stat().st_size == offset
         except OSError:
             complete = False
-        machine = "CI" if path.parent.name == "ci" else machine_name(None, path.parent.name, legacy_hosts)
+        machine = ("CI" if path.parent.name == "ci" else store.CLOUD_GATE_PLACE if name in cloud_gate_files
+                   else machine_name(None, path.parent.name, legacy_hosts))
         sources.append(IndexedMonthlySource(machine, low.timestamp(), high.timestamp(), complete, name))
     return tuple(sources)
 

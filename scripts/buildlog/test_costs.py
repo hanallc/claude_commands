@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import os
 import io
@@ -19,6 +20,7 @@ from scripts.buildlog import cli
 from scripts.buildlog import index
 from scripts.buildlog import moments
 from scripts.buildlog import record
+from scripts.buildlog import store
 from scripts.buildlog import test_moments as fixtures
 from scripts.buildlog.test_index import Record, call, ci_job, ci_run
 from scripts.buildlog.test_holds import hold_event
@@ -74,6 +76,19 @@ class CostTests(unittest.TestCase):
         with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
             reading = costs.read_costs(connection, fixtures.START, fixtures.END)
         self.assertNotIn("aws", reading.first_sources)
+
+    def test_cloud_gate_files_count_as_one_aws_machine(self) -> None:
+        started = (fixtures.START + timedelta(seconds=10)).isoformat()
+        for folder in ("box-one.fixture.internal", "box-two.fixture.internal", "aws"):
+            path = self.fixture.fixture.root/folder/"2026-10.jsonl"
+            path.parent.mkdir(parents=True)
+            _ = path.write_text(json.dumps({
+                "kind": "gate_run", "v": record.RECORD_VERSION, "id": f"gate-{folder}", "host": folder,
+                "started_at": started, "ended_at": started, "source": store.CLOUD_GATE_SOURCE,
+                "suites": [], "modules": []}) + "\n")
+        with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
+            reading = costs.read_costs(connection, fixtures.START, fixtures.END)
+        self.assertEqual(set(reading.first_sources) - {"natedev"}, {"aws"})
 
     def test_phase_score_uses_matched_wall_time_and_nearest_rank_p90(self) -> None:
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
