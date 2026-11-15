@@ -1605,6 +1605,9 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
         print("reviewed question: " + accepted_text)
 
 
+ASK_DESCRIPTION = "File a question for the user. Write its parts as ~/.claude/docs/question_template.md says."
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -1613,7 +1616,7 @@ def main() -> int:
         _ = delivery.add_argument("--owner", required=True)
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "questions-table", "migrate-questions"):
-        subcommand = commands.add_parser(action)
+        subcommand = commands.add_parser(action, description=ASK_DESCRIPTION if action == "ask" else None)
         _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
@@ -1633,13 +1636,13 @@ def main() -> int:
                                         help="the one-line item the count and lists name; the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
                                         help="the question in one line; the parts below give the page its layout")
-            _ = subcommand.add_argument("--context", default="", help="why it is asked now and what waits on it, short")
+            _ = subcommand.add_argument("--context", default="", help="two sentences at most: why it is asked now and what waits on it")
             _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
-                                        help="one entry to look at, such as a before and after or a link; repeat it")
+                                        help="one fact, step or command; a command in backticks; repeat it")
             _ = subcommand.add_argument("--recommend", default="",
-                                        help="the recommended choice and why; required with --choice")
+                                        help="one choice and the reason, in one sentence; required with --choice")
             _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],
-                                        help="one answer the user can pick; give two or more")
+                                        help="one answer in one line that says what happens; give two or more")
             _ = subcommand.add_argument("--unit", default="", help="the asking unit's staff id; without --production, select its parent")
             _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
             _ = subcommand.add_argument("--due", default="")

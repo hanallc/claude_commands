@@ -227,6 +227,9 @@ A question stored as one text, from before the parts form, shows in sections too
 A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
 In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
 A right click can open it in a new tab.
+In all question text, a span in backticks shows as code, and an address in a code span is not a link.
+An item that is only one backtick span, such as a command, shows as a code block.
+The form of a new question is in `~/.claude/docs/question_template.md`.
 The field label stays **Answer**, and its action stays **Save answer**.
 An **Owner unavailable** card shows the question and `No showrunner owns this question.`
 It has no answer form, and the server refuses an answer.

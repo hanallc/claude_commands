@@ -202,10 +202,18 @@ class ReviewTextTests(unittest.TestCase):
 
     def test_question_text_links_addresses_and_leaves_punctuation_outside(self) -> None:
         link = '<a href="http://h:1/x?a=b&amp;c=d" target="_top">http://h:1/x?a=b&amp;c=d</a>'
-        self.assertEqual(change_page.review_text_html("See http://h:1/x?a=b&c=d.\n- <b> https://e.invalid/p)", links=True),
+        self.assertEqual(change_page.review_text_html("See http://h:1/x?a=b&c=d.\n- <b> https://e.invalid/p)", inline=True),
                          f'<p>See {link}.</p><ul><li>&lt;b&gt; <a href="https://e.invalid/p" target="_top">'
                          + 'https://e.invalid/p</a>)</li></ul>')
         self.assertEqual(change_page.review_text_html("See http://h:1/x"), "<p>See http://h:1/x</p>")
+
+    def test_question_text_shows_backtick_spans_as_code(self) -> None:
+        self.assertEqual(change_page.inline_html("Run `a <b>` then see http://h:1/x and `http://h:1/y`"),
+                         'Run <code>a &lt;b&gt;</code> then see <a href="http://h:1/x" target="_top">http://h:1/x</a>'
+                         + ' and <code>http://h:1/y</code>')
+        self.assertEqual(change_browser.item_list([" `deploy.py up --x <y>` ", "Run `ls` now", "`a` and `b`"]),
+                         '<h2>Items</h2><ol class="question-items"><li><pre><code>deploy.py up --x &lt;y&gt;</code></pre></li>'
+                         + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
 
     def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
         parts = update_registration.QuestionParts(

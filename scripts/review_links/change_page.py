@@ -494,6 +494,7 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
 
 
 LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
 
 
 def linked(text: str) -> str:
@@ -503,9 +504,15 @@ def linked(text: str) -> str:
                    if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, links: bool = False) -> str:
-    """Render review text as escaped text blocks and consecutive list runs; `links` makes addresses links."""
-    escape = linked if links else html.escape
+def inline_html(text: str) -> str:
+    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
+    pieces = CODE_SPAN.split(text)
+    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
         return f"<{block}>{escape(text)}</{block}>"
