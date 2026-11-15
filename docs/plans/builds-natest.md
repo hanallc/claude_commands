@@ -3954,3 +3954,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The events each command writes stay the same.
 - AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
 - Commit 0a9c37dd6. Production change; sdlc gave the go.
+
+### Phase 270 — The test times report ranks the AWS gate hosts  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/test_times/show.py`, `config/test_times.conf` and `commands/test_times.md`; sdlc gives the go).
+
+#### As-built
+
+- `show.py top --host aws` selects each host that starts with `AWS_HOST_PREFIX` (`ip-`) and counts runs from the new key `TOP_AWS_CHECKOUT`.
+- Any other host value keeps one host and `TOP_CHECKOUT`. The trend view uses the same prefix constant.
+- `commands/test_times.md` names the new value.
+- Commit 5f1f770a6. Production change; sdlc gave the go.
