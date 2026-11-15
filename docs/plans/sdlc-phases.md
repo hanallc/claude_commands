@@ -262,22 +262,16 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a caller of the two note helpers does not load `quota_alert` and its message-sending imports (next item 19, user approved 2026-11-02 via sdlc).
-
-**Spec:**
-- Move `ahead` and `remaining` from `scripts/whoami/quota_alert.py` to `scripts/whoami/note_file.py`. `remaining` takes `note_file.FieldReader`.
-- `quota_alert` calls `note_file.ahead` and `note_file.remaining`; it keeps no copy and no re-export.
-- Every caller imports them from `note_file`.
+- `note_file.ahead(resets, *, now)` and `note_file.remaining(note)` hold the two note helpers. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`. It keeps no copy and no re-export, so a caller of the helpers does not load `quota_alert`.
+- `test_agent_notes.py` reads `note_file.ahead`; no other caller was found.
 
 **Files:**
-- `scripts/whoami/note_file.py`, `scripts/whoami/quota_alert.py`
-- `scripts/whoami/test_agent_notes.py`
-
-**Workers:** `director only (no Codex workers until the workers-back notice)`.
-
-**Acceptance gate:** the whoami and accounts test modules that import `quota_alert` or `note_file` pass; basedpyright reports zero errors and zero warnings on the changed files.
+- `scripts/whoami/note_file.py` — `ahead`, `remaining`
+- `scripts/whoami/quota_alert.py` — the call sites
+- `scripts/whoami/test_agent_notes.py` — the `ahead` tests
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
