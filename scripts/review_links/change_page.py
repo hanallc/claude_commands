@@ -573,6 +573,24 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: boo
     return "".join(content)
 
 
+def check_html(text: str) -> str:
+    """Render check text with copy controls for code blocks."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(review_text_html(before, "pre"))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    if not content:
+        return review_text_html(text, "pre")
+    after = text[start:]
+    if after.strip():
+        content.append(review_text_html(after, "pre"))
+    return "".join(content)
+
+
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
     if isinstance(question, NoQuestion):
         return ""
@@ -665,7 +683,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
+<h2>{proof_title}</h2>{check_html(row[change_review.CHECK])}
 {question_html(question)}{answer}
 {change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')

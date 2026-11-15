@@ -1019,8 +1019,10 @@ Other image cards stay visible.
 An image fades before removal, and the cards below close the gap over 180ms.
 Reduced motion disables fades and uses instant scrolling.
 
-Questions and Changes show a Lucide copy button inside the top right of each code block.
-The command item renderer emits the button with the code block.
+Question items and change rows show a Lucide copy button inside the top right of each code block.
+Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
+This applies to the How to check cell and the Proof cell.
+The shared renderer emits each code block with its button.
 Plain proof text keeps its `<pre>` block without a copy button.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.

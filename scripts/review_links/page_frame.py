@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+import html
+import re
+
+CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
+                        + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
+
+
+def code_block_html(block: re.Match[str]) -> str:
+    """Build a code block with the shared copy button."""
+    text = block[1] if block[1] is not None else block[2]
+    return ('<div class="code-block"><pre><code>' + html.escape(text)
+            + '</code></pre>' + COPY_BUTTON + '</div>')
+
+
 # Every console page centers its main column in the frame, with the same top
 # gutter, so each page title has the same place and style in its column. A page
 # sets only its own max-width. A page that measures its layout puts
