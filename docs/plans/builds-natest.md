@@ -4221,3 +4221,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_copy_imports_stay_in_the_copy` in `scripts/lib/test_py_root.py` uses a regular decoy copy only. Eleven `sitecustomize.py` mutations found no break that only a namespace copy catches.
 - AWS pairs (3 rounds): agent_exec 16.41 -> 14.46 CPU s, py_root 9.17 -> 6.73 CPU s, all pass.
 - Commit cbfbce6aa. Test-only change.
+
+### Phase 293 — The token handoff hold waits use a short pass interval  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `VerifyTokenWaitFixture.hold_environment` in `scripts/direct/verify_token_wait_test_support.py` sets `BUILD_TARGETS_POLL_S=0.5`. The fixture provider ends the hold at the next host probe, which comes with the next routing pass; the default pass is 15 seconds.
+- A 0.05-second interval used more CPU (more passes while the peer held the token).
+- AWS pair (3 rounds): 21.90 -> 14.47 CPU s, all pass.
+- Commit 272d392b0. Test-only change.
