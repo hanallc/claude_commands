@@ -559,6 +559,10 @@ Missing argv does not remove a compile count. A saved shape does not prove compi
 The join combines repeated attempts. Any positive count keeps the call in compile history.
 An unknown count or a missing join keeps the peak usable until the index supplies a known count.
 The peak's completion time controls its history window, including failed-build floors.
+The estimate reader decodes only rows that can be in the window (`HistoryWindow` in `step_estimator.py`).
+Rows append when steps end, so a binary search finds the first row that ended one day before the window.
+The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
+A row whose bytes do not hold the host and a requested step is not decoded.
 Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
@@ -1113,6 +1117,11 @@ Only removal ends the holder's hold.
 **Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
+`remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
+A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+An unreadable step record makes the claims unreadable.
+On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
 Unreadable claims or admission state keep every outermost gate.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
@@ -1134,6 +1143,11 @@ A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
 Legacy CI cargo requests use the same hold and lineage check before memory admission.
 CI requests outside the keep list remain queued until release.
+A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
+Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
+`snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
+GPU slot waits use the same shape with a `_gpu_slot` field.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>'` stops existing queued gates and running work outside the hold's allow rules.

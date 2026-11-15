@@ -141,11 +141,44 @@ class NoStoppedRun:
 NO_STOPPED_RUN = NoStoppedRun()
 
 
+REMOTE_STEP_STATES = frozenset({step_record.StepState.WAITING_MAC, step_record.StepState.ON_MAC,
+                                step_record.StepState.WAITING_SSH, step_record.StepState.ON_SSH})
+
+
+def remote_step_callers() -> frozenset[build_hold.ProcessIdentity] | build_hold.ClaimsUnreadable:
+    """Name each verify call whose build waits for or runs on the Mac or AWS.
+
+    A step that cannot run on natedev, or that waits for or runs on another target, puts no build on natedev.
+    An unreadable record can name such a call, so it makes every claim unreadable.
+    """
+    callers: set[build_hold.ProcessIdentity] = set()
+    try:
+        paths = sorted(step_record.record_directory().glob("*.json"))
+    except OSError as error:
+        return build_hold.ClaimsUnreadable(f"step records: {error}")
+    for path in paths:
+        match step_record.read(path.stem):
+            case step_record.UnreadableRecord(reason=reason):
+                return build_hold.ClaimsUnreadable(f"{path}: {reason}")
+            case step_record.StepRecord() as record if (
+                    "natedev" not in record.eligible_targets or record.state in REMOTE_STEP_STATES):
+                callers.add(build_hold.ProcessIdentity(record.pid, record.proc_start))
+            case _:
+                pass
+    return frozenset(callers)
+
+
 def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
-    """Read local claim records without contacting the Mac or AWS."""
+    """Read local claim and step records without contacting the Mac or AWS.
+
+    A verify call routed to the Mac or AWS counts as claimed before its claim starts and after it ends.
+    """
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
+    routed = remote_step_callers()
+    if isinstance(routed, build_hold.ClaimsUnreadable):
+        return routed
     claimed: set[build_hold.ProcessIdentity] = set()
     try:
         for target in target_config.read_targets():
@@ -160,7 +193,7 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
         return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
     except target_config.ConfigError as error:
         return build_hold.ClaimsUnreadable(str(error))
-    return build_hold.LiveClaims(frozenset(claimed))
+    return build_hold.LiveClaims(frozenset(claimed | routed), routed - claimed)
 
 
 def holds_claim(
@@ -205,7 +238,7 @@ def classify_drain_runs(
         reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
                                         for item in family) else
                   "admission reservation" if identities & admitted else
-                  "Mac or AWS claim" if holds_claim(process, processes, claimed.identities) else "")
+                  "Mac or AWS claim" if holds_claim(process, processes, claimed.identities - claimed.routed) else "")
         if reason:
             runs.append(WorkingRun(process, owner, reason))
         else:

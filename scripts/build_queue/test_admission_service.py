@@ -1799,6 +1799,27 @@ class RunnerAuthorizationTests(unittest.TestCase):
             finally:
                 folder.chmod(0o755)
 
+    def test_a_ci_step_waits_during_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        from scripts.build_hold import build_hold
+        from scripts.build_targets import build_targets
+
+        holder = build_hold.Holder("fps", datetime.now(user_zone()), "Phase 3 timing", build_hold.UnknownReleaseEta(), "fps")
+        held = records.NatedevHeld("fps", "Phase 3 timing")
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            request = fixture.service_request()
+            with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.Wait)
+                self.assertEqual(waiting.reason, held)
+                self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                step, = view.reading.view.waiting
+                self.assertEqual(step.reason, held)
+            fixture.allow_next_start()
+            fixture.release(only_admitted(fixture.server.handle_request(request)))
+
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             fixture.configure(**{"program_first_peak_gib.cargo": 4})
