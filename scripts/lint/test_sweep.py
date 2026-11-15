@@ -702,15 +702,19 @@ class RebuildTests(SweepCase):
         return output.getvalue()
 
     def test_scratch_script_phase_names_stay_in_scratch_script_group(self) -> None:
-        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-demo-18-abc123"), "scratch.py folders")
-        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-lfo-unit-3r-abc123"), "scratch.py folders")
-        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/gate-check.hana"), "gate and merge copies")
+        roots = (Path("/build/claude/scratch"), Path("/tmp/claude/scratch"))
+        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-demo-18-abc123", roots), "scratch.py folders")
+        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-lfo-unit-3r-abc123", roots), "scratch.py folders")
+        self.assertEqual(sweep.clone_kind("/build/claude/scratch/lfo-tests-0c80d6", roots), "scratch.py folders")
+        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/gate-check.hana", roots), "gate and merge copies")
+        self.assertEqual(sweep.clone_kind("/build/claude/scratch/gate-check.hana", roots), "gate and merge copies")
 
     def test_rust_worktree_under_a_scratch_home_stays_a_rust_worktree(self) -> None:
         home = "/tmp/claude/scratch/gate-home-abc123"
+        roots = (Path("/tmp/claude/scratch"),)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": home}))
-        self.assertEqual(sweep.clone_kind(f"{home}/rust/hana"), "~/rust worktrees")
-        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-demo-18-abc123"), "scratch.py folders")
+        self.assertEqual(sweep.clone_kind(f"{home}/rust/hana", roots), "~/rust worktrees")
+        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-demo-18-abc123", roots), "scratch.py folders")
 
     def test_manifest_path_builds_use_workspace_for_previous_step_and_tmp_removal(self) -> None:
         workspace = "/tmp/gate-check.hana"
