@@ -559,6 +559,10 @@ Missing argv does not remove a compile count. A saved shape does not prove compi
 The join combines repeated attempts. Any positive count keeps the call in compile history.
 An unknown count or a missing join keeps the peak usable until the index supplies a known count.
 The peak's completion time controls its history window, including failed-build floors.
+The estimate reader decodes only rows that can be in the window (`HistoryWindow` in `step_estimator.py`).
+Rows append when steps end, so a binary search finds the first row that ended one day before the window.
+The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
+A row whose bytes do not hold the host and a requested step is not decoded.
 Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
