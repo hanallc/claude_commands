@@ -8,7 +8,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -29,7 +29,7 @@ from uuid import uuid4
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -285,18 +285,16 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
         return replace(request, place=wire.CloudPlace('aws'))
-    output = admission_client.WaitOutput()
-    reply = admission_client.admit(refresh(), output, refresh)
-    if isinstance(reply, wire.Refused):
-        raise GateRefused(reply.reason)
-    if isinstance(reply, admission_client.LeftQueue):
-        raise GateRefused('The cloud route left the admission queue')
-    reservation = CloudReservation(sidecar)
-    try:
-        yield reservation
-    finally:
-        with cancellation.defer_cleanup_signals():
-            _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
+    with ExitStack() as held_slot:
+        try:
+            held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
+        except queue_place.QueuePlaceRefused as error:
+            raise GateRefused(str(error)) from error
+        reservation = CloudReservation(sidecar)
+        try:
+            yield reservation
+        finally:
+            held.status = reservation.status
 
 
 @dataclass(frozen=True)

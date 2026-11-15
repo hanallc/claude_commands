@@ -2623,9 +2623,10 @@ class CloudRouteTests(CostFixture):
         requests: list[wire.AdmitRequest] = []
         admit = admission_client.admit
         def record(request: wire.AdmitRequest, on_wait: Callable[[wire.Wait], None],
-                   refresh: Callable[[], wire.AdmitRequest]) -> wire.Admitted | wire.Refused | admission_client.LeftQueue:
+                   refresh: Callable[[], wire.AdmitRequest], *,
+                   _attempt: Callable[[], None]) -> wire.Admitted | wire.Refused | admission_client.LeftQueue:
             requests.append(request)
-            return admit(request, on_wait, refresh)
+            return admit(request, on_wait, refresh, _attempt=_attempt)
         def service(command: Sequence[str]) -> int:
             record, = self.admission.caller_reservations().values()
             self.assertEqual(record.need, 0)

@@ -295,7 +295,8 @@ class CopyTests(TmpSweepCase):
             with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
                 roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
                                                scratch_roots=(), wide_roots=(), session_temp_roots=())
-            self.assertEqual(roots.copies, (str(authority_root),))
+            # The live sweep also drains natedev's former copies root.
+            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(copy_record.FORMER_COPIES_ROOT)))
             authority.assert_called_once_with()
 
     def copy(self, name: str, **fields: object) -> Path:

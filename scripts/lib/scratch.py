@@ -29,7 +29,9 @@ A task, and what ends it:
     With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
     Old deadline tasks without an id remain valid.
 
-A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
+A folder lives in ROOT (build_folders.conf roots.scratch) as `<kind>-<name>-<word>-<suffix>`. An until:
+task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its record keeps the time.
+scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
 The holds record indexes their paths, so task removal does not scan TMPDIR.
 `--visible` (rows only) puts it in VISIBLE_ROOT
@@ -49,7 +51,7 @@ audit to name to its maker. The scratch guard hook
 (scripts/hooks/pre-tool-use-scratch-guard.py) refuses a loose folder in /tmp, ~/rust and the
 other roots.
 
-Copies live at /tmp/claude/copies/<pair>/<copy>. Their records also name source and copy commits,
+Copies live at <roots.copies>/<pair>/<copy>. Their records also name source and copy commits,
 target mode, seed, borrowed git directory, owner and land target. Open phases and borrowed parents
 stay; an unreadable record, phase state or land target needs repair. Shared .claude-busy locks
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
@@ -605,10 +607,11 @@ def target(task: str, word: str, visible: bool, *,
             raise ScratchError(f"{path} exists")
         return path
     suffix = random_suffix(scratch_settings)
-    name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
-    slug = f"{match['kind']}-{name.replace('/', '-')}"
+    # The record keeps an until: task's time, so its folder name holds only the word.
+    slug = "" if match["kind"] == "until" else f"{match['kind']}-{match['name'].replace('/', '-')}"
+    purpose = "-".join(part for part in (slug, word) if part) or "scratch"
     return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=len(suffix),
-                                            purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
+                                            purpose=purpose, suffix=suffix))
 
 
 def maker() -> str:

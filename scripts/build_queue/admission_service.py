@@ -3782,6 +3782,7 @@ ADMISSION_CALLERS = {
     "merge_gate.py": "production/merge_gate.py",
     "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
+    "queue_place.py": "build_queue/queue_place.py",
     "offload.py": "mac_test/offload.py",
     "copy_watch.py": "mac_test/copy_watch.py",
 }
@@ -3860,7 +3861,7 @@ def drain_check(directory: Path, *, service: bool, include_gate_callers: bool, p
     clients: list[str] = []
     names: set[str] = set(ADMISSION_CALLERS) if not service or include_gate_callers else set()
     if service:
-        names.add("admission_client.py")
+        names.update(("admission_client.py", "queue_place.py"))
     scripts: dict[str, bytes] = {}
     root = Path(__file__).resolve().parents[1]
     for name in names:
