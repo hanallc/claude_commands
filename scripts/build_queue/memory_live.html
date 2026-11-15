@@ -270,6 +270,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
+/* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
+.walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
 .walk-table .unit .cell-text { max-width: none; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
@@ -1195,7 +1197,10 @@ function renderWalk(d) {
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
+      (Array.isArray(machine)
+        // A waiting step lists the machines that can take it, each in its machine color.
+        ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
+        : `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`) + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
       (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>`) + '</tr>');
   };
   const running = d.walk.map((row, index) => ({row, index}));
@@ -1227,7 +1232,7 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine || "", null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
@@ -1271,6 +1276,12 @@ function fitAxisLabels() {
   }
 }
 
+// The canvas font of an element. Its "font" shorthand reads empty when a longhand, such as tabular numbers, has no shorthand form.
+function canvasFont(element) {
+  const style = getComputedStyle(element);
+  return `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+}
+
 const MIN_TRACK_WIDTH = 160;
 const TABLE_CAP_GAP = 12;
 function fitWalkDetails() {
@@ -1296,33 +1307,40 @@ function fitWalkDetails() {
   root.classList.add("layout-measuring");
   const context = document.createElement("canvas").getContext("2d");
   function measureColumn(name) {
-    const widths = [...table.querySelectorAll(`.${name}`)].map(cell => {
-      const style = getComputedStyle(cell);
-      context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      return context.measureText(cell.textContent).width + parseFloat(style.paddingRight);
+    // Waiting targets wrap inside the column and do not size it.
+    const widths = [...table.querySelectorAll(name === "machine" ? "tr:not(.wait) > .machine" : `.${name}`)].map(cell => {
+      context.font = canvasFont(cell);
+      return context.measureText(cell.textContent).width + parseFloat(getComputedStyle(cell).paddingRight);
     });
     if (name === "duration") {
-      const style = getComputedStyle(table.querySelector("th.duration"));
-      context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      widths.push(context.measureText(STEP_TABLE_HEADERS.waiting).width + parseFloat(style.paddingRight));
+      const header = table.querySelector("th.duration");
+      context.font = canvasFont(header);
+      widths.push(context.measureText(STEP_TABLE_HEADERS.waiting).width + parseFloat(getComputedStyle(header).paddingRight));
     }
     root.style.setProperty(`--${name}`, `${Math.ceil(Math.max(...widths))}px`);
   }
   measureColumn("duration");
   measureColumn("machine");
-  context.font = getComputedStyle(walk.querySelector(".amounts")).font;
+  context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
     .map(row => [useValue(row), row.reserved].filter(value => value > 0));
   amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
   const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
     sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
-  const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (amountWidth + LABEL_GAP + 1) / (capFraction || 1));
+  // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
+  const statusWidth = Math.max(0, ...[...walk.querySelectorAll(".cloud-status .amounts")].map(status => {
+    context.font = canvasFont(status);
+    const words = status.textContent.trim().split(/\s+/);
+    return Math.min(...words.map((_, index) => Math.max(context.measureText(words.slice(0, index).join(" ")).width,
+      context.measureText(words.slice(index).join(" ")).width)));
+  }));
+  const minimumTrackWidth = Math.max(MIN_TRACK_WIDTH, (Math.max(amountWidth + LABEL_GAP, statusWidth) + 1) / (capFraction || 1));
   const labels = [...walk.querySelectorAll(".row-label .name, .row-label .owner")];
   const roomHeading = walk.querySelector(".wrow.room .row-heading");
-  context.font = getComputedStyle(roomHeading).font;
+  context.font = canvasFont(roomHeading);
   const roomWidth = context.measureText(`Free ${memoryAmount(latest.room)}`).width + 8;
   const textWidth = Math.ceil(Math.max(roomWidth, ...labels.map(label => {
-    context.font = getComputedStyle(label).font;
+    context.font = canvasFont(label);
     return context.measureText(label.textContent).width;
   }))) + 1;
   const rem = parseFloat(getComputedStyle(root).fontSize);
@@ -1467,7 +1485,7 @@ function placeMemoryBars(d) {
     const context = document.createElement("canvas").getContext("2d");
     const inkBottom = Math.max(...previousAmounts.map(label => {
       const style = getComputedStyle(label);
-      context.font = style.font;
+      context.font = canvasFont(label);
       const metrics = context.measureText(label.textContent);
       const leading = (parseFloat(style.lineHeight) - metrics.fontBoundingBoxAscent - metrics.fontBoundingBoxDescent) / 2;
       return label.getBoundingClientRect().top + leading + metrics.fontBoundingBoxAscent + metrics.actualBoundingBoxDescent;

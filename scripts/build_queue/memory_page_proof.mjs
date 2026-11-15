@@ -597,6 +597,12 @@ try {
                 machine:running?.querySelector('.machine')?.textContent,
                 place:waiting?.querySelector('.place')?.textContent,
                 waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                localWaiting:(() => {const index=latest.waiters.findIndex(row=>row.kind!=='cloud');
+                  return index<0?null:{shown:table.querySelector('tr[data-tip="wait:'+index+'"] .machine')?.textContent,
+                    targets:(latest.waiters[index].targets||[]).join(' or ')};})(),
+                beside:document.querySelector('#walk').classList.contains('beside'),
+                statusHeight:runningDetails?.querySelector('.amounts')?.getBoundingClientRect().height,
+                statusLine:parseFloat(getComputedStyle(runningDetails?.querySelector('.amounts')||document.body).lineHeight),
                 waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
                 vcpus:running?.querySelector('.vcpus')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
@@ -635,7 +641,13 @@ try {
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
-            assert.equal(cloudProof.waitingMachine,'');
+            assert.equal(cloudProof.waitingMachine,'aws');
+            // The user, 11-15: a queued row names the machines that can take it in the Target column.
+            assert.ok(cloudProof.localWaiting && cloudProof.localWaiting.targets,'The fixture has no local waiting row with targets.');
+            assert.equal(cloudProof.localWaiting.shown,cloudProof.localWaiting.targets);
+            // The user, 11-15: a cloud status wraps one letter to a line when its room before the cap is narrow.
+            // A stacked chart gives the status the full card width.
+            if(cloudProof.beside) assert.ok(cloudProof.statusHeight<=2*cloudProof.statusLine+1,'The cloud status takes more than two lines: '+cloudProof.statusHeight+' at '+width+' px.');
             assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
             assert.match(cloudProof.slots,/can run on: AWS \(natedev only when AWS cannot start the gate\)/);

@@ -354,11 +354,18 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="place">{place}</td>', cell)
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
-                    self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
                     if kind == "wait":
+                        # A queued row names the machines that can take it, in a span that wraps in the column.
                         self.assertEqual(machine, "")
+                        targets = " or ".join(cast(list[str], row["targets"]))
+                        self.assertTrue(targets)
+                        shown = " or ".join(f'<span class="machine" data-machine="{target}">{target}</span>'
+                                            for target in cast(list[str], row["targets"]))
+                        self.assertIn(f'<td class="machine" data-machine="{targets}"><span class="wait-target">{shown}</span></td>',
+                                      cell)
                     else:
                         self.assertTrue(machine)
+                        self.assertIn(f'<td class="machine" data-machine="{machine}">{machine}</td>', cell)
                     cpus = row.get("vcpus")
                     shown_cpus = str(cpus) if kind == "row" and isinstance(cpus, int) else "—" if kind == "row" else ""
                     self.assertIn(f'<td class="vcpus">{shown_cpus}</td>', cell)
@@ -1337,7 +1344,7 @@ process.stdout.write(JSON.stringify({
                               (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
-                self.assertEqual(memory_feed.local_runs_on(fit), expected)
+                self.assertEqual(memory_feed.local_runs_on(fit).text(), expected)
 
     def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
@@ -1347,12 +1354,12 @@ process.stdout.write(JSON.stringify({
                                 (target_config.PinnedTarget("mac"), "Mac only"),
                                 (target_config.PinnedTarget("natedev"), "natedev only")):
             with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
-                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana"), expected)
+                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana").text(), expected)
                 self.assertEqual(memory_feed.mac_only_route(route, routes), expected == "Mac only")
                 fit.assert_not_called()
         with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
             self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
-                                                      "/fixture/hana", "hana"), "natedev or Mac")
+                                                      "/fixture/hana", "hana"), memory_feed.RunsOn(("natedev", "mac")))
 
     def test_a_mac_only_step_names_what_holds_the_mac_on_its_queued_run_and_waiting_rows(self) -> None:
         reading = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
@@ -1374,12 +1381,12 @@ process.stdout.write(JSON.stringify({
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
             self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only", "mac_state": "busy with check cargo-handler"})
+                             {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler"})
             self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
-                             {"runs_on": "natedev only (the run asks for it)"})
+                             {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"]})
         with mock.patch.object(routes, "holds", return_value=""):
             self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only"})
+                             {"runs_on": "Mac only", "targets": ["mac"]})
 
     def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
         gib = admission_records.GIB
@@ -1469,6 +1476,7 @@ process.stdout.write(JSON.stringify({
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
                 self.assertEqual({waiter.get("runs_on") for waiter in page["waiters"]}, {"natedev or Mac"})
+                self.assertEqual({tuple(waiter.get("targets", ())) for waiter in page["waiters"]}, {("natedev", "mac")})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1637,6 +1645,7 @@ process.stdout.write(JSON.stringify({
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
                 self.assertEqual(waiter["runs_on"], memory_feed.CLOUD_RUNS_ON)
+                self.assertEqual(waiter.get("targets"), ["aws"])
                 self.assertNotIn("AWS", "".join(str(row.get("runs_on", "")) for row in waits if row.get("kind") != "cloud"))
                 self.assertEqual(remote["machine"], "aws")
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
