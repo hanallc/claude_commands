@@ -862,28 +862,28 @@ class UnitPhasesTests(unittest.TestCase):
                                        carried_running or frozenset(), carried or {})
             return unit_phases.checkpoint_wait(found, view, now=now, zone=utc)
 
-        self.assertEqual(wait(events[:4]), "done, waits to land")
-        self.assertEqual(wait(events[:4], frozenset({"ccccccccc"})), "done, landing now")
-        self.assertEqual(wait(events[:4], frozenset({"d" * 40})), "done, waits to land")
-        self.assertEqual(wait(events[:4], line=second), "done, waits to land, 2nd in line")
+        self.assertEqual(wait(events[:4]), "done, waits to merge")
+        self.assertEqual(wait(events[:4], frozenset({"ccccccccc"})), "done, merging now")
+        self.assertEqual(wait(events[:4], frozenset({"d" * 40})), "done, waits to merge")
+        self.assertEqual(wait(events[:4], line=second), "done, waits to merge, 2nd in line")
         self.assertEqual(wait(events[:4], line=second, results={"c" * 40: failed}),
-                         "done, waits to land, 2nd in line; last try failed at red 13:30: test_cards red")
-        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: landed}), "done, waits to land, 2nd in line")
-        self.assertEqual(wait(events[:4], line={}), "done, not sent to land yet")
-        self.assertEqual(wait(events[:4], line={}, results={"c" * 12: failed}), "done, did not land: failed at red 13:30: test_cards red")
-        self.assertEqual(wait(events[:4], results={"c" * 40: landed}), "done, landed 13:30")
-        self.assertEqual(wait(events[:4], frozenset({"c" * 40}), second, {"c" * 40: failed}), "done, landing now")
+                         "done, waits to merge, 2nd in line; last try failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: landed}), "done, waits to merge, 2nd in line")
+        self.assertEqual(wait(events[:4], line={}), "done, not sent to merge yet")
+        self.assertEqual(wait(events[:4], line={}, results={"c" * 12: failed}), "done, did not merge: failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], results={"c" * 40: landed}), "done, merged 13:30")
+        self.assertEqual(wait(events[:4], frozenset({"c" * 40}), second, {"c" * 40: failed}), "done, merging now")
         self.assertIsNone(wait([*events[:4], events[1]], frozenset({"c" * 40})))
         carrier = {"c" * 40: land_queue.Place(3, "sdlc land-line", "unit-board land-line")}
-        self.assertEqual(wait(events[:4], line={}, carried=carrier), "done, waits to land with unit-board land-line, 3rd in line")
+        self.assertEqual(wait(events[:4], line={}, carried=carrier), "done, waits to merge with unit-board land-line, 3rd in line")
         self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: failed}),
-                         "done, waits to land with unit-board land-line, 3rd in line; last try failed at red 13:30: test_cards red")
-        self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: landed}), "done, landed 13:30")
-        self.assertEqual(wait(events[:4], line=second, carried=carrier), "done, waits to land, 2nd in line")
-        self.assertEqual(wait(events[:4], line={}, carried_running=frozenset({"c" * 40})), "done, landing now")
+                         "done, waits to merge with unit-board land-line, 3rd in line; last try failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: landed}), "done, merged 13:30")
+        self.assertEqual(wait(events[:4], line=second, carried=carrier), "done, waits to merge, 2nd in line")
+        self.assertEqual(wait(events[:4], line={}, carried_running=frozenset({"c" * 40})), "done, merging now")
         view = land_queue.LandView({}, {}, {}, frozenset(), carrier)
         self.assertEqual(unit_phases.checkpoint_wait(events[:4], view, now=now, zone=utc, unit="unit-board"),
-                         "done, waits to land with land-line, 3rd in line")
+                         "done, waits to merge with land-line, 3rd in line")
         self.assertIsNone(wait(events[:2]))
         self.assertEqual([unit_phases.ordinal(number) for number in (1, 2, 3, 4, 11, 12, 13, 21, 22, 101, 111)],
                          ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "101st", "111th"])
@@ -894,12 +894,12 @@ class UnitPhasesTests(unittest.TestCase):
             return unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, zone=utc,
                                                 land=land_queue.land_view(self.root))
 
-        self.assertEqual(notes(), "phase images-card — Images card · done, waits to land")
+        self.assertEqual(notes(), "phase images-card — Images card · done, waits to merge")
         self.assertEqual(land_queue.main(["add", "sdlc images", "--commit", "c" * 40]), 0)
         self.assertEqual(land_queue.main(["add", "sdlc other", "--commit", "d" * 40, "--first"]), 0)
-        self.assertEqual(notes(), "phase images-card — Images card · done, waits to land, 2nd in line")
+        self.assertEqual(notes(), "phase images-card — Images card · done, waits to merge, 2nd in line")
         with land_runs.landing(["c" * 9]):
-            self.assertEqual(notes(), "phase images-card — Images card · done, landing now")
+            self.assertEqual(notes(), "phase images-card — Images card · done, merging now")
 
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")

@@ -420,7 +420,7 @@ def ordinal(number: int) -> str:
 
 
 def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
-    """Say how a land ended: "landed 11:20", or "failed at red 11:20: <first detail line>".
+    """Say how a land ended: "merged 11:20", or "failed at red 11:20: <first detail line>".
 
     A merge conflict names its files, not the first detail line.
     """
@@ -429,7 +429,7 @@ def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str
     except (ValueError, TypeError):
         when = ""
     if result["landed"]:
-        return single_spaced(f"landed {when}")
+        return single_spaced(f"merged {when}")
     if conflicts := re.findall(r"Merge conflict in (\S+)", result["detail"]):
         return single_spaced(f"merge conflict in {', '.join(dict.fromkeys(conflicts))} {when}")
     detail = single_spaced(result["detail"].splitlines()[0]) if result["detail"].strip() else ""
@@ -437,25 +437,25 @@ def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str
 
 
 def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo, unit: str = "") -> str:
-    """Say in plain words where a done commit is on its way to main (user, 2026-11-15: a human must understand it).
+    """Say in plain words where a done commit is on its way to main (user, 2026-11-15: a human must understand it; the user does not read the word land).
 
     A carried commit names the work that carries it; the row's own unit name is left out.
     """
     match state:
         case land_queue.LandRunning():
-            return "landing now"
+            return "merging now"
         case land_queue.InLine(place, failed, carried):
             carrier = place.owner.removeprefix(f"{unit} ") if unit else place.owner
-            text = f"waits to land{f' with {carrier}' if carried else ''}, {ordinal(place.number)} in line"
+            text = f"waits to merge{f' with {carrier}' if carried else ''}, {ordinal(place.number)} in line"
             return f"{text}; last try {try_text(failed, now=now, zone=zone)}" if failed else text
         case land_queue.LandEnded(result) if result["landed"]:
             return try_text(result, now=now, zone=zone)
         case land_queue.LandEnded(result):
-            return f"did not land: {try_text(result, now=now, zone=zone)}"
+            return f"did not merge: {try_text(result, now=now, zone=zone)}"
         case land_queue.NotInLine():
-            return "not sent to land yet"
+            return "not sent to merge yet"
         case land_queue.LineUnused():
-            return "waits to land"
+            return "waits to merge"
 
 
 def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
@@ -498,10 +498,10 @@ def unit_lands(unit: str, land: land_queue.LandView, *, skip: Sequence[str], now
             newest[phase] = result
     parts: list[str] = []
     if landing:
-        parts.append(f"landing now: {', '.join(landing)}")
+        parts.append(f"merging now: {', '.join(landing)}")
     if entries := [f"{' + '.join(phases)} ({ordinal(number)} in line)" for number, phases in sorted(items.items()) if phases]:
-        parts.append(f"done, waits to land: {', '.join(entries)}")
-    parts.extend(f"{phase} did not land: {try_text(result, now=now, zone=zone)}" for phase, result in newest.items()
+        parts.append(f"done, waits to merge: {', '.join(entries)}")
+    parts.extend(f"{phase} did not merge: {try_text(result, now=now, zone=zone)}" for phase, result in newest.items()
                  if not result["landed"] and phase not in skip and phase not in queued and phase not in landing
                  and not on_main(result["commit"]))
     return " · ".join(parts)

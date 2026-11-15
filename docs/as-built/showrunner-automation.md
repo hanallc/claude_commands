@@ -813,14 +813,14 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
     So a checkpoint that a later checkpoint carries shows that later item's place. The order is: running, its own place, a landed result, carried running, carried place, a failed result.
     `unit_phases.land_text` says the land state in plain words, and the wait is `done, <land text>` (user, 2026-11-15: a human must understand it).
-    The land text is `landing now` when `land_runs.running_lands()` holds the event's `checkpoint_commit`.
-    Else, at a place in the line, it is `waits to land, <Nth> in line`, or `waits to land with <unit> <phase>, <Nth> in line` for a carried commit; a failed newest result adds `; last try <state> at <step> <time>: <first detail line>`.
-    Else the newest result shows: `landed <time>`, or `did not land: <state> at <step> <time>: <first detail line>`.
-    Else it is `not sent to land yet`. With no line file, it stays `waits to land`.
+    The land text is `merging now` when `land_runs.running_lands()` holds the event's `checkpoint_commit`.
+    Else, at a place in the line, it is `waits to merge, <Nth> in line`, or `waits to merge with <unit> <phase>, <Nth> in line` for a carried commit; a failed newest result adds `; last try <state> at <step> <time>: <first detail line>`.
+    Else the newest result shows: `merged <time>`, or `did not merge: <state> at <step> <time>: <first detail line>`.
+    Else it is `not sent to merge yet`. With no line file, it stays `waits to merge`.
     `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits, and the `unit phase` owner of each) while it holds the merge lock, and removes it at exit.
-    `unit_phases.unit_lands` adds to the unit's first Notes row each sent checkpoint that has no open phase row: `landing now: <phases>`,
-    `done, waits to land: <phase> (1st in line), <phase> + <phase> (2nd in line)` with one entry for each line item,
-    and `<phase> did not land: <result>` for a newest failed result whose commit is not on `origin/main` (sdlc C1701).
+    `unit_phases.unit_lands` adds to the unit's first Notes row each sent checkpoint that has no open phase row: `merging now: <phases>`,
+    `done, waits to merge: <phase> (1st in line), <phase> + <phase> (2nd in line)` with one entry for each line item,
+    and `<phase> did not merge: <result>` for a newest failed result whose commit is not on `origin/main` (sdlc C1701).
     A merge conflict result says `merge conflict in <files> <time>`.
     A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
     `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).

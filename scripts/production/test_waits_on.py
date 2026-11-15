@@ -93,13 +93,13 @@ class WaitsOnTests(unittest.TestCase):
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
         self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland — after builds/589: done, waits to land, 10th in line")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland — after builds/589: done, waits to merge, 10th in line")
         self.assertEqual(text(waits_on.NotOnMain("c" * 40), results={"c" * 40: failed}),
-                         "acctland — after builds/589: waits to land, 10th in line; last try failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland — after builds/589: done, landing now")
+                         "acctland — after builds/589: waits to merge, 10th in line; last try failed at red 13:30: test_x red")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland — after builds/589: done, merging now")
         self.assertEqual(text(waits_on.NotOnMain("d" * 40)), "acctland — after builds/589: not on main")
         self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: {**failed, "commit": "d" * 40}}),
-                         "acctland — after builds/589: did not land: failed at red 13:30: test_x red")
+                         "acctland — after builds/589: did not merge: failed at red 13:30: test_x red")
         self.assertEqual(text(waits_on.PhaseOpen(now + 3600)), "acctland — after builds/589: in work, ETA 14:40")
         self.assertEqual(text(waits_on.PhaseOpen(None)), "acctland — after builds/589: in work, no ETA")
         self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland — after builds/589: not started")
@@ -108,7 +108,7 @@ class WaitsOnTests(unittest.TestCase):
                                                  land_queue.LandView({}, {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
-                         "acctland — after builds/589: done, landed 13:30, not on main yet")
+                         "acctland — after builds/589: done, merged 13:30, not on main yet")
 
     def test_the_first_row_names_each_sent_checkpoint_of_the_unit(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
@@ -127,11 +127,11 @@ class WaitsOnTests(unittest.TestCase):
         def lands(skip: tuple[str, ...] = (), on_main: bool = False) -> str:
             return unit_phases.unit_lands("shelled", view, skip=skip, now=now, zone=utc, on_main=lambda _commit: on_main)
 
-        self.assertEqual(lands(), "landing now: images-card · done, waits to land: shot-rule (1st in line), "
-                         + "workers-why + land-line (2nd in line) · center-column did not land: merge conflict in docs/a.md, b.md 13:30 "
-                         + "· images did not land: merge conflict in docs/a.md, b.md 13:40")
+        self.assertEqual(lands(), "merging now: images-card · done, waits to merge: shot-rule (1st in line), "
+                         + "workers-why + land-line (2nd in line) · center-column did not merge: merge conflict in docs/a.md, b.md 13:30 "
+                         + "· images did not merge: merge conflict in docs/a.md, b.md 13:40")
         self.assertEqual(lands(("images-card", "shot-rule", "land-line", "images"), on_main=True),
-                         "done, waits to land: workers-why (2nd in line)")
+                         "done, waits to merge: workers-why (2nd in line)")
         self.assertEqual(unit_phases.unit_lands("nobody", view, skip=(), now=now, zone=utc, on_main=lambda _commit: False), "")
 
 

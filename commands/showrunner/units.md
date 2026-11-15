@@ -87,16 +87,16 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
    A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
    The wait uses plain words (user, 2026-11-15: a human must understand it).
-   It is ` · done, landing now` while a land run that holds the checkpoint commit runs now.
-   In the land line it is ` · done, waits to land, 2nd in line`; 1st lands next.
-   A checkpoint that a later checkpoint in the line holds says ` · done, waits to land with <unit> <phase>, 2nd in line`.
+   It is ` · done, merging now` while a merge run that holds the checkpoint commit runs now.
+   In the merge line (`land_queue.py list`) it is ` · done, waits to merge, 2nd in line`; 1st merges next.
+   A checkpoint that a later checkpoint in the line holds says ` · done, waits to merge with <unit> <phase>, 2nd in line`.
    A failed earlier try adds `; last try failed at red 11:20: <first detail line>`.
-   Out of the line it is the last land result: `done, landed 11:20` or `done, did not land: held at ancestry 11:20: <detail>`.
-   With no result, it is ` · done, not sent to land yet`.
-   Before any runner uses the line, it is ` · done, waits to land`.
-   The unit's first row also names each sent checkpoint with no phase row of its own, from the land line and the land results:
-   ` · landing now: <phase>`, ` · done, waits to land: shot-rule (1st in line), a + b (2nd in line)`, or ` · <phase> did not land: merge conflict in <files> 13:58`.
-   Phases in one land line item share one entry. A failed land whose commit is on main later is not shown.
+   Out of the line it is the last merge result: `done, merged 11:20` or `done, did not merge: held at ancestry 11:20: <detail>`.
+   With no result, it is ` · done, not sent to merge yet`.
+   Before any runner uses the line, it is ` · done, waits to merge`.
+   The unit's first row also names each sent checkpoint with no phase row of its own, from the merge line and the merge results:
+   ` · merging now: <phase>`, ` · done, waits to merge: shot-rule (1st in line), a + b (2nd in line)`, or ` · <phase> did not merge: merge conflict in <files> 13:58`.
+   Phases in one merge line item share one entry. A failed merge whose commit is on main later is not shown.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
@@ -142,8 +142,8 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
    It excludes each queue item whose text equals Notes in the same row.
    An item added with `--after <work>` names its wait: `<text> — after <work>: <state>`.
-   The state comes from the local `origin/main` (no fetch), the land line, the land results, and the owner unit's run.
-   Example states: `done, waits to land, 3rd in line`, `done, landing now`, `done, landed 14:10, not on main yet`, `in work, ETA 16:00`, `not started`, `not on main`, `not found`.
+   The state comes from the local `origin/main` (no fetch), the merge line, the merge results, and the owner unit's run.
+   Example states: `done, waits to merge, 3rd in line`, `done, merging now`, `done, merged 14:10, not on main yet`, `in work, ETA 16:00`, `not started`, `not on main`, `not found`.
    When the work is on main, the item shows `ready: <text> (<work> on main)`.
    Each part adds ` +<n> more` for later items.
    The queue count includes only remaining items.
