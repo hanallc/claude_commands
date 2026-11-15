@@ -4171,18 +4171,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_ssh_targets_routing.py` runs fewer complete `verify.sh` flows, with the same checks of behavior.
-
-**Spec:**
-- `test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally` keeps 3 of its 5 complete runs: `completed-decline` (a one-word reason after the run), `runtime-version-mismatch` (a long reason with spaces) and `probe-leftovers` (a busy reason from the probe). All 5 modes go to the same pinned refusal branch (`verify.sh` `pinned_target_refuse "${LAST_TARGET_REASON:-runner}"`). The offload tests check the dropped reasons: disk (`test_offload.test_low_disk_declines_after_probe`) and a probe nextest mismatch (`test_failed_probe_mark`).
-- `test_saved_reservation_survives_a_lost_reserve_response` keeps the 0-read and 3-read cases. The 3-read case checks the recovery retry loop and its poll spacing. The 1-read case is removed.
-
-**Files:** `scripts/direct/test_verify_ssh_targets_routing.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
-
-**Constraints from prior phases:** Phase 287 moved argument-shape checks to direct calls in the same way.
-
-**Acceptance gate:** the module passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
+- `test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally` in `scripts/direct/test_verify_ssh_targets_routing.py` keeps 3 complete `verify.sh` runs: `completed-decline` (a one-word reason after the run), `runtime-version-mismatch` (a long reason with spaces) and `probe-leftovers` (a busy reason from the probe). All pinned modes go to the same `pinned_target_refuse` branch. The offload tests check the dropped disk and probe nextest-mismatch reasons.
+- `test_saved_reservation_survives_a_lost_reserve_response` keeps the 0-read and 3-read cases. The 3-read case covers the recovery retry loop and its poll spacing.
+- AWS pair (3 rounds): 25.67 -> 22.61 CPU s, all pass.
+- Commit 78f9a3130. Test-only change.
