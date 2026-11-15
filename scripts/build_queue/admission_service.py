@@ -878,6 +878,13 @@ class DeferredOwnerRequest:
     arrived_monotonic: float
 
 
+@dataclass(frozen=True)
+class ParkedPlacement:
+    """A placement request whose reply waits for the next pass."""
+    request: wire.PlacementRequest
+    connection: Connection
+
+
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
 
 
@@ -1087,6 +1094,8 @@ class AdmissionServer:
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.reader_requested: bool = False
         self.deferred_requests: list[DeferredOwnerRequest] = []
+        self.parked_placements: list[ParkedPlacement] = []
+        self.last_pass_started: float = float("-inf")
         self.override_reconnect_until: ReconnectDeadline | ReconnectAwaitingListener | NoReconnectGrace = NoReconnectGrace()
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
@@ -1766,16 +1775,46 @@ class AdmissionServer:
         except (OSError, ValueError, RuntimeError) as error:
             print(f"memory admission: cannot start reading alert: {error}", file=sys.stderr)
 
+    def _pass_allowed_at(self) -> float:
+        """Passes start at least min_pass_gap_seconds apart, so a burst of requests shares one pass."""
+        config = self.last_usable_configuration
+        gap = config.min_pass_gap_seconds if isinstance(config, records.MemoryConfig) else 0
+        return self.last_pass_started + gap
+
+    def _pass_gap_open(self) -> bool:
+        return self.clock.monotonic() >= self._pass_allowed_at()
+
+    def _pass_when_open(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
+                        ) -> bool:
+        """Run a pass now when the gap allows it. Otherwise keep the configuration and mark a pass due."""
+        if self._pass_gap_open():
+            _ = self._run_pass(configuration)
+            return True
+        if isinstance(self.pending_configuration, NoPass):
+            self.pending_configuration = configuration
+        self.next_pass = min(self.next_pass, self.clock.monotonic())
+        return False
+
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         from scripts.build_targets import target_config
 
         # One pass reads the target list once; each placement check in the pass uses that read.
         with target_config.command_configuration():
-            return self._pass(configuration)
+            result = self._pass(configuration)
+        self._answer_parked_placements()
+        return result
+
+    def _answer_parked_placements(self) -> None:
+        parked, self.parked_placements = self.parked_placements, []
+        for item in parked:
+            if not item.connection.finished and item.connection.socket.fileno() >= 0:
+                self._send(item.connection, self._placement_reply(item.request,
+                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
+        self.last_pass_started = self.clock.monotonic()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -2963,7 +3002,8 @@ done
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
-                          | wire.PrerequisiteReport | wire.CancelPlacement) -> list[wire.Reply]:
+                          | wire.PrerequisiteReport | wire.CancelPlacement,
+                          connection: Connection | NoConnection = NO_CONNECTION) -> list[wire.Reply]:
         if isinstance(request, wire.ConsumePermission):
             return [self._consume_permission(request)]
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
@@ -3015,6 +3055,10 @@ done
                 self.prerequisites[request.episode] = request.prerequisite
             self._watch_owner(request.owner)
             self.persist()
+            if isinstance(connection, Connection) and not self._pass_gap_open():
+                self.parked_placements.append(ParkedPlacement(request, connection))
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                return []
             _ = self.run_pass()
             return [self._placement_reply(request,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
@@ -3156,7 +3200,7 @@ done
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
-            replies = self._handle_placement(request)
+            replies = self._handle_placement(request, connection)
             if (isinstance(request, wire.ConsumePermission) and isinstance(connection, Connection)
                     and not any(isinstance(reply, wire.FirstAuthorization) for reply in replies)):
                 self.persist()
@@ -3258,9 +3302,15 @@ done
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
             return [self.ledger[key].reply]
-        _ = self._run_pass(configuration)
+        if isinstance(connection, Connection):
+            # The pass delivers admission replies on the connection, now or at the next pass.
+            ran = self._pass_when_open(configuration)
+        else:
+            _ = self._run_pass(configuration)
+            ran = True
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            return self._pending_replies.pop(key, [])
+            replies = self._pending_replies.pop(key, [])
+            return replies if ran else []
         return [self.ledger[key].reply]
 
     def _submit_queue_change(self, request: QueueChange,
@@ -3451,6 +3501,7 @@ done
     def _drop_deferred_requests(self, connection: Connection) -> None:
         self.deferred_requests = [pending for pending in self.deferred_requests
                                   if pending.connection is not connection]
+        self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
         self._drop_deferred_requests(connection)
@@ -3461,7 +3512,7 @@ done
         del self.connections[descriptor]
         connection.socket.close()
         if self._detach_admission(connection):
-            _ = self.run_pass()
+            _ = self._pass_when_open(self._take_configuration())
 
     def _detach_admission(self, connection: Connection) -> bool:
         """End this connection's eligibility before a later pass can grant it."""
@@ -3669,7 +3720,8 @@ done
     def run_once(self, timeout: float = 0) -> None:
         self.start()
         now = self.clock.monotonic()
-        delay = min(timeout, max(0, min(self.next_pass, self.next_source_check, self.next_config_watch_retry) - now))
+        due = max(self.next_pass, self._pass_allowed_at())
+        delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
         if any(descriptor == self.priority_events for descriptor, _events in ready):
             _ = os.eventfd_read(self.priority_events)
@@ -3727,7 +3779,7 @@ done
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
         self._finish_priority_roster()
-        if self.clock.monotonic() >= self.next_pass:
+        if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
@@ -3787,6 +3839,7 @@ done
             connection.socket.close()
         self.connections.clear()
         self.deferred_requests.clear()
+        self.parked_placements.clear()
         for descriptor in self.watchers:
             os.close(descriptor)
         self.watchers.clear()

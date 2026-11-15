@@ -1210,6 +1210,7 @@ class MemoryConfig:
     release_headroom: float
     running_pass_seconds: float
     waiting_pass_seconds: float
+    min_pass_gap_seconds: float
     wait_reply_seconds: float
     query_timeout_seconds: float
     replay_retention_seconds: float
@@ -1314,6 +1315,7 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
                 dev_size_margin_bytes=value("dev_size_margin_gib", lambda raw: math.ceil(float(raw) * GIB)),
                 release_headroom=number("release_headroom"),
                 running_pass_seconds=running_interval, waiting_pass_seconds=number("waiting_pass_seconds"),
+                min_pass_gap_seconds=number("min_pass_gap_seconds"),
                 wait_reply_seconds=number("wait_reply_seconds"), query_timeout_seconds=number("query_timeout_seconds"),
                 replay_retention_seconds=number("replay_retention_seconds"),
                 ended_placement_seconds=number("ended_placement_seconds"),

@@ -946,3 +946,62 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             observed = fixture.server.host_evidence(key)
             self.assertIsInstance(observed, placement.StaleHostEvidence)
             self.assertLessEqual(observed.observed_at, read_started[0])
+
+
+class PassGapTests(unittest.TestCase):
+    """Socket requests in one pass gap share the next pass and get their replies from it."""
+
+    def gap_fixture(self, fixture: AdmissionFixture) -> None:
+        fixture.configure(min_pass_gap_seconds=0.25)
+        _ = fixture.run_pass()
+
+    def test_placement_requests_in_one_gap_share_the_next_pass(self) -> None:
+        with PlacementFixture() as fixture:
+            self.gap_fixture(fixture)
+            requests = [placement_request(fixture) for _ in range(2)]
+            for request in requests:
+                _ = publish_candidate(fixture, request)
+            peers = [fixture.connect(request) for request in requests]
+            with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passes:
+                self.assertEqual(peers[0].replies(), [])
+                self.assertEqual([item.request.episode for item in fixture.server.parked_placements],
+                                 [request.episode for request in requests])
+                self.assertEqual(passes.call_count, 0)
+                fixture.clock.advance(0.25)
+                replies = [peer.replies() for peer in peers]
+                self.assertEqual(passes.call_count, 1)
+            for reply in replies:
+                self.assertEqual(len(reply), 1, reply)
+                self.assertIsInstance(reply[0], wire.Assignment | wire.PlacementWait)
+            self.assertFalse(fixture.server.parked_placements)
+
+    def test_a_closed_connection_drops_its_parked_placement(self) -> None:
+        with PlacementFixture() as fixture:
+            self.gap_fixture(fixture)
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            peer = fixture.connect(request)
+            self.assertEqual(peer.replies(), [])
+            self.assertEqual(len(fixture.server.parked_placements), 1)
+            peer.close()
+            fixture.server.run_once(0)
+            self.assertFalse(fixture.server.parked_placements)
+            fixture.clock.advance(0.25)
+            fixture.server.run_once(0)
+            self.assertFalse(fixture.server.connections)
+
+    def test_an_admission_in_the_gap_gets_its_grant_at_the_next_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.gap_fixture(fixture)
+            peer = fixture.connect(fixture.request())
+            self.assertEqual(peer.replies(), [])
+            fixture.clock.advance(0.25)
+            _ = only_admitted(peer.replies())
+
+    def test_a_request_without_a_connection_gets_its_reply_at_once(self) -> None:
+        with PlacementFixture() as fixture:
+            self.gap_fixture(fixture)
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            _ = assignment_for(fixture, request)
+            self.assertFalse(fixture.server.parked_placements)
