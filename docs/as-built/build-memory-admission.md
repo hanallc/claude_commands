@@ -1873,7 +1873,10 @@ Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
-The narrow layout adds the `Step` column.
+The narrow layout adds the `Step` column and shows each cell in full.
+When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
+Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
+`memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
 The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
 It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
 A v3 registration must match the current boot, process start time, uid, PID, and generation.

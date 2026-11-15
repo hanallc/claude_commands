@@ -282,8 +282,19 @@ try {
                   const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
                     document.querySelector('.wrow.room');
                   return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
-                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
+                    table:rect(metadata).top-rect(table.querySelector('thead tr')).bottom};
                 }),
+                compact:document.querySelector('#walk').classList.contains('compact'),
+                cut:(() => {
+                  // A cell is cut when it ends outside the table box or its text is wider than its box.
+                  const box=rect(table);
+                  const cells=[...table.querySelectorAll('tr > *')].filter(cell=>getComputedStyle(cell).display!=='none');
+                  return [...cells.map(cell=>[cell,cell.querySelector('.cell-text')||cell]),
+                    ...[...document.querySelectorAll('.walk-chart .row-label .name')].map(name=>[name,name])]
+                    .filter(([cell,text])=>rect(cell).left<box.left-0.5 || rect(cell).right>box.right+0.5 ||
+                      text.scrollWidth>text.clientWidth)
+                    .map(([cell])=>cell.className+': '+cell.textContent);
+                })(),
                 machine:table.querySelector('td.machine')?.textContent,
                 capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
@@ -321,7 +332,9 @@ try {
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
             for(const offsets of proof.rowOffsets)
-              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
+              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify({theme,width,offsets,all:proof.rowOffsets}));
+            if(proof.layout==='stacked') assert.deepEqual(proof.cut,[],'A stacked table cell is cut at '+width+' px.');
+            assert.equal(proof.compact,width===390,'Only the phone table uses two lines for each step.');
             assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -676,7 +689,7 @@ try {
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
                   tip:tooltipHtml('row:'+index,latest),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
-                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead').getBoundingClientRect().bottom};
+                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead tr').getBoundingClientRect().bottom};
               });
             })()`);
             assert.equal(macProof.length,3);

@@ -263,10 +263,26 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
 .walk.stacked .step { display: table-cell; }
 .walk.stacked .walk-table { width: 100%; overflow-x: auto; }
-.walk.stacked .walk-table .cell-text { max-width: min(6rem, var(--table-label, 6rem)); }
-.walk.stacked .walk-table .unit .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
+.walk.stacked .walk-table .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
+.walk.stacked .row-label .name { white-space: normal; overflow-wrap: anywhere; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
+/* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
+.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto; column-gap: 12px; width: 100%; }
+.walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
+.walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
+.walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
+.walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
+.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 5; contain: inline-size; }
+.walk.compact .walk-table .done { grid-area: 1 / 5; }
+.walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
+.walk.compact .walk-table .unit { grid-area: 2 / 2; }
+.walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
+.walk.compact .walk-table .machine { grid-area: 2 / 4; }
+.walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
+.walk.compact .walk-table tr.room > *, .walk.compact .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
+.walk.compact .walk-table tr.room, .walk.compact .walk-table tr.wait-first { border-top: 1px solid var(--line); }
+.walk.compact .walk-table tr.room { border-bottom: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
@@ -301,8 +317,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
   .walk-table table { font-size: 0.78rem; }
-  .walk.stacked .walk-table .cell-text { max-width: min(4.5rem, var(--table-label, 4.5rem)); }
-  .walk.stacked .walk-table td.token-wait { white-space: normal; min-width: 7em; }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
@@ -1054,8 +1068,8 @@ function renderWalk(d) {
   const tableRows = [];
   const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", placeClass = "") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place${placeClass}">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
@@ -1064,8 +1078,7 @@ function renderWalk(d) {
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r),
-      r.progress?.kind === "TokenWaitProgress" ? " token-wait" : "");
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
@@ -1134,6 +1147,7 @@ function fitWalkDetails() {
   const track = walk.querySelector(".track");
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
+  walk.classList.remove("compact");
   walk.classList.add("measuring");
   const capFraction = !hasCap(latest) ? 0 : capEnd(latest.ram);
   function measure(labelWidth) {
@@ -1193,15 +1207,9 @@ function fitWalkDetails() {
   walk.classList.toggle("beside", beside);
   walk.classList.toggle("stacked", !beside);
   walk.classList.remove("measuring");
+  walk.classList.toggle("compact", !beside && table.scrollWidth > table.clientWidth);
   measureColumn("duration");
   measureColumn("machine");
-  if (!beside) {
-    const fixedWidth = ["place", "done", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
-      width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
-    const padding = ["step", "unit"].reduce((width, name) =>
-      width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
-    root.style.setProperty("--table-label", `${Math.max(0, (walk.clientWidth - fixedWidth - padding) / 2)}px`);
-  }
   if (beside) {
     // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
     const range = track.getBoundingClientRect();
@@ -1210,17 +1218,24 @@ function fitWalkDetails() {
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
     walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   }
-  for (const row of walk.querySelectorAll(".wrow[data-tip]")) {
-    const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
+  for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
+    const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
     if (row.classList.contains("cloud-work")) detail.style.maxWidth = beside
       ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
     row.style.minHeight = "44px";
-    metadata.style.height = "44px";
+    metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
     row.style.minHeight = `${height}px`;
     metadata.style.height = `${height}px`;
+  }
+  const queueRow = table.querySelector("tr.queue-head");
+  const queueSpacer = walk.querySelector(".walk-chart .queue-head");
+  if (queueRow && queueSpacer) {
+    queueRow.style.height = queueSpacer.style.height = "";
+    const height = Math.ceil(Math.max(queueRow.getBoundingClientRect().height, queueSpacer.getBoundingClientRect().height));
+    queueRow.style.height = queueSpacer.style.height = `${height}px`;
   }
 }
 

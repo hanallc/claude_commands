@@ -1605,3 +1605,15 @@ From builds (not the user), from a defect the user saw at 11:00 EST (via sdlc, f
 - `memory_feed.row_progress` returns `TokenWaitProgress` (`stage`, `tokens`) for a natedev row. `memory_live.html` shows its `stage` in the Stage column; `Done` stays `—`. At phone width the stage wraps in its cell.
 - `/build:queue` prints only the Builds page link; `build_queue.py --json` shows the wait in the running step's `measured.counter.token_wait`.
 - Proof: `phases/89/proof/before-*` and `after-*` (the Running table at 1400 px dark and light, and at phone width), from a fixture of the live feed with one natedev nextest row in the wait.
+
+### Phase 90 — The phone Builds table shows every cell in full · status: done
+
+From builds (not the user), 2026-11-15, from a phase 89 note: the phone-width Running table cut off Pid, Target and vCPU and ended step names in an ellipsis. Fix it so each needed column shows in full, under the UX guide, and add a page proof that fails on a cut cell at 390 px.
+
+#### As-built
+
+- `memory_live.html`: the stacked table shows full cell text. When it is wider than the card, `fitWalkDetails` adds `compact`. Each row is then a two-line subgrid row: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU. Target takes the free width, so Stage fits on one line when the card has room.
+- `--table-label` and the phone `token-wait` rule are gone; the compact layout wraps the stage only when it does not fit.
+- The chart row names wrap in the stacked layout. The row height match now includes the room row and the queue header.
+- `memory_page_proof.mjs`: in the stacked layout no table cell or chart name may be cut, and only 390 px uses two lines. Row offsets measure from the header row. The proof fails at 900 px on the old page.
+- Proof: `phases/90/proof/before-*` and `after-*` (the Running card at 390 px light and dark, and at 900 px dark), from a fixture of the live feed.

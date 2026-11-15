@@ -150,7 +150,6 @@ class MemoryHoverTests(unittest.TestCase):
         cells = root.find(".//tr[@data-tip='row:0']")
         assert cells is not None
         self.assertEqual(cells[0].text, "waiting for jobserver tokens")
-        self.assertEqual(cells[0].get("class"), "place token-wait")
         self.assertEqual(cells[1].text, "—")
 
     def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
