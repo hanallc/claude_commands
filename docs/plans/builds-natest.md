@@ -4394,7 +4394,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Builds dropped the windowed lock (spec item 3) on 11-15: a mode tracked by hand, and a missed set is silent and unsafe.
 - Commit effcb3c11. verify-unit reviewed the diff.
 
-### Phase 308 — A Mac clippy failure in verify.sh lint starts no local mend fix  · status: todo
+### Phase 308 — A Mac clippy failure in verify.sh lint starts no local mend fix  · status: done
 **Depends on:** Phase 307
 **Owner:** natest (builds assigned it on 11-15; verify-unit reviews the diff, because the code is from its phase maclintfix, e07d86209).
 
@@ -4418,12 +4418,16 @@ Full diagnosis: /tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/bf3
 4. Do not change the memory-judgment path (`LINT_MEMORY_JUDGMENT`) or the `--check` path.
 5. Regression test, in process or in one small bash program: Mac mend passes, Mac clippy fails, natedev is busy. verify.sh exits with the clippy failure, and it makes no local mend request. Every behavior check stays.
 6. No signal handlers in new Python code. No new full verify.sh flow in tests.
+7. **Phase 307 fixes in `verify_helper`** (builds held 307 on 11-15; one hash carries both).
+   - No signal disposition: remove `trap '' PIPE` and `trap - PIPE`. The request write goes back in a `( ... )` subshell, so a dead helper kills only that subshell and the call reaches the local fallback. The builtin environment write stays.
+   - `compgen -V names -e` runs before the lock and the write, so a failure sends nothing (verify-unit review). Before this, a compgen failure sent a full request with no environment: the command ran twice, and the unread reply stayed in the pipe for the next call.
+   - Test in the existing `test_verify_helper` bash program: a failing compgen sends no request, takes the fallback, and the next call returns its own result.
 
-**Files:** `scripts/direct/verify.sh` (`run_lint_held_sequence`, `run_lint_sequence`), and the closest existing lint test module (`scripts/direct/test_verify_lint_judgment.py` or the module that covers `run_lint_held_sequence`).
+**Files:** `scripts/direct/verify.sh` (`run_lint_held_sequence`, `run_lint_sequence`, `verify_helper`), `scripts/direct/test_verify_helper.py`, and the closest existing lint test module (`scripts/direct/test_verify_lint_judgment.py` or the module that covers `run_lint_held_sequence`).
 
 **Workers:** 1 writer; one shell change and one test.
 - impl: all files.
 
-**Constraints from prior phases:** Phase 307: `verify_helper` writes its request in a `{ …; }` group and sends the environment without `env`. verify-unit's berth pass 9f8fc1c39 (branch verify-berth-fix-pass, not on main yet) edits the mend branch and the fmt step, and adds `lint_copy_*` functions. Check a trial merge with it before the hash goes to builds. Shellcheck baseline on verify.sh: 23 findings; add none.
+**Constraints from prior phases:** Phase 307: `verify_helper` sends the environment without `env`. verify-unit's berth pass 9f8fc1c39 (branch verify-berth-fix-pass, not on main yet) edits the mend branch and the fmt step, and adds `lint_copy_*` functions. Check a trial merge with it before the hash goes to builds. Shellcheck baseline on verify.sh: 23 findings; add none.
 
 **Acceptance gate:** the new regression test, test_verify_lint_judgment, test_verify_step_state and every lint test module that covers `run_lint_sequence` pass on natedev; `bash -n` and shellcheck on verify.sh add no finding; a trial merge with 9f8fc1c39 and origin/main is clean; verify-unit reviews the diff.

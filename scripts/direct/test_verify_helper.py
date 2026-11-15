@@ -128,6 +128,8 @@ if __name__ == "__main__":
     def test_shell_environment_matches_env_for_exported_values(self) -> None:
         _ = self.program.write_text('''import json, os
 def main():
+    with open(__file__ + ".calls", "a") as calls:
+        calls.write(os.environ.get("FIXTURE_EXECUTION", "helper") + "\\n")
     print(json.dumps(dict(os.environ)))
     return 0
 if __name__ == "__main__":
@@ -135,7 +137,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ''')
         script = shell_functions(DIRECT / "verify.sh", "verify_helper") + r'''
-VERIFY_START_DIR=$1; PY=$2; FIXTURE_ROOT=$4
+VERIFY_START_DIR=$1; PY=$2
 verify_helper --start
 export FIXTURE_SPACE='one two' FIXTURE_EQUALS='one=two=three'
 export FIXTURE_NEWLINES=$'one\ntwo\n' FIXTURE_EMPTY=''
@@ -144,18 +146,11 @@ declare -ax FIXTURE_ARRAY=(one two)
 declare -Ax FIXTURE_MAPPING=([one]=two)
 env -0 > "$4/environment"
 env() { return 91; }
-lock_file_descriptor() {
-    builtin printf '%s\n' "$BASHPID" > "$FIXTURE_ROOT/lock-pid"
-}
-printf() {
-    if [[ "$1" == '%s\0' ]]; then
-        builtin printf '%s\n' "$BASHPID" > "$FIXTURE_ROOT/write-pid"
-    fi
-    builtin printf "$@"
-}
 verify_helper "$3"
 compgen() { return 1; }
 verify_helper "$3" > "$4/fallback-environment"
+unset -f compgen
+FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
 '''
         result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
                                  str(self.program), str(self.root)], capture_output=True, text=True,
@@ -168,11 +163,15 @@ verify_helper "$3" > "$4/fallback-environment"
         _ = expected.pop("_", None)
         _ = actual.pop("_", None)
         self.assertEqual(actual, expected)
-        self.assertEqual((self.root / "lock-pid").read_text(), (self.root / "write-pid").read_text())
         fallback = cast(dict[str, str], json.loads((self.root / "fallback-environment").read_text()))
         self.assertEqual(fallback.pop("FIXTURE_EXECUTION"), "local")
         _ = fallback.pop("_", None)
         self.assertEqual(fallback, expected)
+        following = cast(dict[str, str], json.loads((self.root / "next-environment").read_text()))
+        self.assertEqual(following.pop("FIXTURE_EXECUTION"), "next")
+        _ = following.pop("_", None)
+        self.assertEqual(following, expected)
+        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nlocal\nnext\n")
 
     def test_shell_recovers_after_helper_death_and_keeps_shell_fixtures(self) -> None:
         shell = self.root / "shell-fixture"

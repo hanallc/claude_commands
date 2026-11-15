@@ -574,7 +574,7 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name write_status
+    local input="" has_input=0 status output errors entry name
     local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
@@ -594,22 +594,16 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if lock_file_descriptor 72 2>/dev/null && {
-            # A dead helper must reach the fallback instead of stopping this shell.
-            trap '' PIPE
-            write_status=0
+        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            compgen -V names -e || write_status=1
             for name in "${names[@]}"; do
                 [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
                 printf '%s=%s\0' "$name" "${!name}"
             done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
-            printf '\0' || write_status=1
-            trap - PIPE
-            (( write_status == 0 ))
-        } 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
+            printf '\0'
+        ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
@@ -3981,6 +3975,7 @@ run_mac_lint_fix() {
 
 run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
+    LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
     fmt_cargo --all
     load_metadata
@@ -4006,7 +4001,10 @@ run_lint_held_sequence() {
     fi
     if lint_config_enabled clippy; then
         start_tree_watch
-        invoke_clippy --workspace --all-targets --all-features || lint_status=1
+        if ! invoke_clippy --workspace --all-targets --all-features; then
+            if (( lint_status == 0 )); then LINT_HELD_CLIPPY_FAILED=1; fi
+            lint_status=1
+        fi
         finish_tree_watch
     fi
     return 0
@@ -4085,6 +4083,10 @@ run_lint_sequence() {
                 if (( lint_status == 0 )); then
                     rm -f "$MEND_LOG"
                     exit 0
+                fi
+                if [[ "$force_mac" == 1 && "$LINT_HELD_CLIPPY_FAILED" == 1 ]]; then
+                    rm -f "$MEND_LOG" "$HOLD_WAIT_DIR/lint-held"
+                    exit "$lint_status"
                 fi
                 HOLD_LINT=0
                 rm -f "$HOLD_WAIT_DIR/lint-held"
