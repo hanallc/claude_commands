@@ -4084,3 +4084,28 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - One `ast.walk` for each file; the `Name` nodes match the `killpg` import names after the walk. The shell and `killpg` checks run only on a string constant or shell line that has "kill".
 - AWS pair (3 rounds, median CPU s): `lib/test_process_group_sources` 16.41 -> 5.21.
 - Commit f7d26d4c5. Test-only change.
+
+### Phase 281 — Six repository scans parse only files that name their finding words  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** six source-scan modules find the same results with less CPU.
+
+**Spec:**
+- Each scan reads the file text and skips a file without the words that every finding needs. The phase 280 pattern.
+- `message/test_session_send_sources`: one of the four sender target names.
+- `notify/test_push_texts_sources`: "pushover", or "user" with "--to" or "broadcast".
+- `accounts/test_launch_accounts_sources`: a quoted "claude", or "command claude" or "exec claude"; an `EXCEPTIONS` file is always scanned.
+- `astra/test_design_roles_sources`: "GUILD_" or "guilds".
+- `unguarded_launches` in `lib/test_claude_launch_scan.py`: for Python, a literal that ends in claude or codex, or the words "agent" and "start". Shell files keep the full scan.
+- `forbidden_launches` in `direct/test_one_launch_path.py`: "review".
+
+**Files:** `scripts/message/test_session_send_sources.py`, `scripts/notify/test_push_texts_sources.py`, `scripts/accounts/test_launch_accounts_sources.py`, `scripts/astra/test_design_roles_sources.py`, `scripts/lib/test_claude_launch_scan.py`, `scripts/direct/test_one_launch_path.py`.
+
+**Workers:** 1 writer; no split (six small gates). impl: all six files. test opens as impl.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the eight changed modules pass; AWS pair shows a CPU saving.
