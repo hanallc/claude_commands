@@ -4022,3 +4022,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `interrupted-reservation.py` uses the same loader and stays a separate process.
 - AWS pair (c7a.4xlarge, 3 rounds): `test_verify_ssh_targets_routing` 45.76 -> 36.50 CPU s.
 - Commit 785de7dbe. Test-only change.
+
+### Phase 276 — The Mac offload targets and record wrappers run inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `TARGETS_WRAPPER` and `RECORD_WRAPPER` in `verify_mac_offload_test_support.py` have a top-level `main`, so verify_helper runs them inside its process.
+- `real_targets()` and `real_record()` load the real `build_targets.py` and `record.py` once for each process and return the `main` status. They replace the runpy calls.
+- `verify_hold_wait_test_support` puts its observation code before `return real_record()`.
+- `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals in place of the `runpy.run_path` stub.
+- AWS pair (c7a.4xlarge, 3 rounds): 7 modules 166.71 -> 159.43 CPU s; `test_verify_mac_only` 37.85 -> 34.79.
+- Commit 1e8b2f6fd. Test-only change.

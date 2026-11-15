@@ -741,37 +741,59 @@ raise SystemExit(runner_status)
 '''
 
 
+# The targets and record wrappers have a top-level main, so verify_helper runs them inside its process.
+# Each loads its real program once for each process, as verify_helper loads build_targets.py and record.py.
 TARGETS_WRAPPER = r'''
+import importlib.util
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 import time
+from types import ModuleType
 
 with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 
-command = sys.argv[1]
-root = Path(os.environ["TEST_RUNNER_STATE"])
-if command == "wait-local":
-    write_text_atomic(root / "local-wait-args", json.dumps(sys.argv[2:]))
-if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
-    with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
-        output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
-    write_text_atomic(root / "local-wait-added", "added\n")
-status = 0
-try:
-    runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
-except SystemExit as result:
-    status = result.code or 0
-event = {"command": command, "status": status, "at": time.monotonic(),
-         "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
-with (root / "routing-events.jsonl").open("a") as output:
-    output.write(json.dumps(event) + "\n")
-if command == "register-local" and status == 10:
-    write_text_atomic(root / "registered", "registered\n")
-raise SystemExit(status)
+REAL_TARGETS: dict[Path, ModuleType] = {}
+
+
+def real_targets() -> object:
+    path = Path(os.environ["TEST_REAL_TARGETS"])
+    if path not in REAL_TARGETS:
+        specification = importlib.util.spec_from_file_location("fixture_build_targets", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        REAL_TARGETS[path] = module
+    try:
+        return REAL_TARGETS[path].main() or 0
+    except SystemExit as result:
+        return result.code or 0
+
+
+def main() -> object:
+    command = sys.argv[1]
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+    if command == "wait-local":
+        write_text_atomic(root / "local-wait-args", json.dumps(sys.argv[2:]))
+    if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
+        with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
+            output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
+        write_text_atomic(root / "local-wait-added", "added\n")
+    status = real_targets()
+    event = {"command": command, "status": status, "at": time.monotonic(),
+             "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
+    with (root / "routing-events.jsonl").open("a") as output:
+        output.write(json.dumps(event) + "\n")
+    if command == "register-local" and status == 10:
+        write_text_atomic(root / "registered", "registered\n")
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
@@ -856,24 +878,46 @@ raise SystemExit(0 if free else 1)
 
 
 RECORD_WRAPPER = r'''
+import importlib.util
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
+from types import ModuleType
 
-if sys.argv[1:2] == ["call"]:
-    event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
-             "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
-             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
-             "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
-             "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
-             "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
-             "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
-    with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
-        output.write(json.dumps(event) + "\n")
-with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
+REAL_RECORDS: dict[Path, ModuleType] = {}
+
+
+def real_record() -> object:
+    path = Path(os.environ["TEST_REAL_RECORD"])
+    if path not in REAL_RECORDS:
+        with open(path.resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+        specification = importlib.util.spec_from_file_location("fixture_record", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        _ = sys.modules.setdefault("scripts.buildlog.record", module)
+        REAL_RECORDS[path] = module
+    return REAL_RECORDS[path].main(sys.argv[1:])
+
+
+def main() -> object:
+    if sys.argv[1:2] == ["call"]:
+        event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
+                 "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
+                 "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
+                 "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
+                 "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
+                 "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
+                 "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
+        with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
+            output.write(json.dumps(event) + "\n")
+    return real_record()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
