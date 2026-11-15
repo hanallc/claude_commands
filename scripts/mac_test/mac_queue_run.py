@@ -332,24 +332,23 @@ def run(args: Arguments) -> int:
                     status = status or cleanup_status
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
-            cleanup = (["finish-step", "--assignment-file", str(assignment_file), "--status", str(status)]
-                       if remote.state != RemoteState.NOT_STARTED else
-                       ["cancel-placement", "--episode", episode, "--pid", str(pid)])
-            retry_command = admission_command() + cleanup
+            # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
+            reason = (f"the Mac run ended with status {status}" if remote.state != RemoteState.NOT_STARTED
+                      else "the Mac run did not start")
             if safe:
                 try:
-                    result = subprocess.run(retry_command, stdout=subprocess.DEVNULL)
+                    result = subprocess.run(admission_command() + ["cancel-placement", "--episode", episode,
+                        "--pid", str(pid), "--reason", reason], stdout=subprocess.DEVNULL)
                     released = result.returncode == 0
                 except OSError:
                     released = False
             else:
                 released = False
                 print("mac queue: the Mac run may still be live; placement release is withheld", file=sys.stderr)
-            if released:
-                assignment_file.unlink(missing_ok=True)
-            else:
-                print(f"mac queue: receipt kept at {assignment_file}; return with: {shlex.join(retry_command)} && rm -f -- {shlex.quote(str(assignment_file))}",
-                      file=sys.stderr)
+            # The queue ends the placement when this process ends, so the receipt has no later use.
+            assignment_file.unlink(missing_ok=True)
+            if not released:
+                print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
                 status = status or 1
     return status
 

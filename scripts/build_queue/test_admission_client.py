@@ -672,6 +672,35 @@ class ClientTests(unittest.TestCase):
             mac = next(candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
             self.assertIsInstance(mac.eligibility, placement.AllowedHost)
 
+    def test_a_mac_run_kind_reaches_the_service_with_its_command(self) -> None:
+        from scripts.build_queue import placement
+
+        real_socket = socket.socket
+        for kind in placement.MAC_RUN_KINDS:
+            with self.subTest(kind=kind), mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+                 AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+                _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+                _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+                _ = write_config_fixture(fixture.root / "mac_test.conf",
+                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                request = fixture.request(step="check")
+                fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+                    key, fixture.clock.now(), "the test has not published provider evidence")
+                arguments = ["place-step", "--once", "--wait-events", "--target", "mac", "--kind", kind,
+                    "--pid", str(request.owner.pid), "--episode", request.episode,
+                    "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
+                    "--assignment-file", str(fixture.root / "assignment.json"), "--", "/bin/zsh", "-c", "true"]
+                with fixture.serving(), \
+                     mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                         request.profile, step_estimator.ReusableEstimate())), \
+                     redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                    self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                    with fixture.loop_turn():
+                        constraints = fixture.server.placement_requests[request.episode].constraints
+                self.assertEqual(constraints.command_kind, kind)
+
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()

@@ -107,10 +107,18 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 GPU_SLOT_SUFFIX = "_gpu_slot"
 
 
-def legacy_wait_shape(record: dict[str, object]) -> dict[str, object]:
+@lru_cache(maxsize=None)
+def wait_reason_fields(schema: type) -> frozenset[str]:
+    """Name the fields that accept a wait behind the head, so an older client reads a GPU slot wait there."""
+    return frozenset(name for name, hint in snapshot_fields(schema).items()
+                     if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
+
+
+def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
     """Older clients at 7fdfd9a6a have no GPU slot wait, so they read it as a wait behind the slot."""
     shaped = dict(record)
-    for key, item in record.items():
+    for key in wait_reason_fields(schema):
+        item = record.get(key)
         if isinstance(item, dict) and cast(dict[str, object], item).get("kind") == "GpuSlotWait":
             wait = cast(dict[str, object], item)
             shaped[key] = {"kind": "BehindHead", "head_name": f"the GPU test slot ({wait['used']} of {wait['slots']} in use)",
@@ -142,7 +150,7 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = legacy_wait_shape(legacy_pressure_shape(wire_record(type(item),
+            result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
                 {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
                  for name in record_field_names(type(item))}}, writing=True)))
         elif isinstance(item, Mapping):

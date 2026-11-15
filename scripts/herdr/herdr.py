@@ -3125,12 +3125,15 @@ def pane_native_process(info: dict[str, object], kind: str,
 
 def _pane_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     kinds: set[str] = set()
+    exited = False
     for value in json_items(info.get("foreground_processes"), "foreground processes"):
         process = json_object(value, "foreground process")
         arguments = _foreground_arguments(process)
-        if not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex"):
-            raise HerdrFailure("agent argv is unavailable")
+        exited = exited or not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex")
         kinds.update(kind for kind in ("claude", "codex") if _is_agent_process(arguments, kind))
+    # An agent child that exits leaves its name without an argv; the live agent beside it still names the pane.
+    if exited and not kinds:
+        raise HerdrFailure("agent argv is unavailable")
     return {pane_native_process(info, kind, pane).current_identity for kind in kinds}
 
 
