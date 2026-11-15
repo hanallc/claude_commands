@@ -6,14 +6,14 @@ from pathlib import Path
 import subprocess
 import sys
 from types import ModuleType
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast, get_args
 import unittest
 from unittest import mock
 
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import wait_reply
+from scripts.build_queue.admission_test_support import snapshot_with_head_cause, wait_reply
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test.claim_state import WholeMacScope
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
@@ -211,6 +211,37 @@ class SnapshotCodecTests(unittest.TestCase):
         self.assertTrue(all(type(cast(object, getattr(step, "measured"))).__name__ != "GoneMemory" for step in steps))
         self.assertEqual(raw["running_with_remote"],
                          [codec.snapshot_value(snapshot.running[0]), codec.snapshot_value(remote)])
+
+    def test_pinned_client_reads_each_wait_reason_and_the_current_client_keeps_it(self) -> None:
+        causes: dict[type, records.HeadCause] = {
+            records.MemoryPressure: records.MemoryPressure(0, 91, 50, condition="some"),
+            records.PressureUnavailable: records.PressureUnavailable("no pressure file"),
+            records.ReadingUnavailable: records.ReadingUnavailable(),
+            records.StartSpacingWait: records.StartSpacingWait(1000.5),
+            records.NeedsMemory: records.NeedsMemory(8, 4, 6, 1, 2),
+            records.EstimateExpired: records.EstimateExpired(1000.0),
+            records.BehindHead: records.BehindHead("organon", 900.0, "session"),
+            records.GpuSlotWait: records.GpuSlotWait(1, 1),
+            records.ReadyForAdmission: records.ReadyForAdmission(),
+        }
+        self.assertEqual(set(causes), set(get_args(records.HeadCause)))
+        snapshot = wait_reply(records.NeedsMemory()).snapshot
+        reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0)]
+        reasons += [snapshot_with_head_cause(snapshot, cause).head_reason for cause in causes.values()]
+        self.assertEqual({type(reason) for reason in reasons}, set(get_args(records.WaitReason)))
+        with pinned_snapshot_reader() as (_parse, _schema, pinned):
+            for reason in reasons:
+                cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                with self.subTest(reason=type(reason).__name__, cause=type(cause).__name__):
+                    reply = replace(wait_reply(reason), snapshot=replace(snapshot, head_reason=reason))
+                    line = wire.encode_reply(reply)
+                    self.assertEqual(wire.parse_reply(line), reply)
+                    parsed = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+                    pinned_reason = cast(object, getattr(parsed, "reason"))
+                    pinned_cause = (cast(object, getattr(pinned_reason, "cause"))
+                                    if type(pinned_reason).__name__ == "HeadAdmissionStatus" else pinned_reason)
+                    self.assertEqual(type(pinned_cause).__name__,
+                                     "BehindHead" if isinstance(cause, records.GpuSlotWait) else type(cause).__name__)
 
     def test_acquisition_defaults_unused_variants_and_restores_strict_reads(self) -> None:
         for field in ("job_state", "service_job_state"):

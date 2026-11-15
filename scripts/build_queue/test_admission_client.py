@@ -845,7 +845,7 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
                          step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
             with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
@@ -855,6 +855,7 @@ class ClientTests(unittest.TestCase):
                                       "--", "cargo", "nextest", "run"])
             self.assertEqual(status, 0)
             self.assertEqual(estimate.call_count, 2)
+            self.assertEqual(len(transport.attempts), 1)
             first, second = transport.requests
             assert isinstance(first, wire.AdmitRequest)
             assert isinstance(second, wire.AdmitRequest)
@@ -910,8 +911,7 @@ class ClientTests(unittest.TestCase):
             request = fixture.request(step="build")
             granted = replace(GRANTED, need=16 * GIB)
             transport = self.use_transport(fixture,
-                Exchange(reply_bytes(EXPIRED), reply_bytes(wire.BuildHistoryReply(1))),
-                Exchange(reply_bytes(granted)))
+                Exchange(reply_bytes(EXPIRED), reply_bytes(wire.BuildHistoryReply(1)), reply_bytes(granted)))
             def history_peak(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
                 self.assertIsInstance(transport.requests[-1], wire.BuildHistoryRequest)
                 return records.ExpectedPeak(16 * GIB, "fallback", 0)
@@ -922,7 +922,7 @@ class ClientTests(unittest.TestCase):
                     mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                 self.assertEqual(client.admit(request, lambda _wait: None, refresh), granted)
             self.assertEqual(history.call_count, 1)
-            self.assertEqual(len(transport.attempts), 2)
+            self.assertEqual(len(transport.attempts), 1)
             first, generation, refreshed = transport.requests
             self.assertIsInstance(generation, wire.BuildHistoryRequest)
             assert isinstance(first, wire.AdmitRequest) and isinstance(refreshed, wire.AdmitRequest)
@@ -1202,11 +1202,10 @@ class ClientTests(unittest.TestCase):
                 original = fixture.request(step="build")
                 encoded = reply_bytes(wire.BuildHistoryReply(7))
                 split = len(encoded) // 2
-                prefix = [] if stage == "initial" else [reply_bytes(EXPIRED)]
-                transport = self.use_transport(fixture,
-                    Exchange(*prefix, TimedChunk(interval / 2, encoded[:split]), TimeoutError(),
-                        TimedChunk(interval / 4, encoded[split:])),
-                    Exchange(reply_bytes(GRANTED)))
+                history = (TimedChunk(interval / 2, encoded[:split]), TimeoutError(), TimedChunk(interval / 4, encoded[split:]))
+                exchanges = ([Exchange(*history), Exchange(reply_bytes(GRANTED))] if stage == "initial"
+                             else [Exchange(reply_bytes(EXPIRED), *history, reply_bytes(GRANTED))])
+                transport = self.use_transport(fixture, *exchanges)
                 hooks: list[float] = []
 
                 def decline() -> bool:
@@ -1221,15 +1220,15 @@ class ClientTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
                         mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), original.cwd)), \
-                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)) as peak, \
                         redirect_stderr(io.StringIO()) as errors:
                     request = refresh() if stage == "initial" else original
                     result = client.admit(request, waits.append, refresh)
                 self.assertEqual(result, GRANTED)
                 self.assertEqual(hooks, [interval])
                 self.assertEqual(waits, [] if stage == "initial" else [EXPIRED])
-                self.assertEqual(history.call_count, 1)
-                self.assertEqual(len(transport.attempts), 2)
+                self.assertEqual(peak.call_count, 1)
+                self.assertEqual(len(transport.attempts), 2 if stage == "initial" else 1)
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests), 1)
                 admissions = [item for item in transport.requests if isinstance(item, wire.AdmitRequest)]
                 self.assertTrue(all((item.owner, item.episode, item.since) ==
@@ -1249,9 +1248,9 @@ class ClientTests(unittest.TestCase):
                 first = WAIT if next_reply == "grant" else EXPIRED
                 encoded = reply_bytes(GRANTED if next_reply == "grant" else wire.BuildHistoryReply(7))
                 split = len(encoded) // 2
-                exchange = Exchange(reply_bytes(first) + encoded[:split], TimeoutError(), encoded[split:])
-                exchanges = [exchange] if next_reply == "grant" else [exchange, Exchange(reply_bytes(GRANTED))]
-                transport = self.use_transport(fixture, *exchanges)
+                grant = () if next_reply == "grant" else (reply_bytes(GRANTED),)
+                transport = self.use_transport(fixture,
+                    Exchange(reply_bytes(first) + encoded[:split], TimeoutError(), encoded[split:], *grant))
                 hooks: list[float] = []
                 waits: list[wire.Wait] = []
 
@@ -1272,7 +1271,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(result, GRANTED)
                 self.assertEqual(waits, [first])
                 self.assertEqual(hooks, [interval])
-                self.assertEqual(len(transport.attempts), 1 if next_reply == "grant" else 2)
+                self.assertEqual(len(transport.attempts), 1)
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests),
                     0 if next_reply == "grant" else 1)
                 self.assertEqual(errors.getvalue(), "")
@@ -1824,11 +1823,12 @@ class ClientTests(unittest.TestCase):
             updated = replace(request, episode="must-not-replace", since=fixture.clock.now(),
                 owner=wire.Owner(1, "wrong"), profile=replace(request.profile,
                     peak=records.ExpectedPeak(2 * GIB, "measured", 9)), fresh_test=True)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             refresh = mock.Mock(return_value=updated)
             self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
             self.assertEqual(transport.requests[1], replace(request, profile=updated.profile, fresh_test=True))
             self.assertEqual(refresh.call_count, 1)
+            self.assertEqual(len(transport.attempts), 1)
 
     def test_bad_reply_before_first_wait_refuses_without_retry(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1922,13 +1922,11 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(transport.requests[0], transport.requests[1])
                 self.doCleanups()
 
-    def test_cli_sends_one_run_identity_through_estimate_refresh_and_reconnect(self) -> None:
+    def test_cli_sends_one_run_identity_through_estimate_refresh(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             original = fixture.request()
-            transport = self.use_transport(fixture,
-                Exchange(reply_bytes(WAIT), reply_bytes(EXPIRED)),
-                Exchange(reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             calls: list[int] = []
 
             def estimate(*_args: object, **_kwargs: object) -> step_estimator.StepEstimate:

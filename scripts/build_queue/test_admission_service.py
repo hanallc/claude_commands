@@ -3544,6 +3544,30 @@ class QueueLifecycleTests(unittest.TestCase):
             self.assertEqual(lifetime.memory_wait_s, 10)
             self.assertFalse(self.events(fixture, "ended"))
 
+    def test_estimate_refresh_on_its_connection_keeps_the_place(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            age = records.read_memory_config().policy.timing.estimate_refresh_seconds + 1
+            request = fixture.request(step="merge-gate", age=age)
+            peer = fixture.connect(request)
+            expired = peer.replies()[-1]
+            assert isinstance(expired, wire.Wait)
+            self.assertIsInstance((expired.reason.cause if isinstance(expired.reason, records.HeadAdmissionStatus)
+                                   else expired.reason), records.EstimateExpired)
+            since = fixture.server.waiters[request.episode].row["since"]
+            places = set(fixture.server.places)
+            fixture.clock.advance(10)
+            refreshed = replace(request, profile=replace(request.profile, estimated_at=fixture.clock.now()))
+            peer.socket.sendall(wire.encode_request(refreshed).encode())
+            reply = peer.replies()[-1]
+            assert isinstance(reply, wire.Wait)
+            self.assertNotIsInstance((reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus)
+                                      else reply.reason), records.EstimateExpired)
+            self.assertEqual(self.events(fixture, "left"), [])
+            self.assertEqual(fixture.server.waiters[request.episode].row["since"], since)
+            self.assertEqual(set(fixture.server.places), places)
+
     def test_restart_after_reservation_removal_keeps_the_completed_end(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(step="merge-gate")
