@@ -870,6 +870,26 @@ class DeliveryFailure:
     error: str
 
 
+def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
+                      pause: float) -> list[DeliveryFailure]:
+    """Send to all remaining recipients in each round, pause between rounds, and return the last failures."""
+    remaining = recipients
+    failures: list[DeliveryFailure] = []
+    for attempt in range(tries):
+        if not remaining:
+            break
+        failures = []
+        for target in remaining:
+            try:
+                send_to_staff(target, sender, message)
+            except SEND_ERRORS as error:
+                failures.append(DeliveryFailure(target, str(error)))
+        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
+        if remaining and attempt + 1 < tries:
+            time.sleep(pause)
+    return failures
+
+
 def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
     """Deliver each saved message and report exhausted attempts to its showrunner."""
     if isinstance(delivery, NoMessageDelivery):
@@ -886,22 +906,8 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
             _ = status.request_attempts.pop(delivery.attempt, None)
             return
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
-    remaining = delivery.recipients
-    failures: list[DeliveryFailure] = []
-    if not remaining:
-        failures.append(DeliveryFailure(MissingRecipient(), "no showrunner to send to"))
-    for attempt in range(tries):
-        if not remaining:
-            break
-        failures = []
-        for target in remaining:
-            try:
-                send_to_staff(target, SENDER, delivery.message)
-            except SEND_ERRORS as error:
-                failures.append(DeliveryFailure(target, str(error)))
-        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
-        if remaining and attempt + 1 < tries:
-            time.sleep(pause)
+    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
+                else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
     alert_delivery_failures(delivery, failures, tries)
     status.record(delivery)
 
