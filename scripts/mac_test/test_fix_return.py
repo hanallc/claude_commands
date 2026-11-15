@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from unittest.mock import patch
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
+from scripts.lib import test_hang_guard
 
 HOST = "fixture-host"
 REPOSITORY = eligibility.KnownRepository("claude")
@@ -137,6 +139,127 @@ class ReturnFixTests(unittest.TestCase):
         result = self.return_fix(offload.read_tree_key(self.worktree))
         self.assertEqual(result, fix_return.FixNone())
         self.assertNotIn("--files-from", (self.root / "rsync-calls").read_text())
+
+
+FIX_RETURN = Path(fix_return.__file__)
+VERIFY = FIX_RETURN.parents[1] / "direct/verify.sh"
+
+# Apply a fix in a child that exits with no cleanup, as SIGKILL does, at one point of the return.
+STOPPED_CHILD = r'''
+import os, sys
+from pathlib import Path
+from scripts.mac_test import fix_return
+worktree, staging, stop_at = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+stage, replace = fix_return.stage_file, os.replace
+staged: list[Path] = []
+renamed: list[str] = []
+
+def stage_then_stop(source, temporary, destination):
+    staged.append(source)
+    if stop_at == "staging" and len(staged) == 2:
+        os._exit(137)
+    stage(source, temporary, destination)
+
+def rename_then_stop(source, destination):
+    replace(source, destination)
+    if fix_return.TEMPORARY_MARK in str(source):
+        renamed.append(str(destination))
+        if stop_at == "renames" and len(renamed) == 1:
+            os._exit(137)
+
+fix_return.stage_file = stage_then_stop
+fix_return.os.replace = rename_then_stop
+changes = fix_return.MirrorChanges(("a.rs", "src/b.rs", "c.rs"), ("gone.rs",))
+print(fix_return.apply_fix(worktree, staging, changes, lambda: True))
+'''
+
+# The start of verify.sh: finish_mac_fix with verify_helper running the program in a process.
+VERIFY_START = r'''
+VERIFY_START_DIR=$1
+verify_helper() { "$VERIFY_PYTHON" "$@"; }
+'''
+
+
+def verify_start_function() -> str:
+    body = VERIFY.read_text().split("\nfinish_mac_fix() {", 1)[1].split("\n}\n", 1)[0]
+    return "finish_mac_fix() {" + body + "\n}\nfinish_mac_fix\n"
+
+
+class RollForwardTests(unittest.TestCase):
+    """A stop at any point of the return is completed by the next verify.sh run."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.worktree: Path = Path()
+        self.staging: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.worktree = root / "worktree"
+        self.staging = root / "staging"
+        (self.worktree / "src").mkdir(parents=True)
+        (self.staging / "src").mkdir(parents=True)
+        for name in ("a.rs", "src/b.rs", "c.rs"):
+            _ = (self.worktree / name).write_text(f"old {name}\n")
+            _ = (self.staging / name).write_text(f"fixed {name}\n")
+        _ = (self.worktree / "gone.rs").write_text("removed by the fix\n")
+        git(self.worktree, "init", "-q")
+        git(self.worktree, "add", "-A")
+        git(self.worktree, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com",
+            "commit", "-q", "-m", "fixture")
+
+    def stop_return(self, stop_at: str) -> None:
+        stopped = subprocess.run(
+            [sys.executable, "-c", STOPPED_CHILD, str(self.worktree), str(self.staging), stop_at],
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+            env={**os.environ, "PYTHONPATH": str(FIX_RETURN.parents[2])},
+        )
+        self.assertEqual(stopped.returncode, 137, stopped.stdout + stopped.stderr)
+
+    def next_verify_start(self) -> str:
+        started = subprocess.run(
+            ["bash", "-c", VERIFY_START + verify_start_function(), "verify", str(VERIFY.parent)],
+            cwd=self.worktree / "src", capture_output=True, text=True, check=False,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**os.environ, "VERIFY_PYTHON": sys.executable},
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        return started.stdout
+
+    def files(self) -> dict[str, str]:
+        return {str(path.relative_to(self.worktree)): path.read_text()
+                for path in sorted(self.worktree.rglob("*")) if path.is_file() and ".git" not in path.parts}
+
+    def record(self) -> Path:
+        return fix_return.git_folder_path(self.worktree, fix_return.RECORD_NAME)
+
+    def test_stop_while_staging_leaves_the_worktree_unchanged(self) -> None:
+        self.stop_return("staging")
+        self.assertEqual(fix_return.read_record(self.record())["state"], "staging")
+        self.assertEqual(len([name for name in self.files() if fix_return.TEMPORARY_MARK in name]), 1)
+        output = self.next_verify_start()
+        self.assertIn("the worktree is unchanged", output)
+        self.assertEqual(self.files(), {"a.rs": "old a.rs\n", "c.rs": "old c.rs\n",
+                                        "gone.rs": "removed by the fix\n", "src/b.rs": "old src/b.rs\n"})
+        self.assertFalse(self.record().exists())
+
+    def test_stop_between_renames_is_finished_by_the_next_run(self) -> None:
+        self.stop_return("renames")
+        self.assertEqual(fix_return.read_record(self.record())["state"], "commit")
+        self.assertEqual(self.files()["a.rs"], "fixed a.rs\n")
+        self.assertEqual(self.files()["src/b.rs"], "old src/b.rs\n")
+        output = self.next_verify_start()
+        self.assertIn("finished a stopped Mac fix: 3 file(s) written, 1 removed", output)
+        self.assertEqual(self.files(), {"a.rs": "fixed a.rs\n", "c.rs": "fixed c.rs\n", "src/b.rs": "fixed src/b.rs\n"})
+        self.assertFalse(self.record().exists())
+
+    def test_whole_return_leaves_no_record(self) -> None:
+        changes = fix_return.MirrorChanges(("a.rs", "src/b.rs", "c.rs"), ("gone.rs",))
+        result = fix_return.apply_fix(self.worktree, self.staging, changes, lambda: True)
+        self.assertEqual(result, fix_return.FixApplied(changes.changed, changes.removed))
+        self.assertEqual(self.files(), {"a.rs": "fixed a.rs\n", "c.rs": "fixed c.rs\n", "src/b.rs": "fixed src/b.rs\n"})
+        self.assertFalse(self.record().exists())
+        self.assertEqual(self.next_verify_start(), "")
 
 
 class ParseItemizedTests(unittest.TestCase):

@@ -1339,6 +1339,15 @@ compose_nextest_args() {
     fi
 }
 
+# A stop during a Mac fix return leaves a record in the git folder (fix_return.py).
+# The run finishes it before any step reads the tree. Only a left record costs a Python call.
+finish_mac_fix() {
+    local record
+    record="$(git rev-parse --git-path mac-fix.json 2>/dev/null)" || return 0
+    [[ -e "$record" ]] || return 0
+    verify_helper "$VERIFY_START_DIR/../mac_test/fix_return.py" finish --repo-root "$(git rev-parse --show-toplevel)"
+}
+
 VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
@@ -1404,6 +1413,7 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
+finish_mac_fix || exit 2
 VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD")" || exit 2
 DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
 VERIFY_TEST_ENVIRONMENT=()
