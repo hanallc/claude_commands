@@ -369,6 +369,8 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
         ("XDG_CONFIG_HOME", "config"),
     ):
         _ = environment.setdefault(key, str(path.parent / folder))
+    # A row removal edits the restart record; a fixture never edits the live one.
+    _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
@@ -379,6 +381,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "NOTIFIER_SESSIONS_DIR": environment["NOTIFIER_SESSIONS_DIR"],
             "HERDR_PANE_RECORD_DIR": environment["HERDR_PANE_RECORD_DIR"],
             "XDG_CONFIG_HOME": environment["XDG_CONFIG_HOME"],
+            "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
             "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
         })))
