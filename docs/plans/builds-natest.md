@@ -4100,20 +4100,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; nightly red e986a7389d0cf7a911935fe5).
 
-#### Work Order
+#### As-built
 
-**Goal:** a natedev full gate takes its time limit only from passing full runs that ran test modules.
-
-**Spec:**
-- `history_time_limit` in `scripts/test_times/gate_record.py`: the full query adds `modules_run > 0`. A run of the type check alone does not count.
-- Cause: the five newest passing full runs at 32 vCPUs and 16 jobs ran the type check alone (104-135 s). The limit became 1.5 x 116.7 = 175.09 s, and it cut the 11-15 nightly after 747 of 788 modules had not started.
-- `scripts/test_times/test_gate_record.py`: a new test for runs of the type check alone; existing rows set `modules_run`.
-- `scripts/aws_target/test_cloud_gate.py`: the two history rows set `modules_run`.
-
-**Files:** `scripts/test_times/gate_record.py`, `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_cloud_gate.py`.
-
-**Workers:** 1 writer; no split (one query). impl: all three files. test opens as impl.
-
-**Constraints from prior phases:** phase 219 added the gate time limit; 0f37a8042 (sdlc-fix-rounds) matched the job count.
-
-**Acceptance gate:** test_gate_record, test_cloud_gate, test_gate_box and the three test_merge_gate_suites modules pass.
+- `history_time_limit` in `scripts/test_times/gate_record.py` counts a full run only when `modules_run > 0`. A run of the type check alone does not set the limit.
+- Cause of nightly red e986a7389d0cf7a911935fe5: five passing admin-console `--full` runs of the type check alone (104-135 s) gave a 175.09 s limit. The 11-15 nightly stopped with 747 of 788 modules not started.
+- Until a natedev full run with tests passes, a natedev full run has no time limit.
+- The queue_place tests wait on their own fixture queue, not the live queue.
+- Commit a92140f44. Production change (needs the sdlc go).
