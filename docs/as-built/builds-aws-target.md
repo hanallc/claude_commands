@@ -670,6 +670,10 @@ Placement does not try a type and region whose median box time, boot included, i
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
 The median uses the type's runs in that region, or its runs in all regions when the region has none.
 A type without runs is tried; `lifetime_minutes` is not a measurement.
+Placement also does not try a type in a region whose Spot quota in the hourly snapshot is below one box of that type.
+The showrunner, 2026-11-14: a region with a pending quota request must not get launch attempts.
+A G or VT type uses the G and VT quota; other types use the Standard quota.
+A quota that is missing or older than `price_max_age_seconds` does not cause a skip.
 Each skip prints `Cloud gate skips <type> in <region>`.
 When every variant is skipped, the gate falls back to natedev before a launch.
 Available variants precede variants under a capacity cooldown.
