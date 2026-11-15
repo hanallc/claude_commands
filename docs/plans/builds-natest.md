@@ -4380,13 +4380,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_runner_result.py` checks the reading in process; three result modules were removed; test_verify_mac_malformed keeps one flow. About 16 natedev CPU s less.
 - Commit a3d9484e2. verify-unit reviewed the diff.
 
-### Phase 307 — A verify_helper call starts no env process and no subshell  · status: done
+### Phase 307 — A verify_helper call starts no env process  · status: done
 **Depends on:** Phase 306
 **Owner:** natest (builds gave a go on 11-15: fix 2 of the flow cost plan, with the git_identity cache folded in; verify-unit reviews the verify.sh diff).
 
 #### As-built
 
-- `verify_helper` in verify.sh writes each request in a `{ ...; }` group (no subshell). `compgen -V names -e` and `printf '%s=%s\0'` send the exported variables in place of `env -0`; array exports and `BASH_FUNC_*` entries are not sent. A compgen failure fails the write, so the local fallback runs. `trap '' PIPE` during the write keeps the dead-helper fallback. The perl lock and the `--stdin` capture are unchanged.
+- `verify_helper` in verify.sh runs `compgen -V names -e` before the lock and the request write, so a failure sends no request and the local fallback runs. The write is a `( ... )` subshell with no trap: a dead helper kills only that subshell, and the call reaches the fallback. `printf '%s=%s\0'` sends the exported variables in place of `env -0`; array exports and `BASH_FUNC_*` entries are not sent. The perl lock and the `--stdin` capture are unchanged. (Phase 308 made the subshell and compgen changes after builds held the first form.)
 - natedev, the Mac and the AWS gate run bash 5.3.9 (the gate takes bash from natedev's locked nixpkgs rev), so there is one path.
 - `step_estimator.git_identity` caches by `(git directory, cwd)` for the life of the process; `clear_git_identity_cache` clears it for tests.
 - Tests: new `scripts/build_queue/test_step_estimator.py` (2 cache tests); `test_verify_helper` checks environment equality, the same-shell write and the compgen fallback in one bash program.
@@ -4401,6 +4401,5 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 #### As-built
 
 - `run_lint_held_sequence` sets `LINT_HELD_CLIPPY_FAILED` when Mac mend passed (or is off) and Mac clippy failed. `run_lint_sequence` then removes `MEND_LOG` and the `lint-held` mark and exits with the clippy failure, only on the Mac path (`force_mac=1`). A failed Mac mend and the memory-judgment path keep their behavior; `step_writes_tree` is unchanged.
-- Phase 307 fixes in `verify_helper`: the request write is a `( ... )` subshell again with no PIPE trap (no signal dispositions); `compgen -V names -e` runs before the lock and the write, so a failure sends no request.
 - Tests: `test_verify_lint_judgment` checks the Mac clippy exit (held calls, exit 1, no second mend). `test_verify_helper`'s bash program checks the compgen fallback and that the next call reads its own reply. `test_verify_lint_local_writes` holds natedev before the clippy fix in its clippy cases.
 - Commit ffd2432f2. verify-unit reviews the diff.
