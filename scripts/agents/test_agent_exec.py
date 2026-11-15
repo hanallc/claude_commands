@@ -280,8 +280,9 @@ class ClaudeLauncherTests(unittest.TestCase):
                         command = ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
                                    str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                                    str(self.home), str(prompt), str(self.home / "result"), str(log)]
-                    result = subprocess.run(command, capture_output=True, text=True, check=True,
+                    result = subprocess.run(command, capture_output=True, text=True, check=False,
                                             env=environment, cwd=self.home)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     output = log.read_text() if launcher == "exec" else result.stdout
                     launched = cast(LaunchedClaude, json.loads(output.splitlines()[0]))
                     self.assertEqual(launched, {"config": str(accounts.account_dir(expected)),
@@ -301,8 +302,9 @@ class ClaudeLauncherTests(unittest.TestCase):
                            ["bash", "-c", 'source "$1"; shift; agents_exec_main "$@"', "fixture",
                                    str(SCRIPTS / "agents/agent_exec.sh"), "sample.task", "readonly",
                             str(self.home), str(prompt), str(self.home / "result"), str(log)])
-                result = subprocess.run(command, capture_output=True, text=True, check=True,
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
                                         env=self.environment, cwd=self.home)
+                self.assertEqual(result.returncode, 0, result.stderr)
                 output = log.read_text() if launcher == "exec" else result.stdout
                 self.assertEqual(json.loads(output.splitlines()[0]), {"config": "", "memory": "", "token": ""})
 
