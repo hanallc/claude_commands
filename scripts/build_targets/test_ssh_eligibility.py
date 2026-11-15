@@ -108,6 +108,10 @@ class SshEligibilityTests(unittest.TestCase):
             self.assertEqual(build_targets.main(), 0)
         return [line.split("\t") for line in output.getvalue().splitlines()[1:]]
 
+    def mac_offload_off(self) -> None:
+        # check, lint and doc ignore linux_only, so turn the Mac off to keep these Linux tests from probing it.
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\nlinux_only.hana=linux-part\n")
+
     def linux(self, kind: str = "test", local: bool = False) -> list[str]:
         return next(row for row in self.answer(kind, local) if row[0] == "linux")
 
@@ -282,6 +286,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertTrue(self.commands)
 
     def test_linux_test_check_and_doc_need_no_mac_repository_setting(self) -> None:
+        self.mac_offload_off()
         for kind in ("test", "check", "doc"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.linux(kind)[1], "eligible")
@@ -293,12 +298,14 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_artifacts_final_gate_and_lint_never_use_linux_ssh(self) -> None:
+        self.mac_offload_off()
         for kind in ("build", "example", "final", "lint"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.linux(kind)[1], "excluded")
         self.assertEqual(self.commands, [])
 
     def test_configured_kinds_are_read_on_each_eligibility_check(self) -> None:
+        self.mac_offload_off()
         self.assertEqual(self.linux("check")[1], "eligible")
         _ = write_config_fixture(self.root / "linux.conf", "offload=on\nkinds=test,doc\n")
         self.assertEqual(self.linux("check")[1], "excluded")
