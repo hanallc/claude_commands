@@ -118,6 +118,16 @@ class TestRunFolderTests(unittest.TestCase):
         self.assertIn(f"TMPDIR={self.root}\n", result.stdout + result.stderr)
         self.assertFalse((self.root / "test-runs").exists())
 
+    def test_a_run_without_a_build_log_keeps_its_log_in_the_run_folder(self) -> None:
+        for caller in ("", str(self.root / "caller-buildlog")):
+            with self.subTest(caller=caller), mock.patch.dict(os.environ, self.environment()):
+                _ = os.environ.pop("BUILDLOG_DIR", None)
+                if caller:
+                    os.environ["BUILDLOG_DIR"] = caller
+                with testing_folders.test_run_folder() as path:
+                    self.assertEqual(os.environ["BUILDLOG_DIR"], caller or str(path / "buildlog"))
+                self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
+
     def test_the_context_resets_tempfile_and_restores_the_callers_environment(self) -> None:
         with mock.patch.dict(os.environ, self.environment()), mock.patch.object(tempfile, "tempdir", str(self.root)):
             with testing_folders.test_run_folder() as path:

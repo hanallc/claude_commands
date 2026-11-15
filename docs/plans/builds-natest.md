@@ -4141,3 +4141,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Cause: the test built the index of the full rows two times.
 - AWS pair (3 rounds): 24.09 -> 19.98 CPU s, wall 29.5 -> 25.3 s; all pass, same tests.
 - Commit f36c878c1. Test-only change.
+
+### Phase 286 — A test run keeps its build log in its run folder  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc land go 11-15).
+
+#### Work Order
+
+- **Goal:** No direct test run writes the caller's build log, so `buildlog/test_log_isolation.py` can go.
+- **Spec:** `testing_folders.test_run_folder` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept. `test_testing_folders` checks the two cases and the restore. Remove `scripts/buildlog/test_log_isolation.py`.
+- **Files:** `scripts/lib/testing_folders.py`, `scripts/lib/test_testing_folders.py`, `scripts/buildlog/test_log_isolation.py`.
+- **Workers:** 1 writer: three small edits; the director writes them (no-worker mode).
+- **Constraints from prior phases:** none.
+- **Acceptance gate:** `lib/test_testing_folders` passes; the 5 formerly guarded modules pass with `BUILDLOG_DIR` unset and write no errors.log; basedpyright 0 errors; AWS pair.
