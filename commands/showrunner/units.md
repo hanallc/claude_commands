@@ -39,6 +39,7 @@ The summary uses the first matching rule:
 
 `Now` names each open phase as `<title> (<phase id>)`.
 It removes a repeated phase id from the title's start.
+Inside a sentence, a title's leading article or number word is lowercase; other first words keep their capital.
 Tasks follow plan order, then start order for work outside the plan.
 Executing tasks appear first.
 When a task executes, other open tasks appear under `Also`.
