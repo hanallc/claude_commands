@@ -821,6 +821,15 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
 
+    def test_hourly_runs_the_snapshot_and_the_hours_check_and_keeps_the_worse_status(self) -> None:
+        # buildlog hourly calls aws_target.hourly; a failed snapshot must not skip the hours check.
+        for snapshot_status, check_status in ((1, 0), (0, 1), (0, 0)):
+            with (mock.patch.object(aws_target, 'snapshot', return_value=snapshot_status) as read,
+                  mock.patch.object(aws_target, 'hours_gap_notices', return_value=check_status) as check):
+                self.assertEqual(aws_target.hourly(self.settings, self.state), max(snapshot_status, check_status))
+            read.assert_called_once_with(self.settings, self.state)
+            check.assert_called_once_with(self.settings, self.state)
+
 
 if __name__ == '__main__':
     _ = unittest.main()
