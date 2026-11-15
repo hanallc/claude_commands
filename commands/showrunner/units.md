@@ -88,6 +88,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
    It is ` · waiting on running checkpoint` while a land run that holds the checkpoint commit runs now.
    In the land line it is ` · waiting on queued checkpoint, 2nd in line`; 1st lands next.
+   A checkpoint that a later checkpoint in the line holds has the place of that later item.
    A failed earlier try adds `; last try: land failed at red 11:20: <first detail line>`.
    Out of the line it is the last land result: `checkpoint landed 11:20` or `land held at ancestry 11:20: <detail>`.
    With no result, it is ` · checkpoint sent, not in the land line`.
@@ -138,7 +139,7 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    It excludes each queue item whose text equals Notes in the same row.
    An item added with `--after <work>` names its wait: `<text> · waits on <work>: <state>`.
    The state comes from the local `origin/main` (no fetch), the land line, the land results, and the owner unit's run.
-   Example states: `checkpoint 3rd in land line (builds 589)`, `in gate now`, `open, ETA 16:00`, `not started`, `not on main`, `not found`.
+   Example states: `checkpoint 3rd in land line (builds 589)`, `in gate now`, `checkpoint landed 14:10; not on main yet`, `open, ETA 16:00`, `not started`, `not on main`, `not found`.
    When the work is on main, the item shows `ready: <text> (<work> on main)`.
    Each part adds ` +<n> more` for later items.
    The queue count includes only remaining items.

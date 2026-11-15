@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
+from scripts.direct import plan_history
 from scripts.production import staff
 
 
@@ -52,6 +53,12 @@ def on_main(repo: Path, commit: str) -> bool:
     return git(repo, "merge-base", "--is-ancestor", commit, "origin/main").returncode == 0
 
 
+def carried(repo: Path, commit: str) -> list[str]:
+    """The commits a land of this commit takes: the commit and its ancestors that are not on main."""
+    result = git(repo, "rev-list", commit, "--not", "origin/main")
+    return result.stdout.split() if result.returncode == 0 else []
+
+
 def commit_of(repo: Path, ref: str) -> str:
     """The commit a hash or branch names: the ref itself, else origin/<ref>; empty when neither names a commit."""
     for name in (ref, f"origin/{ref}"):
@@ -73,7 +80,7 @@ def phase_state(repo: Path, member: staff.StaffRow, phase: str, read_run: RunRea
         return OnMain(landed)
     if not isinstance(member.run, staff.OpenRun):
         return PhaseNotStarted()
-    events = read_run(member.run.path)
+    events = read_run(plan_history.run_events_path(member.run.path))
     instance = next((event.get("phase_instance_id") for event in reversed(events)
                      if event.get("event_type") == "phase_started" and event.get("phase_id") == phase), None)
     if instance is None:

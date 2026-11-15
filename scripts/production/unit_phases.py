@@ -568,7 +568,7 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
         else:
             if not isinstance(owner.run, staff.OpenRun) or not unit_runs.run_is_open(owner.run.path):
                 continue
-            path = plan_history.history_root() / "runs" / f"{owner.run.path.name}.jsonl"
+            path = plan_history.run_events_path(owner.run.path)
         events = read_run(path)
         if run_is_finished(events):
             continue
@@ -627,7 +627,9 @@ def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: floa
             case land_queue.InLine(place, failed):
                 text = f"{prefix}{ordinal(place.number)} in land line ({place.owner})"
                 return f"{text}; last try: {land_result_text(failed, now=now, zone=zone)}" if failed else text
-            case land_queue.LandEnded(result) if not result["landed"]:
+            case land_queue.LandEnded(result) if result["landed"]:
+                return f"{land_result_text(result, now=now, zone=zone)}; not on main yet"
+            case land_queue.LandEnded(result):
                 return land_result_text(result, now=now, zone=zone)
             case _:
                 return f"{prefix}not on main"
@@ -714,7 +716,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = plan_history.now_epoch() if now is None else now
     view = census_view(census_read)
     reason = no_worker_reason()
-    land = land_queue.land_view()
+    land = land_queue.land_view(REPOSITORY)
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}

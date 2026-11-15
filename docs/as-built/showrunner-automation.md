@@ -185,7 +185,7 @@ a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Mer
 else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
 Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
 `unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> · waits on <work>: <state>`.
-A commit's state is `in gate now`, `<Nth> in land line (<unit> <phase>)`, its failed land result, or `not on main` (`land_queue.land_state`).
+A commit's state is `in gate now`, `<Nth> in land line (<unit> <phase>)`, its land result (`; not on main yet` after a land), or `not on main` (`land_queue.land_state`).
 `done` removes the first item.
 `clear` writes an empty list without reading a damaged old file.
 Writes use the list lock and atomic publication.
@@ -809,6 +809,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
     `table` reads one `land_queue.LandView` (`land_queue.land_view()`): the running land commits, the land line places, and the newest land results.
     `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
+    A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
+    So a checkpoint that a later checkpoint carries shows that later item's place. The order is: running, its own place, a landed result, carried running, carried place, a failed result.
     The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
     Else, at a place in the line, it is `waiting on queued checkpoint, <Nth> in line`; a failed newest result adds `; last try: <result>`.
     Else the newest result shows: `checkpoint landed <time>`, or `land <state> at <step> <time>: <first detail line>`.

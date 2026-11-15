@@ -11,6 +11,7 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.direct import plan_history
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.production import land_queue, land_runs, staff, unit_phases, unit_queue, waits_on
 
@@ -46,7 +47,7 @@ class WaitsOnTests(unittest.TestCase):
         sent = commit_repository(self.repo, "sent checkpoint", allow_empty=True)
 
         run = self.root / "handler.jsonl"
-        runs: dict[Path, list[dict[str, object]]] = {run: [
+        runs: dict[Path, list[dict[str, object]]] = {plan_history.run_events_path(run): [
             {"event_type": "phase_started", "phase_id": "22", "phase_instance_id": "a"},
             {"event_type": "phase_started", "phase_id": "23", "phase_instance_id": "b"},
             {"event_type": "eta_stated", "phase_instance_id": "b", "eta_phase_id": "23", "eta_at": 1_794_760_000},
@@ -74,6 +75,9 @@ class WaitsOnTests(unittest.TestCase):
         self.assertEqual(state("handler/24"), waits_on.OnMain(base))
         self.assertEqual(state("handler/25"), waits_on.PhaseNotStarted())
         self.assertEqual(state("nobody/1"), waits_on.NotFound())
+        self.assertEqual(waits_on.carried(self.repo, sent), [sent, waiting])
+        self.assertEqual(waits_on.carried(self.repo, main), [])
+        self.assertEqual(waits_on.carried(self.repo, "f" * 40), [])
 
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
@@ -85,7 +89,7 @@ class WaitsOnTests(unittest.TestCase):
 
         def text(found: waits_on.WaitState | None, running: frozenset[str] | None = None,
                  results: dict[str, land_runs.LandResult] | None = None) -> str:
-            view = land_queue.LandView(running or frozenset(), line, results or {})
+            view = land_queue.LandView(running or frozenset(), line, results or {}, frozenset(), {})
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
         self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
@@ -101,7 +105,10 @@ class WaitsOnTests(unittest.TestCase):
         self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland · waits on builds/589: not started")
         self.assertEqual(text(waits_on.NotFound()), "acctland · waits on builds/589: not found")
         self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("plain"), None,
-                                                 land_queue.LandView(frozenset(), {}, {}), now=now, zone=utc), "plain")
+                                                 land_queue.LandView(frozenset(), {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
+        landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
+        self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
+                         "acctland · waits on builds/589: checkpoint landed 13:30; not on main yet")
 
 
 if __name__ == "__main__":
