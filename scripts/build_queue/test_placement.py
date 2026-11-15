@@ -28,6 +28,7 @@ from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -803,6 +804,49 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 evidence = fixture.read_host_evidence(key)
             assert isinstance(evidence, placement.FreshHostEvidence)
             self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("busy"))
+
+    def test_an_episode_keeps_its_first_constraints_across_a_land_a_busy_target_and_a_restart(self) -> None:
+        for revision in ("", *OLDER_CLIENTS, "429f57a6c"):
+            with self.subTest(client=revision or "current"), PlacementFixture() as fixture:
+                first = placement_request(fixture)
+                if revision:
+                    # The first request comes from an older client, in the shape that client writes.
+                    with pinned_snapshot_reader(revision):
+                        older_wire = sys.modules["_pinned_admission_wire"]
+                        older = cast(Callable[[str], object], getattr(older_wire, "parse_request"))(wire.encode_request(first))
+                        line = cast(Callable[[object], str], getattr(older_wire, "encode_request"))(older)
+                    first = cast(wire.PlacementRequest, wire.parse_request(line))
+                destination = first.constraints.candidates[0].destination
+                _ = publish_candidate(fixture, first, placement.TemporaryExclusion("busy"))
+                reply, = fixture.server.handle_request(first)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                # A land changes the candidate policy, and the newer client sends its command kind.
+                later = replace(first, constraints=replace(first.constraints, command_kind="test", candidates=(
+                    placement.PlacementCandidate(destination, placement.FixedExclusion("linux_only")),)))
+                reply, = fixture.server.handle_request(later)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                kept = replace(first, constraints=replace(first.constraints, command_kind="test"))
+                self.assertEqual(fixture.server.placement_requests[first.episode].constraints, kept.constraints)
+                fixture.restart()
+                self.assertEqual(fixture.server.placement_requests[first.episode].constraints, kept.constraints)
+                _ = publish_candidate(fixture, kept, placement.TemporaryExclusion("busy"))
+                reply, = fixture.server.handle_request(later)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                _ = publish_candidate(fixture, kept)
+                self.assertEqual(assignment_for(fixture, later).destination, destination)
+
+    def test_an_episode_refuses_a_request_with_another_start_or_purpose(self) -> None:
+        with PlacementFixture() as fixture:
+            first = placement_request(fixture)
+            _ = publish_candidate(fixture, first, placement.TemporaryExclusion("busy"))
+            reply, = fixture.server.handle_request(first)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            for changed, later in (("since", replace(first, since=first.since + 1)),
+                                   ("purpose", replace(first, purpose=placement.SpeculativeCopy("parent", 1.0)))):
+                with self.subTest(changed=changed):
+                    reply, = fixture.server.handle_request(later)
+                    assert isinstance(reply, wire.Refused)
+                    self.assertEqual(reply.reason, "placement episode changed its owner, start, run or purpose")
 
     def test_a_lost_or_delivered_authorization_never_replays_before_or_after_restart(self) -> None:
         for response in ("lost", "delivered", "delivered_before_next_pass"):
