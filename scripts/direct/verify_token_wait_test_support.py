@@ -265,9 +265,12 @@ esac
         if real_sleep is None:
             self.fail("the token fixture requires sleep on PATH")
         path = self.root / "stubs" / "sleep"
+        # A board.sh acquire waits for a held token with sleep 3 in a loop.
+        # A short real pause keeps that loop from spinning on ps, date and cat.
         _ = path.write_text(
             '#!/bin/sh\n'
-            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}") ;;\n'
+            + f'    3) {shlex.quote(real_sleep)} 0.1 ;;\n'
             + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
             + body)
         path.chmod(0o755)

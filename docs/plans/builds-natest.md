@@ -4232,3 +4232,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - A 0.05-second interval used more CPU (more passes while the peer held the token).
 - AWS pair (3 rounds): 21.90 -> 14.47 CPU s, all pass.
 - Commit 272d392b0. Test-only change.
+
+### Phase 294 — The token-wait fixture stops a board.sh wait from spinning  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** a board.sh token wait in a `VerifyTokenWaitFixture` test does not spin at full CPU, with the same checks of behavior.
+
+**Spec:**
+- `VerifyTokenWaitFixture.write_wait_sleep` in `scripts/direct/verify_token_wait_test_support.py` makes the `sleep 3` stub pause a real 0.1 seconds. The memory poll sleep stays faked.
+- `board.sh acquire --wait N` loops on `mkdir`, `pid_is_gone` (`ps`), `now_epoch` (`date`) and `sleep 3`. With `sleep 3` faked to return at once, a wait for a held token ran that loop at full CPU (about 900 `ps`, `date` and `cat` starts in one reservation test).
+- Stub bodies still see `$1 = 3` after the pause.
+
+**Files:** `scripts/direct/verify_token_wait_test_support.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
+
+**Constraints from prior phases:** Phase 293 set the hold pass interval in the same fixture.
+
+**Acceptance gate:** the 28 fixture modules pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
