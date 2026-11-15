@@ -24,9 +24,10 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, claude_table_layout, display_cells, live_units, unit_queue
+from scripts.production import census, claude_table_layout, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
+from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lib import names as display_names
 from scripts.lib.terminal_cells import terminal_width
 from scripts.message import sessions
@@ -137,7 +138,9 @@ class UnitPhasesTests(unittest.TestCase):
         sessions.mkdir()
         self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(sessions),
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
-                                                    "UNIT_QUEUE_STATE_DIR": str(self.root / "queue")}))
+                                                    "UNIT_QUEUE_STATE_DIR": str(self.root / "queue"),
+                                                    "XDG_STATE_HOME": str(self.root / "state"),
+                                                    "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 
@@ -201,8 +204,9 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(session=session):
                 rendered = table_of([unit("namecheck", session)], {})
                 expected = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
-                self.assertEqual(rendered.splitlines()[0], "| Unit | Status |")
-                self.assertEqual(rendered.splitlines()[2], f"| namecheck | {expected} |")
+                self.assertEqual(rendered.splitlines()[2], "| Unit | Status |")
+                self.assertEqual(rendered.splitlines()[4], f"| namecheck | {expected} |")
+                self.assertEqual(rendered.split("\n\n")[-1].splitlines()[2], "| namecheck | none running | nothing open: no plan, queue empty |")
                 self.assertNotIn("Progress:", rendered)
 
     def test_fitted_table_preserves_fixed_cells_and_cuts_text_in_order(self) -> None:
@@ -275,13 +279,13 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIsInstance(outside["current"], dict)
         cases: list[tuple[object, str, str]] = [
             (open_record(self.root / "plan.md"), "2/7", "phase 3 — Every session records itself"),
-            ({"current": None, "phases": phase_rows("done", "done", "todo")}, "2/3", "between phases"),
-            ({"current": None, "phases": phase_rows("todo", "todo")}, "0/2", "not started"),
-            ({"current": None, "phases": phase_rows("done", "done")}, "2/2", "plan done"),
-            ({"current": None, "phases": []}, "—", "no phases"),
-            ({"unavailable": "Unable to read plan"}, "—", "no plan"),
-            (None, "—", "—"),
-            (outside, "0/1", "not started"),
+            ({"current": None, "phases": phase_rows("done", "done", "todo")}, "2/3", "nothing open: next plan phase 3 not started, queue empty"),
+            ({"current": None, "phases": phase_rows("todo", "todo")}, "0/2", "nothing open: next plan phase 1 not started, queue empty"),
+            ({"current": None, "phases": phase_rows("done", "done")}, "2/2", "nothing open: plan done, queue empty"),
+            ({"current": None, "phases": []}, "—", "nothing open: no plan, queue empty"),
+            ({"unavailable": "Unable to read plan"}, "—", "nothing open: no plan, queue empty"),
+            (None, "—", "nothing open: no plan, queue empty"),
+            (outside, "0/1", "nothing open: next plan phase 1 not started, queue empty"),
         ]
         for record, count, expected in cases:
             with self.subTest(expected=expected):
@@ -390,20 +394,20 @@ class UnitPhasesTests(unittest.TestCase):
         with self.subTest(run="newest unfinished"):
             rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
-            self.assertIn("| messaging | not started | outside-b: impl: write newest | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | none running | nothing open: next plan phase 1 not started, queued work not started | outside-b: impl: write newest | Review delivery · Clean old records · plan: phase 1: Delivery 1 |",
                           rendered)
         _ = run("finished", member, "finished", 3, event("run_finished", summary="x" * 32_000))
         with self.subTest(run="newest finished"):
             rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
-            self.assertIn("| messaging | not started | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | none running | nothing open: next plan phase 1 not started, queued work not started | Review delivery · Clean old records · plan: phase 1: Delivery 1 |",
                           rendered)
         former = replace(member, current_session=staff.StaffId(fixture_runtime_id("previous-director")))
         _ = run("former", former, "previous-session", 4, use_timestamp=True)
         with self.subTest(run="newest from a previous session"):
             rendered = table_of([selected], records)
             self.assertIn("| messaging | idle | ⬜ | 0/1 |", rendered)
-            self.assertIn("| messaging | not started | previous-session: impl: write former | Review delivery +1 more · plan: phase 1: Delivery 1 |",
+            self.assertIn("| messaging | none running | nothing open: next plan phase 1 not started, queued work not started | previous-session: impl: write former | Review delivery · Clean old records · plan: phase 1: Delivery 1 |",
                           rendered)
 
         newest = run("multi", member, "outside-a", 5,
@@ -419,16 +423,16 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = table_of([selected], records)
         self.assertEqual([call.args[0] for call in whole_reads.call_args_list], [newest])
         self.assertIn("| messaging | idle | 🟨 | 0/1 |", rendered)
-        self.assertIn("| messaging | phase 1 — impl: planned task | outside-b: impl: write newest +1 more | Review delivery +1 more |", rendered)
+        self.assertIn("| messaging | none running | phase 1 — impl: planned task | outside-a: impl: write multi · outside-b: impl: write newest | Review delivery · Clean old records |", rendered)
         notes_cases: tuple[tuple[dict[str, object], str], ...] = (
-            ({"current": None, "phases": []}, "no phases"),
-            ({"unavailable": "no plan"}, "no plan"))
+            ({"current": None, "phases": []}, "nothing open: no plan, queued work not started"),
+            ({"unavailable": "no plan"}, "nothing open: no plan, queued work not started"))
         for sample, notes in notes_cases:
             with self.subTest(notes=notes):
                 records["messaging"] = sample
                 rendered = table_of([selected], records)
                 self.assertIn("| messaging | idle |", rendered)
-                self.assertIn(f"| messaging | {notes} | 1: impl: planned task +2 more | Review delivery +1 more |",
+                self.assertIn(f"| messaging | none running | {notes} | outside-a: impl: write multi · outside-b: impl: write newest · 1: impl: planned task | Review delivery · Clean old records |",
                               rendered)
         long_text = "Review delivery " + "x" * 120
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
@@ -448,13 +452,24 @@ class UnitPhasesTests(unittest.TestCase):
                   activity_label="Verification", activity_text="check " + "x" * 150))
         work = table_of([selected], records).split("\n\n")[-1]
         cells = [cell.strip() for cell in work.splitlines()[2].split("|")[1:-1]]
-        self.assertEqual(cells[2], "outside-c: Verification: check " + "x" * 150 + " +3 more")
-        queue = cells[3].split(" · ", 1)[0]
-        self.assertEqual(queue, long_text + " +1 more")
+        self.assertEqual(cells[3], "outside-a: impl: write long · outside-b: — · 1: — · outside-c: Verification: check " + "x" * 150)
+        self.assertEqual(cells[4], long_text + " · Later")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(unit_queue.main(["clear"]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", "acctland", "--after", "no-such-branch-for-test"]), 0)
+        work = table_of([selected], records).split("\n\n")[-1]
+        cells = [cell.strip() for cell in work.splitlines()[2].split("|")[1:-1]]
+        self.assertEqual(cells[4].split(" · plan:", 1)[0], "acctland — after no-such-branch-for-test: not found")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(unit_queue.main(["clear"]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", long_text]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", "Later"]), 0)
         _ = config.write_text(configured)
         wide_records: dict[str, object] = {"messaging": typed_record(self.root / "plan.md", *(["todo"] * 20))}
         fitted = table_of([selected], wide_records)
-        for section in (fitted.split("\n\n")[0], fitted.split("\n\n")[-1]):
+        for section in (fitted.split("\n\n")[1], fitted.split("\n\n")[-1]):
             lines = section.splitlines()
             headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
             rows = [tuple(cell.strip() for cell in line.split("|")[1:-1]) for line in lines[2:]]
@@ -467,10 +482,10 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(values["Progress"], "⬜" * 20)
                 self.assertEqual(layout.line_count(values["Progress"], headings.index("Progress")), 1)
             else:
-                self.assertEqual(values["Notes"], "not started")
                 for title, expected in (
-                        ("Queued", long_text + " +1 more · plan: phase 1: Delivery 1 +19 more"),
-                        ("Non-Phase Work", "outside-c: Verification: check " + "x" * 150 + " +2 more")):
+                        ("Notes", "nothing open: next plan phase 1 not started, queued work not started"),
+                        ("Queued", long_text + " · Later · plan: phase 1: Delivery 1, then 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"),
+                        ("Non-Phase Work", "outside-a: impl: write long · outside-b: — · outside-c: Verification: check " + "x" * 150)):
                     column = headings.index(title)
                     restored = " ".join(row[column] for row in rows if row[column])
                     self.assertEqual(restored.replace(" ", ""), expected.replace(" ", ""))
@@ -482,7 +497,7 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = table_of([selected, unit("another-unit", None)], records)
         self.assertIn("| queue unreadable |", rendered)
         self.assertIn("| another-unit | exited |", rendered)
-        self.assertIn("| another-unit | — | another-phase: impl: write unrelated | — |", rendered)
+        self.assertIn("| another-unit | none running | nothing open: no plan, queue empty | another-phase: impl: write unrelated | — |", rendered)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertTrue(errors.getvalue().startswith(f"unit_phases: {path}: "))
 
@@ -498,9 +513,9 @@ class UnitPhasesTests(unittest.TestCase):
                 lines = work.splitlines()
                 headings = tuple(cell.strip() for cell in lines[0].split("|")[1:-1])
                 rows = [tuple(cell.strip() for cell in line.split("|")[1:-1]) for line in lines[2:]]
-                self.assertEqual(headings, ("Unit", "Notes", "Queued"))
+                self.assertEqual(headings, ("Unit", "Workers", "Notes", "Queued"))
                 self.assertTrue(all(row[0] == "messaging" for row in rows))
-                for column, original in ((1, "phase 1 — " + "N" * 50), (2, queued)):
+                for column, original in ((1, "none running"), (2, "phase 1 — " + "N" * 50), (3, queued)):
                     restored = " ".join(row[column] for row in rows if row[column])
                     self.assertEqual(restored.replace(" ", ""), original.replace(" ", ""))
                 fitted = claude_table_layout.fit(headings, rows, columns)
@@ -522,13 +537,13 @@ class UnitPhasesTests(unittest.TestCase):
              "phase 4 — Delivery 4 · fix rounds 3 + 1 running"),
             (small._replace(current=replace(current, fix_done=2)), "🟩🟩🟩🟨⬜⬜", "3/6",
              "phase 4 — Delivery 4 · fix rounds 2"),
-            (typed_record(self.root / "plan.md"), "—", "—", "no phases"),
-            (typed_record(self.root / "plan.md", "done"), "🟩", "1/1", "plan done"),
-            (typed_record(self.root / "plan.md", "todo"), "⬜", "0/1", "not started"),
-            ({"phases": [{"phase": "1", "status": "open"}]}, "🟨", "0/1", "not started"),
-            (typed_record(self.root / "plan.md", *(["done"] * 20)), "🟩" * 20, "20/20", "plan done"),
+            (typed_record(self.root / "plan.md"), "—", "—", "nothing open: no plan, queue empty"),
+            (typed_record(self.root / "plan.md", "done"), "🟩", "1/1", "nothing open: plan done, queue empty"),
+            (typed_record(self.root / "plan.md", "todo"), "⬜", "0/1", "nothing open: next plan phase 1 not started, queue empty"),
+            ({"phases": [{"phase": "1", "status": "open"}]}, "🟨", "0/1", "nothing open: next plan phase 1 not started, queue empty"),
+            (typed_record(self.root / "plan.md", *(["done"] * 20)), "🟩" * 20, "20/20", "nothing open: plan done, queue empty"),
             (typed_record(self.root / "plan.md", *(["done"] * 44 + ["todo"])),
-             "🟩" * 19 + "⬜", "44/45", "between phases"),
+             "🟩" * 19 + "⬜", "44/45", "nothing open: next plan phase 45 not started, queue empty"),
         ]
         large = ["done"] * 132
         for index, status in ((0, "todo"), (5, "running"), (6, "todo"), (12, "todo"), (125, "running")):
@@ -674,9 +689,9 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(sample.current.phase, "outside-new")
                 rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, census_read=LOCAL,
                                             now=now.timestamp(), zone=ZoneInfo("UTC"))
-                headers = [cell.strip() for cell in rendered.splitlines()[0].split("|")[1:-1]]
+                headers = [cell.strip() for cell in rendered.splitlines()[2].split("|")[1:-1]]
                 table_rows = [[cell.strip() for cell in line.split("|")[1:-1]]
-                              for line in rendered.split("\n\n")[0].splitlines()[2:]]
+                              for line in rendered.split("\n\n")[1].splitlines()[2:]]
                 selected_phase = "1" if has_planned or from_events else "outside-new" if outside else ""
                 cells = (next(row for row in table_rows if row[headers.index("Phase")] == selected_phase)
                          if selected_phase else table_rows[0])
@@ -722,14 +737,66 @@ class UnitPhasesTests(unittest.TestCase):
                     sample = phase_table.build_plan(running.plan)
                 rendered = unit_phases.table([unit("promises", None)], {"promises": sample}, census_read=LOCAL,
                                             now=now.timestamp(), zone=ZoneInfo("UTC"))
-                lines = rendered.split("\n\n")[0].splitlines()
+                lines = rendered.split("\n\n")[1].splitlines()
                 headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
                 cells = dict(zip(headers, (cell.strip() for cell in lines[2].split("|")[1:-1]), strict=True))
                 self.assertEqual(cells.get("ETA Next", "—"), expected_next)
                 self.assertEqual(cells["ETA Plan"], expected_plan)
                 self.assertEqual(cells["Progress"], "🟩⬜")
                 self.assertEqual(cells["Phase"], "1/2")
-                self.assertIn("| promises | between phases", rendered)
+                self.assertIn("| promises | none running | nothing open: next plan phase 2 not started, queue empty", rendered)
+
+        future_promise: dict[str, object] = {"event_type": "eta_stated", "eta_phase_id": "future",
+            "timestamp_epoch": now.timestamp() - 100, "eta_at": now.timestamp() + 1800}
+        finished: dict[str, object] = {"event_type": "phase_finished", "phase_id": "future",
+            "timestamp_epoch": now.timestamp() - 50, "status": "stopped"}
+        sent: dict[str, object] = {"event_type": "checkpoint", "phase_id": "future",
+            "timestamp_epoch": now.timestamp() - 50, "checkpoint_commit": "a" * 40}
+        result: land_runs.LandResult = {"commit": "a" * 40, "production": "show", "unit": "promises",
+            "phase": "future", "landed": True, "step": "", "state": "", "detail": "",
+            "time": datetime.fromtimestamp(now.timestamp() - 50, UTC).isoformat()}
+        cases: list[tuple[str, list[dict[str, object]], list[land_runs.LandResult], str, str]] = [
+            ("pending promise", [future_promise], [], "phase future: 18:30", "—"),
+            ("phase_id target", [{key: value for key, value in future_promise.items() if key != "eta_phase_id"}
+                                     | {"phase_id": "future"}], [], "phase future: 18:30", "—"),
+            ("latest promise", [future_promise, {**future_promise, "timestamp_epoch": now.timestamp() - 80,
+                                           "eta_at": now.timestamp() + 2400}], [], "phase future: 18:40", "—"),
+            ("stopped after promise", [future_promise, finished], [], "—", "—"),
+            ("completed after promise", [future_promise, {**finished, "status": "completed"}], [], "—", "—"),
+            ("error after promise", [future_promise, {**finished, "status": "error"}], [], "—", "—"),
+            ("sent after promise", [future_promise, sent], [], "—", "—"),
+            ("finish before new promise", [{**finished, "timestamp_epoch": now.timestamp() - 120}, future_promise],
+             [], "phase future: 18:30", "—"),
+            ("sent before new promise", [{**sent, "timestamp_epoch": now.timestamp() - 120}, future_promise],
+             [], "phase future: 18:30", "—"),
+            ("other phase finishes", [future_promise, {**finished, "phase_id": "other"}], [], "phase future: 18:30", "—"),
+            ("other phase sent", [future_promise, {**sent, "phase_id": "other"}], [], "phase future: 18:30", "—"),
+            ("merge after promise", [future_promise], [result], "—", "—"),
+            ("failed merge after promise", [future_promise], [{**result, "landed": False}], "—", "—"),
+            ("merge before promise", [future_promise], [{**result,
+                "time": datetime.fromtimestamp(now.timestamp() - 120, UTC).isoformat()}], "phase future: 18:30", "—"),
+            ("other unit merges", [future_promise], [{**result, "unit": "other"}], "phase future: 18:30", "—"),
+            ("other phase merges", [future_promise], [{**result, "phase": "other"}], "phase future: 18:30", "—"),
+            ("phase starts again", [future_promise, finished,
+                {"event_type": "phase_started", "phase_id": "future", "phase_instance_id": "again",
+                 "phase_title": "Future work", "timestamp_epoch": now.timestamp() - 20},
+                {**future_promise, "phase_instance_id": "again", "timestamp_epoch": now.timestamp() - 10}],
+             [], "—", "18:30"),
+        ]
+        results_path = land_runs.results_path()
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        for name, tail, results, expected_plan, expected_next in cases:
+            with self.subTest(lifecycle=name):
+                _ = (history / "promises.jsonl").write_text("\n".join(map(json.dumps, [started, *tail])) + "\n")
+                _ = results_path.write_text("\n".join(map(json.dumps, results)) + "\n")
+                rendered = unit_phases.table([unit("promises", None)],
+                    {"promises": typed_record(running.plan, "done")}, census_read=LOCAL,
+                    now=now.timestamp(), zone=ZoneInfo("UTC"), columns=1000)
+                lines = rendered.split("\n\n")[1].splitlines()
+                headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
+                cells = dict(zip(headers, (cell.strip() for cell in lines[2].split("|")[1:-1]), strict=True))
+                self.assertEqual(cells.get("ETA Plan", "—"), expected_plan)
+                self.assertEqual(cells.get("ETA Next", "—"), expected_next)
 
     def test_workers_show_run_results_before_working_workers_and_count_idle_workers(self) -> None:
         parent = staff.StaffId("parent")
@@ -752,6 +819,31 @@ class UnitPhasesTests(unittest.TestCase):
         for sample, expected in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(unit_phases.workers_cell(sample, now=1060), expected)
+
+    def test_workers_name_the_reason_when_none_runs(self) -> None:
+        parent = staff.StaffId("parent")
+        held, none = unit_phases.NO_WORKER_REASONS["held"], unit_phases.NO_WORKER_REASONS["none"]
+        for sample, reason, expected in (
+                ([], held, "no-worker mode"), ([], none, "none running"),
+                ([census_worker("idle", parent, status="idle")], none, "none running +1 idle"),
+                ([census_worker("d", parent)], held, "d working"),
+                (census.CensusFailed("census took longer than 10 s"), held, "—")):
+            with self.subTest(reason=reason, expected=expected):
+                self.assertEqual(unit_phases.workers_cell(sample, now=1060, reason=reason), expected)
+        self.assertEqual(unit_phases.no_worker_reason(), "none running")
+        state = self.root / "state" / "quota_alert.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        _ = state.write_text(json.dumps({"no_worker_mode": True}))
+        self.assertEqual(unit_phases.no_worker_reason(), "no-worker mode")
+        owner = fixture_member("showrunner", name="reason-owner")
+        _ = fixture_member("unit", name="held", parent=owner.id)
+        rendered = table_of([unit("held", live("held")), unit("away", None)._replace(machine="mac")], {})
+        self.assertEqual(rendered.split("\n\n")[1].splitlines(), [
+            "| Unit | Status | Machine |", "| --- | --- | --- |", "| held | idle | — |", "| away | — | mac |"])
+        self.assertEqual(rendered.splitlines()[-4:], [
+            "| Unit | Workers | Notes |", "| --- | --- | --- |",
+            "| held | no-worker mode | nothing open: no plan, queue empty |",
+            "| away | — | nothing open: no plan, queue empty |"])
 
     def test_status_comes_from_the_census_session_or_the_scanned_machines(self) -> None:
         owner = fixture_member("showrunner", name="status-owner")
@@ -784,6 +876,108 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(unit_phases.census_workers(view, member, "one"), (workers[0],))
         self.assertEqual(unit_phases.census_workers(view, member, "two"), ())
         self.assertEqual(unit_phases.census_workers(unit_phases.census_view(failed), member, "one"), failed)
+
+    def test_notes_name_background_commands_and_a_sent_checkpoint(self) -> None:
+        owner = fixture_member("showrunner", name="shell-owner")
+        member = fixture_member("unit", name="shelled", parent=owner.id,
+            worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        now = 1_794_750_000.0
+        shells = (census.CensusShell("Run the AWS gate", now - 720), census.CensusShell("Watch CI", None))
+        read = tiles(sessions=[census.CensusSession(member.current_session, "busy", shells)])
+        shelled = unit("shelled", live("shelled"))
+        waits = ("waiting on Run the AWS gate 12m", "waiting on Watch CI")
+        self.assertEqual(unit_phases.shell_waits(unit_phases.census_view(read), shelled, now=now), waits)
+        self.assertEqual(unit_phases.shell_waits(census.CensusFailed("census exited 2"), shelled, now=now), ())
+        self.assertEqual(unit_phases.shell_waits(unit_phases.census_view(LOCAL), shelled, now=now), ())
+        self.assertEqual(unit_phases.with_waits("—", waits), " · ".join(waits))
+        self.assertEqual(unit_phases.with_waits("no plan", ()), "no plan")
+        rendered = unit_phases.table([shelled], {"shelled": {"unavailable": "no plan"}},
+                                     now=now, zone=ZoneInfo("UTC"), census_read=read)
+        self.assertIn("| shelled | busy |", rendered)
+        self.assertIn("| shelled | none running | nothing open: no plan, queue empty · waiting on Run the AWS gate 12m · waiting on Watch CI |", rendered)
+        queue_path = unit_queue.state_path(member.id)
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        note_cases: list[tuple[object, list[unit_queue.QueuedItem], str]] = [
+            (typed_record(self.root / "plan.md", "done"), [], "nothing open: plan done, queue empty"),
+            (typed_record(self.root / "plan.md", "done", "todo"), [],
+             "nothing open: next plan phase 2 not started, queue empty"),
+            (None, [], "nothing open: no plan, queue empty"),
+            ({"unavailable": "not readable"}, [unit_queue.QueuedItem("Review delivery")],
+             "nothing open: no plan, queued work not started"),
+            (typed_record(self.root / "plan.md", "done"),
+             [unit_queue.QueuedItem("Review delivery", "shelled/future")],
+             "nothing open: plan done, queued work waits on shelled/future"),
+            (None, [unit_queue.QueuedItem("Review delivery", "shelled/future"), unit_queue.QueuedItem("Clean records")],
+             "nothing open: no plan, queued work waits on shelled/future"),
+            (None, [unit_queue.QueuedItem("Clean records"), unit_queue.QueuedItem("Review delivery", "shelled/future")],
+             "nothing open: no plan, queued work not started"),
+        ]
+        for sample, items, expected in note_cases:
+            with self.subTest(notes=expected, items=items):
+                _ = queue_path.write_text(json.dumps([unit_queue.stored(item) for item in items]))
+                rendered = unit_phases.table([shelled], {"shelled": sample}, now=now, zone=ZoneInfo("UTC"),
+                                             census_read=read, columns=1000)
+                self.assertIn(f"| shelled | none running | {expected} · {' · '.join(waits)} |", rendered)
+        _ = queue_path.write_text("[]")
+        events: list[dict[str, object]] = [
+            {"event_type": "phase_started", "phase_id": "images-card", "phase_instance_id": "one"},
+            {"event_type": "activity_started", "phase_instance_id": "one", "activity": "write the card"},
+            {"event_type": "checkpoint", "phase_instance_id": "one", "checkpoint_commit": "c" * 40},
+            {"event_type": "eta_stated", "phase_instance_id": "one", "eta_phase_id": "images-card"},
+            {"event_type": "activity_started", "phase_instance_id": "two"}]
+        utc = ZoneInfo("UTC")
+        failed: land_runs.LandResult = {"commit": "c" * 40, "production": "sdlc", "unit": "shelled", "phase": "images-card",
+                                        "landed": False, "step": "red", "state": "failed", "detail": "test_cards red\nmore",
+                                        "time": datetime.fromtimestamp(now - 600, UTC).isoformat()}
+        landed: land_runs.LandResult = {**failed, "landed": True, "step": "", "state": "", "detail": ""}
+        second = {"d" * 40: land_queue.Place(1, "sdlc other", "sdlc other"), "c" * 9: land_queue.Place(2, "sdlc images", "sdlc images")}
+
+        def wait(found: list[dict[str, object]], running: frozenset[str] | None = None,
+                 line: dict[str, land_queue.Place] | None = None,
+                 results: dict[str, land_runs.LandResult] | None = None, carried_running: frozenset[str] | None = None,
+                 carried: dict[str, land_queue.Place] | None = None) -> str | None:
+            view = land_queue.LandView(dict.fromkeys(running or (), ""), land_queue.NoLine() if line is None else line, results or {},
+                                       carried_running or frozenset(), carried or {})
+            return unit_phases.checkpoint_wait(found, view, now=now, zone=utc)
+
+        self.assertEqual(wait(events[:4]), "done, waits to merge")
+        self.assertEqual(wait(events[:4], frozenset({"ccccccccc"})), "done, merging now")
+        self.assertEqual(wait(events[:4], frozenset({"d" * 40})), "done, waits to merge")
+        self.assertEqual(wait(events[:4], line=second), "done, waits to merge, 2nd in line")
+        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: failed}),
+                         "done, waits to merge, 2nd in line; last try failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: landed}), "done, waits to merge, 2nd in line")
+        self.assertEqual(wait(events[:4], line={}), "done, not sent to merge yet")
+        self.assertEqual(wait(events[:4], line={}, results={"c" * 12: failed}), "done, did not merge: failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], results={"c" * 40: landed}), "done, merged 13:30")
+        self.assertEqual(wait(events[:4], frozenset({"c" * 40}), second, {"c" * 40: failed}), "done, merging now")
+        self.assertIsNone(wait([*events[:4], events[1]], frozenset({"c" * 40})))
+        carrier = {"c" * 40: land_queue.Place(3, "sdlc land-line", "unit-board land-line")}
+        self.assertEqual(wait(events[:4], line={}, carried=carrier), "done, waits to merge with unit-board land-line, 3rd in line")
+        self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: failed}),
+                         "done, waits to merge with unit-board land-line, 3rd in line; last try failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: landed}), "done, merged 13:30")
+        self.assertEqual(wait(events[:4], line=second, carried=carrier), "done, waits to merge, 2nd in line")
+        self.assertEqual(wait(events[:4], line={}, carried_running=frozenset({"c" * 40})), "done, merging now")
+        view = land_queue.LandView({}, {}, {}, frozenset(), carrier)
+        self.assertEqual(unit_phases.checkpoint_wait(events[:4], view, now=now, zone=utc, unit="unit-board"),
+                         "done, waits to merge with land-line, 3rd in line")
+        self.assertIsNone(wait(events[:2]))
+        self.assertEqual([unit_phases.ordinal(number) for number in (1, 2, 3, 4, 11, 12, 13, 21, 22, 101, 111)],
+                         ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "101st", "111th"])
+        phase = phase_table.OpenPhase("images-card", "Images card", datetime(2026, 11, 15, 14, tzinfo=UTC),
+            phase_table.PhaseProgressNotReported(), phase_table.EtaUnavailable(), phase_table.EtaNeverStated(), "one")
+
+        def notes() -> str:
+            return unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, zone=utc,
+                                                land=land_queue.land_view(self.root))
+
+        self.assertEqual(notes(), "phase images-card — Images card · done, waits to merge")
+        self.assertEqual(land_queue.main(["add", "sdlc images", "--commit", "c" * 40]), 0)
+        self.assertEqual(land_queue.main(["add", "sdlc other", "--commit", "d" * 40, "--first"]), 0)
+        self.assertEqual(notes(), "phase images-card — Images card · done, waits to merge, 2nd in line")
+        with land_runs.landing(["c" * 9]):
+            self.assertEqual(notes(), "phase images-card — Images card · done, merging now")
 
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")
@@ -891,7 +1085,7 @@ class UnitPhasesTests(unittest.TestCase):
                         census_worker("verifier", member.id, phase="ten")]))
                 sections = rendered.split("\n\n")
                 rows: list[list[dict[str, str]]] = []
-                for section in (sections[0], sections[-1]):
+                for section in (sections[1], sections[-1]):
                     lines = section.splitlines()
                     headers = [cell.strip() for cell in lines[0].split("|")[1:-1]]
                     rows.append([dict(zip(headers, (cell.strip() for cell in line.split("|")[1:-1]), strict=True))
@@ -902,7 +1096,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn("phase 8: 03:40", status[0]["ETA Plan"])
                     self.assertNotIn("phase 7:", status[0]["ETA Plan"])
                     self.assertIn("phase 12: 03:30", status[0]["ETA Plan"])
-                    self.assertEqual(status[0][unit_phases.worker_heading()], "verifier working")
+                    self.assertEqual(work[0][unit_phases.worker_heading()], "verifier working")
                     self.assertIn("test: verify the completed rows", work[0]["Notes"])
                     self.assertTrue(work[0]["Notes"].endswith("waiting on build queue (held by builder) 5m"))
                     continue
@@ -915,7 +1109,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn("phase 12: 03:30", status[0]["ETA Plan"])
                 self.assertNotIn("phase 7:", status[0]["ETA Plan"])
                 self.assertEqual(status[1]["ETA Plan"], "—")
-                self.assertEqual([row[unit_phases.worker_heading()] for row in status],
+                self.assertEqual([row[unit_phases.worker_heading()] for row in work],
                                  ["repair working", "verifier working"])
                 self.assertEqual([row["Unit"] for row in work], ["parallel", "parallel"])
                 self.assertTrue(work[0]["Notes"].startswith("phase 8 — Repair delivery"))
@@ -945,7 +1139,7 @@ class UnitPhasesTests(unittest.TestCase):
              "timestamp_epoch": now - 300}]
         run_cases = (
             (False, False, "Verify delivery", "phase 10 — Verify delivery"),
-            (True, False, "Verify delivery", "between phases"),
+            (True, False, "Verify delivery", "nothing open: next plan phase 8 not started, queue empty"),
             (False, True, "Verify delivery", "phase 10 — Verify delivery"),
             (False, False, "Phase 10 — Verify delivery", "phase 10 — Verify delivery"),
             (False, False, "pHaSe 10 - Verify delivery", "phase 10 — Verify delivery"),
@@ -970,14 +1164,12 @@ class UnitPhasesTests(unittest.TestCase):
                         census_worker("verifier", member.id, phase="ten"),
                         census_worker("writer", member.id, phase="ten")]))
                 sections = rendered.split("\n\n")
-                status_lines = sections[0].splitlines()
-                headers = [cell.strip() for cell in status_lines[0].split("|")[1:-1]]
-                status = [dict(zip(headers, (cell.strip() for cell in line.split("|")[1:-1]), strict=True))
-                          for line in status_lines[2:]]
-                self.assertEqual([row["Phase"] for row in status], ["1/4" if between else "10"])
-                self.assertEqual([row[unit_phases.worker_heading()] for row in status],
+                status, work = ([dict(zip(lines[0].split("|")[1:-1], line.split("|")[1:-1], strict=True))
+                                 for line in lines[2:]] for lines in (sections[1].splitlines(), sections[-1].splitlines()))
+                self.assertEqual([row[" Phase "].strip() for row in status], ["1/4" if between else "10"])
+                self.assertEqual([row[f" {unit_phases.worker_heading()} "].strip() for row in work],
                                  ["pane-reader working" if between else "verifier working · writer working"])
-                self.assertIn(f"| parallel | {expected_notes}", sections[-1])
+                self.assertEqual([row[" Notes "].strip() for row in work], [expected_notes])
                 self.assertNotIn("Side review", rendered)
                 self.assertNotIn("side-worker", rendered)
                 self.assertNotIn("Phase 10 —", rendered)
@@ -1013,13 +1205,11 @@ class UnitPhasesTests(unittest.TestCase):
                   patch.object(unit_runs, "run_roots", return_value=(self.root,))):
                 rendered = unit_phases.table([unit("workers", None)], {}, now=1060, zone=ZoneInfo("UTC"),
                     snapshot=staff.snapshot(), census_read=reader("Tests", 1000))
-            self.assertEqual(rendered.splitlines()[2],
-                "| workers | exited | reader waiting on run: Tests 1m |")
-            self.assertEqual(rendered.splitlines()[0], f"| Unit | Status | {heading.capitalize()} |")
+            self.assertEqual(rendered.split("\n\n")[1].splitlines(), ["| Unit | Status |", "| --- | --- |", "| workers | exited |"])
             self.assertEqual(rendered.split("\n\n")[-1].splitlines(), [
-                "| Unit |",
-                "| --- |",
-                "| workers |",
+                f"| Unit | {heading.capitalize()} | Notes |",
+                "| --- | --- | --- |",
+                "| workers | reader waiting on run: Tests 1m | nothing open: no plan, queue empty |",
             ])
             self.assertNotIn("Progress:", rendered)
         display_names.runtime_names.cache_clear()
@@ -1043,24 +1233,23 @@ class UnitPhasesTests(unittest.TestCase):
                         zone=ZoneInfo("UTC"), snapshot=staff.snapshot(),
                         census_read=reader("Check " + "x" * label_size, now - 60))
                 values: dict[str, str] = {}
-                for section in (rendered.split("\n\n")[0], rendered.split("\n\n")[-1]):
+                for section in (rendered.split("\n\n")[1], rendered.split("\n\n")[-1]):
                     headers = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
                     rows = [tuple(cell.strip() for cell in line.split("|")[1:-1])
                             for line in section.splitlines()[2:]]
                     values.update((header, " ".join(row[column] for row in rows if row[column]))
                                   for column, header in enumerate(headers))
                     if "Status" in headers:
-                        self.assertEqual(headers[-2:], ["ETA Plan", unit_phases.worker_heading()])
+                        self.assertEqual(headers[-1], "ETA Plan")
                 self.assertEqual(values["Progress"], "🟨" + "⬜" * 19)
                 self.assertEqual(values["ETA Next"], "no ETA stated")
                 self.assertEqual(values["ETA Plan"], "19:00")
                 self.assertEqual(values["Notes"], "phase 1 — Delivery 1")
-                self.assertEqual(values["Queued"], "plan: phase 2: Delivery 2 +18 more")
-                expected_worker = ("reader waiting on run: Check " + "x" * 50 + "…" if label_size == 60
-                                   else "reader waiting on run: Check " + "x" * 20 + " 1m")
+                self.assertEqual(values["Queued"], "plan: phase 2: Delivery 2, then 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20")
+                expected_worker = "reader waiting on run: Check " + "x" * label_size + " 1m"
                 self.assertEqual(values[unit_phases.worker_heading()].replace(" ", ""),
                                  expected_worker.replace(" ", ""))
-                self.assertEqual(headers, ["Unit", "Notes",
+                self.assertEqual(headers, ["Unit", unit_phases.worker_heading(), "Notes",
                     *(("Non-Phase Work",) if other else ()), "Queued"])
                 if other:
                     self.assertEqual(values["Non-Phase Work"], "outside: impl: other work")
@@ -1074,10 +1263,10 @@ class UnitPhasesTests(unittest.TestCase):
         path = unit_queue.state_path(member.id)
         path.parent.mkdir(parents=True)
         for queued, sample, expected in (
-                ([], record, "plan: phase 3: Delivery 3 +1 more"),
-                ([], long_title, "plan: phase 3: " + "x" * 120 + " +1 more"),
-                (["Review delivery", "Clean old records"], None, "Review delivery +1 more"),
-                (["Review delivery"], record, "Review delivery · plan: phase 3: Delivery 3 +1 more"),
+                ([], record, "plan: phase 3: Delivery 3, then 4"),
+                ([], long_title, "plan: phase 3: " + "x" * 120 + ", then 4"),
+                (["Review delivery", "Clean old records"], None, "Review delivery · Clean old records"),
+                (["Review delivery"], record, "Review delivery · plan: phase 3: Delivery 3, then 4"),
                 ([], typed_record(self.root / "plan.md", "done", "running"), "—"),
                 ([], None, "—")):
             with self.subTest(expected=expected):
@@ -1120,20 +1309,20 @@ class UnitPhasesTests(unittest.TestCase):
         records: dict[str, object] = {"fallback": typed_record(self.root / "as-built.md")}
         for finished, missing, fixing, other, queue_items, progress, notes, eta, queued in (
                 (False, False, False, False, [], "🟩🟨", "phase 2 — Open work",
-                 "18:30", "plan: phase 3: New work +1 more"),
+                 "18:30", "plan: phase 3: New work, then 4"),
                 (False, False, False, False, ["phase 2 — Open work", "Review delivery"],
                  "🟩🟨", "phase 2 — Open work", "18:30",
-                 "Review delivery · plan: phase 3: New work +1 more"),
+                 "Review delivery · plan: phase 3: New work, then 4"),
                 (False, False, False, False, ["phase 2 — Open work", "Review delivery", "Clean records"],
                  "🟩🟨", "phase 2 — Open work", "18:30",
-                 "Review delivery +1 more · plan: phase 3: New work +1 more"),
+                 "Review delivery · Clean records · plan: phase 3: New work, then 4"),
                 (False, False, False, False, ["phase 2 — Open work"], "🟩🟨", "phase 2 — Open work",
-                 "18:30", "plan: phase 3: New work +1 more"),
+                 "18:30", "plan: phase 3: New work, then 4"),
                 (False, False, False, True, [], "🟩🟨🟨", "phase 2 — Open work",
-                 "18:30", "plan: phase 3: New work +1 more"),
-                (True, False, False, False, [], "—", "no phases", "—", "plan: phase 2: Open work +2 more"),
+                 "18:30", "plan: phase 3: New work, then 4"),
+                (True, False, False, False, [], "—", "nothing open: no plan, queue empty", "—", "plan: phase 2: Open work, then 3, 4"),
                 (False, False, True, False, [], "🟩🟨", "phase 2 — Open work · fix: repair Notes · fix rounds 1 + 1 running",
-                 "18:30", "plan: phase 3: New work +1 more"),
+                 "18:30", "plan: phase 3: New work, then 4"),
                 (False, True, False, False, [], "🟩🟨", "phase 2 — Open work", "18:30", "—")):
             with self.subTest(finished=finished, missing=missing, fixing=fixing, other=other, queue_items=queue_items):
                 queue_path = unit_queue.state_path(member.id)
@@ -1163,20 +1352,97 @@ class UnitPhasesTests(unittest.TestCase):
                     rendered = unit_phases.table([unit("fallback", None)], records, census_read=LOCAL,
                                                 now=now, zone=ZoneInfo("UTC"))
                 values: dict[str, str] = {}
-                for section in (rendered.split("\n\n")[0], rendered.split("\n\n")[-1]):
+                for section in (rendered.split("\n\n")[1], rendered.split("\n\n")[-1]):
                     cells = [cell.strip() for cell in section.splitlines()[2].split("|")[1:-1]]
                     headers = [cell.strip() for cell in section.splitlines()[0].split("|")[1:-1]]
                     values.update(zip(headers, cells, strict=True))
-                expected = {"Unit": "fallback", "Status": "exited", "Notes": notes}
+                expected = {"Unit": "fallback", "Status": "exited", "Workers": "none running", "Notes": notes}
                 if not finished:
                     expected.update({"Progress": progress, "Phase": "2", "ETA Next": eta,
                                      "ETA Plan": "18:30"})
                 if other:
-                    self.assertIn("| fallback | phase outside — Other work |", rendered)
+                    self.assertIn("| fallback | — | phase outside — Other work |", rendered)
                 if queued != "—":
                     expected["Queued"] = queued
                 self.assertEqual(values, expected)
                 self.assertEqual([call.args[0] for call in reads.call_args_list], [run])
+
+    def test_summary_counts_board_work_merge_owners_waits_and_local_dates(self) -> None:
+        owner = fixture_member("showrunner", name="summary-owner")
+        member = fixture_member("unit", name="counter", parent=owner.id,
+            worktree=staff.PresentWorktree("natedev", self.root))
+        idle = fixture_member("unit", name="idle", parent=owner.id)
+        excluded = fixture_member("unit", name="elsewhere", parent=owner.id)
+        self.enterContext(patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)), "GIT_CONFIG_NOSYSTEM": "1"}))
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True, capture_output=True)
+        base = commit_repository(self.root, "Base", allow_empty=True)
+        _ = subprocess.run(["git", "-C", str(self.root), "update-ref", "refs/remotes/origin/main", base],
+                           check=True, capture_output=True)
+        _ = self.enterContext(patch.object(unit_phases, "REPOSITORY", self.root))
+        now = datetime(2026, 11, 15, 1, tzinfo=UTC).timestamp()
+        history = self.root / "history" / "runs"
+        history.mkdir(parents=True)
+        folder = self.root / "runs" / "counter"
+        folder.mkdir(parents=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": member.id}))
+        _ = staff.set_run(member.id, staff.OpenRun(folder))
+        events: list[dict[str, object]] = [
+            {"event_type": "run_started", "run_id": "counter", "owner_staff_id": member.id,
+             "working_dir": str(self.root), "run_started_at": now - 600},
+            {"event_type": "phase_started", "phase_id": "draft", "phase_instance_id": "draft",
+             "phase_title": "Write delivery", "timestamp_epoch": now - 500},
+            {"event_type": "phase_started", "phase_id": "sent", "phase_instance_id": "sent",
+             "phase_title": "Send delivery", "timestamp_epoch": now - 400},
+            {"event_type": "checkpoint", "phase_id": "sent", "phase_instance_id": "sent",
+             "checkpoint_commit": "1" * 40, "timestamp_epoch": now - 300},
+            {"event_type": "phase_started", "phase_id": "held", "phase_instance_id": "held",
+             "phase_title": "Hold delivery", "timestamp_epoch": now - 200},
+            {"event_type": "checkpoint", "phase_id": "held", "phase_instance_id": "held",
+             "checkpoint_commit": "2" * 40, "timestamp_epoch": now - 100},
+        ]
+        _ = (history / "counter.jsonl").write_text("\n".join(map(json.dumps, events)) + "\n")
+        for label, commits in (("counter sent", ["1" * 40, "5" * 40]), ("counter pending", ["6" * 40]),
+                               ("elsewhere pending", ["7" * 40]), ("counterx pending", ["8" * 40])):
+            land_queue.add(label, batch="", commits=commits, first=False, before=None)
+        result: land_runs.LandResult = {"commit": "a" * 40, "production": "show", "unit": "counter",
+            "phase": "merged", "landed": True, "step": "", "state": "", "detail": "",
+            "time": "2026-11-15T00:30:00+00:00"}
+        results: list[land_runs.LandResult] = [
+            result,
+            {**result, "commit": "b" * 40},
+            {**result, "commit": "c" * 40, "phase": "earlier", "time": "2026-11-14T10:00:00+00:00"},
+            {**result, "commit": "d" * 40, "phase": "failed", "landed": False},
+            {**result, "commit": "e" * 40, "unit": "elsewhere"},
+            {**result, "commit": "f" * 40, "phase": "yesterday", "time": "2026-11-13T23:00:00+00:00"},
+        ]
+        _ = land_runs.results_path().write_text("\n".join(map(json.dumps, results)) + "\n")
+        path = unit_queue.state_path(member.id)
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps(["Review delivery", {"text": "Wait for missing work", "after": "counter/future"}]))
+        _ = unit_queue.state_path(excluded.id).write_text(json.dumps([{"text": "Excluded", "after": "counter/future"}]))
+        idle_items = [unit_queue.QueuedItem("Ready delivery", base),
+                      unit_queue.QueuedItem("Wait one", "counter/future"),
+                      unit_queue.QueuedItem("Wait two", "counter/future"), unit_queue.QueuedItem("Clean records")]
+        cases = ((ZoneInfo("UTC"), False, 1), (ZoneInfo("America/New_York"), False, 2),
+                 (ZoneInfo("America/New_York"), True, 2))
+        with land_runs.landing(["1" * 40, "3" * 40, "4" * 40],
+                               ["counter sent", "counter running", "elsewhere running"]):
+            for zone, blocked_first, merged in cases:
+                with self.subTest(zone=zone, blocked_first=blocked_first):
+                    items = [idle_items[1], idle_items[0], *idle_items[2:]] if blocked_first else idle_items
+                    _ = unit_queue.state_path(idle.id).write_text(json.dumps([unit_queue.stored(item) for item in items]))
+                    rendered = unit_phases.table([unit("counter", None), unit("idle", None)], {},
+                        now=now, zone=zone, census_read=LOCAL, columns=1000)
+                    self.assertEqual(rendered.splitlines()[:3], [
+                        f"in work 1 · waiting to merge 4 · waiting on other work 3 · merged today {merged}",
+                        "", "| Unit | Status | Progress | Phase | ETA Next |"])
+                    self.assertLessEqual(terminal_width(rendered.splitlines()[0]), 80)
+                    queue_note = "queued work waits on counter/future" if blocked_first else "queued work not started"
+                    self.assertIn(f"| idle | none running | nothing open: no plan, {queue_note} |", rendered)
+                    self.assertIn("ready: Ready delivery", rendered)
+                    self.assertIn("Wait one — after counter/future: not started", rendered)
+                    self.assertIn("Wait two — after counter/future: not started", rendered)
 
     def test_table_has_one_row_per_unit_and_escapes_pipes(self) -> None:
         legend = "Progress: 🟩 done · 🟨 open · ⬜ not started"
@@ -1197,6 +1463,8 @@ class UnitPhasesTests(unittest.TestCase):
                 first_machine = " natedev |" if machine == "mac" else ""
                 second_machine = " mac |" if machine == "mac" else ""
                 self.assertEqual(table_of(units, records), "\n".join([
+                    "in work 1 · waiting to merge 0 · waiting on other work 0 · merged today 0",
+                    "",
                     f"| Unit | Status |{column} Progress | Phase | ETA Next |",
                     f"| --- | --- |{separator} --- | --- | --- |",
                     f"| one | idle |{first_machine} 🟨⬜ | 0/2 | no ETA stated |",
@@ -1204,24 +1472,24 @@ class UnitPhasesTests(unittest.TestCase):
                     "",
                     legend,
                     "",
-                    "| Unit | Notes | Queued |",
-                    "| --- | --- | --- |",
-                    "| one | phase 1 — a\\|b | plan: phase 2: Delivery 2 |",
-                    "| two | — | — |",
+                    "| Unit | Workers | Notes | Queued |",
+                    "| --- | --- | --- | --- |",
+                    "| one | none running | phase 1 — a\\|b | plan: phase 2: Delivery 2 |",
+                    f"| two | {'—' if machine == 'mac' else 'none running'} | nothing open: no plan, queue empty | — |",
                 ]))
 
         config = self.root / "table-conf/build_targets.conf"
         configured = config.read_text()
         _ = config.write_text(configured.replace("kind.natedev=local", "kind.natedev=ssh\nkind.fixture-home=local"))
         selected = unit("one", live("a|b"))._replace(machine="fixture-home")
-        self.assertEqual(table_of([selected], records).splitlines()[0],
+        self.assertEqual(table_of([selected], records).splitlines()[2],
                          "| Unit | Status | Progress | Phase | ETA Next |")
         _ = config.write_text(configured)
 
         records = {"one": typed_record(self.root / "plan.md", "todo")}
         self.assertIn("| one | idle | ⬜ | 0/1 |",
                       table_of([unit("one", live("a|b"))], records))
-        self.assertIn("| one | not started | plan: phase 1: Delivery 1 |",
+        self.assertIn("| one | none running | nothing open: next plan phase 1 not started, queue empty | plan: phase 1: Delivery 1 |",
                       table_of([unit("one", live("a|b"))], records))
         for sample, expected in ((typed_record(self.root / "plan.md", "done"),
                                  "| Unit | Status | Progress | Phase |"),
@@ -1229,9 +1497,9 @@ class UnitPhasesTests(unittest.TestCase):
                                 (None, "| Unit | Status |")):
             with self.subTest(finished_or_absent=sample):
                 rendered = table_of([unit("one", live("a|b"))], {"one": sample})
-                self.assertEqual(rendered.splitlines()[0], expected)
+                self.assertEqual(rendered.splitlines()[2], expected)
                 if "| Progress |" in expected:
-                    self.assertIn("\n\n" + legend + "\n\n| Unit | Notes |\n", rendered)
+                    self.assertIn("\n\n" + legend + "\n\n| Unit | Workers | Notes |\n", rendered)
                 else:
                     self.assertNotIn("Progress:", rendered)
                 self.assertEqual(rendered.count("| Unit |"), 2)
@@ -1268,7 +1536,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = staff.resume(second.id)
         resumed = render()
         self.assertIn("| second | exited |", resumed)
-        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "idle", False),
+        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "busy", False),
                 ("busy", "pause", "paused", False), ("busy", "exit", "exited", False),
                 ("idle", "", "busy", True), ("busy", "", "busy", True),
                 ("starting", "", "busy", False), ("starting", "", "busy", True),
@@ -1365,8 +1633,10 @@ class UnitPhasesTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         table_end = max(index for index, line in enumerate(lines) if line.startswith("| member |"))
         self.assertEqual(lines[:table_end + 1], [
+            "in work 0 · waiting to merge 0 · waiting on other work 0 · merged today 0", "",
             "| Unit | Status |", "| --- | --- |", "| member | exited |", "",
-            "| Unit |", "| --- |", "| member |",
+            "| Unit | Workers | Notes |", "| --- | --- | --- |",
+            "| member | none running | nothing open: no plan, queue empty |",
         ])
         anomalies = [line for line in lines if line.startswith("anomaly:")
                      and ("unread-codex" in line or "unread-claude" in line)]
@@ -1430,7 +1700,11 @@ class UnitPhasesTests(unittest.TestCase):
             result = unit_phases.main(["--production", owner.name])
         self.assertEqual(result, 0)
         lines = output.getvalue().splitlines()
-        self.assertEqual(lines[:3], ["| Unit |", "| --- |", "| member |"])
+        self.assertEqual(lines[:9], [
+            "in work 0 · waiting to merge 0 · waiting on other work 0 · merged today 0", "",
+            "| Unit |", "| --- |", "| member |", "",
+            "| Unit | Workers | Notes |", "| --- | --- | --- |",
+            "| member | — | nothing open: no plan, queue empty |"])
         self.assertEqual([line for line in lines if line.startswith("anomaly:")],
                          ["anomaly: census took longer than 10 s"])
         sender.assert_called_once()
@@ -1523,6 +1797,7 @@ class UnitPhasesTests(unittest.TestCase):
                 reads = sum(call.args[0] == path for call in opened.call_args_list)
                 self.assertEqual(reads - 1, 1, "Read the run events once after the header read.")
         self.assertEqual(output.getvalue().splitlines(), [
+            "in work 2 · waiting to merge 0 · waiting on other work 0 · merged today 0", "",
             "| Unit | Status | Progress | Phase | ETA Next |",
             "| --- | --- | --- | --- | --- |",
             "| one | exited | 🟨⬜ | 1 | no ETA stated |",
@@ -1530,10 +1805,10 @@ class UnitPhasesTests(unittest.TestCase):
             "",
             "Progress: 🟩 done · 🟨 open · ⬜ not started",
             "",
-            "| Unit | Notes | Queued |",
-            "| --- | --- | --- |",
-            "| one | phase 1 — First work · impl: write one | plan: phase 2: Later work |",
-            "| two | phase 1 — First work · impl: write two | plan: phase 2: Later work |",
+            "| Unit | Workers | Notes | Queued |",
+            "| --- | --- | --- | --- |",
+            "| one | none running | phase 1 — First work · impl: write one | plan: phase 2: Later work |",
+            "| two | none running | phase 1 — First work · impl: write two | plan: phase 2: Later work |",
         ])
 
     def test_without_a_production_the_callers_staff_name_selects_it(self) -> None:
@@ -1644,7 +1919,10 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(),
-                    "| Unit | Status |\n| --- | --- |\n| a | idle |\n\n| Unit |\n| --- |\n| a |\n")
+                    "in work 0 · waiting to merge 0 · waiting on other work 0 · merged today 0\n\n"
+                    + "| Unit | Status |\n| --- | --- |\n| a | idle |\n\n"
+                    + "| Unit | Workers | Notes |\n| --- | --- | --- |\n"
+                    + "| a | none running | nothing open: no plan, queue empty |\n")
 
                 unordered = [unit("zulu", live("zulu"))._replace(machine="natedev"),
                              unit("Beta", live("Beta"))._replace(machine="mac"),
@@ -1656,17 +1934,18 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue().splitlines(), [
+                    "in work 0 · waiting to merge 0 · waiting on other work 0 · merged today 0", "",
                     "| Unit | Status | Machine |",
                     "| --- | --- | --- |",
                     "| alpha | exited | natedev |",
                     "| Beta | — | mac |",
                     "| zulu | exited | natedev |",
                     "",
-                    "| Unit |",
-                    "| --- |",
-                    "| alpha |",
-                    "| Beta |",
-                    "| zulu |",
+                    "| Unit | Workers | Notes |",
+                    "| --- | --- | --- |",
+                    "| alpha | none running | nothing open: no plan, queue empty |",
+                    "| Beta | — | nothing open: no plan, queue empty |",
+                    "| zulu | none running | nothing open: no plan, queue empty |",
                 ])
 
     def test_a_missing_plan_folder_keeps_ledger_data_and_an_unresolved_worktree_keeps_its_row(self) -> None:

@@ -45,14 +45,12 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main, :root.layout-measuring main { margin: 0 auto; padding: 24px 10vw 48px; }
-h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
+__PAGE_FRAME_STYLE__
 .num { font-variant-numeric: tabular-nums; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
+.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.status-content { display: contents; }
-.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); height: var(--status-height); }
-.status.is-stale .status-content { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; flex-wrap: inherit; background: var(--bg); }
+#status { flex: 1 1 12rem; min-width: 0; }
+.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
 .dot.stale { background: var(--cap); }
 .card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
@@ -87,9 +85,13 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .seg-unattributed { background: radial-gradient(circle, var(--ink-3) 1px, transparent 1.4px) 0 0 / 5px 5px, var(--unattributed); }
 .seg-floor { background: var(--floor); }
 .seg-agents { background: var(--agents); }
+.seg-desktop { background: var(--desktop); }
 .hatch-swap { background: repeating-linear-gradient(135deg, var(--agents) 0 3px, var(--free) 3px 6px); }
 .bar > div { cursor: help; }
 .bar > div:hover { filter: brightness(1.12); }
+.mark { position: absolute; top: 18px; bottom: -6px; width: 15px; margin-left: -7px; cursor: help; transition: left 0.6s ease; }
+.mark::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; border-left: 3px solid var(--cap); }
+.mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); cursor: help; transition: left 0.6s ease; }
 .legend .row { display: grid; grid-template-columns: 12px minmax(0, 1fr) max-content; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; cursor: help; }
 .legend .row[hidden] { display: none; }
 .legend .row:hover { background: var(--free); }
@@ -142,6 +144,7 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .sw.free { background: var(--free); border: 1px solid var(--ink-2); }
 .sw.floor { background: var(--floor); }
 .sw.agents { background: var(--agents); }
+.sw.desktop { background: var(--desktop); }
 .sw.swap { background: repeating-linear-gradient(135deg, var(--agents) 0 2px, var(--free) 2px 4px); }
 .sw.cap { background: var(--cap); }
 .section-head { font-weight: 600; font-size: 1rem; }
@@ -289,7 +292,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .walk-axis .ticks { position: relative; height: 16px; }
 .walk-axis .ticks span { position: absolute; transform: translateX(-50%); }
 @media (max-width: 560px) {
-  main { padding: 16px 12px 32px; }
   .card { padding: 14px 12px; }
   .walk-head { flex-wrap: wrap; gap: 4px; }
   .walk-sum { margin-left: 0; }
@@ -306,7 +308,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
-.cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
+#mark[hidden], #marklabel[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -330,9 +332,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <body>
 <main>
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
-  <h1>Builds</h1>
+  <h1 class="page-title">Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
-  <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -345,14 +347,16 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="last-reading" id="last-reading" hidden></div>
     </div>
 
-    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree</p>
+    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree: the named parts exceed the total.</p>
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
+      <span class="mark-label num" id="marklabel" data-tip="cap">cap</span>
       <div class="bar">
         <div class="seg-used" id="s-builds" data-tip="builds"><span class="lbl" id="l-builds"></span></div>
         <div class="seg-ci" id="s-ci" data-tip="ci"><span class="lbl" id="l-ci"></span></div>
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
         <div class="seg-floor" id="s-safety" data-tip="safety"><span class="lbl" id="l-safety"></span></div>
+        <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="hatch-swap" id="s-swap" data-tip="swap"><span class="lbl" id="l-swap"></span></div>
         <div class="seg-agents" id="s-agents" data-tip="agents"><span class="lbl" id="l-agents"></span></div>
         <div class="seg-programs" id="s-programs" data-tip="programs"><span class="lbl" id="l-programs"></span></div>
@@ -360,6 +364,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
         <div class="seg-cache" id="s-cache" data-tip="cache"><span class="lbl" id="l-cache"></span></div>
         <div class="seg-unattributed" id="s-unattributed" data-tip="unattributed"><span class="lbl" id="l-unattributed"></span></div>
       </div>
+      <div class="mark" id="mark" data-tip="cap"></div>
     </div>
     <div class="scale num" id="scale"><div class="ticks" id="ticks-top" data-tip="budget"></div></div>
 
@@ -370,7 +375,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="ci"><span class="sw ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci">–</span></div>
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved RAM</span><span class="v num" id="v-reserved">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
-      <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety and desktop</span><span class="v num" id="v-safety">–</span></div>
+      <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-safety">–</span></div>
+      <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="swap"><span class="sw swap"></span><span class="name">RAM for swap</span><span class="v num" id="v-swap">–</span></div>
       <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
       <div class="row" data-tip="programs"><span class="sw programs"></span><span class="name">Other programs</span><span class="v num" id="v-programs">–</span></div>
@@ -433,31 +439,35 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <script>
 let latest = null;
 const TIPS = {
-  builds: (d) => [`Builds and tools · ${ramAmount(d.ram.builds_bytes)}`, amountLines([
-    ["Queued builds", d.ram.queued_builds_bytes], ["rust-analyzer", d.ram.rust_analyzer_bytes],
-    ["sccache", d.ram.sccache_bytes], ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build program RAM is recorded."],
+  builds: (d) => [`Builds and tools · ${ramAmount(d.ram.builds_bytes)}`, lines("RAM that builds and build tools use now.",
+    amountLines([["Queued builds", d.ram.queued_builds_bytes], ["rust-analyzer", d.ram.rust_analyzer_bytes],
+      ["sccache", d.ram.sccache_bytes], ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build program RAM is recorded.")],
   ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`, "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
   reserved: (d) => [`Reserved RAM · ${ramAmount(d.ram.build_covered_bytes)}`, lines(
-    "RAM held for running builds and accepted work.", `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
+    "RAM the queue holds for running builds until they reach their expected peak.",
+    `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
     optional(d.ram.build_missing_bytes, `Missing RAM: ${ramAmount(d.ram.build_missing_bytes)}.`))],
   room: (d) => [`Next step room · ${ramAmount(d.ram.room_bytes)}`, lines(
-    `Available RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety target: ${ramAmount(d.ram.safety_target_bytes)}.`,
+    "RAM that the next waiting step can start in.", `Available RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety target: ${ramAmount(d.ram.safety_target_bytes)}.`,
     optional(d.ram.swap_target_bytes, `− Swap reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`),
     optional(d.ram.build_target_bytes, `− Build reservation target: ${ramAmount(d.ram.build_target_bytes)}.`))],
-  safety: (d) => [`Safety and desktop · ${ramAmount(safetyBytes(d.ram))}`, lines(
-    `Safety reserve: ${ramAmount(d.ram.safety_covered_bytes)}; target ${ramAmount(d.ram.safety_target_bytes)}.`,
-    `Desktop programs: ${ramAmount(d.ram.desktop_bytes)}.`,
-    optional(d.ram.desktop_protection_bytes, `Desktop protection setting: ${ramAmount(d.ram.desktop_protection_bytes)}.`),
-    optional(d.ram.desktop_protection_bytes, "Protection does not add RAM to this block."))],
+  safety: (d) => [`Safety · ${ramAmount(d.ram.safety_covered_bytes)}`, lines(
+    "RAM the queue always leaves free, so the machine does not run out of memory.",
+    `Target: ${ramAmount(d.ram.safety_target_bytes)}.`)],
+  desktop: (d) => measuredTip("Desktop", d.ram.desktop_bytes, lines(
+    "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
+    optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`RAM for swap · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "RAM held against swap outside builds and CI.", `Reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`,
+    "RAM the queue leaves free for memory in swap, mostly agents' memory.",
+    "That memory can come back into RAM at any time.", `Target: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Missing RAM: ${ramAmount(d.ram.swap_missing_bytes)}.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
     "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."),
   programs: (d) => [`Other programs · ${ramAmount(d.ram.other_programs_bytes)}`, lines(
+    "RAM that programs other than builds, agents and the desktop use.",
     ...d.ram.programs.map(program => `${program.name}: ${ramAmount(program.bytes)}`),
     d.ram.smaller_program_count ? `and ${d.ram.smaller_program_count} smaller programs: ${ramAmount(d.ram.smaller_programs_bytes)}` : "")],
-  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines(amountLines([
+  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines("RAM that the kernel uses for itself.", amountLines([
     ["Compressed swap (zram)", d.ram.compressed_swap_bytes], ["Slab, stacks and page tables", d.ram.kernel_structures_bytes],
     ["Other kernel counters", d.ram.kernel_counters_bytes]]),
     "Reclaimable kernel cache appears in the cache block.")),
@@ -471,7 +481,7 @@ const TIPS = {
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
     "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
-    optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`), "Reservations count toward this limit.")],
+    optional(d.ram.ci_counted_bytes, `CI use counted, file cache included: ${ramAmount(d.ram.ci_counted_bytes)}.`), "Reservations count toward this limit.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines(
     optional(d.ram.safety_missing_bytes, `Safety reserve missing: ${ramAmount(d.ram.safety_missing_bytes)}.`),
     optional(d.ram.swap_missing_bytes, `Swap reserve missing: ${ramAmount(d.ram.swap_missing_bytes)}.`),
@@ -485,7 +495,8 @@ const GIB = 1024 ** 3;
 const RAM_BLOCKS = [
   ["builds", "Builds and tools", r => r.builds_bytes], ["ci", "hana CI", r => r.ci_bytes],
   ["reserved", "Reserved RAM", r => r.build_covered_bytes], ["room", "Next step room", r => r.room_bytes],
-  ["safety", "Safety and desktop", r => safetyBytes(r)], ["swap", "RAM for swap", r => r.swap_covered_bytes],
+  ["safety", "Safety", r => r.safety_covered_bytes], ["desktop", "Desktop", r => r.desktop_bytes],
+  ["swap", "RAM for swap", r => r.swap_covered_bytes],
   ["agents", "Agents", r => r.agents_bytes], ["programs", "Other programs", r => r.other_programs_bytes],
   ["kernel", "Kernel, measured", r => r.kernel_bytes], ["cache", "File and kernel cache", r => r.cache_bytes],
   ["unattributed", "Not attributed", r => r.unattributed_bytes],
@@ -503,7 +514,6 @@ function measuredTip(name, bytes, body) {
   return recorded(bytes) ? [`${name} · ${ramAmount(bytes)}`, body]
     : [`${name} · unavailable`, "The latest reading is unavailable.\nThis amount is unknown."];
 }
-function safetyBytes(r) { return r.safety_covered_bytes + (recorded(r.desktop_bytes) ? r.desktop_bytes : 0); }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
   return ({
@@ -540,9 +550,11 @@ function swapTip(row) {
   const owner = row.owner_count === 1 ? identityFields(row).map(([name, value]) => `${sentence(name)}: ${value}`) : [];
   return [title, lines("Swap charged to this program or build.", ...owner)];
 }
-function capEnd(r) {
-  const total = recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes : 1;
-  return (r.builds_bytes + r.ci_bytes + r.build_covered_bytes + r.room_bytes) / total;
+// The fraction of all RAM at the queue cap: both charts draw their cap line here.
+// The Running chart bars use the cap terms (queued use, CI use counted, covered reservations, room), which add to the cap.
+function capEnd(d) {
+  const total = recorded(d.ram.total_bytes) && d.ram.total_bytes > 0 ? d.ram.total_bytes : 1;
+  return hasCap(d) ? d.cap * GIB / total : 0;
 }
 function poolTip(pool, d) {
   if (pool === "builds_ci") return [`Builds and CI · ${swapAmount(d.swap.builds_ci_bytes)}`,
@@ -816,10 +828,9 @@ function render(d) {
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
   const total = recorded(r.total_bytes) ? r.total_bytes : 0;
-  const disagree = r.agreement === "disagree";
-  $("ram-disagree").hidden = !disagree;
-  $("barwrap").hidden = !total || disagree;
-  $("scale").hidden = !total || disagree;
+  $("ram-disagree").hidden = r.agreement !== "disagree";
+  $("barwrap").hidden = !total;
+  $("scale").hidden = !total;
   const parts = [];
   for (const [key, name, amount] of RAM_BLOCKS) {
     const bytes = amount(r);
@@ -834,6 +845,9 @@ function render(d) {
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(d.cap)} GiB`;
   $("v-shortfall").textContent = ramAmount(r.shortfall_bytes);
   $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${f1(d.cap)} GiB`;
+  $("mark").hidden = !hasCap(d);
+  $("marklabel").hidden = !hasCap(d);
+  $("marklabel").textContent = hasCap(d) ? `cap ${f1(d.cap)}` : "";
 
   const [roomValue, roomUnit] = ramAmount(r.room_bytes).split(" ");
   $("room").textContent = roomValue;
@@ -1076,7 +1090,7 @@ function renderWalk(d) {
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
-  if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d.ram)})"></div>`);
+  if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
   $("walk").classList.toggle("has-cap", hasCap(d));
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
@@ -1085,7 +1099,7 @@ function renderWalk(d) {
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
-  const axisEnd = hasCap(d) ? Math.max(0, Math.ceil(capEnd(d.ram) * scale / step) - 1) * step : Math.floor(scale / step) * step;
+  const axisEnd = hasCap(d) ? Math.max(0, Math.ceil(capEnd(d) * scale / step) - 1) * step : Math.floor(scale / step) * step;
   const lowerTicks = [];
   for (let v = 0; v <= axisEnd; v += step) lowerTicks.push(`<span style="left:${(axisEnd ? v / axisEnd * 100 : 0)}%">${v}</span>`);
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
@@ -1123,8 +1137,10 @@ function fitWalkDetails() {
   const track = walk.querySelector(".track");
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
+  // Measure without the last layout: a stacked table is full width, so the chart would stay stacked on a wider page.
+  walk.classList.remove("beside", "stacked");
   walk.classList.add("measuring");
-  const capFraction = !hasCap(latest) ? 0 : capEnd(latest.ram);
+  const capFraction = capEnd(latest);
   function measure(labelWidth) {
     const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
@@ -1192,7 +1208,8 @@ function fitWalkDetails() {
     root.style.setProperty("--table-label", `${Math.max(0, (walk.clientWidth - fixedWidth - padding) / 2)}px`);
   }
   if (beside) {
-    const range = $("barwrap").getBoundingClientRect();
+    // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
+    const range = track.getBoundingClientRect();
     const tableLeft = !hasCap(latest)
       ? walk.getBoundingClientRect().right - naturalWidth
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
@@ -1213,13 +1230,15 @@ function fitWalkDetails() {
 }
 
 function placeMemoryBars(d) {
-  const range = $("barwrap").getBoundingClientRect();
+  const track = $("walk").querySelector(".track");
+  if (!track) return;
+  const range = track.getBoundingClientRect();
   const width = range.width;
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
-  const used = r.builds_bytes / GIB * unit;
-  const ciWidth = r.ci_bytes / GIB * unit;
+  const used = r.queued_builds_bytes / GIB * unit;
+  const ciWidth = r.ci_counted_bytes / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
   const reserveAt = used + ciWidth;
@@ -1248,7 +1267,7 @@ function placeMemoryBars(d) {
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci", "ci");
+      bars = box(used, ciWidth, "seg-ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
@@ -1317,6 +1336,9 @@ function fitLabels() {
   fitWalkDetails();
   if (latest) placeMemoryBars(latest);
   fitAxisLabels();
+  const at = latest ? $("barwrap").getBoundingClientRect().width * capEnd(latest) : 0;
+  $("mark").style.left = `${at}px`;
+  $("marklabel").style.left = `${at}px`;
   for (const [k] of RAM_BLOCKS) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
     lbl.classList.remove("tight");
@@ -1333,10 +1355,6 @@ function esc(s) {
 let lastRead = 0;
 let readingFailure = "";
 function showStatus(text, stale) {
-  const status = $("status").closest(".status");
-  if (!status.classList.contains("is-stale")) {
-    status.style.setProperty("--status-height", `${status.getBoundingClientRect().height}px`);
-  }
   $("status").textContent = text;
   $("dot").classList.toggle("stale", stale);
   $("status").closest(".status").classList.toggle("is-stale", stale);
@@ -1367,7 +1385,10 @@ function recordReadFailure(message) {
   else showQueueError(message.replace(/\.$/, ""));
 }
 
+const consoleHidden = () => window.frameElement?.hidden === true;
+
 async function tick() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1382,6 +1403,7 @@ async function tick() {
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
@@ -1393,6 +1415,12 @@ tick();
 setInterval(tick, SECONDS * 1000);
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+addEventListener("message", event => {
+  if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
+    tick();
+    reloadWhenPageChanges();
+  }
+});
 </script>
 </body>
 </html>

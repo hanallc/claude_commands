@@ -764,6 +764,43 @@ assert_fails "unknown service tier" agents_resolve mistyped.work
 stderr_out="$(agents_resolve mistyped.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" == *"Allowed values: fast, flex, default"* ]] || fail "unknown tier error did not list the allowed values"
 
+# A claude task takes its launch account from a models.conf row, never from its name.
+write_test_registry "$TEST_DIR/account.conf" --replace-provided-sections \
+    assignments/own=claude \
+    assignments/rowed=claude \
+    assignments/plain=claude \
+    assignments/wrong=claude \
+    assignments/coded=codex \
+    own.claude/work=opus:max \
+    own.options/claude_account=caller \
+    rowed.claude/work=opus:max \
+    rowed.claude/other=opus:max \
+    rowed.options/claude_account=caller \
+    rowed.options/claude_account.other=workers \
+    plain.claude/work=opus:max \
+    wrong.claude/work=opus:max \
+    wrong.options/claude_account=mine \
+    coded.codex/work=gpt-test:high \
+    coded.options/claude_account=caller \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
+write_fixture "$TEST_DIR/account.conf"
+
+agents_resolve own.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "caller" ]] || fail "a function's claude_account did not reach its row"
+agents_resolve rowed.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "caller" ]] || fail "a row without its own key did not take the function's account"
+agents_resolve rowed.other
+[[ "$AGENT_CLAUDE_ACCOUNT" == "workers" ]] || fail "a row's own claude_account did not beat the function's key"
+agents_resolve plain.work
+[[ "$AGENT_CLAUDE_ACCOUNT" == "workers" ]] || fail "a claude task with no claude_account did not take the workers pool"
+agents_resolve coded.work
+[[ -z "$AGENT_CLAUDE_ACCOUNT" ]] || fail "a codex task carried a claude account"
+assert_fails "unknown claude account" agents_resolve wrong.work
+stderr_out="$(agents_resolve wrong.work 2>&1 >/dev/null || true)"
+[[ "$stderr_out" == *"Allowed values: workers, caller"* ]] || fail "unknown account error did not list the allowed values"
+write_fixture "$TEST_DIR/tier.conf"
+
 # A codex row with no registry tier shows what ~/.codex/config.toml gives it.
 printf 'model = "gpt-test"\nservice_tier = "fast"\n\n[profiles.x]\nservice_tier = "flex"\n' > "$TEST_DIR/codex-fast.toml"
 assignment_list="$(CODEX_CONFIG_FILE="$TEST_DIR/codex-fast.toml" agents_list_assignments untiered)"

@@ -62,7 +62,20 @@ class DeferredUntil:
     at: datetime
 
 
-OutstandingTiming = DueNow | DeferredUntil
+@dataclass(frozen=True)
+class AwaitingReply:
+    """The user sent the asker a follow-up; the question is not due until the asker replies."""
+    sent: datetime
+
+
+OutstandingTiming = DueNow | DeferredUntil | AwaitingReply
+
+
+@dataclass(frozen=True)
+class Followup:
+    """A follow-up the user sent the asker, and the asker's reply."""
+    followup: str
+    reply: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +102,7 @@ class OutstandingQuestion:
     rank: Ranking = Ranking()
     # The fixed staff id identifies the asker for the answer relay.
     asked_by: str = ""
+    followups: tuple[Followup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,6 +115,7 @@ class ReviewedOutstandingQuestion:
     rank: Ranking = Ranking()
     # The fixed staff id identifies the asker for the answer relay.
     asked_by: str = ""
+    followups: tuple[Followup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +128,7 @@ class ReviewUnavailableOutstandingQuestion:
     rank: Ranking = Ranking()
     # The fixed staff id identifies the asker for the answer relay.
     asked_by: str = ""
+    followups: tuple[Followup, ...] = ()
 
 
 Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
@@ -123,6 +139,32 @@ def check_keys(fields: dict[str, object], allowed: set[str], where: str) -> None
     unknown = sorted(set(fields) - allowed)
     if unknown:
         raise InputError(f"{where}: unknown field(s) {', '.join(unknown)}; allowed: {', '.join(sorted(allowed))}")
+
+
+def read_parts(value: object, where: str) -> QuestionParts:
+    """Read stored question parts; the full question text stays in `question` for every other reader."""
+    if not isinstance(value, dict):
+        raise InputError(f"{where}.parts: expected an object")
+    fields = cast(dict[str, object], value)
+    check_keys(fields, {"ask", "context", "items", "recommend", "choices"}, where + ".parts")
+    texts = {key: fields.get(key) for key in ("ask", "context", "recommend")}
+    lists = {key: fields.get(key) for key in ("items", "choices")}
+    if not all(isinstance(text, str) for text in texts.values()) or not all(
+            isinstance(entries, list) and all(isinstance(entry, str) for entry in cast(list[object], entries))
+            for entries in lists.values()):
+        raise InputError(f"{where}.parts: expected text ask, context and recommend, and lists of text items and choices")
+    return QuestionParts(ask=cast(str, texts["ask"]), context=cast(str, texts["context"]),
+                         items=cast(list[str], lists["items"]), recommend=cast(str, texts["recommend"]),
+                         choices=cast(list[str], lists["choices"]))
+
+
+def question_text(parts: QuestionParts) -> str:
+    """Write the parts as one full question for /next, messages, the review and older readers."""
+    blocks = [parts["ask"], parts["context"],
+              "\n".join(f"{number}. {item}" for number, item in enumerate(parts["items"], 1)),
+              f"Recommended: {parts['recommend']}" if parts["recommend"] else "",
+              "Choices:\n" + "\n".join(f"- {choice}" for choice in parts["choices"]) if parts["choices"] else ""]
+    return "\n\n".join(block for block in blocks if block.strip())
 
 
 def plumbing(line: str) -> str | None:
@@ -145,6 +187,37 @@ def read_ranking(fields: dict[str, object], where: str) -> Ranking:
         raise InputError(f"{where}: {error}") from None
 
 
+def read_pending_followup(value: object, where: str) -> PendingFollowup | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise InputError(f"{where}.followup: expected an object")
+    fields = cast(dict[str, object], value)
+    check_keys(fields, {"text", "sent"}, where + ".followup")
+    text, sent = fields.get("text"), fields.get("sent")
+    if not isinstance(text, str) or not text.strip():
+        raise InputError(f"{where}.followup.text: expected the follow-up text")
+    if not isinstance(sent, str) or not STARTED.match(sent):
+        raise InputError(f"{where}.followup.sent: expected YYYY-MM-DDTHH:MM")
+    return PendingFollowup(text=text, sent=sent)
+
+
+def read_followups(value: object, where: str) -> tuple[Followup, ...]:
+    if not isinstance(value, list):
+        raise InputError(f"{where}.followups: expected a list")
+    exchanges: list[Followup] = []
+    for index, entry in enumerate(cast(list[object], value)):
+        if not isinstance(entry, dict):
+            raise InputError(f"{where}.followups[{index}]: expected an object")
+        fields = cast(dict[str, object], entry)
+        check_keys(fields, {"followup", "reply"}, f"{where}.followups[{index}]")
+        followup, reply = fields.get("followup"), fields.get("reply")
+        if not isinstance(followup, str) or not isinstance(reply, str) or not followup.strip() or not reply.strip():
+            raise InputError(f"{where}.followups[{index}]: expected the follow-up and its reply")
+        exchanges.append(Followup(followup, reply))
+    return tuple(exchanges)
+
+
 def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
     """Validate reminder and question fields from their owning stores."""
     if not isinstance(entries, list):
@@ -155,8 +228,10 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
-                            "marked", "follows", "asked_by"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
+                            "due", "marked", "follows", "asked_by", "followup", "followups"}, where)
+        if "parts" in fields:
+            _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
@@ -167,7 +242,11 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
             raise InputError(f"{where}.text: expected one non-empty line")
         # The plumbing check runs when `update_registration.py questions` writes an item, not here:
         # a stored item that fails it must not take the whole list down.
-        timing = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        timing: OutstandingTiming = DeferredUntil(datetime.fromisoformat(after)) if isinstance(after, str) else DueNow()
+        pending = read_pending_followup(fields.get("followup"), where)
+        if pending is not None:
+            timing = AwaitingReply(datetime.fromisoformat(pending["sent"]))
+        followups = read_followups(fields.get("followups", []), where)
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
         reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
@@ -175,8 +254,8 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         if not isinstance(asked_by, str) or "\n" in asked_by or ("asked_by" in fields and not asked_by.strip()):
             raise InputError(f"{where}.asked_by: expected one non-empty line")
         if "question" not in fields:
-            if "reviewed" in fields or "review_unavailable" in fields or "asked_by" in fields:
-                raise InputError(f"{where}: question required for a review result or an asker")
+            if any(key in fields for key in ("reviewed", "review_unavailable", "asked_by", "followup", "followups")):
+                raise InputError(f"{where}: question required for a review result, an asker or a follow-up")
             items.append(OutstandingReminder(since_at, text, timing, rank))
             continue
         if not isinstance(question, str) or not question.strip():
@@ -184,13 +263,14 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         if "reviewed" in fields:
             if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
                 raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
-            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank, asked_by))
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank, asked_by, followups))
         elif "review_unavailable" in fields:
             if not isinstance(unavailable, str):
                 raise InputError(f"{where}.review_unavailable: expected reason text")
-            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by))
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by,
+                                                              followups))
         else:
-            items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by))
+            items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by, followups))
     return sorted(items, key=lambda item: item.since)
 
 
@@ -213,11 +293,32 @@ class InstanceAbsent(NamedTuple):
     pass
 
 
+class QuestionParts(TypedDict):
+    """The parts of a question that the Questions page shows as separate sections."""
+    ask: str
+    context: str
+    items: list[str]
+    recommend: str
+    choices: list[str]
+
+
+class PendingFollowup(TypedDict):
+    """A follow-up that waits for the asker's reply."""
+    text: str
+    sent: str
+
+
+class FollowupExchange(TypedDict):
+    followup: str
+    reply: str
+
+
 class OutstandingItem(TypedDict):
     since: str
     text: str
     after: NotRequired[str]
     question: NotRequired[str]
+    parts: NotRequired[QuestionParts]
     reviewed: NotRequired[str]
     review_unavailable: NotRequired[str]
     urgency: NotRequired[str]
@@ -225,6 +326,8 @@ class OutstandingItem(TypedDict):
     marked: NotRequired[str]
     follows: NotRequired[str]
     asked_by: NotRequired[str]
+    followup: NotRequired[PendingFollowup]
+    followups: NotRequired[list[FollowupExchange]]
 
 
 class QuestionRegistration(TypedDict):
@@ -1064,7 +1167,8 @@ def read_open_items(path: Path | None, *, production: Production | None = None,
 
 def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
     """Return the items whose deferred time has passed."""
-    return [item for item in items if isinstance(item.timing, DueNow) or item.timing.at <= now]
+    return [item for item in items
+            if isinstance(item.timing, DueNow) or (isinstance(item.timing, DeferredUntil) and item.timing.at <= now)]
 
 
 def read_all_open_fields() -> list[OutstandingItem]:
@@ -1117,6 +1221,8 @@ class OpenItem(NamedTuple):
     def line(self) -> str:
         """The item in full, led by its production and any level it has."""
         text = self.item.text if isinstance(self.item, OutstandingReminder) else self.item.question
+        if not isinstance(self.item, OutstandingReminder):
+            text += "".join(f"\nFollow-up: {each.followup}\nReply: {each.reply}" for each in self.item.followups)
         level = urgency.cell(self.item.rank.urgency)
         asker = f", asked by {self.asker_label}" if self.asker_label else ""
         return f"{self.name}{f' [{level}]' if level else ''}, since {self.item.since:{WHEN}}{asker}: {text}"
@@ -1126,11 +1232,25 @@ class OpenLists(NamedTuple):
     due: list[urgency.Entry[OpenItem]]
     deferred: list[OpenItem]
     unreadable: list[str]
+    # Questions with a follow-up that waits for the asker's reply.
+    awaiting: list[OpenItem]
 
 
 def question_queue(production: Production, below: bool = False) -> str:
     """The queue name for the production question that /next displayed."""
-    return urgency.scope_queue(f"question-{production.owner.id}", below)
+    return question_queue_name(production.owner.id, below)
+
+
+def question_queue_name(owner: str, below: bool = False) -> str:
+    """The queue name of the questions that the showrunner with this staff id owns."""
+    return urgency.scope_queue(f"question-{owner}", below)
+
+
+def question_entry(owner: str, item: OutstandingItem, path: Path) -> urgency.Entry[OutstandingItem]:
+    """The queue entry of one stored question, keyed as `open_lists` keys it."""
+    parsed = parse_outstanding_entries([item], path)[0]
+    return urgency.Entry(item_key(owner, item["text"]), item, parsed.rank.urgency, parsed.since,
+                         after=item_key(owner, parsed.rank.follows) if parsed.rank.follows else "")
 
 
 def item_key(name: str, text: str) -> str:
@@ -1143,6 +1263,7 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
     now = datetime.now(production.zone).replace(tzinfo=None)
     due: list[urgency.Entry[OpenItem]] = []
     deferred: list[OpenItem] = []
+    awaiting: list[OpenItem] = []
     unreadable: list[str] = []
     documents = identities.documents()
     for name in identities.names(production.name, below):
@@ -1164,12 +1285,14 @@ def open_lists(production: Production, below: bool = False, *, identities: Quest
             opened = OpenItem(name, item, label)
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
                 deferred.append(opened)
+            elif isinstance(item.timing, AwaitingReply):
+                awaiting.append(opened)
             else:
                 owner = documents[name].id
                 due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
                                          item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.name))
-    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable, awaiting)
 
 
 def open_items(production: Production) -> None:
@@ -1184,9 +1307,13 @@ def open_items(production: Production) -> None:
     for found in lists.deferred:
         print(f"deferred until {cast(DeferredUntil, found.item.timing).at:{WHEN}}: {found.name}: "
               + (found.item.text if isinstance(found.item, OutstandingReminder) else found.item.question))
+    for found in lists.awaiting:
+        print(f"waiting for the asker's reply since {cast(AwaitingReply, found.item.timing).sent:{WHEN}}: {found.name}: "
+              + found.item.text)
     for name in lists.unreadable:
         print(f"{name}: {UNREADABLE_LIST}")
     report("open", "ok", f"{len(lists.due)} due, {len(lists.deferred)} deferred"
+           + (f", {len(lists.awaiting)} waiting for a reply" if lists.awaiting else "")
            + (f", {len(lists.unreadable)} unreadable" if lists.unreadable else ""))
 
 
@@ -1232,15 +1359,19 @@ def mark_important(production: Production, words: str) -> None:
 SHOWRUNNER_ASKER = "showrunner"
 
 
-def ask(production: Production, text: str, question: str, unit: str, rank: Ranking, *,
+def ask(production: Production, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None) -> None:
-    """Review and file a question with its asker's fixed staff id."""
+    """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
     asker = identities.asker(production, unit)
     if not text.strip() or "\n" in text:
         raise RegistrationFailure("ask", "--text must be one nonempty line")
-    if not question.strip():
-        raise RegistrationFailure("ask", "--question must hold the full question")
+    if not parts["ask"].strip() or "\n" in parts["ask"]:
+        raise RegistrationFailure("ask", "--ask must be one nonempty line")
+    # A question with choices names at least two and the one to take; an open question has none.
+    if parts["choices"] and (len(parts["choices"]) < 2 or not parts["recommend"].strip()):
+        raise RegistrationFailure("ask", "a question with choices needs at least two --choice and one --recommend")
+    question = question_text(parts)
     problem = plumbing(text)
     if problem is not None:
         raise RegistrationFailure("ask", f"{text}: {problem}")
@@ -1253,7 +1384,7 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
     entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
-                            asked_by=asker.id)
+                            asked_by=asker.id, parts=parts)
     if isinstance(accepted, ReviewedQuestion):
         entry["reviewed"] = accepted.reviewed
     else:
@@ -1346,6 +1477,60 @@ def withdraw(production: Production, words: str, *, identities: QuestionStaff | 
     _ = remove_open_item(production, name, text, identities, "withdraw",
                          lambda path, item, now: record_question_history(path, [item], now, withdrawn=True))
     report("withdraw", "ok", f"{name}: {text}")
+
+
+def change_open_question(production: Production, name: str, text: str, identities: QuestionStaff, verb: str,
+                         change: Callable[[OutstandingItem], None]) -> OutstandingItem:
+    """Change one open question under its owner's lock and write it back."""
+    path = outstanding_file(name, identities=identities)
+    with outstanding_lock(path):
+        owner = production if name == production.name else read_production(name, identities.record)
+        entries = open_entries(owner, identities)
+        found = next((entry for entry in entries if entry["text"] == text and "question" in entry), None)
+        if found is None:
+            raise RegistrationFailure(verb, f"{text}: no open question with this text in {name}")
+        change(found)
+        write_open_entries(owner, entries, identities)
+    return found
+
+
+def followup(production: Production, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
+    """Send the asker a follow-up: the question leaves the due list until the asker replies."""
+    identities = identities if identities is not None else QuestionStaff.read()
+    if not words.strip():
+        raise RegistrationFailure("followup", "the follow-up is empty")
+    sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
+
+    def add(entry: OutstandingItem) -> None:
+        if "followup" in entry:
+            raise RegistrationFailure("followup", f"{text}: a follow-up already waits for the asker's reply")
+        entry["followup"] = PendingFollowup(text=words.strip(), sent=sent)
+
+    changed = change_open_question(production, production.name, text, identities, "followup", add)
+    return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
+
+
+def reply(production: Production, words: str, text: str, *, identities: QuestionStaff | None = None) -> None:
+    """Record the asker's reply to the follow-up; the question returns to the user with both."""
+    identities = identities if identities is not None else QuestionStaff.read()
+    if not text.strip():
+        raise RegistrationFailure("reply", "the reply is empty")
+    wanted = words.strip()
+    found = [name for name in identities.names(production.name, below=True)
+             for item in read_open_items(outstanding_file(name, identities=identities),
+                                        production=production if name == production.name else None, identities=identities)
+             if item.text == wanted and isinstance(item.timing, AwaitingReply)]
+    if len(found) != 1:
+        raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
+
+    def answer_followup(entry: OutstandingItem) -> None:
+        pending = entry.pop("followup", None)
+        if pending is None:
+            raise RegistrationFailure("reply", f"{wanted}: no follow-up waits for a reply")
+        entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
+
+    _ = change_open_question(production, found[0], wanted, identities, "reply", answer_followup)
+    report("reply", "ok", f"{found[0]}: {wanted}: back on the open-questions list with the reply")
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -1454,6 +1639,16 @@ def keep_question_fields(entry: OutstandingItem, previous: Outstanding) -> None:
         entry["review_unavailable"] = previous.reason
 
 
+def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
+    """Keep the parts and follow-ups that a showrunner's list does not carry."""
+    if "parts" in stored:
+        entry["parts"] = stored["parts"]
+    if "followup" in stored:
+        entry["followup"] = stored["followup"]
+    if "followups" in stored:
+        entry["followups"] = stored["followups"]
+
+
 class HeldRegistrationQuestion(NamedTuple):
     details: str
 
@@ -1502,6 +1697,7 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
     """Write the showrunner's new list; a question someone filed with `ask` leaves only through `answer`."""
     identities = identities if identities is not None else QuestionStaff.read()
     previous = {item.text: item for item in read_open_items(outstanding, production=production, identities=identities)}
+    stored = {entry["text"]: entry for entry in open_entries(production, identities)}
     now = datetime.now(production.zone)
     since = now.strftime("%Y-%m-%dT%H:%M")
     entries: list[OutstandingItem] = []
@@ -1535,6 +1731,8 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
                                      item.rank.follows))
         if item.text in previous:
             keep_question_fields(entry, previous[item.text])
+            if item.text in stored:
+                keep_layout_fields(entry, stored[item.text])
         elif isinstance(item, QuestionForReview):
             accepted = review_open_question(production.name, item)
             if isinstance(accepted, ReviewedQuestion):
@@ -1560,6 +1758,9 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
         print("reviewed question: " + accepted_text)
 
 
+ASK_DESCRIPTION = "File a question for the user. Write its parts as ~/.claude/docs/question_template.md says."
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -1567,8 +1768,8 @@ def main() -> int:
         delivery = commands.add_parser(action)
         _ = delivery.add_argument("--owner", required=True)
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
-                   "questions-table", "migrate-questions"):
-        subcommand = commands.add_parser(action)
+                   "reply", "questions-table", "migrate-questions"):
+        subcommand = commands.add_parser(action, description=ASK_DESCRIPTION if action == "ask" else None)
         _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
@@ -1583,10 +1784,21 @@ def main() -> int:
             _ = subcommand.add_argument("--state", type=Path)
         elif action in ("mark-important", "answer", "withdraw"):
             _ = subcommand.add_argument("--item", required=True)
+        elif action == "reply":
+            _ = subcommand.add_argument("--item", required=True, help="the question's exact one-line text")
+            _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
         elif action == "ask":
-            _ = subcommand.add_argument("--text", required=True, help="the one-line item the count and lists name")
-            _ = subcommand.add_argument("--question", required=True,
-                                        help="what is asked, why, each choice and what it does, the recommended choice")
+            _ = subcommand.add_argument("--text", default="",
+                                        help="the one-line item the count and lists name; the default is --ask")
+            _ = subcommand.add_argument("--ask", required=True,
+                                        help="the question in one line; the parts below give the page its layout")
+            _ = subcommand.add_argument("--context", default="", help="two sentences at most: why it is asked now and what waits on it")
+            _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
+                                        help="one fact, step or command; a command in backticks; repeat it")
+            _ = subcommand.add_argument("--recommend", default="",
+                                        help="one choice and the reason, in one sentence; required with --choice")
+            _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],
+                                        help="one answer in one line that says what happens; give two or more")
             _ = subcommand.add_argument("--unit", default="", help="the asking unit's staff id; without --production, select its parent")
             _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
             _ = subcommand.add_argument("--due", default="")
@@ -1632,12 +1844,17 @@ def main() -> int:
             _ = answer(production, cast(str, args.item))
         elif action == "withdraw":
             withdraw(production, cast(str, args.item))
+        elif action == "reply":
+            reply(production, cast(str, args.item), cast(str, args.text))
         elif action == "ask":
             try:
                 level = urgency.read(cast(str, args.urgency), cast(str, args.due))
             except urgency.UrgencyError:
                 raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
-            ask(production, cast(str, args.text), cast(str, args.question), cast(str, args.unit), Ranking(level),
+            asked = cast(str, args.ask)
+            parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
+                                  recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
+            ask(production, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
                 identities=identities)
         elif action == "questions-table":
             questions_table(production, identities=identities)

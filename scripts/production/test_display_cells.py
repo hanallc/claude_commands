@@ -30,6 +30,10 @@ class WrappedTableTests(unittest.TestCase):
                 fitted = claude_table_layout.fit(titles, rows, width)
                 self.assertTrue(fitted.keeps_table(titles, rows, width, settings.whole("units_table_cell_lines")))
 
+    def test_a_kept_column_stays_when_every_cell_is_empty(self) -> None:
+        titles, rows = display_cells.wrapped(("Unit", "Notes", "Workers"), [("one", "—", "—")], keep=(2,))
+        self.assertEqual((titles, rows), (("Unit", "Workers"), [("one", "—")]))
+
     def test_ids_break_only_when_the_terminal_width_needs_it(self) -> None:
         headers = ("Unit", "Status", "Progress", "Phase", "ETA Next", "ETA Plan", "Workers")
         rows = [("admin-console", "busy", "🟩" * 20, "restart-record-replace", "no ETA stated",
