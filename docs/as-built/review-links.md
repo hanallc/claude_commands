@@ -94,13 +94,16 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS prices, Builds, Changes and Questions, in alphabetical order.
+The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop top bar shows only the selected page title.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
 Each storage operation catches failures, so blocked storage does not stop navigation.
 The selected page fills a same-origin frame beside the navigation.
+Each page that the user opens keeps its own live frame, and the console hides the others.
+A navigation click back to a page shows it as the user left it: filter, card, type, scroll and typed text.
+A hidden frame keeps its layout with `visibility:hidden`, so its scroll position stays.
 The shell follows the system light or dark theme.
 At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
@@ -112,6 +115,18 @@ The phone navigation starts closed and does not change the stored desktop state.
 `?page=<id>` selects a page.
 Missing and unknown ids select the first configured entry.
 Navigation clicks update this query with `history.replaceState`.
+
+The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
+A reload or a shared link opens each page at its recorded place.
+The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
+A place equal to the configured URL removes its `at.<id>` key.
+The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
+A page that changes its place with `history.replaceState` posts `console-place` to its parent, so the console reads the place again.
+
+A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
+When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
+The Changes page follows both rules.
+The Builds page refreshes in a hidden frame until it reads the same signal.
 
 Older links forward to the fixed address with a 303 and keep their query.
 The server forwards `/<snapshot>/console.html` to `/console/`.
@@ -154,8 +169,8 @@ A click opens a modal overlay titled **Rebuilds needed** with the machine, reaso
 The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
 When the last need clears, the link hides and an open overlay closes.
 
-The console vendors nine SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
+The console vendors ten SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
@@ -183,6 +198,7 @@ All is the default and includes every showrunner in the existing item order.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
+All with no card keeps the URL without a fragment.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
@@ -216,6 +232,48 @@ Recovery sends only answers with `saved: true` whose canonical question record i
 Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 Answers to questions and changes both post to `changes.html`.
+
+### Images page
+
+`/console/images.html` shows registered images with their instructions, newest first.
+The console lists it as **Images**, with the Lucide `image` icon.
+A showrunner or unit registers each image with one command:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register --image PATH --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+```
+
+- The caption says what changed and what to look at.
+- The owner is the staff id that gets delete requests. The command refuses an id that is not in the staff record.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
+- It prints the image link and the console link `http://<host>:<server_port>/console/?page=images`.
+- The server serves the copy, so the user never needs the source path.
+
+Each card shows the image as a link to the full size, the caption, and **For**, **Owner** and **Added**.
+**For** is `Change <id>` or `Phase <id>`. **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`.
+The browser shows **Added** in local time.
+The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
+A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
+The page refreshes its cards when the console shows it again and when the tab becomes visible.
+A hidden frame makes no request.
+
+**Request delete** posts the image id and a token signed with the console browser token.
+The server records the request under `images/.review-link-images.lock`, replies at once, then sends the message.
+The message goes to the owner with `delivery_tries` and `delivery_pause_seconds`, as Send feedback does.
+It starts `From the user (via the Images page): delete this image.`
+It names the image link, caption, subject and time, and the command that deletes it:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id ID
+```
+
+The delete removes the image folder and its file.
+A request that is pending or sent shows **Delete requested. The owner gets a message.** and sends nothing more.
+A failed send shows **Not sent: <error>** above the button, and the user can request again.
+At startup, the server sends each request that a stopped server left pending.
 
 ### Rebuilds page
 
@@ -652,7 +710,7 @@ That interval starts at one hour.
   Each publish resets the folder modification time.
   The sweep deletes expired folders at its next run.
   A stopped server sweeps at its next start.
-- The sweep never deletes the fixed `console/` folder, at any age.
+- The sweep never deletes the fixed `console/` folder or the `images/` folder, at any age. Only a delete removes an image.
 - At the root, the sweep checks `is_symlink()` before `is_dir()`, so it never follows a symlink. It skips symlinks and entries that are not folders, for example `.index.json`, `.index.lock` and temporary files.
 - A root folder is a flat snapshot when its name is six lowercase letters or digits and it holds no subfolder and no symlink. The sweep deletes a flat snapshot as one folder.
 - Any other root folder is a session folder of the older `<session>/<UTC stamp>-<label>-<unique suffix>/` layout. The sweep checks each child folder on its own, skips child symlinks and never deletes the session folder.

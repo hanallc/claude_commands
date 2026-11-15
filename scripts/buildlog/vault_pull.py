@@ -200,7 +200,15 @@ def mac_git(*args: str) -> subprocess.CompletedProcess[str] | VaultCommandFailed
         "no route to host", "network is unreachable", "connection closed", "permission denied (publickey",
     )):
         return MacUnreachable()
-    return command_failure(result, Machine.MAC)
+    return command_failure(result, failing_machine())
+
+
+def failing_machine() -> Machine:
+    """A transfer with the Mac also fails on a damaged natedev object, so check natedev first."""
+    check = git("fsck", "--connectivity-only", "--no-dangling")
+    if isinstance(check, VaultCommandFailed) or check.returncode != 0:
+        return Machine.NATEDEV
+    return Machine.MAC
 
 
 def marked(stdout: str, prefix: str) -> tuple[str, ...]:

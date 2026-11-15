@@ -9,7 +9,7 @@ AWS has no permanent builder or build offload route.
 
 Each gate reserves queue capacity and spending before it requests a box.
 The gate uses its own box and terminates that box after completion or failure.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 The home region, `us-east-2`, holds the shared artifact bucket and gate role.
 Regional stacks supply launch templates, public subnets, and expiry functions.
 The saved `gate-deployment.json` identifies deployed resources.

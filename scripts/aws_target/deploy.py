@@ -90,11 +90,14 @@ class DeploymentRefused(ValueError):
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
-    """Share the configured regions and quota codes between requests and reports."""
+    """Share the gate regions and quota codes between requests and reports.
+
+    A region with only a price read has no gate stack, so a quota request there buys nothing."""
     values = conf.read_or_repository('cloud_gate')
+    regions = gate_regions(home, values)
     return (
-        (gate_regions(home, values), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
-        (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+        (regions, 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+        (regions, 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
     )
 
 
@@ -149,6 +152,14 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
         reason = match[1] if match else type(error).__name__
         print(f'{region}: {label} quota request failed: {reason}')
         return False
+
+
+@dataclass(frozen=True)
+class RegionalNetwork:
+    region: str
+    vpc: str
+    subnets: list[dict[str, object]]
+    image: str
 
 
 @dataclass(frozen=True)
@@ -690,16 +701,7 @@ class Deployment:
         lines = [str(error)]
         if change.get('StatusReason'):
             lines.append(str(change['StatusReason']))
-        try:
-            events = api.call('describe-stack-events', '--stack-name', stack_id, service='cloudformation')
-            for event in ledger.rows(events, 'StackEvents'):
-                stamp = datetime.fromisoformat(ledger.text(event, 'Timestamp').replace('Z', '+00:00')).timestamp()
-                status = ledger.text(event, 'ResourceStatus')
-                if stamp >= started and status.endswith('_FAILED'):
-                    lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
-                                 + f"{status}: {event.get('ResourceStatusReason', '')}")
-        except (ValueError, AwsUnavailable, subprocess.SubprocessError):
-            lines.append('stack events are unavailable')
+        lines.extend(failed_stack_events(api, stack_id, started))
         try:
             stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id, service='cloudformation'), 'Stacks')
             for stack in stacks:
@@ -1128,9 +1130,8 @@ class Deployment:
                        timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
         return image
 
-    def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
-                            parameters: dict[str, str], region: str) -> dict[str, object]:
-        """Deploy only gate resources in the target region."""
+    def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str) -> RegionalNetwork:
+        """Read the default VPC and public subnets of a gate region, and find or copy its gate image."""
         target = api.in_region(region)
         vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
         if not vpcs:
@@ -1140,18 +1141,18 @@ class Deployment:
             subnets = gate_subnets(target, vpc)
         except DeploymentRefused as error:
             raise DeploymentRefused(region + ': ' + str(error)) from error
-        image = self.regional_image(api, settings, region)
-        account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
-        stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
-        partition = stack_id.split(':')[1]
+        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region))
+
+    def regional_gate_stack(self, api: AwsCli, settings: DeploymentSettings, home: dict[str, str],
+                            parameters: dict[str, str], network: RegionalNetwork) -> dict[str, object]:
+        """Deploy only gate resources in the target region; the home stack's scaler policies cover every gate region."""
+        region = network.region
+        target = api.in_region(region)
         deployment = ledger.text(deployment_record(self.directory), 'deployment_id')
-        prefix = f'arn:{partition}:ec2:{region}:{account}:'
-        values = {**parameters, 'GateImage': image, 'VpcId': vpc,
+        values = {**parameters, 'GateImage': network.image, 'VpcId': network.vpc,
             'DeploymentId': deployment, 'CostTagKey': read_settings(self.settings_path).cost_explorer_tag_key,
             'CostTagValue': read_settings(self.settings_path).cost_explorer_tag_value,
-            'RootDeviceName': settings.root_device_name, 'ScalerUserName': settings.scaler_user_name,
-            'HomeGateProfileArn': home['GateProfileArn'], 'HomeGateRoleArn': home['GateRoleArn'],
-            'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets)}
+            'RootDeviceName': settings.root_device_name, 'HomeGateProfileArn': home['GateProfileArn']}
         template = self.output / ('region-gates-' + region + '.json')
         write_text_atomic(template, json.dumps(region_gate_template(), sort_keys=True) + '\n')
         definitions = ledger.mapping(region_gate_template()['Parameters'])
@@ -1160,13 +1161,23 @@ class Deployment:
         stacks = remote.read_record(stack_path) if stack_path.exists() else {}
         stacks[region] = name
         write_text_atomic(stack_path, json.dumps(stacks) + '\n')
-        _ = target.call('deploy', '--stack-name', name, '--template-file', str(template),
-            '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset', '--parameter-overrides',
-            *[key + '=' + value for key, value in values.items() if key in definitions], service='cloudformation',
-            timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+        wait_s = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        if rolled_back_create(target, name):
+            # A stack whose first create failed keeps no resources and cannot be updated; remove it and create it again.
+            print(f'cloud-gate: {region}: removing the gate stack whose first create failed')
+            _ = target.call('delete-stack', '--stack-name', name, service='cloudformation')
+            _ = target.call('wait', 'stack-delete-complete', '--stack-name', name, service='cloudformation', timeout_s=wait_s)
+        started = self.clock()
+        try:
+            _ = target.call('deploy', '--stack-name', name, '--template-file', str(template),
+                '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset', '--parameter-overrides',
+                *[key + '=' + value for key, value in values.items() if key in definitions], service='cloudformation',
+                timeout_s=wait_s)
+        except (AwsUnavailable, subprocess.SubprocessError) as error:
+            raise AwsUnavailable('\n'.join([f'{region}: {error}', *failed_stack_events(target, name, started)])) from error
         stack = ledger.rows(target.call('describe-stacks', '--stack-name', name, service='cloudformation'), 'Stacks')[0]
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue') for row in ledger.rows(stack, 'Outputs')}
-        return {'region': region, 'image': image, 'subnets': subnets, 'template': outputs['GateLaunchTemplate'],
+        return {'region': region, 'image': network.image, 'subnets': network.subnets, 'template': outputs['GateLaunchTemplate'],
                 'version': outputs['GateLaunchVersion'], 'security_group': outputs['GateSecurityGroup'], 'stack': name}
 
     def prices(self) -> None:
@@ -1318,9 +1329,13 @@ class Deployment:
             partition = stack_id.split(':')[1]
             prefix = f'arn:{partition}:ec2:{settings.region}:{account}:'
             values = cloud_gate.settings()
+            # The home scaler policies cover every gate region, so the scaler user's policy count stays fixed.
+            networks = [self.regional_network(api, settings, region) for region in regions[1:]]
             parameters = {
                 'EnableGates': 'true', 'GateImage': settings.ami_id,
-                'GateSubnets': ','.join(prefix + 'subnet/' + ledger.text(row, 'id') for row in subnets),
+                'GateVpcs': ','.join([prefix + 'vpc/' + settings.vpc_id,
+                                      *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
+                'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
                 'GateInstanceTypes': ','.join(values.words('instance_types')),
                 'GateGpuInstanceTypes': ','.join(gpu_size_trial.settings().spot_max_usd_per_hour),
                 'GateRootGiB': str(values.whole('root_gib')),
@@ -1336,9 +1351,12 @@ class Deployment:
             book.record_inventory(ledger.ResourceInventory(int(self.clock()), resources + (
                 ledger.PricedResource('gate-shared', money(str(values.number('shared_usd_per_month')))),), 'gate deployment',
                 builder_removed=bool(inventory and inventory[-1].builder_removed)))
+            # A parameter that the template no longer has must not be passed again.
+            known = ledger.mapping(ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))['Parameters'])
             changes: list[dict[str, object]] = [
                 {'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
-                for row in ledger.rows(stack, 'Parameters') if ledger.text(row, 'ParameterKey') not in parameters]
+                for row in ledger.rows(stack, 'Parameters')
+                if ledger.text(row, 'ParameterKey') not in parameters and ledger.text(row, 'ParameterKey') in known]
             changes.extend({'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items())
             self.output.mkdir(parents=True, exist_ok=True)
             template = self.output / 'gate-template.json'
@@ -1356,8 +1374,8 @@ class Deployment:
             }
             cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             regional = list(ledger.rows(manifest, 'regions'))
-            for region in regions[1:]:
-                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, region))
+            for network in networks:
+                regional.append(self.regional_gate_stack(api, settings, outputs, parameters, network))
                 manifest['regions'] = regional
                 cloud_gate.save(self.directory / 'gate-deployment.json', manifest)
             print('cloud-gate: deployed')
@@ -1460,7 +1478,8 @@ class Deployment:
 def region_gate_template() -> dict[str, object]:
     """Reuse the home gate bodies without regional copies of global resources."""
     source = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
-    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateScalerPolicy', 'GateGpuTrialScalerPolicy', 'GateExpiryRole',
+    # No scaler policy: the scaler user may hold 10 managed policies, and the budget block needs one of them.
+    names = ('GateSecurityGroup', 'GateLaunchTemplate', 'GateExpiryRole',
              'GateExpiryFunction', 'GateExpiryLog', 'GateExpirySchedule', 'GateExpiryPermission')
     resources = ledger.mapping(source['Resources'])
     def rewrite(value: object) -> object:
@@ -1479,21 +1498,56 @@ def region_gate_template() -> dict[str, object]:
             return {key: rewrite(item) for key, item in row.items() if not (key == 'Condition' and item == 'Gates')}
         return value
     regional = {name: rewrite(resources[name]) for name in names}
-    actions = {'ec2:RunInstances', 'ec2:CreateTags', 'ec2:TerminateInstances', 'iam:PassRole'}
-    for name in ('GateScalerPolicy', 'GateGpuTrialScalerPolicy'):
-        policy = ledger.mapping(ledger.mapping(ledger.mapping(regional[name])['Properties'])['PolicyDocument'])
-        policy['Statement'] = [row for row in ledger.rows(policy, 'Statement') if set(cast(list[str], row['Action'])) & actions]
-    parameters = ledger.mapping(source['Parameters'])
-    needed = ('VpcId', 'DeploymentId', 'CostTagKey', 'CostTagValue', 'RootDeviceName', 'GateImage', 'GateSubnets',
-              'GateInstanceTypes', 'GateGpuInstanceTypes', 'GateRootGiB', 'GateSpotMaxPrice', 'GateExpiryMinutes', 'GateExpiryTimeout',
-              'GateExpiryMemory', 'GateLogDays')
-    definitions = {key: parameters[key] for key in needed}
-    definitions.update({key: {'Type': 'String'} for key in ('HomeGateProfileArn', 'HomeGateRoleArn', 'ScalerUserName')})
     outputs = {key: rewrite(value) for key, value in ledger.mapping(source['Outputs']).items()
                if key in ('GateLaunchTemplate', 'GateLaunchVersion', 'GateSecurityGroup')}
+    parameters = ledger.mapping(source['Parameters'])
+    used = referenced_names([regional, outputs, ledger.mapping(source['Conditions'])['GateEveryMinute']])
+    definitions: dict[str, object] = {key: parameters[key] for key in parameters if key in used}
+    definitions.update({key: {'Type': 'String'} for key in ('HomeGateProfileArn', 'HomeGateRoleArn', 'ScalerUserName') if key in used})
     return {'AWSTemplateFormatVersion': '2010-09-09', 'Parameters': definitions,
             'Conditions': {'GateEveryMinute': ledger.mapping(source['Conditions'])['GateEveryMinute']},
             'Resources': regional, 'Outputs': outputs}
+
+
+def referenced_names(value: object) -> set[str]:
+    """The names that Ref and Fn::Sub in a template part refer to."""
+    if isinstance(value, str):
+        return {found.group(1) for found in re.finditer(r'\$\{([A-Za-z0-9]+)', value)}
+    if isinstance(value, list):
+        return set[str]().union(*(referenced_names(item) for item in cast(list[object], value)))
+    if isinstance(value, dict):
+        row = ledger.mapping(cast(object, value))
+        reference = row.get('Ref')
+        names = {reference} if isinstance(reference, str) else set[str]()
+        return names.union(*(referenced_names(item) for item in row.values()))
+    return set[str]()
+
+
+def failed_stack_events(api: AwsCli, stack: str, started: float) -> list[str]:
+    """One line for each resource event of the stack that failed at or after started."""
+    try:
+        events = api.call('describe-stack-events', '--stack-name', stack, service='cloudformation')
+        lines: list[str] = []
+        for event in ledger.rows(events, 'StackEvents'):
+            stamp = datetime.fromisoformat(ledger.text(event, 'Timestamp').replace('Z', '+00:00')).timestamp()
+            status = ledger.text(event, 'ResourceStatus')
+            if stamp >= started and status.endswith('_FAILED'):
+                lines.append(f"{ledger.text(event, 'LogicalResourceId')} ({ledger.text(event, 'ResourceType')}): "
+                             + f"{status}: {event.get('ResourceStatusReason', '')}")
+        return lines
+    except (ValueError, AwsUnavailable, subprocess.SubprocessError):
+        return ['stack events are unavailable']
+
+
+def rolled_back_create(api: AwsCli, stack: str) -> bool:
+    """Whether the stack exists only as a failed first create."""
+    try:
+        stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack, service='cloudformation'), 'Stacks')
+    except AwsUnavailable as error:
+        if 'does not exist' in str(error):
+            return False
+        raise
+    return any(row.get('StackStatus') == 'ROLLBACK_COMPLETE' for row in stacks)
 
 
 def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:

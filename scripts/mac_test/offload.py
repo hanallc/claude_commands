@@ -77,6 +77,8 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+# The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
+MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
 
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
@@ -1779,6 +1781,10 @@ def escape_rsync_filter_path(path: str) -> str:
     return escaped
 
 
+# No trailing slash: a gate checkout's target is a symlink to the gate cache, not a folder.
+MIRROR_EXCLUDES = "/.git\n/target\n"
+
+
 def copy_tree(
     controller: ProcessController,
     config: OffloadConfig,
@@ -1798,7 +1804,7 @@ def copy_tree(
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n")
+                _ = exclude_file.write(MIRROR_EXCLUDES)
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
@@ -1924,10 +1930,16 @@ def remote_test_command(
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
+    # The Mac cargo gate passes a placed run; its folder stays ahead of the real cargo.
+    mac_placement = (
+        "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
+        if isinstance(request.placement, AssignedOffloadRequest) else ""
+    )
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
-        'PATH="$HOME/.cargo/bin:$PATH" '
+        f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
+        f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
         f"{repo_identity}"
@@ -2518,13 +2530,6 @@ def run_offload(
             write_version_decline(request.target, repository.name)
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
-    if not linux and isinstance(request.source, StagedDocSnapshot):
-        try:
-            if eligibility.has_linux_only(request.source.root, request.package,
-                              eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
-                return declined("linux_only", started)
-        except (OSError, UnicodeError, ValueError):
-            return declined("repo", started)
 
     try:
         with ExitStack() as admission_leases:

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from threading import Event
 import unittest
 from typing import ClassVar, TextIO, cast, override
@@ -322,6 +323,28 @@ class StandingTests(unittest.TestCase):
             self.assertFalse(second.exists())
             self.assertTrue(first.exists())
         self.assertFalse(first.exists())
+
+    def test_overlapping_gates_build_in_their_own_leased_caches(self) -> None:
+        cleanup = copies.GateCheckoutDirectory.cleanup
+        config_at_cleanup: list[bool] = []
+
+        def recorded_cleanup(directory: copies.GateCheckoutDirectory) -> None:
+            config_at_cleanup.append((Path(directory.name) / ".cargo" / "config.toml").exists())
+            cleanup(directory)
+
+        with mock.patch.object(copies.GateCheckoutDirectory, "cleanup", autospec=True, side_effect=recorded_cleanup):
+            with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")) as first:
+                with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")) as second:
+                    build_dirs: list[Path] = []
+                    for tree in (first, second):
+                        config = cast(dict[str, dict[str, str]],
+                                      tomllib.loads((tree.parent / ".cargo" / "config.toml").read_text()))
+                        build_dirs.append(Path(config["build"]["build-dir"]))
+                        self.assertEqual(build_dirs[-1], self.cache(tree) / "target")
+                        self.assertEqual((tree / "target").resolve(), build_dirs[-1])
+                        self.assertEqual(self.git(tree, "status", "--porcelain"), "")
+                    self.assertNotEqual(build_dirs[0], build_dirs[1])
+        self.assertEqual(config_at_cleanup, [False, False])
 
     def test_nested_manifest_and_uncommitted_root_manifest_keep_a_fresh_gate(self) -> None:
         _ = self.fresh_base()

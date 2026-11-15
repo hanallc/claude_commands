@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
-from scripts.buildlog.cli_probe_test_support import MeasuredCliRun, measure_cli_work
+from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
 from scripts.buildlog import disk, ci
 from scripts.buildlog import index
@@ -141,11 +141,11 @@ class ReportSpeedTests(unittest.TestCase):
                 full_rows = path.read_bytes().splitlines(keepends=True)
                 # Preserve the distribution of timestamps, kinds and Mac results.
                 quarter_rows = full_rows[:29_138:4] + full_rows[29_138:65_600:4] + full_rows[65_600:]
-                runs: list[list[MeasuredCliRun]] = []
-                for rows in (quarter_rows, full_rows):
-                    _ = path.write_bytes(b"".join(rows))
-                    _ = index.reindex()
-                    runs.append([measure_cli_work("report", environment, len(rows)) for _ in range(3)])
+                # The full index is current, so only the quarter rows need a new index.
+                full_runs = [measure_cli_work("report", environment, len(full_rows)) for _ in range(3)]
+                _ = path.write_bytes(b"".join(quarter_rows))
+                _ = index.reindex()
+                runs = [[measure_cli_work("report", environment, len(quarter_rows)) for _ in range(3)], full_runs]
                 for size, measurements in zip((len(quarter_rows), len(full_rows)), runs, strict=True):
                     for measured in measurements:
                         result = measured.result

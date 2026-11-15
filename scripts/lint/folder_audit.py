@@ -691,11 +691,15 @@ def clean_checkout_cargo_output(path: Path) -> None:
     known = list(index.workspaces) + list(index.history)
     for output in saved:
         for peer in output.other_checkouts:
-            if peer.is_relative_to(path) or not peer.exists():
+            # Cargo finds no workspace without a manifest in the checkout or a parent.
+            if (peer.is_relative_to(path) or not peer.exists()
+                    or not any((folder / "Cargo.toml").is_file() for folder in (peer, *peer.parents))):
                 continue
             mapping = cargo_output.read_cargo_output_roots(peer)
             if isinstance(mapping, cargo_output.CargoOutputUnavailable):
-                raise OSError(f"cannot read {peer}: {mapping.reason}")
+                # Cargo cannot build where it cannot read; the saved rows keep any earlier mapping.
+                print(f"skip unreadable checkout {peer}: {mapping.reason}", file=sys.stderr)
+                continue
             known.append(mapping)
     for output in saved:
         root = output.roots.build_directory
@@ -726,8 +730,26 @@ def clean_checkout_cargo_output(path: Path) -> None:
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
             shutil.rmtree(root)
+            remove_empty_mirror_parents(root, output.roots.workspace_root, path)
         finally:
             sweep.release(locked.held)
+
+
+def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None:
+    """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
+    tail = workspace.parts[1:]
+    if not tail or root.parts[-len(tail):] != tail:
+        return
+    top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
+    if path.is_relative_to(top):
+        return
+    folder = root.parent
+    while folder.is_relative_to(top):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
 
 
 def main(argv: list[str]) -> int:
@@ -737,7 +759,7 @@ def main(argv: list[str]) -> int:
             return 0
         except (OSError, ValueError) as error:
             print(f"Cargo output kept: {error}", file=sys.stderr)
-            return 1
+            return scratch.CARGO_OUTPUT_KEPT_STATUS
     lint_settings = conf.read("lint")
     scratch_settings = conf.read("scratch")
     parser = argparse.ArgumentParser(prog="folder_audit.py", description="Find loose folders, remove the idle ones "

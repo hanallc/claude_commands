@@ -141,24 +141,22 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
 
     def test_readonly_exports_reach_runner_without_shell_assignment(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
-        for name, value in (
-            ("SHELLOPTS", "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail"),
-            ("UID", str(os.getuid())),
-        ):
-            with self.subTest(name=name):
-                self.clear_observations()
-                passed = {name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
-                result = self.verify("test", "sample", "--mac", "why", "--env", name, extra=passed)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {**automatic_environment, name: value})
-                self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(self.local_runs(), [])
-                self.clear_observations()
-                control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
-                self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
-                self.assertEqual(len(self.runner_events()), 1)
-                self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
+        # Both names are read-only in bash; one run forwards both, and one control run forwards neither.
+        values = {"SHELLOPTS": "braceexpand:errexit:hashall:interactive-comments:nounset:pipefail",
+                  "UID": str(os.getuid())}
+        passed = {**values, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
+        self.clear_observations()
+        result = self.verify("test", "sample", "--mac", "why", "--env", "SHELLOPTS", "--env", "UID", extra=passed)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
+        self.assertEqual(observed, {**automatic_environment, **values})
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(self.local_runs(), [])
+        self.clear_observations()
+        control = self.verify("test", "sample", "--mac", "why", "--no-cache", extra=passed)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+        self.assertEqual(len(self.runner_events()), 1)
+        self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
 
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
         real_sleep = shutil.which("sleep")
@@ -229,15 +227,14 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
     def test_forwarded_environment_uses_callers_values_despite_shell_bindings(self) -> None:
         automatic_environment = self.isolate_automatic_environment()
         names = ("name", "PKG", "MAC_REASON", "ARGS")
-        for name in names:
-            with self.subTest(name=name):
-                self.clear_observations()
-                value = "original 'value'\nwith trailing newline\n"
-                result = self.verify("test", "sample", "--mac", "why", "--env", name, extra={
-                    name: value, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
-                self.assertEqual(observed, {**automatic_environment, name: value})
+        # Each name is a verify.sh shell binding; one run forwards all of them with a value of its own.
+        values = {name: f"original '{name}'\nwith trailing newline\n" for name in names}
+        self.clear_observations()
+        result = self.verify("test", "sample", "--mac", "why", *(word for name in names for word in ("--env", name)),
+                             extra={**values, "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = cast(dict[str, str], json.loads((self.runner_state / "forwarded-environment.json").read_text()))
+        self.assertEqual(observed, {**automatic_environment, **values})
         self.clear_observations()
         previous_calls = self.call_records()
         results = self.parser_results([("test", "sample", "--mac", "why", "--env", name) for name in names])
@@ -327,19 +324,36 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.cargo_events(), [])
         self.assertEqual(self.call_records(), [])
 
+    def refusal_texts(self, reasons: list[str]) -> dict[str, str]:
+        """Read the mac_only_refuse text of each reason in one shell process."""
+        output = self.root / "refusal-texts"
+        output.mkdir(exist_ok=True)
+        script = shell_functions(VERIFY, "mac_only_refuse") + "note_event() { :; }\nCMD=test PKG=sample\n" + "".join(
+            f"( mac_only_refuse {shlex.quote(reason)} ) 2>{shlex.quote(str(output / reason))}\n" for reason in reasons)
+        _ = subprocess.run(["bash", "-c", script], cwd=self.root, env=self.environment, check=False,
+                           timeout=TEST_HANG_GUARD_SECS)
+        return {reason: (output / reason).read_text() for reason in reasons}
+
     def test_runner_refusals_never_fall_back_or_retry(self) -> None:
         reasons = {
             "blocked": "the Mac is blocked (/build:status names the holder and when it lifts)",
             "unreachable": "the Mac cannot be reached (/build:status --probe)",
             "backoff": "the Mac was unreachable a short time ago (retry backoff)",
             "disk": "the Mac is below its free-space floor", "off": "Mac offload is off",
-            "repo": "this repository has no Mac setting", "linux_only": "sample is Linux only on the Mac",
+            "repo": "this repository has no Mac setting", "linux_only": "the step covers a package that is Linux only on the Mac",
             "state": "the Mac claim state cannot be read", "copy": "the tree copy to the Mac failed",
             "no_tests": "no test matched on the Mac", "lost": "the link to the Mac dropped during the run",
             "runner": "the Mac runner gave no usable result",
         }
+        texts = self.refusal_texts(list(reasons))
         for reason, text in reasons.items():
             with self.subTest(reason=reason):
+                self.assertEqual(texts[reason], f"verify.sh: test --mac refused: {text}; nothing ran on natedev.\n")
+        # After a refusal, only the printed text depends on the reason. One full run covers each runner
+        # mode and each placement.retry_decision class: no retry, an immediate retry and a delayed retry.
+        for reason in ("off", "blocked", "unreachable", "lost", "runner"):
+            text = reasons[reason]
+            with self.subTest(reason=reason, run="full"):
                 self.clear_observations()
                 mode = "lost" if reason == "lost" else "none" if reason == "runner" else "declined"
                 result = self.mac_result(extra={
@@ -435,7 +449,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 self.assertEqual(self.local_runs(), [])
 
     def test_missing_fetch_result_fails_pass_but_not_mac_failure(self) -> None:
-        for word in ("missing", "too_large", "failed", "not_run", "absent"):
+        # verify.sh prints a fetch word as the runner wrote it, so one written word and an absent word cover it.
+        for word in ("missing", "absent"):
             with self.subTest(word=word):
                 self.clear_observations()
                 result = self.mac_result(fetch="target/shots", extra={

@@ -281,6 +281,20 @@ class CopyTests(TmpSweepCase):
         self.assertEqual(events, ["guard"])
         self.assertFalse(checkout.exists())
 
+    def test_a_kept_cargo_output_keeps_its_folder_and_fails_nothing(self) -> None:
+        checkout = self.tmp / "kept-checkout"
+        checkout.mkdir(parents=True)
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        kept = scratch.CargoOutputKept("Cargo output kept: Cargo output is locked")
+        with (mock.patch.object(scratch, "clean_cargo_outputs", side_effect=kept),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertTrue(checkout.exists())
+        self.assertEqual(result.failed, [])
+        self.assertEqual(result.kept, {tmp_sweep.CARGO_OUTPUT_KEPT: [str(checkout)]})
+        self.assertIn(f"tmp sweep: keep {checkout}: Cargo output kept", output.getvalue())
+
     def test_private_root_never_selects_the_live_copies_authority(self) -> None:
         authority_root = self.tmp.parent / "authority copies"
         with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:

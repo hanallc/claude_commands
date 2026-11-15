@@ -1009,6 +1009,14 @@ class SavedCargoOutput:
         return any(self.roots.build_directory.is_relative_to(root) for root in self.shared_output_roots)
 
 
+# folder_audit.py --clean-cargo-output exits with this status when its guard keeps the output.
+CARGO_OUTPUT_KEPT_STATUS = 3
+
+
+class CargoOutputKept(OSError):
+    """The guard kept a checkout's Cargo output, so the checkout stays for a later sweep."""
+
+
 def cargo_removal_mark(path: Path) -> Path:
     return path.parent / f".scratch-cargo-{path.name}.json"
 
@@ -1098,6 +1106,8 @@ def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None
     result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
                              "--clean-cargo-output", str(path.resolve())],
                             capture_output=True, text=True, check=False)
+    if result.returncode == CARGO_OUTPUT_KEPT_STATUS:
+        raise CargoOutputKept(result.stderr.strip())
     if result.returncode:
         raise OSError(result.stderr.strip() or "Cargo output cleanup failed")
     if result.stderr:
