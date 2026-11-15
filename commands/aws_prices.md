@@ -16,8 +16,8 @@ A region without its own runs uses the type's time from other regions, and the r
 The next line names the cheapest merge gate.
 Then two tables show the refused requests and the launched boxes of each type and region.
 The last table shows billed hours / box hours with the gap, and `over` above `billed_hours_gap_max_ratio`.
-`buildlog hourly` refreshes the snapshot with `aws_target.py snapshot`.
-Empty cells say `no snapshot`, `read failed`, or `no offer`.
+`buildlog hourly` refreshes the snapshot with `aws_target.hourly`.
+Empty cells say `no snapshot`, `read failed`, or `not sold here`.
 Each failed region shows its saved AWS error and the failure time.
 Cached values remain visible with a failure label or an old age.
 A failed hourly snapshot sends one user notice for each failure streak.

@@ -397,6 +397,11 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
     return 0
 
 
+def hourly(settings_path: Path, directory: Path) -> int:
+    """Read the Spot prices, then check billed hours against gate box hours; buildlog hourly runs this."""
+    return max(snapshot(settings_path, directory), hours_gap_notices(settings_path, directory))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('command', choices=('tick', 'snapshot', 'serve', 'open-gates'))
@@ -408,7 +413,7 @@ def main() -> int:
         from scripts.aws_target.open_gates import report
         return report(args.directory, int(time.time()))
     if args.command == 'snapshot':
-        return max(snapshot(args.settings, args.directory), hours_gap_notices(args.settings, args.directory))
+        return hourly(args.settings, args.directory)
     if args.command == 'serve':
         return serve(args.settings, args.directory, args.hana_settings)
     return controller_tick(args.settings, args.directory, args.hana_settings)

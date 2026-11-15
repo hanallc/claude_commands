@@ -6,7 +6,7 @@ AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU s
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 The saved deployment record identifies the regions available for launch.
 Boxes boot the official NixOS image and fetch their tools at boot.
 GPU trial boxes then import the prepared GPU system and reboot.
@@ -404,7 +404,7 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The list contains `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
@@ -494,15 +494,17 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 European deployment needs account and policy changes before the regional stacks can start.
-Enable `eu-south-2` on the AWS Account page and wait until its status is `ENABLED`.
+Enable `eu-south-1` and `eu-south-2` on the AWS Account page and wait until each status is `ENABLED`.
 See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
-Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before deployment.
+Allow every region in `regions` and `spot_candidate_regions` in the `RegionFloor` statement of the Organizations policy `AdvancedModeRegionRestrictionSecurityControlPolicy` before deployment; the runbook names all 19.
+No other statement in that policy may deny EC2 in these regions.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
+`python3 scripts/aws_target/aws_target.py snapshot` runs the same two steps manually.
 No systemd unit change or NixOS rebuild is required.
 The old `aws-target.service` remains disabled.
 `aws_target.py tick` reads account charges only.
@@ -578,7 +580,7 @@ The snapshot does not change `controller.json`.
 It prints two price tables: the standard types, then the GPU types.
 Each has machine types as rows and candidate regions as columns.
 Each cell shows the lowest zone price in USD/h.
-An empty cell says `no snapshot`, `read failed`, or `no offer`.
+An empty cell says `no snapshot`, `read failed`, or `not sold here`.
 Cached prices and quotas remain visible after a read failure.
 Their price cells include `read failed`, and the regional detail gives the last good age.
 Old prices include `old <minutes> min` in their cells.
@@ -654,7 +656,8 @@ Days run from the window start day up to, but not including, the end day, like t
 `run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` table.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
-The hourly `aws_target.py snapshot` command checks the last `run_cost_days` days after its price read.
+`aws_target.hourly` checks the last `run_cost_days` days after its price read.
+`buildlog hourly` and `aws_target.py snapshot` both call it.
 It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
 Each type, region and day that is over sends one `aws.hours_gap` user notice.
 The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
@@ -736,7 +739,7 @@ Refusal handling, regional cost bookings, and the $35 daily and $400 monthly lim
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
-`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2` supplies the candidate regions for Spot work and price reads.
+`spot_candidate_regions` supplies the candidate regions for Spot work and price reads.
 `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
@@ -753,7 +756,9 @@ Credential refusals print their message once and stop the command with a nonzero
 AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
-The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
+A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
+`deploy.py quota-status` reads the same gate regions.
 It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 All three new keys are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.

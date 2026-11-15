@@ -58,14 +58,16 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The gate regions in `regions` are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1` and `eu-south-1`.
+The price reads in `spot_candidate_regions` add `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
 `us-east-2` is the home region for shared artifacts.
-Before European deployment:
+Before deployment:
 
-1. Enable `eu-south-2` on the AWS Account page.
-2. Confirm that its status is `ENABLED`.
-3. Add both European regions to the Organizations `RegionFloor` policy.
-4. Preserve the home and US region permissions.
+1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
+2. Confirm that each status is `ENABLED`.
+3. Allow all 19 regions in the `RegionFloor` statement of the Organizations policy `AdvancedModeRegionRestrictionSecurityControlPolicy`: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+4. Make sure that no other statement in that policy denies EC2 in one of these regions.
+5. Preserve the current region permissions.
 
 Use these commands at your terminal:
 
@@ -83,7 +85,7 @@ python3 scripts/aws_target/deploy.py spot-table
 
 The rows show configured Standard and GPU machine types.
 The columns show candidate regions and the lowest zone price in USD/h.
-A `-` means the snapshot has no offer for that type and region.
+A `not sold here` cell means AWS sells no Spot of that type in that region.
 Wide tables use separate groups of region columns.
 Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
 GPU types use the G and VT quota; other configured types use the Standard quota.
@@ -122,7 +124,8 @@ It prints no resource identities.
 
 `quota-request` requests Standard Spot quota in each configured gate region.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-It requests G and VT Spot quota in each candidate region.
+It requests G and VT Spot quota in each configured gate region.
+A region with only a price read gets no quota request.
 It uses `gpu_spot_quota_request_vcpus` from the same file.
 It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.

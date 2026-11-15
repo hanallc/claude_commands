@@ -181,7 +181,7 @@ def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], mi
     def cell(size: str, region: str) -> str:
         price = minimum.get((region, size))
         note = notes[region]
-        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or 'no offer'
+        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or 'not sold here'
 
     prices = {(row, column): minimum[region, size] for row, size in enumerate(sizes)
               for column, region in enumerate(regions, 1) if (region, size) in minimum}

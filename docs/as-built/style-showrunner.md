@@ -338,8 +338,9 @@ They make the finding wait when a needed file is busy.
 The ticket's gate accepts edits to these recorded need paths.
 
 A file rename (`file_rename`) includes its own file and its new file.
-It also includes Rust files where `module_site_reading` finds a module site for the old stem at either commit.
-`module_site_reading` shares the module-site scan of `renamed_text` (`_module_renames`) and keeps only a `ModuleSiteReading`.
+It also includes Rust files where `module_site_readings` finds a module site for the old stem at either commit.
+`module_site_readings` shares the module-site scan of `renamed_text` (`_module_renames`) and keeps only a `ModuleSiteReading`.
+It reads the tokens of a file once for all moves that the file declares.
 It builds no renamed code, so the footprint cache does not hold the canonical code of each file that declares the old stem.
 `Ledger.files_naming` finds the candidate references.
 The renamed file's own text counts.
@@ -391,6 +392,11 @@ The scan keeps the token check, plain words, item starts, inline modules, and mo
 A second call for the same finding reads no file text.
 `SplitEditedFiles` shares these scans while its `GitReadCache` supplies the blobs.
 `EditedFiles.module_readings` keeps file rename readings.
+`EditedFiles.prepare` takes the findings of one decision before the selection pass.
+It keeps the file moves of the findings that have no stored footprint.
+The first reading reads these moves together, so each declaring file is read once.
+The other moves' blobs do not become sources of the finding that started the reading.
+Each issue loop makes one reader at main (`edits_at_main`) for `checkpoint_selection` and `ticket_sync_wait`.
 For file renames, `of` and `uncertain` share the same readings.
 On cargo-liner, `a1a46e50` (`probe.rs`) names 96 other files.
 Under load 20, `of` takes about 1.2 seconds.

@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import urlsplit
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
+from scripts.lib import conf
 from scripts.review_links import change_page, console
 
 
@@ -50,18 +50,30 @@ class ConsoleTests(unittest.TestCase):
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         with (patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True),
               patch.object(aws_page, "page_url", return_value="/aws/aws_prices.html")):
-            url = console.publish()
-        parsed = urlsplit(url)
-        self.assertEqual(parsed.query, "page=changes")
-        folder = self.root / "snapshots" / parsed.path.split("/")[1]
+            source = console.render(console.read_pages(), console.read_rebuilds()).decode()
+        self.assertEqual(change_page.console_url(), f"http://127.0.0.1:{conf.read('review_links').whole('server_port')}/console/")
+        folder = self.root / "snapshots" / change_page.CONSOLE_FOLDER
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
-        self.assertTrue((folder / change_page.PAGE_NAME).is_file())
         markup = ConsoleMarkup()
-        source = (folder / console.PAGE_NAME).read_text()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["changes", "builds", "aws"])
+        self.assertEqual(markup.pages, ["aws", "builds", "changes", "images", "questions"])
         self.assertEqual(markup.sources, [])
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 6)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 10)
+        base = f"/{change_page.CONSOLE_FOLDER}"
+        changes = f"{base}/{change_page.PAGE_NAME}"
+        self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
+        self.assertIn(f'data-url="{changes}?type=questions" data-title="Questions"', source)
+        self.assertIn(f'data-rebuilds="{base}/{change_page.REBUILDS_NAME}"', source)
+        self.assertIn('aria-controls="rebuild-dialog" hidden>', source)
+        self.assertNotIn("<iframe", source)
+        self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+        self.assertIn("const placeKey = identity => 'at.' + identity;", source)
+        self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
+        self.assertIn("event.data !== 'console-place'", source)
+        self.assertIn("if (opened) frame.contentWindow.postMessage('console-shown', location.origin);", source)
+        self.assertIn('<dialog id="rebuild-dialog" aria-labelledby="rebuild-title">', source)
+        self.assertIn('class="lucide lucide-refresh-cw"', source)
+        self.assertIn('aria-label="Close"', source)
         self.assertIn("/builds/memory_live.html", source)
         self.assertIn("/aws/aws_prices.html", source)
         self.assertIn('class="lucide lucide-cloud"', source)
@@ -86,7 +98,7 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "memory_feed.conf").write_text(f"output_folder={folder}\n")
         pages = console.read_pages()
         self.assertEqual(pages[1].destination, console.AvailablePage("/builds/memory_live.html"))
-        self.assertIn('data-url="/builds/memory_live.html" data-title="Builds"', console.render(pages).decode())
+        self.assertIn('data-url="/builds/memory_live.html" data-title="Builds"', console.render(pages, console.UnavailablePage()).decode())
         self.assertEqual(page.read_text(), "<!doctype html><title>Builds</title><h1>Builds</h1>")
 
     def test_config_order_and_unavailable_pages_remain_visible(self) -> None:
@@ -95,13 +107,14 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["aws", "builds", "changes"])
-        self.assertIsInstance(pages[1].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[2].destination, console.AvailablePage)
+        self.assertEqual([page.identity for page in pages], ["questions", "images", "changes", "builds", "aws"])
+        self.assertIsInstance(pages[1].destination, console.AvailablePage)
+        self.assertIsInstance(pages[3].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
-        source = console.render(pages).decode()
+        source = console.render(pages, console.UnavailablePage()).decode()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["aws", "builds", "changes"])
+        self.assertEqual(markup.pages, ["questions", "images", "changes", "builds", "aws"])
+        self.assertIn('data-rebuilds=""', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
 
@@ -112,10 +125,10 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["changes", "builds", "aws"])
-        self.assertIsInstance(pages[0].destination, console.AvailablePage)
+        self.assertEqual([page.identity for page in pages], ["aws", "builds", "changes", "images", "questions"])
         self.assertIsInstance(pages[1].destination, console.UnavailablePage)
-        self.assertIn('aria-label="Builds — Not available"', console.render(pages).decode())
+        self.assertIsInstance(pages[2].destination, console.AvailablePage)
+        self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
         for path in ("https://example.invalid/page", "//example.invalid/page", "/../outside", "/%2e%2e/outside",

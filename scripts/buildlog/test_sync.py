@@ -383,7 +383,7 @@ class SyncTests(unittest.TestCase):
 
         folder = self.root / "aws"
         with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
-              mock.patch.object(aws_target, "snapshot", return_value=1) as read):
+              mock.patch.object(aws_target, "hourly", return_value=1) as read):
             self.assertEqual(cli.aws_snapshot(), 1)
         state.assert_called_once_with("aws")
         read.assert_called_once_with(conf.path("aws_target"), folder)
