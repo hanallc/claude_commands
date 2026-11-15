@@ -4073,3 +4073,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Each lock costs 0.9 ms CPU, not 5.8 ms. One perl path stays for Linux and the Mac.
 - AWS pair (3 rounds, median CPU s): 9 modules 228.02 -> 213.42; `test_verify_mac_only` 31.38 -> 27.88; `test_verify_ssh_targets_routing` 28.63 -> 25.83.
 - Commit 55ba55287. Production change (sdlc go 2026-11-15).
+
+### Phase 280 — The group signal source scan parses only files that name kill  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** `lib/test_process_group_sources` finds the same group signals with less CPU.
+
+**Spec:**
+- `unguarded_group_signals` in `scripts/lib/test_process_group.py` skips a file whose text, with line continuations joined, has no "kill". Each finding needs that word.
+- It walks each syntax tree once. It collects the `Name` nodes and matches them to the `killpg` import names after the walk.
+- It checks a string constant or a shell line only when the text has "kill".
+
+**Files:** `scripts/lib/test_process_group.py`.
+
+**Workers:** 1 writer; no split (one function). impl: `scripts/lib/test_process_group.py`. test opens as impl.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** `lib/test_process_group` and `lib/test_process_group_sources` pass; AWS pair shows a CPU saving.

@@ -118,29 +118,35 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                 continue
         relative = path.relative_to(scripts)
         source = path.read_text(encoding="utf-8")
+        # Each finding needs the word kill: a parse of each other file only costs time.
+        if "kill" not in source.replace("\\\n", ""):
+            continue
         lines: set[int] = set()
         if path.suffix == ".py" or (source.startswith("#!") and "python" in source.partition("\n")[0]):
             tree = ast.parse(source, filename=str(path))
             direct_names = {"killpg"}
+            names: list[ast.Name] = []
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     for alias in node.names:
                         if alias.name == "killpg":
                             direct_names.add(alias.asname or alias.name)
                             lines.add(node.lineno)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) and node.attr == "killpg":
+                elif isinstance(node, ast.Attribute) and node.attr == "killpg":
                     lines.add(node.lineno)
-                elif isinstance(node, ast.Name) and node.id in direct_names:
-                    lines.add(node.lineno)
+                elif isinstance(node, ast.Name):
+                    names.append(node)
                 elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    if any(shell_group_kills(line) or re.search(r"\.\s*killpg\s*\(", line)
-                           for line in node.value.replace("\\\n", "").splitlines()):
+                    text = node.value.replace("\\\n", "")
+                    if "kill" in text and any("kill" in line and (shell_group_kills(line)
+                                                                  or re.search(r"\.\s*killpg\s*\(", line))
+                                              for line in text.splitlines()):
                         lines.add(node.lineno)
+            lines.update(node.lineno for node in names if node.id in direct_names)
         else:
             for number, line in enumerate(source.replace("\\\n", "").splitlines(), 1):
-                if (re.search(r"(?:\.\s*|\b)killpg\s*\(|\bfrom\s+os\s+import\s+killpg\b", line)
-                        or shell_group_kills(line)):
+                if "kill" in line and (re.search(r"(?:\.\s*|\b)killpg\s*\(|\bfrom\s+os\s+import\s+killpg\b", line)
+                                       or shell_group_kills(line)):
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
