@@ -4242,3 +4242,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `VerifyTokenWaitFixture.write_wait_sleep` in `scripts/direct/verify_token_wait_test_support.py` makes the `sleep 3` stub pause a real 0.1 seconds; the memory poll sleep stays faked. A faked `sleep 3` let a `board.sh acquire --wait` loop spin at full CPU while a peer held the token.
 - AWS pair (3 rounds, 9 modules): token_reservation 15.55 -> 9.27 CPU s, about 9.2 CPU s less in total, all pass.
 - Commit 99927dcf3. Test-only change.
+### Phase 295 — The style ledger reads each repository tip once a process  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc gave no objection on 11-15).
+
+#### As-built
+
+- `scripts/style/style_ledger.py`: `_read_tip` (lru_cache 16) serves `Ledger._tip` and `GitReadCache.tip`, so one process builds each tip once; `_check_ref_format` keeps valid ref names. A production command is one process, so its git reads do not change.
+- `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
+- AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
+- Commit 232d9f01e. Production change.
