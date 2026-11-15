@@ -1203,6 +1203,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                write_cache_build_dir(tree, cache / "target")
                 path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
@@ -1215,6 +1216,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 if isinstance(cache_lease, GateLease):
                     caller_error = sys.exception()
                     try:
+                        cache_build_dir_config(tree).unlink(missing_ok=True)
                         refresh_remotes(tree, source)
                         mark_target(cache_lease.tree)
                         commit = commit_at(tree, "HEAD")
@@ -1226,6 +1228,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def cache_build_dir_config(tree: Path) -> Path:
+    """Cargo reads this file in the gate folder above the checkout, outside the repository."""
+    return tree.parent / ".cargo" / "config.toml"
+
+
+def write_cache_build_dir(tree: Path, build_dir: Path) -> None:
+    """Put the gate's Cargo intermediates in the leased cache, so each gate builds warm.
+    The lease holds the cache for one gate at a time, so two gates never share one build-dir.
+    The file overrides the user's global build-dir; a repository's own Cargo config still wins."""
+    config = cache_build_dir_config(tree)
+    config.parent.mkdir(exist_ok=True)
+    write_text_atomic(config, f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
 
 
 def manifest_path_files(tree: Path) -> set[str]:
