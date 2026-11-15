@@ -644,6 +644,28 @@ try {
               'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
             proof.capLine=capLine;
+            // The memory bar draws its cap marker and label at the cap value.
+            const barMark=await evaluate(`(() => {
+              const mark=document.querySelector('#barwrap #mark'), label=document.querySelector('#barwrap #marklabel');
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=mark?.getBoundingClientRect();
+              const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+              return {present:!!mark&&!mark.hidden&&getComputedStyle(mark).display!=='none'&&box.height>0,
+                label:label&&!label.hidden?label.textContent:'',left:box?box.left+7:null,middle:(bar.top+bar.bottom)/2,
+                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,
+                color:mark?getComputedStyle(mark,'::before').borderLeftColor:'',scrollY,
+                card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+            })()`);
+            assert.ok(barMark.present,'The memory bar has no cap marker.');
+            assert.equal(barMark.label,'cap '+capReading.cap.toFixed(1));
+            assert.ok(Math.abs(barMark.left-barMark.expected)<=1.5,'The memory bar cap marker is off the cap value. '+JSON.stringify(barMark));
+            const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{...barMark.card,scale:1}})).data,'base64');
+            const barPixel=pngPixels(barShot)(Math.floor(barMark.left-barMark.card.x),Math.floor(barMark.middle+barMark.scrollY-barMark.card.y));
+            const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
+            assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
+              'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
+            if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
+            proof.barMark=barMark;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
