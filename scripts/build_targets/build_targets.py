@@ -32,7 +32,7 @@ from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
-from scripts.build_queue.placement import ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
+from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
 
@@ -325,7 +325,7 @@ class NatedevOnly:
     reason: str
 
 
-def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
+def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
                       selection: TargetSelection = ROUTED, *, writes_tree: bool = False
                       ) -> AnyTarget | NatedevOnly:
     """Choose the run location for each step before target admission."""
@@ -343,7 +343,7 @@ def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
 
 
 def fixed_placement_constraints(
-    repo_root: Path, package: str, kind: StepKind, command: tuple[str, ...],
+    repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
     session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
     provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
@@ -397,7 +397,8 @@ def fixed_placement_constraints(
             candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
     source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
-        placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder())
+        placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
+        command_kind=kind)
 
 
 def command_constraints(args: CliArguments) -> int:

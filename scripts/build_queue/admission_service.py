@@ -2261,7 +2261,8 @@ class AdmissionServer:
         return placement.HostEvidenceKey(destination, request.constraints.session,
             request.constraints.command, digest.hexdigest(), request.constraints.repository,
             request.constraints.package, request.profile.step, settings,
-            request.owner if destination.provider == "local" else placement.NoLocalHoldOwner())
+            request.owner if destination.provider == "local" else placement.NoLocalHoldOwner(),
+            request.constraints.command_kind)
 
     def _host_probe_timeout(self, key: placement.HostEvidenceKey) -> float:
         from scripts.build_targets import target_config
@@ -2363,19 +2364,25 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
             target = replace(target, settings=key.settings.path)
-        kind = recorded_step_kind(request.profile.step)
-        if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
+        sent = request.constraints.command_kind
+        kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
+        eligibility: placement.HostEligibility
+        if kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget) and target.platform == "macos":
+            # A Mac run has no repository step policy. The busy check and the claims below still apply.
+            eligibility = placement.AllowedHost()
+        elif kind not in placement.STEP_COMMAND_KINDS:
             # The target can never run this command, so a pinned step refuses at once.
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
-        if isinstance(target, target_config.SshTarget):
-            answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
-                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                new_step=True, session=key.session)
         else:
-            answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
-                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
-        eligibility: placement.HostEligibility = (placement.TemporaryExclusion(answer.reason)
-            if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
+            if isinstance(target, target_config.SshTarget):
+                answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
+                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
+                    new_step=True, session=key.session)
+            else:
+                answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
+                    request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
+            eligibility = (placement.TemporaryExclusion(answer.reason)
+                if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
