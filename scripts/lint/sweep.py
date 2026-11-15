@@ -1059,9 +1059,9 @@ def copied_name(name: str) -> str:
     return (stem + dot + rest).replace("-", "_")
 
 
-def cargo_roots() -> list[str]:
-    """Read both output roots through the shared Cargo reader."""
-    result = read_cargo_output_roots(Path.cwd())
+def cargo_roots(cwd: str) -> list[str]:
+    """Read both output roots of the workspace at cwd through the shared Cargo reader."""
+    result = read_cargo_output_roots(Path(cwd))
     if isinstance(result, CargoOutputUnavailable):
         return []
     index = CargoOutputIndex((result,))
@@ -5128,9 +5128,16 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    # Read the working folder once: a gate can remove its checkout while this sweep runs in it.
+    try:
+        cwd = os.getcwd()
+    except FileNotFoundError:
+        print("lint sweep: the working folder was removed; workspace sweep skipped")
+        return 0
+    repo = repo_name(cwd)
     token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        roots = (cargo_roots() if target_dir is None else
+        roots = (cargo_roots(cwd) if target_dir is None else
                  [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else [])
         def assess() -> tmp_sweep.SweepAssessment:
             if not dry_run and target_dir is None:
@@ -5141,14 +5148,14 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                         Path(root, USE_STAMP).touch()
                     except OSError:
                         pass
-            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, lint_settings=lint_settings)
+            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings)
         return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
     finally:
         OUTPUT_ROOTS.reset(token)
 
 
 def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
-                    recent_minutes: float, *,
+                    recent_minutes: float, repo: str | None, *,
                     lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
     """Sweep the resolved output roots to their budget."""
     from scripts.lint import tmp_sweep
@@ -5156,7 +5163,7 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
     if not roots:
         print("lint sweep: no target directory to sweep")
         return tmp_sweep.SkippedSweepAssessment()
-    budget, source = budget_bytes(dict(os.environ), budget_config, repo_name(os.getcwd()))
+    budget, source = budget_bytes(dict(os.environ), budget_config, repo)
     if budget is None:
         print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
         return tmp_sweep.CompletedSweepAssessment(2)
