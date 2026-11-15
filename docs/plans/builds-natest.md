@@ -4210,3 +4210,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_launch_settings_match_shell_role_resolution_and_tier_precedence` in `scripts/lib/test_models_registry.py` checks `direct` (`impl`, `review`), `design_roles` (`designer`), `producers` (`morty`) and `producer_only`, for both families and all five tiers. Neither resolver has a branch for one key name.
 - AWS pair (3 rounds): 11.20 -> 6.09 CPU s, all pass.
 - Commit 3a8806fd6. Test-only change.
+
+### Phase 292 — The agent launcher and copy import tests drop repeated launches  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** `scripts/agents/test_agent_exec.sh` and `scripts/lib/test_py_root.py` start fewer launches, with the same checks of behavior.
+
+**Spec:**
+- In `test_agent_exec.sh`, the failed-extraction loop keeps one case for each task (`claude_case.task` exit 0, `direct.simplify` exit 7). `agents_exec_main` keeps the Claude exit the same way for each task.
+- The print-error loop runs one error event for each task. Both tasks take the same print path, and `test_claude_result.py` checks each event shape.
+- The codex readonly dry run also carries the extra arguments, and the simplify readonly dry run also carries the session id. The separate extra-arguments and session-id dry runs go.
+- In `test_copy_imports_stay_in_the_copy`, the other copy has regular packages only. Two mutation sets on `sitecustomize.py` (11 breaks) found no break that the namespace copy catches and the regular copy misses.
+
+**Files:** `scripts/agents/test_agent_exec.sh`, `scripts/lib/test_py_root.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). Each change is in one file.
+
+**Constraints from prior phases:** Phases 287-291 cut repeated heavy runs in the same way.
+
+**Acceptance gate:** both modules pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) for each module passes with the same test count and less CPU.
