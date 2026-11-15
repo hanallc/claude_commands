@@ -1192,7 +1192,8 @@ function fitWalkDetails() {
     root.style.setProperty("--table-label", `${Math.max(0, (walk.clientWidth - fixedWidth - padding) / 2)}px`);
   }
   if (beside) {
-    const range = $("barwrap").getBoundingClientRect();
+    // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
+    const range = track.getBoundingClientRect();
     const tableLeft = !hasCap(latest)
       ? walk.getBoundingClientRect().right - naturalWidth
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
@@ -1213,7 +1214,9 @@ function fitWalkDetails() {
 }
 
 function placeMemoryBars(d) {
-  const range = $("barwrap").getBoundingClientRect();
+  const track = $("walk").querySelector(".track");
+  if (!track) return;
+  const range = track.getBoundingClientRect();
   const width = range.width;
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const r = d.ram;

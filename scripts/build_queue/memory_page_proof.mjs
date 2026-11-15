@@ -449,12 +449,17 @@ try {
               unit.dispatchEvent(new Event('change'));
             })()`);
 
-            for(const [name,detail] of [
-              ['cloud_stage','tools ready'],
-              ['cloud_region','tests start · eu-south-2, zone a'],
-              ['cloud_zone','eu-south-2, zone us-east-1b'],
-              ['cloud_empty','']]) {
-              await show(readings[name]);
+            // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
+            const disagreeReading=structuredClone(readings.cloud_region);
+            disagreeReading.ram.agreement='disagree';
+            const detailLayouts={};
+            for(const [name,detail,reading] of [
+              ['cloud_stage','tools ready',readings.cloud_stage],
+              ['cloud_region','tests start · eu-south-2, zone a',readings.cloud_region],
+              ['cloud_region_disagree','tests start · eu-south-2, zone a',disagreeReading],
+              ['cloud_zone','eu-south-2, zone us-east-1b',readings.cloud_zone],
+              ['cloud_empty','',readings.cloud_empty]]) {
+              await show(reading);
               const detailProof=await evaluate(`(() => {
                 const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
                 const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
@@ -464,7 +469,11 @@ try {
                   rootFont:getComputedStyle(document.documentElement).fontSize,
                   beside:document.querySelector('#walk').classList.contains('beside'),
                   detailRight:amounts.getBoundingClientRect().right,
+                  detailWidth:amounts.getBoundingClientRect().width,
                   tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  barHidden:document.querySelector('#barwrap').hidden,
+                  bars:[...document.querySelectorAll('#walk .track .b')].map(bar=>{
+                    const rect=bar.getBoundingClientRect();return [Math.round(rect.left),Math.round(rect.width)];}),
                   chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
@@ -476,13 +485,21 @@ try {
                 'The AWS detail text crosses into the table.');
               assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
               assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
-              if(name==='cloud_region' && process.env.MEMORY_PAGE_SHOT) {
+              detailLayouts[name]=detailProof;
+              if(name==='cloud_region_disagree') {
+                const agree=detailLayouts.cloud_region;
+                assert.ok(detailProof.barHidden && !agree.barHidden,'The disagree reading does not hide the memory bar.');
+                for(const key of ['beside','tableLeft','detailWidth','chartHeight'])
+                  assert.equal(detailProof[key],agree[key],'The hidden memory bar changes the Running chart '+key+'.');
+                assert.deepEqual(detailProof.bars,agree.bars,'The hidden memory bar changes the Running chart bars.');
+              }
+              if(name.startsWith('cloud_region') && process.env.MEMORY_PAGE_SHOT) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
                 })()`);
                 const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,`${theme}-${width}-aws.png`),Buffer.from(shot.data,'base64'));
+                await writeFile(join(folder,`${theme}-${width}-${name==='cloud_region'?'aws':'aws-disagree'}.png`),Buffer.from(shot.data,'base64'));
               }
             }
 
