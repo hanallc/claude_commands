@@ -939,6 +939,15 @@ def _place_key(owner: wire.Owner, since: float) -> str:
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
 
 
+def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
+    """A new estimate for the same episode keeps its connection, so the waiter keeps its place."""
+    same_kind = ((isinstance(first, wire.AdmitRequest) and isinstance(request, wire.AdmitRequest))
+                 or (isinstance(first, wire.LaunchRequest) and isinstance(request, wire.LaunchRequest)))
+    return (same_kind and isinstance(first, (wire.AdmitRequest, wire.LaunchRequest))
+            and isinstance(request, (wire.AdmitRequest, wire.LaunchRequest))
+            and (request.episode, request.owner, request.since) == (first.episode, first.owner, first.since))
+
+
 def _notify(message: str) -> None:
     address = os.environ.get("NOTIFY_SOCKET", "")
     if address:
@@ -3578,7 +3587,7 @@ done
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
                     raise ValueError(reason)
                 if not isinstance(request, wire.BuildHistoryRequest):
-                    if not isinstance(connection.request, NoRequest):
+                    if not (isinstance(connection.request, NoRequest) or _refreshes(connection.request, request)):
                         raise ValueError("one request for admission per connection")
                     connection.request = request
                 connection.received = b""

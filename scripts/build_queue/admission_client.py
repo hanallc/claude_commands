@@ -459,6 +459,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     failure_limit = _whole_seconds("BUILDLOG_MEM_CHECK_RETRY_S", 60)
     had_wait = False
     refresh_pending = False
+    answered_expiry = -math.inf
     failed_since: float | None = None  # An external transport/checker boundary, not stored domain state.
     restarted = False
     last_valid = CLOCK.monotonic()
@@ -572,6 +573,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         raise CheckerFailure("invalid admission answer")
                     from scripts.build_queue import admission_records as records
                     cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
+                    if isinstance(cause, records.EstimateExpired) and cause.estimated_at <= answered_expiry:
+                        # A pass can reach this connection before the service reads the refreshed request.
+                        continue
                     if isinstance(cause, records.ReadingUnavailable):
                         raise CheckerFailure(cause.reason)
                     if launch and retry.launch_without_wait:
@@ -590,16 +594,20 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if isinstance(cause, records.EstimateExpired):
                         if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
                             raise CheckerFailure("estimate cannot be refreshed")
+                        estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
                         refresh_pending = True
+                        answered_expiry = cause.estimated_at
                         try:
-                            request = replace(_refreshed(first, refresh, channel=EstimateConnection(connection, pending)),
+                            request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
                                               code_version=LOADED_ADMISSION_CODE_VERSION)
                             refresh_pending = False
                         except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
                             raise
                         except Exception as error:
                             raise CheckerFailure(str(error)) from error
-                        break
+                        # A new connection would end this waiter's place, and a pass could start a later step in the gap.
+                        connection.sendall(wire.encode_request(request).encode())
+                        continue
         except CheckerFailure as error:
             if generation_query:
                 return wire.Refused(str(error) or "checker returned an error")
