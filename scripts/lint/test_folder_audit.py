@@ -207,6 +207,60 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse(cache.exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
+    def test_gate_folder_cleanup_removes_its_build_dir_and_the_empty_mirror_folders(self) -> None:
+        session = self.root / "session"
+        session.mkdir()
+        gate = copies.GateCheckoutDirectory(prefix="queue-gate-", dir=session)
+        checkout = Path(gate.name).resolve() / "checkout"
+        (checkout / ".git").mkdir(parents=True)
+        _ = (checkout / "Cargo.toml").write_text("[workspace]\n")
+        mirror = self.root / "paths"
+        build_dir = mirror.joinpath(*checkout.parts[1:])
+        build_dir.mkdir(parents=True)
+        (checkout.parent / ".cargo").mkdir()
+        _ = (checkout.parent / ".cargo" / "config.toml").write_text(f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
+        _ = (build_dir / "output").write_text("build output")
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", build_dir)
+        _ = self.enterContext(unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots))
+        _ = self.enterContext(unittest.mock.patch.object(scratch, "cargo_checkout_peers", return_value=()))
+        _ = self.enterContext(unittest.mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])))
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "cargo-state")}))
+        index = sweep.cargo_output_cache_path()
+        index.parent.mkdir()
+        _ = index.write_text(json.dumps([{"workspace_root": str(checkout), "target_directory": str(checkout / "target"),
+                                          "build_directory": str(build_dir)}]))
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(saved[0].roots.build_directory, build_dir)
+            folder_audit.clean_checkout_cargo_output(path)
+        with unittest.mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
+            gate.cleanup()
+        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(build_dir.exists())
+        self.assertFalse(build_dir.parent.exists())
+        self.assertEqual(list(build_dir.parent.parent.iterdir()), [])
+        self.assertFalse(scratch.cargo_removal_mark(checkout.parent).exists())
+
+    def test_gate_folder_cleanup_without_an_outside_build_dir_starts_no_cargo(self) -> None:
+        cargo_home = self.root / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{cargo-cache-home}/../paths{workspace-root}"\n')
+        self.enterContext(unittest.mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home)}))
+        for manifest in ("[workspace]\n", ""):
+            with self.subTest(manifest=manifest):
+                gate = copies.GateCheckoutDirectory(prefix="queue-gate-", dir=self.root)
+                checkout = Path(gate.name) / "checkout"
+                (checkout / ".git").mkdir(parents=True)
+                (checkout / "target").mkdir()
+                if manifest:
+                    _ = (checkout / "Cargo.toml").write_text(manifest)
+                stderr = io.StringIO()
+                with (unittest.mock.patch.object(cargo_output, "read_cargo_output_roots",
+                                                 side_effect=AssertionError("cargo metadata started")),
+                      redirect_stderr(stderr)):
+                    gate.cleanup()
+                self.assertFalse(checkout.parent.exists())
+                self.assertEqual(stderr.getvalue(), "")
+
     def test_shared_symlink_output_survives_a_different_cargo_target_setting(self) -> None:
         checkout, cache = self.cargo_checkout()
         (checkout / "target").symlink_to(cache, target_is_directory=True)

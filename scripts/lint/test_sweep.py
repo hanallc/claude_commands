@@ -2766,7 +2766,7 @@ class FloorTests(SweepCase):
                             if placeholder == "workspace-path-hash" else "{" + placeholder + "}/shared/target")
                 self.running_nextest(base, template, process_uses)
                 if placeholder == "workspace-path-hash":
-                    folder = base / "cargo-home" / "build" / sweep.cargo_workspace_path_hash(base / "workspace" / "Cargo.toml")
+                    folder = base / "cargo-home" / "build" / cargo_target_config.cargo_workspace_path_hash(base / "workspace" / "Cargo.toml")
                 else:
                     folder = base / ("cargo-home" if placeholder == "cargo-cache-home" else "workspace")
                 output = cargo_target(folder, "shared", APP, time.time() - 2 * DAY)[1]
@@ -2787,7 +2787,7 @@ class FloorTests(SweepCase):
         # https://github.com/rust-lang/cargo/blob/master/src/context/mod.rs#L734-L762
         # https://github.com/rust-lang/rust/blob/master/library/std/src/path.rs#L3584-L3631
         # https://github.com/rust-lang/rustc-stable-hash/tree/v0.1.2/src
-        self.assertEqual(sweep.cargo_workspace_path_hash(Path("/workspaces/sample/Cargo.toml")),
+        self.assertEqual(cargo_target_config.cargo_workspace_path_hash(Path("/workspaces/sample/Cargo.toml")),
                          "f6/cfca1227ebe898")
 
     def test_unknown_build_folder_template_keeps_the_whole_cargo_cache(self) -> None:
