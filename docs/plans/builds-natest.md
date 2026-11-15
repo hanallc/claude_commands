@@ -4320,3 +4320,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The `StandingTests` fixture (`test_copies.py`) and the `StyleSyncTests` fixture (`test_style_sync.py`) give their children a TMPDIR inside the test folder. The two kill tests assert that the killed owner's checkout is inside the test folder.
 - The free leftovers are deleted.
 - Commit 0a92e8ed5. Test-only change.
+
+### Phase 302 — verify.sh records waits and activity inside its helper process  · status: done
+**Depends on:** Phase 297
+**Owner:** natest (production change; the diff goes to sdlc).
+
+#### As-built
+
+- Each progress_history recorder call from verify.sh was a new Python start, about 150 ms, for about 19 ms of work.
+- verify.sh sends its 7 recorder calls (start-wait, wait-holder, 3 finish-wait, start-activity, finish-activity) through `verify_helper`, which runs progress_history main in its process. With no helper, `verify_helper` falls back to `"$PY"`.
+- The test_verify_wait_holder drivers that extract the wait functions also extract `verify_helper`; they start no helper, so their recorder observers see each call.
+- AWS pair, 9 wait-recording modules: about 9.7 CPU s less (wait_holder 6.65).
+- Commit 966a0f225. Production change; the diff went to sdlc.
