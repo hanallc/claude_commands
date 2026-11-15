@@ -95,18 +95,28 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A matching phase label at the start of the title appears once, regardless of case or dash.
    The phase instance in the selected run supplies the open step.
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-   A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
+   Work sent after the instance's last phase, pass, or activity start replaces the step with a merge wait.
    The wait uses plain words (user, 2026-11-15: a human must understand it).
-   It is ` · done, merging now` while a merge run that holds the checkpoint commit runs now.
+   It is ` · done, merging now` while the sent commit merges.
    In the merge line (`land_queue.py list`) it is ` · done, waits to merge, 2nd in line`; 1st merges next.
-   A checkpoint that a later checkpoint in the line holds says ` · done, waits to merge with <unit> <phase>, 2nd in line`.
+   A commit carried by another merge item says ` · done, waits to merge with <unit> <phase>, 2nd in line`.
    A failed earlier try adds `; last try failed at red 11:20: <first detail line>`.
    Out of the line it is the last merge result: `done, merged 11:20` or `done, did not merge: held at ancestry 11:20: <detail>`.
    With no result, it is ` · done, not sent to merge yet`.
    Before any runner uses the line, it is ` · done, waits to merge`.
-   The unit's first row also names each sent checkpoint with no phase row of its own, from the merge line and the merge results:
-   ` · merging now: <phase>`, ` · done, waits to merge: shot-rule (1st in line), a + b (2nd in line)`, or ` · <phase> did not merge: merge conflict in <files> 13:58`.
-   Phases in one merge line item share one entry. A failed merge whose commit is on main later is not shown.
+   The unit's first row names each merge group once, separated by ` · `.
+   Phases that merge now form one group: `merging now: a, b`.
+   Each merge line item forms one group, including open phases whose commits that item carries.
+   A shared item shows `3 phases done, merge together, 2nd in line: workers-why, checkpoint-wait, land-line`.
+   A single phase without its own open row shows `land-line done, waits to merge, 1st in line`.
+   Groups follow merge line order after the group that merges now.
+   Phases within a group follow open row order, then the order of other phases in the merge line.
+   Open rows in groups of two or more phases show only `done` in place of their merge wait.
+   A single phase with its own open row keeps its merge wait there and adds no group text to the first row.
+   Merged, failed, and not-sent states keep their text on their own rows.
+   A failed result without an open row still appends `<phase> did not merge: merge conflict in <files> 13:58`.
+   A failed merge whose commit is on main later is not shown.
+   Merge grouping preserves the summary counts and uses the existing reads.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    A unit without open work shows `nothing open: <plan reason>, <queue reason>`.

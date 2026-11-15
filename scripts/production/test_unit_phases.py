@@ -33,6 +33,7 @@ from scripts.lib.terminal_cells import terminal_width
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
+from scripts.production import waits_on
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
 from scripts.production.production_doc import read_production
@@ -1173,6 +1174,90 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertNotIn("Side review", rendered)
                 self.assertNotIn("side-worker", rendered)
                 self.assertNotIn("Phase 10 —", rendered)
+
+        repository = self.root / "merge-repo"
+        repository.mkdir()
+        self.enterContext(patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)), "GIT_CONFIG_NOSYSTEM": "1"}))
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(repository)], check=True, capture_output=True)
+        base = commit_repository(repository, "Base", allow_empty=True)
+        _ = subprocess.run(["git", "-C", str(repository), "update-ref", "refs/remotes/origin/main", base],
+                           check=True, capture_output=True)
+        repair_commit = commit_repository(repository, "Repair delivery", allow_empty=True)
+        verify_commit = commit_repository(repository, "Verify delivery", allow_empty=True)
+        carrier_commit = commit_repository(repository, "Merge route", allow_empty=True)
+        _ = self.enterContext(patch.object(unit_phases, "REPOSITORY", repository))
+        batch = self.root / "merge-batch"
+        _ = batch.write_text(f"parallel 10 {verify_commit}\nparallel 8 {repair_commit}\nparallel merge-route {carrier_commit}\n")
+        grouped_line = "3 phases done, merge together, 2nd in line: 8, 10, merge-route"
+        merge_cases = (
+            ("carried line", True, True, grouped_line, "done", "done", 0, 3, 0, 2),
+            ("direct line", True, True, grouped_line, "done", "done", 0, 3, 0, 4),
+            ("single first row", True, False, "", "done, waits to merge, 1st in line", "", 1, 1, 0, 1),
+            ("single later row", False, True, "", "", "done, waits to merge, 1st in line", 1, 1, 0, 1),
+            ("carried running", True, True, "merging now: 8, 10, merge-route", "done", "done", 0, 3, 0, 1),
+            ("direct running", True, True, "merging now: 8, 10", "done", "done", 0, 2, 0, 2),
+            ("not sent", True, False, "", "done, not sent to merge yet", "", 1, 1, 0, 0),
+            ("merged and failed", True, True, "other did not merge: failed at test 02:59: review failed",
+             "done, merged 02:59", "done, did not merge: failed at test 02:59: review failed", 0, 2, 1, 1),
+        )
+        for (name, repair_sent, verify_sent, group_text, repair_text, verify_text,
+             in_work, waiting, merged, git_calls) in merge_cases:
+            with self.subTest(merge=name):
+                selected_events = [dict(selected) for selected in events[:5]]
+                for sent, phase_id, instance, commit in ((repair_sent, "8", "eight", repair_commit),
+                                                         (verify_sent, "10", "ten", verify_commit)):
+                    if sent:
+                        selected_events.append({"event_type": "checkpoint", "phase_id": phase_id,
+                            "phase_instance_id": instance, "checkpoint_commit": commit, "timestamp_epoch": now - 60})
+                _ = path.write_text("\n".join(map(json.dumps, selected_events)) + "\n")
+                with land_queue.edited() as items:
+                    items.clear()
+                if name in ("carried line", "direct line"):
+                    land_queue.add("other first", batch="", commits=[base], first=False, before=None)
+                    land_queue.add("parallel merge-route", batch=str(batch) if name == "direct line" else "",
+                                   commits=[] if name == "direct line" else [carrier_commit], first=False, before=None)
+                elif name in ("single first row", "single later row"):
+                    phase_id, commit = ("8", repair_commit) if repair_sent else ("10", verify_commit)
+                    land_queue.add(f"parallel {phase_id}", batch="", commits=[commit], first=False, before=None)
+                results: list[land_runs.LandResult] = []
+                if name == "merged and failed":
+                    result: land_runs.LandResult = {"commit": repair_commit, "production": "show", "unit": "parallel",
+                        "phase": "8", "landed": True, "step": "test", "state": "failed", "detail": "review failed",
+                        "time": datetime.fromtimestamp(now - 60, UTC).isoformat()}
+                    results = [result, {**result, "commit": verify_commit, "phase": "10", "landed": False},
+                               {**result, "commit": carrier_commit, "phase": "other", "landed": False}]
+                _ = land_runs.results_path().write_text("\n".join(map(json.dumps, results)) + "\n")
+                running_commits, running_owners = ([], [])
+                if name == "carried running":
+                    running_commits, running_owners = [carrier_commit], ["parallel merge-route"]
+                elif name == "direct running":
+                    running_commits, running_owners = [verify_commit, repair_commit], ["parallel 10", "parallel 8"]
+                with patch.object(plan_history, "now_epoch", return_value=now):
+                    record = phase_table.build_plan(plan)
+                with (land_runs.landing(running_commits, running_owners),
+                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                      patch.object(land_queue, "land_view", wraps=land_queue.land_view) as merge_reads,
+                      patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queue_reads,
+                      patch.object(waits_on, "git", wraps=waits_on.git) as git_reads):
+                    rendered = unit_phases.table([unit("parallel", None)], {"parallel": record},
+                        now=now, zone=ZoneInfo("UTC"), census_read=LOCAL, columns=1000)
+                self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+                self.assertEqual(merge_reads.call_count, 1)
+                self.assertEqual(queue_reads.call_count, 1)
+                self.assertEqual(git_reads.call_count, git_calls)
+                self.assertEqual(rendered.splitlines()[0],
+                    f"in work {in_work} · waiting to merge {waiting} · waiting on other work 0 · merged today {merged}")
+                work_lines = rendered.split("\n\n")[-1].splitlines()
+                work_headers = [cell.strip() for cell in work_lines[0].split("|")[1:-1]]
+                work_rows = [dict(zip(work_headers, (cell.strip() for cell in line.split("|")[1:-1]), strict=True))
+                             for line in work_lines[2:]]
+                expected_notes = ["phase 8 — Repair delivery" + (f" · {repair_text}" if repair_text else "")
+                                  + (f" · {group_text}" if group_text else ""),
+                                  "phase 10 — Verify delivery" + (f" · {verify_text}" if verify_text else "")]
+                self.assertEqual([row["Notes"] for row in work_rows], expected_notes)
+                if group_text:
+                    self.assertEqual(rendered.count(group_text), 1)
 
     def test_table_shows_census_workers_with_their_runs(self) -> None:
         owner = fixture_member("showrunner", name="workers-owner")

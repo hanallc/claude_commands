@@ -816,7 +816,9 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching phase label at the start of the title appears once, regardless of case or dash.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-    `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
+    `unit_phases.phase_sent_work` finds work sent after the instance's last phase, pass, or activity start.
+    It returns `SentCommit`, `SentCommitUnrecorded`, or `NoSentWork`.
+    `checkpoint_wait` uses that state to show a merge wait in place of the step.
     `table` reads one `land_queue.LandView` (`land_queue.land_view()`): the running land commits, the land line places, and the newest land results.
     `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
     A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
@@ -827,9 +829,20 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Else the newest result shows: `merged <time>`, or `did not merge: <state> at <step> <time>: <first detail line>`.
     Else it is `not sent to merge yet`. With no line file, it stays `waits to merge`.
     `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits, and the `unit phase` owner of each) while it holds the merge lock, and removes it at exit.
-    `unit_phases.unit_lands` adds to the unit's first Notes row each sent checkpoint that has no open phase row: `merging now: <phases>`,
-    `done, waits to merge: <phase> (1st in line), <phase> + <phase> (2nd in line)` with one entry for each line item,
-    and `<phase> did not merge: <result>` for a newest failed result whose commit is not on `origin/main` (sdlc C1701).
+    `unit_phases.unit_lands` groups sent work from the unit's merge owners and its open phases' sent commits.
+    Direct and carried commits join their merge item's numbered group.
+    Direct and carried commits that merge now join one running group.
+    Open phases follow board order inside each group; other phases follow merge line order.
+    `UnitMergeNotes` returns the first-row text and the open phases whose rows show only `done`.
+    The first row shows `merging now: a, b`, followed by merge line groups in line order, separated by ` · `.
+    A shared item shows `3 phases done, merge together, 2nd in line: workers-why, checkpoint-wait, land-line`.
+    A single phase without an open row shows `land-line done, waits to merge, 1st in line`.
+    A single phase with an open row keeps its merge wait there; the first row does not repeat it.
+    Open rows in groups of two or more phases replace their merge wait with `done`.
+    Merged, failed, and not-sent states keep their text on their own rows.
+    Failed results without open rows still append `<phase> did not merge: <result>` when the commit is absent from `origin/main`.
+    Grouping uses the existing `LandView` and run events; it adds no file reads or Git calls.
+    The summary still counts phase owners, not merge groups.
     A merge conflict result says `merge conflict in <files> <time>`.
     A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
     `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).

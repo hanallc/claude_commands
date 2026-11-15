@@ -473,35 +473,75 @@ def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo, unit: 
             return "waits to merge"
 
 
-def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
-                    now: float, zone: ZoneInfo, unit: str = "") -> str | None:
-    """Say where the checkpoint sent after the phase instance's last start of work is on its way to main."""
+class SentCommit(NamedTuple):
+    """The commit sent after the phase's last work start."""
+
+    commit: str
+
+
+class SentCommitUnrecorded(NamedTuple):
+    """The phase sent work without a recorded commit."""
+
+
+class NoSentWork(NamedTuple):
+    """The phase has no sent work after its last work start."""
+
+
+PhaseSentWork = SentCommit | SentCommitUnrecorded | NoSentWork
+
+
+def phase_sent_work(events: list[dict[str, object]]) -> PhaseSentWork:
+    """Find the sent commit after the phase's last work start."""
     for event in reversed(events):
         kind = event.get("event_type")
         if kind == "checkpoint":
             commit = event.get("checkpoint_commit")
-            state = land_queue.land_state(land, commit) if isinstance(commit, str) and commit else land_queue.LineUnused()
-            return f"done, {land_text(state, now=now, zone=zone, unit=unit)}"
+            return SentCommit(commit) if isinstance(commit, str) and commit else SentCommitUnrecorded()
         if kind in WORK_STARTS:
-            return None
-    return None
+            return NoSentWork()
+    return NoSentWork()
 
 
-def unit_lands(unit: str, land: land_queue.LandView, *, skip: Sequence[str], now: float, zone: ZoneInfo,
-               on_main: Callable[[str], bool]) -> str:
-    """Say where each of the unit's sent checkpoints is on its way to main, from the lands, the line and the results.
+def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
+                    now: float, zone: ZoneInfo, unit: str = "") -> str | None:
+    """Describe the merge state of work sent after the phase's last work start."""
+    sent = phase_sent_work(events)
+    if isinstance(sent, NoSentWork):
+        return None
+    state = land_queue.land_state(land, sent.commit) if isinstance(sent, SentCommit) else land_queue.LineUnused()
+    return f"done, {land_text(state, now=now, zone=zone, unit=unit)}"
 
-    It names checkpoints that land now, wait in the land line, or did not land and are not on main yet; the phases
-    of one line item share one entry. Phases in skip have their own row (sdlc C1701: done work that waits to land).
-    """
+
+class UnitMergeNotes(NamedTuple):
+    """The unit's merge groups and open phases whose rows need only done."""
+
+    text: str
+    grouped_phases: frozenset[str]
+
+
+def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
+               on_main: Callable[[str], bool]) -> UnitMergeNotes:
+    """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
 
     def own(owner: str) -> str:
-        phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
-        return "" if phase in skip else phase
+        return owner.removeprefix(prefix) if owner.startswith(prefix) else ""
 
-    landing = [phase for owner in land.running.values() if (phase := own(owner))]
+    merging: list[str] = []
     items: dict[int, list[str]] = {}
+    for phase, sent in open_sent.items():
+        if not isinstance(sent, SentCommit):
+            continue
+        state = land_queue.land_state(land, sent.commit)
+        if isinstance(state, land_queue.LandRunning):
+            merging.append(phase)
+        elif isinstance(state, land_queue.InLine):
+            items.setdefault(state.place.number, []).append(phase)
+    open_merging = frozenset(merging)
+    open_items = {number: frozenset(phases) for number, phases in items.items()}
+    for owner in land.running.values():
+        if (phase := own(owner)) and phase not in merging:
+            merging.append(phase)
     for place in ({} if isinstance(land.line, land_queue.NoLine) else land.line).values():
         if (phase := own(place.owner)) and phase not in items.setdefault(place.number, []):
             items[place.number].append(phase)
@@ -512,25 +552,31 @@ def unit_lands(unit: str, land: land_queue.LandView, *, skip: Sequence[str], now
         if result["unit"] == unit and (phase not in newest or result["time"] > newest[phase]["time"]):
             newest[phase] = result
     parts: list[str] = []
-    if landing:
-        parts.append(f"merging now: {', '.join(landing)}")
-    if entries := [f"{' + '.join(phases)} ({ordinal(number)} in line)" for number, phases in sorted(items.items()) if phases]:
-        parts.append(f"done, waits to merge: {', '.join(entries)}")
+    grouped: set[str] = set()
+    if merging and (len(merging) > 1 or merging[0] not in open_sent):
+        parts.append(f"merging now: {', '.join(merging)}")
+        grouped.update(open_merging)
+    for number, phases in sorted(items.items()):
+        if len(phases) > 1:
+            parts.append(f"{len(phases)} phases done, merge together, {ordinal(number)} in line: {', '.join(phases)}")
+            grouped.update(open_items.get(number, ()))
+        elif phases and phases[0] not in open_sent:
+            parts.append(f"{phases[0]} done, waits to merge, {ordinal(number)} in line")
     parts.extend(f"{phase} did not merge: {try_text(result, now=now, zone=zone)}" for phase, result in newest.items()
-                 if not result["landed"] and phase not in skip and phase not in queued and phase not in landing
+                 if not result["landed"] and phase not in open_sent and phase not in queued and phase not in merging
                  and not on_main(result["commit"]))
-    return " · ".join(parts)
+    return UnitMergeNotes(" · ".join(parts), frozenset(grouped))
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
                      snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: land_queue.LandView,
-                     unit: str = "") -> str:
+                     unit: str = "", merge_grouped: bool = False) -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
     if (wait := checkpoint_wait(instance, land, now=now, zone=zone, unit=unit)) is not None:
-        parts.append(wait)
+        parts.append("done" if merge_grouped else wait)
     elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
         if text and text.casefold() not in (single_spaced(phase.title).casefold(), label.casefold(),
@@ -916,16 +962,18 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if pending_eta != display_cells.NONE:
                 plan_eta = " · ".join(cell for cell in (plan_eta, pending_eta) if cell != display_cells.NONE)
                 show_plan_eta = True
-        sent_text = unit_lands(unit.unit, land, skip=open_ids, now=now, zone=zone,
-                               on_main=lambda commit: waits_on.on_main(REPOSITORY, commit))
-        sent = (sent_text,) if sent_text else ()
+        open_sent = {phase.phase: phase_sent_work([
+            event for event in run_events if event.get("phase_instance_id") == phase.instance_id])
+            for phase in open_run_phases}
+        merge_notes = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone,
+                                 on_main=lambda commit: waits_on.on_main(REPOSITORY, commit))
+        sent = (merge_notes.text,) if merge_notes.text else ()
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
                 notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land,
-                                         unit=member.name)
-                instance = [event for event in run_events if event.get("phase_instance_id") == phase.instance_id]
-                if checkpoint_wait(instance, land, now=now, zone=zone, unit=member.name) is None:
+                                         unit=member.name, merge_grouped=phase.phase in merge_notes.grouped_phases)
+                if isinstance(open_sent[phase.phase], NoSentWork):
                     in_work += 1
                 else:
                     merge_owners.add(f"{unit.unit} {phase.phase}")
