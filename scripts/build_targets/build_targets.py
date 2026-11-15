@@ -29,6 +29,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
@@ -1139,7 +1140,7 @@ def caller_waits_on_hold(holds: build_hold.NatedevHolds, directory: Path) -> boo
     """Check whether a hold makes the calling session wait."""
     from scripts.build_hold import build_hold
 
-    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory,
+    return isinstance(hold_waited_on(holds, session_owner.owning_session(), directory,
                                     current_caller_lineage()), build_hold.Holder)
 
 
@@ -1242,8 +1243,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 print(f"{name}: natedev is held by {display_field(blocking.name)} for "
                       + f"{display_field(blocking.purpose)}{waiting}",
                       file=sys.stderr, flush=True)
-                resolution = build_hold.run_resolution()
-                if isinstance(resolution, build_hold.RunNotInStaff):
+                resolution = session_owner.run_resolution()
+                if isinstance(resolution, session_owner.RunNotInStaff):
                     line = (f"{name}: build has no run pointer ({display_field(str(resolution.run))}); "
                             + f"waits on {display_field(blocking.name)} hold for {display_field(blocking.purpose)}.")
                 elif isinstance(session, NoOwningSession):

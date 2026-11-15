@@ -639,8 +639,9 @@ def memory_room(host: HostMemory | ReadingUnavailable, runs: Sequence[RunMemory]
     used = sum(run.use.bytes for run in runs if isinstance(run.use, AnonymousRunUse))
     kept = sum(run.bytes for run in holds)
     unavailable = tuple(run for run in runs if isinstance(run.use, RunUseUnavailable))
+    # Swapped agent memory can return to RAM at any time, so it is outside the cap and the room.
     cap: int | CapUnavailable = (CapUnavailable(unavailable) if unavailable
-                                 else max(0, used + ci_use + host.available - safety))
+                                 else max(0, used + ci_use + host.available - safety - agent_swap_demand))
     return MemoryRoom(host.available, safety, used, kept,
                       host.available - safety - kept - agent_swap_demand, cap, holds, total=host.total,
                       ci_use=ci_use, agent_swap_demand=agent_swap_demand)

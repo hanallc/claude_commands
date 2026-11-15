@@ -21,6 +21,7 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
+from scripts.lib import waiting_rows
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 
@@ -117,7 +118,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
                                        ssh="fake-ssh", mac_repo="~/fixture", mac_host="fixture")
         for failure in (subprocess.TimeoutExpired("fake-ssh", 25), GateRefused("interrupted by SIGTERM"), KeyboardInterrupt()):
             with self.subTest(failure=type(failure).__name__), mock.patch.dict(os.environ, self.environment), mock.patch.object(merge_gate, "wait_for_release_lock"), mock.patch.object(
-                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", "", self.base]) as checked, mock.patch.object(
+                    merge_gate, "checked_git", side_effect=["main", "", self.base, self.base, self.base, "", self.base]) as checked, mock.patch.object(
+                    waiting_rows, "move_to"), mock.patch.object(
                     merge_gate, "git", return_value=subprocess.CompletedProcess([], 0, "", "")), mock.patch.object(
                     merge_gate, "promotion_edit_conflict", return_value=""), mock.patch.object(
                     merge_gate, "subprocess", SimpleNamespace(run=mock.Mock(side_effect=failure),

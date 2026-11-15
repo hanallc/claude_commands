@@ -85,6 +85,7 @@ Configuration carries no unit branch. Branch consumers use `session_staff.RowRes
 - `Rule.rule_id` is `<origin>:<path relative to its rule root>`: `global:rust/foo.md`, `local:docs/style/foo.md`, `local:docs/<member>/style/foo.md`. Every ledger row and every `--rule` uses the id, never the stem.
 - `Rule.reach: RepoReach | MemberReach(member, crate_dir)`. A `docs/<member>/style` rule reaches the workspace member whose directory name or package name is `<member>`, else `RuleValidationError`.
 - `workspace_members(manifests) -> tuple[WorkspaceMember(directory, package_name), ...]`, deepest first: explicit members plus in-tree path dependencies, recursively, minus `exclude`. The loader and the ledger share it.
+- `load_rules` reads the repository's `Cargo.toml` files once for all member rules (`_repository_members`), not once for each rule.
 - `rules.py list [--repo] [--json]` prints `rule_id` first and shows unclassified rules. Exit 2 on a validation error. `STYLE_HISTORY_NATE_STYLE_DIR` points the loader at another rule folder.
 - `approval: always` loads as `Rule.approval = AlwaysApproved(family)`; absence gives `UserApproves()`.
   Other values raise `approval must be always`. A rule without a family raises `approval always requires a family`.
@@ -138,7 +139,7 @@ A version that the script does not support raises `CheckCouldNotRun`. Current ta
 
 **Read files.** `record --reads <path> [<path> ...]` names the other files a rule-scope verdict rests on. The ledger accepts it only with `--input-scope rule`, a verdict in `SCOPED_VERDICTS` (`clean`, `exception`, `held`), and a crate or module cell of an included Rust file. It normalizes each path like `--path`, then sorts the paths and removes duplicates; the cell's own path changes nothing. A judgment has one of two shapes: `ReadFiles(paths)` (an empty tuple is refused) or `NoReadFiles` (`NO_READ_FILES`). `Judgment` and `TicketJudgment` carry it in `reads`. `_read_fingerprint(tip, path, reads)` is SHA-256 over the sorted `(path, blob)` pairs of the cell file plus the read files, from `tip.blobs`. `record` stores this digest as the judgment's `input_fingerprint`, and refuses a path with no file at the commit (`<path>: no file at <commit>`). Without `--reads`, a rule-scope verdict uses the whole crate or module fingerprint, so the cell comes back after any change in its crate or module. The ticket text tells a unit to use `--input-scope rule --reads <files>`, and tells it that a cell without `--reads` comes back after any change in its crate or module.
 
-**Input comparison.** `_judgment_inputs_match(row, tip, scope, path, family)` is the one comparison of a judgment with a tip. A judgment with reads compares only by `_read_fingerprint` at the checked tip, and a read file that is missing at the tip is a mismatch. A judgment without reads compares its declared scope's fingerprint (`_comparison_scope`). When the fingerprints differ and `family` is `modules`, `_only_comments_changed` compares the `TreeEntry(mode, kind, object)` maps at the judged commit and at the tip (`Ledger._scope_inputs` over `_inputs`, or `_read_inputs` for a judgment with reads; `RepositoryTip.entries` holds every `ls-tree -r` entry, submodules included, retained while the commit remains in use): the same paths, and each changed entry is a `.rs` regular file (`REGULAR_FILE_MODES`) with the same mode at both commits and an equal `RustCode`. `RustCode` stores a digest of token values, token kinds, and inner docs at their code positions. Moving an inner doc changes the digest. A changed mode, a changed submodule, a changed non-`.rs` blob, a blob that is not UTF-8 or that `token_spans` cannot place (`NotTokenized`), and a fingerprint change with no changed entry do not match. `Ledger._rust_code` reads each blob once. Callers pass the rule's family (`Cell.family` in `style_merge_changes`). Current state, awaiting merge, `_repeated_judgments`, `judged_at_base` and the decline cell check all go through it.
+**Input comparison.** `_judgment_inputs_match(row, tip, scope, path, family)` is the one comparison of a judgment with a tip. A judgment with reads compares only by `_read_fingerprint` at the checked tip, and a read file that is missing at the tip is a mismatch. A judgment without reads compares its declared scope's fingerprint (`_comparison_scope`). When the fingerprints differ and `family` is `modules`, `_only_comments_changed` compares the `TreeEntry(mode, kind, object)` maps at the judged commit and at the tip (`Ledger._scope_inputs` over `_inputs`, or `_read_inputs` for a judgment with reads; `RepositoryTip.entries` holds every `ls-tree -r` entry, submodules included, retained while the commit remains in use): the same paths, and each changed entry is a `.rs` regular file (`REGULAR_FILE_MODES`) with the same mode at both commits and an equal `RustCode`. `RustCode` stores a digest of token values, token kinds, and inner docs at their code positions. Moving an inner doc changes the digest. A changed mode, a changed submodule, a changed non-`.rs` blob, a blob that is not UTF-8 or that `token_spans` cannot place (`NotTokenized`), and a fingerprint change with no changed entry do not match. `Ledger._rust_code` reads each blob once. Callers pass the rule's family (`Cell.family` in `style_merge_changes`). Current state, awaiting merge, `_repeated_judgments`, `judged_at_base` and the decline cell check all go through it. `_repeated_judgments` reads under `_maintained_cell_reads`, as a coverage cell does, so a later refill reads its stored comparison, ancestry and code facts.
 
 **Cell state** comes from the newest judgment rows (`ORDER BY recorded_at DESC, id DESC`) whose `rule_blob` equals the rule's current blob and whose declared scope equals the newest row's. "The inputs match" below means `_judgment_inputs_match` is true:
 
@@ -177,6 +178,7 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 - `held unbuilt --repo <checkout> --id F [--id F ...] --by <who>` clears merged proposal claims and records the reader and time.
 - `held recheck-merged --repo <checkout>` checks filed findings with merged proposal claims.
 - `held fold-test-files --repo <checkout>` folds sibling test file findings and prints each declaring file and the totals.
+- `held unfold-test-files --repo <checkout>` returns item findings that a whole test file move holds although they do not move into its declaring file. It copies the ledger to `ledger.before-unfold-test-files.sqlite` before it writes, and deletes the copy after it verifies the writes. A returned finding goes back to `filed` when its row keeps a proposal, otherwise to `unfiled`. A move that keeps no item finding is withdrawn, and a `fold_withdrawals` row records the time (`FoldUndone`). It skips built moves. It prints `<rule>: restored unfiled N, restored filed N, folds kept N, folds withdrawn N` for each rule, then `unchanged` or the deleted copy.
 
 Filing folds modules findings from a sibling `*_tests.rs` file under one rule.
 The repository tree supplies the declaring file and module name.
@@ -188,6 +190,8 @@ Without `path`, `mod.rs`, `lib.rs`, and `main.rs` use their own directory.
 Another declaring file `foo.rs` uses the `foo/` directory.
 The fold needs exactly one supported declaration of the sibling test file.
 Other forms give no source and keep their item findings.
+A finding folds only when its text and after name the declaring file, and name no Rust file other than it and the test file (`moves_into_test_file_destination`).
+A finding that names no file, or another file, proposes a different change, such as a split of the test file. It keeps its own row.
 A whole-file move gives no item-move proof and requires normal review.
 The ledger reads the finding's anchor commit, or HEAD when no anchor exists.
 The finding prose does not select the destination.
@@ -368,6 +372,8 @@ Candidates hold the module name or a `path` string that the scan cannot read wit
 `UNREAD_PATH_STRING` includes raw strings and strings with escapes.
 Such strings can name the module file without its name.
 The scan treats these files as uncertain.
+The ledger keeps the search result of each blob, so later `EditedFiles` readers of that ledger do not search the blob again.
+The ledger also keeps the local root candidates of each commit set, so later readers do not read those trees again.
 A file outside the crate root is scanned only when it names the library, the old file, or an unreadable path string.
 
 `files_naming` uses one `git grep` per name and commit.
@@ -825,8 +831,11 @@ Ticket proofs retain their Git reads and create no comparison facts before their
 Schema 43 maintains finding results in `refill_findings`.
 Each catalog, finding, and view has its own result and source identity.
 The `synced` view stores the declaration outcome, site evidence, anchor, and current item metadata.
+A stored reading decodes the item metadata of each file once at a tip, though several findings name that file.
 The `built` view stores rename endpoints without an approval answer.
 Endpoint columns index the crate, old name, new name, and owner.
+Footprint views name the reader's `FootprintRole`: `footprint:synced-and-unit`, `-main`, `-checkpoint` and `-ticket-base`.
+Readers at the unit base, main's pushed tip, a waiting checkpoint and its ticket base thus do not replace each other's stored footprint.
 Approval observations remain separate from immutable source facts.
 Each read stage checks the decision paths that supplied the stored result.
 An approval change repeats the existing calculation.
@@ -860,6 +869,7 @@ The read verifies shared endpoint sources before it reads dependent results.
 `RefillWriteBatch` queues derived writes until the source proofs finish.
 A footprint that is calculated commits its queued writes when it ends, also inside a selection, so the selection does not hold them in memory.
 A coverage read commits its queued writes when it ends, also inside a selection, so the declaration stage does not hold its cells in memory.
+A coverage read finds the git objects of its catalog's synced cells from those cells (`SYNCED_CELL_OBJECTS`), not from every stored git-object dependency.
 A declaration read commits its queued results after each anchor commit group and when it ends, so a large read does not hold them in memory.
 No source proof holds the database write lock.
 Publication checks source versions again inside the final transaction.

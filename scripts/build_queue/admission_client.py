@@ -1048,7 +1048,7 @@ def down_alert() -> int:
 
     retained = False
     try:
-        restart = "sudo systemctl restart build-admission.socket build-admission.service"
+        restart = "systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service"
         message = (f"The build queue service has not answered for {configuration.silence_seconds:g} seconds. Builds wait.\n"
                    "The service restarts by itself. Read journalctl -u build-admission.service.\n"
                    f"If the user must act, push the phone with this command: {restart}")
@@ -1181,7 +1181,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 
         local = refresh_local()
         session = OwningSession(args.session_id) if args.session_id else NoOwningSession()
-        selection = step_selection.Pinned(args.target) if args.target else step_selection.ROUTED
+        # A Mac-only step is pinned to the Mac, so the routing rule lets a build leave natedev.
+        selection = (step_selection.Pinned(args.target) if args.target else
+                     step_selection.Pinned("mac") if args.mac_only else step_selection.ROUTED)
         routing = target_config.LocalRequired("local caller") if args.local_only else target_config.ANY_ELIGIBLE_TARGET
         kind = args.kind or local.profile.step
         if kind == "nextest":

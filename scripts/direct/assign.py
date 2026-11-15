@@ -35,6 +35,7 @@ from scripts.production import worker as staff_worker
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
+from scripts.whoami import quota_state
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -823,6 +824,8 @@ def submission_result(result: int) -> int:
 def main() -> int:
     require_live_director()
     args = parse_arguments()
+    if quota_state.no_worker_mode():
+        refuse(quota_state.NO_WORKER_START)
     if args.role == "simplify":
         return simplify_daily.main(["--session-dir", args.session_dir, "--cwd", args.cwd])
     env = dict(os.environ)

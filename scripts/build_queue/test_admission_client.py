@@ -622,6 +622,37 @@ class ClientTests(unittest.TestCase):
                     self.assertFalse(any(line.startswith("{") for line in output.getvalue().splitlines()))
                     self.assertFalse(fixture.server.reservations)
 
+    def test_mac_only_build_offers_the_mac(self) -> None:
+        from scripts.build_queue import placement
+
+        real_socket = socket.socket
+        with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+             AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+            _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+            _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+            _ = write_config_fixture(fixture.root / "mac_test.conf",
+                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                + "kind.natedev=local\nplatform.natedev=linux\n")
+            request = fixture.request(step="check")
+            fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+                key, fixture.clock.now(), "the test has not published provider evidence")
+            arguments = ["place-step", "--once", "--wait-events", "--mac-only", "--kind", "build",
+                "--pid", str(request.owner.pid), "--episode", request.episode,
+                "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
+                "--assignment-file", str(fixture.root / "assignment.json"), "--", "cargo", "build"]
+            with fixture.serving(), \
+                 mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                     request.profile, step_estimator.ReusableEstimate())), \
+                 redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                with fixture.loop_turn():
+                    constraints = fixture.server.placement_requests[request.episode].constraints
+            self.assertIsInstance(constraints.selection, placement.MacOnlyHost)
+            mac = next(candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+            self.assertIsInstance(mac.eligibility, placement.AllowedHost)
+
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
@@ -1290,7 +1321,7 @@ class ClientTests(unittest.TestCase):
                 "The build queue service has not answered for 10 seconds. Builds wait.\n"
                 + "The service restarts by itself. Read journalctl -u build-admission.service.\n"
                 + "If the user must act, push the phone with this command: "
-                + "sudo systemctl restart build-admission.socket build-admission.service")
+                + "systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service")
             self.assertEqual(commands[1], commands[0])
 
     def test_down_alert_retains_sent_or_waiting_messages_and_retries_only_empty_deliveries(self) -> None:
@@ -1316,7 +1347,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--need") + 1], "blocked")
                     values = [command[index + 1] for index, part in enumerate(command) if part == "--value"]
                     self.assertEqual(values, [
-                        "action=On natedev, run: sudo systemctl restart build-admission.socket build-admission.service",
+                        "action=On natedev, run: systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service",
                         "body=The builds session did not take the message. Builds wait until the service answers.",
                         "sender=build-admission", "title=Build queue service is down"])
                     scripts = Path(client.__file__).resolve().parents[1]

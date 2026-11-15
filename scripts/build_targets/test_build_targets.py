@@ -27,6 +27,7 @@ from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
@@ -1003,7 +1004,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
 
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:
-        with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
+        with mock.patch.object(session_owner, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
             self.assertEqual(self.wait(), (0, "", ""))
 
 

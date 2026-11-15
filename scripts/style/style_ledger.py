@@ -96,6 +96,14 @@ FINDING_REPLACEMENT_GUIDANCE = (
 )
 
 
+# The git objects that the catalog's synced cells read. CROSS JOIN keeps the cells as the outer loop;
+# the planner otherwise walks every stored git-object dependency of every table.
+SYNCED_CELL_OBJECTS = (
+    "SELECT DISTINCT d.source_key FROM refill_cells c CROSS JOIN refill_dependencies d "
+    + "ON d.consumer_table='refill_cells' AND d.consumer_key=c.consumer_key AND d.source_kind='git_object' "
+    + "WHERE c.catalog=? AND c.view='synced'"
+)
+
 UNCOVERED_SUFFIX = "#uncovered"
 
 
@@ -367,7 +375,14 @@ class RuleBodyChanged:
     rule_blob: str
 
 
-WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone | RuleBodyChanged
+@dataclass(frozen=True)
+class FoldUndone:
+    """A whole test file move kept none of its item findings; `held unfold-test-files` returned them at this time."""
+
+    at: str
+
+
+WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone | RuleBodyChanged | FoldUndone
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
@@ -382,6 +397,8 @@ def withdrawn_line(by: WithdrawnBy) -> str:
             return f"declaration gone at {by.commit[:7]}"
         case RuleBodyChanged():
             return f"rule body changed to {by.rule_blob[:8]}"
+        case FoldUndone():
+            return f"fold undone at {by.at}; its item findings returned"
 
 
 @dataclass(frozen=True)
@@ -795,6 +812,62 @@ class FoldedTestFile:
     finding_id: str
     before: int
     declaring_file: str
+
+
+@dataclass(frozen=True)
+class UnfoldedRule:
+    """What `held unfold-test-files` did for one rule's whole test file moves."""
+
+    rule: str
+    restored_unfiled: int
+    restored_filed: int
+    folds_kept: int
+    folds_withdrawn: int
+
+
+def unfolded_line(item: UnfoldedRule) -> str:
+    return (f"{item.rule}: restored unfiled {item.restored_unfiled}, restored filed {item.restored_filed}, "
+            + f"folds kept {item.folds_kept}, folds withdrawn {item.folds_withdrawn}")
+
+
+# The text `_fold_test_file_group` writes; group 1 is the declaring file.
+WHOLE_TEST_FILE_MOVE = re.compile(r"Move the whole file \S+ into the inline \S+ module in (\S+)\.")
+RUST_FILE_NAME = re.compile(r"[A-Za-z0-9_./-]*[A-Za-z0-9_]\.rs\b")
+
+
+def _names_file(name: str, path: str) -> bool:
+    """Whether a Rust file name from finding text is the repository path's trailing parts."""
+    parts, path_parts = name.split("/"), path.split("/")
+    return len(parts) <= len(path_parts) and path_parts[-len(parts):] == parts
+
+
+def moves_into_test_file_destination(finding: HeldFinding, destination: str) -> bool:
+    """Whether the finding names the declaring file and no Rust file other than it and the test file."""
+    names = tuple(match.group() for match in RUST_FILE_NAME.finditer(finding.text + "\n" + finding.after))
+    return any(_names_file(name, destination) for name in names) and all(
+        _names_file(name, destination) or _names_file(name, finding.path) for name in names)
+
+
+@dataclass(frozen=True)
+class UnfoldPlan:
+    """The item findings to return, the whole test file moves to withdraw, and the counts for each rule."""
+
+    restored: tuple[HeldFinding, ...]
+    withdrawn: tuple[str, ...]
+    rules: tuple[UnfoldedRule, ...]
+
+
+@dataclass(frozen=True)
+class NoUnfoldBackup:
+    """No fold needed a change, so the command wrote nothing and copied nothing."""
+
+
+@dataclass(frozen=True)
+class UnfoldedTestFiles:
+    """The per-rule counts, and the ledger copy made before the writes; it was deleted after verification."""
+
+    rules: tuple[UnfoldedRule, ...]
+    backup: Path | NoUnfoldBackup
 
 
 @dataclass(frozen=True)
@@ -2622,6 +2695,9 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS judgments_holder ON judgments(rule,ticket,recorded_at DESC,id DESC);
         CREATE INDEX IF NOT EXISTS finding_judging_ticket ON held_findings(ticket,finding_id);
     """ + _replaced_triggers(_judgment_version_triggers()) + _finding_version_triggers(),
+    # When `held unfold-test-files` withdrew a whole test file move that kept none of its item findings. Each row is
+    # written with its held_findings state change, so the held_findings triggers version it.
+    44: "CREATE TABLE IF NOT EXISTS fold_withdrawals (finding_id TEXT PRIMARY KEY, unfolded_at TEXT NOT NULL);",
 }
 
 
@@ -2743,7 +2819,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
 type HeldFindingRow = tuple[
     str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName,
     str, str, int, str, str, str, str, int, str, str, str, str,
-    str, str, int, str, str, str, str, int,
+    str, str, int, str, str, str, str, int, str,
 ]
 
 
@@ -2768,6 +2844,10 @@ class Ledger:
         self._maintaining_findings: bool = False
         self._finding_objects: set[str] = set()
         self._finding_searches: set[tuple[str, str]] = set()
+        # Whether each blob holds a `path` string that the module scan cannot read; a blob's text never changes.
+        self.unread_path_blobs: dict[str, bool] = {}
+        # The local root candidates of each commit set; a commit's tree never changes.
+        self._footprint_roots: dict[tuple[str, ...], tuple[str, ...]] = {}
         self._object_groups: dict[str, tuple[str, ...]] = {}
         self._search_index: refill_findings.SearchIndex = refill_findings.SearchIndex()
         self._finding_metadata: set[tuple[str, str]] = set()
@@ -3046,9 +3126,11 @@ class Ledger:
         return decode_proof(source, types)
 
     def footprint_roots(self, commits: tuple[str, ...]) -> tuple[str, ...]:
-        """Return local root candidates used by the existing footprint readers."""
-        return tuple(sorted({str(parent) for commit in commits for path in self._tip(commit).blobs
-                             if path.endswith(".rs") for parent in PurePosixPath(path).parents}))
+        """Return local root candidates used by the existing footprint readers, once for each commit set."""
+        if commits not in self._footprint_roots:
+            self._footprint_roots[commits] = tuple(sorted({str(parent) for commit in commits for path in self._tip(commit).blobs
+                                                           if path.endswith(".rs") for parent in PurePosixPath(path).parents}))
+        return self._footprint_roots[commits]
 
     def record_finding_sources(self, commits: tuple[str, ...], blobs: tuple[str, ...]) -> None:
         """Record the immutable inputs read by the current finding calculation."""
@@ -5217,8 +5299,9 @@ class Ledger:
         query = ("SELECT " + ",".join("h." + name for name in columns.split(","))
                  + ",COALESCE(w.rule_blob,''),COALESCE(r.name,''),COALESCE(r.line,0),"
                  + "COALESCE(r.text,''),COALESCE(r.kind,''),COALESCE(r.reason,''),COALESCE(t.state,''),"
-                 + "CASE WHEN w.finding_id IS NULL THEN 0 ELSE 1 END "
+                 + "CASE WHEN w.finding_id IS NULL THEN 0 ELSE 1 END,COALESCE(u.unfolded_at,'') "
                  + "FROM held_findings h LEFT JOIN rule_body_withdrawals w ON w.finding_id=h.finding_id "
+                 + "LEFT JOIN fold_withdrawals u ON u.finding_id=h.finding_id "
                  + "LEFT JOIN rename_dispositions r ON r.finding_id=h.finding_id "
                  + "LEFT JOIN tickets t ON t.id=h.ticket " + where + " ORDER BY h.created_at,h.finding_id")
         return tuple(cast(list[HeldFindingRow], self._connection.execute(query, parameters).fetchall()))
@@ -5241,7 +5324,7 @@ class Ledger:
                 state = Built(Path(row[11]))
             case "withdrawn":
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                                  RuleBodyChanged(row[23]) if row[30] else
+                                  RuleBodyChanged(row[23]) if row[30] else FoldUndone(row[31]) if row[31] else
                                   DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
                                   else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
@@ -5685,13 +5768,18 @@ class Ledger:
         return self._test_file_destinations[tip.commit].get(finding.path, SeparateItemMove())
 
     def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:
-        """Fold one rule's unclaimed findings into the repository's whole sibling test file move."""
+        """Fold one rule's unclaimed findings that move into the declaring file into its whole sibling test file move."""
+        if not findings:
+            return ()
+        lead = next((finding for finding in findings if isinstance(finding.state, Filed)), findings[0])
+        destination = self._test_file_destination(lead)
+        if not isinstance(destination, TestFileDestination):
+            return ()
+        # A finding that names another file, or no file, proposes a different change; it keeps its own row.
+        findings = tuple(finding for finding in findings if moves_into_test_file_destination(finding, destination.path))
         if not findings:
             return ()
         first = next((finding for finding in findings if isinstance(finding.state, Filed)), findings[0])
-        destination = self._test_file_destination(first)
-        if not isinstance(destination, TestFileDestination):
-            return ()
         text = (f"Move the whole file {first.path} into the inline {destination.module} module "
                 + f"in {destination.path}.")
         before = f"The whole test file {first.path} is a separate sibling module."
@@ -5723,6 +5811,70 @@ class Ledger:
             [(identity, now, finding.finding_id) for finding in findings if finding.finding_id != identity],
         )
         return (FoldedTestFile(first.rule, first.path, identity, len(findings), destination.path),)
+
+    def _unfold_plan(self) -> UnfoldPlan:
+        """Find the item findings that a whole test file move holds although they do not move into its destination."""
+        members: dict[str, list[HeldFinding]] = {}
+        folds: dict[str, tuple[str, HeldStateName, str]] = {}
+        for member_id, fold_id, rule, state, text in cast(list[tuple[str, str, str, HeldStateName, str]], self._connection.execute(
+                "SELECT m.finding_id,f.finding_id,f.rule,f.state,f.text FROM held_findings m "
+                + "JOIN held_findings f ON f.finding_id=m.duplicate_of WHERE m.state='withdrawn' "
+                + "AND f.text LIKE 'Move the whole file %' AND f.state!='built' ORDER BY m.created_at,m.finding_id").fetchall()):
+            move = WHOLE_TEST_FILE_MOVE.fullmatch(text)
+            member = self._held(member_id)
+            if move is not None and isinstance(member.state, Withdrawn) and member.state.by == DuplicateOf(fold_id):
+                folds[fold_id] = (rule, state, move.group(1))
+                members.setdefault(fold_id, []).append(member)
+        restored: list[HeldFinding] = []
+        withdrawn: list[str] = []
+        counts: dict[str, list[int]] = {}
+        for fold_id, (rule, state, destination) in folds.items():
+            failing = [member for member in members[fold_id] if not moves_into_test_file_destination(member, destination)]
+            count = counts.setdefault(rule, [0, 0, 0, 0])
+            for member in failing:
+                restored.append(member)
+                count[1 if isinstance(member.state, Withdrawn) and isinstance(member.state.proposal, Path) else 0] += 1
+            if len(failing) < len(members[fold_id]):
+                count[2] += 1
+            elif state in ("unfiled", "filed"):
+                withdrawn.append(fold_id)
+                count[3] += 1
+        return UnfoldPlan(tuple(restored), tuple(withdrawn),
+                          tuple(UnfoldedRule(rule, *count) for rule, count in sorted(counts.items())))
+
+    def unfold_test_files(self) -> UnfoldedTestFiles:
+        """Return wrongly folded item findings to their decisions; copy the ledger first and verify after the writes."""
+        backup = self.database.with_name(self.database.stem + ".before-unfold-test-files" + self.database.suffix)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            plan = self._unfold_plan()
+            if not plan.restored and not plan.withdrawn:
+                return UnfoldedTestFiles(plan.rules, NoUnfoldBackup())
+            # A second reader copies the committed ledger; this connection holds the write lock and has not written.
+            with (closing(sqlite3.connect(self.database.resolve().as_uri() + "?mode=ro", uri=True,
+                                          timeout=BUSY_TIMEOUT_SECONDS)) as source,
+                  closing(sqlite3.connect(backup, timeout=BUSY_TIMEOUT_SECONDS)) as copy):
+                source.backup(copy)
+            now = _now()
+            # The row keeps its proposal, so a finding filed before the fold returns to the same decision.
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET state=CASE WHEN proposal='' THEN 'unfiled' ELSE 'filed' END,"
+                + "duplicate_of='',updated_at=? WHERE finding_id=?",
+                [(now, finding.finding_id) for finding in plan.restored])
+            _ = self._connection.executemany("UPDATE held_findings SET state='withdrawn',updated_at=? WHERE finding_id=?",
+                                             [(now, fold_id) for fold_id in plan.withdrawn])
+            _ = self._connection.executemany("INSERT OR REPLACE INTO fold_withdrawals VALUES (?,?)",
+                                             [(fold_id, now) for fold_id in plan.withdrawn])
+        after = self._unfold_plan()
+        returned = tuple(self._held(finding.finding_id) for finding in plan.restored)
+        if (after.restored or after.withdrawn
+                or any(not isinstance(finding.state, Filed if isinstance(original.state, Withdrawn)
+                                      and isinstance(original.state.proposal, Path) else Unfiled)
+                       for finding, original in zip(returned, plan.restored, strict=True))
+                or any(not isinstance(self._held(fold_id).state, Withdrawn) for fold_id in plan.withdrawn)):
+            raise LedgerError(f"held unfold-test-files did not verify; the ledger before it is {backup}")
+        backup.unlink()
+        return UnfoldedTestFiles(plan.rules, backup)
 
     def fold_test_files(self) -> tuple[FoldedTestFile, ...]:
         """Fold pending sibling test file moves in one transaction and retain their item rows as duplicates."""
@@ -7680,6 +7832,9 @@ class Ledger:
             self._follow_evidence[(finding, tip.commit)] = evidence
             self._finding_anchors[finding] = anchor
             for path, blob in metadata:
+                # Findings in one file share its declarations at this tip; read and decode them once.
+                if (tip.commit, path) in self._declared_files:
+                    continue
                 items = results.facts.input_fact("finding_declarations", blob, 1)
                 if not isinstance(items, UnstoredFact):
                     self._declared_files[(tip.commit, path)] = cast(tuple[DeclaredItem, ...], self._decode_finding_proof(items))
@@ -8774,16 +8929,22 @@ class Ledger:
         identity = cell_identity((tip.commit, branch, cells.facts.object_store, rule.rule_id,
                                   rule.blob, rule.judgment_identity, rule.tier, rule.family, rule.input_scope, path))
         def calculate() -> tuple[CellState, str]:
-            previous = self._maintaining_cell
-            self._maintaining_cell = True
-            try:
+            with self._maintained_cell_reads():
                 return self._judgment_state(rule, path, tip)
-            finally:
-                self._maintaining_cell = previous
         return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
                             calculate,
                             lambda: self._cell_dependencies(rule, path, tip),
                             crate=crate, family=rule.family, tier=rule.tier)
+
+    @contextmanager
+    def _maintained_cell_reads(self) -> Generator[None]:
+        """Read and keep the immutable comparison, ancestry and code facts that a judgment reads."""
+        previous = self._maintaining_cell
+        self._maintaining_cell = True
+        try:
+            yield
+        finally:
+            self._maintaining_cell = previous
 
     def _style_branch(self) -> StyleBranch:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -8826,8 +8987,10 @@ class Ledger:
                 if row.declared_scope != rows[0].declared_scope or not rule_catalog.judged_text_unchanged(row.rule_blob, rule):
                     continue
                 try:
-                    repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
-                               and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
+                    # The comparisons are immutable facts, so a later refill reads them from the ledger.
+                    with self._maintained_cell_reads():
+                        repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
+                                   and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
                 except GitReadFailed:
                     raise
                 except LedgerError:
@@ -8894,11 +9057,7 @@ class Ledger:
         maintained = JudgmentCells(facts, "synced")
         if self._maintain_judgments:
             facts.observe_sources()
-            objects = cast(list[tuple[str]], self._connection.execute(
-                "SELECT DISTINCT d.source_key FROM refill_dependencies d JOIN refill_cells c "
-                + "ON c.consumer_key=d.consumer_key WHERE d.consumer_table='refill_cells' "
-                + "AND d.source_kind='git_object' AND c.catalog=? AND c.view='synced'",
-                (facts.catalog,)).fetchall())
+            objects = cast(list[tuple[str]], self._connection.execute(SYNCED_CELL_OBJECTS, (facts.catalog,)).fetchall())
             _ = self._judgment_objects_available(tuple(name for (name,) in objects))
         style_branch = self._style_branch()
         branch = ""
@@ -9232,6 +9391,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         result["withdrawn_by"] = by.judgment_id if isinstance(by, (ExceptionVerdict, JudgedAgain)) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
         result["rule_changed_to"] = by.rule_blob if isinstance(by, RuleBodyChanged) else ""
+        result["unfolded_at"] = by.at if isinstance(by, FoldUndone) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
     follow = finding.follow
@@ -9304,7 +9464,8 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
+        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files",
+                  "unfold-test-files")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -9365,7 +9526,7 @@ def main() -> None:
                 if action == "built":
                     _ = command.add_argument("--commit", dest="merge", default=None)
                 _ = command.add_argument("--by", required=action == "unbuilt", default=None)
-            elif action not in ("recheck-merged", "fold-test-files"):
+            elif action not in ("recheck-merged", "fold-test-files", "unfold-test-files"):
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
                     _ = command.add_argument("--proposal", required=True)
@@ -9532,6 +9693,12 @@ def main() -> None:
                     for group in folded:
                         print(f"folded {group.rule} {group.path}: {group.before} -> 1 ({group.finding_id}) in {group.declaring_file}")
                     print(f"folded {len(folded)} files: {sum(group.before for group in folded)} -> {len(folded)} findings")
+                elif args.action == "unfold-test-files":
+                    unfolded = ledger.unfold_test_files()
+                    for item in unfolded.rules:
+                        print(unfolded_line(item))
+                    print("unchanged" if isinstance(unfolded.backup, NoUnfoldBackup)
+                          else f"verified; deleted the backup {unfolded.backup}")
                 elif args.action == "recheck-merged":
                     for item in ledger.recheck_merged_findings():
                         print(not_built_line(ledger.repo, item))
