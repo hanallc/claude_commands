@@ -124,14 +124,41 @@ def room_text(room: admission_records.MemoryRoom | admission_records.ReadingUnav
     return text
 
 
-def room_check_text(check: admission_records.RoomCheck) -> str:
+def room_relation_text(check: admission_records.RoomCheck) -> str:
     relation = "<=" if check.need <= check.room else ">"
+    return f"need {gib(check.need)} {relation} room {gib(max(0, check.room))}"
+
+
+def room_basis_text(basis: admission_records.StartBasis) -> str:
+    return ("; starts alone" if isinstance(basis, admission_records.StartsAlone) else
+            "; within held slot" if isinstance(basis, admission_records.WithinSlot) else
+            "; head override" if isinstance(basis, admission_records.OverrideRoom) else "")
+
+
+def room_check_text(check: admission_records.RoomCheck) -> str:
     result = "pass" if check.passes else "held"
-    basis = check.basis
-    exception = ("; starts alone" if isinstance(basis, admission_records.StartsAlone) else
-                 "; within held slot" if isinstance(basis, admission_records.WithinSlot) else
-                 "; head override" if isinstance(basis, admission_records.OverrideRoom) else "")
-    return f"Room: need {gib(check.need)} {relation} room {gib(max(0, check.room))}: {result}{exception}"
+    return f"Room: {room_relation_text(check)}: {result}{room_basis_text(check.basis)}"
+
+
+def head_room_text(check: admission_records.RoomCheck,
+                   room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> str:
+    """Show the head's room check with the same terms as the cap line, so it never reads as fitting."""
+    text = room_relation_text(check)
+    if isinstance(room, admission_records.ReadingUnavailable):
+        return text + room_basis_text(check.basis)
+    # A head override does not count the memory kept aside for running builds.
+    override = isinstance(check.basis, admission_records.OverrideRoom)
+    kept = 0 if override else room.kept
+    # The terms keep the order of the page's room equation: free, safety, swap, then kept aside.
+    terms = [f"free {gib(room.available)}", f"safety {gib(room.safety)}"]
+    if room.agent_swap_demand:
+        terms.append(f"{gib(room.agent_swap_demand)} swapped outside builds")
+    if kept:
+        terms.append(f"kept aside {gib(kept)}")
+    protected = room.available - room.safety - kept - room.agent_swap_demand - check.room
+    if protected > 0:
+        terms.append(f"head protection {gib(protected)}")
+    return f"{text} ({' − '.join(terms)}){room_basis_text(check.basis)}"
 
 
 def keep_aside_text(run: admission_records.RunKeepAside) -> str:

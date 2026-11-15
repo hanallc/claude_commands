@@ -87,6 +87,7 @@ class RestartDisposition(Enum):
     STARTED = "this attempt launched the row"
     RESTORED = "the row needs no new launch"
     HELD = "the row keeps its pause or exit record"
+    REMOVED = "the row no longer exists, so its id left the restart record"
 
 
 class RestartSuccessReport(Enum):
@@ -305,7 +306,15 @@ class WorkerPanes(Protocol):
                         ) -> dict[staff.StaffId, list[WorkerRow]]: ...
 
 
+class RestoreSkip(Protocol):
+    @property
+    def reason(self) -> str: ...
+
+
 class WorkerRestore(Protocol):
+    def not_restored(self, row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                     runs: dict[str, list[str]] | None = None) -> RestoreSkip | None: ...
+
     def restore(self, parent: staff.StaffId, *, record: staff.StaffSnapshot | None = None,
                 only: frozenset[staff.StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
                 started_panes: dict[staff.StaffId, str] | Literal["discard"] = "discard",
@@ -475,6 +484,16 @@ def _observations(record: staff.StaffSnapshot, client: herdr.Herdr) -> RestartOb
     runs = unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record) if owners else {}
     panes = _codex_conversations(client)
     return RestartObservations(panes.codex, runs, owners, panes.names)
+
+
+def leaves_record(row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                  runs: dict[str, list[str]] | None = None) -> str | None:
+    """Name why this row never restarts, so its id leaves the restart record; None when it can restart."""
+    if row.kind != "worker":
+        return None
+    worker = cast(WorkerRestore, cast(object, import_module("scripts.production.worker")))
+    skip = worker.not_restored(row, record, runs=runs)
+    return None if skip is None else skip.reason
 
 
 def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
@@ -1041,9 +1060,16 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             if select_only and row is None:
                 matches = [item for item in record.rows if item.name == reference]
                 row = matches[0] if len(matches) == 1 else None
-            if row is None:
-                print(f"{reference}: unknown or ambiguous staff row" if select_only else
-                      f"{' '.join(reference.split())}: restart anomaly: in the restart record, no fixed staff id", file=sys.stderr)
+            if row is None and select_only:
+                print(f"{reference}: unknown or ambiguous staff row", file=sys.stderr)
+                continue
+            # A retry cannot start these ids, so they leave the record.
+            reason = "no staff row" if row is None else None if select_only else leaves_record(row, record, runs=observed.runs)
+            if row is None or reason is not None:
+                print(f"{' '.join((reference if row is None else row.name).split())}: restart anomaly: {reason}; "
+                      + ("would leave the restart record" if dry_run else "removed from the restart record"), file=sys.stderr)
+                if not dry_run:
+                    shutdown_record.forget([reference])
                 continue
             if not isinstance(account, AllRestartAccounts):
                 try:
@@ -1091,6 +1117,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                   and parent is not None and parent.id in selected_ids else row)
         holders[holder.id] = holder
         members_by_holder.setdefault(holder.id, []).append(str(row.id))
+    # The record saves only members that a restart starts; the stop still reaches every member.
+    leaving = {str(row.id) for row in selected if stop_all and leaves_record(row, record, runs=observed.runs) is not None}
+    saved_by_holder = {holder: [member for member in members if member not in leaving]
+                       for holder, members in members_by_holder.items()}
     callers = {os.environ.get("CLAUDE_CODE_SESSION_ID"), os.environ.get("CODEX_THREAD_ID")} - {None, ""}
     if stop_all and any(row.current_session in callers for row in selected):
         arguments = ["stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
@@ -1116,7 +1146,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 for member in members_by_holder[holder.id]:
                     if member != str(holder.id):
                         _ = locks.enter_context(staff.row_operation(member))
-                shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+                shutdown_record.update(started=[], pending=saved_by_holder[holder.id])
                 recorded.set()
                 workers: tuple[staff.StaffId, ...] = ()
                 if worker_scope is WorkerRestartScope.FOLLOW_OWNER and holder.kind in ("unit", "showrunner"):
@@ -1186,12 +1216,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             for member in members_by_holder[holder.id]:
                 if member != str(holder.id):
                     _ = locks.enter_context(staff.row_operation(member))
-            shutdown_record.update(started=[], pending=members_by_holder[holder.id])
+            shutdown_record.update(started=[], pending=saved_by_holder[holder.id])
             current_record = staff.initial_snapshot()
             current_record = replace(current_record, rows=tuple(row for row in current_record.rows if row.id not in blocked_workers))
             current = current_record.by_id(holder.id)
             if current is None:
-                raise ValueError("staff row no longer exists")
+                shutdown_record.forget(members_by_holder[holder.id])
+                print(f"{holder.name}: restart anomaly: no staff row; removed from the restart record", file=sys.stderr)
+                return RestartDisposition.REMOVED
             if current.kind in ("unit", "showrunner") and (
                     isinstance(current.paused, staff.Paused) or isinstance(current.exited, staff.Exited)):
                 print(f"{current.name}: {'exited' if isinstance(current.exited, staff.Exited) else 'paused'}")
@@ -1225,7 +1257,7 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
 
     def record_start(holder: staff.StaffRow, disposition: RestartDisposition) -> None:
         members = members_by_holder[holder.id]
-        if disposition is RestartDisposition.HELD:
+        if disposition in (RestartDisposition.HELD, RestartDisposition.REMOVED):
             return
         started.extend(member for member in members if staff.StaffId(member) not in blocked_workers)
 

@@ -184,11 +184,13 @@ class LaunchSettingsTests(unittest.TestCase):
     def test_launch_settings_match_shell_role_resolution_and_tier_precedence(self) -> None:
         from scripts.lib import models_registry
 
+        # Neither resolver has a branch for one key name, so each section checks one or two keys.
+        # Each case starts the shell resolver's registry reader once.
         for family in ("codex", "claude"):
             for section, keys, reference_section in (
-                ("direct", ("impl", "test", "fix", "review"), "direct"),
-                ("design_roles", ("designer", "reviewer"), "design_roles"),
-                ("producers", ("morty", "brain", "dwight"), "producers"),
+                ("direct", ("impl", "review"), "direct"),
+                ("design_roles", ("designer",), "design_roles"),
+                ("producers", ("morty",), "producers"),
                 ("producers", ("producer_only",), "direct"),
             ):
                 for key in keys:

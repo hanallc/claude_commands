@@ -914,6 +914,8 @@ The builds showrunner owns cut-over. Workers do not change live units or admissi
 `drain-check` counts live imported waiters, reservations, and processes that retain old admission functions.
 `drain-check --service` counts live service waiters, reservations, and clients through the same process list.
 Both commands only read state. A nonempty count refuses the drain.
+`state-check` reads `state.json` with the same strict reader as `serve`, from the same directory: `--state-dir`, which defaults to the live admission directory `serve` uses. It exits 0 when the file reads or is absent, and 2 with the error otherwise.
+Promotion runs it from the target tree, so code that cannot read the live state does not reach main.
 
 1. Hold natedev before rollback.
 2. Require quiet builds and `drain-check --service` reporting `drained`.
@@ -1104,8 +1106,11 @@ Every present holder file remains in force, including when the cycle has `releas
 There is no releasing state.
 Only removal ends the holder's hold.
 
-**Drain.** `build_hold.py drain --for '<why>'` keeps existing queued and running natedev runs until they finish.
-It captures outermost gates, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+**Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
+It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
+Unreadable claims or admission state keep every outermost gate.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
 A second scan adds only identities whose start ticks do not exceed that bound.
 The command merges those identities under the release lock before starting the enforcer.
@@ -1120,6 +1125,7 @@ Each 60 seconds, it prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
 Ctrl-C returns 130 and retains the hold.
 Status derives `draining (N runs left)` or `held` from matching live keep entries.
+Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
 Legacy CI cargo requests use the same hold and lineage check before memory admission.
@@ -1694,6 +1700,9 @@ The reader publishes physical memory and sampler observations under a lock and w
 Each reading contains the monotonic time when its read started.
 The loop applies the current peak hold and frozen test-phase need at each pass.
 The reader applies no reservation policy.
+A reading does not find the build run or the account of each process.
+The pass finds them for the owners it checks, from the same process table.
+One pass reads the build target list once, through `target_config.command_configuration()`.
 The loop combines the latest reading with its current reservations and waiters.
 A reading can be one pass cadence old.
 The reader uses `waiting_pass_seconds` while steps wait and `running_pass_seconds` otherwise.

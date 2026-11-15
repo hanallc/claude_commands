@@ -46,11 +46,17 @@ export TZ="${zone:-America/New_York}"
 
 counts=
 payload=$(cat)
-# Match the payload's current session, as assignment.py does.
-unit_session=$(printf '%s\n' "$payload" | jq -r --slurpfile staff "$staff" '
-  .session_id as $session
-  | first($staff[0].rows[]? | select(.kind == "unit" and (.current_session // .id) == $session)
-          | "\(.id) \($session)") // empty' 2>/dev/null)
+# One jq start reads the unit row of the payload's current session, as assignment.py matches it.
+# With no unit row, it reads the showrunner ids. A bad payload matches no unit row.
+owners=$(jq -r --arg payload "$payload" '
+  (try ($payload | fromjson | .session_id) catch null) as $session
+  | first(.rows[]? | select(.kind == "unit" and (.current_session // .id) == $session)
+          | "unit \(.id) \($session)")
+    // (.rows[]? | select(.kind == "showrunner") | .id)' "$staff" 2>/dev/null)
+unit_session=
+case $owners in
+  "unit "*) unit_session=${owners#unit } ;;
+esac
 # bash has EPOCHSECONDS built in; a shell with neither leaves a deferred question to the next change.
 [ -z "${ZSH_VERSION:-}" ] || zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
 # Staff ids contain no spaces. Select owners before reading their timer folders.
@@ -58,7 +64,7 @@ for identity in $(
   if [ -n "$unit_session" ]; then
     printf '%s\n' "${unit_session%% *}"
   else
-    jq -r '.rows[]? | select(.kind == "showrunner") | .id' "$staff" 2>/dev/null
+    printf '%s\n' "$owners"
   fi
 ); do
   conf="${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$identity/conf"
