@@ -4303,18 +4303,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (builds assigned the test_assign_claude_claim_follow flake on 11-15; test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `stop_assignment` checks a stopped process's state only after the kernel reports its exit.
-
-**Spec:**
-- Cause: `test_group_stop_leaves_a_free_claim_and_the_next_follow_proceeds` (SIGHUP) failed once in a 12-wide verify run on 5c42c1b5b. `stop_assignment` in `scripts/direct/test_assign_claude.py` read the child state after the stub's socket end of file and the launcher's exit. The kernel closes a process's files before it makes the process a zombie, so under load `/proc` can show R or D, and `process_start` returns `Started`.
-- `exit_watch(pid)` opens a pidfd (kqueue `NOTE_EXIT` on the Mac) when each stopped process reports, before the stop signal. After the launcher ends, `stop_assignment` waits for each exit event, then checks the state. No time bound or retry; `TEST_HANG_GUARD_SECS` is only the hang guard.
-
-**Files:** `scripts/direct/test_assign_claude.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is one test helper.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** test_assign_claude and test_assign_claude_claim_follow pass on natedev; basedpyright reports zero errors and zero warnings.
+- Cause of the test_assign_claude_claim_follow SIGHUP flake: `stop_assignment` read the stopped child's state after its socket end of file and the launcher exit; the kernel closes files before it makes the task a zombie.
+- `exit_watch(pid)` in `scripts/direct/test_assign_claude.py` opens a pidfd (kqueue `NOTE_EXIT` on the Mac) before the stop signal; `stop_assignment` waits for each exit event before the state check.
+- Commit e6348babb. Test-only change.
