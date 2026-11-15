@@ -353,6 +353,35 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `hash-object --path` takes a path relative to the top level, so it must run from the top level, or list attributes do not match.
 - Images a failed batch registered stay unclaimed until `sweep_change_images` removes them.
 
+### Phase 39 — The ten C51 suites pass on the Mac  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `scripts/lib/py` runs under macOS `/bin/bash` 3.2 with no Python options, and `scripts.herdr.test_herdr.NativePaneSessionTests` passes on darwin, so the ten C51 suites pass on the Mac.
+
+**Spec:**
+- Cause 1 (Mac queue run at 7d40bfcc5, 2026-11-15): `scripts/lib/py` runs under `set -u` and expands `"${python_options[@]}"` and `"${file_separator[@]}"` when the arrays are empty. bash 3.2 (macOS `/bin/bash`) stops with `python_options[@]: unbound variable`. `scripts.agents.test_account_move.AccountMoveTests.test_group_preview_starts_in_a_fresh_process_without_prior_shutdown_imports` fails on the Mac with that line. Real Mac runs fail the same way when `env bash` resolves to `/bin/bash`.
+- Fix 1: write every array expansion in `scripts/lib/py` in the form `${name[@]+"${name[@]}"}` (lines 11, 95, 104, 105, 108, 110, 114 at 7d40bfcc5: `shim_parts`, `python_options`, `file_separator`). Keep all other behavior. Check: `/bin/bash`-3.2 semantics cannot run on natedev, so a test runs `scripts/lib/py` with no options under `bash` with `set -u` and checks that no array expansion in the file has the bare `"${name[@]}"` form (a text check over the file), plus a run of `scripts/lib/py -c 'print(1)'`.
+- Cause 2: `NativePaneSessionTests` fakes the Linux `/proc` arguments of a fixture pid. On darwin, `herdr._codex_launch_argument` (herdr.py about line 3930) reads `_darwin_processes()` (`ps`) and does not find the pid, so it returns `arguments unreadable`. 18 tests fail on the Mac: `test_codex_native_process_uses_its_resume_argument_or_own_pane_report` (subtests), `test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread`, `test_cached_starting_pane_reports_once_in_each_run`.
+- Fix 2: each test in `NativePaneSessionTests` that fakes `/proc` pins the platform the same way the existing test near line 170 does: `patch.object(herdr, "_PLATFORM", "linux")`. One place does it for the class (for example `setUp` with `enterContext`) when every test in the class fakes `/proc`; otherwise each such test. Product code does not change.
+
+**Files:**
+- `scripts/lib/py` — array expansions
+- `scripts/lib/test_py_shim.py` — the bare-expansion check
+- `scripts/herdr/test_herdr.py` — `NativePaneSessionTests` platform pin
+- `scripts/agents/test_account_move.py` — the preview test sets `CLAUDE_PYTHON`, so `scripts/lib/py` writes no cache under the test HOME
+
+**Workers:** 1 writer + 1 tester — the two fixes touch disjoint files.
+- `impl` — `scripts/lib/py` and its test
+- `test` — `scripts/herdr/test_herdr.py`
+
+**State:** none
+
+**Constraints from prior phases:** run tests under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`. No Mac command runs outside `mac_queue_run.py`; the director runs the Mac proof.
+
+**Acceptance gate:** `python3 -m unittest scripts.herdr.test_herdr scripts.agents.test_account_move` and `scripts.lib.test_py_shim` pass on natedev; basedpyright prints `0 errors, 0 warnings` on each changed Python file; the director runs the ten C51 suites on the Mac through `mac_queue_run.py` from a clone of this branch and all pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
