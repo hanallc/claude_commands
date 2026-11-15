@@ -4010,3 +4010,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The payload goes in with `--arg` and `fromjson` in a `try`. A bad payload matches no unit row; `/dev/null` staff gives no owners.
 - AWS pair (c7a.4xlarge, 3 rounds): `test_statusline` 45.11 -> 44.66 CPU s.
 - Commit 9d9e95bab. Production change; sdlc go 2026-11-14.
+
+### Phase 275 — The ssh-targets wrapper fixtures run inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `verify_ssh_targets_test_support.BUILD_TARGETS_STATUS` loads the real `build_targets.py` once for each process and returns its `main` status. It replaces `RUN_BUILD_TARGETS`.
+- `reserve-refusal.py` and `reserve-response-loss.py` have a top-level `main`, so verify_helper runs them inside its process. Each answer and observation stays the same.
+- `interrupted-reservation.py` uses the same loader and stays a separate process.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_verify_ssh_targets_routing` 45.76 -> 36.50 CPU s.
+- Commit 785de7dbe. Test-only change.
