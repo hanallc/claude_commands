@@ -4061,3 +4061,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - AWS pair (3 rounds, median CPU s): 8 modules 290.41 -> 255.76; `test_statusline` 45.05 -> 34.42; `test_offload` 46.90 -> 40.08.
 - Live CLI start CPU on natedev: `direct.assign` 335 -> 199 ms; `admission_protocol` 144 -> 85 ms; `progress_history` 118 -> 83 ms.
 - Commit 3f52df2c3. Production change (sdlc go 2026-11-14).
+
+### Phase 279 — One cheap perl start for each shell file lock  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 2026-11-15).
+
+#### Work Order
+
+**Goal:** each `lock_file_descriptor` call costs one small perl start, with the same exit codes.
+
+**Spec:**
+- `scripts/direct/file_lock.sh` finds perl once, when a script sources it: `command -v perl`, then `/run/current-system/sw/bin/perl`, then `/usr/bin/perl`. It keeps the result in `FILE_LOCK_PERL`.
+- The perl text uses the numbers 2 (LOCK_EX) and 4 (LOCK_NB), the same on Linux and macOS, so it loads no Fcntl.
+- It saves the errno and loads Errno only after a refusal. Exit codes: 0 lock, 75 busy, 2 error.
+- One perl path stays for Linux and the Mac (534089ccf: the Mac has no flock(1)).
+
+**Files:** `scripts/direct/file_lock.sh`.
+
+**Workers:** 1 writer; no split (one file). impl: `scripts/direct/file_lock.sh`. test opens as impl.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** AWS pair on the verify modules shows a CPU saving with all tests passing.
