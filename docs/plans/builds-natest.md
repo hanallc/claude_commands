@@ -4345,3 +4345,27 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Tests that extract the function without a helper still start a separate Python (26 of 59 lookups in wait_holder).
 - AWS pair, 9 verify and recorder modules: about 1.5 CPU s less (wait_holder 1.04).
 - Commit 6fd02cc51. Production change; the diff went to sdlc.
+
+### Phase 304 — A cloud gate result keeps one copy and only what natedev reads  · status: done
+**Depends on:** none
+**Owner:** natest (builds approved on 11-15; production change, the diff goes to sdlc).
+
+#### Work Order
+
+**Goal:** a cloud gate result is about 5 MB in one file, not two 20 MB files.
+
+**Spec:**
+- Cause (gate f7bd8f16): outcome.json holds the full remote-result.json inside it. gate.executions equals gate.jobs when no module retried (7.6 MB each). Each job's times carries content_reads, folder_scans, config_reads and all test times; record.modules carries the read lists again.
+- natedev reads from the result: the verdict, the job list, job outputs, time_limit_report and the record. import_record appends the record to the buildlog store; index.py and affected_modules read the read lists from there. No natedev reader uses the lists inside job times.
+- `gate_box.encode_run` sends `executions` only when it differs from `jobs`. `decode_run` reads a missing `executions` as `jobs`.
+- The box keeps in job times only the counts and seconds; it drops the tests, content_reads, folder_scans and config_reads lists. record.modules keeps the one copy natedev reads.
+- outcome.json keeps the status and names remote-result.json; it holds no second copy. Every reader of the outcome result reads that file.
+- `decode_run` and the outcome reader accept the old shapes, because a box runs the tree under test.
+
+**Files:** `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/gate_trial.py`, `scripts/aws_target/gpu_size_trial.py`, and their tests.
+
+**Workers:** 1 writer (the director; no-worker mode).
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the aws_target test modules pass on natedev; one AWS gate trial on HEAD returns a result of about 5 MB and passes; every behavior check stays.

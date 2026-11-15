@@ -216,7 +216,7 @@ class CloudGateTests(CostFixture):
         with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
             outcome = self.execute()
         self.assertEqual(outcome['status'], 'complete')
-        row = ledger.mapping(outcome['result'])
+        row = cloud_gate.outcome_result(self.folder, outcome)
         cloud_gate.validate_result(row, self.request)
         run = gate_box.decode_run(row['gate'])
         self.assertFalse(run.passed)
@@ -249,7 +249,7 @@ class CloudGateTests(CostFixture):
         with mock.patch.object(time, "monotonic", side_effect=lambda: self.now):
             outcome = worker.execute(self.folder, self.request, self.deployment)
         self.assertEqual(outcome['status'], 'complete')
-        result = ledger.mapping(outcome['result'])
+        result = cloud_gate.outcome_result(self.folder, outcome)
         cloud_gate.validate_result(result, self.request)
         run = gate_box.decode_run(result['gate'])
         self.assertTrue(run.passed, run.time_limit_report)
@@ -1086,7 +1086,10 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.fake.result = self.result(1)
         outcome = self.execute()
         self.assertEqual(outcome['status'], 'complete')
-        result = ledger.mapping(outcome['result'])
+        # The outcome names the downloaded result and holds no second copy.
+        self.assertEqual(outcome.get('result_file'), cloud_gate.RESULT_FILE)
+        self.assertNotIn('result', outcome)
+        result = cloud_gate.outcome_result(self.folder, outcome)
         self.assertFalse(gate_box.decode_run(result['gate']).passed)
         self.assertEqual(self.book.launches()[-1]['result'], 'finished')
 
@@ -1376,7 +1379,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
         outcome = self.execute()
         self.assertEqual(outcome['status'], 'complete')
-        self.assertFalse(gate_box.decode_run(ledger.mapping(outcome['result'])['gate']).passed)
+        self.assertFalse(gate_box.decode_run(cloud_gate.outcome_result(self.folder, outcome)['gate']).passed)
 
     def test_expired_instance_without_result_allows_local_fallback(self) -> None:
         self.fake.has_result = False
@@ -1547,7 +1550,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         reply = self.execute()
         self.assertEqual(reply['status'], 'complete')
         self.assertTrue(self.fake.terminated)
-        result = ledger.mapping(reply['result'])
+        result = cloud_gate.outcome_result(self.folder, reply)
         self.assertTrue(all(row['box'] == 'i-fixture' for row in ledger.rows(result, 'runs')))
         self.assertNotIn('record', result)
 
