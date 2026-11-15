@@ -129,7 +129,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Granted\n")
         self.assertNotIn("step refused", result.stderr)
-        self.assertIn("no history, so the fallback", result.stderr)
+        self.assertIn("fixture nextest needs 7.0 GiB; 60.0 GiB free", result.stderr)
         retry = ("memory admission check failed (promoted checker unavailable); trying again, "
                  "the step keeps its place")
         self.assertEqual(result.stderr.splitlines().count(retry), 1)
