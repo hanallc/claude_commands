@@ -22,9 +22,8 @@ class TableData(TypedDict):
     right: list[int]
     rows: list[list[str]]
     region_axis: spot_table.RegionAxis
-    # Rankings of [row, column] cells from the lowest price up: one per type, and one per vCPU count.
+    # Rankings of [row, column] cells from the lowest price up, one per type.
     type_ranks: list[list[list[list[int]]]]
-    group_ranks: list[list[list[list[int]]]]
     # [row, column] cells of a type that the region does not sell.
     not_sold: list[list[int]]
 
@@ -71,7 +70,7 @@ def ranking_data(rankings: tuple[spot_table.Ranking, ...]) -> list[list[list[lis
 def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, 'headers': list(table.headers), 'right': sorted(table.right),
             'rows': [list(row) for row in table.rows], 'region_axis': table.region_axis,
-            'type_ranks': ranking_data(table.type_ranks), 'group_ranks': ranking_data(table.group_ranks),
+            'type_ranks': ranking_data(table.type_ranks),
             'not_sold': [list(cell) for cell in sorted(table.not_sold)]}
 
 

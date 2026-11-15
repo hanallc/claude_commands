@@ -434,14 +434,11 @@ class ControlTests(CostFixture):
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
-        # Every fixture price is equal, so each ranking is one set: the type, or every type with the same vCPU count.
+        # Every fixture price is equal, so each type's ranking is one set.
         prices = data['prices'][0]
         columns = range(1, len(prices['headers']))
         self.assertEqual([row[0] for row in prices['rows']], list(self.regions))
         self.assertEqual(prices['type_ranks'], [[[[row, column] for row in range(len(self.regions))]] for column in columns])
-        self.assertEqual(sorted(cell for ranking in prices['group_ranks'] for ties in ranking for cell in ties),
-                         sorted([row, column] for row in range(len(self.regions)) for column in columns))
-        self.assertEqual([len(ranking) for ranking in prices['group_ranks']], [1] * len(prices['group_ranks']))
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], list(self.regions))
@@ -478,7 +475,7 @@ class ControlTests(CostFixture):
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
 
-    def test_prices_split_gpu_types_and_mark_the_lowest_of_each_type_and_vcpu_count(self) -> None:
+    def test_prices_split_gpu_types_and_mark_the_lowest_of_each_type(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         path = self.state / 'spot-prices.json'
         document = ledger.mapping(cast(object, json.loads(path.read_text())))
@@ -495,11 +492,6 @@ class ControlTests(CostFixture):
         # The lower price ranks first in its type, then the equal prices; a type of equal prices is one set.
         self.assertEqual(standard.type_ranks[0], (frozenset({(row, 1)}), frozenset((index, 1) for index in rows[:-1])))
         self.assertEqual(standard.type_ranks[1], (frozenset((index, 2) for index in rows),))
-        vcpus = {column: deploy.largest_gate_vcpus((size,)) for column, size in enumerate(standard.headers[1:], 1)}
-        peers = {column for column, count in vcpus.items() if count == vcpus[1]}
-        others = {(index, column) for column in vcpus if column not in peers for index in rows}
-        lowest = {cell for ranking in standard.group_ranks for cell in ranking[0]}
-        self.assertEqual(lowest, {(row, 1)} | others)
 
     def test_snapshot_line_is_one_line_only_when_every_region_agrees(self) -> None:
         reads = tuple(spot_table.RegionRead(region, 3364, False, None, 0) for region in ('a', 'b'))

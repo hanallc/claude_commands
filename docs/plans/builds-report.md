@@ -1546,3 +1546,13 @@ From the user (via builds, 2026-11-15): "instead of saying 'not sold here' i thi
 - `aws_prices.html`: a not sold cell shows the lucide `ban` icon with the title `Not sold here`. The Standard and GPU price cards sit side by side and stack below 760 px. `lowestShown` uses only cells in the chosen rows and columns.
 - Proof: `phases/84/proof/before-*` and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width, all regions at phone width).
 - Tests: 44 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 85 — The price tables mark only the lowest price of each type · status: done
+
+From builds (not the user), 2026-11-15: remove the vCPU group mark, the outline and its legend line. The user could not tell what it meant, and the cost per run lines already compare the types.
+
+#### As-built
+
+- `Table.group_ranks` and its page data are gone. `price_table` ranks only each type column (`type_ranks`).
+- `aws_prices.html`: the `.mark` fill is the one mark, and the legend has one line, "lowest price of the type". The terminal table had no marks, so it does not change.
+- Proof: `phases/85/proof/before-*` (the phase 84 after shots) and `after-*`.

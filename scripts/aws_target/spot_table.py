@@ -31,10 +31,8 @@ class Table:
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
     region_axis: RegionAxis
-    # One ranking for each type, and one for all the types with the same vCPU count.
-    # The page marks the first set of each ranking that has a cell in the chosen regions.
+    # One ranking for each type. The page marks the first set of each ranking that has a cell in the chosen regions.
     type_ranks: tuple[Ranking, ...] = ()
-    group_ranks: tuple[Ranking, ...] = ()
     # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
     not_sold: frozenset[tuple[int, int]] = frozenset()
 
@@ -183,7 +181,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
 
 def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], minimum: dict[tuple[str, str], Decimal],
                 notes: Mapping[str, str]) -> Table:
-    """One row per region and one column per type, with the lowest price of each type and of each vCPU count marked."""
+    """One row per region and one column per type, with the lowest price of each type marked."""
     def cell(size: str, region: str) -> str:
         price = minimum.get((region, size))
         note = notes[region]
@@ -192,10 +190,9 @@ def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], mi
     places = {(row, column): (region, size) for row, region in enumerate(regions) for column, size in enumerate(sizes, 1)}
     prices = {place: minimum[key] for place, key in places.items() if key in minimum}
     not_sold = frozenset(place for place, key in places.items() if key not in minimum and not notes[key[0]])
-    groups = {column: largest_gate_vcpus((size,)) for column, size in enumerate(sizes, 1)}
     return Table(title, ('region', *sizes), frozenset(range(1, len(sizes) + 1)),
                  tuple((region, *(cell(size, region) for size in sizes)) for region in regions), 'rows',
-                 ranks(prices, lambda place: place[1]), ranks(prices, lambda place: groups[place[1]]), not_sold)
+                 ranks(prices, lambda place: place[1]), not_sold)
 
 
 def ranks(prices: dict[tuple[int, int], Decimal], group: Callable[[tuple[int, int]], int]) -> tuple[Ranking, ...]:

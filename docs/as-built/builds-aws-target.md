@@ -635,9 +635,10 @@ An unreadable cost ledger shows a note in place of the billed hours.
 
 The AWS prices page shows the same tables, published by `aws_page.publish`.
 The user asked for these page changes on 2026-11-14 through builds:
-1. A price with the lowest value of its type has a fill.
-2. A price with the lowest value of all the types with the same vCPU count has an outline.
-   A cell can have both. Equal prices are all lowest. A legend under the standard prices names both marks.
+1. A price with the lowest value of its type has a fill. Equal prices are all lowest.
+   A legend under the standard prices names the fill.
+2. No mark compares the types with the same vCPU count. Builds removed that outline on 2026-11-15,
+   because the user could not tell what it meant, and the cost per run lines already compare the types.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
    The user asked for the side by side cards on 2026-11-15 through builds.
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
@@ -648,9 +649,9 @@ The user asked for these page changes on 2026-11-14 through builds:
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The fill and the outline mark the lowest price in the chosen regions. `Table.type_ranks` and `Table.group_ranks`
-   hold each type and each vCPU count from the lowest price up, so the page marks the first set that has a chosen region.
-   A type or vCPU count with fewer than two prices in the chosen regions has no mark: one region shows no fill.
+3. The fill marks the lowest price in the chosen regions. `Table.type_ranks` holds each type from the lowest price up,
+   so the page marks the first set that has a chosen region.
+   A type with fewer than two prices in the chosen regions has no mark: one region shows no fill.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
 6. The page keeps the choice in browser storage, with the run kind.
