@@ -465,4 +465,12 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     Until then, add no row.
     Merge callers share `list_ready`, which fetches `origin main` before it adds missing rows.
     A fourth field, `after <step>`, holds the line until the session completes the step and runs `change_review.py live --merged <hash> --step <step>`.
+18. **Work by message** (user, 2026-11-15: the units board showed `no plan`
+    and an empty Queued while units worked on assigned work). The board reads
+    only the run records and `/unit:queue`. Before you start work that arrives
+    by message, open it as a phase in your current run with
+    `progress_history.py start-phase --session-dir "${SESSION_DIR}" --phase-id <short id> --phase-title "<title>"`,
+    then state its ETA with `progress_history.py eta`. Apply <PrepareSession/>
+    when no run is open. Add work that waits behind your current work with
+    `/unit:queue add`, and remove it with `/unit:queue done` when you open it.
 </ProductionUnit>

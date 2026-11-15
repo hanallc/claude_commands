@@ -757,10 +757,14 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `unit_phases.main` submits the census to its read pool with the unit and plan reads, so the reads overlap.
     `census.parse` accepts schema 2 only and returns `Census` with `CensusMachine`, `CensusSession` and `CensusWorker` records, or `CensusFailed(reason)`.
     It reads the top-level `sessions` list and not the `directors` list.
+    A session carries its `CensusShell(name, started_at)` records from the optional `shells` list; a census without the list gives none.
     A worker carries `CensusPass(role, phase)` or `NoPass`, and its `CensusRun` records.
     `census_status` gives the status word of the census session for the unit, or `—` when the word is null.
     The unit's session is the staff row's `current_session`, or the pane Claude's session when the unit has no staff row.
     The words are `busy`, `idle`, `paused` and `exited`; the census gives starting and waiting as activities.
+    `session_state.classify` counts the Claude record state `shell` as busy (user, 2026-11-15: units showed idle while a gate ran).
+    Claude Code writes `shell` when the turn has ended and a background command still runs.
+    The handler tiles read the same word through the accounts command, so the tiles and this table agree.
     A unit whose session is not listed shows `exited` when its machine is a reachable census machine, and `—` otherwise.
     A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
     One census takes 2 s to 4 s on natedev and is the longest read of the table.
@@ -784,6 +788,9 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching phase label at the start of the title appears once, regardless of case or dash.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
+    `unit_phases.checkpoint_sent` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows ` · checkpoint sent, waits to land` in place of the step.
+    `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
+    Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.
     Text equal to the title adds nothing; this comparison ignores case and whitespace.
     Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
