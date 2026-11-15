@@ -628,6 +628,15 @@ The user asked for these page changes on 2026-11-14 through builds:
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
 5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
 
+A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
+1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
+2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
+3. The fill and the outline mark the lowest price in the chosen regions. `Table.row_ranks` and `Table.group_ranks`
+   hold each row and each vCPU count from the lowest price up, so the page marks the first set that has a chosen region.
+4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
+5. A snapshot line for one region shows only when that region is chosen.
+6. The page keeps the choice in browser storage, with the run kind.
+
 ### Billed hours check
 
 The user asked for this check on 2026-11-14 through builds.

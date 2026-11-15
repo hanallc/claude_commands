@@ -1519,3 +1519,18 @@ From builds (not the user), 2026-11-14: the 20:27 hourly vault sync stopped with
 - `vault_pull.mac_git` keeps the unreachable rule. Any other failed transfer calls `failing_machine()`. It runs `git fsck --connectivity-only --no-dangling` on `LOCAL_VAULT` (about 0.3 s). A failed check gives `Machine.NATEDEV`; a good check gives `Machine.MAC`.
 - The failure in the Mac script (`remote_outcome`) still names the Mac.
 - Test `test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged`: a refused fetch names the Mac; after an empty loose commit object on natedev, the same failure names natedev. 46 tests in `test_vault_pull` pass; basedpyright 0/0/0.
+
+### Phase 83 — The AWS prices page filters by region · status: done
+
+From the user (via builds, 2026-11-14): "please add a filter at the top that allows for choosing any combination or all of the regions to narrow the focus of what is visible". From builds (not the user): put it in `aws_page` only, all regions by default, for every section; do not change `console.py`, `console.conf` or `change_page.py`.
+
+#### As-built
+
+- `aws_prices.html`: a sticky `Regions` bar under the title with an `All` chip and one chip for each region in `PageData.regions` (the candidates, plus a region that only the billed hours table shows). A chip toggles its region; the last chosen region stays on. The choice stays in browser storage (`aws-prices-regions`).
+- `spot_table.Table.region_axis` is `columns` for prices, refused, launched and billed hours, and `rows` for quotas and run tables. The page drops the columns or rows of other regions, and shows "Nothing to show in the chosen regions." for a table with nothing left.
+- `Table.row_lowest` and `group_lowest` became `row_ranks` and `group_ranks`: the cells of each row and each vCPU count from the lowest price up, with equal prices in one set (`ranks()`). The page marks the first set with a cell in the chosen regions, so the marks follow the filter.
+- `RunCosts.cheapest` became `estimates`, every candidate estimate cheapest first (`cheapest` is now a property). The page data has `estimates` (region and summary) and `no_estimate`; the cheapest line names the first estimate in the chosen regions.
+- `SpotTables.snapshot_rows` gives (region, line) pairs; one line for all regions has no region. `snapshot_lines` reads them.
+- `/aws_prices` in the terminal does not change.
+- Proof: `phases/83/proof/before-*` (four shots) and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width).
+- Tests: 43 in `test_control` pass; basedpyright 0/0/0.

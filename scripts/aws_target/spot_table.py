@@ -9,11 +9,18 @@ from pathlib import Path
 import shutil
 from statistics import median
 import textwrap
+from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf
+
+
+# Where a table puts its regions: one region in each row (the first column), or in each column after the first.
+RegionAxis = Literal['rows', 'columns']
+# The (row, column) price cells of one group from the lowest price up; equal prices share a set.
+Ranking = tuple[frozenset[tuple[int, int]], ...]
 
 
 @dataclass(frozen=True)
@@ -23,10 +30,11 @@ class Table:
     # The indexes of the columns that hold numbers.
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
-    # The (row, column) cells with the lowest price of their row.
-    row_lowest: frozenset[tuple[int, int]] = frozenset()
-    # The (row, column) cells with the lowest price of all the types with the same vCPU count.
-    group_lowest: frozenset[tuple[int, int]] = frozenset()
+    region_axis: RegionAxis
+    # One ranking for each row, and one for all the types with the same vCPU count.
+    # The page marks the first set of each ranking that has a cell in the chosen regions.
+    row_ranks: tuple[Ranking, ...] = ()
+    group_ranks: tuple[Ranking, ...] = ()
 
 
 def minutes_ago(seconds: int) -> str:
@@ -85,15 +93,22 @@ class RunCosts:
     scope: run_cost.RunScope
     explanation: str
     tables: tuple[Table, ...]
-    cheapest: Cheapest | None
+    # Every estimate of a placement candidate, cheapest first; equal estimates keep the table order.
+    estimates: tuple[Cheapest, ...]
     refused: Table
     launched: Table
 
     @property
+    def cheapest(self) -> Cheapest | None:
+        return self.estimates[0] if self.estimates else None
+
+    @property
     def summary(self) -> str:
-        if self.cheapest is None:
+        return self.summary_of(self.cheapest)
+
+    def summary_of(self, cheapest: Cheapest | None) -> str:
+        if cheapest is None:
             return f'Cheapest {self.scope.noun}: no estimate; the snapshot has no price or the ledger has no runs'
-        cheapest = self.cheapest
         return f'Cheapest {self.scope.noun}: {cheapest.size} in {cheapest.region}, {cheapest.usd:.4f} USD (estimate)'
 
 
@@ -109,12 +124,17 @@ class SpotTables:
     hours_note: str
 
     @property
-    def snapshot_lines(self) -> tuple[str, ...]:
-        """One line when every region has the same snapshot state and minute; else one line per region."""
+    def snapshot_rows(self) -> tuple[tuple[str, str], ...]:
+        """(region, line) pairs: one line with no region when every region has the same snapshot state and minute;
+        else one line per region."""
         details = {read.detail for read in self.regions}
         if len(details) == 1 and not any(read.failure for read in self.regions):
-            return (f'Snapshot {details.pop()}',)
-        return tuple(f'{read.region}: {read.detail}' for read in self.regions)
+            return (('', f'Snapshot {details.pop()}'),)
+        return tuple((read.region, f'{read.region}: {read.detail}') for read in self.regions)
+
+    @property
+    def snapshot_lines(self) -> tuple[str, ...]:
+        return tuple(line for _region, line in self.snapshot_rows)
 
 
 def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None) -> SpotTables:
@@ -167,16 +187,16 @@ def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], mi
               for column, region in enumerate(regions, 1) if (region, size) in minimum}
     groups = {row: largest_gate_vcpus((size,)) for row, size in enumerate(sizes)}
     return Table(title, ('type', *regions), frozenset(range(1, len(regions) + 1)),
-                 tuple((size, *(cell(size, region) for region in regions)) for size in sizes),
-                 lowest(prices, lambda place: place[0]), lowest(prices, lambda place: groups[place[0]]))
+                 tuple((size, *(cell(size, region) for region in regions)) for size in sizes), 'columns',
+                 ranks(prices, lambda place: place[0]), ranks(prices, lambda place: groups[place[0]]))
 
 
-def lowest(prices: dict[tuple[int, int], Decimal], group: Callable[[tuple[int, int]], int]) -> frozenset[tuple[int, int]]:
-    """The cells with the lowest price of their group; equal prices are all lowest."""
-    least: dict[int, Decimal] = {}
+def ranks(prices: dict[tuple[int, int], Decimal], group: Callable[[tuple[int, int]], int]) -> tuple[Ranking, ...]:
+    """For each group in order, its cells from the lowest price up; equal prices share a set."""
+    grouped: dict[int, dict[Decimal, set[tuple[int, int]]]] = {}
     for place, price in prices.items():
-        least[group(place)] = min(least.get(group(place), price), price)
-    return frozenset(place for place, price in prices.items() if price == least[group(place)])
+        grouped.setdefault(group(place), {}).setdefault(price, set()).add(place)
+    return tuple(tuple(frozenset(ties[price]) for price in sorted(ties)) for _key, ties in sorted(grouped.items()))
 
 
 def quota_table(title: str, label: str, field: str, sizes: tuple[str, ...], regions: tuple[str, ...],
@@ -193,7 +213,7 @@ def quota_table(title: str, label: str, field: str, sizes: tuple[str, ...], regi
                      *(f'{int(conf.decimal(ledger.text(reading, field)) // vcpus)} boxes'
                        if reading and vcpus else note or 'unknown vCPU count' for _size, vcpus in fits)))
     return Table(title, ('region', label, *(f'{size} ({vcpus or "?"} vCPUs)' for size, vcpus in fits)),
-                 frozenset(range(1, 2 + len(fits))), tuple(rows))
+                 frozenset(range(1, 2 + len(fits))), tuple(rows), 'rows')
 
 
 def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: frozenset[str], regions: tuple[str, ...],
@@ -219,7 +239,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                        + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
                        + 'so the time comes from the other regions.')
-        cheapest: Cheapest | None = None
+        estimates: list[Cheapest] = []
         headers = ('region', 'Spot USD/h', f'{scope.noun} (minutes)', 'runs', 'estimate', 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []
@@ -235,8 +255,8 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                 estimate = (evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds)
                             if price is not None and seconds else None)
                 # Placement picks only the instance_types, so only they can be the cheapest.
-                if estimate is not None and size in candidates and (cheapest is None or estimate < cheapest.usd):
-                    cheapest = Cheapest(estimate, size, region)
+                if estimate is not None and size in candidates:
+                    estimates.append(Cheapest(estimate, size, region))
                 here = [run for run in runs if (run.instance_type, run.region) == (size, region)]
                 scoped = [run for run in here if run.mode in scope.modes]
                 # Allocations split each bill between both kinds, so only the share of the scope's kinds counts here.
@@ -251,13 +271,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                               f'{paid:.4f}' if paid is not None else unbilled(len(here)),
                               f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' if billed
                               else unbilled(len(scoped)), str(len(billed))))
-            tables.append(Table(size, headers, frozenset(range(1, len(headers))), tuple(table)))
+            tables.append(Table(size, headers, frozenset(range(1, len(headers))), tuple(table), 'rows'))
             refused_rows.append((size, *refused_cells))
             launched_rows.append((size, *launched_cells))
         right = frozenset(range(1, len(counts)))
-        scopes.append(RunCosts(scope, explanation, tuple(tables), cheapest,
-                               Table(f'Refused {scope.noun} requests (capacity and quota)', counts, right, tuple(refused_rows)),
-                               Table(f'Launched {scope.noun} boxes', counts, right, tuple(launched_rows))))
+        scopes.append(RunCosts(scope, explanation, tuple(tables), tuple(sorted(estimates, key=lambda entry: entry.usd)),
+                               Table(f'Refused {scope.noun} requests (capacity and quota)', counts, right,
+                                     tuple(refused_rows), 'columns'),
+                               Table(f'Launched {scope.noun} boxes', counts, right, tuple(launched_rows), 'columns')))
     return tuple(scopes)
 
 
@@ -274,7 +295,7 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tup
     try:
         checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, sizes, max_ratio)
     except ledger.LedgerUnavailable:
-        return Table(title, ('type', *regions), frozenset(), ()), 'No billed hours: the cost ledger is not readable.'
+        return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
     # A region that is no longer a candidate keeps its column while it has hours in the window.
     columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
     rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
@@ -282,7 +303,7 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tup
     note = (f'AWS billed Spot hours / recorded box hours, last {days} days, on the days with a bill. '
             + f'The gap in parentheses is the difference over the box hours. Over: the gap is above {max_ratio:.0%}. '
             + 'Not billed: no day has a bill yet.')
-    return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows), note
+    return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns'), note
 
 
 def hours_cell(check: run_cost.HoursCheck | None) -> str:

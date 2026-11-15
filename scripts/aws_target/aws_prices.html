@@ -67,12 +67,27 @@ thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: va
 .filter button + button { border-left: 1px solid var(--line); }
 .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 .filter button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The region filter stays at the top of the view while the page scrolls. */
+.regions { position: sticky; top: 0; z-index: 3; display: flex; align-items: baseline; gap: 10px; background: var(--bg);
+  padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
+.regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; flex: none; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips button { font: inherit; font-size: 0.84rem; color: var(--ink-2); background: var(--card); border: 1px solid var(--line);
+  border-radius: 999px; padding: 3px 11px; cursor: pointer; }
+.chips button:hover { background: var(--hover); }
+.chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chips .all { font-weight: 600; }
 </style>
 </head>
 <body>
 <main>
 <h1>AWS prices</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
+<nav class="regions" aria-label="Regions to show">
+  <span class="regions-label" id="regions-label">Regions</span>
+  <div class="chips" role="group" aria-labelledby="regions-label" id="regions"></div>
+</nav>
 <div id="prices"></div>
 <div id="quotas"></div>
 <section class="card" id="runs">
@@ -92,7 +107,11 @@ thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: va
 <script>
 "use strict";
 const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
-const STORE_KEY = "aws-prices-scope";
+const SCOPE_KEY = "aws-prices-scope";
+const REGIONS_KEY = "aws-prices-regions";
+const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
+let shown = new Set(data.regions);
+let scope = null;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -101,41 +120,74 @@ function element(tag, text, className) {
   return node;
 }
 
+function remembered(key) {
+  try { return localStorage.getItem(key); } catch (error) { return null; }
+}
+
+function remember(key, value) {
+  try { localStorage.setItem(key, value); } catch (error) { /* The choice is kept only for this view. */ }
+}
+
+// The columns and rows of a table in the chosen regions; the first column always shows.
+function visible(table) {
+  const columns = table.headers.map((_header, index) => index)
+    .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
+  const rows = table.rows.map((_row, index) => index)
+    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]));
+  return { columns, rows };
+}
+
+// For each ranking, the cells of its first set that has a cell in view: the lowest price in the chosen regions.
+function lowestShown(rankings, view) {
+  const columns = new Set(view.columns);
+  const marked = new Set();
+  for (const ranking of rankings || []) {
+    for (const ties of ranking) {
+      const inView = ties.filter(([, column]) => columns.has(column));
+      if (inView.length) { inView.forEach(cell => marked.add(String(cell))); break; }
+    }
+  }
+  return marked;
+}
+
 // Draw tables with the same headers as one grid, so their columns line up; a titled row starts each table.
 function tableElement(tables, titled) {
   const first = tables[0];
   const right = new Set(first.right);
+  const { columns } = visible(first);
   const wrap = element("div", undefined, "scroll");
   const grid = element("table");
   const head = grid.createTHead().insertRow();
-  first.headers.forEach((header, index) => {
+  for (const index of columns) {
     const cell = element("th", undefined, right.has(index) ? "n" : "");
-    const [, name, unit] = header.match(/^(.*?)(?: (\(.*\)))?$/);
+    const [, name, unit] = first.headers[index].match(/^(.*?)(?: (\(.*\)))?$/);
     name.split(" ").forEach((word, position) => cell.append(...(position ? [" "] : []), element("span", word)));
     if (unit) cell.appendChild(element("small", unit));
     cell.scope = "col";
     head.appendChild(cell);
-  });
+  }
   for (const table of tables) {
+    const view = visible(table);
     const body = grid.createTBody();
     if (titled) {
       const title = element("th", table.title, "group");
-      title.colSpan = first.headers.length;
+      title.colSpan = columns.length;
       title.scope = "rowgroup";
       body.insertRow().appendChild(title);
     }
-    const low = new Set((table.row_lowest || []).map(String));
-    const groupLow = new Set((table.group_lowest || []).map(String));
-    table.rows.forEach((row, rowIndex) => {
+    const low = lowestShown(table.row_ranks, view);
+    const groupLow = lowestShown(table.group_ranks, view);
+    for (const rowIndex of view.rows) {
       const line = body.insertRow();
-      row.forEach((value, index) => {
+      for (const index of columns) {
+        const value = table.rows[rowIndex][index];
         const place = String([rowIndex, index]);
         const marks = [low.has(place) ? "low" : "", groupLow.has(place) ? "group-low" : ""].filter(Boolean);
         const cell = element("td", marks.length ? undefined : value, right.has(index) ? "n" : "");
         if (marks.length) cell.appendChild(element("span", value, ["mark", ...marks].join(" ")));
         line.appendChild(cell);
-      });
-    });
+      }
+    }
   }
   wrap.appendChild(grid);
   return wrap;
@@ -148,20 +200,27 @@ function heading(text) {
   return title;
 }
 
+// A table shows when a row and a region of it are in the chosen regions.
+function shows(tables) {
+  return tables.some(table => {
+    const view = visible(table);
+    return view.rows.length && (table.region_axis !== "columns" || view.columns.length > 1);
+  });
+}
+
 function fill(section, table, note) {
   section.replaceChildren(heading(table.title));
   if (note) section.appendChild(element("p", note, "note"));
-  if (table.rows.length) section.appendChild(tableElement([table], false));
+  if (shows([table])) section.appendChild(tableElement([table], false));
+  else if (table.rows.length) section.appendChild(element("p", NOTHING_SHOWN, "note"));
   return section;
 }
 
 function cards(id, tables) {
   const holder = document.getElementById(id);
-  return tables.map(table => {
-    const section = fill(element("section", undefined, "card"), table);
-    holder.appendChild(section);
-    return section;
-  });
+  const sections = tables.map(table => fill(element("section", undefined, "card"), table));
+  holder.replaceChildren(...sections);
+  return sections;
 }
 
 function swatch(marks, text) {
@@ -174,33 +233,47 @@ const published = new Date(data.read_at * 1000);
 document.getElementById("published").textContent =
   `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
 
-const priceCards = cards("prices", data.prices);
-const legend = element("p", undefined, "legend");
-legend.append(swatch(["low"], "lowest price of the type"), swatch(["group-low"], "lowest price of the types with the same vCPU count"));
-priceCards[0].appendChild(legend);
-const snapshot = element("ul", undefined, "snapshot");
-for (const line of data.snapshot) snapshot.appendChild(element("li", line));
-priceCards[priceCards.length - 1].appendChild(snapshot);
-cards("quotas", data.quotas);
-fill(document.getElementById("hours"), data.hours, data.hours_note);
-
 function markOverflow() {
   for (const wrap of document.querySelectorAll(".scroll")) wrap.classList.toggle("overflows", wrap.scrollWidth > wrap.clientWidth + 1);
 }
 addEventListener("resize", markOverflow);
 
+function drawFixed() {
+  const priceCards = cards("prices", data.prices);
+  const legend = element("p", undefined, "legend");
+  legend.append(swatch(["low"], "lowest price of the type"), swatch(["group-low"], "lowest price of the types with the same vCPU count"));
+  priceCards[0].appendChild(legend);
+  const snapshot = element("ul", undefined, "snapshot");
+  for (const line of data.snapshot) if (!line.region || shown.has(line.region)) snapshot.appendChild(element("li", line.text));
+  priceCards[priceCards.length - 1].appendChild(snapshot);
+  cards("quotas", data.quotas);
+  fill(document.getElementById("hours"), data.hours, data.hours_note);
+}
+
 const filter = document.getElementById("filter");
-function showScope(scope) {
+function drawScope() {
   const costs = data.runs.find(entry => entry.scope === scope) || data.runs[0];
   for (const button of filter.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
-  document.getElementById("cheapest").textContent = costs.summary;
+  const cheapest = costs.estimates.find(entry => shown.has(entry.region));
+  document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;
   document.getElementById("explanation").textContent = costs.explanation;
   const tables = document.getElementById("run-tables");
-  tables.replaceChildren(...(costs.tables.length ? [tableElement(costs.tables, true)] : []));
+  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", NOTHING_SHOWN, "note"));
   fill(document.getElementById("refused"), costs.refused);
   fill(document.getElementById("launched"), costs.launched);
+}
+
+function draw() {
+  drawFixed();
+  drawScope();
   markOverflow();
-  try { localStorage.setItem(STORE_KEY, costs.scope); } catch (error) { /* The choice is kept only for this view. */ }
+}
+
+function showScope(next) {
+  scope = next;
+  drawScope();
+  markOverflow();
+  remember(SCOPE_KEY, scope);
 }
 for (const costs of data.runs) {
   const button = element("button", costs.label);
@@ -209,9 +282,40 @@ for (const costs of data.runs) {
   button.addEventListener("click", () => showScope(costs.scope));
   filter.appendChild(button);
 }
-let remembered = null;
-try { remembered = localStorage.getItem(STORE_KEY); } catch (error) { remembered = null; }
-showScope(remembered);
+
+// The region filter: all regions by default, any combination; the last chosen region stays on.
+const chips = document.getElementById("regions");
+const allChip = element("button", "All", "all");
+allChip.type = "button";
+chips.appendChild(allChip);
+const regionChips = data.regions.map(region => {
+  const chip = element("button", region);
+  chip.type = "button";
+  chip.dataset.region = region;
+  chips.appendChild(chip);
+  return chip;
+});
+function showRegions(next) {
+  shown = next;
+  allChip.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+  for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  draw();
+  remember(REGIONS_KEY, JSON.stringify([...shown]));
+}
+allChip.addEventListener("click", () => showRegions(new Set(data.regions)));
+for (const chip of regionChips) {
+  chip.addEventListener("click", () => {
+    const next = new Set(shown);
+    if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
+    if (next.size) showRegions(next);
+  });
+}
+
+let saved = [];
+try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
+const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
+scope = remembered(SCOPE_KEY);
+showRegions(new Set(known.length ? known : data.regions));
 </script>
 </body>
 </html>

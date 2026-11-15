@@ -426,10 +426,19 @@ class ControlTests(CostFixture):
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']], [list(range(1, len(self.regions) + 1))] * 2)
-        # Every fixture price is equal, so every price cell is the lowest of its row and of its vCPU count.
-        cells = [[row, column] for row in range(len(data['prices'][0]['rows'])) for column in range(1, len(self.regions) + 1)]
-        self.assertEqual((data['prices'][0]['row_lowest'], data['prices'][0]['group_lowest']), (cells, cells))
-        self.assertEqual(data['snapshot'], list(tables.snapshot_lines))
+        # Every fixture price is equal, so each ranking is one set: the row, or every row with the same vCPU count.
+        prices = data['prices'][0]
+        columns = range(1, len(self.regions) + 1)
+        self.assertEqual(prices['row_ranks'], [[[[row, column] for column in columns]] for row in range(len(prices['rows']))])
+        self.assertEqual(sorted(cell for ranking in prices['group_ranks'] for ties in ranking for cell in ties),
+                         [[row, column] for row in range(len(prices['rows'])) for column in columns])
+        self.assertEqual([len(ranking) for ranking in prices['group_ranks']], [1] * len(prices['group_ranks']))
+        self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])],
+                         ['columns', 'columns', 'rows', 'rows'])
+        self.assertEqual(data['regions'], list(self.regions))
+        self.assertEqual([line['text'] for line in data['snapshot']], list(tables.snapshot_lines))
+        summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
+        self.assertEqual(summaries, [costs.summary for costs in tables.runs])
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'
@@ -474,13 +483,14 @@ class ControlTests(CostFixture):
                          ([*self.standard, *self.compare], list(self.gpu)))
         column = len(self.regions)
         columns = range(1, column + 1)
-        # The lower price is the only lowest cell of its row; a row of equal prices marks every cell.
-        self.assertEqual({cell for cell in standard.row_lowest if cell[0] == 0}, {(0, column)})
-        self.assertEqual({cell for cell in standard.row_lowest if cell[0] == 1}, {(1, index) for index in columns})
+        # The lower price ranks first in its row, then the equal prices; a row of equal prices is one set.
+        self.assertEqual(standard.row_ranks[0], (frozenset({(0, column)}), frozenset((0, index) for index in columns[:-1])))
+        self.assertEqual(standard.row_ranks[1], (frozenset((1, index) for index in columns),))
         vcpus = [deploy.largest_gate_vcpus((row[0],)) for row in standard.rows]
         peers = {index for index, count in enumerate(vcpus) if count == vcpus[0]}
         others = {(row, index) for row in range(len(vcpus)) if row not in peers for index in columns}
-        self.assertEqual(standard.group_lowest, {(0, column)} | others)
+        lowest = {cell for ranking in standard.group_ranks for cell in ranking[0]}
+        self.assertEqual(lowest, {(0, column)} | others)
 
     def test_snapshot_line_is_one_line_only_when_every_region_agrees(self) -> None:
         reads = tuple(spot_table.RegionRead(region, 3364, False, None, 0) for region in ('a', 'b'))

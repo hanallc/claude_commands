@@ -21,9 +21,21 @@ class TableData(TypedDict):
     headers: list[str]
     right: list[int]
     rows: list[list[str]]
-    # [row, column] cells: the lowest price of the row, and of the types with the same vCPU count.
-    row_lowest: list[list[int]]
-    group_lowest: list[list[int]]
+    region_axis: spot_table.RegionAxis
+    # Rankings of [row, column] cells from the lowest price up: one per row, and one per vCPU count.
+    row_ranks: list[list[list[list[int]]]]
+    group_ranks: list[list[list[list[int]]]]
+
+
+class EstimateData(TypedDict):
+    region: str
+    summary: str
+
+
+class SnapshotLine(TypedDict):
+    # Empty when the line covers every region.
+    region: str
+    text: str
 
 
 class RunCostData(TypedDict):
@@ -31,14 +43,18 @@ class RunCostData(TypedDict):
     label: str
     explanation: str
     tables: list[TableData]
-    summary: str
+    # The summary for each candidate estimate, cheapest first; the page shows the first in the chosen regions.
+    estimates: list[EstimateData]
+    no_estimate: str
     refused: TableData
     launched: TableData
 
 
 class PageData(TypedDict):
     read_at: int
-    snapshot: list[str]
+    # Every region a table shows, for the region filter.
+    regions: list[str]
+    snapshot: list[SnapshotLine]
     prices: list[TableData]
     quotas: list[TableData]
     runs: list[RunCostData]
@@ -46,20 +62,29 @@ class PageData(TypedDict):
     hours_note: str
 
 
+def ranking_data(rankings: tuple[spot_table.Ranking, ...]) -> list[list[list[list[int]]]]:
+    return [[[list(cell) for cell in sorted(ties)] for ties in ranking] for ranking in rankings]
+
+
 def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, 'headers': list(table.headers), 'right': sorted(table.right),
-            'rows': [list(row) for row in table.rows], 'row_lowest': [list(cell) for cell in sorted(table.row_lowest)],
-            'group_lowest': [list(cell) for cell in sorted(table.group_lowest)]}
+            'rows': [list(row) for row in table.rows], 'region_axis': table.region_axis,
+            'row_ranks': ranking_data(table.row_ranks), 'group_ranks': ranking_data(table.group_ranks)}
 
 
 def page_data(tables: spot_table.SpotTables, now: int) -> PageData:
+    # The billed hours table can add a region that is no longer a candidate.
+    regions = dict.fromkeys((*(read.region for read in tables.regions), *tables.hours.headers[1:]))
     return {
         'read_at': now,
-        'snapshot': list(tables.snapshot_lines),
+        'regions': list(regions),
+        'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_data(table) for table in tables.prices],
         'quotas': [table_data(table) for table in tables.quotas],
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
-                  'tables': [table_data(table) for table in costs.tables], 'summary': costs.summary,
+                  'tables': [table_data(table) for table in costs.tables],
+                  'estimates': [{'region': entry.region, 'summary': costs.summary_of(entry)} for entry in costs.estimates],
+                  'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
         'hours': table_data(tables.hours),
