@@ -303,6 +303,26 @@ def census_status(view: CensusView | census.CensusFailed, unit: live_units.LiveU
     return "exited" if (unit.machine or remote.local_machine()) in view.reachable else display_cells.NONE
 
 
+def shell_waits(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit, *, now: float) -> tuple[str, ...]:
+    """Name each background command that the unit's tile shows, as `waiting on <name> <elapsed>`."""
+    if isinstance(view, census.CensusFailed):
+        return ()
+    session_id = _unit_session(unit)
+    session = view.sessions.get(session_id) if session_id is not None else None
+    if session is None:
+        return ()
+    return tuple(single_spaced(f"waiting on {shell.name}"
+                               + ("" if shell.started_at is None else f" {elapsed_text(now - shell.started_at)}"))
+                 for shell in session.shells)
+
+
+def with_waits(notes: str, waits: tuple[str, ...]) -> str:
+    """Append the unit's background command waits to its Notes cell."""
+    if not waits:
+        return notes
+    return " · ".join(waits) if notes == display_cells.NONE else " · ".join((notes, *waits))
+
+
 def census_workers(view: CensusView | census.CensusFailed, member: staff.StaffRow,
                    phase: str | None = None) -> tuple[census.CensusWorker, ...] | census.CensusFailed:
     """Return the unit's census workers, or those whose open pass is in one phase instance."""
@@ -377,12 +397,30 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     return single_spaced(task)
 
 
+CHECKPOINT_SENT = "checkpoint sent, waits to land"
+WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
+
+
+def checkpoint_sent(events: list[dict[str, object]]) -> bool:
+    """A checkpoint after the phase instance's last start of work waits to land."""
+    for event in reversed(events):
+        kind = event.get("event_type")
+        if kind == "checkpoint":
+            return True
+        if kind in WORK_STARTS:
+            return False
+    return False
+
+
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
                      snapshot: staff.StaffSnapshot, now: float) -> str:
     """Show one open phase's work, repair rounds, and open waits."""
-    step = display_cells.open_step([event for event in events if event.get("phase_instance_id") == phase.instance_id])
+    instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
+    step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
-    if isinstance(step, display_cells.OpenStep):
+    if checkpoint_sent(instance):
+        parts.append(CHECKPOINT_SENT)
+    elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
         if text and text.casefold() not in (single_spaced(phase.title).casefold(), label.casefold(),
                                             f"{label} dispatch".casefold()):
@@ -621,6 +659,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         opened: OpenUnitRun | NoOpenUnitRun = NoOpenUnitRun()
         queued_record = record
         status = census_status(view, unit)
+        waits = shell_waits(view, unit, now=now)
         workers = display_cells.NONE
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         run_events: list[dict[str, object]] = []
@@ -672,6 +711,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now)
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
                           if first else display_cells.NONE)
+                if first:
+                    notes = with_waits(notes, waits)
                 phase_workers = census_workers(view, member, phase.instance_id)
                 status_rows.append((unit.unit, status if first else display_cells.NONE,
                                     *((machines[index] if first else display_cells.NONE,) if machines else ()),
@@ -683,6 +724,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             notes = notes_cell(notes_record, read_run=read_run)
             queued = (queued_cell(member.id, queued_record, notes=notes)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
+            notes = with_waits(notes, waits)
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
                                 progress_cell(progress_record), phase_cell(progress_record),
                                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=open_run_phases),
