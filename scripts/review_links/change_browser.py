@@ -291,7 +291,8 @@ def item_html(entry: str) -> str:
     """Show an item that is one backtick span, such as a command, as a code block."""
     whole = change_page.CODE_SPAN.fullmatch(entry.strip())
     if whole is not None:
-        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+        return ('<div class="code-block"><pre><code>' + html.escape(whole.group(1))
+                + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
@@ -658,7 +659,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = r'''
+SCRIPT = page_frame.MOTION_SCRIPT + r'''
+const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
@@ -686,6 +688,7 @@ function bindPage(){
 }
 function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
 function show(){
+ const previous=current;
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
  tab=place.get('showrunner') || '';
@@ -700,10 +703,15 @@ function show(){
  empty.hidden=current!==null;
  empty.textContent=kind==='questions' ? (pending.length ? 'No questions for this showrunner.' : 'No questions to answer.') :
   (pending.length ? 'No changes for this showrunner.' : 'No changes to review.');
- rows.forEach(r=>r.hidden=r!==current);
+ const target=current, cards=rows;
+ const navigationTarget=target?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation');
+ const reveal=()=>{cards.forEach(row=>row.hidden=row!==target);navigationTarget.append(next);};
+ if(previous && previous.dataset.key!==target?.dataset.key && previous.isConnected)
+  void motion.switchCard(previous,target,reveal);
+ else if(previous!==target){motion.finish();reveal();}
+ else if(!previous) reveal();
  // A question has its own Skip, which the server keeps.
  next.hidden=kind==='questions' || !waiting().some(r=>r!==current);
- (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(tab,current.dataset.key);
  // The default place, All with no card, keeps a plain URL.
  history.replaceState(null,'',tab || current ? '#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''}) : location.pathname+location.search);
@@ -725,9 +733,10 @@ async function save(row,form,outcome){
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
  const moveOn=notice=>{
-  row.dataset.pending='false';form.hidden=true;
+  row.dataset.pending='false';
   if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
   else show();
+  motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
  // Works and Does not work show the next change at once; a failed save puts the change back.
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
@@ -755,7 +764,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
   else applyHeldPage();
  }
 }
@@ -780,6 +789,7 @@ function applyHeldPage(){
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ motion.finish();
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
  history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
@@ -815,4 +825,5 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
+                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)

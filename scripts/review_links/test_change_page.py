@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import html
 import os
 import re
 import json
@@ -233,8 +234,22 @@ class ReviewTextTests(unittest.TestCase):
                          'Run <code>a &lt;b&gt;</code> then see <a href="http://h:1/x" target="_top">http://h:1/x</a>'
                          + ' and <code>http://h:1/y</code>')
         self.assertEqual(change_browser.item_list([" `deploy.py up --x <y>` ", "Run `ls` now", "`a` and `b`"]),
-                         '<h2>Items</h2><ol class="question-items"><li><pre><code>deploy.py up --x &lt;y&gt;</code></pre></li>'
+                         '<h2>Items</h2><ol class="question-items"><li><div class="code-block">'
+                         + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
                          + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
+
+    def test_code_copy_markup_keeps_code_text_separate_from_the_control(self) -> None:
+        code = '  first <tag> & value\tsecond  '
+        rendered = change_browser.item_html('`' + code + '`')
+        self.assertIn('<pre><code>' + html.escape(code) + '</code></pre>' + page_frame.COPY_BUTTON, rendered)
+        self.assertEqual(rendered.count(page_frame.COPY_BUTTON), 1)
+        self.assertIn('type="button" data-copy-code aria-label="Copy code" title="Copy"', rendered)
+        inline = change_page.document(change_page.inline_html('Run `sudo systemctl start session.mount`.')).decode()
+        self.assertNotIn(page_frame.COPY_BUTTON, inline)
+        self.assertIn('<code>sudo systemctl start session.mount</code>', inline)
+        plain = '<pre>Keep this proof text.</pre>'
+        self.assertIn(plain, change_page.document(plain).decode())
+        self.assertNotIn(page_frame.COPY_BUTTON, change_page.document(plain).decode())
 
     def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
         parts = update_registration.QuestionParts(
@@ -388,8 +403,9 @@ class ChangePageTests(unittest.TestCase):
         for content in (change_page.render(self.page, status).decode(),
                         change_browser.render(change_page.ReviewBrowser('token'), status).decode()):
             with self.subTest(page=content[:80]):
-                self.assertIn('<pre>Steps</pre><ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>'
-                              + '<pre>Finish. You see: Result</pre>', content)
+                self.assertIn('<pre>Steps</pre>', content)
+                self.assertIn('<ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>', content)
+                self.assertIn('<pre>Finish. You see: Result</pre>', content)
                 self.assertIn('<h2>Question</h2><p>Which steps?</p><ol><li>First</li><li>Second</li></ol>', content)
                 self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
 
@@ -1287,6 +1303,8 @@ class ChangePageTests(unittest.TestCase):
         _ = self.review_list.write_text("".join(lines) + change_review.REVIEWED + reviewed)
         _, _, browser = self.browser()
         page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertEqual(browser.count(page_frame.MOTION_SCRIPT), 1)
+        self.assertIn("prefers-reduced-motion: reduce", browser)
         for body in (browser, page):
             self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
             self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
@@ -1299,6 +1317,107 @@ class ChangePageTests(unittest.TestCase):
             _ = change_page.submit(self.page, urlencode({"token": self.page.token, "row": "C1", "outcome": "works", "feedback": ""}),
                                    change_page.DeliveryStatus(self.root))
         self.assertFalse((self.root / image_store.CHANGE_FOLDER / identity).exists())
+
+    def test_code_copy_controls_reach_command_items_and_shared_assets_reach_both_changes_pages(self) -> None:
+        _ = self.file_user_question('Copy the command?', question='Copy the command?\n1. In a terminal:\n2. `git -C /etc/nixos diff`')
+        question = self.browser('questions')[2]
+        changes = self.browser()[2]
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertIn('<pre><code>git -C /etc/nixos diff</code></pre>' + page_frame.COPY_BUTTON, question)
+        self.assertEqual(question.count(page_frame.COPY_BUTTON), 1)
+        for page in (changes, selected):
+            self.assertIn('<pre>Run moves list. You see: Each group starts at 1</pre>', page)
+            self.assertNotIn(page_frame.COPY_BUTTON, page)
+        for page in (question, changes, selected):
+            with self.subTest(title=page.split('<title>')[1].split('</title>')[0]):
+                self.assertEqual(page.count(page_frame.COPY_SCRIPT), 1)
+                self.assertEqual(page.count(page_frame.COPY_STYLE), 1)
+                self.assertEqual(page.count(page_frame.COPY_BUTTON), page.count('<pre><code>'))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser behavior')
+    def test_code_copy_handles_results_repeated_clicks_and_new_blocks_inside_an_iframe(self) -> None:
+        text = '  first <tag> & value\n\tsecond\n'
+        content = change_page.document('<input id="answer" value="keep this">'
+                                       + change_browser.item_html('`placeholder`').replace('placeholder', html.escape(text))
+                                       + '<p>Keep <code>inline</code> unchanged.</p>').decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[], copied=[], turns=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ const check=(value,text)=>{if(!value) failures.push(text);};
+ const button=document.querySelector('[data-copy-code]'),code=document.querySelector('pre code');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
+ button.click();await turns(0);
+ check(copied[0]===code.textContent,'The clipboard receives the exact code text.');
+ check(button.title==='Copied' && button.getAttribute('aria-label')==='Copied','Success has an accessible label.');
+ check(getComputedStyle(button.querySelector('[data-copy-icon]')).display==='none'
+  && getComputedStyle(button.querySelector('[data-copied-icon]')).display!=='none','Success shows the check icon.');
+ await turns(1200);button.click();await turns(1000);
+ check(button.title==='Copied','A second click restarts the result time.');
+ await turns(1100);
+ check(button.title==='Copy' && button.getAttribute('aria-label')==='Copy code','The result returns to Copy.');
+ navigator.clipboard.writeText=async()=>{throw new Error('Denied');};
+ button.click();await turns(0);
+ check(button.title==='Copy failed' && getComputedStyle(button.querySelector('[data-copy-icon]')).display!=='none','A failed write keeps the copy icon.');
+ await turns(2100);check(button.title==='Copy','A failure returns to Copy.');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:undefined});
+ const field=document.getElementById('answer');field.focus();field.setSelectionRange(1,4);
+ document.execCommand=command=>{copied.push(document.querySelector('textarea').value);return command==='copy';};
+ button.click();await turns(0);
+ check(copied.at(-1)===code.textContent,'The fallback receives the exact code text.');
+ check(button.title==='Copied' && document.activeElement===field && field.selectionStart===1 && field.selectionEnd===4,'The fallback restores focus and the field selection.');
+ check(!document.querySelector('textarea'),'The fallback removes its textarea.');
+ const fresh=document.querySelector('.code-block').cloneNode(true);document.body.append(fresh);
+ fresh.querySelector('code').textContent='new block\n';fresh.querySelector('button').click();await turns(0);
+ check(copied.at(-1)==='new block\n','A new block works without another listener.');
+ document.execCommand=()=>false;button.click();await turns(0);
+ check(button.title==='Copy failed','A failed fallback reports failure.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>'''
+        content = content.replace('</body>', probe + '</body>')
+        complete = threading.Event()
+        results: list[list[str]] = []
+
+        class CopyProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == '/complete':
+                    if not complete.wait(20):
+                        self.send_error(504)
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body = (content if self.path == '/frame' else
+                        '<iframe src="/frame"></iframe><img src="/complete" hidden alt="">')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                _ = self.wfile.write(body.encode())
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), CopyProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / 'copy-profile'
+                profile.mkdir()
+                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
 
     def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
         path = change_page.page_url()
@@ -2703,7 +2822,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("No changes for this showrunner.", body)
         self.assertIn("No changes to review.", body)
         self.assertIn("current===row && (tab==='' || tab===row.dataset.tab) && navigation===position", body)
-        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});", body)
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
@@ -2745,7 +2864,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('value="feedback">Send feedback</button></div></form>', body)
             self.assertNotIn('secondary-actions', body)
         with self.subTest(navigation="Skip joins the action row"):
-            self.assertIn("current?.querySelector('form:not([hidden]) .answer-actions')", body)
+            self.assertIn("target?.querySelector('form:not([hidden]) .answer-actions')", body)
             self.assertIn('.navigation:empty{display:none}', body)
             self.assertNotIn('position:sticky', body)
         with self.subTest(card="title and metadata"):
@@ -2861,7 +2980,7 @@ class ChangePageTests(unittest.TestCase):
    check(tab==='demo','a page load reads the filter from the URL');
    navigate();
    for(const key of ['page-owner/C1','page-owner/C3']){
-    go(key);const actions=[...current.querySelectorAll('button[name=outcome]')];
+    go(key);await motion.settled();const actions=[...current.querySelectorAll('button[name=outcome]')];
     check(current.dataset.key!== 'page-owner/C3' || current.textContent.includes('Showrunner: The proof has three steps.'),'the feedback note appears above the actions');
     check(getComputedStyle(next.parentElement).position==='static','Skip uses the normal flow');
     check(next.parentElement===actions[0].parentElement && actions.every(button=>button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING),'Skip ends the action row');

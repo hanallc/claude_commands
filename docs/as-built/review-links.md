@@ -1004,3 +1004,27 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+
+Changes, Questions, and Images share one motion helper.
+A different Changes or Questions card fades out for 120ms, then fades in for 180ms with a 4px upward move.
+A new switch completes the active switch first.
+The first load and an update that keeps the same card do not fade.
+A new card above the viewport scrolls into view smoothly.
+Image links scroll smoothly to their image, then reveal it over 180ms with a 4px upward move.
+Other image cards stay visible.
+An image fades before removal, and the cards below close the gap over 180ms.
+Reduced motion disables fades and uses instant scrolling.
+
+Questions and Changes show a Lucide copy button inside the top right of each code block.
+The command item renderer emits the button with the code block.
+Plain proof text keeps its `<pre>` block without a copy button.
+Inline code keeps its current style.
+The button copies the code text without the button or its label.
+The button shows a check and the label “Copied” for two seconds after success.
+A second click starts the two seconds again.
+A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
+The shared script uses the clipboard API when available.
+Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
+The fallback restores focus and the previous selection.
+One document listener also handles code blocks from page updates.
