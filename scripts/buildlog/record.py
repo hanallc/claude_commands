@@ -600,9 +600,17 @@ def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
 
 
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    return _keep_compressed(data, _log_relative_path(host, epoch, record_id))
+
+
+def keep_result(data: bytes, host: str, epoch: float, record_id: str) -> str:
+    """Keep a cloud gate result beside its gate run record."""
+    return _keep_compressed(data, f"{host}/{store.RESULTS_DIR}/{store.month(epoch)}/{record_id}.json.gz")
+
+
+def _keep_compressed(data: bytes, relative: str) -> str:
     import gzip
 
-    relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
     if target.is_file():
         _sync_directory(target.parent)
