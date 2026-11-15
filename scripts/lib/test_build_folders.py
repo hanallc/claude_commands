@@ -50,6 +50,23 @@ class BuildFolderTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
 
+    def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        lines = [line for line in settings.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("roots.scratch")]
+
+        def configure(root: Path) -> None:
+            text = "\n".join(f"{line}\nroots.scratch={root}" if line == "[roots]" else line for line in lines)
+            _ = settings.write_text(text + "\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ):
+            del os.environ[copy_record.ROOT_ENV]
+            configure(self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            configure(self.root / "second-root")
+            self.assertEqual(copy_record.root(), self.root / "second-root")
+
     def test_cli_remove_cleans_free_records_and_keeps_a_held_folder(self) -> None:
         allocated = self.command("unique", "--prefix", "remove-cli-")
         self.assertEqual(allocated.returncode, 0, allocated.stderr)
@@ -1418,6 +1435,16 @@ os._exit(0)
                     if process.poll() is None:
                         process.kill()
                     _ = process.communicate(timeout=10)
+
+    def test_a_sweep_without_wait_tries_a_held_lock_once(self) -> None:
+        held = folders.create_build_folder(folders.UniqueBuildFolder("sweep-held-"))
+        self.addCleanup(_release_folder, held)
+        free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
+        _release_folder(free)
+        with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(held.is_dir())
+        self.assertFalse(free.exists())
 
     def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
         for stage in ("folder", "lease", "temporary-lease", "lock"):

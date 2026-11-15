@@ -15,13 +15,12 @@ import sys
 from pathlib import Path
 from typing import TypedDict, cast
 
+from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.hooks.tool_call_text import scan_text
 
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
-CARGO_BUILDS = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                          "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri"})
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
 PREFIX_ARGUMENTS = frozenset({"-u", "--unset", "--user", "-g", "--group", "-n", "--adjustment",
@@ -95,12 +94,7 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
         return False
     if program != "cargo":
         return False
-    if arguments and arguments[0].startswith("+"):
-        arguments = arguments[1:]
-    while arguments and arguments[0].startswith("-"):
-        option = arguments[0]
-        arguments = arguments[2:] if option in {"--config", "--color", "--manifest-path", "-C", "-Z"} else arguments[1:]
-    return bool(arguments and arguments[0] in CARGO_BUILDS)
+    return cargo_subcommand(arguments) in CARGO_BUILD_VERBS
 
 
 def building_command(command: str, *, suite_runner_only: bool = False) -> bool:

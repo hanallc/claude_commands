@@ -8,8 +8,8 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Sequence
-from dataclasses import replace
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
 import json
@@ -21,12 +21,13 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement
+from scripts.aws_target import ledger, measurement, price_days, run_cost
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.notify import push_texts
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -80,16 +81,120 @@ def read_snapshot(directory: Path) -> dict[str, object]:
         return {'prices': [], 'regions': []}
 
 
+@dataclass(frozen=True)
+class SnapshotFailure:
+    region: str
+    at: int
+    read: str
+    error: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SnapshotFailureStreak:
+    since: int
+    notice_claimed: bool
+
+
+@dataclass(frozen=True)
+class SnapshotHealthy:
+    """Every regional read succeeded."""
+
+
+def snapshot_failures(document: dict[str, object]) -> tuple[SnapshotFailure, ...]:
+    """Read the latest failed attempt for each region."""
+    return tuple(SnapshotFailure(ledger.text(row, 'region'), ledger.instant(row, 'at'),
+        ledger.text(row, 'read'), ledger.text(row, 'error'), str(row.get('reason', '')))
+        for row in ledger.rows(document, 'failures')) if 'failures' in document else ()
+
+
+def snapshot_failure_notice(key: str, push: push_texts.RenderedPush, timeout: float) -> bool:
+    """Send a keyed user notice through the existing message interface."""
+    try:
+        result = subprocess.run(push_texts.user_send_argv(push, key=key),
+                                capture_output=True, text=True, check=False, timeout=timeout)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def snapshot_permission_failure(failure: SnapshotFailure) -> bool:
+    """Select permission failures that the gate deployment can repair."""
+    return re.search(r'\b(?:AccessDenied(?:Exception)?|UnauthorizedOperation|not authorized)\b',
+                     failure.error + ' ' + failure.reason, re.IGNORECASE) is not None
+
+
+def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.RenderedPush:
+    """Name each regional permission error and its repair."""
+    lines: list[str] = []
+    for failure in failures:
+        lines.append(f'AWS refused the {failure.region} {failure.read} read.')
+    return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
+
+
+def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
+    """Every type a cloud gate can launch or compare."""
+    return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
+                                *values.words('gpu_instance_types'))))
+
+
+def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:
+    gap = f'{check.hours_gap_ratio:.0%}' if check.hours_gap_ratio is not None else 'all billed hours'
+    return push_texts.render('aws.hours_gap', day=day, size=size, region=region, billed=f'{check.billed_hours or 0:.2f}',
+                             box=f'{check.box_hours:.2f}', gap=gap, limit=f'{limit:.0%}')
+
+
+def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time,
+                      notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
+    """Send one user notice for each gate type, region and UTC day whose billed hours differ from its box hours."""
+    configuration = conf.read(settings_path)
+    limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
+    end = datetime.fromtimestamp(clock(), UTC)
+    start = end - timedelta(days=configuration.whole('run_cost_days'))
+    try:
+        checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
+                                           configuration.text('instance_type'),
+                                           gate_sizes(conf.read_or_repository('cloud_gate')), limit)
+    except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+        print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
+        return 1
+    path = directory / 'hours-gap-notices.json'
+    saved = ledger.mapping(cast(object, json.loads(path.read_text()))).get('claimed') if path.exists() else None
+    # A day before the window is never checked again, so its key is dropped.
+    claimed = {key for key in (cast(list[object], saved) if isinstance(saved, list) else [])
+               if isinstance(key, str) and key.rpartition(':')[2] >= start.date().isoformat()}
+    def save() -> None:
+        write_text_atomic(path, json.dumps({'claimed': sorted(claimed)}) + '\n')
+    status = 0
+    for (size, region, day), check in sorted(checks.items()):
+        key = f'aws-hours-gap:{size}:{region}:{day}'
+        if not check.hours_gap_over or key in claimed:
+            continue
+        # Save the claim before delivery so a slow send never repeats.
+        claimed.add(key)
+        save()
+        if not notify(key, hours_gap_push(day, size, region, check, limit), configuration.number('snapshot_notification_timeout_s')):
+            claimed.discard(key)
+            print(f'aws_target: hours gap notice for {size} in {region} on {day} remains pending', file=sys.stderr)
+            status = 1
+    save()
+    return status
+
+
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
-             clock: Callable[[], float] = time.time) -> int:
-    """Replace successful regional reads and preserve failed regional reads."""
+             clock: Callable[[], float] = time.time,
+             notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
+             force: bool = False) -> int:
+    """Replace successful regional reads and preserve failed regional reads.
+
+    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
     configuration = conf.read(settings_path)
     values = conf.read_or_repository('cloud_gate')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    sizes = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('gpu_instance_types'))))
+    sizes = gate_sizes(values)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / 'spot-prices.lock').open('a+') as lock:
         try:
@@ -102,7 +207,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             last = int(lock.read().strip() or '0')
         except ValueError:
             last = 0
-        if last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
+        if not force and last and 0 <= now - last < configuration.whole('price_refresh_seconds'):
             return 0
         environment = {key: value for key, value in os.environ.items() if key not in (
             'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
@@ -122,7 +227,9 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         prices = list(ledger.rows(document, 'prices'))
         readings = list(ledger.rows(document, 'regions')) if 'regions' in document else []
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
+        failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
             try:
@@ -137,6 +244,8 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
                 readings = [row for row in readings if row.get('region') != region]
                 readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
+                read_prices.extend(regional)
+                _ = failures.pop(region, None)
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
                 raw_lines: list[str] = []
                 for raw_line in str(error).splitlines():
@@ -149,12 +258,41 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     for pattern in SNAPSHOT_ERROR_PATTERNS)), lines[0] if lines else '')
                 reason = admin_secrets.redact(' '.join(error_line.split()))[:reason_limit]
                 print(f'aws_target: snapshot {region} {read_name} unavailable: {type(error).__name__}: {reason}', file=sys.stderr)
+                failures[region] = SnapshotFailure(region, now, read_name, type(error).__name__, reason)
                 status = 1
-        write_text_atomic(directory / 'spot-prices.json', json.dumps(
-            {'prices': prices, 'regions': readings}, sort_keys=True) + '\n')
-        _ = lock.seek(0)
-        _ = lock.truncate()
-        _ = lock.write(str(now))
+        current_failures = tuple(failures[region] for region in regions if region in failures)
+        output: dict[str, object] = {'prices': prices, 'regions': readings, 'failures': [
+            dict(region=row.region, at=row.at, read=row.read, error=row.error, reason=row.reason)
+            for row in current_failures]}
+        # Success drops an unsent notice because no user action remains.
+        streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
+        if current_failures:
+            previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
+            since = ledger.instant(previous, 'since') if previous else now
+            notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
+            streak = SnapshotFailureStreak(since, notice_claimed)
+            output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
+        write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+        try:
+            price_days.record(directory, read_prices, now, configuration.whole('spot_price_days_keep'))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
+            status = 1
+        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
+        if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
+            # Save the claim before delivery because note keys alone do not suppress repeats.
+            output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
+            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
+                          configuration.number('snapshot_notification_timeout_s')):
+                output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
+                write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+                print('aws_target: snapshot user notice remains pending', file=sys.stderr)
+        # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
+        if not force:
+            _ = lock.seek(0)
+            _ = lock.truncate()
+            _ = lock.write(str(now))
         return status
 
 
@@ -269,15 +407,23 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
     return 0
 
 
+def hourly(settings_path: Path, directory: Path) -> int:
+    """Read the Spot prices, then check billed hours against gate box hours; buildlog hourly runs this."""
+    return max(snapshot(settings_path, directory), hours_gap_notices(settings_path, directory))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('tick', 'snapshot', 'serve'))
+    _ = parser.add_argument('command', choices=('tick', 'snapshot', 'serve', 'open-gates'))
     _ = parser.add_argument('--settings', type=Path)
     _ = parser.add_argument('--directory', type=Path)
     _ = parser.add_argument('--hana-settings', type=Path)
     args = parser.parse_args(namespace=RefreshArguments())
+    if args.command == 'open-gates':
+        from scripts.aws_target.open_gates import report
+        return report(args.directory, int(time.time()))
     if args.command == 'snapshot':
-        return snapshot(args.settings, args.directory)
+        return hourly(args.settings, args.directory)
     if args.command == 'serve':
         return serve(args.settings, args.directory, args.hana_settings)
     return controller_tick(args.settings, args.directory, args.hana_settings)

@@ -1417,7 +1417,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)
@@ -1433,7 +1433,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         )
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
+        self.assertIn("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH", remote_words)
         self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
@@ -1515,6 +1515,28 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
 
+
+
+class MirrorExcludeTests(unittest.TestCase):
+    def test_a_symlinked_target_leaves_the_mirror_target_folder_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, cache, mirror = root / "source", root / "cache", root / "mirror"
+            for folder in (source, cache, mirror / "target"):
+                folder.mkdir(parents=True)
+            _ = (source / "lib.rs").write_text("fn main() {}\n", encoding="utf-8")
+            _ = (cache / "gate.o").write_text("gate\n", encoding="utf-8")
+            (source / "target").symlink_to(cache)
+            _ = (mirror / "target" / "mac.o").write_text("mac\n", encoding="utf-8")
+            excludes = root / "excludes"
+            _ = excludes.write_text(offload.MIRROR_EXCLUDES, encoding="utf-8")
+            result = subprocess.run(["rsync", "-rlpc", "--delete", f"--exclude-from={excludes}",
+                                     f"{source}/", f"{mirror}/"], capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((mirror / "target").is_symlink())
+            self.assertEqual((mirror / "target" / "mac.o").read_text(encoding="utf-8"), "mac\n")
+            self.assertEqual((mirror / "lib.rs").read_text(encoding="utf-8"), "fn main() {}\n")
 
 
 class BackoffReadTests(unittest.TestCase):

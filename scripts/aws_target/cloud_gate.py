@@ -8,29 +8,28 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 import json
-import math
 import os
 from pathlib import Path
 import re
 import shlex
-import statistics
 import subprocess
+from statistics import median
 import sys
 import tempfile
 import time
 from typing import Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
+from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges, largest_gate_vcpus
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -286,18 +285,16 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
         return replace(request, place=wire.CloudPlace('aws'))
-    output = admission_client.WaitOutput()
-    reply = admission_client.admit(refresh(), output, refresh)
-    if isinstance(reply, wire.Refused):
-        raise GateRefused(reply.reason)
-    if isinstance(reply, admission_client.LeftQueue):
-        raise GateRefused('The cloud route left the admission queue')
-    reservation = CloudReservation(sidecar)
-    try:
-        yield reservation
-    finally:
-        with cancellation.defer_cleanup_signals():
-            _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
+    with ExitStack() as held_slot:
+        try:
+            held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
+        except queue_place.QueuePlaceRefused as error:
+            raise GateRefused(str(error)) from error
+        reservation = CloudReservation(sidecar)
+        try:
+            yield reservation
+        finally:
+            held.status = reservation.status
 
 
 @dataclass(frozen=True)
@@ -497,7 +494,9 @@ class GateWorker:
 
     def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
                       live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
-        """Prefer available capacity, the configured type order, and the lowest total gate cost."""
+        """Prefer available capacity, then the lowest expected USD per run, then the configured type order.
+
+        A type and region whose median box time is above max_gate_minutes is not tried."""
         values = settings()
         types = values.words('instance_types')
         def type_rank(variant: GateLaunchVariant) -> int:
@@ -506,17 +505,16 @@ class GateWorker:
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
+        days = policy.whole('run_cost_days')
         try:
-            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown))
+            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown, days * 86400))
         except OSError:
             history = ()
         recent = [row for row in history if float(str(row['time'])) <= now]
-        zone_codes = {'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'}
-        quota_codes = {'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded'}
         refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
         zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
-                 for row in refused if row.get('error_code') in zone_codes}
-        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in quota_codes}
+                 for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
+        regions = {str(row.get('region', '')) for row in refused if row.get('error_code') in run_cost.QUOTA_REFUSALS}
         def cooled(variant: GateLaunchVariant) -> bool:
             return variant.region in regions or (variant.region, variant.instance_type, variant.zone) in zones
         try:
@@ -526,33 +524,56 @@ class GateWorker:
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
             prices = {}
         prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+        moment = datetime.fromtimestamp(now, UTC)
+        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
+        cap = values.whole('max_gate_minutes')
+        def median_box_s(variant: GateLaunchVariant) -> Decimal | None:
+            # A type with no measured runs has no median; the lifetime_minutes default is not a measurement.
+            seconds, _own = evidence.box_seconds(variant.instance_type, variant.region, (mode,))
+            return Decimal(median(seconds)) if seconds else None
+        slow = {(variant.instance_type, variant.region): box for variant in variants
+                if (box := median_box_s(variant)) is not None and box > cap * 60}
+        for (size, region), box in sorted(slow.items()):
+            print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
+                  + f'is above max_gate_minutes={cap}.', flush=True)
+        variants = [variant for variant in variants if (variant.instance_type, variant.region) not in slow]
+        try:
+            quotas = {row.region: row for row in ledger.read_spot_quotas(self.book.directory) if 0 <= now - row.read_at <= max_age}
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+            quotas = {}
+        gpu_types = set(values.words('gpu_instance_types'))
+        def quota_vcpus(variant: GateLaunchVariant) -> Decimal | None:
+            row = quotas.get(variant.region)
+            if row is None:
+                return None
+            return row.gpu_vcpus if variant.instance_type in gpu_types else row.standard_vcpus
+        # A region whose Spot quota is below one box refuses every launch of that type; an unread quota is still tried.
+        small = {(variant.instance_type, variant.region): quota for variant in variants
+                 if (quota := quota_vcpus(variant)) is not None
+                 and 0 < (box := largest_gate_vcpus((variant.instance_type,))) and quota < box}
+        for (size, region), quota in sorted(small.items()):
+            print(f'Cloud gate skips {size} in {region}: its Spot quota {quota.normalize():f} vCPUs is below one box '
+                  + f'({largest_gate_vcpus((size,))} vCPUs).', flush=True)
+        variants = [variant for variant in variants if (variant.instance_type, variant.region) not in small]
         if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
             return sorted(variants, key=cooled)
-        durations: list[float] = []
-        for row in recent:
-            if row.get('result') != 'finished' or row.get('mode') != mode or float(str(row['time'])) < now - max_age:
-                continue
-            try:
-                duration = float(str(row['gate_s']))
-                if math.isfinite(duration) and duration > 0:
-                    durations.append(duration)
-            except (ValueError, KeyError, TypeError):
-                continue
-        hours = (Decimal(str(statistics.median(durations))) / 3600 if durations
-                 else Decimal(values.whole('lifetime_minutes')) / 60)
+        default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
         transfer = conf.decimal(values.text('remote_region_transfer_usd'))
         wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
         extra_seconds = {region: conf.decimal(str(seconds)) for region, seconds in
                          ledger.mapping(cast(object, json.loads(values.text('region_extra_gate_seconds')))).items()}
         if any(not region or seconds < 0 for region, seconds in extra_seconds.items()):
             raise ValueError('The regional gate delay must be nonnegative')
-        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, int, bool, Decimal, int]:
+        def order(item: tuple[int, GateLaunchVariant]) -> tuple[bool, bool, Decimal, int, int]:
             position, variant = item
             key = (variant.region, variant.instance_type, variant.zone)
-            cost = (prices[key] * hours + (transfer if variant.region != self.api.region else Decimal(0))
+            # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
+            cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, (mode,), wait_cost,
+                                         default_seconds)
+                    + (transfer if variant.region != self.api.region else Decimal(0))
                     + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
                     if key in prices else Decimal(0))
-            return cooled(variant), type_rank(variant), key not in prices, cost, position
+            return cooled(variant), key not in prices, cost, type_rank(variant), position
         return [variant for _, variant in sorted(enumerate(variants), key=order)]
 
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
@@ -582,6 +603,9 @@ class GateWorker:
                 readings = self.live_spot_prices(variants)
                 live_prices = [price for reading in readings if reading.used for price in reading.prices]
                 variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
+                if not variants:
+                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                    return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes or a Spot quota below one box')
                 launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
                     'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
             save(path, launch)

@@ -261,8 +261,60 @@ def _staff_paths(fields: dict[str, object], row: staff.StaffRow) -> None:
         fields.update(working_dir=str(row.worktree.path), worktree=row.worktree.path.name)
 
 
-def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
-    """Resolve current state through staff and preserve recorded events."""
+class _KnownBranch(NamedTuple):
+    head: str
+    name: str
+
+
+# Each state read resolves the branch; one git start for each HEAD keeps reads cheap.
+_KNOWN_BRANCHES: dict[Path, _KnownBranch] = {}
+
+
+def _head_text(worktree: Path) -> str | None:
+    """Return the HEAD file text of a worktree root, or None when no file names its branch."""
+    marker = worktree / ".git"
+    try:
+        if marker.is_dir():
+            git_dir = marker
+        else:
+            pointer = marker.read_text(encoding="utf-8")
+            if not pointer.startswith("gitdir: "):
+                return None
+            git_dir = worktree / pointer.removeprefix("gitdir: ").strip()
+        head = (git_dir / "HEAD").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # A reftable repository keeps this fixed stub in HEAD whatever the branch.
+    return None if head.startswith("ref: refs/heads/.invalid") else head
+
+
+def _worktree_branch(worktree: Path) -> str:
+    """Return the current branch, or detached@<commit>, and run git again only when HEAD changes."""
+    head = _head_text(worktree)
+    known = _KNOWN_BRANCHES.get(worktree)
+    if head is not None and known is not None and known.head == head:
+        return known.name
+    branch = subprocess.run(["git", "-C", str(worktree), "branch", "--show-current"],
+                            capture_output=True, text=True, check=False)
+    name = branch.stdout.strip()
+    succeeded = branch.returncode == 0
+    if succeeded and not name:
+        commit = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, check=False)
+        name = f"detached@{commit.stdout.strip() or 'unknown'}"
+        succeeded = commit.returncode == 0
+    # A failed git run keeps nothing, so the next read runs git again.
+    if head is not None and succeeded:
+        _KNOWN_BRANCHES[worktree] = _KnownBranch(head, name)
+    return name
+
+
+def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot, *,
+                    pass_agents: bool = True) -> dict[str, object]:
+    """Resolve current state through staff and preserve recorded events.
+
+    pass_agents=False leaves each pass as recorded and finds no worker backend.
+    """
     if fields.get("event_type"):
         return fields
     row = unit_runs.run_owner(fields, record)
@@ -271,20 +323,14 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
     _staff_paths(fields, row)
     if not isinstance(row.worktree, staff.WorktreeUnfilled):
         if not fields.get("event_type"):
-            branch = subprocess.run(["git", "-C", str(row.worktree.path), "branch", "--show-current"],
-                                    capture_output=True, text=True, check=False)
-            fields["branch"] = branch.stdout.strip()
-            if branch.returncode == 0 and not fields["branch"]:
-                commit = subprocess.run(["git", "-C", str(row.worktree.path), "rev-parse", "--short", "HEAD"],
-                                        capture_output=True, text=True, check=False)
-                fields["branch"] = f"detached@{commit.stdout.strip() or 'unknown'}"
+            fields["branch"] = _worktree_branch(row.worktree.path)
     if not fields.get("event_type"):
         main = fields.get("main_agent")
         identity = dict(cast(dict[str, object], main)) if isinstance(main, dict) else {}
         identity.update(session_id=row.current_session, family=_director_family(row))
         fields["main_agent"] = identity
         passes = fields.get("pass")
-        if isinstance(passes, dict):
+        if pass_agents and isinstance(passes, dict):
             for value in cast(dict[str, object], passes).values():
                 if not isinstance(value, dict):
                     continue

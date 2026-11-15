@@ -595,7 +595,7 @@ The old comparison worktree supplies the reference behavior throughout.
 These are engineering estimates; this document reports no new timings.
 The first four ranges add the stated stage estimates without credit for improvements to unrelated stages.
 The final range assumes no broad rule, scope, or ranking-output change.
-Phase 5 removes remaining scans of unchanged groups and avoids repeated calls across all four measured categories.
+Phase 6 removes remaining scans of unchanged groups and avoids repeated calls across all four measured categories.
 Its 2–5 s estimate includes about 1–2 s of dirty-fact work shared by candidates, judgments, and sites.
 It does not add the earlier 1–3 s category ranges unchanged.
 Each phase records actual complete-command time and changed-stage time on the same Mac input before landing.
@@ -639,9 +639,22 @@ It stores proof results, footprints, and built-rename endpoints together at each
 It replaces `_refresh_site_rows` and `_built_renames` reconstruction on the refill path.
 The phase adds finding moves, approval changes, and footprint cases to the comparison.
 
-### Phase 5: complete the maintained selector
+### Phase 5: read stored facts in the selector
 
-Phase 5 adds `refill_groups` and `refill_outputs`.
+Phase 5 removes the repeated work that the warm profile showed in the selector.
+Each footprint reader has a `FootprintRole`, so readers at different commits keep separate stored footprints.
+The coverage read finds its git objects from its own cells (`SYNCED_CELL_OBJECTS`).
+`judged_at_base` reads its stored comparison, ancestry and code facts.
+A stored declaration reading decodes each file's item metadata once.
+`load_rules` reads the repository's manifests once.
+Measured on natedev, paired with the phase base 9e0786fa7 under the same load and MemoryMax=2G:
+base cold 19:18 / 1.73 GB, warm 3:12 / 1.00 GB; phase cold 15:46 / 1.70 GB, warm 0:37 / 0.62 GB.
+All four runs select the same result.
+The warm profile is now flat: the declaration reading is the largest part, at about a third.
+
+### Phase 6: complete the maintained selector
+
+Phase 6 adds `refill_groups` and `refill_outputs`.
 It replaces the remaining per-invocation group rebuilding with changed-group updates.
 It adds completion, renumbering, availability, and publication dependencies.
 It preserves own/count/borrow ordering and both lock intervals.

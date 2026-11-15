@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import TypedDict
 
@@ -150,6 +150,36 @@ def command_words(argv: list[str]) -> list[str]:
     return command_context(argv, os.getcwd(), {})[0]
 
 
+CARGO_BUILD_VERBS = frozenset({
+    "build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r", "bench", "doc", "d",
+    "rustc", "rustdoc", "fix", "install", "miri", "mend",
+})
+CARGO_VALUE_OPTIONS = frozenset({
+    "-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path", "--target-dir", "--target",
+    "-j", "--jobs", "-p", "--package", "--exclude", "-F", "--features", "--profile", "--message-format",
+    "--artifact-dir", "--out-dir",
+})
+
+
+def cargo_subcommand_index(arguments: Sequence[str]) -> int | None:
+    """Find cargo's subcommand with the cargo wrapper's toolchain, option and value rules."""
+    skip_value = False
+    for index, argument in enumerate(arguments):
+        if skip_value:
+            skip_value = False
+        elif argument in CARGO_VALUE_OPTIONS:
+            skip_value = True
+        elif not argument.startswith(("+", "-")):
+            return index
+    return None
+
+
+def cargo_subcommand(arguments: Sequence[str]) -> str:
+    """Return cargo's subcommand from the words after `cargo`, or "" when it has none."""
+    index = cargo_subcommand_index(arguments)
+    return "" if index is None else arguments[index]
+
+
 def step_name(argv: list[str]) -> str:
     """clippy, mend, doc, fmt, nextest, check or sweep; the program otherwise."""
     if any(PurePath(word).name == "sweep.py" for word in argv):
@@ -160,10 +190,7 @@ def step_name(argv: list[str]) -> str:
     program = PurePath(words[0]).name
     if program != "cargo":
         return program
-    rest = words[1:]
-    if rest and rest[0].startswith("+"):
-        rest = rest[1:]
-    return rest[0] if rest else "cargo"
+    return cargo_subcommand(words[1:]) or "cargo"
 
 
 def toolchain(argv: list[str]) -> str | None:

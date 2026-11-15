@@ -18,6 +18,22 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
 GIB = admission_records.GIB
+MIB = 1024 ** 2
+RAM_FIXTURE: dict[str, object] = {
+    "capture_time": 100.0, "attribution_read_at": 100.0, "total_bytes": 64 * GIB, "available_bytes": 30 * GIB,
+    "safety_target_bytes": 4 * GIB, "swap_target_bytes": 2 * GIB, "build_target_bytes": 6 * GIB,
+    "room_bytes": 18 * GIB, "shortfall_bytes": 0, "safety_covered_bytes": 4 * GIB, "swap_covered_bytes": 2 * GIB,
+    "build_covered_bytes": 6 * GIB, "safety_missing_bytes": 0, "swap_missing_bytes": 0, "build_missing_bytes": 0,
+    "builds_bytes": 5 * GIB, "queued_builds_bytes": 3 * GIB, "rust_analyzer_bytes": GIB, "sccache_bytes": 512 * MIB,
+    "other_build_tools_bytes": 512 * MIB, "ci_bytes": 2 * GIB, "agents_bytes": 8 * GIB, "desktop_bytes": 3 * GIB,
+    "desktop_protection_bytes": 2 * GIB, "other_programs_bytes": 4 * GIB, "smaller_programs_bytes": GIB,
+    "smaller_program_count": 5,
+    "programs": [{"id": "firefox", "name": "firefox", "bytes": 2 * GIB}, {"id": "zed", "name": "zed", "bytes": GIB}],
+    "kernel_bytes": 3 * GIB, "compressed_swap_bytes": GIB * 3 // 2, "kernel_structures_bytes": GIB,
+    "kernel_counters_bytes": GIB // 2, "kernel_no_counter_bytes": GIB * 3 // 2, "cache_bytes": 7 * GIB, "unattributed_bytes": 2 * GIB, "missing": [], "agreement": "agree",
+}
+SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * GIB, "builds_ci_bytes": GIB,
+                                   "outside_bytes": 2 * GIB, "reserve_share_percent": 50}
 
 
 def field_values(fields: ElementTree.Element) -> list[str | None]:
@@ -176,8 +192,7 @@ class MemoryHoverTests(unittest.TestCase):
             ("worker", {"worker": "impl2"}, [("showrunner", "builds"), ("unit", "report"), ("worker", "impl2")]),
             ("worker", {"unit": "—", "worker": "staff1"}, [("showrunner", "builds"),
                                                           ("unit", "this run is from the showrunner"), ("worker", "staff1")]),
-            ("unknown", {"showrunner": "owner not recorded", "unit": "owner not recorded"},
-             [("showrunner", "owner not recorded"), ("unit", "owner not recorded")]),
+            ("unknown", {"showrunner": "owner not recorded", "unit": "owner not recorded"}, []),
         ):
             row: dict[str, object] = {"name": "hana nextest", "queued": True, "used": 1, "reserved": 0, "counted": 1,
                                       "progress": {"kind": "NoProgress"}, **owner, "runner": runner, **extra}
@@ -190,6 +205,10 @@ class MemoryHoverTests(unittest.TestCase):
                     rendered = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
                     root = ElementTree.fromstring(f"<root>{rendered}</root>")
                     self.assertEqual(root[0].tag, "b")
+                    if not expected:
+                        self.assertIsNone(root.find("dl[@class='identity']"), rendered)
+                        self.assertNotIn("not recorded", rendered)
+                        continue
                     self.assertEqual(root[1].get("class"), "identity")
                     names = [cell.text for cell in root[1].findall("dt")]
                     values = field_values(root[1])
@@ -214,10 +233,11 @@ class MemoryHoverTests(unittest.TestCase):
             ("", False, "It reserves no memory. Host free memory already accounts for this use."),
         ):
             with self.subTest(keep_text=keep_text, queued=queued):
-                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"read_at": 400, "walk": [{
                     "name": "fixture nextest", "unit": "fixture", "showrunner": "fixture-production", "used": 1,
-                    "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text}]}))
+                    "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text, "started_at": 100}]}))
                 self.assertTrue(hover[1].endswith(expected), hover[1])
+                self.assertTrue(hover[1].startswith("Started 5 min ago. " + (keep_text or "It uses")[0].upper()), hover[1])
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
@@ -253,12 +273,15 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertIn(f"building · {done} of {total} units · {expected} done", str(text))
 
     def test_pressure_percent_uses_one_decimal_and_rounds_down(self) -> None:
-        hover = self.page_expression("[tipText('g-some', data), tipText('g-full', data), tipText('g-swap', data)]", {
-            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5},
-            "swap_used": 1, "swap_total": 3})
-        for expected in ("1.2%", "0.0%", "33.3%", "25.0%", "5.0%"):
-            self.assertIn(expected, str(hover))
-        self.assertIn("Swap use alone does not hold the queue.", str(hover))
+        hover = cast(list[list[str]], self.page_expression(
+            "[tipText('g-some', data), tipText('g-full', data), tipText('g-swap', data)]", {
+            "psi": {"some": 1.29, "full": 0.09}, "limits": {"some": 25, "full": 5}}))
+        self.assertEqual(hover, [
+            ["Some tasks stall · 1.2%", "Memory waits affecting at least one task.\n" +
+             "The reading uses a ten-second average.\nThe queue holds above 25.0%."],
+            ["All tasks stall · 0.0%", "Memory waits affecting all active tasks.\n" +
+             "The reading uses a ten-second average.\nThe queue holds above 5.0%."],
+            ["Swap used · 3.0 GiB", "Swap capacity: 8.0 GiB.\nSwap use alone does not hold the queue."]])
 
     def test_pressure_level_uses_stalls_without_a_swap_limit(self) -> None:
         for some, full, used, pressure, expected in (
@@ -270,7 +293,7 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(some=some, full=full, swap_used=used):
                 result = self.page_expression("level(data)", {
                     "psi": {"some": some, "full": full}, "limits": {"some": 25, "full": 5},
-                    "pressure": pressure, "swap_used": used, "swap_total": 8})
+                    "pressure": pressure, "swap": {**SWAP_FIXTURE, "used_bytes": used * GIB}})
                 self.assertEqual(result, expected)
 
     def test_step_table_uses_the_first_column_for_stage_and_waiting_place(self) -> None:
@@ -405,7 +428,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
-        head = "Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots"
+        head = "Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − kept aside 6.0 GiB) · cloud 2 of 9 slots"
         priority = "queue priority: port (the user's bump)"
         data = {"read_at": 200, "waiters": [
             {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
@@ -418,7 +441,8 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(index=index):
                 hover = str(self.page_expression(f"tipText('wait:{index}', data)", data))
                 self.assertEqual(hover.count(reason), 1)
-                self.assertEqual(hover.count(head), int(index == 0))
+                # The page names kept-aside memory "reserved".
+                self.assertEqual(hover.count(head.replace("kept aside", "reserved")), int(index == 0))
                 self.assertEqual(hover.count(priority), int(index == 0))
                 if index == 0:
                     self.assertNotIn("Needs 1.9 GiB", hover)
@@ -449,7 +473,8 @@ function fitLabels() {}
         javascript = functions + constants + "\nconst data = JSON.parse(require('fs').readFileSync(0, 'utf8'));\n" + (
             "process.stdout.write(JSON.stringify(" + expression + "));\n")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        payload: dict[str, object] = {"walk": [], "waiters": [], "swap_by": [], **cast(dict[str, object], data)}
+        payload: dict[str, object] = {"walk": [], "waiters": [], "swap_by": [], "ram": RAM_FIXTURE,
+                                      "swap": SWAP_FIXTURE, **cast(dict[str, object], data)}
         result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload),
             text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -482,7 +507,133 @@ function fitLabels() {}
         result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
             "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
             "limits":{"some":25,"full":5}, "pressure":"none", "cap":20,
-            "swap_used":0,"swap_total":8,"cap_text":"fixture room"})
+            "cap_text":"fixture room"})
         self.assertIn("neutral", str(result))
         self.assertIn("1.0", str(result))
         self.assertIn("20.0 GiB", str(result))
+
+    def test_the_bar_and_legend_show_the_eleven_blocks_in_order(self) -> None:
+        page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        order = ["builds", "ci", "reserved", "room", "safety", "swap", "agents", "programs", "kernel", "cache",
+                 "unattributed"]
+        bar = page[page.index('<div class="bar">'):page.index('<div class="scale')]
+        legend = page[page.index('<div class="legend">'):page.index('<details class="room-explainer">')]
+        self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], order)
+        self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]],
+                         [*order, "cap", "shortfall", "waiting", "progress"])
+        self.assertIn('<details class="legend-box" open>', page)
+        for removed in ('id="mark"', 'id="marklabel"', "updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText"):
+            self.assertNotIn(removed, page)
+
+    def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:
+        keys = ["builds", "ci", "reserved", "room", "safety", "swap", "agents", "programs", "kernel", "cache",
+                "unattributed", "cap", "budget"]
+        tips = cast(list[list[str]], self.page_expression(
+            "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]", {"cap": 40, "cap_text": "fixture"}))
+        self.assertEqual(dict(zip(keys, tips, strict=True)), {
+            "builds": ["Builds and tools · 5.0 GiB",
+                       "Queued builds: 3.0 GiB.\nrust-analyzer: 1.0 GiB.\nsccache: 0.5 GiB.\nOther build tools: 0.5 GiB."],
+            "ci": ["hana CI · 2.0 GiB", "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
+            "reserved": ["Reserved RAM · 6.0 GiB",
+                         "RAM held for running builds and accepted work.\nReservation target: 6.0 GiB."],
+            "room": ["Next step room · 18.0 GiB", "Available RAM: 30.0 GiB.\n− Safety target: 4.0 GiB.\n" +
+                     "− Swap reserve target: 2.0 GiB.\n− Build reservation target: 6.0 GiB."],
+            "safety": ["Safety and desktop · 7.0 GiB", "Safety reserve: 4.0 GiB; target 4.0 GiB.\n" +
+                       "Desktop programs: 3.0 GiB.\nDesktop protection setting: 2.0 GiB.\n" +
+                       "Protection does not add RAM to this block."],
+            "swap": ["RAM for swap · 2.0 GiB", "RAM held against swap outside builds and CI.\nReserve target: 2.0 GiB."],
+            "agents": ["Agents · 8.0 GiB",
+                       "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."],
+            "programs": ["Other programs · 4.0 GiB",
+                         "firefox: 2.0 GiB\nzed: 1.0 GiB\nand 5 smaller programs: 1.0 GiB"],
+            "kernel": ["Kernel, measured · 3.0 GiB",
+                       "Compressed swap (zram): 1.5 GiB.\nSlab, stacks and page tables: 1.0 GiB.\n" +
+                       "Other kernel counters: 0.5 GiB.\n" +
+                       "Reclaimable kernel cache appears in the cache block."],
+            "cache": ["File and kernel cache · 7.0 GiB", "Estimated cache outside available RAM.\n" +
+                      "Includes file cache and reclaimable kernel cache.\nPrograms can close while their file cache remains."],
+            "unattributed": ["Not attributed · 2.0 GiB", "RAM that the readings do not explain.\n" +
+                             "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
+                             "Memory with no program name: 0.5 GiB."],
+            "cap": ["Queue cap · 40.0 GiB", "Limit for queued builds and hana CI.\nQueued use counted: 3.0 GiB.\n" +
+                    "CI use counted: 2.0 GiB.\nReservations count toward this limit."],
+            "budget": ["RAM budget · 64.0 GiB", "Blocks divide this machine's usable RAM.\n" +
+                       "Available RAM includes cache Linux expects to reclaim.\nReservations use available RAM."],
+        })
+        blocks = cast(int, self.page_expression("RAM_BLOCKS.reduce((sum, [, , amount]) => sum + amount(data.ram), 0)", {}))
+        self.assertEqual(blocks, 64 * GIB)
+
+    def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
+        ram = {**RAM_FIXTURE, "available_bytes": 5 * GIB, "room_bytes": 0, "shortfall_bytes": 3 * GIB,
+               "swap_covered_bytes": GIB, "build_covered_bytes": 0, "swap_missing_bytes": GIB,
+               "build_missing_bytes": 6 * GIB, "rust_analyzer_bytes": 0, "sccache_bytes": 20 * MIB,
+               "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"},
+               "kernel_no_counter_bytes": 0}
+        tips = cast(list[list[str]], self.page_expression(
+            "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('builds', data)," +
+            " ramAmount(0), tipText('unattributed', data)]", {"ram": ram}))
+        self.assertEqual(tips[0], ["Shortfall · 3.0 GiB",
+                                   "Swap reserve missing: 1.0 GiB.\nBuild reservation missing: 6.0 GiB."])
+        self.assertEqual(tips[1], ["Reserved RAM · 0.0 GiB", "RAM held for running builds and accepted work.\n" +
+                                   "Reservation target: 6.0 GiB.\nMissing RAM: 6.0 GiB."])
+        self.assertEqual(tips[2], ["Kernel, measured · unavailable",
+                                   "The latest reading is unavailable.\nThis amount is unknown."])
+        self.assertEqual(tips[3][1], "Queued builds: 3.0 GiB.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
+        self.assertEqual(tips[5], ["Not attributed · 2.0 GiB",
+                                   "RAM that the readings do not explain.\nNo program name is available for this amount."])
+        self.assertEqual(tips[4], "0.0 GiB")
+        empty = {**RAM_FIXTURE, "builds_bytes": 0, "queued_builds_bytes": 0, "rust_analyzer_bytes": 0,
+                 "sccache_bytes": 0, "other_build_tools_bytes": 0}
+        self.assertEqual(self.page_expression("tipText('builds', data)", {"ram": empty}),
+                         ["Builds and tools · 0.0 GiB", "No build program RAM is recorded."])
+
+    def test_the_status_line_names_the_one_reason_a_start_waits(self) -> None:
+        for code, ram, expected in (
+            ("unavailable", RAM_FIXTURE, "Memory reading unavailable; build capacity is unknown."),
+            ("gpu_slot", RAM_FIXTURE, "A GPU test waits: another GPU test holds the GPU test slot."),
+            ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; room is 18.0 GiB."),
+            ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
+             "No room: reserves exceed available RAM by 3.0 GiB."),
+            ("no_room", {**RAM_FIXTURE, "room_bytes": 0},
+             "No room: safety, swap reserves, and build reservations use available RAM."),
+            ("one_running_memory_wait", RAM_FIXTURE, "One build runs; another needs 12.0 GiB, but room is 9.0 GiB."),
+            ("none", RAM_FIXTURE, ""),
+        ):
+            with self.subTest(code=code):
+                status = {"code": code, "active_local_build_count": 1, "next_need_bytes": 12 * GIB,
+                          "check_room_bytes": 9 * GIB}
+                self.assertEqual(self.page_expression("statusLine(data)", {"ram": ram, "memory_status": status}),
+                                 expected)
+
+    def test_swap_rows_use_their_own_text_and_show_one_owner_only(self) -> None:
+        def row(name: str, kind: str, amount: int, **extra: object) -> dict[str, object]:
+            return {"name": name, "detail": "fixture", "swap": amount / GIB, "bytes": amount, "kind": kind,
+                    "pool": "outside", "category": "", "members": [], "owner_count": 0, **extra}
+        rows = [
+            row("Agents (3)", "owner", GIB, category="agents", owner_count=3, showrunner="builds", unit="report"),
+            row("hana nextest", "owner", 3 * MIB, owner_count=1, showrunner="builds", unit="report"),
+            row("2 smaller groups", "smaller", 2048, owner_count=2,
+                members=[{"name": "a", "bytes": 1024}, {"name": "b", "bytes": 1024}]),
+            row("Unclassified groups", "ungrouped", 512),
+            row("Not attributed", "unattributed", 4 * MIB),
+            row("Reading difference", "difference", -2 * MIB),
+            row("All swap used", "total", 3 * GIB, pool="all"),
+        ]
+        tips = cast(list[list[str]], self.page_expression(
+            "[...data.swap_by.map((row, index) => tipText(`swap:${index}`, data)), tipText('swap-pool:outside', data)," +
+            " tipText('swap-pool:builds_ci', data)]", {"swap_by": rows}))
+        self.assertEqual(tips, [
+            ["Agents (3) · 1.0 GiB", "Swap charged to agent sessions and their tools."],
+            ["hana nextest · 3.0 MiB", "Swap charged to this program or build.\nShowrunner: builds\nUnit: report"],
+            ["2 smaller groups · 2.0 KiB", "Combined swap of 2 named groups.\nThe expanded list shows each group."],
+            ["Unclassified groups · 512 B", "Swap charged to groups without a program name."],
+            ["Not attributed · 4.0 MiB", "Swap without a matching group reading."],
+            ["Reading difference · −2.0 MiB",
+             "Group readings exceed the host total.\nThis is an accounting difference, not negative swap."],
+            ["All swap used · 3.0 GiB", "Swap space used across this machine.\n" +
+             "Includes builds, CI, agents, and other programs.\nSome pages can also have RAM copies."],
+            ["Outside builds and CI · 2.0 GiB", "Swap used outside the builds and CI groups.\n" +
+             "Queue reserve share: 50%.\nRAM reserve target: 2.0 GiB."],
+            ["Builds and CI · 1.0 GiB",
+             "Swap used by builds, build tools, and CI.\nThe queue excludes this from its swap reserve target."],
+        ])

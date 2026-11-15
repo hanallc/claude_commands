@@ -44,8 +44,10 @@ class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
 
 
-def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = ()) -> admission_records.QueueRead:
-    inputs = admission_records.QueueInputs([], running, (), admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB),
+def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = (),
+                     host: admission_records.HostMemory | None = None) -> admission_records.QueueRead:
+    host = host or admission_records.HostMemory(30 * admission_records.GIB, 60 * admission_records.GIB)
+    inputs = admission_records.QueueInputs([], running, (), host,
         admission_records.NO_PRESSURE_HOLD, admission_records.ReadyToStart(), admission_records.NoHeadAdmissionOverride(), 200_000)
     return gate.queue_read_from(inputs, admission_policy_fixture())
 
@@ -137,12 +139,52 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
         _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
         _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=self.root / "mac-builds.json"))
         _ = self.enterContext(mock.patch.object(queue_view, "refresh_mac_builds"))
         _ = self.enterContext(mock.patch.object(target_availability, "read_snapshots", return_value=()))
+
+    def test_unplaced_mac_runs_appear_on_the_page_and_send_one_message(self) -> None:
+        from scripts.buildlog import mac_idle
+
+        baseline = captured_reading()
+        for label in ("placement episode/attempt", "user", "hana-ci", "unplaced"):
+            with self.subTest(label=label):
+                build = queue_view.MacBuild(710001, "/Mac/hana", baseline.explanation.now - 30,
+                    "cargo build -p hana", "hana", gate_label=queue_view.parse_gate_label(label),
+                    gate_placement=label.removeprefix("placement ") if label.startswith("placement ") else "")
+                unplaced = (queue_view.UnplacedMacRun(build.pid, build.started_at, build.command),) if label == "unplaced" else ()
+                reading = queue_view.MacBuildReading(baseline.explanation.now, (build,), unplaced_runs=unplaced)
+                notified: set[tuple[int, float]] = set()
+                with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as send,
+                      mock.patch.object(queue_view, "read_mac_builds", return_value=reading),
+                      mock.patch.object(admission_client, "view", return_value=baseline),
+                      mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+                    page = memory_feed.reading()
+                    memory_feed.notify_unplaced_mac_runs(reading, notified)
+                    memory_feed.notify_unplaced_mac_runs(reading, notified)
+                    self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
+                    row = next(row for row in page["walk"] if row["pid"] == build.pid)
+                    self.assertIn(label, row["name"])
+                    if label == "unplaced":
+                        self.assertIn("pid 710001", str(send.call_args))
+                        self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])
+                        first_key = cast(mac_idle.OutageMessage, send.call_args.kwargs["identity"]).key
+                        next_run = queue_view.UnplacedMacRun(build.pid, build.started_at + 0.00001, build.command)
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=(next_run,)), notified)
+                        self.assertEqual(send.call_count, 2)
+                        self.assertNotEqual(first_key, cast(mac_idle.OutageMessage, send.call_args.kwargs["identity"]).key)
+                        newer = (queue_view.UnplacedMacRun(710002, build.started_at, "rustc source.rs"),
+                                 queue_view.UnplacedMacRun(710003, build.started_at, "cargo nextest run"))
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
+                        self.assertEqual(send.call_count, 3)
+                        self.assertIn("pid 710002", cast(str, send.call_args.args[0]))
+                        self.assertIn("pid 710003", cast(str, send.call_args.args[0]))
+                        memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
+                        self.assertEqual(send.call_count, 3)
 
     def configure(self, *, seconds: float = 0.125) -> None:
         source = Path(__file__).resolve().parents[2] / "config/memory_feed.conf"
@@ -298,7 +340,7 @@ process.stdout.write(JSON.stringify({
 
     def test_page_heading_shows_next_step_room_without_a_waiting_count(self) -> None:
         page = self.expected_page()
-        self.assertIn('id="answer" data-tip="answer">Next step room</div>', page)
+        self.assertIn('id="answer" data-tip="room">Next step room</div>', page)
         self.assertNotIn("steps wait", page)
         self.assertNotIn("step waits", page)
 
@@ -528,7 +570,7 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
@@ -639,6 +681,16 @@ process.stdout.write(JSON.stringify({
         for name in ("memory_live.html", "memory.json"):
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
+
+    def test_a_one_time_run_reads_the_mac_but_sends_no_alert(self) -> None:
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+              mock.patch.object(memory_feed, "notify_unplaced_mac_runs") as notify):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+            notify.assert_not_called()
+            with (mock.patch.object(time, "sleep", side_effect=FeedStopped),
+                  self.assertRaises(FeedStopped)):
+                _ = memory_feed.main([])
+        notify.assert_called_once()
 
     def test_restart_replaces_the_served_page_with_configured_timing(self) -> None:
         self.output.mkdir()
@@ -870,9 +922,14 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(rows["system services"]["bytes"], 2 * admission_records.GIB)
         self.assertEqual(rows["hana CI"]["bytes"], admission_records.GIB)
         self.assertEqual(rows[queue_lines.step_text(queued, read_step_names())]["bytes"], admission_records.GIB)
-        self.assertEqual(rows["not in a group"]["bytes"], admission_records.GIB)
-        self.assertEqual(rows["not attributed"]["bytes"], admission_records.GIB)
-        self.assertEqual(rows["Total"]["bytes"], swap.used)
+        self.assertEqual(rows["Unclassified groups"]["bytes"], admission_records.GIB)
+        self.assertEqual(rows["Not attributed"]["bytes"], admission_records.GIB)
+        self.assertEqual(rows["All swap used"]["bytes"], swap.used)
+        self.assertEqual(rows["agent sessions (2)"]["owner_count"], 2)
+        self.assertEqual({name: rows[name]["pool"] for name in ("hana CI", "system services", "Not attributed")},
+                         {"hana CI": "builds_ci", "system services": "outside", "Not attributed": "outside"})
+        self.assertEqual(rows[queue_lines.step_text(queued, read_step_names())]["pool"], "builds_ci")
+        self.assertEqual(swap.builds_ci, 2 * admission_records.GIB)
         self.assertEqual(sum(row["bytes"] for row in swap.rows if row["kind"] != "total"), swap.used)
         self.assertEqual(swap.files_read, sum(reads.values()))
         self.assertTrue(all(count == 1 for count in reads.values()))
@@ -909,7 +966,7 @@ process.stdout.write(JSON.stringify({
         residual = next(row for row in swap.rows if row["kind"] == "unattributed")
         self.assertEqual(residual["bytes"], 7)
         self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
-        self.assertIn("not attributed: 7 B", memory_feed.swap_text(swap.rows))
+        self.assertIn("Not attributed: 7 B", memory_feed.swap_text(swap.rows))
 
     def test_swap_exposes_a_signed_counter_difference_without_changing_owner_values(self) -> None:
         self.host_swap(2 ** 20, 2 ** 20)
@@ -917,8 +974,8 @@ process.stdout.write(JSON.stringify({
         swap = memory_feed.read_swap((), {}, 6, read_step_names())
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap.rows[0]["bytes"], 2 ** 20 + 7)
-        residual = next(row for row in swap.rows if row["kind"] == "unattributed")
-        self.assertEqual(residual["bytes"], -7)
+        residual = next(row for row in swap.rows if row["kind"] == "difference")
+        self.assertEqual((residual["bytes"], residual["name"]), (-7, "Reading difference"))
         self.assertEqual(sum(row["bytes"] for row in swap.rows[:-1]), swap.used)
 
     def test_swap_names_ci_instead_of_the_raw_service_step(self) -> None:
@@ -952,10 +1009,12 @@ process.stdout.write(JSON.stringify({
         self.host_swap(4 * admission_records.GIB, 3 * admission_records.GIB)
         for number in range(3):
             _ = self.cgroup(f"owner-{number}.slice", admission_records.GIB // 2)
-        with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+        gib = admission_records.GIB
+        host = admission_records.HostMemory(30 * gib, 60 * gib, 4 * gib, gib, build_and_ci_swap=0)
+        with mock.patch.object(admission_client, "view", return_value=captured_reading(host=host)):
             page = memory_feed.reading(replace(memory_feed.read_configuration(), swap_rows=1))
-        self.assertEqual(page["swap_used"], 3)
-        self.assertEqual(page["swap_total"], 4)
+        self.assertEqual((page["swap"]["used_bytes"], page["swap"]["capacity_bytes"]), (3 * gib, 4 * gib))
+        self.assertEqual((page["swap"]["builds_ci_bytes"], page["swap"]["outside_bytes"]), (0, 3 * gib))
         self.assertEqual([row["kind"] for row in page["swap_by"]], ["owner", "smaller", "unattributed", "total"])
         self.assertEqual(sum(row["bytes"] for row in page["swap_by"][:-1]), 3 * admission_records.GIB)
         self.assertEqual(page["swap_by"][1]["bytes"], admission_records.GIB)
@@ -1482,47 +1541,126 @@ process.stdout.write(JSON.stringify({
                 for minutes in (45, 19 * 60, 2 * 24 * 60):
                     self.assertIn(queue_view.leftover_age(minutes), text)
 
-    def test_memory_shares_split_other_and_place_swapped_demand_in_free_memory(self) -> None:
-        gib = admission_records.GIB
-        room = gate.memory_room(admission_records.HostMemory(20 * gib, 64 * gib, 32 * gib, 22 * gib), [],
-                                admission_policy_fixture())
-        assert isinstance(room, admission_records.MemoryRoom)
-        for case, total, agents, guarantee, expected in (
-            ("both read", 64.0, True, "2147483648", (2.0, 5.0, 2.0, 5.0, 37.0, "")),
-            ("agents fill other", 26.0, True, "2147483648", (2.0, 5.0, 1.0, 5.0, 0.0, "")),
-            ("agents unavailable", 64.0, False, "2147483648", (2.0, None, 2.0, 0.0, 42.0, "agents' memory unavailable")),
-            ("guarantee unavailable", 64.0, True, "max", (None, 5.0, 0.0, 5.0, 39.0, "desktop guarantee unavailable")),
-        ):
-            with self.subTest(case=case):
-                user = self.root / case
-                write_user_slices(user, agents=agents, guarantee=guarantee)
-                with mock.patch.dict(os.environ, {"BUILDLOG_USER_CGROUP": str(user)}):
-                    shares = memory_feed.memory_shares(total, room, 3.0, 0.0, 0.0)
-                desktop, agents_ram, shown_desktop, shown_agents, other, reason = expected
-                self.assertEqual(shares["desktop_guarantee"], desktop)
-                self.assertEqual(shares["agents_ram"], agents_ram)
-                self.assertEqual(shares["shown_desktop"], shown_desktop)
-                self.assertEqual(shares["shown_agents"], shown_agents)
-                self.assertEqual(shares["other"], other)
-                self.assertIn(reason, shares["slices_unavailable"])
-                self.assertEqual(bool(reason), bool(shares["slices_unavailable"]))
-                self.assertEqual(shares["agents_swap"], 10.0)
-                self.assertEqual(shares["shown_agents_swap"], 10.0)
+    def ram_fixture(self, *, meminfo: bool = True) -> None:
+        """Write private slice, program and kernel readings: agents 5 GiB, desktop 1.5 GiB, Chrome 3 GiB, system 1 GiB.
 
-    def test_swapped_demand_stays_right_of_the_cap_when_reserved_fills_free_memory(self) -> None:
+        The kernel parts are zram 3 GiB, structures 2 GiB and counters 1 GiB; 1 GiB has no counter.
+        """
         gib = admission_records.GIB
-        room = gate.memory_room(admission_records.HostMemory(20 * gib, 64 * gib, 32 * gib, 22 * gib), [],
-                                admission_policy_fixture())
-        assert isinstance(room, admission_records.MemoryRoom)
-        user = self.root / "slices"
-        write_user_slices(user, agents=True, guarantee="2147483648")
-        with mock.patch.dict(os.environ, {"BUILDLOG_USER_CGROUP": str(user)}):
-            shares = memory_feed.memory_shares(64.0, room, 3.0, 0.0, 15.0)
-        cap = room.cap
-        assert isinstance(cap, int)
-        self.assertEqual(shares["shown_agents_swap"], 10.0)
-        self.assertEqual(shares["shown_reserved"], 7.0)
-        self.assertEqual(shares["shown_reserved"], cap / gib)
+        user = self.root / "user"
+        write_user_slices(user)
+        for folder, anonymous in ((user / "app.slice" / "app-com.google.Chrome-41.scope", 2 * gib),
+                                  (user / "app.slice" / "app-google\\x2dchrome@0f.service", gib),
+                                  (self.root / "cgroup" / "system.slice", gib)):
+            folder.mkdir(parents=True, exist_ok=True)
+            _ = (folder / "memory.stat").write_text(f"anon {anonymous}\nshmem 0\n")
+        fields = {"MemTotal": 64 * gib, "MemFree": 10 * gib, "MemAvailable": 20 * gib, "Buffers": gib,
+                  "Cached": 12 * gib, "Shmem": gib, "KReclaimable": 2 * gib, "SUnreclaim": gib,
+                  "KernelStack": gib // 4, "PageTables": gib * 3 // 4, "SecPageTables": 0, "Percpu": gib // 4,
+                  "VmallocUsed": gib // 2, "Active(anon)": 10 * gib, "Inactive(anon)": 10 * gib, "Active(file)": 6 * gib,
+                  "Inactive(file)": 19 * gib, "Unevictable": 0}
+        zram = self.root / "sys" / "block" / "zram0"
+        zram.mkdir(parents=True, exist_ok=True)
+        _ = (zram / "mm_stat").write_text(f"{9 * gib} {2 * gib} {3 * gib} 0 {3 * gib} 0 0 0 0\n")
+        _ = (self.root / "proc" / "vmstat").write_text(f"nr_free_pages 1\nnr_memmap_pages {gib // 2 // os.sysconf('SC_PAGE_SIZE')}\n")
+        if not meminfo:
+            fields = {"MemTotal": 64 * gib}
+        _ = (self.root / "proc" / "meminfo").write_text("".join(f"{name}: {amount // 1024} kB\n" for name, amount in fields.items()))
+
+    @staticmethod
+    def fixture_room(available: int) -> admission_records.MemoryRoom:
+        gib = admission_records.GIB
+        signed = available - 4 * gib - 6 * gib - 2 * gib
+        return admission_records.MemoryRoom(available, 4 * gib, gib, 6 * gib, signed, gib + 2 * gib + available - 6 * gib,
+                                            (), total=64 * gib, ci_use=2 * gib, agent_swap_demand=2 * gib)
+
+    def test_ram_blocks_cover_the_reserves_in_order_and_divide_the_total(self) -> None:
+        gib = admission_records.GIB
+        self.ram_fixture()
+        tools = memory_feed.BuildToolRam(rust_analyzer=4 * gib, sccache=gib // 2, other=gib // 2)
+        for available, covered, missing, room, shortfall in (
+            (20 * gib, (4 * gib, 2 * gib, 6 * gib), (0, 0, 0), 8 * gib, 0),
+            (5 * gib, (4 * gib, gib, 0), (0, gib, 6 * gib), 0, 7 * gib),
+            (3 * gib, (3 * gib, 0, 0), (gib, 2 * gib, 6 * gib), 0, 9 * gib),
+        ):
+            with self.subTest(available=available):
+                blocks = memory_feed.ram_blocks(self.fixture_room(available), tools, 100.0, 1)
+                self.assertEqual((blocks["safety_covered_bytes"], blocks["swap_covered_bytes"],
+                                  blocks["build_covered_bytes"]), covered)
+                self.assertEqual((blocks["safety_missing_bytes"], blocks["swap_missing_bytes"],
+                                  blocks["build_missing_bytes"]), missing)
+                self.assertEqual((blocks["room_bytes"], blocks["shortfall_bytes"]), (room, shortfall))
+                self.assertEqual(sum(missing), shortfall)
+                self.assertEqual(blocks["builds_bytes"], gib + 5 * gib)
+                self.assertEqual(blocks["queued_builds_bytes"], gib)
+                self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
+                self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
+                self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
+                self.assertEqual((blocks["smaller_program_count"], blocks["smaller_programs_bytes"]), (1, gib))
+                self.assertEqual(blocks["other_programs_bytes"], 4 * gib)
+                self.assertEqual((blocks["kernel_bytes"], blocks["cache_bytes"]), (6 * gib, 4 * gib))
+                self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
+                                  blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
+                                 (3 * gib, 2 * gib, gib, gib))
+                shown = (blocks["builds_bytes"] + blocks["ci_bytes"] + blocks["build_covered_bytes"] + blocks["room_bytes"]
+                         + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
+                         + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
+                self.assertEqual(shown, 64 * gib)
+                self.assertEqual((blocks["missing"], blocks["agreement"]), ([], "agree"))
+
+    def test_the_kernel_parts_read_zram_and_the_counters(self) -> None:
+        gib = admission_records.GIB
+        self.ram_fixture()
+        values = memory_feed.meminfo_bytes()
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(3 * gib, 2 * gib, gib, gib))
+        mm_stat = self.root / "sys" / "block" / "zram0" / "mm_stat"
+        mm_stat.unlink()
+        mm_stat.parent.rmdir()
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(0, 2 * gib, gib, 4 * gib))
+        mm_stat.parent.mkdir()
+        _ = mm_stat.write_text("9\n")
+        kernel = memory_feed.kernel_ram(values)
+        self.assertIsInstance(kernel.total, admission_records.ReadingUnavailable)
+        self.assertEqual(kernel.no_counter, 0)
+        (self.root / "proc" / "vmstat").unlink()
+        self.assertIsInstance(memory_feed.kernel_ram(values).counters, admission_records.ReadingUnavailable)
+
+    def test_ram_blocks_name_a_missing_reading_and_a_disagreement(self) -> None:
+        gib = admission_records.GIB
+        self.ram_fixture(meminfo=False)
+        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)
+        self.assertIsInstance(blocks["kernel_bytes"], admission_records.ReadingUnavailable)
+        self.assertIsInstance(blocks["cache_bytes"], admission_records.ReadingUnavailable)
+        self.assertEqual([line.split(":")[0] for line in blocks["missing"]], ["Kernel, measured", "File and kernel cache"])
+        small = replace(self.fixture_room(20 * gib), total=30 * gib)
+        self.ram_fixture()
+        self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)["agreement"], "disagree")
+
+    def test_the_memory_status_names_the_one_reason_a_start_waits(self) -> None:
+        gib = admission_records.GIB
+        explanation = captured_reading().explanation
+        room = self.fixture_room(20 * gib)
+        inputs = explanation.decided_from
+        for code, pressure, captured in (
+            ("none", inputs.pressure, room),
+            ("pressure", admission_records.MemoryPressure(9.0), room),
+            ("unavailable", admission_records.PressureUnavailable("fixture"), room),
+            ("shortfall", inputs.pressure, self.fixture_room(5 * gib)),
+            ("no_room", inputs.pressure, self.fixture_room(12 * gib)),
+        ):
+            with self.subTest(code=code):
+                changed = replace(explanation, decided_from=replace(inputs, pressure=pressure))
+                status = memory_feed.memory_status(changed, captured, 0)
+                self.assertEqual(status["code"], code)
+                self.assertEqual(status["check_room_bytes"], captured.room)
+        waiter: admission_records.Waiter = {"pid": 999, "start_time": "999", "need": gib, "since": inputs.now,
+            "session_id": "waiting", "session_name": "waiting", "unit": "", "step": "check", "folder": "/tree"}
+        waiting = gate.queue_read_from(replace(inputs, ordered=[(Path("waiting"), waiter)]), admission_policy_fixture()).explanation
+        head = waiting.head
+        assert isinstance(head, admission_records.HeadExplanation)
+        gpu_wait = replace(waiting, head=replace(head, cause=admission_records.GpuSlotWait(1, 1)))
+        self.assertEqual(memory_feed.memory_status(gpu_wait, room, 0)["code"], "gpu_slot")
 
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
@@ -1554,7 +1692,7 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
                 self.assertEqual(page["used"], cargo_use / admission_records.GIB)
-                self.assertEqual(page["other"], python_use / admission_records.GIB)
+                self.assertEqual(page["ram"]["other_build_tools_bytes"], python_use)
                 build_rows = [row for row in page["walk"] if not row.get("ci", False)]
                 self.assertEqual(len(build_rows), int(bool(cargo_use)))
                 self.assertEqual(page["leftovers"], [])
@@ -1696,10 +1834,12 @@ process.stdout.write(JSON.stringify({
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:
-    """Write private session.slice and app-agents.slice readings: 6 GiB agents with 1 GiB inactive cache."""
+    """Write private session.slice and app-agents.slice readings: 1.5 GiB desktop, 6 GiB agents with 1 GiB inactive cache."""
     gib = admission_records.GIB
     (user / "session.slice").mkdir(parents=True, exist_ok=True)
     _ = (user / "session.slice" / "memory.min").write_text(f"{guarantee}\n")
+    _ = (user / "session.slice" / "memory.current").write_text(f"{gib * 3 // 2}\n")
+    _ = (user / "session.slice" / "memory.stat").write_text(f"anon {gib * 3 // 2}\nshmem 0\ninactive_file 0\n")
     if agents:
         agents_slice = user / "app.slice" / "app-agents.slice"
         agents_slice.mkdir(parents=True, exist_ok=True)

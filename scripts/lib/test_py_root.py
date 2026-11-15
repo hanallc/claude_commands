@@ -332,28 +332,28 @@ class PythonRootTests(unittest.TestCase):
                 "EXPECTED_CHECKOUT": str(selected), "CONF_DIR": str(selected / "config"),
                 "XDG_CACHE_HOME": str(base / "cache"), "BUILDLOG_SCOPE": "0",
             }
-            for regular in (False, True):
-                if regular:
-                    for package in ('build_targets', 'mac_test'):
-                        _ = (other / "scripts" / package / "__init__.py").write_text("")
-                for arguments in (["-m", "unittest", "scripts.build_targets.test_copy_imports"], [str(wrapper)]):
-                    for child in ("shim", "plain"):
-                        with self.subTest(regular=regular, arguments=arguments, child=child):
-                            launch = (["-c", "import os, sys; os.execv(sys.argv[1], sys.argv[1:])",
-                                       str(selected / "scripts/lib/py"), *arguments] if child == "shim" else
-                                      ["-c", "import os, sys; os.execv(sys.executable, [sys.executable, *sys.argv[1:]])",
-                                       *arguments])
-                            result = subprocess.run(
-                                [str(other / "scripts/lib/py"), *launch], cwd=selected,
-                                env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
-                            )
-                            self.assertIn("IMPORTS=", result.stdout)
-                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                with self.subTest(regular=regular, child="detached"):
-                    result = subprocess.run(
-                        [str(other / "scripts/lib/py"), str(detached),
-                         "-m", "unittest", "scripts.build_targets.test_copy_imports"], cwd=selected,
-                        env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
-                    )
-                    self.assertIn("IMPORTS=", result.stdout)
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # The other copy has regular packages, which import before any namespace portion.
+            # A namespace copy caught no startup break that this copy misses.
+            for package in ('build_targets', 'mac_test'):
+                _ = (other / "scripts" / package / "__init__.py").write_text("")
+            for arguments in (["-m", "unittest", "scripts.build_targets.test_copy_imports"], [str(wrapper)]):
+                for child in ("shim", "plain"):
+                    with self.subTest(arguments=arguments, child=child):
+                        launch = (["-c", "import os, sys; os.execv(sys.argv[1], sys.argv[1:])",
+                                   str(selected / "scripts/lib/py"), *arguments] if child == "shim" else
+                                  ["-c", "import os, sys; os.execv(sys.executable, [sys.executable, *sys.argv[1:]])",
+                                   *arguments])
+                        result = subprocess.run(
+                            [str(other / "scripts/lib/py"), *launch], cwd=selected,
+                            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                        )
+                        self.assertIn("IMPORTS=", result.stdout)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with self.subTest(child="detached"):
+                result = subprocess.run(
+                    [str(other / "scripts/lib/py"), str(detached),
+                     "-m", "unittest", "scripts.build_targets.test_copy_imports"], cwd=selected,
+                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertIn("IMPORTS=", result.stdout)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -36,13 +36,17 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
+# Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
+TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+
+
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (existing, overrides):
+    for layer in (TEST_CONFIG_DEFAULTS.get(source.name, ""), existing, overrides):
         previous = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -86,16 +90,35 @@ def write_config_fault(path: Path, source: str) -> int:
     return path.write_text("\n".join(lines) + "\n")
 
 
+class ConfigFixtureRefused(ValueError):
+    """The configuration folder is not a private folder that only the test owns."""
+
+
 def commit_config_fixture(path: Path) -> None:
-    """Give the private configuration a known-good git revision for fault tests."""
+    """Give the private configuration a known-good git revision for fault tests.
+
+    The folder must be under the temporary root and outside every other git repository.
+    No caller GIT_* variable reaches git, so the commit can go only to the folder's own repository.
+    """
     import subprocess
+    import tempfile
     from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-    environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    folder = path.parent.resolve()
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if folder == temporary_root or not folder.is_relative_to(temporary_root):
+        raise ConfigFixtureRefused(f"{folder} is not a private folder under {temporary_root}")
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment |= {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    enclosing = subprocess.run(["git", "-C", str(folder), "rev-parse", "--show-toplevel"], capture_output=True,
+                               text=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
+    if enclosing.returncode == 0 and Path(enclosing.stdout.strip()).resolve() != folder:
+        raise ConfigFixtureRefused(f"{folder} is inside the git repository {enclosing.stdout.strip()}")
+    environment |= {"GIT_DIR": str(folder / ".git"), "GIT_WORK_TREE": str(folder)}
     for arguments in (("init", "-q"), ("config", "user.name", "Config fixture"),
                       ("config", "user.email", "fixture@example.invalid"),
                       ("add", path.name), ("commit", "-qm", "known good configuration")):
-        _ = subprocess.run(["git", "-C", str(path.parent), *arguments], check=True,
+        _ = subprocess.run(["git", "-C", str(folder), *arguments], check=True,
                            capture_output=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
 
 
@@ -108,7 +131,10 @@ def config_environment(root: Path) -> dict[str, str]:
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes(_template(name).read_bytes())
+            if name in TEST_CONFIG_DEFAULTS:
+                _ = write_config_fixture(destination)
+            else:
+                _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder)}
 
 

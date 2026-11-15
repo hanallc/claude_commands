@@ -39,6 +39,7 @@ from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSourc
                             codex_credits, reset_credits)
 from scripts.whoami.agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
+from scripts.whoami.notes_state_test_support import private_notes_state
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
@@ -109,7 +110,7 @@ class AgentNotesTests(unittest.TestCase):
         _ = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         _ = os.environ.pop("CODEX_HOME", None)
         _ = self.enterContext(patch.object(note_file, "AGENTS_DIR", self.root))
-        _ = self.enterContext(patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl", create=True))
+        _ = self.enterContext(private_notes_state(self.root))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         self.rows = cast(MagicMock, self.enterContext(patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset()))))
         _ = self.enterContext(patch("scripts.message.sessions.live_sessions", return_value=[]))

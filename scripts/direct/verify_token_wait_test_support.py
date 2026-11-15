@@ -508,7 +508,10 @@ esac
 
         admission.server.host_probe = provider
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
-        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"}
+        # The provider ends the hold at the next host probe, which comes with the next routing pass.
+        # A short pass interval keeps the waiter from sleeping the default 15 seconds before that probe.
+        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                "BUILD_TARGETS_POLL_S": "0.5"}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
         with output.open("wb") as stream:

@@ -242,9 +242,10 @@ def _open_lock(path: Path, directory: int, *, create: bool) -> int:
         raise
 
 
-def _take_lock(descriptor: int, mode: int) -> bool:
+def _take_lock(descriptor: int, mode: int, *, wait: bool = True) -> bool:
+    """Try the lock until the configured probe wait ends, or once when wait is False."""
     settings = _settings()
-    deadline = time.monotonic() + settings.number("locks.probe_wait_seconds")
+    deadline = time.monotonic() + (settings.number("locks.probe_wait_seconds") if wait else 0.0)
     retry = settings.number("locks.probe_retry_seconds")
     while True:
         try:
@@ -533,14 +534,14 @@ def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
 
 
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None) -> bool:
+                        dir_fd: int | None = None, wait: bool = True) -> bool:
     """Run cleanup under the free folder's lock, then remove temporary metadata."""
     with ExitStack() as parents:
         directory = dir_fd if dir_fd is not None else parents.enter_context(
             _folder_parent(path, path.parent, create=False))
         descriptor = _open_lock(path, directory, create=True)
         try:
-            if not _take_lock(descriptor, fcntl.LOCK_EX):
+            if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
                 return False
             if not _lock_current(path, directory, descriptor):
                 return False
@@ -564,8 +565,9 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                             temporary=temporary, dir_fd=directory)
 
 
-def sweep_temporary_build_folders(parent: Path) -> None:
-    """Remove free allocations in a parent reserved for temporary maker folders."""
+def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
+    """Remove free allocations in a parent reserved for temporary maker folders.
+    With wait False, a held folder costs one lock try, not the probe wait."""
     try:
         with _folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
@@ -583,7 +585,7 @@ def sweep_temporary_build_folders(parent: Path) -> None:
                         return
                     _remove_folder(path, directory, allocated)
 
-                _ = remove_build_folder(path, cleanup, dir_fd=directory)
+                _ = remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
     except FileNotFoundError:
         pass
 
