@@ -35,7 +35,7 @@ from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import send_budget, session_send
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lib import conf
+from scripts.lib import conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.mac_test import floor_claims
@@ -265,6 +265,7 @@ class SweepCase(unittest.TestCase):
             **config_environment(state / "config"),
             tmp_sweep.STATE_ENV: str(state / "sweep"),
             "BUILDLOG_DIR": str(state / "buildlog"),
+            copy_record.ROOT_ENV: str(state / "scratch"),
         })))
         skip_host_ci_targets(state)
 
@@ -1298,6 +1299,51 @@ class FloorTests(SweepCase):
         self.assertCountEqual(outputs.workspaces, (
             CargoOutputRoots(workspace, target, build), CargoOutputRoots(fallback, other, other),
         ))
+
+    def scratch_task(self, base: Path, name: str) -> CargoOutputRoots:
+        """A scratch task checkout whose Cargo build folder is outside the scratch root."""
+        workspace = base / "scratch" / name
+        workspace.mkdir(parents=True)
+        _ = (workspace / "Cargo.toml").write_text("[package]\n")
+        tree, _ = cargo_target(base / "cargo", name, APP, time.time() - DAY)
+        return CargoOutputRoots(workspace, workspace / "target", tree.parent)
+
+    def test_an_unrecorded_scratch_checkout_maps_through_one_cargo_read(self) -> None:
+        base = self.base()
+        task = self.scratch_task(base, "task")
+        member = task.workspace_root / "member"
+        member.mkdir()
+        _ = (member / "Cargo.toml").write_text("[package]\n")
+        with (mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(base / "scratch")}),
+              mock.patch.object(sweep, "read_cargo_output_roots", return_value=task) as read):
+            roots, outputs = sweep.discover_cargo_outputs([str(base / "scratch"), str(base / "cargo")],
+                                                          lint_settings=conf.read("lint"))
+        read.assert_called_once_with(task.workspace_root)
+        self.assertIn(task, outputs.workspaces)
+        self.assertIn(str(task.build_directory), roots)
+        self.assertEqual(outputs.no_recorded_evidence, ())
+
+    def test_a_recorded_scratch_checkout_and_other_checkouts_read_no_cargo(self) -> None:
+        base = self.base()
+        task = self.scratch_task(base, "task")
+        self.root_row(task.workspace_root, task.build_directory, task.build_directory)
+        outside = base / "outside"
+        outside.mkdir()
+        _ = (outside / "Cargo.toml").write_text("[package]\n")
+        with (mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(base / "scratch")}),
+              mock.patch.object(sweep, "read_cargo_output_roots") as read):
+            _ = sweep.discover_cargo_outputs([str(base)], lint_settings=conf.read("lint"))
+        read.assert_not_called()
+
+    def test_floor_roots_add_the_scratch_root_only_outside_the_configured_roots(self) -> None:
+        from scripts.copies import copies
+
+        settings = conf.read("lint")
+        configured = (*settings.words("sweep_floor_roots"), str(copies.gates_root()))
+        for scratch, expected in (("/build/claude/scratch", (*configured, "/build/claude/scratch")),
+                                  ("/tmp/claude/scratch", configured)):
+            with self.subTest(scratch=scratch), mock.patch.dict(os.environ, {copy_record.ROOT_ENV: scratch}):
+                self.assertEqual(sweep.floor_roots(lint_settings=settings), expected)
 
     def test_recorded_step_kinds_supply_floor_targets_without_running_cargo(self) -> None:
         base = self.base()

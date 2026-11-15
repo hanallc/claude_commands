@@ -24,6 +24,7 @@ from scripts.buildlog import store
 from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
+from scripts.lib import copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import config_environment
@@ -42,12 +43,22 @@ class DiskTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
         self.enterContext(mock.patch.dict(os.environ, {
             "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
+            copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    def test_scanned_folders_add_the_scratch_root_only_outside_the_folders(self) -> None:
+        base = self.base()
+        folders = [("tmp", str(base / "tmp"))]
+        for scratch, expected in ((base / "build" / "scratch", [*folders, ("scratch", str(base / "build" / "scratch"))]),
+                                  (base / "tmp" / "scratch", folders)):
+            with (self.subTest(scratch=scratch), mock.patch.object(disk, "FOLDERS", folders),
+                  mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch)})):
+                self.assertEqual(disk.scanned_folders(), expected)
 
     def test_linux_capacity_checks_the_external_output_device(self) -> None:
         base = self.base()
@@ -317,6 +328,7 @@ class DiskTests(unittest.TestCase):
             with (
                 self.subTest(previous=label),
                 mock.patch.object(disk, "FOLDERS", [("first", "first"), ("second", "second")]),
+                mock.patch.dict(os.environ, {copy_record.ROOT_ENV: "first/scratch"}),
                 mock.patch.object(disk, "read_floor", return_value=None),
                 mock.patch.object(disk, "read_snapshot", return_value=previous),
                 mock.patch.object(disk, "datetime", wraps=datetime, now=clock),
