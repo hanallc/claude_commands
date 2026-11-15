@@ -295,6 +295,7 @@ REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 NO_WORKER_MODE_SENDER = "quota-alert"
+NO_WORKER_MODE_FYI = "FYI, no action:"
 KILL_GRACE = 10
 
 
@@ -707,15 +708,36 @@ def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) 
             print(f"quota-alert: {what} failed: exit {result.returncode}")
 
 
+def _worker_mode_text(active: bool) -> str:
+    return quota_state.no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
+
+
 def _broadcast_worker_mode(active: bool) -> None:
-    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers."""
+    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers.
+
+    Each producer in `no_worker_mode_fyi` gets one copy marked as information only.
+    """
     def notice() -> list[str]:
-        text = quota_state.no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
+        text = _worker_mode_text(active)
         return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
 
     _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
+    try:
+        producers = conf.read("accounts").text("no_worker_mode_fyi").split()
+    except conf.Unusable as error:
+        print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
+        producers = []
+    for producer in producers:
+        _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
     if active:
         _start_detached("Codex worker stop", "production/worker_capacity.py", lambda: ["stop"])
+
+
+def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
+    def arguments() -> list[str]:
+        return ["--to", producer, "--from", NO_WORKER_MODE_SENDER,
+                "--text", f"{NO_WORKER_MODE_FYI} {_worker_mode_text(active)}"]
+    return arguments
 
 
 def _start_no_worker_mode(state: State) -> bool:

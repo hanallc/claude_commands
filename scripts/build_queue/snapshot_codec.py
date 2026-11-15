@@ -104,6 +104,39 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
     return record
 
 
+GPU_SLOT_SUFFIX = "_gpu_slot"
+
+
+@lru_cache(maxsize=None)
+def wait_reason_fields(schema: type) -> frozenset[str]:
+    """Name the fields that accept a wait behind the head, so an older client reads a GPU slot wait there."""
+    return frozenset(name for name, hint in snapshot_fields(schema).items()
+                     if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
+
+
+def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
+    """Older clients at 7fdfd9a6a have no GPU slot wait, so they read it as a wait behind the slot."""
+    shaped = dict(record)
+    for key in wait_reason_fields(schema):
+        item = record.get(key)
+        if isinstance(item, dict) and cast(dict[str, object], item).get("kind") == "GpuSlotWait":
+            wait = cast(dict[str, object], item)
+            shaped[key] = {"kind": "BehindHead", "head_name": f"the GPU test slot ({wait['used']} of {wait['slots']} in use)",
+                           "joined_at": 0.0, "head_session_id": ""}
+            shaped[key + GPU_SLOT_SUFFIX] = wait
+    return shaped
+
+
+def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
+    """Restore each GPU slot wait that the writer kept beside its older shape."""
+    shaped = dict(record)
+    for key, item in record.items():
+        if key.endswith(GPU_SLOT_SUFFIX) and key.removesuffix(GPU_SLOT_SUFFIX) in record:
+            shaped[key.removesuffix(GPU_SLOT_SUFFIX)] = item
+            del shaped[key]
+    return shaped
+
+
 def snapshot_value(value: object) -> object:
     """Convert each shared record once within this encoding."""
     converted: dict[int, object] = {}
@@ -117,9 +150,9 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = legacy_pressure_shape(wire_record(type(item),
+            result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
                 {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
-                 for name in record_field_names(type(item))}}, writing=True))
+                 for name in record_field_names(type(item))}}, writing=True)))
         elif isinstance(item, Mapping):
             result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
         elif isinstance(item, frozenset):
@@ -190,7 +223,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
-    record = wire_record(schema, record, writing=False)
+    record = current_wait_shape(wire_record(schema, record, writing=False))
     if schema.__name__ == "MemoryPressure" and record.get("condition") == "swap":
         record = {**record, "condition": "some"}
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING

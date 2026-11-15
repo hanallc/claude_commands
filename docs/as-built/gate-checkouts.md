@@ -191,7 +191,7 @@ The command's exit status is returned, and its output passes through.
 `--publish PATH` copies a built file out of the checkout after the command returns.
 The option can repeat. Each PATH is relative to the checkout.
 The copy occurs while `standing()` still holds the lease, so it follows the `target` symlink into the cache root.
-`publish_files(tree, paths, command_exit)` makes one `scratch.new(word="gate-binary", throwaway=True)` folder under `/tmp/claude/scratch`.
+`publish_files(tree, paths, command_exit)` makes one `scratch.new(word="gate-binary", throwaway=True)` folder under the scratch root (`build_folders.conf` `roots.scratch`).
 Each file keeps its base name and mode. It is written to `.<name>.tmp` first and then renamed.
 `manifest.json` in the folder holds `repository`, the full checkout `commit`, `command_exit` and the file names.
 Stdout prints `published: <absolute path> <full commit>` for each file.
@@ -410,7 +410,7 @@ The Linux scanner reports unreadable working directories during its single proce
 Both callers raise `ConfigError` for a bad configured value, including an empty value.
 The required `missing` policy applies only when both capacity keys are absent.
 Mac claims still use one slot.
-Offload records use `build_hold.owning_session()` before the shell session fallback.
+Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 
 After confirmed clone cleanup, `mac_run.sh` calls `copies.py unregister-remote` for both registry records.

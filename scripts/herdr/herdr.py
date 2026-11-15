@@ -141,6 +141,10 @@ class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
 
 
+class NativeRegistryChanging(NativeRegistryUnavailable):
+    """The process starts or exits: its registry record is not written yet or is already removed."""
+
+
 class _DarwinProcessGone(HerdrFailure):
     """An empty failed ps read was confirmed by the pid no longer existing."""
 
@@ -1359,17 +1363,25 @@ class PaneSessionsStarting:
 
 
 @dataclass(frozen=True)
+class PaneSessionsChanging:
+    """The Claude process starts or exits, so the pane has no current session to read."""
+
+
+@dataclass(frozen=True)
 class PaneSessionsUnknown:
     """The process evidence cannot establish the pane's current sessions."""
 
     reason: str
 
 
+PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown
+
+
 @dataclass
 class PaneEvidenceRun:
     """Share decoded pane evidence and printed reasons within one run."""
 
-    sessions: dict[tuple[str, str, str], frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown] = field(default_factory=dict)
+    sessions: dict[tuple[str, str, str], PaneSessions] = field(default_factory=dict)
     shell_processes: dict[tuple[str, str, str], int] = field(default_factory=dict)
     reported: set[tuple[str, str, str]] = field(default_factory=set)
     lock: RLock = field(default_factory=RLock)
@@ -1993,7 +2005,7 @@ class Herdr:
                 self.save_layout()
             return True
 
-    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown:
+    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
         with run.lock:
             if key in run.sessions:
@@ -2002,13 +2014,14 @@ class Herdr:
                 info = json_object(self.result("pane", "process-info", "--pane",
                     json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
                 shell, foreground = _pane_process_ids(info, "native pane processes")
-                sessions: frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown = frozenset(_pane_sessions(info, pane))
+                sessions: PaneSessions = frozenset(_pane_sessions(info, pane))
                 if not sessions and foreground == shell:
                     run.shell_processes[key] = shell
             except CodexPaneStarting:
                 sessions = PaneSessionsStarting()
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                sessions = PaneSessionsUnknown(str(error))
+                sessions = (PaneSessionsChanging() if isinstance(error.__cause__, NativeRegistryChanging)
+                            else PaneSessionsUnknown(str(error)))
             run.sessions[key] = sessions
             return sessions
 
@@ -2022,10 +2035,13 @@ class Herdr:
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
             sessions = self._row_pane_sessions(pane, run)
-            if isinstance(sessions, (PaneSessionsStarting, PaneSessionsUnknown)):
-                reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
+            if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
+                reason = ("starting" if isinstance(sessions, PaneSessionsStarting)
+                          else "starting or exiting" if isinstance(sessions, PaneSessionsChanging) else sessions.reason)
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
+                if isinstance(sessions, PaneSessionsChanging):
+                    continue
                 if isinstance(sessions, PaneSessionsUnknown):
                     if launches is None:
                         try:
@@ -3109,12 +3125,15 @@ def pane_native_process(info: dict[str, object], kind: str,
 
 def _pane_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     kinds: set[str] = set()
+    exited = False
     for value in json_items(info.get("foreground_processes"), "foreground processes"):
         process = json_object(value, "foreground process")
         arguments = _foreground_arguments(process)
-        if not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex"):
-            raise HerdrFailure("agent argv is unavailable")
+        exited = exited or not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex")
         kinds.update(kind for kind in ("claude", "codex") if _is_agent_process(arguments, kind))
+    # An agent child that exits leaves its name without an argv; the live agent beside it still names the pane.
+    if exited and not kinds:
+        raise HerdrFailure("agent argv is unavailable")
     return {pane_native_process(info, kind, pane).current_identity for kind in kinds}
 
 
@@ -4015,6 +4034,8 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
+            if _registry_changing(pid, started):
+                raise NativeRegistryChanging(f"pid {pid}: native registry identity is unavailable; process starts or exits")
             raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
@@ -4028,6 +4049,16 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
     if isinstance(identity, CodexLaunchIdentityUnknown):
         raise ValueError(identity.reason)
     return NativeAgentProcess(identity, started, environment)
+
+
+def _registry_changing(pid: int, started: str) -> bool:
+    """The process exited, or it runs without its registry record: before the first write or after the removal."""
+    try:
+        if _process_birth(pid) != started:
+            return True
+    except ValueError:
+        return True
+    return not (runtime_sessions.sessions_dir() / f"{pid}.json").exists()
 
 
 def check_native_target(pid: int, kind: str, expected: NativeAgentProcess) -> bool:

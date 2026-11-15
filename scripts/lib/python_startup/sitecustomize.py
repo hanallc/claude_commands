@@ -1,16 +1,32 @@
-"""Select one checkout for this process and preserve other startup hooks."""
+"""Select one checkout for this process and preserve other startup hooks.
+
+The hook also points the method compile of `dataclasses` at a shared code cache.
+dataclasses compiles the generated methods of each class from source at import.
+On 2026-11-14 that compile was 45-80% of the import CPU of the hot CLIs
+(direct.assign 278 of 428 ms). The cache keeps the marshal code of each source
+in /var/tmp/dataclass-code-<uid>/<cache tag>. tmp_sweep.py prunes the entries that no
+process read in lint.conf `dataclass_code_days` days.
+"""
 
 from __future__ import annotations
 
 import os
+import stat
 import sys
-from collections.abc import Callable
-from importlib.machinery import PathFinder
+import time
+from collections.abc import Callable, Sequence
+from importlib.machinery import ModuleSpec, PathFinder
 from importlib.util import module_from_spec
-from types import ModuleType
+from types import CodeType, ModuleType
 
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
+DATACLASS_CODE_FILENAME = "<string>"
+# dataclasses.py has no __future__ import, so its exec compiles with no flags.
+DATACLASS_CODE_FLAGS = 0
+# A read refreshes an entry's time once a day, so the prune age counts in days.
+DATACLASS_CODE_TOUCH_SECONDS = 86400
+_dataclass_code_folder: list[str] = []
 
 
 def checkout_root(start: str) -> str:
@@ -74,9 +90,125 @@ def select_checkout(arguments: list[str]) -> str:
     return selected
 
 
+def dataclass_code_root() -> str:
+    """Return this user's dataclass code cache root."""
+    return f"/var/tmp/dataclass-code-{os.getuid()}"
+
+
+def dataclass_code_usable(root: str, uid: int) -> bool:
+    """Whether root is a folder that uid owns and that no other user can open."""
+    try:
+        status = os.lstat(root)
+    except OSError:
+        return False
+    return stat.S_ISDIR(status.st_mode) and status.st_uid == uid and not status.st_mode & 0o077
+
+
+def dataclass_code_folder(root: str) -> str:
+    """Make the cache folder of this Python under root; return "" when the cache stays off."""
+    try:
+        os.mkdir(root, 0o700)
+    except OSError:
+        pass
+    if not dataclass_code_usable(root, os.getuid()):
+        return ""
+    folder = os.path.join(root, sys.implementation.cache_tag)
+    try:
+        os.mkdir(folder, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return ""
+    return folder
+
+
+def dataclass_code(source: str, folder: str) -> CodeType:
+    """Return the code that the dataclasses exec compiles from source, from folder when it holds it.
+
+    A missing, truncated or corrupt entry compiles again and replaces the file.
+    """
+    import hashlib
+    import marshal
+
+    key = hashlib.sha1(f"{DATACLASS_CODE_FLAGS} {sys.flags.optimize}\n{source}".encode()).hexdigest()
+    path = os.path.join(folder, key)
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        descriptor = -1
+    if descriptor >= 0:
+        try:
+            status = os.fstat(descriptor)
+            data = os.read(descriptor, status.st_size)
+        except OSError:
+            status, data = None, b""
+        finally:
+            os.close(descriptor)
+        try:
+            cached: object = marshal.loads(data)  # pyright: ignore[reportAny]
+        except (EOFError, ValueError, TypeError):
+            cached = None
+        if isinstance(cached, CodeType):
+            if status is not None and status.st_mtime < time.time() - DATACLASS_CODE_TOUCH_SECONDS:
+                try:
+                    os.utime(path)
+                except OSError:
+                    pass
+            return cached
+    code = compile(source, DATACLASS_CODE_FILENAME, "exec", DATACLASS_CODE_FLAGS, dont_inherit=True)
+    partial = f"{path}.{os.getpid()}"
+    try:
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            _ = os.write(descriptor, marshal.dumps(code))
+        finally:
+            os.close(descriptor)
+        os.replace(partial, path)
+    except OSError:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+    return code
+
+
+def dataclass_exec(source: str, globals_: dict[str, object], locals_: dict[str, object]) -> None:
+    """Run the generated method source of dataclasses with code from the shared cache."""
+    if not _dataclass_code_folder:
+        _dataclass_code_folder.append(dataclass_code_folder(dataclass_code_root()))
+    folder = _dataclass_code_folder[0]
+    code = (dataclass_code(source, folder) if folder
+            else compile(source, DATACLASS_CODE_FILENAME, "exec", DATACLASS_CODE_FLAGS, dont_inherit=True))
+    exec(code, globals_, locals_)
+
+
+class DataclassCodeFinder:
+    """Set `exec` in `dataclasses` to dataclass_exec when a process first imports it."""
+
+    def find_spec(self, name: str, path: Sequence[str] | None, target: ModuleType | None = None, /) -> ModuleSpec | None:
+        if name != "dataclasses":
+            return None
+        sys.meta_path.remove(self)
+        spec = PathFinder.find_spec(name, path, target)
+        loader = spec.loader if spec is not None else None
+        if spec is None or loader is None:
+            return spec
+        load = loader.exec_module
+
+        def exec_module(module: ModuleType) -> None:
+            load(module)
+            module.__dict__["exec"] = dataclass_exec
+
+        vars(loader)["exec_module"] = exec_module
+        return spec
+
+
 def start_process(arguments: list[str]) -> str:
     """Select the checkout at interpreter startup and give a direct test run its folder."""
     selected = select_checkout(arguments)
+    if "dataclasses" not in sys.modules and not any(
+            type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path):
+        sys.meta_path.insert(0, DataclassCodeFinder())
     _start_test_run(selected, arguments)
     return selected
 

@@ -40,7 +40,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, mac_idle_alert
+from scripts.buildlog import charts, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -123,19 +123,27 @@ LOADED_FEED_CODE_VERSION = loaded_feed_code_version(installed.code_root)
 GIB = 1024 ** 3
 CI_CGROUP = Path("/sys/fs/cgroup/hana.slice/hana-ci.slice")
 PROC = Path("/proc")
+SYS_BLOCK = Path("/sys/block")
 CGROUP = CI_CGROUP.parents[1]
 SWAP_NAMES = {
     "agents": "agent sessions ({count})", "apps": "other apps: {app}",
     "desktop": "desktop session", "system": "system services", "ci": "hana CI",
-    "ungrouped": "not in a group", "unattributed": "not attributed", "total": "Total",
-    "smaller": "{count} smaller groups", "between": "between steps",
+    "ungrouped": "Unclassified groups", "unattributed": "Not attributed", "total": "All swap used",
+    "difference": "Reading difference", "smaller": "{count} smaller groups", "between": "between steps",
     "compiler": "compiler cache",
     "unavailable": "Swap is unreadable: {path}",
-    "difference": "Host swap minus the named cgroup readings.",
+    "unattributed_detail": "Pool swap minus the named cgroup readings.",
+    "difference_detail": "The named cgroup readings exceed the pool swap.",
     "host": "SwapTotal minus SwapFree from {path}",
+    "recorded": "SwapTotal minus SwapFree in the recorded admission reading",
 }
-SWAP_OWNER_SLICES = {"app-agents.slice": "agents", "session.slice": "desktop",
-                     "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
+SwapCategory = Literal["agents", "desktop", "system", "ci", ""]
+SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "session.slice": "desktop",
+                                              "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
+SwapPool = Literal["outside", "builds_ci"]
+SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
+BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
+SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
 
 
 class MachineColors(TypedDict):
@@ -162,6 +170,7 @@ class FeedConfiguration:
     swap_rows: int
     report_refresh_seconds: int
     colors: PageColors
+    other_rows: int
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -188,7 +197,7 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
     return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
-                             {"light": theme("light"), "dark": theme("dark")})
+                             {"light": theme("light"), "dark": theme("dark")}, settings.whole("other_rows"))
 
 
 class PageArguments(CodeRootArguments):
@@ -364,12 +373,21 @@ class RunRow(RowQueueNotes):
     ci_runners: NotRequired[list[CIRunner]]
 
 
+class SwapMember(TypedDict):
+    name: str
+    bytes: int
+
+
 class SwapRow(TypedDict):
     name: str
     detail: str
     swap: float
     bytes: int
-    kind: Literal["owner", "ungrouped", "unattributed", "smaller", "total"]
+    kind: SwapRowKind
+    pool: SwapPool | Literal["all"]
+    category: SwapCategory
+    members: list[SwapMember]
+    owner_count: int
     showrunner: NotRequired[str]
     unit: NotRequired[str]
     ci_label: NotRequired[str]
@@ -391,6 +409,7 @@ class SwapUnavailable:
 class SwapReading:
     used: int
     total: int
+    builds_ci: int
     rows: list[SwapRow]
     files_read: int
 
@@ -411,6 +430,7 @@ class MacBuildRow(RowQueueNotes):
     kind: Literal["mac-build"]
     name: str
     repository: str
+    gate_label: str
     showrunner: str
     unit: str
     pid: int
@@ -500,6 +520,14 @@ class ReportNotRead(Enum):
     VALUE = "not read"
 
 
+class SwapTotals(TypedDict):
+    used_bytes: int
+    capacity_bytes: int
+    builds_ci_bytes: int
+    outside_bytes: int
+    reserve_share_percent: int
+
+
 class MemoryPage(TypedDict):
     colors: PageColors
     ok: bool
@@ -516,23 +544,14 @@ class MemoryPage(TypedDict):
     room: float
     room_source: Literal["free"]
     limit: str
-    other: float
-    desktop_guarantee: float | None
-    agents_ram: float | None
-    agents_swap: float
-    shown_desktop: float
-    shown_agents: float
-    shown_agents_swap: float
-    slices_unavailable: str
-    shown_reserved: float
+    ram: RamBlocks
+    memory_status: MemoryStatus
     ci_name: str
     ci_ram: float
-    shown_safety: float
     waiting: int
     smallest_need: float
     pressure: str
-    swap_used: float
-    swap_total: float
+    swap: SwapTotals
     walk: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow]
     waiters: list[WaitRow | CloudWaitRow]
     swap_by: list[SwapRow]
@@ -572,16 +591,13 @@ def cargo_job(command: tuple[str, ...]) -> str:
     for index, argument in enumerate(command):
         if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
             continue
-        arguments = iter(command[index + 1:])
-        for argument in arguments:
-            if argument in ("--color", "--config", "--manifest-path", "--lockfile-path", "-C", "-Z"):
-                _ = next(arguments, "")
-            elif not argument.startswith(("-", "+")):
-                if argument in ("test", "nextest"):
-                    return "tests"
-                if argument == "build" and any(flag in command for flag in ("--release", "-r")):
-                    return "release build"
-                return argument
+        subcommand = parse.cargo_subcommand(command[index + 1:])
+        if subcommand in ("test", "nextest"):
+            return "tests"
+        if subcommand == "build" and any(flag in command for flag in ("--release", "-r")):
+            return "release build"
+        if subcommand:
+            return subcommand
     return ""
 
 
@@ -778,8 +794,10 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                  identity: unit_labels.UnitLabels, *, names: StepNames) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
-    return {"kind": "mac-build", "name": queue_view.mac_step_name(build, names=names, identity=identity),
-            **page_owner_labels(identity, ci_label=label), "repository": build.repository,
+    gate = queue_view.gate_label_text(build)
+    return {"kind": "mac-build",
+            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + gate if gate else ""),
+            **page_owner_labels(identity, ci_label=label), "gate_label": gate, "repository": build.repository,
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
@@ -855,9 +873,15 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
         return charts.IndexUnavailable(str(error))
 
 
-def swap_row(name: str, detail: str, amount: int,
-             kind: Literal["owner", "ungrouped", "unattributed", "smaller", "total"] = "owner") -> SwapRow:
-    return {"name": name, "detail": detail, "swap": gib(amount), "bytes": amount, "kind": kind}
+def swap_row(name: str, detail: str, amount: int, pool: SwapPool | Literal["all"], kind: SwapRowKind = "owner",
+             category: SwapCategory = "") -> SwapRow:
+    return {"name": name, "detail": detail, "swap": gib(amount), "bytes": amount, "kind": kind,
+            "pool": pool, "category": category, "members": [], "owner_count": 0}
+
+
+def swap_pool(path: Path) -> SwapPool:
+    """Place a cgroup in the builds and CI pool or outside it, by its slice membership."""
+    return "builds_ci" if BUILDS_CI_SLICES.intersection(path.relative_to(CGROUP).parts) else "outside"
 
 
 class SwapReadingPass:
@@ -885,24 +909,27 @@ class SwapReadingPass:
         except OSError:
             return []
 
-    def add(self, key: str, name: str, path: str, amount: int,
-            kind: Literal["owner", "ungrouped"] = "owner") -> None:
+    def add(self, key: str, name: str, path: Path, detail: str, amount: int,
+            kind: Literal["owner", "ungrouped"] = "owner", category: SwapCategory = "") -> None:
         if not amount:
             return
+        pool = swap_pool(path)
+        key = f"{key}:{pool}" if kind == "ungrouped" else key
         if key in self.rows:
             row = self.rows[key]
             row["bytes"] += amount
             row["swap"] = gib(row["bytes"])
-            row["detail"] += "; " + path
-        else:
-            self.rows[key] = swap_row(name, path, amount, kind)
-            owner = self.owners.get(Path(key))
-            if owner is not None:
-                identity = page_owner_labels(owner.identity)
-                self.rows[key]["showrunner"] = identity["showrunner"]
-                self.rows[key]["unit"] = identity["unit"]
-            elif key == "ci":
-                self.rows[key]["ci_label"] = SWAP_NAMES["ci"]
+            row["detail"] += "; " + detail
+            return
+        self.rows[key] = swap_row(name, detail, amount, pool, kind, category)
+        owner = self.owners.get(Path(key))
+        if owner is not None:
+            identity = page_owner_labels(owner.identity)
+            self.rows[key]["showrunner"] = identity["showrunner"]
+            self.rows[key]["unit"] = identity["unit"]
+            self.rows[key]["owner_count"] = 1
+        elif key == "ci":
+            self.rows[key]["ci_label"] = SWAP_NAMES["ci"]
 
     def visit(self, path: Path) -> int:
         counter = self.counter(path)
@@ -913,41 +940,82 @@ class SwapReadingPass:
         leaf = path in self.owners or bool(category) or path.parent.name in ("app.slice", "background.slice")
         children = self.children(path) if not leaf or nested_owner or category == "agents" else []
         charged = 0
+        shown = str(path.relative_to(CGROUP))
         if category == "agents":
             self.agent_count += sum(child.name.endswith(".scope") for child in children)
         if path in self.owners and not nested_owner:
             owner = self.owners[path]
-            name, detail = owner.name, owner.detail
             if isinstance(counter, int):
-                self.add(str(path), name, detail + " · " + str(path.relative_to(CGROUP)), counter)
+                self.add(str(path), owner.name, path, owner.detail + " · " + shown, counter)
         elif category and not nested_owner:
             if isinstance(counter, int):
-                self.add(category, SWAP_NAMES[category], str(path.relative_to(CGROUP)), counter)
+                self.add(category, SWAP_NAMES[category], path, shown, counter, category=category)
         elif path.parent.name in ("app.slice", "background.slice") and not nested_owner:
-            app = path.name.removeprefix("app-").removesuffix(".scope").removesuffix(".service")
+            app = program_name(path)
             if isinstance(counter, int):
-                self.add(str(path), SWAP_NAMES["apps"].format(app=app), str(path.relative_to(CGROUP)), counter)
+                self.add(str(path), SWAP_NAMES["apps"].format(app=app), path, shown, counter)
         elif children:
             charged = sum(self.visit(child) for child in children)
             if isinstance(counter, int):
                 if path in self.owners:
                     owner = self.owners[path]
-                    name, detail = owner.name, owner.detail
-                    self.add(str(path), name, detail, counter - charged)
+                    self.add(str(path), owner.name, path, owner.detail, counter - charged)
                 elif category:
-                    self.add(category, SWAP_NAMES[category], str(path.relative_to(CGROUP)), counter - charged)
+                    self.add(category, SWAP_NAMES[category], path, shown, counter - charged, category=category)
                 else:
-                    self.add("ungrouped", SWAP_NAMES["ungrouped"], str(path.relative_to(CGROUP)),
-                             counter - charged, "ungrouped")
+                    self.add("ungrouped", SWAP_NAMES["ungrouped"], path, shown, counter - charged, "ungrouped")
         elif isinstance(counter, int):
             self.add(str(path), path.name.removesuffix(".scope").removesuffix(".service").removesuffix(".slice"),
-                     str(path.relative_to(CGROUP)), counter)
+                     path, shown, counter)
         return counter if isinstance(counter, int) else charged
 
 
+@dataclass(frozen=True)
+class RecordedHostSwap:
+    """Hold the host swap totals the admission decision used."""
+    used: int
+    capacity: int
+    builds_ci: int
+
+
+@dataclass(frozen=True)
+class LiveHostSwap:
+    """Read the host swap now; the builds and CI pool is its own group readings."""
+
+
+LIVE_HOST_SWAP = LiveHostSwap()
+
+
+def pool_rows(rows: Sequence[SwapRow], ungrouped: Sequence[SwapRow], pool: SwapPool, pool_bytes: int | LiveHostSwap,
+              row_limit: int) -> list[SwapRow]:
+    """Show one pool's largest groups, its smaller groups and its own reading difference."""
+    main = [row for row in rows if row["category"]]
+    others = [row for row in rows if not row["category"]]
+    count = max(0, row_limit - len(main))
+    visible = sorted(main + others[:count], key=lambda row: row["bytes"], reverse=True)
+    smaller = others[count:]
+    if smaller:
+        smaller_row = swap_row(SWAP_NAMES["smaller"].format(count=len(smaller)),
+            "; ".join(f"{row['name']}: {row['bytes']} B" for row in smaller),
+            sum(row["bytes"] for row in smaller), pool, "smaller")
+        smaller_row["members"] = [{"name": row["name"], "bytes": row["bytes"]} for row in smaller]
+        smaller_row["owner_count"] = sum(row["owner_count"] for row in smaller)
+        visible.append(smaller_row)
+    visible.extend(ungrouped)
+    difference = 0 if isinstance(pool_bytes, LiveHostSwap) else pool_bytes - sum(row["bytes"] for row in visible)
+    if difference > 0:
+        visible.append(swap_row(SWAP_NAMES["unattributed"], SWAP_NAMES["unattributed_detail"], difference, pool,
+                                "unattributed"))
+    elif difference < 0:
+        visible.append(swap_row(SWAP_NAMES["difference"], SWAP_NAMES["difference_detail"], difference, pool,
+                                "difference"))
+    return visible
+
+
 def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[str, unit_labels.UnitLabels],
-              row_limit: int, names: StepNames) -> SwapReading | SwapUnavailable:
-    """Account for host swap with disjoint cgroup owners and an explicit difference."""
+              row_limit: int, names: StepNames, host: RecordedHostSwap | LiveHostSwap = LIVE_HOST_SWAP
+              ) -> SwapReading | SwapUnavailable:
+    """Account for host swap in two pools, with disjoint cgroup owners and an explicit difference in each pool."""
     owners: dict[Path, SwapOwner] = {}
     for step in steps:
         memory = step.measured
@@ -974,35 +1042,35 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
     reading = SwapReadingPass(owners)
     for child in reading.children(CGROUP):
         _ = reading.visit(child)
-    path = PROC / "meminfo"
-    try:
-        values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                  for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
-        total = values["SwapTotal"]
-        used = total - values["SwapFree"]
-    except (OSError, ValueError, KeyError, IndexError):
-        return SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path))
+    files_read = len(reading.counters)
+    if isinstance(host, LiveHostSwap):
+        path = PROC / "meminfo"
+        try:
+            values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
+                      for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
+            capacity = values["SwapTotal"]
+            used = capacity - values["SwapFree"]
+        except (OSError, ValueError, KeyError, IndexError):
+            return SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path))
+        files_read += 1
+        builds_ci = sum(row["bytes"] for row in reading.rows.values() if row["pool"] == "builds_ci")
+        pool_bytes: dict[SwapPool, int | LiveHostSwap] = {"outside": used - builds_ci, "builds_ci": host}
+        source = SWAP_NAMES["host"].format(path=path)
+    else:
+        used, capacity, builds_ci = host.used, host.capacity, host.builds_ci
+        pool_bytes = {"outside": used - builds_ci, "builds_ci": builds_ci}
+        source = SWAP_NAMES["recorded"]
     if "agents" in reading.rows:
         reading.rows["agents"]["name"] = SWAP_NAMES["agents"].format(count=reading.agent_count)
+        reading.rows["agents"]["owner_count"] = reading.agent_count
     rows = sorted((row for row in reading.rows.values() if row["kind"] == "owner"),
                   key=lambda row: row["bytes"], reverse=True)
-    main_owners = [reading.rows[key] for key in ("agents", "desktop", "system", "ci") if key in reading.rows]
-    other_owners = [row for row in rows if row not in main_owners]
-    count = max(0, row_limit - len(main_owners))
-    visible = sorted(main_owners + other_owners[:count], key=lambda row: row["bytes"], reverse=True)
-    smaller = other_owners[count:]
-    if smaller:
-        smaller_row = swap_row(SWAP_NAMES["smaller"].format(count=len(smaller)),
-            "; ".join(f"{row['name']}: {row['bytes']} B" for row in smaller),
-            sum(row["bytes"] for row in smaller), "smaller")
-        smaller_row["showrunner"] = ", ".join(sorted({row.get("showrunner", "") for row in smaller} - {""}))
-        smaller_row["unit"] = ", ".join(sorted({row.get("unit", "") for row in smaller} - {""}))
-        visible.append(smaller_row)
-    visible.extend(row for row in reading.rows.values() if row["kind"] == "ungrouped")
-    attributed = sum(row["bytes"] for row in visible)
-    visible.append(swap_row(SWAP_NAMES["unattributed"], SWAP_NAMES["difference"], used - attributed, "unattributed"))
-    visible.append(swap_row(SWAP_NAMES["total"], SWAP_NAMES["host"].format(path=path), used, "total"))
-    return SwapReading(used, total, visible, len(reading.counters) + 1)
+    visible = [row for pool in SWAP_POOLS
+               for row in pool_rows([row for row in rows if row["pool"] == pool],
+                                    [row for row in reading.rows.values() if row["kind"] == "ungrouped" and row["pool"] == pool],
+                                    pool, pool_bytes[pool], row_limit)]
+    visible.append(swap_row(SWAP_NAMES["total"], source, used, "all", "total"))
+    return SwapReading(used, capacity, builds_ci, visible, files_read)
 
 
 def swap_text(rows: Sequence[SwapRow]) -> str:
@@ -1010,44 +1078,360 @@ def swap_text(rows: Sequence[SwapRow]) -> str:
     return "\n".join(f"{row['name']}: {row['bytes']} B ({row['swap']:.6f} GiB) · {row['detail']}" for row in rows)
 
 
-class MemoryShares(TypedDict):
-    other: float
-    desktop_guarantee: float | None
-    agents_ram: float | None
-    agents_swap: float
-    shown_desktop: float
-    shown_agents: float
-    shown_agents_swap: float
-    slices_unavailable: str
-    shown_safety: float
-    shown_reserved: float
+class ProgramRam(TypedDict):
+    id: str
+    name: str
+    bytes: int
 
 
-def memory_shares(total: float, room: admission_records.MemoryRoom, safety: float, used: float,
-                  reserved: float) -> MemoryShares:
-    """Split memory outside builds into agents, the desktop guarantee and the rest, and place swapped demand outside the cap."""
-    available = gib(room.available)
-    shown_safety = min(safety, used + available)
-    # Swapped agent memory is outside the cap: it sits right of the cap line, so reserved stops at the cap.
-    agents_swap = gib(room.agent_swap_demand)
-    shown_agents_swap = max(0.0, min(agents_swap, available - safety))
-    shown_reserved = max(0.0, min(reserved, available - safety - shown_agents_swap))
-    outside = max(0.0, total - available - gib(room.cap_use))
-    agents = gate.agents_memory()
-    guarantee = gate.desktop_guarantee()
-    agents_ram = gib(agents.bytes) if isinstance(agents, admission_records.MeasuredMemory) else None
-    desktop = gib(guarantee) if isinstance(guarantee, int) else None
-    shown_agents = min(agents_ram or 0.0, outside)
-    shown_desktop = min(desktop or 0.0, outside - shown_agents)
+RamReading = int | admission_records.ReadingUnavailable
+
+
+class RamBlocks(TypedDict):
+    """Give each bar block one byte amount, from the recorded room and one attribution reading."""
+    capture_time: float
+    attribution_read_at: float
+    total_bytes: RamReading
+    available_bytes: int
+    safety_target_bytes: int
+    swap_target_bytes: int
+    build_target_bytes: int
+    room_bytes: int
+    shortfall_bytes: int
+    safety_covered_bytes: int
+    swap_covered_bytes: int
+    build_covered_bytes: int
+    safety_missing_bytes: int
+    swap_missing_bytes: int
+    build_missing_bytes: int
+    builds_bytes: int
+    queued_builds_bytes: int
+    rust_analyzer_bytes: int
+    sccache_bytes: int
+    other_build_tools_bytes: int
+    ci_bytes: int
+    agents_bytes: RamReading
+    desktop_bytes: RamReading
+    desktop_protection_bytes: RamReading
+    programs: list[ProgramRam]
+    other_programs_bytes: int
+    smaller_programs_bytes: int
+    smaller_program_count: int
+    kernel_bytes: RamReading
+    compressed_swap_bytes: RamReading
+    kernel_structures_bytes: RamReading
+    kernel_counters_bytes: RamReading
+    kernel_no_counter_bytes: int
+    cache_bytes: RamReading
+    unattributed_bytes: int
+    missing: list[str]
+    agreement: Literal["agree", "disagree"]
+
+
+MemoryStatusCode = Literal["unavailable", "gpu_slot", "pressure", "shortfall", "no_room", "one_running_memory_wait", "none"]
+
+
+class MemoryStatus(TypedDict):
+    code: MemoryStatusCode
+    active_local_build_count: int
+    next_need_bytes: int
+    check_room_bytes: int
+
+
+RAM_NAMES = {
+    "system": "system services", "background": "background services", "sessions": "login sessions",
+    "agents": "Agents", "desktop": "Desktop programs", "kernel": "Kernel, measured", "cache": "File and kernel cache",
+}
+RUST_ANALYZER = "rust-analyzer"
+KERNEL_FIELDS = ("SUnreclaim", "KernelStack", "PageTables")
+KERNEL_COUNTER_FIELDS = ("SecPageTables", "Percpu", "VmallocUsed")
+# MemTotal less these fields and the kernel parts leaves the kernel memory that no counter names.
+COUNTED_FIELDS = ("MemFree", "Active(anon)", "Inactive(anon)", "Active(file)", "Inactive(file)",
+                  "Unevictable", "KReclaimable")
+CACHE_FIELDS = ("Buffers", "Cached", "Shmem", "KReclaimable", "MemAvailable", "MemFree")
+
+
+def scope_program(path: Path) -> str:
+    """Name a run scope by its program only when every member runs that program."""
+    try:
+        programs = {(PROC / pid / "comm").read_text().strip() for pid in (path / "cgroup.procs").read_text().split()}
+    except OSError:
+        programs = set[str]()
+    if len(programs) != 1:
+        return path.name.removesuffix(".scope")
+    # A Nix wrapper runs as ".ghostty-wrapped"; its comm is cut to 15 bytes.
+    return re.sub(r"^\.(.+)-wrap[a-z]*$", r"\1", programs.pop()) or path.name
+
+
+def program_name(path: Path) -> str:
+    """Name an app cgroup by its program: app-com.google.Chrome-41.scope gives Chrome."""
+    name = path.name.removeprefix("app-").removesuffix(".scope").removesuffix(".service").removesuffix(".slice")
+    if name.startswith("run-"):
+        return scope_program(path)
+    name = re.sub(r"(@.*|-[0-9]+|-[0-9a-f]{16,})$", "", name.replace("\\x2d", "-")).removeprefix("google-")
+    return name.rsplit(".", 1)[-1] or path.name
+
+
+def swap_backed_bytes(path: Path) -> int:
+    """Read the anonymous plus shared memory of one cgroup: memory that only swap can free."""
+    gate.check_memory_reading(path / "memory.stat")
+    fields = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
+    return int(fields["anon"]) + int(fields["shmem"])
+
+
+def other_programs() -> dict[str, int]:
+    """Read the programs outside builds, CI, agents and the desktop, by name, each cgroup charge once."""
+    user = gate.user_manager_cgroup()
+    groups: list[tuple[str, Path]] = [(program_name(child), child) for child in sorted((user / "app.slice").glob("*"))
+                                      if child.is_dir() and child.name != "app-agents.slice"]
+    groups += [(RAM_NAMES["background"], user / "background.slice"), (RAM_NAMES["system"], CGROUP / "system.slice"),
+               (RAM_NAMES["system"], CGROUP / "init.scope")]
+    groups += [(RAM_NAMES["sessions"], scope) for scope in sorted(user.parent.glob("session-*.scope"))]
+    programs: dict[str, int] = {}
+    for name, path in groups:
+        try:
+            amount = swap_backed_bytes(path)
+        except (OSError, ValueError, KeyError):
+            continue
+        # Chrome and chrome are one program: join names that differ only in case, and keep the capitalized one.
+        key = next((known for known in programs if known.lower() == name.lower()), name)
+        shown = key if key != key.lower() else name
+        programs[shown] = programs.pop(key, 0) + amount
+    return programs
+
+
+def meminfo_bytes() -> dict[str, int] | admission_records.ReadingUnavailable:
+    """Read /proc/meminfo once, in bytes."""
+    path = PROC / "meminfo"
+    try:
+        return {fields[0].removesuffix(":"): int(fields[1]) * 1024
+                for line in path.read_text().splitlines() if (fields := line.split()) and len(fields) >= 2}
+    except (OSError, ValueError) as error:
+        return admission_records.ReadingUnavailable(f"{path}: {error}")
+
+
+def meminfo_fields(values: Mapping[str, int] | admission_records.ReadingUnavailable,
+                   names: Sequence[str]) -> Mapping[str, int] | admission_records.ReadingUnavailable:
+    if isinstance(values, admission_records.ReadingUnavailable):
+        return values
+    absent = [name for name in names if name not in values]
+    return admission_records.ReadingUnavailable("meminfo lacks " + ", ".join(absent)) if absent else values
+
+
+def kernel_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
+    """Measure the kernel structures in RAM: unreclaimable slab, kernel stacks and page tables."""
+    fields = meminfo_fields(values, KERNEL_FIELDS)
+    if isinstance(fields, admission_records.ReadingUnavailable):
+        return fields
+    return sum(fields[name] for name in KERNEL_FIELDS)
+
+
+def compressed_swap_reading() -> RamReading:
+    """Read the RAM that holds compressed swap: mem_used_total, field 3 of each zram device mm_stat."""
+    total = 0
+    for path in sorted(SYS_BLOCK.glob("zram*/mm_stat")):
+        try:
+            total += int(path.read_text().split()[2])
+        except (OSError, ValueError, IndexError) as error:
+            return admission_records.ReadingUnavailable(f"{path}: {error}")
+    return total
+
+
+def memmap_reading() -> RamReading:
+    """Read the page descriptors allocated after boot, from /proc/vmstat nr_memmap_pages."""
+    path = PROC / "vmstat"
+    try:
+        pages = dict(line.split() for line in path.read_text().splitlines())["nr_memmap_pages"]
+        return int(pages) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, KeyError) as error:
+        return admission_records.ReadingUnavailable(f"{path}: {error!r}")
+
+
+def kernel_counters_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
+    """Measure the other counted kernel memory: page descriptors, secondary page tables, per-CPU and vmalloc."""
+    fields = meminfo_fields(values, (*KERNEL_COUNTER_FIELDS, "KernelStack"))
+    if isinstance(fields, admission_records.ReadingUnavailable):
+        return fields
+    memmap = memmap_reading()
+    if isinstance(memmap, admission_records.ReadingUnavailable):
+        return memmap
+    # With VMAP_STACK the kernel stacks are vmalloc pages; KernelStack already counts them.
+    vmalloc = max(0, fields["VmallocUsed"] - fields["KernelStack"])
+    return memmap + fields["SecPageTables"] + fields["Percpu"] + vmalloc
+
+
+@dataclass(frozen=True)
+class KernelRam:
+    """Hold the three measured kernel parts and the kernel memory that no counter names."""
+    compressed_swap: RamReading
+    structures: RamReading
+    counters: RamReading
+    no_counter: int
+
+    @property
+    def total(self) -> RamReading:
+        parts = (self.compressed_swap, self.structures, self.counters)
+        unavailable = next((part for part in parts if isinstance(part, admission_records.ReadingUnavailable)), None)
+        return unavailable if unavailable is not None else sum(known_bytes(part) for part in parts)
+
+
+def kernel_ram(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> KernelRam:
+    """Measure the kernel parts; without every reading, the no-counter amount is 0."""
+    structures, counters, compressed = kernel_reading(values), kernel_counters_reading(values), compressed_swap_reading()
+    fields = meminfo_fields(values, ("MemTotal", *COUNTED_FIELDS))
+    no_counter = 0
+    if isinstance(fields, Mapping) and all(isinstance(part, int) for part in (structures, counters, compressed)):
+        counted = sum(fields[name] for name in COUNTED_FIELDS)
+        no_counter = max(0, fields["MemTotal"] - counted - known_bytes(structures) - known_bytes(counters)
+                         - known_bytes(compressed))
+    return KernelRam(compressed, structures, counters, no_counter)
+
+
+def cache_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
+    """Estimate the file and kernel cache outside available RAM; a negative estimate stays negative."""
+    fields = meminfo_fields(values, CACHE_FIELDS)
+    if isinstance(fields, admission_records.ReadingUnavailable):
+        return fields
+    pool = fields["Buffers"] + fields["Cached"] - fields["Shmem"] + fields["KReclaimable"]
+    return pool - max(0, fields["MemAvailable"] - fields["MemFree"])
+
+
+def slice_program_bytes(reading: admission_records.MeasuredMemory | admission_records.ReadingUnavailable) -> RamReading:
+    """Take the anonymous plus shared memory of one slice reading."""
+    if isinstance(reading, admission_records.ReadingUnavailable):
+        return reading
+    if isinstance(reading.anonymous, admission_records.AnonymousRunUse):
+        return reading.anonymous.bytes
+    return admission_records.ReadingUnavailable(reading.anonymous.reason)
+
+
+@dataclass(frozen=True)
+class BuildToolRam:
+    """Hold the builds.slice program RAM that no queued build holds."""
+    rust_analyzer: int
+    sccache: int
+    other: int
+
+
+def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int) -> BuildToolRam:
+    """Read the builds.slice program RAM that no queued build holds, on the same basis as the queued builds.
+
+    rust-analyzer and the compiler cache have their own lines. Other build tools is the rest of builds.slice
+    (the slice reading minus the queued use and the groups that another line or block counts), plus each
+    recorded tool group outside builds.slice.
+    """
+    builds = gate.builds_slice_cgroup()
+    rust_analyzer = sccache = outside_tools = named_inside = 0
+    for entry in running:
+        memory = entry.step.measured
+        if isinstance(memory, admission_records.CompilerServiceMemory):
+            path = builds / "sccache.service"
+        elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup and not memory.diagnostic:
+            path = Path(memory.cgroup)
+        else:
+            continue
+        try:
+            amount = swap_backed_bytes(path)
+        except (OSError, ValueError, KeyError):
+            # The group ended after the capture: it holds no RAM now.
+            continue
+        inside = path.is_relative_to(builds)
+        if isinstance(memory, admission_records.CompilerServiceMemory):
+            sccache += amount
+        elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
+              or entry.step.step == SWAP_NAMES["between"]):
+            # A CI service counts in hana CI, and a run between steps counts in its queued hold.
+            pass
+        elif isinstance(memory.activity, ScopeProcesses) and memory.activity.program == RUST_ANALYZER:
+            rust_analyzer += amount
+        elif not inside:
+            outside_tools += amount
+            continue
+        else:
+            continue
+        named_inside += amount if inside else 0
+    try:
+        slice_bytes = swap_backed_bytes(builds)
+    except (OSError, ValueError, KeyError):
+        slice_bytes = queued_use + named_inside
+    return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
+
+
+def known_bytes(value: RamReading) -> int:
+    return value if isinstance(value, int) else 0
+
+
+def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_time: float,
+               program_rows: int) -> RamBlocks:
+    """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest."""
+    available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
+    safety_covered = min(safety, available)
+    swap_covered = min(swap, max(0, available - safety))
+    build_covered = min(build, max(0, available - safety - swap))
+    agents = slice_program_bytes(gate.agents_memory())
+    desktop = slice_program_bytes(gate.desktop_memory())
+    values = meminfo_bytes()
+    kernel, cache = kernel_ram(values), cache_reading(values)
+    ranked = sorted(((name, amount) for name, amount in other_programs().items() if amount > 0),
+                    key=lambda item: item[1], reverse=True)
+    smaller = ranked[program_rows:]
+    other_programs_bytes = sum(amount for _, amount in ranked)
+    builds = room.used + tools.rust_analyzer + tools.sccache + tools.other
+    total: RamReading = (room.total if isinstance(room.total, int)
+                         else admission_records.ReadingUnavailable("total RAM is not recorded"))
+    named = (builds + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
+             + known_bytes(kernel.total) + known_bytes(cache))
+    unattributed = total - available - named if isinstance(total, int) else 0
+    readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
+                (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
+    missing = [f"{name}: {value.reason}" for name, value in readings
+               if isinstance(value, admission_records.ReadingUnavailable)]
     return {
-        "other": outside - shown_agents - shown_desktop,
-        "desktop_guarantee": desktop, "agents_ram": agents_ram, "agents_swap": agents_swap,
-        "shown_desktop": shown_desktop, "shown_agents": shown_agents,
-        "shown_agents_swap": shown_agents_swap,
-        "slices_unavailable": "; ".join(reading.reason for reading in (agents, guarantee)
-                                        if isinstance(reading, admission_records.ReadingUnavailable)),
-        "shown_safety": shown_safety, "shown_reserved": shown_reserved,
+        "capture_time": capture_time, "attribution_read_at": time.time(),
+        "total_bytes": total, "available_bytes": available,
+        "safety_target_bytes": safety, "swap_target_bytes": swap, "build_target_bytes": build,
+        "room_bytes": room.room, "shortfall_bytes": room.shortfall,
+        "safety_covered_bytes": safety_covered, "swap_covered_bytes": swap_covered, "build_covered_bytes": build_covered,
+        "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
+        "build_missing_bytes": build - build_covered,
+        "builds_bytes": builds, "queued_builds_bytes": room.used, "rust_analyzer_bytes": tools.rust_analyzer,
+        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
+        "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
+        "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
+        "other_programs_bytes": other_programs_bytes,
+        "smaller_programs_bytes": sum(amount for _, amount in smaller), "smaller_program_count": len(smaller),
+        "kernel_bytes": kernel.total, "compressed_swap_bytes": kernel.compressed_swap,
+        "kernel_structures_bytes": kernel.structures, "kernel_counters_bytes": kernel.counters,
+        "kernel_no_counter_bytes": min(kernel.no_counter, max(0, unattributed)), "cache_bytes": cache,
+        "unattributed_bytes": unattributed, "missing": missing,
+        "agreement": "disagree" if unattributed < 0 or known_bytes(cache) < 0 else "agree",
     }
+
+
+def memory_status(explanation: admission_records.QueueExplanation, room: admission_records.MemoryRoom,
+                  active_local_builds: int) -> MemoryStatus:
+    """Give the one reason the next start waits, from the recorded admission result."""
+    head = explanation.head
+    pressure = explanation.decided_from.pressure
+    check = head.room if isinstance(head, admission_records.HeadExplanation) else admission_records.RoomCheck(
+        0, room.room, True, basis=admission_records.Fits())
+    code: MemoryStatusCode = "none"
+    if (isinstance(pressure, admission_records.PressureUnavailable)
+            or isinstance(head, admission_records.HeadExplanation)
+            and isinstance(head.cause, (admission_records.ReadingUnavailable, admission_records.PressureUnavailable))):
+        code = "unavailable"
+    elif isinstance(head, admission_records.HeadExplanation) and isinstance(head.cause, admission_records.GpuSlotWait):
+        code = "gpu_slot"
+    elif isinstance(pressure, admission_records.MemoryPressure):
+        code = "pressure"
+    elif room.room == 0:
+        code = "shortfall" if room.shortfall > 0 else "no_room"
+    elif (active_local_builds == 1 and isinstance(head, admission_records.HeadExplanation)
+          and isinstance(head.cause, admission_records.NeedsMemory) and not check.passes
+          and explanation.line.fitting == 0):
+        code = "one_running_memory_wait"
+    return {"code": code, "active_local_build_count": active_local_builds,
+            "next_need_bytes": check.need, "check_room_bytes": check.room}
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -1157,6 +1541,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     description = "Memory the compiler cache holds outside the build queue"
             else:
                 description = "Memory these processes hold outside the build queue"
+                if isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses):
+                    name = memory.activity.program
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
@@ -1281,7 +1667,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure
-    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names)
+    # Without the recorded builds and CI swap, the page reads host swap now instead of failing.
+    swap_host = (LIVE_HOST_SWAP if isinstance(host.build_and_ci_swap, admission_records.ReadingUnavailable)
+                 else RecordedHostSwap(host.swap_total - host.swap_free, host.swap_total, host.build_and_ci_swap))
+    swap = read_swap(parsed.view.running, labels, configuration.swap_rows, names, swap_host)
     if isinstance(swap, SwapUnavailable):
         raise RuntimeError(swap.reason)
     pressure_values = read_stalls()
@@ -1290,25 +1679,29 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = admission_records.pressure_text(pressure)
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
-    shares = memory_shares(total, captured, safety, used, reserved)
     return {
         "colors": configuration.colors,
         "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
-        **shares,
+        "ram": ram_blocks(captured, build_tool_ram(explanation.running, captured.used), explanation.now, configuration.other_rows),
+        "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,
         "waiting": len(waiting_rows), "smallest_need": min((step.need / GIB for step in parsed.view.waiting), default=0.0),
         "pressure": pressure_label,
-        "swap_used": gib(swap.used), "swap_total": gib(swap.total),
+        "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
+                 "outside_bytes": swap.used - swap.builds_ci,
+                 "reserve_share_percent": explanation.policy.agent_swap_share_percent},
         "walk": work_rows, "waiters": waiting_rows, "swap_by": swap.rows, "psi": pressure_values,
         "head_text": queue_view.head_text(model),
         "priority_text": head_facts.priority_text(explanation.priority),
         "queued_priority_units": queued_priority_units,
         "unmatched_priority_text": unmatched_priority_text,
-        "mac_idle_alert": mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), zone,
-            block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",
+        "mac_idle_alert": "\n".join(text for text in (
+            mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), zone,
+                block=mac_idle_alert.BlockText.OMITTED if routes.blocked() else mac_idle_alert.BlockText.SHOWN) or "",
+            *(f"Mac unplaced run: pid {run.pid}; {run.command}" for run in mac_reading.unplaced_runs)) if text),
         "targets": target_availability.availability_rows(snapshots, labels, zone),
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
@@ -1322,6 +1715,24 @@ def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
     return json.dumps(codec.snapshot_value(payload))
 
 
+def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[tuple[int, float]]) -> None:
+    """Send builds one message with all new unplaced processes."""
+    from scripts.buildlog import mac_idle
+
+    if reading.error:
+        return
+    new_runs = tuple(run for run in reading.unplaced_runs if (run.pid, run.started_at) not in notified)
+    if not new_runs:
+        return
+    text = "Mac runs have no queue placement:\n" + "\n".join(
+        f"pid {run.pid}; {run.command}" for run in new_runs)
+    text += "\nUse mac_queue_run.py for agent and SSH commands."
+    keys = [f"mac-unplaced-{run.pid}-{run.started_at!r}" for run in new_runs]
+    key = ";".join(keys)
+    if mac_idle.notify_showrunner(text, identity=mac_idle.OutageMessage(int(new_runs[0].started_at), reading.read_at, key)):
+        notified.update((run.pid, run.started_at) for run in new_runs)
+
+
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -1333,6 +1744,7 @@ def main(argv: Sequence[str]) -> int:
     report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
     next_report_at = 0.0
     next_mac_at = 0.0
+    notified_mac_runs: set[tuple[int, float]] = set()
     while True:
         if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
@@ -1344,6 +1756,9 @@ def main(argv: Sequence[str]) -> int:
         try:
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
+                if not args.once:
+                    # A one-time proof run reads the Mac but sends no alert.
+                    notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
             last_good = payload

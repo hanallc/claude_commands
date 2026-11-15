@@ -27,7 +27,7 @@ from unittest import mock
 
 from scripts.build_targets import build_targets as build_targets, targets
 from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
-from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -70,7 +70,7 @@ class SshEligibilityTests(unittest.TestCase):
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
         book = ledger.CostLedger(mac_test.state_paths("linux").directory)
         book.record_inventory(ledger.ResourceInventory(self.now, (
             ledger.PricedResource("retained-storage", Decimal("0")),), "priced fixture inventory"))

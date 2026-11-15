@@ -1444,3 +1444,49 @@ From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "St
 - `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
 - `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
 - Checkpoint b62309ba4.
+
+### Phase 78 — The AWS prices page joins the admin console · status: done
+
+From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the admin console from one source, with a filter for merge gates, targeted runs or both. From aws-unit (not the user), 2026-11-14: write the split on top of main; keep the math in `run_cost.py`; give the region state typed fields; `render()` output must not change.
+
+#### As-built
+
+- `spot_table.spot_tables()` returns `SpotTables`: `prices` and `quotas` as `Table` (title, headers, `right` number columns, rows), one `RegionRead` per region (`age_s`, `stale`, `failure`, `failure_age_s`; `note` and `detail` are properties) and one `RunCosts` per scope (explanation, one `Table` per type, `Cheapest`). `render()` draws `/aws_prices` from these values; its output is byte-identical (live snapshot, widths 40–400).
+- `run_cost.SCOPES` holds `RunScope` merge-gate, targeted-test and both (name, filter label, noun, modes). `RunEvidence.box_seconds` and `expected_usd` take `modes: tuple[str, ...]`; `cloud_gate.py` passes `(mode,)`.
+- `aws_page.py` writes `aws_prices.html` with the page data as JSON to `config/aws_page.conf` `output_folder`, and gives `page_url()` for `config/console.conf`. The hourly buildlog job "AWS prices page" publishes it after the AWS snapshot.
+- The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
+- Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
+- Checkpoint 0c64c36b5.
+
+### Phase 79 — The AWS tables take the user's review changes · status: done
+
+From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws owns `run_cost.py` data changes; report owns the display in `spot_table.py` and `aws_page.py`.
+
+#### As-built
+
+- `spot_table.spot_tables()` is the one typed source for `/aws_prices` and the page. `Table.right` names the number columns, and both views right-align them.
+- `render()` draws the price and quota tables with `split_table()`: the first column, then as many equal columns as fit the terminal width.
+- The quota table is `Spot quotas and boxes that fit`: standard and G and VT quotas, then boxes per type.
+- `SpotTables.snapshot_lines` gives one `Snapshot read N min ago` line when every region has the same state and minute. Otherwise it gives one line per region. A failed read always gives one line per region.
+- The run cost headers are region, Spot USD/h, the scope noun, estimate, paid USD/h, paid USD/run, refused, launched.
+- Refused and launched count only the requests of the selected scope (repair from builds (not the user), 2026-11-14). `RunEvidence` keys requests by type, region and mode. A request without a mode (`NO_MODE`, written before launch rows recorded a mode) counts only under Both (from builds (not the user), 2026-11-14). The refusal wait in the estimate still counts every request, because capacity refusals do not depend on the run kind.
+- `unbilled()` writes a paid cell without a bill: `bill due (N runs)` when runs of the scope wait for their day's bill, `no <scope noun> runs` when only other kinds ran, else `no runs`. The paid USD/h cell uses only `no runs` and `bill due`.
+- The cheapest line considers only `instance_types`, the types that placement picks. `runs_text()` writes `1 run` and `N runs`.
+- `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
+- Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
+- Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
+
+### Phase 80 — The Mac idle watch pushes the user only when the user must act · status: done
+
+From builds (not the user), 2026-11-14 15:10: the user could not understand the phone push `mac_idle.stuck` ("Waiting tests are not using the Mac", 13:22) and asked for a fix for good. A phone push goes out only when the user must act, in plain words; a session acts on all else.
+
+#### As-built
+
+- Cause of the 13:22 push: a kept claim (holder cargo-liner). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The takeover is live since that restart.
+- A free Mac, an idle claim, a block and the disk case send no phone push. `watch_once` sends them as the one message to builds (`notify_outage`), and free-Mac repairs still run.
+- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. After `push_seconds` it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
+- `mac_idle.unreachable` (`push_catalog.py`): title "Mac tests stopped", action "Wake the Mac or check its network.", body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." `waiting_tests()` writes "1 test waits" or "N tests wait".
+- `mac_idle.py cleared --since <since>` is the push's clears-when. It exits 1 while the fresh saved alert is unreachable with that start and waiting tests; else 0.
+- `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation` are gone from the catalog and from `push_texts_reviewed.json`. The unreadable state does not change.
+- Calls sent to builds, each a one-line revert: the idle states send no push; the new unreachable push; the unreadable state unchanged.
+- `mac_idle.unreachable` waits for the user's approval (`review.py texts --id mac_idle.unreachable --approve`). Until then `test_every_catalog_example_has_current_approval` fails for it. The other 117 tests in `test_mac_idle` and `test_push_texts` pass.

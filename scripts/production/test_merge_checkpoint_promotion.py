@@ -1004,7 +1004,8 @@ with lock.open("a") as held:
         _ = (self.state / "fail-checkpoint-test").touch()
         red = self.run_checkpoint(sha)
         self.assertEqual(red.process.returncode, 1, red.process.stderr + red.process.stdout)
-        self.assertIn("red: failed", red.process.stdout)
+        # The fixture is red on every tree, so the base check holds the checkpoint as a base red.
+        self.assertIn("red: held", red.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), before)
         (self.state / "fail-checkpoint-test").unlink()
         green = self.run_checkpoint(sha)

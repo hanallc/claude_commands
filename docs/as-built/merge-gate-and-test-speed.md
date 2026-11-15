@@ -303,6 +303,11 @@ This record changes no selection and refuses no run.
 
 **Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
+This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
+A red module runs once more alone, as in the gate.
+The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
+`--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -631,14 +636,23 @@ The daily rule removes these jobs from default gates.
 2. Verify that the promotion checkout uses main and has an eligible recorded tip.
 3. Verify the settings blob and ancestry of `origin/<merge branch>`.
 4. Check edited paths against the target through `promotion_edit_conflict(repo, target)`.
-5. Record the exact source commit and base for push recovery.
-6. Fast-forward local main and push it.
-7. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
+5. Check live stored state with the target code through `live_state_refusal(repo, target)`.
+6. Record the exact source commit and base for push recovery.
+7. Fast-forward local main and push it.
+8. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
 
 `promotion_edit_conflict` refuses only edited paths that the promotion also changes.
 A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
 The live index and edits stay unchanged; untracked files do not count.
 Local, Mac, and checkpoint promotion use this function.
+
+`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/merge_gate.conf`.
+It runs each listed module from that tree as `python3 -m <module> state-check`, within `live_state_check_seconds`.
+A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/merge_gate.conf` or without the `live_state_checks` key has no checks.
+A nonzero exit refuses the promotion before main moves, and names the module and its last error line.
+The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
+The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
+It exists because the Phase 44 re-land on 2026-11-14 promoted a strict reader over old-shape rows and stopped the service.
 A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
 Tree equality alone does not authorize that push.
 The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.

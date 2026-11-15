@@ -1055,6 +1055,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger = self.ledger()
         self.assertEqual(ledger.judged_at_base((cell,), base), (cell,))
         self.assertEqual(ledger.judged_at_base((cell,), changed), ())
+        # A later refill reads the stored comparisons and compares no inputs again.
+        with mock.patch.object(style_ledger.Ledger, "_compare_judgment_inputs") as compared:
+            self.assertEqual(self.ledger().judged_at_base((cell,), base), (cell,))
+            self.assertEqual(self.ledger().judged_at_base((cell,), changed), ())
+        compared.assert_not_called()
 
     def test_rule_reads_checkpoint_keeps_named_files_for_later_comparisons(self) -> None:
         rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")

@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf
-from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
+from scripts.lib import conf, copy_record
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable, read_cargo_output_roots
 from scripts.lib.user_zone import user_zone
 
 from scripts.buildlog import store
@@ -88,6 +88,14 @@ FOLDERS: list[tuple[str, str]] = [
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
 ]
+
+
+def scanned_folders() -> list[tuple[str, str]]:
+    """FOLDERS plus the scratch root when no folder holds it; task checkouts build there."""
+    scratch = copy_record.root()
+    if any(scratch.is_relative_to(Path(path).expanduser()) for _, path in FOLDERS):
+        return list(FOLDERS)
+    return [*FOLDERS, ("scratch", str(scratch))]
 
 
 @dataclass(frozen=True)
@@ -264,24 +272,98 @@ def capacity_rows(paths: list[Path], measured: tuple[tuple[int, filesystem.Files
     return rows
 
 
+UNREADABLE_FILE = "cargo-output-unreadable.json"
+
+
+@dataclass(frozen=True)
+class UnreadableCheckout:
+    """A checkout Cargo could not read, keyed by its manifest's change time and size."""
+
+    manifest_mtime_ns: int
+    manifest_size: int
+    reason: str
+
+
+def manifest_key(checkout: Path) -> tuple[int, int] | None:
+    try:
+        status = (checkout / "Cargo.toml").stat()
+    except OSError:
+        return None
+    return status.st_mtime_ns, status.st_size
+
+
+def unreadable_path() -> Path:
+    from scripts.lint import sweep
+
+    return sweep.cargo_output_cache_path().with_name(UNREADABLE_FILE)
+
+
+def saved_unreadable() -> dict[Path, UnreadableCheckout]:
+    try:
+        rows = cast(object, json.loads(unreadable_path().read_text()))
+    except (OSError, ValueError):
+        return {}
+    saved: dict[Path, UnreadableCheckout] = {}
+    for path, value in (cast(dict[str, object], rows).items() if isinstance(rows, dict) else ()):
+        if not isinstance(value, dict):
+            continue
+        fields = cast(dict[str, object], value)
+        mtime, size, reason = fields.get("manifest_mtime_ns"), fields.get("manifest_size"), fields.get("reason")
+        if isinstance(mtime, int) and isinstance(size, int) and isinstance(reason, str):
+            saved[Path(path)] = UnreadableCheckout(mtime, size, reason)
+    return saved
+
+
+def save_unreadable(rows: dict[Path, UnreadableCheckout]) -> None:
+    from scripts.lib.atomic_file import write_text_atomic
+
+    path = unreadable_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({str(checkout): {
+        "manifest_mtime_ns": row.manifest_mtime_ns, "manifest_size": row.manifest_size, "reason": row.reason,
+    } for checkout, row in sorted(rows.items())}, indent=1) + "\n")
+
+
 def mapped_output_paths(folders: list[tuple[str, str]]) -> tuple[list[Path], list[str]]:
-    """Read current mappings and retain saved output roots for older workspaces."""
+    """Use the saved output roots, and ask Cargo only for checkouts that no saved row maps.
+
+    A checkout that Cargo could not read is read again only after its manifest changes.
+    """
     from scripts.lint import sweep
 
     saved = sweep.saved_cargo_output_roots()
     mappings = list((*saved.workspaces, *saved.history))
     checkouts: list[str] = []
     _ = sweep.target_dirs([path for _, path in folders], checkouts=checkouts)
-    checkouts.extend(str(item.workspace_root) for item in saved.workspaces
-                     if (item.workspace_root / "Cargo.toml").is_file())
+    mapped = {item.workspace_root.resolve() for item in saved.workspaces}
+    found: list[CargoOutputRoots] = []
     unavailable: list[str] = []
-    for checkout in sorted(set(checkouts)):
-        roots = read_cargo_output_roots(Path(checkout))
+    before = saved_unreadable()
+    unreadable: dict[Path, UnreadableCheckout] = {}
+    # A member crate sorts after its workspace, so one read covers the workspace.
+    for checkout in sorted({Path(path).resolve() for path in checkouts}):
+        if checkout in mapped or not mapped.isdisjoint(checkout.parents):
+            continue
+        key = manifest_key(checkout)
+        earlier = before.get(checkout)
+        if earlier is not None and key == (earlier.manifest_mtime_ns, earlier.manifest_size):
+            unreadable[checkout] = earlier
+            unavailable.append(f"{checkout}: {earlier.reason}")
+            continue
+        roots = read_cargo_output_roots(checkout)
         if isinstance(roots, CargoOutputUnavailable):
             unavailable.append(f"{checkout}: {roots.reason}")
+            if key is not None:
+                unreadable[checkout] = UnreadableCheckout(*key, roots.reason)
         else:
-            mappings.append(roots)
-    return sorted({path for roots in mappings
+            found.append(roots)
+            mapped.add(roots.workspace_root)
+    if found:
+        # The next walk reads these rows and skips the Cargo reads.
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex(tuple(found)))
+    if unreadable != before:
+        save_unreadable(unreadable)
+    return sorted({path for roots in (*mappings, *found)
                    for path in (roots.target_directory, roots.build_directory)}), unavailable
 
 
@@ -317,7 +399,7 @@ def snapshot() -> MeasuredDiskSnapshot:
                 "previous_measured_at": previous_snapshot["previous_measured_at"],
             }
     previous = previous_outside_measurement(previous_snapshot)
-    folders = list(FOLDERS)
+    folders = scanned_folders()
     outputs, unavailable = mapped_output_paths(folders)
     for output in outputs:
         if not any(output.is_relative_to(Path(path).expanduser().resolve()) for _, path in folders):

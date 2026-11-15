@@ -23,6 +23,7 @@ from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 
 MANIFEST = change_page.BROWSER_MANIFEST
+FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
 
 
 @dataclass(frozen=True)
@@ -64,10 +65,34 @@ class PreparedReviews:
 
 
 def page_at(root: Path, path: str) -> ReviewBrowser:
-    match = re.fullmatch(r"/([a-z0-9]{6})/changes\.html", urlsplit(path).path)
+    match = re.fullmatch(FOLDER + r"/changes\.html", urlsplit(path).path)
     if match is None:
         raise FileNotFoundError("not a change browser")
-    folder = root / match[1]
+    token, initial = browser_manifest(browser_folder(root, match[1]))
+    kinds = parse_qs(urlsplit(path).query).get("type", ["changes"])
+    match kinds:
+        case ["changes"]:
+            return ReviewBrowser(token, initial, "changes")
+        case ["questions"]:
+            return ReviewBrowser(token, initial, "questions")
+        case _:
+            raise ValueError("type must be changes or questions")
+
+
+def rebuilds_at(root: Path, path: str) -> None:
+    """Accept the rebuild needs path only beside a published browser."""
+    match = re.fullmatch(FOLDER + "/" + re.escape(change_page.REBUILDS_NAME), urlsplit(path).path)
+    if match is None:
+        raise FileNotFoundError("not a rebuild page")
+    _ = browser_manifest(browser_folder(root, match[1]))
+
+
+def browser_folder(root: Path, name: str) -> Path:
+    """Give the fixed console folder, or an older browser snapshot that still accepts answers."""
+    return change_page.console_folder(root) if name == change_page.CONSOLE_FOLDER else root / name
+
+
+def browser_manifest(folder: Path) -> tuple[str, str]:
     manifest = folder / MANIFEST
     if folder.is_symlink() or manifest.is_symlink():
         raise ValueError("not a regular browser manifest")
@@ -78,11 +103,8 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
     token, initial = fields.get("token"), fields.get("initial")
     if not isinstance(token, str) or not token or not isinstance(initial, str):
         raise ValueError("invalid browser manifest")
-    return ReviewBrowser(token, initial)
+    return token, initial
 
-
-def publish(initial: str = "") -> str:
-    return change_page.publish_browser(initial)
 
 
 def row_token(browser: ReviewBrowser, key: str) -> str:
@@ -205,35 +227,51 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 
 
 def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
-    """Show the rebuild action before its reasons and session details."""
-    def session(label: str, identity: str) -> str:
+    """Show each machine's rebuild action, then each need's reason, source agent and commit."""
+    def session(identity: str) -> str:
         member = record.by_id(staff.StaffId(identity))
-        text = f"{label}: {member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
-        return '<p>' + html.escape(text) + '</p>'
+        return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
 
+    def field(label: str, value: str) -> str:
+        return f'<dt>{label}</dt><dd>{value}</dd>'
+
+    ordered = sorted(machines, key=lambda item: (
+        item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"]))
+    names = ["the Mac" if machine.newest["machine"] == "mac" else machine.newest["machine"] for machine in ordered]
     blocks: list[str] = []
-    for machine in sorted(machines, key=lambda item: (
-            item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"])):
+    for machine, name in zip(ordered, names):
         machine_name = machine.newest["machine"]
-        name = "the Mac" if machine_name == "mac" else machine_name
         terminal = "Terminal" if machine_name == "mac" else "a terminal"
         items: list[str] = []
-        details: list[str] = []
         for item in sorted(machine.records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
-            requester = (session("Requested by", item["requested_by"])
-                         if item["requested_by"] and item["requested_by"] != item["concerns"] else "")
-            items.append(f'<li>{html.escape(item["reason"])}</li>')
-            details.append('<li><p>Configuration commit: <code>' + html.escape(item["nixos_commit"]) + '</code></p>'
-                           + session("Affected session", item["concerns"]) + requester + '</li>')
+            source = item["requested_by"] or item["concerns"]
+            affected = (field("Affected session", html.escape(session(item["concerns"])))
+                        if item["concerns"] and item["concerns"] != source else "")
+            items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
+                         + field("Source agent", html.escape(session(source))) + affected
+                         + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
         blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
             + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
             + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
             + ('<p>One rebuild applies all listed changes.</p>' if len(machine.records) >= 2 else '')
-            + '<p>After the rebuild</p><ul>' + ''.join(items) + '</ul>'
-            + '<details><summary>Details</summary><ol>' + ''.join(details) + '</ol></details></article>')
-    return (f'<div hidden data-rebuilds data-count="{len(machines)}">'
-            + (''.join(blocks) + '<p>Completed requests clear automatically. Refresh this page after the rebuild.</p>'
-               if blocks else '<p>No rebuilds needed.</p>') + '</div>')
+            + '<ul>' + ''.join(items) + '</ul></article>')
+    count = sum(len(machine.records) for machine in machines)
+    label = f"Rebuild {', '.join(names)} ({count})" if count else ""
+    return (f'<div data-rebuilds data-count="{count}" data-label="{html.escape(label, quote=True)}">'
+            + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
+            + '</div>')
+
+
+REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
+[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}[data-rebuilds] li p{margin:0 0 8px}
+[data-rebuilds] dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
+
+
+def render_rebuilds() -> bytes:
+    """Render the open rebuild needs for the console's rebuild link and overlay."""
+    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuild_list(need.read_needs(), staff.snapshot()),
+                                "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -241,50 +279,36 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
     prepared = prepare(browser, status)
-    rebuilds = need.read_needs()
+    kind = browser.kind
+    names = prepared.queues if kind == "changes" else prepared.question_tabs
     menus: list[str] = []
-    for kind, names in (("changes", prepared.queues), ("questions", prepared.question_tabs)):
-        for name in names:
-            count = (sum(item.tab == name and item.waiting for item in prepared.changes) if kind == "changes"
-                     else sum(item.tab == name for item in prepared.questions))
-            label = "Owner unavailable" if name == "unrouted" else name
-            menus.append(f'<option data-type="{kind}" data-showrunner="{html.escape(name)}" '
-                         + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
-    type_tabs = '<nav class="review-types" role="tablist" aria-label="Review type">'
-    for kind, label, count in (("questions", "Questions", len(prepared.questions)),
-                               ("changes", "Changes", sum(item.waiting for item in prepared.changes)),
-                               ("rebuilds", "Rebuilds", len(rebuilds))):
-        type_tabs += (f'<button type="button" id="type-{kind}" role="tab" aria-controls="review-panel" '
-                      + f'aria-selected="{str(kind == "changes").lower()}" data-review-type="{kind}">'
-                      + f'{label} (<span data-type-count="{kind}">{count}</span>)</button>')
-    type_tabs += '</nav>'
-    content = ('''<style>[hidden]{display:none!important}
-.review-types{display:flex;flex-wrap:nowrap;margin:0;gap:0}
-.review-types button{flex:1;min-width:0;margin:0;padding:10px 6px;white-space:nowrap;font-size:clamp(13px,3.6vw,17px);background:transparent;color:light-dark(#595959,#b0b0b0);border:1px solid transparent;border-bottom:1px solid light-dark(#707070,#a0a0a0);border-top:3px solid transparent}
-.review-types button[aria-selected=true]{color:CanvasText;background:Canvas;border-color:light-dark(#707070,#a0a0a0);border-bottom-color:Canvas;border-top-color:Highlight}
-.review-types button:focus-visible{outline-offset:-5px}
-.review-panel{border:1px solid light-dark(#707070,#a0a0a0);border-top:0;padding:16px;min-width:0;background:Canvas}
+    for name in names:
+        count = (sum(item.tab == name and item.waiting for item in prepared.changes) if kind == "changes"
+                 else sum(item.tab == name for item in prepared.questions))
+        label = "Owner unavailable" if name == "unrouted" else name
+        menus.append(f'<option data-showrunner="{html.escape(name)}" '
+                     + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
+    cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
+             else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
+    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}">'
+               + f'<h1>{change_page.TITLES[kind]}</h1>'
+               + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
+               + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
+               + '<template data-runner-options>' + ''.join(menus) + '</template>'
+               + '<p hidden role="status" data-save-notice></p>' + cards
+               + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
+               + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div>'
+               + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
+    return change_page.document(content, change_page.TITLES[kind])
+
+
+PAGE_STYLE = """<style>[hidden]{display:none!important}
 [data-showrunner-filter]{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;margin-bottom:16px}
 [data-showrunner-filter] label{white-space:nowrap}
 [data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
 section+section{border:0;margin:0;padding:0}
-[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:16px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}
-[data-rebuilds] details p{margin:0}[data-rebuilds] details p+p{margin-top:8px}
 .navigation{padding:12px 0;background:Canvas}.navigation:empty{display:none}button{min-height:44px}
-</style>''' + f'<div data-review-content data-refresh-seconds="{refresh_seconds}"><h1 data-review-heading>Changes to review</h1>'
-               + type_tabs + '<div class="review-panel" id="review-panel" role="tabpanel" aria-labelledby="type-changes">'
-               + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
-               + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
-               + '<template data-runner-options>' + ''.join(menus) + '</template>'
-               + '<p hidden role="status" data-save-notice></p>'
-               + ''.join(section(item, feedback_rows) for item in prepared.changes)
-               + ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions)
-               + rebuild_list(rebuilds, prepared.record)
-               + '<p hidden data-empty></p><div class="navigation"><button type="button" data-next hidden>Skip for now</button></div>'
-               + '<noscript>Enable JavaScript to review items and use Skip for now.</noscript></div></div>'
-               + '<script>const initial=' + json.dumps(browser.initial).replace('<', '\\u003c') + ';' + SCRIPT + '</script>')
-    return change_page.document(content)
+</style>"""
 
 
 def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
@@ -379,68 +403,49 @@ def submit_question(question: WaitingQuestion, answer: str, status: change_page.
 
 SCRIPT = r'''
 let content=document.querySelector('[data-review-content]');
-let rows,runnerOptions,types,rebuilds,rebuildCount,showrunners,runnerMenu,next,empty,heading,saveNotice;
+let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
-const remembered=new Map(), places=new Map(); let current=null, tab='', kind='changes', navigation=0, shownHash='';
+const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
  runnerOptions=[...content.querySelector('[data-runner-options]').content.children];
- types=[...content.querySelectorAll('[data-review-type]')];
- rebuilds=content.querySelector('[data-rebuilds]');rebuildCount=Number(rebuilds.dataset.count);
  showrunners=content.querySelector('[data-showrunner-filter]');runnerMenu=showrunners.querySelector('select');
  next=content.querySelector('[data-next]');empty=content.querySelector('[data-empty]');
- heading=content.querySelector('[data-review-heading]');saveNotice=content.querySelector('[data-save-notice]');
- runnerMenu.addEventListener('change',()=>{tab=runnerMenu.value;go(remembered.get(kind+'/'+tab));});
- types.forEach(t=>t.addEventListener('click',()=>{navigation++;clearNotice();kind=t.dataset.reviewType;
-  location.hash=places.get(kind) || new URLSearchParams({type:kind});show();}));
- content.querySelector('[role=tablist]').addEventListener('keydown',event=>{
-  let index=types.indexOf(document.activeElement);
-  if(event.key==='ArrowRight') index=(index+1)%types.length;
-  else if(event.key==='ArrowLeft') index=(index+types.length-1)%types.length;
-  else if(event.key==='Home') index=0;
-  else if(event.key==='End') index=types.length-1;
-  else return;
-  event.preventDefault();types[index].click();types[index].focus();
- });
+ saveNotice=content.querySelector('[data-save-notice]');
+ runnerMenu.addEventListener('change',()=>{tab=runnerMenu.value;go(remembered.get(tab));});
  next.addEventListener('click',()=>advance(current));
  rows.forEach(row=>{
   const form=row.querySelector('form');
   if(form) form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
  });
 }
-function waiting(){return rows.filter(r=>r.dataset.type===kind && (tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
+function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
 function show(){
  const place=new URLSearchParams(location.hash.slice(1));
  const requested=place.has('row') ? place.get('row') : initial;
- kind=place.get('type') || rows.find(r=>r.dataset.key===requested)?.dataset.type || (rows.some(r=>r.dataset.type==='questions') ? 'questions' : 'changes');
- const options=runnerOptions.filter(option=>option.dataset.type===kind);
- const rebuildMode=kind==='rebuilds';
- heading.textContent={questions:'Questions to answer',changes:'Changes to review',rebuilds:'Rebuilds needed'}[kind];
- rebuilds.hidden=!rebuildMode;showrunners.hidden=rebuildMode;
- document.querySelector('.navigation').hidden=rebuildMode;
- types.forEach(t=>{t.setAttribute('aria-selected',String(t.dataset.reviewType===kind));t.tabIndex=t.dataset.reviewType===kind ? 0 : -1;
-  t.querySelector('[data-type-count]').textContent=t.dataset.reviewType==='rebuilds' ? rebuildCount : rows.filter(r=>r.dataset.type===t.dataset.reviewType && r.dataset.pending==='true').length;});
- content.querySelector('[role=tabpanel]').setAttribute('aria-labelledby','type-'+kind);
  tab=place.get('showrunner') || '';
- if(tab!=='' && !options.some(option=>option.value===tab)) tab='';
- runnerMenu.replaceChildren(new Option('All ('+rows.filter(row=>row.dataset.type===kind && row.dataset.pending==='true').length+')',''),...options.map(option=>{
+ if(tab!=='' && !runnerOptions.some(option=>option.value===tab)) tab='';
+ const pending=rows.filter(row=>row.dataset.pending==='true');
+ runnerMenu.replaceChildren(new Option('All ('+pending.length+')',''),...runnerOptions.map(option=>{
   const item=option.cloneNode(true);
-  item.textContent=(item.value==='unrouted' ? 'Owner unavailable' : item.value)+' ('+rows.filter(row=>row.dataset.type===kind && row.dataset.tab===item.value && row.dataset.pending==='true').length+')';
+  item.textContent=(item.value==='unrouted' ? 'Owner unavailable' : item.value)+' ('+pending.filter(row=>row.dataset.tab===item.value).length+')';
   return item;
  }));runnerMenu.value=tab;
- current=rows.find(r=>r.dataset.key===requested && (tab==='' || r.dataset.tab===tab) && r.dataset.type===kind) || waiting()[0] || null;
- empty.hidden=rebuildMode || current!==null;
- const typeWaiting=rows.some(r=>r.dataset.type===kind && r.dataset.pending==='true');
- empty.textContent=kind==='questions' ? (typeWaiting ? 'No questions for this showrunner.' : 'No questions to answer.') :
-  (typeWaiting ? 'No changes for this showrunner.' : 'No changes to review.');
+ current=rows.find(r=>r.dataset.key===requested && (tab==='' || r.dataset.tab===tab)) || waiting()[0] || null;
+ empty.hidden=current!==null;
+ empty.textContent=kind==='questions' ? (pending.length ? 'No questions for this showrunner.' : 'No questions to answer.') :
+  (pending.length ? 'No changes for this showrunner.' : 'No changes to review.');
  rows.forEach(r=>r.hidden=r!==current);
- next.hidden=rebuildMode || !waiting().some(r=>r!==current);
+ next.hidden=!waiting().some(r=>r!==current);
  (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
- if(current) remembered.set(kind+'/'+tab,current.dataset.key);
- const hash=new URLSearchParams(rebuildMode ? {type:kind} : {type:kind,showrunner:tab || '',row:current?.dataset.key || ''});
- places.set(kind,hash.toString()); history.replaceState(null,'','#'+hash); shownHash=location.hash; }
+ if(current) remembered.set(tab,current.dataset.key);
+ // The default place, All with no card, keeps a plain URL.
+ history.replaceState(null,'',tab || current ? '#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''}) : location.pathname+location.search);
+ shownHash=location.hash;
+ // The console records this place in its own URL, so a reload or a shared link opens it again.
+ if(parent!==window) parent.postMessage('console-place',location.origin); }
 function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
-function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({type:kind,showrunner:tab,row:key || ''});show();}
+function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
  const at=rows.indexOf(row), candidates=waiting();
  const following=candidates.find(r=>rows.indexOf(r)>at) || candidates[0];
@@ -462,7 +467,7 @@ async function save(row,form,outcome){
   saved=true;
   row.dataset.pending='false';form.hidden=true;
   if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){
-   advance(row);saveNotice.textContent=row.dataset.type==='questions' ? 'Answer saved.' : 'Review saved.';saveNotice.hidden=false;
+   advance(row);saveNotice.textContent=kind==='questions' ? 'Answer saved.' : 'Review saved.';saveNotice.hidden=false;
   }
   else show();
  }catch(error){
@@ -475,8 +480,8 @@ async function save(row,form,outcome){
  }
 }
 function detailKey(detail){
- const owner=detail.closest('[data-key],[data-machine]');
- return (owner?.dataset.key || 'rebuild/'+owner?.dataset.machine)+'/'+[...owner.querySelectorAll('details')].indexOf(detail);
+ const owner=detail.closest('[data-key]');
+ return owner?.dataset.key+'/'+[...owner.querySelectorAll('details')].indexOf(detail);
 }
 function applyHeldPage(){
  if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
@@ -484,18 +489,18 @@ function applyHeldPage(){
  if(fresh.outerHTML===shownPage) return;
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
- const controlId=focused===runnerMenu || types.includes(focused) ? focused.id : '';
+ const controlId=focused===runnerMenu ? focused.id : '';
  const fieldRow=focused?.closest('[data-key]')?.dataset.key;
  const fieldName=focused?.matches('textarea,input[type=text]') ? focused.name : '';
  const selection=[focused?.selectionStart,focused?.selectionEnd,focused?.selectionDirection];
  const previous=rows.indexOf(current),following=rows.slice(previous+1).map(row=>row.dataset.key);
- const candidates=[...fresh.querySelectorAll('section[data-key]')].filter(row=>row.dataset.type===kind && (tab==='' || row.dataset.tab===tab) && row.dataset.pending==='true');
+ const candidates=[...fresh.querySelectorAll('section[data-key]')].filter(row=>(tab==='' || row.dataset.tab===tab) && row.dataset.pending==='true');
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
  const notice=saveNotice.hidden ? '' : saveNotice.textContent;
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
- history.replaceState(null,'','#'+new URLSearchParams(kind==='rebuilds' ? {type:kind} : {type:kind,showrunner:tab || '',row:chosen?.dataset.key || ''}));
+ history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
  show();
  if(notice){saveNotice.textContent=notice;saveNotice.hidden=false;}
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
@@ -503,8 +508,10 @@ function applyHeldPage(){
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
  window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
 }
+// A console frame that another page covers is hidden and loads no update.
+const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 async function refreshPage(supersede=false){
- if(document.visibilityState!=='visible' || (activeLoads && !supersede)) return;
+ if(paused() || (activeLoads && !supersede)) return;
  const request=++newestRequest;
  activeLoads++;
  try{
@@ -522,6 +529,7 @@ function scheduleRefresh(){
 }
 document.addEventListener('input',()=>applyHeldPage());
 document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
+window.addEventListener('message',event=>{if(event.source===parent && event.origin===location.origin && event.data==='console-shown') refreshPage(true);});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''

@@ -27,7 +27,9 @@ from scripts.build_targets import build_targets
 from scripts.lib import process_start as process_identity
 
 from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
+from scripts.build_queue import placement
 from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
@@ -811,6 +813,18 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("test", "portable"), "any_target\n")
         self.assertEqual(self.kind_answer("test", "linux-part"), "any_target\n")
 
+    def test_lint_and_doc_of_a_named_package_exclude_the_mac_for_a_linux_only_member(self) -> None:
+        # verify.sh lints and documents the whole workspace for one package.
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
+        for kind in ("lint", "doc"):
+            with self.subTest(kind=kind):
+                self.assertIn("mac\texcluded\tlinux_only", self.kind_output(kind, "portable"))
+                constraints = build_targets.fixed_placement_constraints(self.root, "portable", kind, ("cargo", kind),
+                                                                        NoOwningSession(), "fixed-source")
+                mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+                self.assertEqual(mac.eligibility, placement.FixedExclusion("linux_only"))
+        self.assertIn("mac\teligible", self.kind_output("check", "portable"))
+
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")
         offload.write_backoff(time.time() + 60)
@@ -1003,7 +1017,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
 
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:
-        with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
+        with mock.patch.object(session_owner, "owning_session", side_effect=AssertionError("Owner lookup not needed")):
             self.assertEqual(self.wait(), (0, "", ""))
 
 
