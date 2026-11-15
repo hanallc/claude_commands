@@ -129,6 +129,16 @@ class StepKind:
         return f"{self.repo} {self.step}" if self.repo else self.step
 
 
+def repository_name(folder: str | None, identity: str | None) -> str:
+    """The repository's name: the last part of its origin URL, else its folder name.
+
+    A verify gate copy has its own folder, such as checkout, and the origin of the repository it copies.
+    """
+    if identity and identity.startswith("https://"):
+        return identity.rsplit("/", 1)[-1]
+    return folder or ""
+
+
 @dataclass(frozen=True)
 class CostContribution:
     at: float
@@ -294,7 +304,8 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         )
     rows = cast(Sequence[tuple[str | None, str | None, str, float | None, float | None, int | None,
                                int | None, str | None, str | None, str | None, str | None,
-                               str | None, float, int, str | None, str | None, str | None, float | None, str | None]],
+                               str | None, float, int, str | None, str | None, str | None, float | None, str | None,
+                               str | None]],
         connection.execute(
             "WITH window_steps AS MATERIALIZED (SELECT id,target,host,session,step FROM steps WHERE "
             + moments.window_bounds("started_at") + ")" + context_sql
@@ -302,7 +313,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
             + " SELECT target, host, step, duration_s, mem_wait_s, status, crates_compiled, session,"
             + " worktree, repo, build_base, tree_key, unixepoch(started_at, 'subsec'),"
             + " CASE WHEN unixepoch(started_at,'subsec') >= :lower_epoch THEN (" + index.COUNTED_FAILURE + ") ELSE 0 END,"
-            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome"
+            + " c.mac,c.mac_reason,c.local_reason,c.mac_s,c.outcome,repo_identity"
             + " FROM steps LEFT JOIN"
             + " (SELECT id,mac,mac_reason,local_reason,mac_s,outcome FROM main.calls) c"
             + " ON c.id = steps.call_id AND unixepoch(started_at,'subsec') >= :lower_epoch"
@@ -312,11 +323,11 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     observations: list[SourceObservation] = []
     sessions: dict[tuple[str, str], tuple[moments.PreviousNextest, moments.RecordedBuildTree | moments.UnrecordedIdentity]] = {}
     intervals: list[tuple[float, int, int]] = []
-    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text in rows:
+    for target, host, kind, duration, wait, status, crates, session, worktree, repo, base, tree, at, failed, mac, reason, local_reason, mac_s, outcome_text, identity in rows:
         machine = machine_name(target, host, legacy_hosts)
         seconds, wait_s = max(0.0, duration or 0.0), max(0.0, wait or 0.0)
         selected = lower <= at < upper
-        step_kind = StepKind(repo or "", kind)
+        step_kind = StepKind(repository_name(repo, identity), kind)
         if selected:
             observations.append(SourceObservation(at, machine))
             if kind != "launch":

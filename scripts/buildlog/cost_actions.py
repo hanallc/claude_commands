@@ -71,17 +71,17 @@ def largest_share(reading: costs.CostReading, machine: str, cause: costs.Cause,
 
 def memory_holder(connection: sqlite3.Connection, machine: str, start: datetime, end: datetime) -> LowerMemoryPeak | None:
     """The step kind with the largest memory peak times run time, from steps with a recorded peak."""
-    rows = cast(list[tuple[str | None, str | None, str | None, str, int, float]], connection.execute(
-        "SELECT target, host, repo, step, peak_mem_bytes, duration_s FROM steps WHERE "
+    rows = cast(list[tuple[str | None, str | None, str | None, str | None, str, int, float]], connection.execute(
+        "SELECT target, host, repo, repo_identity, step, peak_mem_bytes, duration_s FROM steps WHERE "
         + moments.window_bounds("started_at") + " AND peak_mem_bytes > 0 AND duration_s > 0",
         moments.window_parameters(start, end)).fetchall())
     legacy_hosts: dict[str, str] = {}
     held: defaultdict[StepKind, float] = defaultdict(float)
     peaks: defaultdict[StepKind, list[int]] = defaultdict(list)
-    for target, host, repo, step, peak, duration in rows:
+    for target, host, repo, identity, step, peak, duration in rows:
         if costs.machine_name(target, host, legacy_hosts) != machine:
             continue
-        kind = StepKind(repo or "", step)
+        kind = StepKind(costs.repository_name(repo, identity), step)
         held[kind] += peak / GIB * duration / 3600
         peaks[kind].append(peak)
     if not held:
@@ -93,12 +93,12 @@ def memory_holder(connection: sqlite3.Connection, machine: str, start: datetime,
 
 def failing_test(connection: sqlite3.Connection, machine: str, start: datetime, end: datetime) -> FixTest | None:
     """The test with the most failed or timed out runs on the machine."""
-    rows = cast(list[tuple[str | None, str | None, str | None, str]], connection.execute(
-        "SELECT s.target, s.host, s.repo, t.test FROM tests t JOIN steps s ON s.id = t.step_id WHERE "
+    rows = cast(list[tuple[str | None, str | None, str | None, str | None, str]], connection.execute(
+        "SELECT s.target, s.host, s.repo, s.repo_identity, t.test FROM tests t JOIN steps s ON s.id = t.step_id WHERE "
         + moments.window_bounds("s.started_at") + " AND t.status IN ('failed', 'timed_out')",
         moments.window_parameters(start, end)).fetchall())
     legacy_hosts: dict[str, str] = {}
-    failures = Counter((repo or "", test) for target, host, repo, test in rows
+    failures = Counter((costs.repository_name(repo, identity), test) for target, host, repo, identity, test in rows
                        if costs.machine_name(target, host, legacy_hosts) == machine)
     if not failures:
         return None
