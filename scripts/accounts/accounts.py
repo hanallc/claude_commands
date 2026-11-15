@@ -4332,7 +4332,7 @@ BoardTone = Literal["default", "success", "error", "warning", "inactive"]
 
 
 class BoardSpan(TypedDict):
-    """One styled piece of a board cell; the console Accounts page draws it as it is."""
+    """One styled piece of a board cell; the console Accounts page and the unit-board plugin draw it as it is."""
     text: str
     tone: BoardTone
     kind: Literal["fact", "bold"]
@@ -4351,14 +4351,17 @@ class BoardRow(TypedDict):
 
 
 class Board(TypedDict):
+    """The rows hold the reset text for one local day; a reader draws them again from stale_at, an ISO UTC time."""
     columns: list[BoardColumn]
     rows: list[BoardRow]
+    stale_at: str
 
 
 class StatusDocument(TypedDict):
     upcoming_moves: list[str]
     session_inputs: list[str]
     accounts: list[StatusAccountDocument]
+    board: Board
     problems: list[str]
 
 
@@ -4546,8 +4549,11 @@ def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | Re
     """The accounts board: one line per role of each account, then the total line."""
     account_config = read_account_settings(account_config)
     rows = sorted(reading.rows, key=lambda row: row.label.casefold())
+    # The reset text changes at the next local midnight.
+    today = reading.checked_at.astimezone(reading.zone).date()
+    stale_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), reading.zone).astimezone(timezone.utc).isoformat()
     if not rows:
-        return Board(columns=list(BOARD_COLUMNS), rows=[])
+        return Board(columns=list(BOARD_COLUMNS), rows=[], stale_at=stale_at)
     lines = [line for row in rows for line in _account_board_rows(row, reading, account_config=account_config)]
     known = [count for row in rows for count in row.role_counts if isinstance(count, RoleSessionCounts)]
     total = {"busy": str(sum(count.busy for count in known)), "idle": str(sum(count.idle for count in known)),
@@ -4558,7 +4564,7 @@ def status_board(reading: StatusReading, *, account_config: conf.ConfigRead | Re
                                  **{key: [_span(value)] for key, value in total.items()},
                                  "resets": empty, "credits": empty, "enabled": empty},
                           facts=_count_facts(total)))
-    return Board(columns=list(BOARD_COLUMNS), rows=lines)
+    return Board(columns=list(BOARD_COLUMNS), rows=lines, stale_at=stale_at)
 
 
 def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
@@ -4581,7 +4587,8 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
             read_ok=_read_ok(row, reading, account_config=account_config),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                                     board=status_board(reading, account_config=account_config), problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]

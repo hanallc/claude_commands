@@ -12,7 +12,7 @@ The plugin keeps its name because both commands use it.
 
 The files in `mods/unit-board/hooks/` use the Claude Code engine through `$`.
 `register.tsx` owns engine calls, pane state, timers, and command hooks.
-`data.ts` owns account loading, source checks, and user-zone lookup.
+`data.ts` owns account loading, board checks, and source checks.
 `accounts.tsx` draws accounts; `queue.tsx` draws queue span lines.
 Shared text helpers remain available to both panes.
 The accounts and queue wire types describe their Python readers.
@@ -25,7 +25,7 @@ Promoted changes apply at the next session start or `/reload-plugins`.
 ## Commands
 
 `/showrunner:accounts [close]` opens the `Accounts` pane without a model turn.
-It runs `accounts.py status --json --stored` and resolves the user zone.
+It runs `accounts.py status --json --stored`.
 It replies `Accounts opened.` or `Accounts closed.`.
 
 `/build:queue [<position|session|folder>]` opens the `Build queue` pane without a model turn.
@@ -71,7 +71,7 @@ A missing record means the pane is closed.
 Accounts records have `loading`, `accounts`, or `failed` states.
 Queue records have `loading`, `queue`, or `failed` states and retain their selection.
 Each pane has its own busy guard, timer, and lifecycle counter.
-Close cancels its timer and invalidates pending reads and zone lookups.
+Close cancels its timer and invalidates pending reads.
 A forced refresh during a read requests one following read.
 
 Accounts refreshes every ten seconds while open.
@@ -80,6 +80,8 @@ It also checks reported session inputs and the peer-count cache.
 A missing path uses its nearest existing parent for discovery.
 A source change or failed stat requests a new reading.
 Reported session inputs also request current local counts on each tick.
+The board's `stale_at` is the next local midnight, when the reset text changes.
+The first tick at or after `stale_at` requests a new reading.
 Accounts ignores `turn.complete`.
 
 The build queue reads live process memory every ten seconds while open.
@@ -89,7 +91,8 @@ Countdown spans redraw once per second until expiry, without another script run.
 
 ## Account drawing
 
-`AccountsView(elements, columns, status, zone, now)` fits the pane width.
+`accounts.status_board()` builds the board, and the console Accounts page draws the same board.
+The board holds its columns, one row of cells for each table line, and the same facts for a narrow pane.
 Its columns start with the access mark, account, left, and role.
 The activity columns follow: busy, idle, paused, exited, and total.
 The final columns show resets, credits, and enabled.
@@ -100,7 +103,6 @@ Python combines machine counts in `role_counts` and retains separate records in 
 The decoder counts an older peer's starting sessions as busy before it combines machine counts.
 A role without reported members has zero counts; `spare` has no count.
 The totals row sums known activity counts.
-The pane adds the starting and waiting counts of an older stored status to busy.
 
 Without live detached work, units and showrunners without live sessions count as exited on their selected role account.
 Claude producers count under `showrunners` through the same hold and activity rules.
@@ -112,18 +114,15 @@ Staff exit and pause records take priority.
 The access mark uses `read_ok`.
 Low allowance uses error below 10 percent and warning below 25 percent.
 
+`AccountsView(elements, columns, status)` draws the board as it is, and each span keeps its tone and weight.
 Tables use the widest header or cell, with two spaces between columns.
-Narrow panes split columns or show labeled facts.
+A narrow pane splits the table before `resets`, or shows the facts of each row.
 Wrapping preserves complete facts and stays inside the pane.
 Problems appear as wrapped warning lines.
-`accountDisplay` converts the wire contract to `AccountReading<T>` and `CreditBalance`.
-It converts `StoredRoleSessionCounts` to `RoleSessionCounts` with all activity counts present.
+`validBoard` refuses a board with an unknown tone or kind, a column without an alignment, or a `stale_at` that is not a time.
+The pane then shows `Stored accounts status could not be read.`.
+A pane state saved before the board existed draws as loading until the next reading.
 The [account design](accounts.md#status-counts-and-notes) defines count attribution and stored reads.
-
-`resolveUserZone` follows `scripts/lib/user_zone.py`.
-It checks `USER_ZONE`, then `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`.
-It validates the zone through `Intl.DateTimeFormat`.
-A changed lifecycle cancels a pending lookup.
 
 ## Invariants and checks
 
@@ -131,7 +130,7 @@ A changed lifecycle cancels a pending lookup.
 2. A closed pane performs no timer, filesystem, or process work.
 3. The mod reads no credential file and requests no login.
 4. Accounts uses `accounts.py status --json --stored` without account probes.
-5. User-facing times use the user zone.
+5. User-facing times use the user zone, which `accounts.py` applies.
 6. The readers remain one-shot commands; the mod adds no daemon or external job.
 
 Run `command claude plugin test mods/unit-board` for the mod tests.
