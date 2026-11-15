@@ -11,6 +11,29 @@ from typing import Protocol
 from scripts.lib.suite_runners import starts_suite_runner
 
 
+SESSION_KEYS = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_NAME")
+SCOPE_KEYS = ("BUILDLOG_RUN", "PYTEST_CURRENT_TEST", *SESSION_KEYS)
+
+
+def environment_values(environ: Path, keys: tuple[str, ...]) -> dict[str, str]:
+    """Read some keys from a process environment file; an unreadable file has none.
+    A search for each key costs less CPU than a parse of the whole environment."""
+    try:
+        raw = b"\0" + environ.read_bytes()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for key in keys:
+        marker = b"\0" + key.encode() + b"="
+        # The last copy of a key wins, as in a dict built from the whole environment.
+        start = raw.rfind(marker)
+        if start >= 0:
+            start += len(marker)
+            end = raw.find(b"\0", start)
+            values[key] = raw[start:end if end >= 0 else len(raw)].decode(errors="replace")
+    return values
+
+
 def runs_suite_runner(command: tuple[str, ...]) -> bool:
     return any(starts_suite_runner(command[index:]) for index in range(len(command)))
 
@@ -110,11 +133,7 @@ class ScopeActivityReader:
 
     def environment(self, pid: int) -> dict[str, str]:
         if pid not in self.environments:
-            try:
-                raw = (self.proc / str(pid) / "environ").read_bytes().decode(errors="replace")
-                self.environments[pid] = dict(item.split("=", 1) for item in raw.split("\0") if "=" in item)
-            except OSError:
-                self.environments[pid] = {}
+            self.environments[pid] = environment_values(self.proc / str(pid) / "environ", SCOPE_KEYS)
         return self.environments[pid]
 
     def command(self, pid: int) -> tuple[str, ...]:
