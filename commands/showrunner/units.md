@@ -8,7 +8,7 @@ Run this in the showrunner session:
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`.
 The caller's staff row selects the production.
 Print the full output as Markdown, without code fences or added text.
-Include the summary, unit blocks, style table, totals, and anomaly lines when present.
+Include the summary, status table, unit blocks, style table, totals, and anomaly lines when present.
 
 The phase board prints one block per staff unit, sorted by name without case distinctions.
 It includes paused units, stopped units, and units without a session.
@@ -16,6 +16,17 @@ The first line counts each unit once:
 `working N · waiting to merge N · waiting on other work N · idle N · <total> units`.
 It inserts `unknown N` before the total only when that count exceeds zero.
 Counts include only units in these blocks.
+
+The status table follows the count line, above the blocks.
+Its columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`.
+- `Status` is the census status of the unit's session.
+- `Machine` appears only when a unit uses another machine.
+- `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
+- `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
+- `ETA Next` is the stated ETA of the phase, with any delay.
+- `ETA Plan` appears only while a plan runs.
+The table omits a column whose cells are all `—`.
+It wraps cells to the pane width, or to `units_table_floor_columns` when the width is unknown.
 
 Each title is `**<unit>** — <bucket>`.
 When any unit uses another machine, each title includes its machine in parentheses.
@@ -26,7 +37,7 @@ Each field is a list item with a bold label.
 Multiple items use an indented numbered list.
 Queue items always use a numbered list.
 Native Markdown wrapping preserves full titles, reasons, and queue text inside their blocks.
-The phase board reads no pane width and uses no continuation rows.
+The blocks use no pane width and no continuation rows.
 
 The summary uses the first matching rule:
 

@@ -24,7 +24,7 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
+from scripts.production import census, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
@@ -233,8 +233,10 @@ class UnitPhasesTests(unittest.TestCase):
                         unit_lookup.ClaudeUnknown("no records")):
             with self.subTest(session=session):
                 rendered = table_of([unit(member.name, session)], {})
+                status = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
                 self.assertEqual(rendered.splitlines(), [
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
+                    "| Unit | Status |", "| --- | --- |", f"| namecheck | {status} |", "",
                     "**namecheck** — idle",
                     "- **Now:** Nothing to do: no plan or queued work.",
                     "- **Next:** Nothing queued. No plan is assigned."])
@@ -248,16 +250,17 @@ class UnitPhasesTests(unittest.TestCase):
                              activity_text="checks " + "all details " * 30)])
         _ = self.queue(member, unit_queue.QueuedItem(queued))
         for columns in (40, 80, 120, 180):
-            with (self.subTest(columns=columns), patch.dict(os.environ, {"COLUMNS": str(columns)}),
-                  patch.object(display_cells, "wrapped") as wrapped):
+            with self.subTest(columns=columns), patch.dict(os.environ, {"COLUMNS": str(columns)}):
                 rendered = self.blocks([member], {})
-                self.assertIn(title + " (review)", rendered)
-                self.assertIn(queued, rendered)
-                self.assertIn("checks " + ("all details " * 30).strip(), rendered)
+                blocks = rendered[rendered.index("**wide**"):]
+                self.assertIn(title + " (review)", blocks)
+                self.assertIn(queued, blocks)
+                self.assertIn("checks " + ("all details " * 30).strip(), blocks)
                 self.assertEqual(rendered.count("**wide**"), 1)
-                wrapped.assert_not_called()
-                for text in ("| Unit |", "🟩", "🟨", "⬜", "in work", "merged today", "fix rounds",
-                             "Non-Phase Work", "nothing open", "ETA Plan", "Workers |", "…"):
+                self.assertEqual(rendered.count("| Unit |"), 1)
+                self.assertNotIn("\n| ", blocks)
+                for text in ("in work", "merged today", "fix rounds", "Non-Phase Work", "nothing open",
+                             "Workers |", "…"):
                     self.assertNotIn(text, rendered)
 
     def test_blocks_sort_units_and_show_machines_only_when_needed(self) -> None:
@@ -267,7 +270,7 @@ class UnitPhasesTests(unittest.TestCase):
         rendered = unit_phases.table(selected, {}, census_read=census_for(selected))
         self.assertEqual([line for line in rendered.splitlines() if line.startswith("**")],
                          ["**alpha** (natedev) — idle", "**Beta** (mac) — idle", "**zulu** (natedev) — idle"])
-        self.assertEqual(rendered.count("\n\n"), 3)
+        self.assertEqual(rendered.count("\n\n"), 4)
         self.assertEqual(rendered.count("- **Now:**"), 3)
         self.assertEqual(rendered.count("- **Next:**"), 3)
         for field in ("Also", "Wait", "Merge"):
@@ -954,6 +957,7 @@ class UnitPhasesTests(unittest.TestCase):
         table_end = next(index for index, line in enumerate(lines) if line.startswith("- **Next:**"))
         self.assertEqual(lines[:table_end + 1], [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
+            "| Unit | Status |", "| --- | --- |", "| member | exited |", "",
             "**member** — idle",
             "- **Now:** Nothing to do: no plan or queued work.",
             "- **Next:** Nothing queued. No plan is assigned.",
@@ -1020,8 +1024,9 @@ class UnitPhasesTests(unittest.TestCase):
             result = unit_phases.main(["--production", owner.name])
         self.assertEqual(result, 0)
         lines = output.getvalue().splitlines()
-        self.assertEqual(lines[:5], [
+        self.assertEqual(lines[:9], [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 1 · 1 units", "",
+            "| Unit |", "| --- |", "| member |", "",
             "**member** — unknown",
             "- **Now:** Workers unavailable; who runs cannot be determined.",
             "- **Next:** Nothing queued. No plan is assigned."])
@@ -1051,12 +1056,13 @@ class UnitPhasesTests(unittest.TestCase):
             return {}
 
         def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo,
-                   census_read: census.Census | census.CensusFailed) -> str:
+                   census_read: census.Census | census.CensusFailed, columns: int | None) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
             self.assertIs(census_read, LOCAL)
+            self.assertIsNone(columns)
             calls.append("table")
             return "phase table"
 
@@ -1119,6 +1125,9 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(reads - 1, 1, "Read the run events once after the header read.")
         self.assertEqual(output.getvalue().splitlines(), [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 2 · 2 units", "",
+            "| Unit | Status | Progress | Phase | ETA Next |", "| --- | --- | --- | --- | --- |",
+            "| one | exited | 🟨⬜ | 1 | no ETA stated |", "| two | exited | 🟨⬜ | 1 | no ETA stated |", "",
+            "Progress: 🟩 done · 🟨 open · ⬜ not started", "",
             "**one** — unknown",
             "- **Now:** First work (1) is open, but nothing runs; reason not recorded.",
             "- **Next:** Plan next: Later work (2).", "",
@@ -1213,7 +1222,7 @@ class UnitPhasesTests(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone,
-                                                 census_read=LOCAL)
+                                                 census_read=LOCAL, columns=None)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")
@@ -1236,6 +1245,7 @@ class UnitPhasesTests(unittest.TestCase):
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(),
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
+                    + "| Unit | Status |\n| --- | --- |\n| a | idle |\n\n"
                     + "**a** — idle\n- **Now:** Nothing to do: no plan or queued work.\n"
                     + "- **Next:** Nothing queued. No plan is assigned.\n")
 
