@@ -77,16 +77,16 @@ python3 scripts/aws_target/deploy.py quota-request
 python3 scripts/aws_target/deploy.py quota-status
 ```
 
-Read the local hourly snapshot without an AWS call or a passphrase:
+Publish the AWS prices page from the local hourly snapshot without an AWS call or a passphrase:
 
 ```sh
-python3 scripts/aws_target/deploy.py spot-table
+python3 scripts/aws_target/aws_page.py publish
 ```
 
-The rows show configured Standard and GPU machine types.
-The columns show candidate regions and the lowest zone price in USD/h.
+The command prints the page link. The console also links the page.
+The rows show candidate regions.
+The columns show configured Standard and GPU machine types and the lowest zone price in USD/h.
 A `not sold here` cell means AWS sells no Spot of that type in that region.
-Wide tables use separate groups of region columns.
 Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
 GPU types use the G and VT quota; other configured types use the Standard quota.
 Old snapshots show a stale mark after `price_max_age_seconds`.
@@ -107,13 +107,13 @@ The existing price rows still support the gate ranking fallback.
 After this change reaches the installed scripts:
 
 1. Run `python3 scripts/aws_target/aws_target.py snapshot` to create the first snapshot.
-2. Run `python3 scripts/aws_target/deploy.py spot-table`, or `/aws_prices` in a session, to inspect the snapshot.
+2. Run `python3 scripts/aws_target/aws_page.py publish` and open the AWS prices page to inspect the snapshot.
 
 Later reads run through the existing timer.
 `GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota` in every candidate region.
 The deployed stack gets this policy only from `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
 Until the user runs that command, each hourly read logs the refused read and sends the `aws.snapshot_failed` alert.
-The command reads prices and quotas at its end, so `/aws_prices` shows them at once.
+The command reads prices and quotas at its end; `aws_page.py publish` then shows them at once.
 The snapshot makes only these two read calls.
 It does not use Cost Explorer or create resources.
 

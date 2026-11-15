@@ -1290,11 +1290,6 @@ class Deployment:
                 for zone in sorted(zones):
                     print(region, size, zone, str(latest.get((size, zone), 'unavailable')))
 
-    def spot_table(self) -> None:
-        """Print the local snapshot without AWS credentials or network calls."""
-        from scripts.aws_target import spot_table
-        print(spot_table.render(self.directory, int(self.clock()), settings_path=self.settings_path))
-
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
         settings = read_deployment_settings(self.settings_path, self.directory)
@@ -1613,7 +1608,7 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
@@ -1640,8 +1635,6 @@ def main() -> int:
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'remove-images':
             return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
-        elif args.command == 'spot-table':
-            deploy.spot_table()
         elif args.command == 'prices':
             deploy.prices()
         elif args.command == 'quota-request':
