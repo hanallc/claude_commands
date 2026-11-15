@@ -4182,18 +4182,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_token_renew.py` runs 2 fewer complete lint runs, with the same checks of behavior.
-
-**Spec:**
-- `test_a_lint_script_edit_invalidates_a_previously_reused_pass` (was `test_each_lint_script_edit_invalidates_a_previously_reused_pass`) keeps one complete run after a `verify.sh` edit. The `invoke.sh` and lint config edit runs go through the same `tree_key` scripts list.
-- New `LintKeyInputTests.test_the_lint_tree_key_reads_verify_invoke_and_the_lint_config` runs `tree_key` with a `verify_helper` that prints its words. It checks that the key call names `verify.sh`, `invoke.sh` and the lint config.
-
-**Files:** `scripts/direct/test_verify_token_renew.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
-
-**Constraints from prior phases:** Phases 287 and 288 cut repeated complete runs in the same way.
-
-**Acceptance gate:** the module passes on natedev; basedpyright reports zero errors and zero warnings; a mutation that drops each path from `tree_key` fails the new test; an AWS pair (3 rounds) passes with less CPU.
+- `test_a_lint_script_edit_invalidates_a_previously_reused_pass` in `scripts/direct/test_verify_token_renew.py` keeps one complete lint run after a `verify.sh` edit. It was `test_each_lint_script_edit_invalidates_a_previously_reused_pass`.
+- `LintKeyInputTests.test_the_lint_tree_key_reads_verify_invoke_and_the_lint_config` runs `tree_key` with a `verify_helper` that prints its words. It checks that the key call names `verify.sh`, `invoke.sh` and the lint config.
+- A `tree_key` mutation that drops each path fails the new test.
+- AWS pair (3 rounds): 19.27 -> 16.76 CPU s, all pass.
+- Commit 85116f891. Test-only change.
