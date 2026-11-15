@@ -93,22 +93,22 @@ class WaitsOnTests(unittest.TestCase):
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
         self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland · waits on builds/589: checkpoint 10th in land line (report 89)")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland — after builds/589: done, waits to land, 10th in line")
         self.assertEqual(text(waits_on.NotOnMain("c" * 40), results={"c" * 40: failed}),
-                         "acctland · waits on builds/589: 10th in land line (report 89); last try: land failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland · waits on builds/589: checkpoint in gate now")
-        self.assertEqual(text(waits_on.NotOnMain("d" * 40)), "acctland · waits on builds/589: not on main")
+                         "acctland — after builds/589: waits to land, 10th in line; last try failed at red 13:30: test_x red")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland — after builds/589: done, landing now")
+        self.assertEqual(text(waits_on.NotOnMain("d" * 40)), "acctland — after builds/589: not on main")
         self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: {**failed, "commit": "d" * 40}}),
-                         "acctland · waits on builds/589: land failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseOpen(now + 3600)), "acctland · waits on builds/589: open, ETA 14:40")
-        self.assertEqual(text(waits_on.PhaseOpen(None)), "acctland · waits on builds/589: open, no ETA")
-        self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland · waits on builds/589: not started")
-        self.assertEqual(text(waits_on.NotFound()), "acctland · waits on builds/589: not found")
+                         "acctland — after builds/589: did not land: failed at red 13:30: test_x red")
+        self.assertEqual(text(waits_on.PhaseOpen(now + 3600)), "acctland — after builds/589: in work, ETA 14:40")
+        self.assertEqual(text(waits_on.PhaseOpen(None)), "acctland — after builds/589: in work, no ETA")
+        self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland — after builds/589: not started")
+        self.assertEqual(text(waits_on.NotFound()), "acctland — after builds/589: not found")
         self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("plain"), None,
                                                  land_queue.LandView(frozenset(), {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
-                         "acctland · waits on builds/589: checkpoint landed 13:30; not on main yet")
+                         "acctland — after builds/589: done, landed 13:30, not on main yet")
 
 
 if __name__ == "__main__":

@@ -184,8 +184,9 @@ The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/un
 a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
 else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
 Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
-`unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> · waits on <work>: <state>`.
-A commit's state is `in gate now`, `<Nth> in land line (<unit> <phase>)`, its land result (`; not on main yet` after a land), or `not on main` (`land_queue.land_state`).
+`unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> — after <work>: <state>`.
+A phase checkpoint's state is `done, <land text>`, with `, not on main yet` after a land; a commit's state is its land text, or `not on main` when it is not in the line.
+An open phase is `in work, ETA <time>` or `in work, no ETA`.
 `done` removes the first item.
 `clear` writes an empty list without reading a damaged old file.
 Writes use the list lock and atomic publication.
@@ -811,10 +812,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
     A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
     So a checkpoint that a later checkpoint carries shows that later item's place. The order is: running, its own place, a landed result, carried running, carried place, a failed result.
-    The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
-    Else, at a place in the line, it is `waiting on queued checkpoint, <Nth> in line`; a failed newest result adds `; last try: <result>`.
-    Else the newest result shows: `checkpoint landed <time>`, or `land <state> at <step> <time>: <first detail line>`.
-    Else it is `checkpoint sent, not in the land line`. With no line file, it stays `waiting on queued checkpoint`.
+    `unit_phases.land_text` says the land state in plain words, and the wait is `done, <land text>` (user, 2026-11-15: a human must understand it).
+    The land text is `landing now` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
+    Else, at a place in the line, it is `waits to land, <Nth> in line`, or `waits to land with <unit> <phase>, <Nth> in line` for a carried commit; a failed newest result adds `; last try <state> at <step> <time>: <first detail line>`.
+    Else the newest result shows: `landed <time>`, or `did not land: <state> at <step> <time>: <first detail line>`.
+    Else it is `not sent to land yet`. With no line file, it stays `waits to land`.
     `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits) while it holds the merge lock, and removes it at exit.
     A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
     `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).

@@ -73,10 +73,14 @@ class LandRunning(NamedTuple):
 
 
 class InLine(NamedTuple):
-    """The commit waits at a place; failed is the newest result when that try did not land."""
+    """The commit waits at a place; failed is the newest result when that try did not land.
+
+    carried is True when a later commit at that place holds this commit.
+    """
 
     place: Place
     failed: land_runs.LandResult | None
+    carried: bool
 
 
 class LandEnded(NamedTuple):
@@ -181,13 +185,13 @@ def land_state(view: LandView, commit: str) -> LandState:
     failed = result if result is not None and not result["landed"] else None
     place = None if isinstance(view.line, NoLine) else place_of(view.line, commit)
     if place is not None:
-        return InLine(place, failed)
+        return InLine(place, failed, False)
     if result is not None and result["landed"]:
         return LandEnded(result)
     if land_runs.holds(view.carried_running, commit):
         return LandRunning()
     if (carrier := place_of(view.carried_line, commit)) is not None:
-        return InLine(carrier, failed)
+        return InLine(carrier, failed, True)
     if result is not None:
         return LandEnded(result)
     return LineUnused() if isinstance(view.line, NoLine) else NotInLine()

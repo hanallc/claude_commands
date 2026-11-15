@@ -411,9 +411,6 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
 # The repository whose local origin/main a queued item's wait is checked against; no fetch.
 REPOSITORY = Path(__file__).resolve().parents[2]
 
-# Notes for a sent checkpoint that has not landed (user, 2026-11-15).
-CHECKPOINT_WAITS = {"running": "waiting on running checkpoint", "queued": "waiting on queued checkpoint"}
-NOT_IN_LINE = "checkpoint sent, not in the land line"
 WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
 
 
@@ -422,55 +419,62 @@ def ordinal(number: int) -> str:
     return f"{number}{suffix}"
 
 
-def land_result_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
-    """Say how a land ended: "checkpoint landed 11:20", or "land failed at red 11:20: <first detail line>"."""
+def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
+    """Say how a land ended: "landed 11:20", or "failed at red 11:20: <first detail line>"."""
     try:
         when = short_time(datetime.fromisoformat(result["time"]), now=now, zone=zone)
     except (ValueError, TypeError):
         when = ""
     if result["landed"]:
-        return single_spaced(f"checkpoint landed {when}")
+        return single_spaced(f"landed {when}")
     detail = single_spaced(result["detail"].splitlines()[0]) if result["detail"].strip() else ""
-    return single_spaced(f"land {result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
+    return single_spaced(f"{result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
+
+
+def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo, unit: str = "") -> str:
+    """Say in plain words where a done commit is on its way to main (user, 2026-11-15: a human must understand it).
+
+    A carried commit names the work that carries it; the row's own unit name is left out.
+    """
+    match state:
+        case land_queue.LandRunning():
+            return "landing now"
+        case land_queue.InLine(place, failed, carried):
+            carrier = place.owner.removeprefix(f"{unit} ") if unit else place.owner
+            text = f"waits to land{f' with {carrier}' if carried else ''}, {ordinal(place.number)} in line"
+            return f"{text}; last try {try_text(failed, now=now, zone=zone)}" if failed else text
+        case land_queue.LandEnded(result) if result["landed"]:
+            return try_text(result, now=now, zone=zone)
+        case land_queue.LandEnded(result):
+            return f"did not land: {try_text(result, now=now, zone=zone)}"
+        case land_queue.NotInLine():
+            return "not sent to land yet"
+        case land_queue.LineUnused():
+            return "waits to land"
 
 
 def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
-                    now: float, zone: ZoneInfo) -> str | None:
-    """Name the state of a checkpoint sent after the phase instance's last start of work.
-
-    A land that holds its commit runs now, or it waits at a place in the land line, or its last land ended.
-    A failed land that waits in the line again names that failure after its place.
-    """
+                    now: float, zone: ZoneInfo, unit: str = "") -> str | None:
+    """Say where the checkpoint sent after the phase instance's last start of work is on its way to main."""
     for event in reversed(events):
         kind = event.get("event_type")
         if kind == "checkpoint":
             commit = event.get("checkpoint_commit")
-            if not isinstance(commit, str) or not commit:
-                return CHECKPOINT_WAITS["queued"]
-            match land_queue.land_state(land, commit):
-                case land_queue.LandRunning():
-                    return CHECKPOINT_WAITS["running"]
-                case land_queue.InLine(place, failed):
-                    queued = f"{CHECKPOINT_WAITS['queued']}, {ordinal(place.number)} in line"
-                    return f"{queued}; last try: {land_result_text(failed, now=now, zone=zone)}" if failed else queued
-                case land_queue.LandEnded(result):
-                    return land_result_text(result, now=now, zone=zone)
-                case land_queue.NotInLine():
-                    return NOT_IN_LINE
-                case land_queue.LineUnused():
-                    return CHECKPOINT_WAITS["queued"]
+            state = land_queue.land_state(land, commit) if isinstance(commit, str) and commit else land_queue.LineUnused()
+            return f"done, {land_text(state, now=now, zone=zone, unit=unit)}"
         if kind in WORK_STARTS:
             return None
     return None
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
-                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: land_queue.LandView) -> str:
+                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: land_queue.LandView,
+                     unit: str = "") -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
-    if (wait := checkpoint_wait(instance, land, now=now, zone=zone)) is not None:
+    if (wait := checkpoint_wait(instance, land, now=now, zone=zone, unit=unit)) is not None:
         parts.append(wait)
     elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
@@ -617,26 +621,21 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_re
 
 
 def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
-    """Say the state of the work a queued item waits on; the owner is the unit and phase that sent its commit."""
-    commit = found.commit if isinstance(found, waits_on.NotOnMain | waits_on.PhaseSent) else ""
-    if commit:
-        prefix = "checkpoint " if isinstance(found, waits_on.PhaseSent) else ""
-        match land_queue.land_state(land, commit):
-            case land_queue.LandRunning():
-                return f"{prefix}in gate now"
-            case land_queue.InLine(place, failed):
-                text = f"{prefix}{ordinal(place.number)} in land line ({place.owner})"
-                return f"{text}; last try: {land_result_text(failed, now=now, zone=zone)}" if failed else text
-            case land_queue.LandEnded(result) if result["landed"]:
-                return f"{land_result_text(result, now=now, zone=zone)}; not on main yet"
-            case land_queue.LandEnded(result):
-                return land_result_text(result, now=now, zone=zone)
-            case _:
-                return f"{prefix}not on main"
+    """Say in plain words the state of the work a queued item waits on."""
     match found:
+        case waits_on.PhaseSent(commit):
+            state = land_queue.land_state(land, commit)
+            landed = isinstance(state, land_queue.LandEnded) and state.result["landed"]
+            return f"done, {land_text(state, now=now, zone=zone)}{', not on main yet' if landed else ''}"
+        case waits_on.NotOnMain(commit):
+            state = land_queue.land_state(land, commit)
+            if isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
+                return "not on main"
+            landed = isinstance(state, land_queue.LandEnded) and state.result["landed"]
+            return f"{land_text(state, now=now, zone=zone)}{', not on main yet' if landed else ''}"
         case waits_on.PhaseOpen(eta_at):
             when = short_time(datetime.fromtimestamp(eta_at, UTC), now=now, zone=zone) if eta_at is not None else ""
-            return f"open, ETA {when}" if when else "open, no ETA"
+            return f"in work, ETA {when}" if when else "in work, no ETA"
         case waits_on.PhaseNotStarted():
             return "not started"
         case _:
@@ -650,7 +649,7 @@ def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
         return item.text
     if isinstance(found, waits_on.OnMain):
         return f"ready: {item.text} ({item.after} on main)"
-    return f"{item.text} · waits on {item.after}: {wait_text(found, land, now=now, zone=zone)}"
+    return f"{item.text} — after {item.after}: {wait_text(found, land, now=now, zone=zone)}"
 
 
 def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE,
@@ -806,7 +805,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
-                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land)
+                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land,
+                                         unit=member.name)
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids, describe=describe)
                           if first else display_cells.NONE)
                 if first:
