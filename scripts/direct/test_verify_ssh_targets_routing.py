@@ -349,7 +349,7 @@ from pathlib import Path
 import runpy
 
 with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.direct.test_verify_step_state import read_step_row
+from scripts.direct.step_row_test_support import read_step_row
 snapshot = Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json")
 if not snapshot.exists():
     records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))
