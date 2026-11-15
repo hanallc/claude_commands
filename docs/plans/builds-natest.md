@@ -4123,11 +4123,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; sdlc go 11-15).
 
-#### Work Order
+#### As-built
 
-- **Goal:** `list_branches` in `scripts/review_links/branch_page.py` makes no git call for each remote head.
-- **Spec:** A new `main_history(repository, main)` reads `git log --format=%H %cI %P main` once. It returns each commit date and each commit's first mainline commit; the walk starts at the oldest mainline commit. `list_branches` uses it for the merged check, the commit date, the merge commit and the merge date. `is_ancestor` and `mainline_merge` go.
-- **Files:** `scripts/review_links/branch_page.py`.
-- **Workers:** 1 writer: one file; the director writes it (no-worker mode).
-- **Constraints from prior phases:** none.
-- **Acceptance gate:** `review_links/test_branch_page` passes; basedpyright 0 errors; on the live repo, old and new rows agree; the AWS pair shows a CPU gain.
+- `main_history` in `scripts/review_links/branch_page.py` reads `git log --format=%H %cI %P main` once. `list_branches` takes the merged check, the commit date, the merge commit and the merge date from it.
+- The walk starts at the oldest mainline commit, so each commit gets the oldest mainline commit that holds it. `is_ancestor` and `mainline_merge` are gone.
+- Live ~/.claude repo: 104 heads, 42 merged; old and new rows agree; 0.11 s against 0.93 s.
+- AWS pair (3 rounds): `review_links/test_branch_page` 16.67 -> 9.29 CPU s, wall 16.9 -> 9.7 s; all pass, same tests.
+- Commit b4b5396bb. Production change (sdlc go 11-15).
