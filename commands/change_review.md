@@ -155,7 +155,7 @@ Typed text or an active save holds replacement; only the newest loaded update wa
 Replacement continues when all unsaved fields are empty or the save ends.
 After a successful save, the page requests a fresh update to exclude older responses.
 A failed load changes nothing; the next interval tries again.
-The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
+The heading follows the type: Questions to answer or Changes to review.
 An empty showrunner filter shows `No questions for this showrunner.` or `No changes for this showrunner.`
 An empty type shows `No questions to answer.` or `No changes to review.`
 The selected showrunner filter supplies the count; the card has no separate remaining count.
@@ -206,11 +206,15 @@ Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
-Each successful save opens the next waiting change in the same filter.
+Works and Does not work open the next waiting change at once, before the server answers.
+The next card shows **Saving review.** until the save ends, then **Review saved.**
+Other answers open the next waiting change in the same filter after a successful save.
 Navigation during a save prevents this automatic change.
 Skip for now skips a change without saving an answer.
 A failed HTTP save keeps the typed text, answer form, and waiting count, and shows `Not saved: <reason>`.
-An automatic move after a change save shows **Review saved.** above the next card.
+A failed Works or Does not work save puts the row back in the list.
+Its notice shows `Not saved: <row>. <reason> It is back in the list.` and an **Open it** button.
+An automatic move after another change save shows **Review saved.** above the next card.
 An automatic move after a question save shows **Answer saved.** above the next card.
 Manual navigation clears this notice.
 A direct link to a saved verdict shows **Saved: <answer>**.

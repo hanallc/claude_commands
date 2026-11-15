@@ -23,7 +23,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
 if arguments[:1] == ["check"]:
     import sys
     with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.test_verify_step_state import read_step_row
+    from scripts.direct.step_row_test_support import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "compiling-state").write_text(record["state"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("new hold")

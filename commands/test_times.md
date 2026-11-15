@@ -25,6 +25,7 @@ A newer gate record appears on a later run after that refresh ends.
 The first list after a gate can omit that gate.
 When no complete compatible index exists, the report builds an index before it prints.
 Use `--host NAME` to select another host. The default is the current host. The heading names the selected host.
+Use `--host aws` to rank the gate modules of every AWS gate host from `TOP_AWS_CHECKOUT`.
 
 The nextest table shows the median of passed runs, including successful retries.
 It also shows retained run counts, failed and timed-out run counts, and the latest duration.

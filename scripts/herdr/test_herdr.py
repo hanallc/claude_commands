@@ -7462,3 +7462,23 @@ class SavedLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PaneSessionsTests(unittest.TestCase):
+    """An exited agent child keeps its name without an argv; the live agent beside it still names the pane."""
+
+    LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
+    EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
+
+    def sessions(self, *processes: dict[str, object]) -> set[str]:
+        observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
+        with patch.object(herdr, "native_process", return_value=observed):
+            return herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+
+    def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
+        self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})
+        self.assertEqual(self.sessions(self.EXITED, self.LIVE), {"recorded-id"})
+
+    def test_an_agent_without_an_argv_and_no_live_agent_is_unknown(self) -> None:
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent argv is unavailable"):
+            _ = self.sessions(self.EXITED)

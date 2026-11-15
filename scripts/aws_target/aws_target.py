@@ -21,7 +21,7 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, run_cost
+from scripts.aws_target import ledger, measurement, price_days, run_cost
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
@@ -153,6 +153,7 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
     start = end - timedelta(days=configuration.whole('run_cost_days'))
     try:
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
+                                           configuration.text('instance_type'),
                                            gate_sizes(conf.read_or_repository('cloud_gate')), limit)
     except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
@@ -186,7 +187,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
              force: bool = False) -> int:
     """Replace successful regional reads and preserve failed regional reads.
 
-    force reads before the refresh interval ends; deploy.py up uses it."""
+    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
@@ -228,6 +229,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
             try:
@@ -242,6 +244,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
                 readings = [row for row in readings if row.get('region') != region]
                 readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
+                read_prices.extend(regional)
                 _ = failures.pop(region, None)
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
                 raw_lines: list[str] = []
@@ -270,6 +273,11 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             streak = SnapshotFailureStreak(since, notice_claimed)
             output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
         write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+        try:
+            price_days.record(directory, read_prices, now, configuration.whole('spot_price_days_keep'))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
+            status = 1
         access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
         if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
             # Save the claim before delivery because note keys alone do not suppress repeats.
@@ -280,9 +288,11 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
                 write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
                 print('aws_target: snapshot user notice remains pending', file=sys.stderr)
-        _ = lock.seek(0)
-        _ = lock.truncate()
-        _ = lock.write(str(now))
+        # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
+        if not force:
+            _ = lock.seek(0)
+            _ = lock.truncate()
+            _ = lock.write(str(now))
         return status
 
 

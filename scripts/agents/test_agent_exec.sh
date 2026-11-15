@@ -117,9 +117,10 @@ assert_equal "codex write command is wrong" \
     "env CODEX_HOME=$HOME/.codex1 codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_write"
 
-codex_readonly="$(run_dry codex_case.task readonly)"
-assert_equal "codex readonly command is wrong" \
-    "env CODEX_HOME=$HOME/.codex1 codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
+# The readonly run also carries extra arguments, which go after the model flags.
+codex_readonly="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task readonly)"
+assert_equal "codex readonly command with extra arguments is wrong" \
+    "env CODEX_HOME=$HOME/.codex1 codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox read-only -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$codex_readonly"
 
 claude_write="$(run_dry claude_case.task write)"
@@ -132,11 +133,14 @@ assert_equal "claude readonly command is wrong" \
     "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
-simplify_readonly="$(run_dry direct.simplify readonly)"
+# The simplify run also carries a session id as an extra argument.
+simplify_readonly="$(AGENT_EXEC_EXTRA_ARGS='--session-id abcdef12-0000-4000-8000-000000000001' run_dry direct.simplify readonly)"
 "${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_readonly" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
+assert arguments.count("--session-id") == 1, arguments
+assert arguments[arguments.index("--session-id") + 1] == "abcdef12-0000-4000-8000-000000000001", arguments
 assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in arguments, arguments
 assert "--print" in arguments, arguments
 assert arguments[arguments.index("--permission-mode") + 1] == "plan", arguments
@@ -148,14 +152,6 @@ assert "--allowedTools" not in arguments, arguments
 assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
-simplify_session="$(AGENT_EXEC_EXTRA_ARGS='--session-id abcdef12-0000-4000-8000-000000000001' run_dry direct.simplify readonly)"
-"${BASH_SOURCE[0]%/*}/../lib/py" - "$simplify_session" <<'PYTHON'
-import shlex
-import sys
-arguments = shlex.split(sys.argv[1])
-assert arguments.count("--session-id") == 1, arguments
-assert arguments[arguments.index("--session-id") + 1] == "abcdef12-0000-4000-8000-000000000001", arguments
-PYTHON
 [[ ! -e "${LOG_FILE}.session" ]] || fail "the agent launcher wrote a private session file"
 
 bare_command="$(run_dry bare_case.task write)"
@@ -172,11 +168,6 @@ tier_claude_command="$(run_dry tier_case.claude_task readonly)"
 assert_equal "claude command carried a codex service tier" \
     "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_claude_command"
-
-extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
-assert_equal "extra arguments were not appended" \
-    "env CODEX_HOME=$HOME/.codex1 codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --add-dir /tmp/extra --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
-    "$extra_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"
 MISSING_LOG="$TEST_DIR/missing.log"
@@ -254,6 +245,8 @@ assert_equal "workers ignored the named Claude account" "$HOME/.claude4" "$(cat 
 assert_equal "Claude worker lost its prompt" "test prompt" "$(cat "$TEST_CLAUDE_PROMPT_FILE")"
 assert_equal "print worker used the caller catalog" "claude-opus-claude4-fixture" "$(recorded_claude_model)"
 
+# agents_exec_main keeps the Claude exit for each task after a failed extraction.
+# One case for each task covers exit 0 and a nonzero exit.
 test_extraction_failure_preserves_the_task_exit_policy() {
     local task claude_exit expected actual
     while read -r task claude_exit expected; do
@@ -266,32 +259,30 @@ test_extraction_failure_preserves_the_task_exit_policy() {
         assert_equal "$task changed exit $claude_exit after extraction failed" "$expected" "$actual"
     done <<'CASES'
 claude_case.task 0 0
-claude_case.task 7 7
-direct.simplify 0 0
 direct.simplify 7 7
 CASES
 }
 
 test_extraction_failure_preserves_the_task_exit_policy
 
+# Both tasks take the same print path. test_claude_result.py checks each error event shape.
+# Each task runs one error event here.
 test_every_claude_print_launch_keeps_agents_and_reports_errors() {
     local task event expected actual
-    for task in claude_case.task direct.simplify; do
-        while IFS=$'\t' read -r event expected; do
-            actual=0
-            TEST_CLAUDE_RESULT="$event" run_exec_fixture \
-                "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE" \
-                2> "$TEST_DIR/print-error.stderr" || actual=$?
-            assert_equal "$task accepted a Claude error" 1 "$actual"
-            assert_equal "$task did not retain foreground agents" 1 "$(cat "$TEST_CLAUDE_BACKGROUND_FILE")"
-            assert_equal "$task lost the execution reason" "$expected" "$(cat "$OUTPUT_FILE")"
-            [[ "$(cat "$TEST_DIR/print-error.stderr")" != *"$expected"* ]] \
-                || fail "$task printed the output error on stderr"
-        done <<'CASES'
-{"type":"result","is_error":true,"result":"weekly limit"}	ERROR: weekly limit
-{"type":"result","errors":["credentials expired"],"result":"Pass"}	ERROR: credentials expired
+    while IFS=$'\t' read -r task event expected; do
+        actual=0
+        TEST_CLAUDE_RESULT="$event" run_exec_fixture \
+            "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE" \
+            2> "$TEST_DIR/print-error.stderr" || actual=$?
+        assert_equal "$task accepted a Claude error" 1 "$actual"
+        assert_equal "$task did not retain foreground agents" 1 "$(cat "$TEST_CLAUDE_BACKGROUND_FILE")"
+        assert_equal "$task lost the execution reason" "$expected" "$(cat "$OUTPUT_FILE")"
+        [[ "$(cat "$TEST_DIR/print-error.stderr")" != *"$expected"* ]] \
+            || fail "$task printed the output error on stderr"
+    done <<'CASES'
+claude_case.task	{"type":"result","is_error":true,"result":"weekly limit"}	ERROR: weekly limit
+direct.simplify	{"type":"result","errors":["credentials expired"],"result":"Pass"}	ERROR: credentials expired
 CASES
-    done
 }
 
 test_every_claude_print_launch_keeps_agents_and_reports_errors

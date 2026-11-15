@@ -27,7 +27,8 @@ from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
+    SESSION_KEYS, environment_values)
 
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
@@ -74,6 +75,9 @@ from scripts.build_queue.admission_records import (
     FreeCheck,
     GIB,
     GoneMemory,
+    GpuSlotFree,
+    GpuSlotWait,
+    GpuTestSlots,
     HeadAdmissionOverride,
     HeadAdmissionStatus,
     HeadCause,
@@ -550,7 +554,7 @@ class HeadStartsAt:
 @dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
-    causes: tuple[Literal["free memory", "pressure", "queue order", "start spacing"], ...]
+    causes: tuple[Literal["free memory", "GPU test slot", "pressure", "queue order", "start spacing"], ...]
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
@@ -875,14 +879,17 @@ def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestP
 
 
 def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
+    # The service reads this table on each pass. Plain strings and bytes cost half the CPU of Path objects.
     processes: dict[int, ProcessIdentity] = {}
-    for entry in proc.iterdir():
-        if not entry.name.isdecimal():
+    root = os.fspath(proc)
+    for name in os.listdir(root):
+        if not name.isdecimal():
             continue
         try:
-            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            if fields[0] not in ("Z", "X"):
-                processes[int(entry.name)] = ProcessIdentity(int(fields[1]), fields[19])
+            with open(f"{root}/{name}/stat", "rb", buffering=0) as handle:
+                fields = handle.read().rsplit(b") ", 1)[1].split()
+            if fields[0] not in (b"Z", b"X"):
+                processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode())
         except (OSError, ValueError, IndexError):
             continue
     return processes
@@ -991,6 +998,17 @@ def sum_swap_backed_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable])
             return use
         total += use.bytes
     return AnonymousRunUse(total)
+
+
+def swap_backed_use_less(use: AnonymousRunUse | RunUseUnavailable,
+                         charged: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
+    """Remove the swap-backed use that other readings already charge from one group's use."""
+    taken = sum_swap_backed_use(charged)
+    if isinstance(use, RunUseUnavailable):
+        return use
+    if isinstance(taken, RunUseUnavailable):
+        return taken
+    return AnonymousRunUse(max(0, use.bytes - taken.bytes))
 
 
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
@@ -1618,11 +1636,7 @@ class QueueIdentityReader:
         while not session and current in self.processes and current not in seen:
             seen.add(current)
             if current not in self.environments:
-                try:
-                    raw = (self.proc / str(current) / "environ").read_bytes().decode(errors="replace")
-                    self.environments[current] = dict(part.split("=", 1) for part in raw.split("\0") if "=" in part)
-                except OSError:
-                    self.environments[current] = {}
+                self.environments[current] = environment_values(self.proc / str(current) / "environ", SESSION_KEYS)
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
             name = name or env.get("CLAUDE_SESSION_NAME", "")
@@ -1654,6 +1668,8 @@ def queue_wait_reason(decision: AdmissionDecision, need: int, available: int,
         return order
     if not isinstance(decision.pressure, NoPressureHold):
         return decision.pressure
+    if isinstance(decision.gpu, GpuSlotWait):
+        return decision.gpu
     if decision.starts_at:
         return StartSpacingWait(decision.starts_at)
     if not decision.free_passes:
@@ -1876,12 +1892,15 @@ def progress_text(reading: StepMemory) -> str:
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
 
 
+def ci_readings(readings: Iterable[StepMemory]) -> tuple[UnownedSliceMemory, ...]:
+    """Select the CI service readings that the queue cap counts."""
+    return tuple(reading for reading in readings
+                 if isinstance(reading, UnownedSliceMemory) and not isinstance(reading.job_state, NotServiceSlice))
+
+
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
     """Calculate room from the captured run and CI readings."""
-    readings = tuple(step.measured for step in inputs.running)
-    ci_use = sum(reading.bytes for reading in readings
-                 if isinstance(reading, UnownedSliceMemory)
-                 and not isinstance(reading.job_state, NotServiceSlice))
+    ci_use = sum(reading.bytes for reading in ci_readings(step.measured for step in inputs.running))
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
@@ -1909,6 +1928,13 @@ def start_spacing_after(now: float, policy: AdmissionPolicy) -> NextStartAt:
     return NextStartAt(now + policy.timing.recovery_start_seconds)
 
 
+def gpu_test_reservation(row: Reservation, gpu: GpuTestSlots) -> bool:
+    """Count an admitted local step of a GPU repository that runs tests."""
+    waiter = row.get("queue_waiter")
+    repository = waiter.get("repository_name", row["repo"]) if waiter is not None else row["repo"]
+    return gpu.holds(repository, row["step"])
+
+
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    head: QueuedHead | NoQueuedHead, room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
@@ -1931,6 +1957,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     has_override = not isinstance(inputs.override, NoHeadAdmissionOverride)
     no_runs = not inputs.reservations and not inputs.slots
     new_started = False
+    gpu = policy.gpu_tests
+    # The reservation is the slot: it ends at release or when its owner exits.
+    gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
     protected_extra = 0
     protected_claim: Waiter | NoWaiter = NoWaiter()
     for _, row in ordered:
@@ -1959,6 +1988,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
                    next_start.at if new_started else 0.0)
         can_start = (within or readable and clear and room_passes) and fresh
         can_start = can_start and isinstance(state, QueuedWaiter) and (reused or due and not new_started)
+        gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
+        gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
+        can_start = can_start and isinstance(gpu_wait, GpuSlotFree)
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
         if not reused and protected_need and not fits:
             if not isinstance(protected_claim, NoWaiter):
@@ -1970,10 +2002,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
             room_passes, order_hold, 0.0 if reused else spacing,
-            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis))
+            reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         decisions.append(WaiterAdmission(row, decision, state))
         if can_start:
             remaining += held - need
+            gpu_used += gpu_step
             if not reused:
                 new_started = True
         elif reused:
@@ -2287,6 +2320,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         return HeadStartsAt(cause.at, ended, charge_drop, freed, growth_drop)
     if isinstance(cause, NeedsMemory):
         return HeadStillHeld(decision, ("free memory",))
+    if isinstance(cause, GpuSlotWait):
+        return HeadStillHeld(decision, ("GPU test slot",))
     if isinstance(cause, (MemoryPressure, PressureUnavailable)):
         return HeadStillHeld(decision, ("pressure",))
     return HeadStillHeld(decision, ("queue order",))
@@ -2575,6 +2610,15 @@ def agents_memory() -> MeasuredMemory | ReadingUnavailable:
         return ReadingUnavailable(f"{directory}: agents' memory unavailable: {error}")
 
 
+def desktop_memory() -> MeasuredMemory | ReadingUnavailable:
+    """Read the desktop session's working set and swap (session.slice)."""
+    directory = user_manager_cgroup() / "session.slice"
+    try:
+        return slice_working_set(directory)
+    except (OSError, UnicodeError, ValueError) as error:
+        return ReadingUnavailable(f"{directory}: desktop memory unavailable: {error}")
+
+
 def slice_swap_current(directory: Path) -> int:
     """Read one required slice swap counter."""
     path = directory / "memory.swap.current"
@@ -2721,6 +2765,8 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             duplicate_use += sum(memory.anonymous.bytes for memory in scoped
                                  if isinstance(memory.anonymous, AnonymousRunUse))
             amount = max(0, amount - duplicate_use)
+            anonymous = swap_backed_use_less(working_set.anonymous,
+                                             (duplicate.anonymous, *(memory.anonymous for memory in scoped)))
             swapped = max(0, swapped - duplicate.swap_bytes - sum(memory.swap_bytes for memory in scoped))
             promise: MemoryPromise = NoPromise()
             activity = activity_reader.scope(members, child.name)
@@ -2747,7 +2793,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                         job_state = RunningServiceJob(activity_reader.started_at(first))
             if required or amount or members:
                 result.append(UnownedSliceMemory(amount, promise=promise,
-                                                 swap_bytes=swapped,
+                                                 swap_bytes=swapped, anonymous=anonymous,
                                                  cgroup=str(child), owner=child.name,
                                                  activity=activity, pid=row_pid,
                                                  job_state=job_state, service_job_state=current_state))

@@ -109,7 +109,6 @@ At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
 The menu button opens the navigation above the frame.
 A page choice, the Escape key, or a click outside closes the navigation.
-When the rebuild overlay is open, the Escape key closes only the overlay.
 The phone navigation starts closed and does not change the stored desktop state.
 
 `?page=<id>` selects a page.
@@ -140,7 +139,7 @@ Older browser folders still accept answers that a page posts to them.
 
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
-Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
+Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
 The URL value has the form `python:<module>:<function>`.
 The function takes no arguments and returns a URL path under the review root.
 The console also accepts a full URL from the configured review origin and converts it to a path.
@@ -167,13 +166,34 @@ The link reads that page when the console loads, then at each `page_refresh_seco
 Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
 A long label wraps to a second line and stays inside the sidebar.
 The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
-At phone width the link is a small fixed button at the bottom left, never wider than the open sidebar (220px), so it wraps and stays inside the sidebar.
-A click opens a modal overlay titled **Rebuilds needed** with the Rebuilds page content.
-The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
-When no machine needs a rebuild, the link hides and an open overlay closes.
+At phone width the link fills a bar below the page, so it never covers the page content.
+A click opens the Rebuilds page in the frame, titled **Rebuilds needed**, as a navigation entry opens its page.
+`?page=rebuilds` selects it, and the link shows an inset outline while the page is open.
+Each read of the page for the link also replaces the list on an open Rebuilds page, so that page needs no refresh of its own.
+When no machine needs a rebuild, the link hides, and an open Rebuilds page shows `No rebuilds needed.`
 
-The console vendors ten SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
+A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
+An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
+The function takes the review root and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+A page without an items function, or an unavailable page, never shows the icon.
+The console posts `open=<id>` for the page it shows to `/console/news`.
+While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
+It posts when it loads, at each page choice, and at each `page_refresh_seconds` interval while the browser tab is visible.
+The server records the open page's item keys in the private `console/.review-link-seen.json`.
+It answers `{"new": [<id>, ...]}` with each other page that holds a key absent from its record.
+The server keeps the record, so the phone and the desktop show the same marks.
+A page with no record takes its present keys, so the first visit marks nothing.
+Opening a page clears its icon at once.
+An item that leaves a page and comes back after the user opens the page shows as new again.
+An items function that fails writes one line to the server log, and its page shows no icon.
+In the open sidebar the icon's center lines up with the status dots of unavailable pages.
+In the collapsed rail the icon sits at the top right of the page icon.
+At phone width the menu button shows the icon while any page holds new items.
+Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+
+The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
@@ -184,6 +204,9 @@ Any other `type` value gets a 503 page.
 The page has no tab bar and no combined total.
 The heading and document title follow the kind: **Changes to review** or **Questions to answer**.
 The page updates itself through its existing GET URL without a full reload.
+The one exception is a server update that changes the page script.
+The content carries `data-script`, a hash of the script from `change_page.script_version()`.
+When an update brings a different hash, the page loads again, because the old script cannot bind the new rows.
 `page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
 The page loads updates only while its browser tab is visible.
 It loads an update at once when the tab becomes visible again.
@@ -293,13 +316,13 @@ Each card shows, in this order:
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The **Delete** and **Send feedback** buttons.
+5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
-A pair has one caption, one details block, one Feedback field and one **Delete** that removes both images.
+A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
 On a page 1104px or wider, a single card is 680px wide and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
@@ -310,25 +333,26 @@ The owner name has no kind, such as `(unit)`.
 The panel has a rounded outline and thin lines between its rows and columns.
 The panel stays in place while the cards scroll.
 Each row shows a hover color, and a click on a row goes to the first image of its group.
-On a narrow screen the panel goes above the cards and scrolls with them.
+On a narrow screen the panel goes above the cards and scrolls with them, and its owner column takes the spare width.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
+The card list carries `data-script`, the page script hash.
+When a refresh brings a different hash, the page loads again in place of the swap.
+An older script does not bind the new card forms, so a form would post outside the script.
 
-**Delete** posts the image id and a token signed with the console browser token.
-The server checks the token and removes the image folder at once under `images/.review-link-images.lock`.
-No message goes to the owner.
-The page does not wait: the card leaves the page at once, and the request runs in the background.
-A failed delete puts the card back in its place with one line: **Not deleted: <reason>**.
-The page skips its refresh while a delete or a feedback send runs.
-
-**Send feedback** posts the same signed form with the feedback text.
-The page refuses empty feedback with **Enter feedback first.** and keeps the card.
+Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.
+The server checks the token.
+**Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Otherwise the card leaves the page at once, and the request runs in the background.
+The page skips its refresh while a send runs.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The message holds the feedback, the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
+The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
+A `Feedback:` line follows when the user wrote text.
+Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
+A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.
 The card goes back in its place with one line: **Not sent: <reason>**.
 An agent deletes an image with this command:
@@ -343,25 +367,29 @@ An agent deletes an image with this command:
 Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
 That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
 The server serves it only in a folder that holds the browser manifest.
-It is not in the navigation.
+It has no navigation entry; the rebuild link opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then one entry per change, newest first.
-Each entry is a list of three rows: Who, When and Reason.
+Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
+Each owner shows once, as a heading, and the owner with the newest change comes first.
+Under an owner, the changes go newest first, and changes with the same shown time share one time.
+The time is a column at the left, with the reasons of that time beside it.
 The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
 `rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
 A commit's reason is its subject and its time is the author time.
 Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
-A filed need is an entry with its requester (else the affected session), its creation time and its reason.
+A filed need is a change with its requester (else the affected session) as owner, its creation time and its reason.
 A need covers its own commit, so that commit shows once.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
-When shows the time in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray text that keeps at least 4.5:1 contrast.
 A listed machine without a recorded change list shows `The change list is not available yet.`
 When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
-The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
-The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
+The page heading uses 26px text; machine headings use 20px text; owner headings use 17px; the changes use 15px.
+The content column is up to 1060px wide.
+The machine blocks sit side by side when each block has at least 420px, with 48px between them; otherwise they stack with 32px between them.
+At 480px or less, each time sits above its reasons.
 Controls wrap on narrow screens, keep a minimum height of 44px, and show keyboard focus in both color themes.
 
 ### Answering a change review
@@ -479,7 +507,8 @@ A reload restores that place when the row waits, awaits validation, or has an op
 An answered row stays absent from the browser list during delivery and after a reload.
 An empty showrunner filter shows **No changes for this showrunner.** or **No questions for this showrunner.** and hides Skip for now.
 The showrunner filter supplies the count; the card has no separate remaining count.
-Each successful save opens the next waiting change in the same filter.
+Works and Does not work open the next waiting change at once, before the server answers.
+Other answers open the next waiting change in the same filter after a successful save.
 Skip for now skips a change without saving an answer.
 The page keeps the current row if the user selects Skip for now or another tab during the save.
 
@@ -571,7 +600,10 @@ Owner unavailable changes retain their verdict controls and hide every showrunne
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving** during a save.
-An automatic move shows **Answer saved.** or **Review saved.** above the next card.
+After Works or Does not work, the next card shows **Saving review.** until the save ends, then **Review saved.**
+An automatic move after another answer shows **Answer saved.**, **Follow-up sent.**, **Skipped.** or **Review saved.** above the next card.
+A failed Works or Does not work save puts the row back in the list with its typed text and answer form.
+The notice then shows **Not saved: <row>. <reason> It is back in the list.** and an **Open it** button that shows the row.
 Skip for now stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 A failed save keeps the row in that count and does not change the current row.

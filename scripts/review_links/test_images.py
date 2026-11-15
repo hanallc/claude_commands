@@ -4,17 +4,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -130,10 +132,112 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<option value="week" selected>', source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("(feedback ? 'Not sent: ' : 'Not deleted: ') + error.message", source)
+        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
-    def test_card_shows_the_caption_details_image_feedback_field_delete_and_send_feedback(self) -> None:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
+        _ = self.register()
+        current = images.render(self.root).decode()
+        marker = f'data-script="{images.SCRIPT_VERSION}"'
+        self.assertEqual(current.count(marker), 1)
+        probe = """<script>
+(async () => {
+ const wait = ms => new Promise(done => setTimeout(done, ms));
+ const report = failures => fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+ const list = () => document.querySelector('[data-images]');
+ if (list().dataset.script === 'older-script') {
+  document.dispatchEvent(new Event('visibilitychange'));
+  await wait(5000);
+  await report(['an update from a newer script did not reload the page']);
+  return;
+ }
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const before = list();
+ document.dispatchEvent(new Event('visibilitychange'));
+ for (let step = 0; step < 100 && list() === before; step++) await wait(20);
+ check(list() !== before, 'the update puts in a new list');
+ const card = list().querySelector('article'), form = card.querySelector('form');
+ form.elements.feedback.value = 'Too dark.';
+ form.requestSubmit(form.querySelector('button[value="feedback"]'));
+ for (let step = 0; step < 100 && card.isConnected; step++) await wait(20);
+ check(!card.isConnected, 'Send Feedback removes the card from the page');
+ await wait(200);
+ check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
+ await report(failures);
+})();
+</script>"""
+        gets: list[str] = []
+        posts: list[dict[str, list[str]]] = []
+        results: list[list[str]] = []
+        probe_complete = threading.Event()
+
+        class BrowserProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the asynchronous checks report their result.
+                    if not probe_complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/":
+                    # A frame holds the page, as in the console, so its reload does not end the screenshot load.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    _ = self.wfile.write(f'<iframe src="{images.PAGE_PATH}" width="1100" height="800"></iframe>'
+                                         .encode() + b'<img src="/probe-complete" alt="" hidden>')
+                    return
+                if self.path != images.PAGE_PATH:
+                    self.send_error(404)
+                    return
+                gets.append(self.path)
+                # The first load is a page from an older script; every later answer is the current page.
+                page = current.replace(marker, 'data-script="older-script"') if len(gets) == 1 else current
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                _ = self.wfile.write(page.replace("</body>", probe + "</body>").encode())
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(payload)))
+                    probe_complete.set()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                posts.append(parse_qs(payload))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(b'{"state": "done"}')
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / "browser-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"],
+                                     capture_output=True, text=True, timeout=45)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+        self.assertEqual(len(gets), 4, "load, update, reload, update")
+        self.assertEqual([(post["action"], post["feedback"]) for post in posts], [(["feedback"], ["Too dark."])])
+
+    def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         images.write_record(self.root / images.FOLDER / record["id"], record)
@@ -151,8 +255,9 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
-            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
+            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
+            + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '<span role="status" data-image-status></span></div></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
@@ -180,19 +285,37 @@ class ImagesTests(ImagesFixture):
                 images.submit(self.root, body)
         self.assertEqual(images.records(self.root), [record])
 
-    def test_an_old_record_with_a_delete_request_reads_and_shows_delete(self) -> None:
+    def test_an_old_record_with_a_delete_request_reads_and_shows_the_answer_buttons(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
         stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
         _ = (folder / images.RECORD).write_text(json.dumps(stored))
         self.assertEqual(images.read_record(folder), record)
-        self.assertIn('<button type="submit" name="action" value="delete">Delete</button>',
-                      images.render(self.root).decode())
+        page = images.render(self.root).decode()
+        self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
+        self.assertNotIn('value="delete"', page)
 
-    def feedback_body(self, record: images.ImageRecord, feedback: str) -> str:
+    def feedback_body(self, record: images.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
-        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": "feedback"})
+        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
+
+    def test_approved_and_not_approved_send_the_answer_with_feedback_only_when_written(self) -> None:
+        for action, first, feedback, lines in (
+                ("approved", "your image is approved.", "", ()),
+                ("not approved", "your image is not approved.", "  The counts are wrong. ", ("Feedback: The counts are wrong.",))):
+            with self.subTest(action=action):
+                self.sent.clear()
+                record = self.register("After: the panel.")
+                images.submit(self.root, self.feedback_body(record, feedback, action))
+                self.assertEqual([message for _, _, message in self.sent], ["\n".join((
+                    f"From the user (via the Images page): {first}", *lines,
+                    f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
+                    "Caption: After: the panel.", "For: Phase console-images",
+                    "After you act on it, delete the image: "
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
+                self.assertIn("feedback_at", images.read_record(self.root / images.FOLDER / record["id"]))
+                self.assertNotIn(record["id"], images.render(self.root).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
         record = self.register("After: the panel. Look at the counts.")
@@ -219,7 +342,7 @@ class ImagesTests(ImagesFixture):
     def test_feedback_that_reaches_no_one_keeps_the_image_shown(self) -> None:
         record = self.register()
         with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")) as send:
-            with self.assertRaisesRegex(images.FeedbackNotSent, "session gone"):
+            with self.assertRaisesRegex(images.AnswerNotSent, "session gone"):
                 images.submit(self.root, self.feedback_body(record, "Wrong colors."))
         self.assertEqual(send.call_count, 3)
         self.assertEqual(images.records(self.root), [record])
@@ -303,7 +426,7 @@ class ImagePairTests(ImagesFixture):
             + f'<figure><figcaption>After</figcaption><a href="{after}" target="_blank" rel="noopener">'
             + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
             + '<form method="post" data-image-form>', card)
-        self.assertEqual((card.count("<form"), card.count('value="delete"'), card.count('value="feedback"'),
+        self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
                           card.count("<h2"), card.count("<dl")), (1, 1, 1, 1, 1))
         self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
         # A narrow card stacks the pair, before on top.

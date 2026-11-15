@@ -730,8 +730,26 @@ def clean_checkout_cargo_output(path: Path) -> None:
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
             shutil.rmtree(root)
+            remove_empty_mirror_parents(root, output.roots.workspace_root, path)
         finally:
             sweep.release(locked.held)
+
+
+def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None:
+    """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
+    tail = workspace.parts[1:]
+    if not tail or root.parts[-len(tail):] != tail:
+        return
+    top = Path(*root.parts[:-len(tail)]).joinpath(*path.parts[1:])
+    if path.is_relative_to(top):
+        return
+    folder = root.parent
+    while folder.is_relative_to(top):
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
 
 
 def main(argv: list[str]) -> int:

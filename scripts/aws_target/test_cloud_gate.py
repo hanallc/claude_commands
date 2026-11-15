@@ -23,7 +23,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import cloud_gate, gate_box, gate_trial, ledger
-from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
+from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -201,8 +201,8 @@ class CloudGateTests(CostFixture):
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1)""").close()
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
         self.request['modules'] = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
         self.fake.has_result = False
         self.fake.log = ("Runner: 2 modules, whole machine, 32 CPUs\n"
@@ -233,8 +233,8 @@ class CloudGateTests(CostFixture):
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1)""").close()
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
+                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
         self.fake.has_result = False
         self.fake.log = "Runner: 1 modules, whole machine, 32 CPUs\nStarting module: fixture/test_ok.py\n"
         numeric_settings(self.root / "cloud_gate.conf", {"result_poll_s": "3"})
@@ -477,6 +477,34 @@ class CloudGateTests(CostFixture):
         self.gate_history([(first, 'us-east-2', cap), (third, 'us-east-2', cap)])
         with redirect_stdout(StringIO()):
             self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+
+    def test_a_region_whose_spot_quota_is_below_one_box_is_not_tried(self) -> None:
+        worker, variants = self.steering_fixture()
+        types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
+        self.variant_prices(variants, {})
+        boxes = {size: largest_gate_vcpus((size,)) for size in types}
+        largest = max(boxes.values())
+        path = self.state / 'spot-prices.json'
+        def quotas(west: int, *, age: int = 0) -> None:
+            document = ledger.mapping(cast(object, json.loads(path.read_text())))
+            document['regions'] = [{'region': region, 'read_at': int(self.now) - age, 'standard_vcpus': str(vcpus),
+                                    'gpu_vcpus': '0'} for region, vcpus in (('us-east-2', largest), ('us-west-2', west))]
+            _ = path.write_text(json.dumps(document))
+        # us-west-2 fits only the smaller boxes, so only the largest type there is skipped.
+        quotas(largest - 1)
+        with redirect_stdout(StringIO()) as output:
+            ranked = worker.rank_variants(variants, 'merge-gate')
+        skipped = {size for size, vcpus in boxes.items() if vcpus == largest}
+        self.assertEqual({(row.region, row.instance_type) for row in variants} - {(row.region, row.instance_type) for row in ranked},
+                         {('us-west-2', size) for size in skipped})
+        self.assertEqual(output.getvalue().count('Cloud gate skips '), len(skipped))
+        self.assertIn(f'its Spot quota {largest - 1} vCPUs is below one box ({largest} vCPUs)', output.getvalue())
+        # A quota of exactly one box is tried, and a stale quota never causes a skip.
+        for west, age in ((largest, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
+            with self.subTest(west=west, age=age):
+                quotas(west, age=age)
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
 
     def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
         cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
@@ -1847,6 +1875,34 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(set(rows[-1]), {'total_cost_usd', 'cost_basis', 'cleanup_complete'})
         self.assertTrue(rows[-1]['cleanup_complete'])
 
+
+    def test_paired_queue_wait_does_not_shorten_the_box_lifetime(self) -> None:
+        cohort = self.root / 'waited'
+        folder = cohort / 'waited'
+        folder.mkdir(parents=True)
+        # The request was written before a long wait for a cloud slot, so its first expiry is almost spent.
+        request = {**self.request, 'attempt': 'waited', 'task': 'paired', 'rounds': 1, 'module': 'waited/test_ok.py',
+                   'expires': int(self.now) + 60, 'base': {'commit': 'base', 'tree': 'base-tree'},
+                   'changed': {'commit': 'commit', 'tree': 'tree'}}
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / 'deployment.json', self.deployment)
+        @contextmanager
+        def slot(_repo: Path, sidecar: Path, _mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+            yield cloud_gate.CloudReservation(sidecar)
+        def execute(worker: cloud_gate.GateWorker, folder: Path, request: dict[str, object],
+                    _deployment: dict[str, object]) -> dict[str, object]:
+            cloud_gate.save(folder / 'launched-request.json', request)
+            worker.book.resolve_gate('waited', ledger.GateAbsent(int(self.now)))
+            return {'status': 'fallback', 'reason': 'fixture'}
+        with (mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=slot),
+              mock.patch.object(cloud_gate.GateWorker, 'execute', new=execute),
+              mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
+              mock.patch.object(time, 'time', return_value=self.now), redirect_stdout(StringIO())):
+            _ = gate_trial.coordinate_trial(cohort, self.state, self.settings)
+        expires = int(self.now) + cloud_gate.settings().whole('lifetime_minutes') * 60
+        self.assertEqual(cloud_gate.read(folder / 'launched-request.json')['expires'], expires)
+        self.assertEqual(cloud_gate.read(folder / 'request.json')['expires'], expires)
+        self.assertEqual([row.expires for row in self.book.read_snapshot().gate_reservations], [expires])
 
     def test_paired_uncertain_cost_keeps_full_reservation_and_absent_cost_is_zero(self) -> None:
         reservation = ledger.GateReservation('uncertain', int(self.now), int(self.now) + 1200,

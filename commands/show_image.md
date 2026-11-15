@@ -19,7 +19,7 @@ A file path alone is not something the user can view.
    ```sh
    ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image <path> | --before <path> --after <path>) --caption "<caption>" --owner <your staff id> (--change <id> | --phase <id>)
    ```
-   - A pair shows its two images side by side on one card, with one caption, one Feedback field and one Delete. On a narrow window the before image is on top.
+   - A pair shows its two images side by side on one card, with one caption, one Feedback field and one set of answer buttons. On a narrow window the before image is on top.
    - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the images, so you can delete the source files after it prints `registered`.
@@ -28,7 +28,7 @@ A file path alone is not something the user can view.
    In a notice to a showrunner, give the same links and the image ids.
 
 The page shows the oldest image first, and a new image goes to the end.
-The user removes an image, or both images of a pair, with its **Delete** button.
-The user can also send feedback on an image. It arrives as a message that starts `From the user (via the Images page): feedback on your image.`
+The user answers on an image or pair with **Approved**, **Not Approved** or **Send Feedback**, and any of them can carry feedback.
+The answer arrives as a message that starts `From the user (via the Images page):`.
 Act on it as on the user's words. Then delete the image with the command in the message.
 To remove your own image, run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id <id>`.

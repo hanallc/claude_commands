@@ -20,7 +20,7 @@ from scripts.production import change_review, change_routing, staff, update_regi
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page
+from scripts.review_links import change_page, console
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -90,6 +90,22 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
             return ReviewBrowser(token, initial, "questions")
         case _:
             raise ValueError("type must be changes or questions")
+
+
+def waiting_changes(request: console.NewsRequest) -> frozenset[str]:
+    """Name the changes that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).changes if item.waiting)
+
+
+def waiting_questions(request: console.NewsRequest) -> frozenset[str]:
+    """Name the questions that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).questions)
+
+
+def console_reviews(root: Path) -> PreparedReviews:
+    """Read the change lists and questions once for the console's news request."""
+    token, initial = browser_manifest(change_page.console_folder(root))
+    return prepare(ReviewBrowser(token, initial), change_page.DeliveryStatus(root))
 
 
 def rebuilds_at(root: Path, path: str) -> None:
@@ -219,7 +235,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
-    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
+    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
@@ -358,19 +374,22 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
+@dataclass(frozen=True)
+class Rebuild:
+    """One change that a machine's rebuild applies: its time, its owner and its reason."""
+
+    at: str
+    owner: str
+    reason: str
+
+
 def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
                  record: staff.StaffSnapshot) -> str:
-    """Show each machine the status line names, then one entry per change: who made it, when and why."""
+    """Show each machine the status line names, then its changes under each owner and each shown time."""
     def who(session: str) -> str:
         member = record.by_member_reference(session) if session else None
         return (f"{member.name} ({member.kind})" if member is not None
                 else f"Unknown session: {session}" if session else "Unknown session")
-
-    def entry(session: str, at: str, reason: str) -> tuple[datetime, str]:
-        moment = datetime.fromisoformat(at)
-        return moment, (f'<li><dl><dt>Who</dt><dd>{html.escape(who(session))}</dd>'
-                        + f'<dt>When</dt><dd><time datetime="{html.escape(at, quote=True)}">{shown_time(moment)}</time></dd>'
-                        + f'<dt>Reason</dt><dd>{html.escape(reason)}</dd></dl></li>')
 
     names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
@@ -378,25 +397,42 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
         filed = {item["nixos_commit"] for item in records}
         # A filed need and its commit are one change; the need gives the requester and the reason.
-        items = [entry(item["requested_by"] or item["concerns"], item["created_at"], item["reason"]) for item in records]
-        items += [entry(change.session, change.at, change.reason)
+        items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]), item["reason"])
+                 for item in records]
+        items += [Rebuild(change.at, who(change.session), change.reason)
                   for change in changes.get(machine_name, ()) if change.commit not in filed]
-        listed = ('<ul>' + ''.join(shown for _, shown in sorted(items, key=lambda item: item[0], reverse=True)) + '</ul>'
-                  if items else '<p>The change list is not available yet.</p>')
+        listed = owner_groups(items) if items else '<p>The change list is not available yet.</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
             + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
-REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] ul{list-style:none;padding:0}[data-rebuilds] li+li{margin-top:16px}
-[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
-[data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
+def owner_groups(items: list[Rebuild]) -> str:
+    """Name each owner once, newest change first; under an owner, changes at one shown time share that time."""
+    owners: dict[str, dict[str, list[Rebuild]]] = {}
+    for item in sorted(items, key=lambda item: datetime.fromisoformat(item.at), reverse=True):
+        owners.setdefault(item.owner, {}).setdefault(shown_time(datetime.fromisoformat(item.at)), []).append(item)
+    return ''.join(
+        f'<div data-owner><h3>{html.escape(owner)}</h3><dl>'
+        + ''.join(f'<dt><time datetime="{html.escape(group[0].at, quote=True)}">{html.escape(shown)}</time></dt>'
+                  + ''.join(f'<dd>{html.escape(item.reason)}</dd>' for item in group)
+                  for shown, group in times.items())
+        + '</dl></div>' for owner, times in owners.items())
+
+
+# Machines sit side by side when the frame is wide; under each owner, a time is a column beside its reasons.
+REBUILD_STYLE = """<style>main{max-width:1060px}
+[data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
+[data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
+[data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;margin:0;min-width:0;overflow-wrap:anywhere}
+[data-rebuilds] dd+dt,[data-rebuilds] dd+dt+dd{padding-top:8px}
+@media (max-width:480px){[data-rebuilds] dl{display:block}[data-rebuilds] dd+dt{padding-top:12px}[data-rebuilds] dd+dt+dd{padding-top:0}}</style>"""
 
 
 def render_rebuilds() -> bytes:
-    """Render the status line's rebuild answer for the console's rebuild link and overlay."""
+    """Render the status line's rebuild answer for the console's rebuild link and Rebuilds page."""
     config = conf.path("statusline")
     rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
     return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
@@ -418,7 +454,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
-    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}">'
+    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
                + f'<h1>{change_page.TITLES[kind]}</h1>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
@@ -638,6 +674,14 @@ async function save(row,form,outcome){
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
+ const moveOn=notice=>{
+  row.dataset.pending='false';form.hidden=true;
+  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
+  else show();
+ };
+ // Works and Does not work show the next change at once; a failed save puts the change back.
+ const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
+ if(early) moveOn('Saving review.');
  try{
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
@@ -646,14 +690,18 @@ async function save(row,form,outcome){
    outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   saved=true;
-  row.dataset.pending='false';form.hidden=true;
-  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){
-   advance(row);saveNotice.textContent=kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.';
+  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
+  else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
+ }catch(error){
+  const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
+  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  if(early){
+   row.dataset.pending='true';form.hidden=false;show();
+   const open=document.createElement('button');open.type='button';open.textContent='Open it';
+   open.addEventListener('click',()=>go(row.dataset.key));
+   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
    saveNotice.hidden=false;
   }
-  else show();
- }catch(error){
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+(error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message);
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
@@ -669,6 +717,8 @@ function applyHeldPage(){
  if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
  const fresh=heldPage;heldPage=null;
  if(fresh.outerHTML===shownPage) return;
+ // A page from an older server script cannot bind the new rows, so it loads again.
+ if(fresh.dataset.script!==content.dataset.script){location.reload();return;}
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
  const controlId=focused===runnerMenu ? focused.id : '';
@@ -715,3 +765,4 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
+SCRIPT_VERSION = change_page.script_version(SCRIPT)

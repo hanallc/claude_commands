@@ -19,6 +19,9 @@ folders without that end evidence until nothing in them changed for 7 days.
 Files and links at the top level also wait 7 days. Tempfile-named entries and
 invoke/verify logs keep their existing rules. Every process and ownership check
 still applies; the log distinguishes an ended owner from the 7-day fallback.
+The timed sweep also prunes the dataclass code cache of the startup hook
+(scripts/lib/python_startup/sitecustomize.py): an entry goes when no process
+read it in lint.conf `dataclass_code_days` days, and an emptied cache tag folder goes with it.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
@@ -107,6 +110,7 @@ from urllib.parse import unquote, urlparse
 
 from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
+from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
@@ -260,6 +264,8 @@ class Roots:
     wide: tuple[str, ...] = ()
     sessions: tuple[str, ...] = ()
     copies: tuple[str, ...] = ()
+    # Dataclass code cache roots; prune_dataclass_code judges each entry of each cache tag folder.
+    dataclass_code: tuple[str, ...] = ()
     verify_temp_name: re.Pattern[str] = field(default_factory=verify_temp_name, kw_only=True)
 
     def all(self) -> tuple[str, ...]:
@@ -364,6 +370,7 @@ class Sweep:
     failed: list[FailedEntry] = field(default_factory=list)
     kept: dict[str, list[str]] = field(default_factory=dict)
     freed: int = 0
+    dataclass_code_removed: int = 0
 
     def keep(self, path: str, reason: str) -> None:
         self.kept.setdefault(reason, []).append(path)
@@ -373,7 +380,8 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
                   scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
                   session_temp_roots: Sequence[str] | None = None) -> Roots:
-    """Each root by its real path; only the scratch and copies roots differ by host. The Mac's /tmp is a link to
+    """Each root by its real path; only the scratch and copies roots differ by host. Only the live /tmp root
+    adds the dataclass code cache root. The Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
     runs = tuple(str(root) for root in unit_runs.run_roots()) if run_roots is None else run_roots
@@ -393,7 +401,8 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
                  temp_real, tuple(dict.fromkeys(os.path.realpath(root) for root in task_roots if os.path.isdir(root))),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
                  tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
-                 tuple(dict.fromkeys(os.path.realpath(root) for root in copies)))
+                 tuple(dict.fromkeys(os.path.realpath(root) for root in copies)),
+                 (dataclass_code_root(),) if live else ())
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -1244,7 +1253,35 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
         for root in roots.copies:
             scratch.clear_finished_copy_removals(Path(root), scratch_settings=scratch_settings)
             scratch.remove_empty_copy_pairs(Path(root))
+        for root in roots.dataclass_code:
+            result.dataclass_code_removed += prune_dataclass_code(root, now, lint_settings.whole("dataclass_code_days"))
     return result
+
+
+def prune_dataclass_code(root: str, now: float, days: int) -> int:
+    """Remove each cache entry that no process read in days days, then each emptied cache tag folder.
+
+    An old Python's cache tag folder empties and goes by the same rule. Return the count of removed entries.
+    """
+    if not dataclass_code_usable(root, os.getuid()):
+        return 0
+    limit = now - days * 86400
+    removed = 0
+    for tag in listing(root):
+        if not tag.is_dir(follow_symlinks=False):
+            continue
+        for entry in listing(tag.path):
+            try:
+                if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < limit:
+                    os.unlink(entry.path)
+                    removed += 1
+            except OSError:
+                continue
+        try:
+            os.rmdir(tag.path)
+        except OSError:
+            pass
+    return removed
 
 
 class CleanupEndReason(Enum):
@@ -1523,6 +1560,8 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
         print(f"tmp sweep: {verb} {entry['path']} ({entry['gib']:.1f} GiB), last changed {entry['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
+    if result.dataclass_code_removed:
+        print(f"tmp sweep: removed {result.dataclass_code_removed} dataclass code entries")
     print(summary(result, dry_run))
     if not dry_run:
         append_log(state_dir() / LOG_NAME, record(result, dry_run, moment), moment)

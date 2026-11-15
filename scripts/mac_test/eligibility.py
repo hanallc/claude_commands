@@ -18,12 +18,12 @@ from scripts.lib import conf
 from scripts.mac_test import cargo_manifest
 
 
-MacVerb = Literal["nextest", "check", "clippy", "mend-check", "doc", "build"]
+MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"]
 
 
 def step_kind(verb: str) -> str:
     """Map a command verb to its recorded step kind."""
-    return {"test": "nextest", "mend-check": "mend"}.get(verb, verb)
+    return {"test": "nextest", "mend-check": "mend", "mend-fix": "mend"}.get(verb, verb)
 
 
 NonBusyMacDeclineReason = Literal[
@@ -341,6 +341,16 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
     return False
 
 
+# linux_only keeps tests and the binaries they run off the Mac. These kinds only compile,
+# and only the Mac compiles macOS code, so linux_only never applies to them.
+COMPILE_ONLY_STEP_KINDS = frozenset({"check", "lint", "doc"})
+
+
+def linux_only_applies(kind: str) -> bool:
+    """Apply linux_only to every kind that is not compile-only, and to a step with no kind."""
+    return kind not in COMPILE_ONLY_STEP_KINDS
+
+
 def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     """Check a named package alone, or the whole workspace when no package is named.
 
@@ -353,11 +363,13 @@ def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
 
 
 def linux_only_policy(config: OffloadConfig, repository: KnownRepository, repo_root: Path,
-                      package: str) -> KnownRepository | IneligibleMacStep:
+                      package: str, kind: str) -> KnownRepository | IneligibleMacStep:
     """Apply the repository's linux_only setting; an unset or unreadable setting refuses the step."""
     key = f"linux_only.{repository.name}"
     if key not in config.values:
         return IneligibleMacStep("repo")
+    if not linux_only_applies(kind):
+        return repository
     try:
         if has_linux_only(repo_root, package, comma_values(config.values[key])):
             return IneligibleMacStep("linux_only")
@@ -377,7 +389,12 @@ def remote_step_kinds(kind: str) -> tuple[str, ...]:
 
 
 def verb_kind(verb: MacVerb) -> str:
-    return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check") else verb
+    return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check", "mend-fix") else verb
+
+
+def recorded_step_kind(step: str) -> str:
+    """Map a recorded step to its command kind; a recorded mend is the mend-check verb."""
+    return verb_kind(cast(MacVerb, "mend-check" if step == "mend" else step))
 
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
@@ -393,7 +410,7 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
         if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
             return IneligibleMacStep("target does not permit this command")
         return backoff_eligibility(repository, target, backoff)
-    policy = linux_only_policy(config, repository, repo_root, package)
+    policy = linux_only_policy(config, repository, repo_root, package, kind or verb_kind(verb))
     if isinstance(policy, IneligibleMacStep):
         return policy
     return backoff_eligibility(repository, target, backoff)
