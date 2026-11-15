@@ -259,6 +259,26 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
 
+### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a caller of the two note helpers does not load `quota_alert` and its message-sending imports (next item 19, user approved 2026-11-02 via sdlc).
+
+**Spec:**
+- Move `ahead` and `remaining` from `scripts/whoami/quota_alert.py` to `scripts/whoami/note_file.py`. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`; it keeps no copy and no re-export.
+- Every caller imports them from `note_file`.
+
+**Files:**
+- `scripts/whoami/note_file.py`, `scripts/whoami/quota_alert.py`
+- `scripts/whoami/test_agent_notes.py`
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`.
+
+**Acceptance gate:** the whoami and accounts test modules that import `quota_alert` or `note_file` pass; basedpyright reports zero errors and zero warnings on the changed files.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
