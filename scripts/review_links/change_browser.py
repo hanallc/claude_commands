@@ -23,6 +23,7 @@ from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 
 MANIFEST = change_page.BROWSER_MANIFEST
+FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
 
 
 @dataclass(frozen=True)
@@ -64,10 +65,10 @@ class PreparedReviews:
 
 
 def page_at(root: Path, path: str) -> ReviewBrowser:
-    match = re.fullmatch(r"/([a-z0-9]{6})/changes\.html", urlsplit(path).path)
+    match = re.fullmatch(FOLDER + r"/changes\.html", urlsplit(path).path)
     if match is None:
         raise FileNotFoundError("not a change browser")
-    token, initial = browser_manifest(root / match[1])
+    token, initial = browser_manifest(browser_folder(root, match[1]))
     kinds = parse_qs(urlsplit(path).query).get("type", ["changes"])
     match kinds:
         case ["changes"]:
@@ -80,10 +81,15 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
 
 def rebuilds_at(root: Path, path: str) -> None:
     """Accept the rebuild needs path only beside a published browser."""
-    match = re.fullmatch(r"/([a-z0-9]{6})/" + re.escape(change_page.REBUILDS_NAME), urlsplit(path).path)
+    match = re.fullmatch(FOLDER + "/" + re.escape(change_page.REBUILDS_NAME), urlsplit(path).path)
     if match is None:
         raise FileNotFoundError("not a rebuild page")
-    _ = browser_manifest(root / match[1])
+    _ = browser_manifest(browser_folder(root, match[1]))
+
+
+def browser_folder(root: Path, name: str) -> Path:
+    """Give the fixed console folder, or an older browser snapshot that still accepts answers."""
+    return change_page.console_folder(root) if name == change_page.CONSOLE_FOLDER else root / name
 
 
 def browser_manifest(folder: Path) -> tuple[str, str]:
@@ -99,9 +105,6 @@ def browser_manifest(folder: Path) -> tuple[str, str]:
         raise ValueError("invalid browser manifest")
     return token, initial
 
-
-def publish(initial: str = "") -> str:
-    return change_page.publish_browser(initial)
 
 
 def row_token(browser: ReviewBrowser, key: str) -> str:

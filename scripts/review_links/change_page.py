@@ -7,9 +7,9 @@ except FileNotFoundError:
     pass
 
 import argparse
-import functools
 import html
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -41,6 +41,7 @@ MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
 REBUILDS_NAME = "rebuilds.html"
 BROWSER_MANIFEST = ".review-link-browser.json"
+CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
@@ -1030,29 +1031,35 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                         del status.request_attempts[attempt]
 
 
-def publish_browser(initial: str = "") -> str:
-    """Publish one all-list page without copying change records."""
-    root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
-        source = Path(temporary) / PAGE_NAME
-        _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
-        url = review_link.snapshot_at(root, [source], new=True)[0]
-    folder = root / urlsplit(url).path.split("/")[1]
-    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
-    atomic_file.write_bytes_atomic(folder / BROWSER_MANIFEST, json.dumps(manifest).encode(), mode=0o600)
-    return url
+def console_folder(root: Path) -> Path:
+    """Create the fixed console folder and its browser token once; later calls keep both."""
+    folder = root / CONSOLE_FOLDER
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = folder / BROWSER_MANIFEST
+    if target.exists():
+        return folder
+    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": ""}
+    draft = folder / f"{BROWSER_MANIFEST}.{secrets.token_hex(8)}"
+    atomic_file.write_bytes_atomic(draft, json.dumps(manifest).encode(), mode=0o600)
+    try:
+        # A link never replaces a token that a concurrent first request created.
+        os.link(draft, target)
+    except FileExistsError:
+        pass
+    finally:
+        draft.unlink()
+    return folder
 
 
-@functools.cache
-def console_browser(root: Path) -> str:
-    """Publish one browser folder for each process, so the console's pages share it."""
-    del root
-    return urlsplit(publish_browser()).path
+def console_url() -> str:
+    """Return the fixed console address; the server renders it from the current code at each request."""
+    return f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}/{CONSOLE_FOLDER}/"
 
 
 def page_url() -> str:
-    """Publish the Changes page and return its path under the review root."""
-    return console_browser(review_link.review_root().resolve())
+    """Return the fixed Changes page path under the review root."""
+    _ = console_folder(review_link.review_root().resolve())
+    return f"/{CONSOLE_FOLDER}/{PAGE_NAME}"
 
 
 def questions_url() -> str:
@@ -1096,9 +1103,7 @@ def main(arguments: list[str]) -> int:
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
-            from scripts.review_links import console
-
-            print(console.publish())
+            print(console_url())
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")

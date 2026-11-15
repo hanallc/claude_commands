@@ -85,11 +85,13 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
-`change_page.py` without rows prints `/<snapshot>/console.html?page=changes`.
-Selected-row links with `--production NAME C27` still open `changes.html` directly.
-`scripts/review_links/console.py` publishes the console beside its Changes snapshot.
-The server applies the same root, traversal, private-file, and symlink rules to both pages.
-The console adds a same-origin content policy and permits same-origin framing.
+`change_page.py` without rows prints one fixed link, `http://<host>:<server_port>/console/`.
+`/console` without the final slash forwards to `/console/` with the same query.
+The server renders `/console/` from the current code and configuration at each GET.
+A merge to main thus changes the console with no new link and no restart step.
+A render error gives a 503 page: **The console is not available.**
+Selected-row links with `--production NAME C27` still open their own signed `changes.html` directly.
+The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for AWS prices, Builds, Changes and Questions, in alphabetical order.
@@ -111,8 +113,16 @@ The phone navigation starts closed and does not change the stored desktop state.
 Missing and unknown ids select the first configured entry.
 Navigation clicks update this query with `history.replaceState`.
 
+Older links forward to the fixed address with a 303 and keep their query.
+The server forwards `/<snapshot>/console.html` to `/console/`.
+It forwards an all-list `/<snapshot>/changes.html` to `/console/changes.html`.
+It forwards `/<snapshot>/rebuilds.html` to `/console/rebuilds.html`.
+A snapshot whose folder holds a selected-row manifest keeps its own `changes.html`.
+A forwarded link can come from a folder that the sweep already deleted.
+Older browser folders still accept answers that a page posts to them.
+
 `config/console.conf` defines entries in file order.
-The publisher reads it through `conf.read("console")` when it creates the link.
+The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
 The URL value has the form `python:<module>:<function>`.
 The function takes no arguments and returns a URL path under the review root.
@@ -120,13 +130,13 @@ The console also accepts a full URL from the configured review origin and conver
 The URL function raises one of `review_link.SNAPSHOT_ERRORS` when the page is unavailable.
 An absent function also makes the entry unavailable.
 That entry remains visible and shows **Not available** when selected.
-Publishing the console again resolves the current configuration and page availability.
+Each console request resolves the current configuration and page availability.
 
 A page joins with one configuration block and its URL function.
 The page serves itself at that path and permits same-origin framing.
 A link that leaves the page uses `target="_top"`.
 The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
-`change_page.page_url` reuses the existing Changes publisher.
+`change_page.page_url` returns the fixed `/console/changes.html` path.
 `change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
@@ -135,7 +145,7 @@ That function returns the AWS prices page URL without publishing the page.
 
 The bottom-left rebuild link shows only while a rebuild need is open.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
-That function returns `/<snapshot>/rebuilds.html` beside the Changes page.
+That function returns `/console/rebuilds.html`.
 The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
 Its label names each machine and the need count, for example **Rebuild natedev, the Mac (3)**.
 The collapsed rail shows the icon with a count badge, and hover or focus shows the label.
@@ -209,8 +219,8 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Rebuilds page
 
-`/<snapshot>/rebuilds.html` lists open rebuild needs for the console's rebuild link.
-The server serves it only beside a published Changes browser.
+`/console/rebuilds.html` lists open rebuild needs for the console's rebuild link.
+The server serves it only in a folder that holds the browser manifest.
 It is not in the navigation.
 A `data-rebuilds` block carries `data-count`, the number of open needs, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac, then other machines in name order.
@@ -443,7 +453,9 @@ Skip for now stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 A failed save keeps the row in that count and does not change the current row.
 
-The all-list publisher stores a private `.review-link-browser.json` beside a placeholder HTML file.
+The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
+The first `change_page.page_url` call creates the folder and the manifest with a hard link, so two first requests keep one secret.
+Later calls keep the same manifest, so a page stays valid across merges and restarts.
 This manifest contains a random page secret and an optional initial row key.
 It stores no copied rows or answers.
 Each prepared row receives a token signed from that secret and its qualified list/row key.
@@ -625,6 +637,7 @@ The server reads the current settings when it needs them.
   The new process keeps the pid, arguments and environment.
   A failed process replacement or new start exits 1, and the service manager starts the service again.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
+- `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.
 - A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
@@ -639,6 +652,7 @@ That interval starts at one hour.
   Each publish resets the folder modification time.
   The sweep deletes expired folders at its next run.
   A stopped server sweeps at its next start.
+- The sweep never deletes the fixed `console/` folder, at any age.
 - At the root, the sweep checks `is_symlink()` before `is_dir()`, so it never follows a symlink. It skips symlinks and entries that are not folders, for example `.index.json`, `.index.lock` and temporary files.
 - A root folder is a flat snapshot when its name is six lowercase letters or digits and it holds no subfolder and no symlink. The sweep deletes a flat snapshot as one folder.
 - Any other root folder is a session folder of the older `<session>/<UTC stamp>-<label>-<unique suffix>/` layout. The sweep checks each child folder on its own, skips child symlinks and never deletes the session folder.
