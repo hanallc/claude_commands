@@ -14,7 +14,7 @@ from unittest import mock
 from scripts.style import style_plan, style_proposals
 
 from scripts.lib import berth_board
-from scripts.style import style_ledger
+from scripts.style import style_footprint, style_ledger
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 
@@ -57,9 +57,12 @@ class StylePlanTests(StylePlanFixture):
         probe, gauge = (next(finding for finding in self.ledger().proposal_findings(issue) if finding.path == path)
                         for path in ("crates/alpha/src/probe.rs", "crates/alpha/src/gauge.rs"))
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("crates/alpha/src/render.rs")),
-              mock.patch.object(style_proposals, "proposal_command")):
+              mock.patch.object(style_proposals, "proposal_command"),
+              mock.patch.object(style_footprint, "token_spans", wraps=style_footprint.token_spans) as reads):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
+        # One token read of lib.rs serves both file moves.
+        self.assertEqual([call.args[0] for call in reads.call_args_list].count("mod gauge;\nmod probe;\nmod render;\n"), 1)
         self.assertEqual(output.count(f"waiting {issue}: {probe.path} edits crates/alpha/src/render.rs, busy (1 finding)\n"), 1)
         self.assertNotIn(f"waiting {issue}: crates/alpha/src/probe.rs busy", output)
         ticket = self.ledger().ticket_open(ticket_owner_id("names"))[0]

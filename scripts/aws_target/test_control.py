@@ -669,7 +669,7 @@ class ControlTests(CostFixture):
         self.assertEqual(self.snapshot(), 0)
         table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
         missing = next(line for line in table.splitlines() if line.startswith(self.omitted))
-        self.assertIn('no offer', missing)
+        self.assertIn('not sold here', missing)
         self.assertNotIn(' -', missing)
 
 
