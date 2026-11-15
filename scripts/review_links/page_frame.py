@@ -51,3 +51,69 @@ document.addEventListener('click',event=>{
  dialog.showModal();dialog.focus({preventScroll:true});
 });
 })();'''
+
+# Both pages use these durations and complete a cancelled motion before the next motion.
+MOTION_SCRIPT = r'''function createCardMotion(){
+ const fadeOutMs=120, fadeInMs=180;
+ const reduced=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
+ let generation=0, animations=[], commit=()=>{}, pending=Promise.resolve();
+ function finish(){
+  generation++;
+  animations.forEach(animation=>animation.cancel());animations=[];
+  const complete=commit;commit=()=>{};complete();
+ }
+ async function play(element,frames,duration){
+  const animation=element.animate(frames,{duration,easing:'ease-out',fill:'both'});
+  animations.push(animation);
+  try{await animation.finished;}catch(error){}
+  animation.cancel();animations=animations.filter(item=>item!==animation);
+ }
+ function scroll(element,always=false){
+  if(element && (always || element.getBoundingClientRect().top<0))
+   element.scrollIntoView({block:'start',behavior:reduced() ? 'instant' : 'smooth'});
+ }
+ function fadeIn(target){
+  return play(target,[{opacity:0,transform:'translateY(4px)'},{opacity:1,transform:'none'}],fadeInMs);
+ }
+ async function fadeCard(previous,target,reveal,alwaysScroll=false){
+  finish();const operation=generation;commit=reveal;
+  if(reduced()){finish();scroll(target,alwaysScroll);return;}
+  if(previous?.isConnected) await play(previous,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(operation!==generation) return;
+  commit=()=>{};reveal();scroll(target,alwaysScroll);
+  if(target?.isConnected) await fadeIn(target);
+ }
+ function switchCard(...args){pending=fadeCard(...args);return pending;}
+ async function revealCard(target){
+  finish();const operation=generation;
+  if(reduced()){scroll(target,true);return;}
+  const top=Math.min(Math.max(0,scrollY+target.getBoundingClientRect().top),
+   Math.max(0,document.documentElement.scrollHeight-innerHeight));
+  if(Math.abs(top-scrollY)>1) await new Promise(resolve=>{
+   const done=()=>{clearTimeout(timeout);removeEventListener('scrollend',done);resolve();};
+   const timeout=setTimeout(done,1000);
+   addEventListener('scrollend',done,{once:true});scroll(target,true);
+  });
+  if(operation!==generation || !target.isConnected) return;
+  await fadeIn(target);
+ }
+ function scrollCard(target){pending=revealCard(target);return pending;}
+ async function removeCard(card,removed){
+  finish();const operation=generation;
+  const siblings=[...card.parentNode.children].filter(item=>item!==card && !item.hidden);
+  const closeGap=()=>{
+   const tops=siblings.map(item=>item.getBoundingClientRect().top);
+   card.remove();removed();
+   if(!reduced()) siblings.forEach((item,index)=>{
+    const offset=tops[index]-item.getBoundingClientRect().top;
+    if(offset) void play(item,[{transform:`translateY(${offset}px)`},{transform:'none'}],fadeInMs);
+   });
+  };
+  commit=()=>{card.remove();removed();};
+  if(!reduced()) await play(card,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(operation!==generation) return;
+  commit=()=>{};closeGap();
+ }
+ return {switchCard,scrollCard,removeCard,scroll,finish,settled:()=>pending};
+}
+'''

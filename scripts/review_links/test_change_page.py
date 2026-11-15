@@ -1287,6 +1287,8 @@ class ChangePageTests(unittest.TestCase):
         _ = self.review_list.write_text("".join(lines) + change_review.REVIEWED + reviewed)
         _, _, browser = self.browser()
         page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertEqual(browser.count(page_frame.MOTION_SCRIPT), 1)
+        self.assertIn("prefers-reduced-motion: reduce", browser)
         for body in (browser, page):
             self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
             self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
@@ -2703,7 +2705,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("No changes for this showrunner.", body)
         self.assertIn("No changes to review.", body)
         self.assertIn("current===row && (tab==='' || tab===row.dataset.tab) && navigation===position", body)
-        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});", body)
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
@@ -2745,7 +2747,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('value="feedback">Send feedback</button></div></form>', body)
             self.assertNotIn('secondary-actions', body)
         with self.subTest(navigation="Skip joins the action row"):
-            self.assertIn("current?.querySelector('form:not([hidden]) .answer-actions')", body)
+            self.assertIn("target?.querySelector('form:not([hidden]) .answer-actions')", body)
             self.assertIn('.navigation:empty{display:none}', body)
             self.assertNotIn('position:sticky', body)
         with self.subTest(card="title and metadata"):
@@ -2861,7 +2863,7 @@ class ChangePageTests(unittest.TestCase):
    check(tab==='demo','a page load reads the filter from the URL');
    navigate();
    for(const key of ['page-owner/C1','page-owner/C3']){
-    go(key);const actions=[...current.querySelectorAll('button[name=outcome]')];
+    go(key);await motion.settled();const actions=[...current.querySelectorAll('button[name=outcome]')];
     check(current.dataset.key!== 'page-owner/C3' || current.textContent.includes('Showrunner: The proof has three steps.'),'the feedback note appears above the actions');
     check(getComputedStyle(next.parentElement).position==='static','Skip uses the normal flow');
     check(next.parentElement===actions[0].parentElement && actions.every(button=>button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING),'Skip ends the action row');

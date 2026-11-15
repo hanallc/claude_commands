@@ -5841,7 +5841,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "peak_history_share_percent"):
+                        "peak_history_share_percent", "progress_profile_sweep_seconds"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5862,6 +5862,8 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
+                        elif key == "progress_profile_sweep_seconds":
+                            self.assertEqual(repaired.progress_profile_sweep_seconds, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
 
@@ -6201,7 +6203,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.start_ci_job()
         for resident, available in ((2, 22), (6, 18)):
             with self.subTest(resident=resident):
+                # 1 GiB of the CI working set is active file cache: available RAM holds it, so the cap does not count it.
                 _ = (self.ci / "memory.current").write_text(str(resident * GIB))
+                _ = (self.ci / "memory.stat").write_text(f"anon {(resident - 1) * GIB}\nshmem 0\ninactive_file 0\n")
                 reading = self.reading()
                 room = self.queue_with_ci(reading, available * GIB).explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
@@ -6210,7 +6214,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.used, 0)
                 self.assertEqual(room.kept, 0)
                 self.assertEqual(room.runs, ())
-                self.assertEqual(room.cap, (resident + available - 3) * GIB)
+                self.assertEqual(room.cap, (resident - 1 + available - 3) * GIB)
                 self.assertEqual(room.room, (available - 3) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:

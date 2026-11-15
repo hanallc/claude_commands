@@ -167,14 +167,42 @@ def snapshot_value(value: object) -> object:
     return convert(value)
 
 
+EXACT_SCALARS: tuple[object, ...] = (str, int, bool)
+
+
+@lru_cache(maxsize=None)
+def exact_scalars(schema: object) -> frozenset[object]:
+    """Name the scalar types that a schema takes unchanged by exact type; a float still needs its finite check."""
+    if schema in EXACT_SCALARS:
+        return frozenset({schema})
+    origin = get_origin(schema)
+    variants = cast(tuple[object, ...], get_args(schema))
+    if (origin is UnionType or origin is LITERAL_UNION_ORIGIN) and Path not in variants:
+        return frozenset(variant for variant in variants if variant in EXACT_SCALARS)
+    return frozenset()
+
+
+def parse_scalar(value: object, schema: type) -> object:
+    """Accept a value of the scalar type, or an int for a float; refuse a value that is not finite."""
+    valid = type(value) is schema or schema is float and type(value) is int
+    if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
+        raise ValueError("invalid snapshot scalar")
+    return value
+
+
 def parse_snapshot_value(value: object, schema: object) -> object:
     """Validate the wire shape against the same domain fields that the writer serializes."""
+    if schema is str or schema is int or schema is float or schema is bool:
+        # Profile records hold millions of scalars; this check comes before the typing lookups.
+        return parse_scalar(value, schema)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
     if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
+        if type(value) in exact_scalars(schema):
+            return value
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -189,11 +217,6 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         if value is not None:
             raise ValueError("invalid snapshot null")
         return None
-    if schema is str or schema is int or schema is float or schema is bool:
-        valid = (type(value) is schema or schema is float and type(value) is int)
-        if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-            raise ValueError("invalid snapshot scalar")
-        return value
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
     if origin in (list, tuple, frozenset, Sequence):
@@ -201,7 +224,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("invalid snapshot sequence")
         items = cast(list[object], value)
         if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
-            parsed = [parse_snapshot_value(item, args[0]) for item in items]
+            exact = exact_scalars(args[0])
+            parsed = [item if type(item) in exact else parse_snapshot_value(item, args[0]) for item in items]
         else:
             if len(items) != len(args):
                 raise ValueError("invalid snapshot tuple")
