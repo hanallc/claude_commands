@@ -195,6 +195,12 @@ It requires the saved foundation ownership record.
 It does not activate the removed builder route.
 The home stack supplies the bucket, role, instance profile, and home launch resources.
 Each additional region has a separate gate stack and expiry function.
+A regional stack holds only the security group, the launch template and the expiry function.
+The home stack's two scaler policies cover every gate region, so regional stacks create no IAM policy.
+The scaler user then holds 2 gate policies and keeps a free slot for the budget block policy.
+AWS attaches at most 10 managed policies to one IAM user.
+When a regional stack fails, `up` prints the failed resource events of that run.
+`up` deletes a regional stack in `ROLLBACK_COMPLETE` before it deploys that stack again.
 Deployment records each completed regional stack in `gate-deployment.json`.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
