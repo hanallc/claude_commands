@@ -4135,11 +4135,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-- **Goal:** `test_report_cli_work_grows_near_linearly_at_the_live_index_size` builds the index of the full rows once.
-- **Spec:** Measure the CLI on the full rows right after the first `index.update`. Then write the quarter rows, reindex and measure them. The assertions stay the same.
-- **Files:** `scripts/buildlog/test_report.py`.
-- **Workers:** 1 writer: one file; the director writes it (no-worker mode).
-- **Constraints from prior phases:** none.
-- **Acceptance gate:** `buildlog/test_report` passes; basedpyright 0 errors; the AWS pair shows a CPU gain.
+- `test_report_cli_work_grows_near_linearly_at_the_live_index_size` in `scripts/buildlog/test_report.py` measures the CLI on the full rows after the first `index.update`. Then it writes the quarter rows, reindexes and measures them.
+- Cause: the test built the index of the full rows two times.
+- AWS pair (3 rounds): 24.09 -> 19.98 CPU s, wall 29.5 -> 25.3 s; all pass, same tests.
+- Commit f36c878c1. Test-only change.
