@@ -262,7 +262,6 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, record: staff.StaffSnapshot)
     expected = answer.expected
     names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
-    count = 0
     for machine_name, name in zip(answer.machines, names):
         terminal = "Terminal" if machine_name == "mac" else "a terminal"
         items: list[str] = []
@@ -278,14 +277,13 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, record: staff.StaffSnapshot)
             items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
                          + field("Source agent", html.escape(session(source))) + affected
                          + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
-        count += len(items)
         blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
             + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
             + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
             + ('<p>One rebuild applies all listed changes.</p>' if len(items) >= 2 else '')
             + '<ul>' + ''.join(items) + '</ul></article>')
-    label = f"Rebuild {', '.join(names)} ({count})" if count else ""
-    return (f'<div data-rebuilds data-count="{count}" data-label="{html.escape(label, quote=True)}">'
+    label = f"Rebuild {' and '.join(names)}" if names else ""
+    return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
             + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
             + '</div>')
 

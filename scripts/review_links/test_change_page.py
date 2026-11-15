@@ -1265,7 +1265,7 @@ class ChangePageTests(unittest.TestCase):
             reads.assert_called_once_with()
             answer = rebuild_row.read(Path(os.environ["CONF_DIR"]) / "statusline.conf")
             self.assertIn(change_browser.rebuild_list(answer, staff.snapshot()), self.request(rebuilds, {}).body)
-            block = body.split('<div data-rebuilds data-count="3" data-label="Rebuild natedev, the Mac (3)">', 1)[1].rsplit('</div>', 1)[0]
+            block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1].rsplit('</div>', 1)[0]
             self.assertLess(block.index('data-machine="natedev"'), block.index('data-machine="mac"'))
             self.assertIn('<h2>Rebuild natedev</h2>', block)
             self.assertIn('<h2>Rebuild the Mac</h2>', block)
@@ -1300,7 +1300,7 @@ class ChangePageTests(unittest.TestCase):
                 summary = need.MachineNeeds(single, (single["reason"],), (single,))
                 content = change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), staff.snapshot())
-                self.assertIn('data-count="1" data-label="Rebuild natedev (1)"', content)
+                self.assertIn('data-count="1" data-label="Rebuild natedev"', content)
                 self.assertIn('<dt>Source agent</dt><dd>second-session (unit)</dd>', content)
                 self.assertNotIn('Affected session', content)
                 self.assertNotIn('One rebuild applies all listed changes.', content)
@@ -1315,7 +1315,7 @@ class ChangePageTests(unittest.TestCase):
                 _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{details}\n")
                 body = change_browser.render_rebuilds().decode()
                 self.assertEqual(rebuild_row.read(configuration).machines, ("natedev", "mac"))
-                block = body.split('<div data-rebuilds data-count="4" data-label="Rebuild natedev, the Mac (4)">', 1)[1]
+                block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1]
                 natedev, mac = block.split('</article>', 1)
                 self.assertNotIn("running system", natedev)
                 self.assertIn('<ul><li><p>The running system differs from /etc/nixos main <code>' + "d" * 40
@@ -1323,7 +1323,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn('<p>One rebuild applies all listed changes.</p>', mac)
                 only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
                                                    staff.snapshot())
-                self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac (1)">'
+                self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
                                  + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
                                  + '<p>Run <code>rebuild</code> in Terminal on the Mac.</p>'
                                  + '<p>Mac updates can take five minutes while the Mac is reachable.</p>'
