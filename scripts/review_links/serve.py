@@ -467,7 +467,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except change_page.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
-        except images.FeedbackNotSent as error:
+        except images.AnswerNotSent as error:
             self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
             return
         except ValueError as error:
