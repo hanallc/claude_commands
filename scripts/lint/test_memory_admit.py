@@ -6201,7 +6201,9 @@ class CiSliceMemoryTests(unittest.TestCase):
         self.start_ci_job()
         for resident, available in ((2, 22), (6, 18)):
             with self.subTest(resident=resident):
+                # 1 GiB of the CI working set is active file cache: available RAM holds it, so the cap does not count it.
                 _ = (self.ci / "memory.current").write_text(str(resident * GIB))
+                _ = (self.ci / "memory.stat").write_text(f"anon {(resident - 1) * GIB}\nshmem 0\ninactive_file 0\n")
                 reading = self.reading()
                 room = self.queue_with_ci(reading, available * GIB).explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
@@ -6210,7 +6212,7 @@ class CiSliceMemoryTests(unittest.TestCase):
                 self.assertEqual(room.used, 0)
                 self.assertEqual(room.kept, 0)
                 self.assertEqual(room.runs, ())
-                self.assertEqual(room.cap, (resident + available - 3) * GIB)
+                self.assertEqual(room.cap, (resident - 1 + available - 3) * GIB)
                 self.assertEqual(room.room, (available - 3) * GIB)
 
     def test_idle_ci_charges_resident_memory_and_records_swap_separately(self) -> None:

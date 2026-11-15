@@ -80,6 +80,10 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .bar > div:last-child { border-radius: 2px 4px 4px 2px; }
 .seg-used { background: var(--used); }
 .seg-room { background: var(--room); }
+/* Build tools and builds outside the queue: the queued builds color, lighter, outside the cap. */
+.seg-tools { background: color-mix(in srgb, var(--used) 50%, var(--card)); }
+/* Queued and CI use above the cap: the shortfall look. */
+.seg-over { background: var(--free); box-shadow: inset 0 0 0 1px var(--ink-2); }
 .seg-ci { background: var(--ci); border-left: 1px solid var(--card); }
 .seg-programs { background: var(--programs); }
 .seg-kernel { background: var(--kernel); }
@@ -134,6 +138,7 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .why p { margin: 4px 0; }
 .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: none; }
 .sw.used { background: var(--used); }
+.sw.tools { background: color-mix(in srgb, var(--used) 50%, var(--card)); }
 .sw.ci { background: var(--ci); }
 .sw.res { background: repeating-linear-gradient(135deg, var(--res-a) 0 2px, var(--res-b) 2px 4px); }
 .sw.room { background: var(--room); }
@@ -354,10 +359,12 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
       <span class="mark-label num" id="marklabel" data-tip="cap">cap</span>
       <div class="bar">
-        <div class="seg-used" id="s-builds" data-tip="builds"><span class="lbl" id="l-builds"></span></div>
+        <div class="seg-used" id="s-queued" data-tip="queued"><span class="lbl" id="l-queued"></span></div>
         <div class="seg-ci" id="s-ci" data-tip="ci"><span class="lbl" id="l-ci"></span></div>
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
+        <div class="seg-over" id="s-over" data-tip="shortfall"><span class="lbl" id="l-over"></span></div>
+        <div class="seg-tools" id="s-tools" data-tip="tools"><span class="lbl" id="l-tools"></span></div>
         <div class="seg-floor" id="s-safety" data-tip="safety"><span class="lbl" id="l-safety"></span></div>
         <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="hatch-swap" id="s-swap" data-tip="swap"><span class="lbl" id="l-swap"></span></div>
@@ -374,10 +381,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <details class="legend-box" open>
       <summary><span class="chev">▶</span><span class="name">Legend</span></summary>
     <div class="legend">
-      <div class="row" data-tip="builds"><span class="sw used"></span><span class="name">Builds and tools</span><span class="v num" id="v-builds">–</span></div>
+      <div class="row" data-tip="queued"><span class="sw used"></span><span class="name">Queued builds</span><span class="v num" id="v-queued">–</span></div>
       <div class="row" data-tip="ci"><span class="sw ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci">–</span></div>
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved RAM</span><span class="v num" id="v-reserved">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
+      <div class="row" data-tip="tools"><span class="sw tools"></span><span class="name">Build tools</span><span class="v num" id="v-tools">–</span></div>
       <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-safety">–</span></div>
       <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="swap"><span class="sw swap"></span><span class="name">RAM for swap</span><span class="v num" id="v-swap">–</span></div>
@@ -442,10 +450,14 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <script>
 let latest = null;
 const TIPS = {
-  builds: (d) => [`Builds and tools · ${ramAmount(d.ram.builds_bytes)}`, lines("RAM that builds and build tools use now.",
-    amountLines([["Queued builds", d.ram.queued_builds_bytes], ["rust-analyzer", d.ram.rust_analyzer_bytes],
-      ["sccache", d.ram.sccache_bytes], ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build program RAM is recorded.")],
-  ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`, "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
+  queued: (d) => [`Queued builds · ${ramAmount(d.ram.queued_builds_bytes)}`,
+    "RAM that builds in the queue use now.\nThe queue cap counts it."],
+  ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`,
+    "RAM used by hana CI programs.\nThe queue cap counts it.\nFile cache and kernel memory appear separately."],
+  tools: (d) => [`Build tools · ${ramAmount(d.ram.build_tools_bytes)}`, lines(
+    "RAM that build tools and builds outside the queue use now.\nThe queue cap does not count it.",
+    amountLines([["rust-analyzer", d.ram.rust_analyzer_bytes], ["sccache", d.ram.sccache_bytes],
+      ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build tool RAM is recorded.")],
   reserved: (d) => [`Reserved RAM · ${ramAmount(d.ram.build_covered_bytes)}`, lines(
     "RAM the queue holds for running builds until they reach their expected peak.",
     `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
@@ -484,11 +496,13 @@ const TIPS = {
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
     "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
-    optional(d.ram.ci_counted_bytes, `CI use counted, file cache included: ${ramAmount(d.ram.ci_counted_bytes)}.`), "Reservations count toward this limit.")],
+    optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`),
+    "Queued builds, hana CI, reserved RAM and the next step room add to the cap.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines(
     optional(d.ram.safety_missing_bytes, `Safety reserve missing: ${ramAmount(d.ram.safety_missing_bytes)}.`),
     optional(d.ram.swap_missing_bytes, `Swap reserve missing: ${ramAmount(d.ram.swap_missing_bytes)}.`),
-    optional(d.ram.build_missing_bytes, `Build reservation missing: ${ramAmount(d.ram.build_missing_bytes)}.`))],
+    optional(d.ram.build_missing_bytes, `Build reservation missing: ${ramAmount(d.ram.build_missing_bytes)}.`),
+    optional(overCap(d), `Queued and CI use above the cap: ${ramAmount(overCap(d))}.`))],
   budget: (d) => [`RAM budget · ${ramAmount(d.ram.total_bytes)}`,
     "Blocks divide this machine's usable RAM.\nAvailable RAM includes cache Linux expects to reclaim.\nReservations use available RAM."],
   waiting: () => ["Waiting step", "The dashed bar shows the memory the step needs.\nIt ends at the queue cap."],
@@ -496,14 +510,27 @@ const TIPS = {
 };
 const GIB = 1024 ** 3;
 const RAM_BLOCKS = [
-  ["builds", "Builds and tools", r => r.builds_bytes], ["ci", "hana CI", r => r.ci_bytes],
+  ["queued", "Queued builds", r => r.queued_builds_bytes], ["ci", "hana CI", r => r.ci_bytes],
   ["reserved", "Reserved RAM", r => r.build_covered_bytes], ["room", "Next step room", r => r.room_bytes],
+  ["tools", "Build tools", r => r.build_tools_bytes],
   ["safety", "Safety", r => r.safety_covered_bytes], ["desktop", "Desktop", r => r.desktop_bytes],
   ["swap", "RAM for swap", r => r.swap_covered_bytes],
   ["agents", "Agents", r => r.agents_bytes], ["programs", "Other programs", r => r.other_programs_bytes],
   ["kernel", "Kernel, measured", r => r.kernel_bytes], ["cache", "File and kernel cache", r => r.cache_bytes],
   ["unattributed", "Not attributed", r => r.unattributed_bytes],
 ];
+// Queued and CI use above the cap. The cap is below that use only when available RAM
+// does not cover the safety and swap reserves.
+function overCap(d) {
+  return hasCap(d) ? Math.max(0, Math.round(d.ram.queued_builds_bytes + d.ram.ci_bytes - d.cap * GIB)) : 0;
+}
+// The bar widths of the cap terms: queued builds and CI stop at the cap, and the use above it has its own block.
+// CI sits right of queued builds, so the use above the cap comes off CI first.
+function capTermWidths(d) {
+  const over = overCap(d);
+  const ci = Math.max(0, d.ram.ci_bytes);
+  return {queued: Math.max(0, d.ram.queued_builds_bytes - Math.max(0, over - ci)), ci: ci - Math.min(ci, over), over};
+}
 function lines(...items) { return items.filter(Boolean).join("\n"); }
 function optional(bytes, text) { return recorded(bytes) && bytes > 0 ? text : ""; }
 function ramAmount(bytes) {
@@ -835,9 +862,13 @@ function render(d) {
   $("barwrap").hidden = !total;
   $("scale").hidden = !total;
   const parts = [];
+  const widths = capTermWidths(d);
+  if (total) setSeg("s-over", widths.over, total);
+  $("s-over").hidden = widths.over === 0;
+  $("l-over").textContent = f1(widths.over / GIB);
   for (const [key, name, amount] of RAM_BLOCKS) {
     const bytes = amount(r);
-    const shown = recorded(bytes) ? Math.max(0, bytes) : 0;
+    const shown = key in widths ? widths[key] : recorded(bytes) ? Math.max(0, bytes) : 0;
     if (total) setSeg(`s-${key}`, shown, total);
     $(`s-${key}`).hidden = shown === 0;
     $(`l-${key}`).textContent = f1(shown / GIB);
@@ -1241,7 +1272,7 @@ function placeMemoryBars(d) {
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
   const used = r.queued_builds_bytes / GIB * unit;
-  const ciWidth = r.ci_counted_bytes / GIB * unit;
+  const ciWidth = r.ci_bytes / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
   const reserveAt = used + ciWidth;
