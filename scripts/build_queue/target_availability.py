@@ -167,6 +167,10 @@ class MacRoutes:
             self.policies[key] = fit
         return self.policies[key]
 
+    def is_mac(self, target: str) -> bool:
+        """Say whether a pinned target name is the Mac target."""
+        return isinstance(self.mac, targets.TargetSnapshot) and self.mac.target.name == target
+
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)

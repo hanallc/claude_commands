@@ -52,6 +52,7 @@ from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
+from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 from scripts.lib import build_slots, conf
@@ -360,6 +361,22 @@ def local_runs_on(mac: target_availability.TargetFit | target_availability.NoMac
     if isinstance(mac, target_availability.FitUnreadable):
         return "natedev only (Mac state unknown)"
     return "natedev only"
+
+
+# A run that asks for natedev: the plain words of the local caller route.
+RUN_ASKS_TEXT = "the run asks for it"
+
+
+def step_runs_on(route: target_config.StepRoute, routes: target_availability.MacRoutes, step: str, folder: str,
+                 package: str | admission_records.PackageNotRecorded) -> str:
+    """Name the targets that can take a natedev queue step: a route that limits the step first, else the Mac routes."""
+    if isinstance(route, target_config.LocalRequired):
+        return f"natedev only ({RUN_ASKS_TEXT if route == target_config.LOCAL_CALLER else route.reason})"
+    if isinstance(route, target_config.MacOnly):
+        return "Mac only"
+    if isinstance(route, target_config.PinnedTarget):
+        return ("Mac" if routes.is_mac(route.target) else route.target) + " only"
+    return local_runs_on(routes.fit(step, folder, package))
 
 
 CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
@@ -1599,7 +1616,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": [],
-                     "runs_on": local_runs_on(routes.fit(step.step, step.folder, step.package))
+                     "runs_on": step_runs_on(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else ""})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
@@ -1696,8 +1713,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room,
-                        "runs_on": "" if ci_label else local_runs_on(
-                            routes.fit(waiter.step, waiter.folder, waiter.package))})
+                        "runs_on": "" if ci_label else step_runs_on(
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:

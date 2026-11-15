@@ -28,6 +28,8 @@ from scripts.buildlog import charts, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
+from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
+from scripts.build_targets import target_config, targets
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
@@ -1336,6 +1338,20 @@ process.stdout.write(JSON.stringify({
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
                 self.assertEqual(memory_feed.local_runs_on(fit), expected)
+
+    def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
+        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
+        for route, expected in ((target_config.LOCAL_CALLER, "natedev only (the run asks for it)"),
+                                (target_config.WRITES_TREE, "natedev only (step writes the tree)"),
+                                (target_config.MAC_ONLY, "Mac only"),
+                                (target_config.PinnedTarget("mac"), "Mac only"),
+                                (target_config.PinnedTarget("natedev"), "natedev only")):
+            with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
+                self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana"), expected)
+                fit.assert_not_called()
+        with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
+            self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
+                                                      "/fixture/hana", "hana"), "natedev or Mac")
 
     def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
         gib = admission_records.GIB
