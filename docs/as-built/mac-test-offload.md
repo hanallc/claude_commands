@@ -133,18 +133,22 @@ Malformed numeric protocol values become `AdmissionUnavailable` at the admission
 
 The watch sends the builds showrunner one message after `alert_seconds` while eligible steps wait.
 It resolves the address with `showrunners.py address builds`.
-The message names the block, idle claim, or free Mac.
+The message names the block, idle claim, free Mac, disk exclusion, or unreachable Mac.
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
 `MAC UNREACHABLE` identifies a future connection backoff.
 `MAC IDLE WATCH` identifies unreadable or stale state.
-Neither condition sends an idle notification.
+The unreachable state sends the message after `alert_seconds` while eligible steps wait.
+The unreadable state sends no message or phone push.
 
-After `push_seconds`, a block uses `mac_idle.blocked` with `need=blocked`.
-An idle claim or free Mac uses `mac_idle.stuck` with `need=decision`.
-A free Mac has no reservation sentence.
-The block push names `/build:mac unblock` as its action.
-The other push asks the builds showrunner to resume Mac work.
+A free Mac, idle claim, block, or disk exclusion sends no phone push.
+These states keep the message to builds.
+The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `push_seconds` while eligible steps wait.
+The title is "Mac tests stopped".
+The action is "Wake the Mac or check its network."
+The body gives the elapsed minutes and the number of waiting tests.
+It states that builds cannot reach the Mac.
+The unreachable state runs no repairs.
 
 Both sends use outage keys and `--repeat-minutes`.
 The repeat window covers at least `repeat_minutes` and the current outage age.
@@ -166,9 +170,9 @@ This policy covers process stops, including SIGTERM, SIGKILL, and session stops.
 It does not cover power loss or promise filesystem synchronization.
 
 The watch saves `messaged` and `pushed` only after accepted delivery.
-The block push uses `mac_idle.py cleared --since <since>`.
+The unreachable push uses `mac_idle.py cleared --since <since>`.
 That check reads only the saved result.
-It clears when the outage changes, ends, or has no waiting steps.
+It clears when the saved state is no longer unreachable, the outage changes, or no steps wait.
 Missing and stale readings never clear a push.
 A later outage gets new marks and keys.
 

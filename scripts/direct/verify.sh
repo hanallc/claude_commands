@@ -2640,7 +2640,9 @@ try_reserved_target() {
 }
 
 pinned_target_refuse() {
-    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$1" >&2
+    local reason=$1
+    [[ "$reason" != command ]] || reason="the target cannot run this command"
+    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
     note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
@@ -2662,6 +2664,7 @@ mac_only_refuse() {
         no_tests) text="no test matched on the Mac" ;;
         lost) text="the link to the Mac dropped during the run" ;;
         runner) text="the Mac runner gave no usable result" ;;
+        command) text="the Mac cannot run this command" ;;
         *) text=$reason ;;
     esac
     export BUILDLOG_TARGET=""
@@ -2678,6 +2681,7 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
@@ -2758,7 +2762,13 @@ start_routing_wait() {
 
 wait_for_placement() {
     local wait_kind=resource wait_target=hold
-    [[ -n "$PHASE_RESOURCE_WAIT" || "${PLACEMENT_WAIT_MEMORY:-0}" != 0 ]] || wait_kind=evidence
+    # Only the first empty reply of an episode wakes at the next pass. Later empty
+    # replies wait the interval, so waiters cannot wake each other through state.json.
+    if [[ -z "$PHASE_RESOURCE_WAIT" && "${PLACEMENT_WAIT_MEMORY:-0}" == 0
+            && "${PLACEMENT_EVIDENCE_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
+        wait_kind=evidence
+        PLACEMENT_EVIDENCE_EPISODE=$PLACEMENT_EPISODE
+    fi
     if [[ "${PLACEMENT_WAIT_MEMORY:-0}" == 0 ]]; then start_routing_wait; fi
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment

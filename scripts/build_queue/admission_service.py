@@ -473,10 +473,10 @@ class SystemEvidence:
     read_at: float
     started_monotonic: float
     processes: Mapping[int, gate.ProcessIdentity]
-    accounts: Mapping[int, int | OwnerProcessGone]
     lifetimes: Mapping[str, gate.StepLifetime]
     reservations: Mapping[str, ReservationEvidence]
-    runs: Mapping[int, LiveBuildRun | NoLiveBuildRun]
+    # The reader thread is done with this reader when it publishes the reading; only the pass uses it after that.
+    activity: ScopeActivityReader = field(compare=False)
     unowned: tuple[records.UnownedSliceMemory, ...]
     scope_members: Mapping[str, frozenset[int]]
     scope_process_memory: Mapping[int, records.MeasuredMemory]
@@ -485,6 +485,10 @@ class SystemEvidence:
     host: records.HostMemory | records.ReadingUnavailable
     pressure: records.Pressure
     compilers: tuple[records.StepMemory, ...]
+
+    def build_run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+        """Find one owner's build run from this reading's process table."""
+        return self.activity.run(pid)
 
 
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
@@ -563,9 +567,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     pressure = readings.pressure(host if isinstance(host, records.HostMemory) else
                                  records.HostMemory(0, records.UnknownHostTotal()), pressure_policy)
     return SystemEvidence(now, started_monotonic, MappingProxyType(processes),
-        MappingProxyType({pid: process_uid(pid, proc.path) for pid in processes}),
-        MappingProxyType(lifetimes), MappingProxyType(reservations),
-        MappingProxyType({pid: activity.run(pid) for pid in processes}),
+        MappingProxyType(lifetimes), MappingProxyType(reservations), activity,
         tuple(unowned), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
         tuple(between), host, pressure, tuple(readings.compilers()))
 
@@ -1411,7 +1413,8 @@ class AdmissionServer:
 
     def _account(self, pid: int) -> int | OwnerProcessGone:
         if not isinstance(self.system_reader, NoSystemReader):
-            return self.system_reader.latest.accounts.get(pid, OwnerProcessGone())
+            if pid not in self.system_reader.latest.processes:
+                return OwnerProcessGone()
         return process_uid(pid, self.proc.path)
 
     def _run_alive(self, run: wire.RunIdentity | LiveBuildRun) -> bool:
@@ -1516,7 +1519,7 @@ class AdmissionServer:
                     continue
             row = reservation_row(record)
             if "build_run" not in row:
-                row["build_run"] = evidence.runs.get(record.owner.pid, NoLiveBuildRun())
+                row["build_run"] = evidence.build_run(record.owner.pid)
                 row["run_origin"] = records.FoundRun(row["build_run"])
             elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = records.CallerRun(NoLiveBuildRun())
@@ -1540,7 +1543,7 @@ class AdmissionServer:
             if "build_run" not in waiting.row:
                 waiting.row["build_run"] = (_live_run(request.run)
                     if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity)
-                    else evidence.runs.get(request.owner.pid, NoLiveBuildRun()))
+                    else evidence.build_run(request.owner.pid))
         pressure = evidence.pressure
         if isinstance(pressure, records.MemoryPressure):
             pressure = gate.pressure_from_readings(pressure.full_avg10, pressure.some_avg10,
@@ -1756,6 +1759,14 @@ class AdmissionServer:
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
+        from scripts.build_targets import target_config
+
+        # One pass reads the target list once; each placement check in the pass uses that read.
+        with target_config.command_configuration():
+            return self._pass(configuration)
+
+    def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
+              ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -2263,7 +2274,7 @@ class AdmissionServer:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, mac_test
-        from scripts.mac_test.eligibility import MacVerb, verb_kind
+        from scripts.mac_test.eligibility import recorded_step_kind
         from scripts.build_hold import build_hold
 
         destination = key.destination
@@ -2293,9 +2304,10 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
             target = replace(target, settings=key.settings.path)
-        kind = verb_kind(cast(MacVerb, request.profile.step))
+        kind = recorded_step_kind(request.profile.step)
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
-            return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
+            # The target can never run this command, so a pinned step refuses at once.
+            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         if isinstance(target, target_config.SshTarget):
             answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                 request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
@@ -3807,6 +3819,20 @@ def read_state(directory: Path) -> ServiceState:
     return wire.parse_record(text, ServiceState)
 
 
+def state_check(directory: Path) -> int:
+    """Read stored state as serve does, without changing it."""
+    if not (directory / "state.json").exists():
+        print("state-check: no state.json")
+        return 0
+    try:
+        _ = read_state(directory)
+    except ValueError as error:
+        print(f"state-check: {error}", file=sys.stderr)
+        return 2
+    print("state-check: state.json reads")
+    return 0
+
+
 def _older_caller(pid: int, args: list[str], proc: Proc, scripts: dict[str, bytes],
                   versions: dict[str, str], current_version: str) -> bool:
     """Require matching entry content and a recorded version of the loaded admission code."""
@@ -3923,7 +3949,7 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority"))
+    _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority", "state-check"))
     default_state_dir = store.root() / "admission"
     _ = parser.add_argument("--state-dir", type=Path, default=default_state_dir)
     _ = parser.add_argument("--service", action="store_true")
@@ -3936,6 +3962,8 @@ def main() -> int:
     if args.command == "drain-check":
         return drain_check(args.state_dir, service=args.service,
                            include_gate_callers=args.state_dir == default_state_dir, proc=SystemProc())
+    if args.command == "state-check":
+        return state_check(args.state_dir)
     if args.command == "export-priority":
         export_priority(args.state_dir)
         return 0

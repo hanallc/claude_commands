@@ -413,25 +413,14 @@ def notify_outage(paths: MacIdlePaths, saved: mac_idle_alert.SavedAlert, now: fl
 
 def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
     from scripts.notify import push_texts
-    from scripts.notify.push_catalog import mac_idle_reservation
+    from scripts.notify.push_catalog import waiting_tests
     from scripts.lib.process_failure import failure_detail
-    from scripts.lib.user_zone import user_zone
 
-    holder, detail = saved["holder"] or "none", saved["detail"] or "no block and no claim"
-    blocked = saved["cause"] == "blocked"
-    clears = (f"/build:mac unblock by {holder}" if blocked else f"release of the idle claim {detail}"
-              if saved["cause"] == "claim_idle" else
-              "the Mac has enough free disk space" if saved["cause"] == "disk" else
-              "the builds showrunner checks why the waiting steps do not take the Mac")
-    values = {"minutes": str(int((now - saved["since"]) // 60)), "waiting": str(saved["waiting"]),
-              "since": mac_idle_alert.clock_text(saved["since"], user_zone(), include_zone=True), "clears": clears}
-    values.update({"holder": holder, "detail": detail} if blocked else
-                  {"reservation": mac_idle_reservation(holder, detail) if saved["cause"] == "claim_idle" else ""})
-    rendered = push_texts.render("mac_idle.blocked" if blocked else "mac_idle.stuck", **values)
+    rendered = push_texts.render("mac_idle.unreachable",
+        minutes=str(int((now - saved["since"]) // 60)), tests=waiting_tests(saved["waiting"]))
     since = str(int(saved["since"]))
     command = push_texts.user_send_argv(rendered, sender="Mac idle watch", key=f"mac-idle-{since}")
-    if blocked:
-        command.extend(["--clears-when", f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}"])
+    command.extend(["--clears-when", f"{SCRIPTS}/lib/py {SCRIPTS}/buildlog/mac_idle.py cleared --since {since}"])
     settings = mac_idle_alert.read_idle_config()
     window = outage_repeat_minutes(saved["since"], now, settings)
     command.extend(["--repeat-minutes", f"{window:g}", "--recipient-key", "user"])
@@ -526,6 +515,7 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                 saved["state"], saved["detail"] = "unreadable", reading.reason
             elif isinstance(reading, MacUnreachable):
                 saved["state"], saved["until"] = "unreachable", reading.until
+                write_record(idle_file, {"since": since})
             else:
                 saved["state"] = "idle"
                 if isinstance(reading, FreeMac):
@@ -555,7 +545,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
             if outage_key(kept) == outage_key(saved):
                 saved["messaged"] = kept["messaged"]
         write_record(paths.state / "alert.json", saved)
-        if not isinstance(reading, IdleMac) or now - saved["since"] < settings.alert_seconds or not calls:
+        if (not isinstance(reading, IdleMac | MacUnreachable)
+                or now - saved["since"] < settings.alert_seconds or not calls):
             return
         # Only wait evidence and repairs need the process ancestry.
         live = processes(paths.proc)
@@ -569,7 +560,8 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
             # The sender owns delivery deduplication. Retry unconfirmed attempts.
             saved["messaged"] = notify_outage(paths, saved, now, calls, live, admission)
             write_record(paths.state / "alert.json", saved)
-        if now - saved["since"] >= settings.push_seconds and not saved["pushed"]:
+        if (isinstance(reading, MacUnreachable)
+                and now - saved["since"] >= settings.push_seconds and not saved["pushed"]):
             saved["pushed"] = push_outage(saved, now)
             write_record(paths.state / "alert.json", saved)
         if not isinstance(reading, FreeMac):
@@ -650,7 +642,7 @@ def main(args: list[str]) -> int:
             return 1
         if not isinstance(saved, dict) or time.time() - saved["written"] > freshness:
             return 1
-        return int(saved["state"] == "idle" and int(saved["since"]) == int(since) and saved["waiting"] > 0)
+        return int(saved["state"] == "unreachable" and int(saved["since"]) == int(since) and saved["waiting"] > 0)
     elif args == ["watch"]:
         watch_once(paths, time.time(), time.monotonic())
     else:

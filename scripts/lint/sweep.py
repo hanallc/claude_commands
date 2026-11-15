@@ -3572,7 +3572,9 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     label = home_relative(str(folder))
     if name.casefold() in ("trash", ".trash"):
         return FolderChoice(label, size, FolderChoiceKind.TRASH)
-    if any(part.casefold() == "scratch" for part in folder.parts):
+    # Only the configured scratch roots hold temporary work; a "scratch" name elsewhere is no proof.
+    resolved = folder.expanduser().resolve()
+    if any(resolved.is_relative_to(root.expanduser().resolve()) for root in scratch_roots()):
         return FolderChoice(label, size, FolderChoiceKind.SCRATCH)
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 

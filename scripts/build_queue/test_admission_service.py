@@ -524,6 +524,25 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class StateCheckTests(unittest.TestCase):
+    def test_state_check_reads_current_state_and_refuses_an_old_placement_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with redirect_stderr(output), mock.patch("sys.stdout", io.StringIO()):
+                self.assertEqual(service.state_check(root), 0)
+                state = service.ServiceState({}, {}, {}, records.ReadyToStart(), records.NoHeadAdmissionOverride())
+                write_text_atomic(root / "state.json", wire.encode_record(state))
+                self.assertEqual(service.state_check(root), 0)
+                stored = cast(dict[str, object], json.loads((root / "state.json").read_text()))
+                stored["placement_requests"] = {"episode": {"kind": "PlacementRequest", "episode": "episode"}}
+                write_text_atomic(root / "state.json", json.dumps(stored))
+                before = (root / "state.json").read_bytes()
+                self.assertEqual(service.state_check(root), 2)
+            self.assertIn("stored placement records require external conversion", output.getvalue())
+            self.assertEqual((root / "state.json").read_bytes(), before)
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
@@ -1326,6 +1345,28 @@ class ReplyPublicationTests(unittest.TestCase):
                     self.assertEqual(read.call_count, 2)
                 finally:
                     reader.close()
+
+    def test_a_reading_finds_build_runs_and_accounts_only_for_the_owners_a_pass_asks_about(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, records.MemoryConfig)
+            original = ScopeActivityReader.run
+            asked: list[int] = []
+
+            def run(reader: ScopeActivityReader, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+                asked.append(pid)
+                return original(reader, pid)
+
+            with mock.patch.object(ScopeActivityReader, "run", run), mock.patch.object(
+                    service, "process_uid", side_effect=AssertionError("a reading reads no account")):
+                evidence = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                                               fixture.readings, fixture.proc, fixture.clock)
+                self.assertIn(request.owner.pid, evidence.processes)
+                self.assertEqual(asked, [])
+                expected = original(ScopeActivityReader(evidence.processes, fixture.proc.path), request.owner.pid)
+                self.assertEqual(evidence.build_run(request.owner.pid), expected)
+                self.assertEqual(asked, [request.owner.pid])
 
     def test_unknown_admit_and_launch_owners_request_one_early_read(self) -> None:
         for launch in (False, True):

@@ -1,6 +1,8 @@
 # Build folders
 
-Status: implementation plan. Phase bf1 is in progress at a devtools worker.
+Status: implementation plan. Phase bf1 has landed. The devtools part of Phase 2 (bf2d, bf2p, bf9r) is merged into sdlc.
+The build disk is in: `/build` (3.6 TiB) has its file system since 2026-11-14 18:43 EST.
+Next: measure the slot values again on `/build` and send them to the user. Then the queue part of Phase 2 (rescue), then Phase 3.
 The user approved D1–D9 on 2026-11-12 at 12:45 EST.
 This plan has nine phases and an estimate of **64 worker hours**.
 
@@ -82,7 +84,7 @@ This plan has nine phases and an estimate of **64 worker hours**.
 ## Configuration and user decisions
 
 The builds queue unit owns `config/build_folders.conf`.
-The user approved the slot values on 2026-11-12 (relayed by builds). Count x complete size limit:
+The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-14 the user deferred slot work until the build disk is in (#88). The disk is now in, and the Mac counts stand. Count x complete size limit:
 
 | Machine | Repository | Slots | Size limit |
 | --- | --- | ---: | ---: |
@@ -105,6 +107,45 @@ The private-config helper supplies test roots and values, not another allocation
 Do not add per-module production fixture keys or a parent lease that blocks its child fixture slots.
 Mac hana's approved count remains two; its size limit still needs user go.
 
+### Slot values after the build disk (2026-11-14)
+
+#88 is closed with no limits set. The user, 2026-11-14 12:15: "We should only implement this after we install the disk." The build disk is now in. The values are measured again on `/build` and go to the user for approval.
+
+The user questioned the first #88 values: "Why are we allocating more than we have? And why have 16 Claude folders?" After Phase 8, nothing deletes at the floor, so the sum of count x size limit on each machine must fit its budget. builds set these rules on 2026-11-14 for the next measure:
+
+1. A machine's budget is the space that build folders use at the measure, plus the free space above the floor.
+2. A count is the measured 7-day peak of tasks of that repository that built at the same time on that machine (build log). A count the user approved stays: Mac hana and Mac cargo-liner stay at 2.
+3. A size limit is the largest measured folder plus a small margin. When the budget does not hold that, the proposal names the repository that gets less and the cost.
+4. Pools are keyed by the origin URL as owner/name. Every worktree of one origin is in one pool. A repository with no origin uses its shared git folder.
+5. Each repository is named. No line covers "every other repository".
+6. A repository with count 0 waits for a slot and prints one line that names the repository and the /tune key to set. A missing key still stops admission with a named config error.
+7. The claude folders are on tmpfs. They count against memory, not the disk sum.
+8. When a slot take deletes a target above its size limit, verify.sh prints one line that names the slot and its measured size. The target is deleted once and the next build starts from nothing; it is not made smaller.
+
+### Slot proposal on /build (2026-11-15, waits for the user)
+
+Measured on natedev 2026-11-15 00:59 to 01:04 EST. The Mac values of 2026-11-14 stand.
+A slot is one fixed workspace path. Its build-dir follows from its folder name, `/build/cargo/<name>`, so a slot folder name is unique across `~/rust` and `~/worktrees`.
+A size limit covers the build-dir and the workspace `target/` together. The budget check is per disk.
+
+| Machine | Repository | Peak | Count | Largest folder | Size limit | Sum |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| natedev | hana (all natepiano/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
+| natedev | cargo-liner | 5 | 5 | 30.2 GiB | 32 GiB | 160 GiB |
+| natedev | bevy_brp | 0 | 1 | 18.4 GiB | 20 GiB | 20 GiB |
+| natedev | nateroids | 0 | 1 | 16.7 GiB | 18 GiB | 18 GiB |
+| natedev | obsidian_knife | 0 | 1 | not measured | 3 GiB (estimate) | 3 GiB |
+| natedev | gltf-ibl-sampler-egui | 0 | 1 | not measured | 5 GiB (estimate) | 5 GiB |
+| natedev | claude (on /build since 2026-11-14) | 11 | 11 | 0.05 GiB | 0.25 GiB | 2.75 GiB |
+| Mac | hana | 1 | 2 | 63.8 GiB | 66 GiB | 132 GiB |
+| Mac | cargo-liner | 1 | 2 | 24.7 GiB | 26 GiB | 52 GiB |
+
+Sums:
+
+1. natedev `/build`: pools 755 GiB plus sccache 26 GiB is 781 GiB. The budget is 817 GiB used plus 2117 GiB free above the 733 GiB floor (20 percent), 2934 GiB.
+2. natedev `/`: final outputs in `target/` are at most 2.6 GiB for each slot, about 25 GiB, against 283 GiB free above the 300 GiB floor.
+3. Mac: 184 of 188.4 GiB, as on 2026-11-14.
+
 ## Rollout and estimates
 
 Hours include implementation, focused tests, review fixes, and owner coordination.
@@ -118,7 +159,7 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | --- | --- | --- | ---: | --- |
 | bf1 | Maker and process lock; landed | devtools; queue reviews B files | 6 | None |
 | 2 | Rescue and legacy collector protection | queue; resources and devtools own collector edits | 8 | bf1 |
-| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values approved 2026-11-12 |
+| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values measured again on `/build` and approved |
 | 4 | Gate caches become slots | queue and aws | 8 | 3 |
 | 5 | Other repository callers | verify, style, and devtools | 8 | 4 |
 | 6 | One-offs and review folders | devtools; builds owners edit B files | 6 | 5 |
@@ -239,7 +280,7 @@ Run maker, scratch, temporary sweep, and folder audit tests before Phase 3 activ
 **Goal:** Implement D2–D4 through the maker and existing queue page.
 **Owner units:** queue implements slots and queue fields; resources wires capacity.
 **Estimate:** 10 worker hours.
-**Depends on:** Phase 2; user go before production activation.
+**Depends on:** Phase 2; values measured again on `/build` and approved; user go before production activation.
 **Files:** Maker/config files and the Phase 3 queue/target inventory row with adjacent tests.
 
 1. Define fixed pools by machine and repository identity.
@@ -313,8 +354,10 @@ Verify owns mirror execution; resources does not own this migration.
 4. Remove `~/rust/repro` row folders after the row verdict and a verified rescue ref.
 5. Retain a row folder when rescue fails.
 6. Migrate adjacent fixtures through the maker and private config.
+7. Give each one-off Cargo build-dir a lease with its workspace. On natedev, Cargo puts the build-dir of a workspace at `/build/paths<workspace path>`, outside the workspace. The release that removes the workspace also removes that build-dir. On 2026-11-15, 22 gate copies left 283 GiB of build-dirs under `/build/paths/tmp` with no workspace.
 
 **Acceptance gate:** Run affected scratch, review, and temporary-file caller tests.
+Verify that the removal of a one-off workspace removes its build-dir outside the workspace.
 Verify lease inheritance for shell and browser workers.
 Verify row-verdict cleanup after rescue and folder retention after rescue failure.
 Verify that no one-off request silently contains repository work.

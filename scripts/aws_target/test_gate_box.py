@@ -493,7 +493,11 @@ class GateResourcesTests(unittest.TestCase):
 
     def test_scaler_grants_have_workload_and_resource_scopes(self) -> None:
         properties = ledger.mapping(ledger.mapping(self.resources()['GateScalerPolicy'])['Properties'])
-        statements = ledger.rows(ledger.mapping(properties['PolicyDocument']), 'Statement')
+        everything = ledger.rows(ledger.mapping(properties['PolicyDocument']), 'Statement')
+        # The regional image grant exists only when another gate region has an image.
+        regional_images = [row for row in everything if 'Fn::If' in row]
+        self.assertEqual([cast(list[object], row['Fn::If'])[0] for row in regional_images], ['GateHasRegionImages'])
+        statements = [row for row in everything if 'Fn::If' not in row]
         by_action = {str(row['Action']): row for row in statements}
         self.assertEqual(properties['Users'], [{'Ref': 'ScalerUser'}])
         terminate = by_action[str(['ec2:TerminateInstances'])]
@@ -506,7 +510,12 @@ class GateResourcesTests(unittest.TestCase):
             if row['Resource'] == '*':
                 self.assertIn(row['Action'], (['ec2:DescribeInstances'], ['ce:GetCostAndUsage']))
         launches = [row for row in statements if row['Action'] == ['ec2:RunInstances']]
-        self.assertEqual(len(launches), 5)
+        self.assertEqual(len(launches), 6)
+        tagged = next(row for row in launches if 'security-group/*' in json.dumps(row['Resource']))
+        self.assertEqual(ledger.mapping(ledger.mapping(tagged['Condition'])['StringEquals']), {
+            'aws:ResourceTag/GateDeployment': {'Ref': 'DeploymentId'}, 'aws:ResourceTag/Workload': 'cloud-claude-gate'})
+        subnet = next(row for row in launches if 'subnet/*' in json.dumps(row['Resource']))
+        self.assertEqual(subnet['Condition'], {'ArnEquals': {'ec2:Vpc': {'Ref': 'GateVpcs'}}})
         instance = next(row for row in launches if 'instance/*' in json.dumps(row['Resource']))
         condition = ledger.mapping(instance['Condition'])
         self.assertEqual(ledger.mapping(condition['StringEquals'])['ec2:InstanceType'], {'Ref': 'GateInstanceTypes'})
