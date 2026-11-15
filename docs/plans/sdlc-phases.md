@@ -176,25 +176,21 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 29 — Each worker pass records its model  · status: done
 **Depends on:** Phase 5
 
-#### Work Order
+#### As-built
 
-**Goal:** every pane-dispatched worker pass names its family, model and effort, so a trial can match worker models.
-
-**Spec:**
-- `progress_history.begin_dispatch` takes the called family, model and effort. It no longer writes `unknown` and `unset` for every pane dispatch (since `a453a2ca4`, 2026-11-05).
-- `scripts/production/worker.py` passes the family, model and effort of the worker the pane launched: the launch policy's settings, or the `--model` and `--effort` values when given. A worker whose model the pane does not know still records `unknown`; the recorder never infers a model.
-- Tests: a pane dispatch records the launched worker's family, model and effort in `pass_started.called_agent`; a dispatch with an unknown model records `unknown`.
-- Find why 22 of 29 cargo-liner-handler after compactions show no contract Read (Step log, After sample), and report the cause in the Step log. Make no change to `phase_process.py`.
+- `progress_history.begin_dispatch` takes `called: CalledAgent` (family, model, effort). The default `CALLED_AGENT_NOT_RECORDED` is `unknown / unknown / unset`, so test calls in other modules keep their form.
+- `worker.launched_agent(row)` reads the worker's newest pane launch record (`pane_record.launch_for_session`). The family is the launch kind; the model and effort come from `worker_panes.kept_settings` over `pane_record.resume_arguments`. A Claude launch keeps no effort and records `unset`. No record or no kept model records `unknown / unknown / unset`. The herdr dispatch passes `called=launched_agent(started.row)`.
+- Tests: `test_dispatch_records_the_called_worker_model` (test_progress_history.py) and `test_launched_agent_reads_the_kept_launch_settings` (test_worker.py).
+- A live read of 607 worker rows resolves the 30 that have launch records. A live dispatch proof waits for the workers-back notice.
+- The Step log's "Worker model and NoReload cause (Phase 29)" section gives the NoReload cause. In 86 cargo-liner-handler boundaries of the after window, 27 reload with `Read`, 21 reload with Bash only, and 38 do not reload. 71 of 86 show the skill text that Claude Code restores after compaction. The measure counts only `Read`.
 
 **Files:**
-- `scripts/direct/progress_history.py` — `begin_dispatch`
-- `scripts/production/worker.py` — the `begin_dispatch` call
-- `scripts/direct/test_progress_history.py`, `scripts/production/test_worker.py` — called-agent tests
-- `docs/plans/sdlc-phases-design.md` — Step log (the `NoReload` cause)
+- `scripts/direct/progress_history.py` — `CalledAgent`, `begin_dispatch`
+- `scripts/production/worker.py` — `launched_agent`, the `begin_dispatch` call
+- `scripts/direct/test_progress_history.py`, `scripts/production/test_worker.py`
+- `docs/plans/sdlc-phases-design.md` — Step log
 
-**Workers:** `director only (no Codex workers until the workers-back notice)`.
-
-**Acceptance gate:** `test_progress_history.py` and `test_worker.py` pass; basedpyright reports zero errors on the changed files; a dispatch after the fix records a known `called_agent`.
+**Gotchas:** `pane_launch.CurrentLaunch["kind"]` is not a required key; read it through `pane_launch.saved_kind`.
 
 ### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
 **Depends on:** Phase 29
