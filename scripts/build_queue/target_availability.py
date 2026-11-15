@@ -1,4 +1,4 @@
-"""Name each target block and hold, and why a natedev step does not go to the Mac.
+"""Name each target block and hold, and whether a natedev step may run on the Mac.
 
 Every fact comes from one `targets.target_snapshots()` reading and the
 `build_targets.step_policy` reader. This module reads no block, hold, claim or
@@ -14,13 +14,11 @@ from typing import TYPE_CHECKING, TypedDict, final
 
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import (LOCAL_CALLER, ConfigError, ExcludedTarget, LocalRequired, MacOnly,
-    PinnedTarget, SshTarget, StepRoute)
+from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
     from scripts.mac_test import mac_test
-    from scripts.mac_test.claim_state import ClaimScope
 
 
 class TargetRow(TypedDict):
@@ -91,13 +89,9 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
-
-
-# The first line of a step's route: a step the run pins to natedev, a step only the Mac takes,
-# or a step either host can take.
-LOCAL_LINE = "Runs on natedev because the run asks for it"
-MAC_ONLY_LINE = "Runs only on the Mac"
-EITHER_LINE = "Runs on the Mac or natedev, whichever is available first"
+# Plain words for the static Mac exclusions; other reasons show as recorded.
+EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac",
+                  "linux_only": "this package runs only on Linux"}
 
 
 @dataclass(frozen=True)
@@ -105,9 +99,28 @@ class NoMacTarget:
     """No configured target runs macOS."""
 
 
+@dataclass(frozen=True)
+class Allowed:
+    """The step may run on the target; the note names the target's state."""
+    note: str
+
+
+@dataclass(frozen=True)
+class NotAllowed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class FitUnreadable:
+    reason: str
+
+
+TargetFit = Allowed | NotAllowed | FitUnreadable
+
+
 @final
 class MacRoutes:
-    """Explain, for each natedev step, why it does not run on the Mac."""
+    """Say, for each natedev step, whether it may run on the Mac, and why not."""
 
     def __init__(self, snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels], zone: tzinfo) -> None:
         self.mac: targets.TargetSnapshot | NoMacTarget | SnapshotsUnreadable = (
@@ -115,103 +128,63 @@ class MacRoutes:
             else next((snapshot for snapshot in snapshots if snapshot.target.platform == "macos"), NoMacTarget()))
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
-        self.policies: dict[tuple[str, str | PackageNotRecorded, str], str] = {}
-        self.scopes: dict[str, ClaimScope] = {}
+        self.policies: dict[tuple[str, str | PackageNotRecorded, str], TargetFit | None] = {}
 
-    def line(self, step: str, folder: str, package: str | PackageNotRecorded, route: StepRoute) -> str:
+    def fit(self, step: str, folder: str, package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
         mac = self.mac
-        if isinstance(route, LocalRequired):
-            return LOCAL_LINE if route == LOCAL_CALLER else "Runs on natedev: " + route.reason
-        if isinstance(route, PinnedTarget) and not (isinstance(mac, targets.TargetSnapshot)
-                                                    and route.target == mac.target.name):
-            return "Runs only on " + route.target
-        if isinstance(mac, NoMacTarget):
-            return ""
         if isinstance(mac, SnapshotsUnreadable):
-            return "Mac: state unreadable, " + mac.reason
-        if isinstance(route, (MacOnly, PinnedTarget)):
-            return "\n".join(filter(None, (MAC_ONLY_LINE, self.state_line(mac, folder))))
+            return FitUnreadable("Mac state unreadable, " + mac.reason)
+        if isinstance(mac, NoMacTarget):
+            return mac
         kind = build_targets.recorded_step_kind(step)
         if isinstance(kind, build_targets.KindNotOffloaded):
-            return "Mac: kind not offloaded"
+            return NotAllowed("this step kind does not run on the Mac")
         rule = build_targets.step_routing_rule(kind)
         if isinstance(rule, build_targets.NatedevOnly):
-            return "Mac: natedev only, " + rule.reason
+            return NotAllowed(rule.reason)
         excluded = self.policy(mac, folder, package, kind)
-        if excluded:
-            return excluded
-        return "\n".join(filter(None, (EITHER_LINE, self.state_line(mac, folder))))
+        return excluded or self.state_fit(mac.states[0])
 
     def policy(self, mac: targets.TargetSnapshot, folder: str, package: str | PackageNotRecorded,
-               kind: build_targets.StepKind) -> str:
+               kind: build_targets.StepKind) -> TargetFit | None:
         """Read each repository, package and kind once in a page reading.
 
-        Backoff and unreadable state are not policy: the Mac state line names them.
+        Backoff and unreadable state are not policy: the Mac state names them.
         """
         key = (folder, package, kind)
         if key not in self.policies:
             name = package if isinstance(package, str) else ""
             try:
                 result = build_targets.step_policy(mac.target, Path(folder), name, kind, backoff=mac.backoff)
-                text = ""
+                fit: TargetFit | None = None
                 if isinstance(result, ExcludedTarget) and result.reason not in DYNAMIC_REASONS:
-                    text = "Mac: excluded, " + result.reason
+                    reason = EXCLUSION_TEXT.get(result.reason, result.reason)
                     if isinstance(package, PackageNotRecorded) and result.reason == "linux_only":
-                        text += "; package not recorded"
+                        reason += "; package not recorded"
+                    fit = NotAllowed(reason)
             except (ConfigError, OSError, UnicodeError, ValueError) as error:
-                text = f"Mac: state unreadable, {error}"
-            self.policies[key] = text
+                fit = FitUnreadable(f"Mac state unreadable, {error}")
+            self.policies[key] = fit
         return self.policies[key]
 
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
 
-    def state_line(self, mac: targets.TargetSnapshot, folder: str) -> str:
-        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim.
-
-        A Mac free for this repository adds no line.
-        """
-        state = mac.states[0]
+    def state_fit(self, state: targets.TargetState) -> TargetFit:
         if isinstance(state, targets.Held):
             identity = holder_labels(state, self.labels)
             owner = identity.unit if identity.unit != "—" else identity.session
             if identity.showrunner != "—":
                 owner += f" ({identity.showrunner})"
-            return f"Mac: blocked by {owner} {targets.end_text(state.end, self.zone)}"
+            return Allowed(f"blocked by {owner} {targets.end_text(state.end, self.zone)}")
         if isinstance(state, targets.Running):
-            jobs = self.repository_jobs(mac, folder)
-            if not jobs:
-                return ""
-            return "Mac: busy with " + "; ".join(job.what for job in jobs)
+            return Allowed("busy with " + "; ".join(job.what for job in state.jobs))
         if isinstance(state, targets.Unreachable):
-            return "Mac: unreachable, " + state.reason
+            return Allowed("unreachable, " + state.reason)
         if isinstance(state, targets.StateUnreadable):
-            return "Mac: state unreadable, " + state.reason
-        return ""
-
-    def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
-        """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
-        from scripts.mac_test import mac_test
-
-        # Cost: target_claim_scope runs git once for each waiting or running folder in each page reading,
-        # and only while the Mac runs a claim. self.scopes keeps one result for each folder in the reading.
-        if folder not in self.scopes:
-            self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
-        scope = self.scopes[folder]
-        return tuple(targets.running_job(claim) for claim in mac.claims
-                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
-
-
-def same_repository(claim: ClaimScope, step: ClaimScope) -> bool:
-    """A whole Mac scope matches every repository; a repository matches by key, else by name."""
-    from scripts.mac_test import mac_test
-
-    if not isinstance(claim, mac_test.RepositoryScope) or not isinstance(step, mac_test.RepositoryScope):
-        return True
-    if claim.key and step.key:
-        return claim.key == step.key
-    return claim.name == step.name
+            return FitUnreadable("Mac state unreadable, " + state.reason)
+        return Allowed("no block or claim recorded")
 
 
 def mac_claims(snapshots: Snapshots) -> Sequence[mac_test.HeldClaim]:

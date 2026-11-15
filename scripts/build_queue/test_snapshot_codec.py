@@ -43,6 +43,8 @@ def service_snapshot() -> records.AdmissionWaitSnapshot:
 
 # The CI pin, and the last main before older clients read a GPU slot wait as a wait behind the slot.
 OLDER_CLIENTS = ("7fdfd9a6a", "6a0923b23")
+# The CI cargo front that nixos pins on 2026-11-15. It refuses its step on a wait that it cannot read.
+CI_CLIENT = "bbc8803f4"
 
 
 @contextmanager
@@ -233,7 +235,8 @@ class SnapshotCodecTests(unittest.TestCase):
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
         snapshot = wait_reply(records.NeedsMemory()).snapshot
-        reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0)]
+        reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0),
+                                             records.NatedevHeld("fps", "Phase 3 timing")]
         reasons += [snapshot_with_head_cause(snapshot, cause).head_reason for cause in causes.values()]
         self.assertEqual({type(reason) for reason in reasons}, set(get_args(records.WaitReason)))
         for revision in OLDER_CLIENTS:
@@ -249,7 +252,22 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
                         self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, records.GpuSlotWait) else type(cause).__name__)
+                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld))
+                                         else type(cause).__name__)
+
+    def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
+        held = records.NatedevHeld("fps", "Phase 3 timing")
+        snapshot = wait_reply(records.NeedsMemory()).snapshot
+        reply = replace(wait_reply(held, 3, "", records.held_text(held)), snapshot=replace(snapshot, head_reason=held))
+        line = wire.encode_reply(reply)
+        self.assertEqual(wire.parse_reply(line), reply)
+        with pinned_snapshot_reader(CI_CLIENT) as (_parse, _schema, pinned):
+            older = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+        for reason in (cast(object, getattr(older, "reason")),
+                       cast(object, getattr(cast(object, getattr(older, "snapshot")), "head_reason"))):
+            self.assertEqual(type(reason).__name__, "BehindHead")
+            self.assertEqual(cast(str, getattr(reason, "head_name")), "the natedev hold by fps for Phase 3 timing")
+        self.assertEqual(cast(str, getattr(older, "text")), "natedev is held by fps for Phase 3 timing; waiting for release")
 
     def test_gpu_slot_wait_keeps_its_shape_in_a_field_with_no_wait_behind_the_head(self) -> None:
         waiting = wait_reply(records.NeedsMemory()).snapshot

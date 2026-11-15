@@ -1899,9 +1899,19 @@ def ci_readings(readings: Iterable[StepMemory]) -> tuple[UnownedSliceMemory, ...
                  if isinstance(reading, UnownedSliceMemory) and not isinstance(reading.job_state, NotServiceSlice))
 
 
+def ci_cap_use(readings: Iterable[StepMemory]) -> int:
+    """Return the CI use that the queue cap counts: swap-backed use, as for queued builds.
+
+    The CI file cache is in available RAM already, so the cap does not count it twice.
+    A reading without its swap-backed use counts its working set.
+    """
+    return sum(reading.anonymous.bytes if isinstance(reading.anonymous, AnonymousRunUse) else reading.bytes
+               for reading in ci_readings(readings))
+
+
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
     """Calculate room from the captured run and CI readings."""
-    ci_use = sum(reading.bytes for reading in ci_readings(step.measured for step in inputs.running))
+    ci_use = ci_cap_use(step.measured for step in inputs.running)
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
