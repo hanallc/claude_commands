@@ -4,17 +4,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -130,10 +132,112 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<option value="week" selected>', source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("(feedback ? 'Not sent: ' : 'Not deleted: ') + error.message", source)
+        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
-    def test_card_shows_the_caption_details_image_feedback_field_delete_and_send_feedback(self) -> None:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
+        _ = self.register()
+        current = images.render(self.root).decode()
+        marker = f'data-script="{images.SCRIPT_VERSION}"'
+        self.assertEqual(current.count(marker), 1)
+        probe = """<script>
+(async () => {
+ const wait = ms => new Promise(done => setTimeout(done, ms));
+ const report = failures => fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+ const list = () => document.querySelector('[data-images]');
+ if (list().dataset.script === 'older-script') {
+  document.dispatchEvent(new Event('visibilitychange'));
+  await wait(5000);
+  await report(['an update from a newer script did not reload the page']);
+  return;
+ }
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const before = list();
+ document.dispatchEvent(new Event('visibilitychange'));
+ for (let step = 0; step < 100 && list() === before; step++) await wait(20);
+ check(list() !== before, 'the update puts in a new list');
+ const card = list().querySelector('article'), form = card.querySelector('form');
+ form.elements.feedback.value = 'Too dark.';
+ form.requestSubmit(form.querySelector('button[value="feedback"]'));
+ for (let step = 0; step < 100 && card.isConnected; step++) await wait(20);
+ check(!card.isConnected, 'Send Feedback removes the card from the page');
+ await wait(200);
+ check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
+ await report(failures);
+})();
+</script>"""
+        gets: list[str] = []
+        posts: list[dict[str, list[str]]] = []
+        results: list[list[str]] = []
+        probe_complete = threading.Event()
+
+        class BrowserProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the asynchronous checks report their result.
+                    if not probe_complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/":
+                    # A frame holds the page, as in the console, so its reload does not end the screenshot load.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    _ = self.wfile.write(f'<iframe src="{images.PAGE_PATH}" width="1100" height="800"></iframe>'
+                                         .encode() + b'<img src="/probe-complete" alt="" hidden>')
+                    return
+                if self.path != images.PAGE_PATH:
+                    self.send_error(404)
+                    return
+                gets.append(self.path)
+                # The first load is a page from an older script; every later answer is the current page.
+                page = current.replace(marker, 'data-script="older-script"') if len(gets) == 1 else current
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                _ = self.wfile.write(page.replace("</body>", probe + "</body>").encode())
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(payload)))
+                    probe_complete.set()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                posts.append(parse_qs(payload))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(b'{"state": "done"}')
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / "browser-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"],
+                                     capture_output=True, text=True, timeout=45)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+        self.assertEqual(len(gets), 4, "load, update, reload, update")
+        self.assertEqual([(post["action"], post["feedback"]) for post in posts], [(["feedback"], ["Too dark."])])
+
+    def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         images.write_record(self.root / images.FOLDER / record["id"], record)
@@ -151,8 +255,9 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
-            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
+            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
+            + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '<span role="status" data-image-status></span></div></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
@@ -180,19 +285,37 @@ class ImagesTests(ImagesFixture):
                 images.submit(self.root, body)
         self.assertEqual(images.records(self.root), [record])
 
-    def test_an_old_record_with_a_delete_request_reads_and_shows_delete(self) -> None:
+    def test_an_old_record_with_a_delete_request_reads_and_shows_the_answer_buttons(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
         stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
         _ = (folder / images.RECORD).write_text(json.dumps(stored))
         self.assertEqual(images.read_record(folder), record)
-        self.assertIn('<button type="submit" name="action" value="delete">Delete</button>',
-                      images.render(self.root).decode())
+        page = images.render(self.root).decode()
+        self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
+        self.assertNotIn('value="delete"', page)
 
-    def feedback_body(self, record: images.ImageRecord, feedback: str) -> str:
+    def feedback_body(self, record: images.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
-        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": "feedback"})
+        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
+
+    def test_approved_and_not_approved_send_the_answer_with_feedback_only_when_written(self) -> None:
+        for action, first, feedback, lines in (
+                ("approved", "your image is approved.", "", ()),
+                ("not approved", "your image is not approved.", "  The counts are wrong. ", ("Feedback: The counts are wrong.",))):
+            with self.subTest(action=action):
+                self.sent.clear()
+                record = self.register("After: the panel.")
+                images.submit(self.root, self.feedback_body(record, feedback, action))
+                self.assertEqual([message for _, _, message in self.sent], ["\n".join((
+                    f"From the user (via the Images page): {first}", *lines,
+                    f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
+                    "Caption: After: the panel.", "For: Phase console-images",
+                    "After you act on it, delete the image: "
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
+                self.assertIn("feedback_at", images.read_record(self.root / images.FOLDER / record["id"]))
+                self.assertNotIn(record["id"], images.render(self.root).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
         record = self.register("After: the panel. Look at the counts.")
@@ -219,7 +342,7 @@ class ImagesTests(ImagesFixture):
     def test_feedback_that_reaches_no_one_keeps_the_image_shown(self) -> None:
         record = self.register()
         with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")) as send:
-            with self.assertRaisesRegex(images.FeedbackNotSent, "session gone"):
+            with self.assertRaisesRegex(images.AnswerNotSent, "session gone"):
                 images.submit(self.root, self.feedback_body(record, "Wrong colors."))
         self.assertEqual(send.call_count, 3)
         self.assertEqual(images.records(self.root), [record])
@@ -233,6 +356,92 @@ class ImagesTests(ImagesFixture):
             with self.subTest(reason=reason), self.assertRaisesRegex(change_page.AnswerRefused, reason):
                 images.submit(self.root, body)
         self.assertEqual((images.records(self.root), self.sent), ([record], []))
+
+
+class ImagePairTests(ImagesFixture):
+    def register_pair(self, caption: str = "The panel. Look at the counts.") -> images.ImageRecord:
+        after = self.temporary / "after.webp"
+        _ = after.write_bytes(PNG[::-1])
+        return images.register(after, caption, self.owner_id(), "Phase image-pairs", before=self.shot)
+
+    def test_a_pair_is_one_record_in_one_folder_and_one_delete_removes_both(self) -> None:
+        record = self.register_pair()
+        folder = self.root / images.FOLDER / record["id"]
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), [images.RECORD, "after.webp", "before.png"])
+        self.assertEqual(((folder / "before.png").read_bytes(), (folder / "after.webp").read_bytes()), (PNG, PNG[::-1]))
+        self.assertEqual((record["file"], record.get("before")), ("after.webp", "before.png"))
+        self.assertEqual(images.records(self.root), [record])
+        images.delete(self.root, record["id"])
+        self.assertFalse(folder.exists())
+
+    def test_a_pair_with_a_bad_before_image_leaves_no_folder(self) -> None:
+        text = self.temporary / "notes.txt"
+        _ = text.write_text("not an image")
+        for before, reason in ((text, "use one of"), (self.temporary / "absent.png", "no such image file")):
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                _ = images.register(self.shot, "caption", self.owner_id(), "Phase image-pairs", before=before)
+        self.assertFalse((self.root / images.FOLDER).exists())
+
+    def test_a_record_whose_before_is_not_text_stays_off_the_page(self) -> None:
+        record = self.register_pair()
+        folder = self.root / images.FOLDER / record["id"]
+        stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
+        stored["before"] = 7
+        _ = (folder / images.RECORD).write_text(json.dumps(stored))
+        with redirect_stderr(StringIO()) as errors:
+            self.assertEqual(images.records(self.root), [])
+        self.assertIn("invalid image record", errors.getvalue())
+
+    def test_command_files_a_pair_and_refuses_a_half_pair(self) -> None:
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        output = StringIO()
+        with redirect_stdout(output):
+            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--caption", "Cards",
+                                "--owner", self.owner_id(), "--phase", "image-pairs"])
+        self.assertEqual(code, 0)
+        record = images.records(self.root)[0]
+        origin = f"http://127.0.0.1:8765/images/{record['id']}"
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"registered {record['id']}: {origin}/before.png {origin}/after.png",
+            "Image link: http://127.0.0.1:8765/console/?page=images&at.images="
+            + f"%2Fconsole%2Fimages.html%23image%3D{record['id']}"])
+        for options in (["--before", str(self.shot)], ["--image", str(self.shot), "--after", str(after)], []):
+            with self.subTest(options=options), redirect_stderr(StringIO()) as errors, \
+                    self.assertRaises(SystemExit):
+                _ = images.main(["register", *options, "--caption", "Cards", "--owner", self.owner_id(),
+                                 "--phase", "image-pairs"])
+            self.assertIn("give --image, or --before and --after", errors.getvalue())
+        self.assertEqual(images.records(self.root), [record])
+
+    def test_a_pair_card_shows_before_then_after_with_one_form(self) -> None:
+        record = self.register_pair("Look at <the> counts")
+        card = images.card(record, "token", staff.snapshot(), 3)
+        before, after = (f"/images/{record['id']}/before.png", f"/images/{record['id']}/after.webp")
+        self.assertTrue(card.startswith(f'<article id="image-{record['id']}" class="pair" data-image='))
+        self.assertIn(
+            '<div class="image-pair">'
+            + f'<figure><figcaption>Before</figcaption><a href="{before}" target="_blank" rel="noopener">'
+            + f'<img src="{before}" alt="Before: Look at &lt;the&gt; counts" loading="lazy"></a></figure>'
+            + f'<figure><figcaption>After</figcaption><a href="{after}" target="_blank" rel="noopener">'
+            + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
+            + '<form method="post" data-image-form>', card)
+        self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
+                          card.count("<h2"), card.count("<dl")), (1, 1, 1, 1, 1))
+        self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
+        # A narrow card stacks the pair, before on top.
+        self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
+
+    def test_pair_feedback_names_the_before_and_after_images(self) -> None:
+        record = self.register_pair()
+        token = images.request_token(images.console_token(self.root), record["id"])
+        images.submit(self.root, urlencode({"image": record["id"], "token": token, "feedback": "Good.",
+                                            "action": "feedback"}))
+        lines = self.sent[0][2].splitlines()
+        self.assertEqual(lines[1:4], ["Feedback: Good.",
+                                      f"Before: http://127.0.0.1:8765/images/{record['id']}/before.png",
+                                      f"After: http://127.0.0.1:8765/images/{record['id']}/after.webp"])
+        self.assertNotIn(record["id"], images.render(self.root).decode())
 
 
 class ImagesServerTests(ImagesFixture):
@@ -272,6 +481,14 @@ class ImagesServerTests(ImagesFixture):
         self.assertEqual((status, kind, body), (200, "image/png", PNG))
         status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{images.RECORD}")
         self.assertEqual(status, 404)
+
+    def test_server_serves_both_images_of_a_pair(self) -> None:
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        record = images.register(after, "Cards", self.owner_id(), "Phase image-pairs", before=self.shot)
+        for file in ("before.png", "after.png"):
+            with self.subTest(file=file):
+                self.assertEqual(self.http("GET", images.image_path(record, file)), (200, "image/png", PNG))
 
     def test_server_deletes_the_image_and_refuses_a_bad_token(self) -> None:
         record = self.register()

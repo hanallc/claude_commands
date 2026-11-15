@@ -123,7 +123,7 @@ class ScopeEvents:
 class ObservedAdmissionServer(service.AdmissionServer):
     """Expose loop instrumentation only at the shared test fixture boundary."""
 
-    _source_paths: ClassVar[tuple[int, set[Path]]] = (-1, set())
+    _source_path_cache: ClassVar[tuple[Path, int, set[Path]]] = (Path(), -1, set())
 
     def __init__(self, state_dir: Path, clock: service.Clock, readings: service.Readings,
                  proc: service.Proc, *, fault: Callable[[str], None], socket_path: Path,
@@ -145,14 +145,14 @@ class ObservedAdmissionServer(service.AdmissionServer):
                 os.eventfd_write(self.priority_events, 1)
 
     @override
-    def _source_stamps(self) -> dict[Path, tuple[int, int] | service.SourceMissing]:
-        module_count = len(sys.modules)
-        previous_count, paths = ObservedAdmissionServer._source_paths
-        if module_count == previous_count:
-            return {path: self._stamp(path) for path in paths}
-        stamps = super()._source_stamps()
-        ObservedAdmissionServer._source_paths = (module_count, set(stamps))
-        return stamps
+    def _source_paths(self) -> set[Path]:
+        key = (self.source_root, len(sys.modules))
+        root, module_count, paths = ObservedAdmissionServer._source_path_cache
+        if (root, module_count) == key:
+            return set(paths)
+        paths = super()._source_paths()
+        ObservedAdmissionServer._source_path_cache = (*key, set(paths))
+        return paths
 
     @override
     def persist(self) -> None:

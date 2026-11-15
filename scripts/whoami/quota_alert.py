@@ -813,29 +813,16 @@ def state_file() -> Generator[State]:
 
 
 
-def ahead(resets: str | None, *, now: datetime) -> bool:
-    """Whether a note's reset is still to come."""
-    reset = reset_time(resets)
-    return isinstance(reset, note_file.KnownReset) and reset.value > now
-
-
-def remaining(note: AgentNote) -> float | None:
-    try:
-        return float(note.get("weekly_remaining_usage") or "")
-    except ValueError:
-        return None
-
-
 def percent(note: AgentNote) -> str:
-    value = remaining(note)
+    value = note_file.remaining(note)
     return "unknown" if value is None else f"{value:g}%"
 
 
 def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
     """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note_file.in_use(note) and ahead(note.get("resets"), now=now)
-            and (value := remaining(note)) is not None and value <= threshold]
+            if note_file.in_use(note) and note_file.ahead(note.get("resets"), now=now)
+            and (value := note_file.remaining(note)) is not None and value <= threshold]
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
@@ -879,14 +866,14 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 pass
         if note is None:
             return False
-        value = remaining(note)
+        value = note_file.remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
         reset = reset_time(note.get("resets"))
         return isinstance(reset, note_file.KnownReset) and reset.value <= now
     if note is None or not note_file.in_use(note):
         return True
-    value = remaining(note)
+    value = note_file.remaining(note)
     return value is not None and value > threshold
 
 
@@ -1263,7 +1250,7 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
     from scripts.notify.push_texts import render
     from scripts.accounts import accounts
 
-    left = remaining(note)
+    left = note_file.remaining(note)
     if left is None or not 0 < left <= 2:
         return QuotaStatusNote(note.label, "no Codex account-move reminder outside 0–2% weekly usage left")
     at = now or datetime.now(timezone.utc)
@@ -2125,7 +2112,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     if isinstance(reset, note_file.KnownReset):
                         episodes[name]["weekly_reset"] = reset.value.isoformat()
             episode = episodes[name]
-            if note.tool == "codex" and remaining(note) == 0:
+            if note.tool == "codex" and note_file.remaining(note) == 0:
                 episode["reached_zero"] = True
             if episode.get("push") == "due":
                 push = (claude_next_move_push(note, selection) if note.tool == "claude"

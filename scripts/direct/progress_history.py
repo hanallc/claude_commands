@@ -2118,9 +2118,22 @@ def _link_dispatch_state(worker_id: staff.StaffId, session_dir: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class CalledAgent:
+    """The family, model and effort a dispatched worker runs; `unknown` and `unset` mean not recorded."""
+
+    family: str
+    model: str
+    effort: str
+
+
+CALLED_AGENT_NOT_RECORDED = CalledAgent("unknown", "unknown", "unset")
+
+
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                    worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
-                   fix_cause: str = "", fix_pass: int = 0, activity: str = "") -> str:
+                   fix_cause: str = "", fix_pass: int = 0, activity: str = "",
+                   called: CalledAgent = CALLED_AGENT_NOT_RECORDED) -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
@@ -2128,7 +2141,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         session_dir=str(session_dir), team_slot=slot, phase_id=phase, pass_kind=role, launcher_pid=os.getpid(),
         worker_name=worker_name, worker_id=worker_id, launcher_command=json.dumps(launcher_command) if launcher_command else "",
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
-        called_family="unknown", called_model="unknown", called_effort="unset",
+        called_family=called.family, called_model=called.model, called_effort=called.effort,
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
     )
     session_dir.mkdir(parents=True, exist_ok=True)

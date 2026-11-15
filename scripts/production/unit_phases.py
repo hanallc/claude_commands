@@ -40,9 +40,10 @@ from scripts.style import style_config
 from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
 
-from scripts.production import display_cells
+from scripts.production import display_cells, land_queue, land_runs
 from scripts.production import unit_queue
 from scripts.lib import unit_runs
+from scripts.whoami import quota_state
 
 # Workers and ETA Next keep their existing character limit.
 TASK_WIDTH = 80
@@ -240,8 +241,18 @@ RUN_TEXT: dict[census.RunState, str] = {"running": "waiting on run", "finished_q
                                         "missing": "run gone"}
 
 
-def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *, now: float) -> str:
-    """Show census workers with detached runs before workers that are working."""
+# The Workers cell for a unit with no running worker names one of these reasons (user, 2026-11-15).
+NO_WORKER_REASONS = {"held": "no-worker mode", "none": "none running"}
+
+
+def no_worker_reason() -> str:
+    """Name why no worker runs: the recorded no-worker mode, else none running."""
+    return NO_WORKER_REASONS["held" if quota_state.no_worker_mode() else "none"]
+
+
+def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *, now: float,
+                 reason: str = display_cells.NONE) -> str:
+    """Show census workers with detached runs before workers that are working, or the reason none runs."""
     if isinstance(workers, census.CensusFailed):
         return display_cells.NONE
     bearing: list[str] = []
@@ -261,9 +272,9 @@ def workers_cell(workers: Sequence[census.CensusWorker] | census.CensusFailed, *
         elif worker.status == "idle":
             idle += 1
     result = " · ".join([*bearing, *working])
-    if result and idle:
-        result += f" +{idle} idle"
-    return shortened(result) if result else display_cells.NONE
+    if not result and reason == display_cells.NONE:
+        return display_cells.NONE
+    return single_spaced((result or reason) + (f" +{idle} idle" if idle else ""))
 
 
 class CensusView(NamedTuple):
@@ -397,29 +408,78 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     return single_spaced(task)
 
 
-CHECKPOINT_SENT = "checkpoint sent, waits to land"
+# Notes for a sent checkpoint that has not landed (user, 2026-11-15).
+CHECKPOINT_WAITS = {"running": "waiting on running checkpoint", "queued": "waiting on queued checkpoint"}
+NOT_IN_LINE = "checkpoint sent, not in the land line"
 WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
 
 
-def checkpoint_sent(events: list[dict[str, object]]) -> bool:
-    """A checkpoint after the phase instance's last start of work waits to land."""
+class LandView(NamedTuple):
+    """The lands that run now, the land line, and the newest result of each land."""
+
+    running: frozenset[str]
+    line: dict[str, land_queue.Place] | land_queue.NoLine
+    results: dict[str, land_runs.LandResult]
+
+
+def land_view() -> LandView:
+    return LandView(land_runs.running_commits(), land_queue.places(), land_runs.last_results())
+
+
+def ordinal(number: int) -> str:
+    suffix = "th" if 10 <= number % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
+def land_result_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
+    """Say how a land ended: "checkpoint landed 11:20", or "land failed at red 11:20: <first detail line>"."""
+    try:
+        when = short_time(datetime.fromisoformat(result["time"]), now=now, zone=zone)
+    except (ValueError, TypeError):
+        when = ""
+    if result["landed"]:
+        return single_spaced(f"checkpoint landed {when}")
+    detail = single_spaced(result["detail"].splitlines()[0]) if result["detail"].strip() else ""
+    return single_spaced(f"land {result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
+
+
+def checkpoint_wait(events: list[dict[str, object]], land: LandView, *, now: float, zone: ZoneInfo) -> str | None:
+    """Name the state of a checkpoint sent after the phase instance's last start of work.
+
+    A land that holds its commit runs now, or it waits at a place in the land line, or its last land ended.
+    A failed land that waits in the line again names that failure after its place.
+    """
     for event in reversed(events):
         kind = event.get("event_type")
         if kind == "checkpoint":
-            return True
+            commit = event.get("checkpoint_commit")
+            if not isinstance(commit, str) or not commit:
+                return CHECKPOINT_WAITS["queued"]
+            if land_runs.holds(land.running, commit):
+                return CHECKPOINT_WAITS["running"]
+            result = land_runs.result_for(land.results, commit)
+            place = None if isinstance(land.line, land_queue.NoLine) else land_queue.place_of(land.line, commit)
+            if place is None and result is not None:
+                return land_result_text(result, now=now, zone=zone)
+            if place is None:
+                return CHECKPOINT_WAITS["queued"] if isinstance(land.line, land_queue.NoLine) else NOT_IN_LINE
+            queued = f"{CHECKPOINT_WAITS['queued']}, {ordinal(place.number)} in line"
+            if result is None or result["landed"]:
+                return queued
+            return f"{queued}; last try: {land_result_text(result, now=now, zone=zone)}"
         if kind in WORK_STARTS:
-            return False
-    return False
+            return None
+    return None
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
-                     snapshot: staff.StaffSnapshot, now: float) -> str:
+                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: LandView) -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
-    if checkpoint_sent(instance):
-        parts.append(CHECKPOINT_SENT)
+    if (wait := checkpoint_wait(instance, land, now=now, zone=zone)) is not None:
+        parts.append(wait)
     elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
         if text and text.casefold() not in (single_spaced(phase.title).casefold(), label.casefold(),
@@ -625,6 +685,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
     now = plan_history.now_epoch() if now is None else now
     view = census_view(census_read)
+    reason = no_worker_reason()
+    land = land_view()
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
@@ -659,8 +721,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         opened: OpenUnitRun | NoOpenUnitRun = NoOpenUnitRun()
         queued_record = record
         status = census_status(view, unit)
+        # The census did not scan the unit's machine, so it cannot say that no worker runs there.
+        unit_reason = reason if status != display_cells.NONE else display_cells.NONE
         waits = shell_waits(view, unit, now=now)
-        workers = display_cells.NONE
+        workers = unit_reason
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         run_events: list[dict[str, object]] = []
         if isinstance(member, staff.StaffRow):
@@ -683,7 +747,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 if not phase_ids:
                     progress_record = run_record
             if not open_run_phases:
-                workers = workers_cell(census_workers(view, member), now=now)
+                workers = workers_cell(census_workers(view, member), now=now, reason=unit_reason)
         notes_record = progress_record if plan_phase_rows(record_fields(progress_record)) else record
         eta_record = (phase_table.with_run_promises(progress_record, run_events)
                       if run is not None and isinstance(progress_record, phase_table.PhaseRecord) else progress_record)
@@ -708,7 +772,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
-                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now)
+                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land)
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
                           if first else display_cells.NONE)
                 if first:
@@ -718,8 +782,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                     *((machines[index] if first else display_cells.NONE,) if machines else ()),
                                     progress_cell(progress_record) if first else display_cells.NONE,
                                     phase.phase, phase_eta_cell(phase, now=now, zone=zone),
-                                    plan_eta if first else display_cells.NONE, workers_cell(phase_workers, now=now)))
-                work_rows.append((unit.unit, notes, display_cells.NONE, queued))
+                                    plan_eta if first else display_cells.NONE))
+                work_rows.append((unit.unit,
+                                  workers_cell(phase_workers, now=now, reason=unit_reason if first else display_cells.NONE),
+                                  notes, display_cells.NONE, queued))
         else:
             notes = notes_cell(notes_record, read_run=read_run)
             queued = (queued_cell(member.id, queued_record, notes=notes)
@@ -728,23 +794,23 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
                                 progress_cell(progress_record), phase_cell(progress_record),
                                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=open_run_phases),
-                                plan_eta, workers))
-            work_rows.append((unit.unit, notes, non_phase_cell(record, opened, notes_record=notes_record), queued))
-    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan",
-                      worker_heading())
-    work_headers = ("Unit", "Notes", "Non-Phase Work", "Queued")
+                                plan_eta))
+            work_rows.append((unit.unit, workers, notes, non_phase_cell(record, opened, notes_record=notes_record), queued))
+    status_headers = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase", "ETA Next", "ETA Plan")
+    work_headers = ("Unit", worker_heading(), "Notes", "Non-Phase Work", "Queued")
     if not show_plan_eta:
-        status_headers = (*status_headers[:-2], status_headers[-1])
-        status_rows = [(*cells[:-2], cells[-1]) for cells in status_rows]
+        status_headers = status_headers[:-1]
+        status_rows = [cells[:-1] for cells in status_rows]
     progress_column = 3 if machines else 2
     show_progress = any(cells[progress_column] != display_cells.NONE for cells in status_rows)
     lines: list[str] = []
-    for headers, table_rows in ((status_headers, status_rows), (work_headers, work_rows)):
+    # Workers stays when every cell is empty, so the table always says whether workers run (user, 2026-11-15).
+    for headers, table_rows, keep in ((status_headers, status_rows, ()), (work_headers, work_rows, (1,))):
         if lines:
             if show_progress:
                 lines.extend(("", progress_legend()))
             lines.append("")
-        headers, table_rows = display_cells.wrapped(headers, table_rows, columns)
+        headers, table_rows = display_cells.wrapped(headers, table_rows, columns, keep=keep)
         lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
                       "| " + " | ".join(("---",) * len(headers)) + " |"))
         lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
