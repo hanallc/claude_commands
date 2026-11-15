@@ -4246,20 +4246,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; sdlc gave no objection on 11-15).
 
-#### Work Order
+#### As-built
 
-**Goal:** in-process style test runs build each repository tip and check each ref name once, with the same checks of behavior.
-
-**Spec:**
-- `scripts/style/style_ledger.py`: `_read_tip(repo, commit)` is an `lru_cache(maxsize=16)` over `_tip`. `Ledger._tip` and `GitReadCache.tip` call it. A tip depends only on its full commit name, and no code writes into a tip.
-- `_check_ref_format(repo, name)` keeps each valid ref name in a set; `check-ref-format` depends only on the name. `set_tip` and the ticket `assigned` move call it.
-- A production command is one process, so its git reads do not change.
-- `scripts/style/ledger_test_support.py`: `LedgerTestCase.forget_tips()` clears the cache; `tip_builds()` clears it and spies on `_tip`. The three `_tip` spies and the hidden-object test in `test_refill_cells.py` use them.
-
-**Files:** `scripts/style/style_ledger.py`, `scripts/style/ledger_test_support.py`, `scripts/style/test_refill_cells.py`, `scripts/style/test_style_ledger.py`, `scripts/style/test_style_ledger_sites.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module family.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the 48 modules that use style_ledger pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
+- `scripts/style/style_ledger.py`: `_read_tip` (lru_cache 16) serves `Ledger._tip` and `GitReadCache.tip`, so one process builds each tip once; `_check_ref_format` keeps valid ref names. A production command is one process, so its git reads do not change.
+- `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
+- AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
+- Commit 232d9f01e. Production change.
