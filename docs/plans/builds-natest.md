@@ -4291,19 +4291,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (builds assigned the test_queue_card flake on 11-15; queue owns the queue card; the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** a sweep or a folder create that opens a lock another process then removes does not raise.
-
-**Spec:**
-- Cause: the devtools full gate on 7b1ecd3fd (AWS) failed `test_cloud_card_reads_progress_from_a_private_service`. `AdmissionFixture` calls `socket_parent`, which sweeps the shared socket parent. `remove_build_folder` opened another module's free folder lock with `O_CREAT`, the owner unlinked the lock, and `_open_lock` saw `st_nlink == 0` and raised `ValueError`.
-- `_open_lock` refuses a non-regular file and `st_nlink > 1` (a hard link). It accepts `st_nlink == 0`.
-- Every `_open_lock` caller checks `_lock_current`, which refuses a removed lock: the sweep leaves that folder, and `create_build_folder` tries a new name.
-
-**Files:** `scripts/lib/build_folders.py`, `scripts/lib/test_build_folders.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is one line and one test.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the new test (sweep and create subtests) fails without the fix and passes with it; test_build_folders, test_queue_card and test_socket_test_support pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count.
+- Cause of the test_queue_card flake (devtools gate on 7b1ecd3fd, AWS): `AdmissionFixture` sweeps the shared socket parent; the sweep opened another module's free folder lock, the owner unlinked it, and `_open_lock` raised on `st_nlink == 0`.
+- `_open_lock` in `scripts/lib/build_folders.py` refuses only a non-regular file and `st_nlink > 1`. Every caller checks `_lock_current`, which refuses a removed lock.
+- Test `test_a_lock_removed_after_its_open_is_not_current` (sweep and create) in `test_build_folders.py`.
+- builds accepted the cause; queue and sdlc have the diff.
+- Commit eb9561c7d. Production change.
