@@ -62,7 +62,7 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     production = showrunner_footer.read_production(instance)
     if production is None:
         return "", ""
-    from scripts.production import footer_counts
+    from scripts.production import footer_counts, proposals_folder
     from scripts.production.update_registration import (
         DeferredUntil, OutstandingReminder, QuestionStaff, RegistrationFailure, due, read_open_items,
     )
@@ -70,8 +70,11 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     read_sources = sources if require_complete else None
     if identities is None:
         identities = QuestionStaff.read() if read_sources is None else QuestionStaff.read(sources=read_sources)
+    own = None
     if require_complete:
-        _ = footer_counts.sources(production.doc, identities=identities, read_sources=read_sources)
+        # One read of the proposal issues serves the watched paths and the count.
+        own = proposals_folder.open_proposals(production.doc, sources=read_sources)
+        _ = footer_counts.sources(production.doc, identities=identities, read_sources=read_sources, own=own)
     else:
         sources.extend(footer_counts.sources(production.doc, identities=identities))
     sources.extend(footer_counts.routing_sources(identities.record, sources=read_sources))
@@ -102,7 +105,8 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
         after = showrunner_footer.deferred_until([owner.id], production.zone, identities=identities)
         deadline = "" if after is None else str(int(after.timestamp()))
     line = footer_counts.counts_line(footer_counts.read_counts(
-        production.doc, questions=questions or 0, record=identities.record, source=source, sources=read_sources)) or ""
+        production.doc, questions=questions or 0, record=identities.record, source=source, sources=read_sources,
+        own=own)) or ""
     return line, deadline
 
 

@@ -77,6 +77,20 @@ class MacBuildOrigin(Enum):
 UNRECORDED_OWNER = UnitLabels("")
 
 
+class MacGateLabel(Enum):
+    USER = "user"
+    PLACEMENT = "placement"
+    CI = "hana-ci"
+    UNPLACED = "unplaced"
+    UNAVAILABLE = "unavailable"
+
+
+def parse_gate_label(wire: str) -> MacGateLabel:
+    if wire.startswith("placement "):
+        return MacGateLabel.PLACEMENT
+    return next((label for label in MacGateLabel if label.value == wire), MacGateLabel.UNAVAILABLE)
+
+
 @dataclass(frozen=True)
 class MacBuild:
     pid: int
@@ -93,6 +107,23 @@ class MacBuild:
     origin: MacBuildOrigin = MacBuildOrigin.UNKNOWN
     ci_runner: str = ""
     ci_job: str = ""
+    gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
+    gate_placement: str = ""
+
+
+@dataclass(frozen=True)
+class UnplacedMacRun:
+    pid: int
+    started_at: float
+    command: str
+
+
+def unplaced_run_record(run: UnplacedMacRun) -> dict[str, object]:
+    return {"pid": run.pid, "started_at": run.started_at, "command": run.command}
+
+
+def unplaced_run_from_record(row: dict[str, object]) -> UnplacedMacRun:
+    return UnplacedMacRun(int(cast(int, row["pid"])), float(cast(float, row["started_at"])), str(row["command"]))
 
 
 @dataclass(frozen=True)
@@ -100,6 +131,7 @@ class MacBuildReading:
     read_at: float
     builds: tuple[MacBuild, ...]
     error: str = ""
+    unplaced_runs: tuple[UnplacedMacRun, ...] = ()
 
 
 def mac_reading_path() -> Path:
@@ -156,6 +188,12 @@ def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
                            ci=build.origin is MacBuildOrigin.CI, current_name=current_name)
 
 
+def gate_label_text(build: MacBuild) -> str:
+    if build.gate_label == MacGateLabel.PLACEMENT and build.gate_placement:
+        return "placement " + build.gate_placement
+    return "" if build.gate_label == MacGateLabel.UNAVAILABLE else build.gate_label.value
+
+
 def mac_build_record(build: MacBuild) -> dict[str, object]:
     return {"pid": build.pid, "folder": build.folder, "started_at": build.started_at,
             "command": build.command, "repository": build.repository,
@@ -165,7 +203,7 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
             "counter": {"phase": build.counter.phase, "done": build.counter.done, "total": build.counter.total}
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
-            "ci_runner": build.ci_runner, "ci_job": build.ci_job}
+            "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build)}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
@@ -183,7 +221,10 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
                     str(row["recorded_unit"]), str(row["session"]),
                     MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
-                    str(row.get("ci_runner", "")), str(row.get("ci_job", "")))
+                    str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
+                    parse_gate_label(str(row.get("gate_label", ""))),
+                    str(row.get("gate_label", "")).removeprefix("placement ")
+                    if str(row.get("gate_label", "")).startswith("placement ") else "")
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -192,7 +233,8 @@ def read_mac_builds() -> MacBuildReading:
         data = cast(dict[str, object], json.loads(mac_reading_path().read_text()))
         rows = cast(list[dict[str, object]], data["builds"])
         return MacBuildReading(float(cast(float, data["read_at"])), tuple(mac_build_from_record(row) for row in rows),
-                               str(data.get("error", "")))
+                               str(data.get("error", "")), tuple(unplaced_run_from_record(row)
+                                   for row in cast(list[dict[str, object]], data.get("unplaced_runs", []))))
     except (OSError, ValueError, TypeError, KeyError) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
         return MacBuildReading(0, (), "Mac reading unavailable")
@@ -218,6 +260,7 @@ def mac_build_script() -> str:
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
 import ctypes
 import json
+import re
 import struct
 import sys
 import os
@@ -358,7 +401,7 @@ def repository_name(folder):
 
 
 def process_environment(pid):
-    """Read only Cargo paths and CI labels from the Mac environment."""
+    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
     if sys.platform != "darwin":
         return {}
     try:
@@ -380,7 +423,7 @@ def process_environment(pid):
 
 
 def cargo_environment(data):
-    """Keep only Cargo paths and CI labels from the environment."""
+    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
     if len(data) < 4:
         return {}
     argc = struct.unpack_from("i", data)[0]
@@ -399,7 +442,7 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
@@ -463,9 +506,73 @@ def build_origin(pid, processes):
     return "non-ci"
 
 
-def read_builds():
-    processes = read_processes()
-    captures = read_captures(processes)
+def read_gate_records():
+    records = {}
+    for path in (Path.home() / ".local/state/mac-gate/records").glob("[0-9]*"):
+        try:
+            pid, stamp, label = path.read_text().rstrip("\n").split("\t")
+            born = int(time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")))
+            records[int(pid)] = (born, label)
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+PLACEMENT_FORM = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+
+
+def gate_label(pid, processes, records, ci_uid):
+    """Use the nearest gate record whose start time matches, or the nearest MAC_PLACEMENT."""
+    if processes[pid].get("uid") == ci_uid:
+        return "hana-ci"
+    seen = set()
+    while pid in processes and pid not in seen:
+        seen.add(pid)
+        process = processes[pid]
+        record = records.get(pid)
+        if record and record[0] == process["started_at"]:
+            return record[1]
+        # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
+        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        if PLACEMENT_FORM.fullmatch(placement):
+            return "placement " + placement
+        pid = process["parent"]
+    return "unplaced"
+
+
+def ci_user_id():
+    import pwd
+    try:
+        return pwd.getpwnam("hana-ci").pw_uid
+    except KeyError:
+        return -1
+
+
+def unplaced_runs(processes, records, captures):
+    """Name each cargo or rustc root with no placement; a compiler under sccache or a build is not a root."""
+    candidates = {pid for pid, process in processes.items()
+                  if Path(process["executable"]).name in ("cargo", "rustc", "cargo-nextest")}
+    roots = candidates | set(captures)
+    runs = []
+    ci_uid = ci_user_id()
+    for pid in candidates:
+        cursor, seen = processes[pid]["parent"], {pid}
+        while (cursor in processes and cursor not in seen and cursor not in roots
+               and Path(processes[cursor]["executable"]).name != "sccache"):
+            seen.add(cursor)
+            cursor = processes[cursor]["parent"]
+        if cursor in processes and cursor not in seen:
+            continue
+        if gate_label(pid, processes, records, ci_uid) == "unplaced":
+            runs.append(dict(pid=pid, started_at=processes[pid]["started_at"], command=processes[pid]["command"]))
+    return sorted(runs, key=lambda run: (run["started_at"], run["pid"]))
+
+
+def read_builds(processes=None, records=None, captures=None):
+    processes = read_processes() if processes is None else processes
+    captures = read_captures(processes) if captures is None else captures
+    records = read_gate_records() if records is None else records
+    ci_uid = ci_user_id()
     candidates = set(captures)
     for pid, process in processes.items():
         if Path(process["executable"]).name in ("cargo", "cargo-nextest"):
@@ -537,11 +644,20 @@ def read_builds():
                            progress_tail=tail, repository=repository,
                            recorded_unit=record["recorded_unit"], session=record["session"],
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
-                           ci_job=ci_environment.get("GITHUB_JOB", "")))
+                           ci_job=ci_environment.get("GITHUB_JOB", ""),
+                           gate_label=gate_label(pid, processes, records, ci_uid)))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
-print(json.dumps(read_builds()))
+def read_reading():
+    processes = read_processes()
+    records = read_gate_records()
+    captures = read_captures(processes)
+    return dict(builds=read_builds(processes, records, captures),
+                unplaced_runs=unplaced_runs(processes, records, captures))
+
+
+print(json.dumps(read_reading()))
 print("rc=0")
 ''' + "MAC_READING\n"
 
@@ -557,19 +673,23 @@ def refresh_mac_builds() -> None:
             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=10)
         if result.returncode or result.stderr or not result.stdout.endswith("rc=0\n"):
             raise ValueError(" ".join(result.stderr.split()) or "Mac activity check failed")
-        records = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+        data = cast(dict[str, object], json.loads(result.stdout.removesuffix("rc=0\n")))
+        records = cast(list[dict[str, object]], data["builds"])
+        unplaced = tuple(unplaced_run_from_record(row) for row in
+            cast(list[dict[str, object]], data.get("unplaced_runs", [])))
         builds: list[MacBuild] = []
         for row in records:
             counter = progress_profile.parse_progress(str(row.pop("progress_tail")))
             row["counter"] = ({"phase": counter.phase, "done": counter.done, "total": counter.total}
                               if isinstance(counter, progress_profile.ProgressCounter) else {})
             builds.append(mac_build_from_record(row))
-        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)))
+        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)), unplaced_runs=unplaced)
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
-        reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable")
+        reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable", previous.unplaced_runs)
     write_text_atomic(mac_reading_path(), json.dumps({"read_at": reading.read_at, "error": reading.error,
-        "builds": [mac_build_record(build) for build in reading.builds]}), new_file_mode=0o644)
+        "builds": [mac_build_record(build) for build in reading.builds],
+        "unplaced_runs": [unplaced_run_record(run) for run in reading.unplaced_runs]}), new_file_mode=0o644)
 
 def step_counter(step: admission_records.RunningStep) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
     """Read the counter from the local memory reading."""
@@ -748,6 +868,8 @@ def head_status(model: QueueModel) -> Line:
         return (*result, Span(" low room", "error"))
     if isinstance(cause, admission_records.BehindHead):
         return (*result, Span(" queue order", "inactive"))
+    if isinstance(cause, admission_records.GpuSlotWait):
+        return (*result, Span(" GPU test slot", "inactive"))
     return result
 
 
@@ -1029,8 +1151,7 @@ def head_text(model: QueueModel) -> str:
     head = model.reading.explanation.head
     text = ""
     if isinstance(head, admission_records.HeadExplanation) and head.decision.state == "hold":
-        text = (f"free {head.free.available / admission_records.GIB:.1f} GiB; "
-                + f"reserve {head.free.reserve / admission_records.GIB:.1f} GiB; need {head.free.need / admission_records.GIB:.1f} GiB")
+        text = queue_evidence.head_room_text(head.room, model.reading.explanation.room)
     if isinstance(model.reading, wire.CloudQueueRead):
         used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in cloud_rows(model))
         text += (" · " if text else "") + f"cloud {used} of {model.reading.cloud_slots} slots"

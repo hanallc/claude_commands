@@ -86,6 +86,10 @@ State:
 
 @~/.claude/docs/decision_criteria.md
 
+The question form for every question to the user is defined by this import:
+
+@~/.claude/docs/question_template.md
+
 ---
 
 <Throughout>
@@ -266,7 +270,7 @@ State:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up: what is asked, why, and the answer choices. Set it
+  where it first comes up, in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
   restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
@@ -561,7 +565,8 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit, give the order to it under `commands/unit/merge.md`.
+4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
+   That unit is under this showrunner or under a showrunner above it. The order names this production.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>
@@ -596,6 +601,9 @@ notice to the unit director before any merge command runs:
    first `held` or `failed` line stops a single-item run.
    A batch drops stopped items and retries the remaining items once.
    Send each final `send <unit>:` message to its unit director.
+   A `merge director:` line names red tests or modules that are red on the
+   base without the checkpoint. It goes to the merge director, who repairs
+   the base red and then runs the held checkpoints again.
 
 <ChangeReviewFeatureLog>
 Run only for a project that closes out by change review, after

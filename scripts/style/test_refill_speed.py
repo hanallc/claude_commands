@@ -129,10 +129,13 @@ class RefillSpeedTests(LedgerTestCase):
         candidates = declared(tip, PARENT_FILE).declared_items
         check = cast(Callable[[str, str, declarations.DeclaredItem, str, str, declarations.DeclaredItem], object],
                      getattr(ledger, "_outside_body_check"))
-        with mock.patch.object(declarations, "item_body", wraps=declarations.item_body) as reads:
+        with (mock.patch.object(declarations, "item_body", wraps=declarations.item_body) as reads,
+              mock.patch.object(declarations, "source_spans", wraps=declarations.source_spans) as scans):
             for item in candidates:
                 _ = check(old_tip, PARENT_FILE, old, tip, PARENT_FILE, item)
             self.assertEqual(reads.call_count, 1 + len(candidates))
+            # The old body is tokenized once, not once for each candidate.
+            self.assertEqual(scans.call_count, 1)
 
 
 @final

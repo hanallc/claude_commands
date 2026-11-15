@@ -68,6 +68,12 @@ class JudgmentCellsTests(LedgerTestCase):
         with self.subTest(change="lint judgment"):
             self.lint(self.git("rev-parse", "HEAD"), "clippy", True, {})
             self.assert_full_recomputation()
+        with (self.subTest(change="cell dependency kinds"), self.ledger() as ledger,
+              closing(sqlite3.connect(ledger.database)) as connection):
+            rows = cast(list[tuple[str]], connection.execute(
+                "SELECT DISTINCT source_kind FROM refill_dependencies WHERE consumer_table='refill_cells'").fetchall())
+            kinds = {kind for (kind,) in rows}
+            self.assertLessEqual(kinds, {"judgments", "lint_tool"})
 
     def test_unchanged_reopen_reads_no_historical_judgment_source(self) -> None:
         rule = self.rule("modules", "tier: C\nfamily: modules\ninput_scope: crate\n")
@@ -82,9 +88,8 @@ class JudgmentCellsTests(LedgerTestCase):
         self.set_tip(tip)
         with self.ledger() as cold:
             expected = self.coverage(cold)
-        builder = cast(Callable[[object, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
         code = cast(Callable[[bytes], object], vars(style_ledger)["_rust_code"])
-        with self.ledger() as warm, mock.patch.object(style_ledger, "_tip", wraps=builder) as tips:
+        with self.ledger() as warm, self.tip_builds() as tips:
             judgments = cast(Callable[..., object], getattr(warm, "_judgments"))
             with mock.patch.object(warm, "_judgments", wraps=judgments) as histories:
                 with mock.patch.object(style_ledger, "_rust_code", wraps=code) as sources:
@@ -102,6 +107,7 @@ class JudgmentCellsTests(LedgerTestCase):
                 _ = object_path.rename(hidden)
                 try:
                     for maintained in (False, True):
+                        self.forget_tips()
                         with self.subTest(maintained=maintained), self.ledger() as ledger:
                             with mock.patch.object(ledger, "_maintain_judgments", maintained):
                                 with self.assertRaises(style_ledger.GitReadFailed):

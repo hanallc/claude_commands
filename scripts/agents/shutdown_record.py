@@ -106,6 +106,13 @@ def remove_started(row_ids: list[str]) -> None:
     update(started=row_ids, pending=[])
 
 
+def forget(row_ids: list[str]) -> None:
+    """Remove ids that will not restart: a removed staff row or a suspended worker."""
+    # Most removals and closes name no saved id; those read the record and write nothing.
+    if set(row_ids) & set(read()):
+        update(started=row_ids, pending=[])
+
+
 class MigrationArguments(argparse.Namespace):
     stop_after_first: bool = False
 

@@ -42,7 +42,6 @@ class StyleLedgerSitesTests(LedgerTestCase):
             return file
 
         cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips")).clear()
-        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
         flush = refill_facts.RefillWriteBatch.flush
         batch_versions: list[set[int]] = []
 
@@ -57,7 +56,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
                 batch_versions.append(set(versions))
             flush(batch, facts)
 
-        with (mock.patch.object(style_ledger, "_tip", wraps=builder) as inventories,
+        with (self.tip_builds() as inventories,
               mock.patch.object(style_ledger, "read_declarations", wraps=remember) as reads,
               mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate,
               mock.patch.object(refill_facts.RefillWriteBatch, "flush", autospec=True, side_effect=flush_batch)):
@@ -77,7 +76,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         separate.assert_not_called()
         self.assertTrue(all(file() is None for file in parsed_files))
         for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
-                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
             with self.subTest(completed_cache=cache):
                 self.assertFalse(getattr(ledger, cache))
         items = cast(dict[tuple[str, str], tuple[declarations.DeclaredItem, ...]], getattr(ledger, "_declared_files"))
@@ -991,7 +990,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
         self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
         for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
-                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
             with self.subTest(completed_cache=cache):
                 self.assertFalse(getattr(ledger, cache))
 

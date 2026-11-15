@@ -29,8 +29,9 @@ from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -1513,7 +1514,16 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
+            forget_restart(row)
             return Closed()
+
+
+def forget_restart(row: staff.StaffRow) -> None:
+    """Remove a suspended worker from the restart record: a restart never starts it."""
+    try:
+        shutdown_record.forget([str(row.id)])
+    except (OSError, ValueError) as error:
+        print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
@@ -1608,6 +1618,9 @@ def main(arguments: list[str] | None = None) -> int:
             if worker_admission.find_worker(record, owner.id, name.value) is None:
                 return _result(AdmissionRefused(f"no worker named {name.value}"))
             return _result(close(owner.id, name))
+        if quota_state.no_worker_mode():
+            print(f"worker_panes.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
+            return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr_types.HerdrFailure) as error:

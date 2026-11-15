@@ -1075,6 +1075,29 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@dataclass(frozen=True)
+class NotRestored:
+    """Restore never starts this worker, so its id leaves the restart record."""
+
+    reason: str
+
+
+def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                 runs: dict[str, list[str]] | None = None) -> NotRestored | None:
+    """Read why restore would not start this worker; None when it would, or when a read fails."""
+    if quota_state.no_worker_mode() and isinstance(staff.backend(row), staff.CodexBackend):
+        return NotRestored("Codex worker in no-worker mode")
+    try:
+        run = worker_panes.worker_run(row, record=record, scanned=runs)
+        active = progress_history.active_dispatch(row.id, run)
+        detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)
+    except (OSError, ValueError, staff.StaffRefused):
+        return None
+    if isinstance(active, progress_history.NoActiveDispatch) and not detached:
+        return NotRestored("worker with no active dispatch")
+    return None
+
+
 @herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
@@ -1623,6 +1646,9 @@ def main(arguments: list[str] | None = None) -> int:
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
+    if args.command in ("add", "assign") and quota_state.no_worker_mode():
+        print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         if args.command == "finish-dispatch":
             return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir), args.dispatch_id)

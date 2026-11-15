@@ -278,7 +278,9 @@ class QueuePlaceFixture(ExitStack):
         self.proc: Path = self.root / "proc"
         self.proc.mkdir()
         self.config: Path = self.root / "build_admission.conf"
-        write_memory_config(self.config, **{"program_first_peak_gib.rust-analyzer": "18"})
+        # A short stop grace and sample interval: a test waits seconds on each with the live values.
+        write_memory_config(self.config, program_stop_seconds="0.2", program_sample_seconds="0.1",
+                            **{"program_first_peak_gib.rust-analyzer": "18"})
         self.enter_context(mock.patch.dict(os.environ, {
             **gate_isolation_environment(self.root), **fake_memory_readings(self.root),
             "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "BUILDLOG_DIR": str(self.log),
@@ -287,7 +289,7 @@ class QueuePlaceFixture(ExitStack):
             "UNIT_SESSION_DIR": "", "UNIT_RUN_DIR": "", "CLAUDE_CODE_SESSION_ID": "queue-place-test",
             "QUEUE_TEST_LIFELINE": str(self.lifeline_read),
         }))
-        self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root))
+        self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root, skip_idle_spacing=True))
         self.admission.clock.epoch = time.time()
         _ = self.enter_context(self.admission.serving())
         self.children: list[subprocess.Popen[bytes]] = []
@@ -613,6 +615,20 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         _ = place.popen(["rust-analyzer", "--version"])
             self.assertTrue(requests.call_args_list)
             self.assertTrue(all(call.args[0] == argv for call in requests.call_args_list))
+
+    def test_cargo_command_sizes_from_its_step_history(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            argv = ["/tools/cargo", "check", "--workspace"]
+            with mock.patch.object(step_estimator, "program_peak_estimate",
+                                   side_effect=AssertionError("cargo sized from program history")), \
+                 mock.patch.object(client, "step_request", wraps=client.step_request) as requests:
+                with queue.queue_place(argv, fixture.root) as place:
+                    _, row = fixture.reservation()
+                    self.assertEqual((row["step"], row["need"]), ("check", 12 * GIB))
+                    self.assertEqual(place.purpose, queue.ProgramPurpose.BATCH)
+            self.assertTrue(requests.call_args_list)
+            self.assertTrue(all(call.args[0] == argv and call.args[6] is records.INFER_FROM_ARGV
+                                for call in requests.call_args_list))
 
     def require_transient_scope(self) -> None:
         if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
@@ -1621,3 +1637,105 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertIsNone(child.poll())
                     reservation_id = str(row.get("reservation_id", ""))
             fixture.assert_released(self, reservation_id)
+
+
+class HeldReservationTests(unittest.TestCase):
+    """held_reservation is the one admit and release path for every queue entry."""
+
+    grant: wire.Admitted = wire.Admitted("reservation-1", GIB, "fallback", "/nonexistent/max", "/nonexistent/wave", {})
+
+    def step_request(self) -> queue.RefreshedRequest:
+        return queue.RefreshedRequest(lambda: cast(wire.AdmitRequest, object()))
+
+    def test_release_carries_the_holder_status_after_success_and_failure(self) -> None:
+        for failure in (False, True):
+            with self.subTest(failure=failure), \
+                 mock.patch.object(client, "admit", return_value=self.grant), \
+                 mock.patch.object(client, "release", return_value=wire.Ok()) as release, \
+                 redirect_stderr(io.StringIO()):
+                try:
+                    with queue.held_reservation(self.step_request()) as held:
+                        self.assertIs(held.grant, self.grant)
+                        held.status = 7
+                        if failure:
+                            raise RuntimeError("holder failed")
+                except RuntimeError:
+                    self.assertTrue(failure)
+                release.assert_called_once_with("reservation-1", 7, self.grant.cleanup_timing)
+
+    def test_refusal_and_queue_exit_raise_before_any_release(self) -> None:
+        replies: tuple[tuple[wire.Refused | client.LeftQueue, str], ...] = (
+            (wire.Refused("no room"), "no room"),
+            (client.LeftQueue(), "left the admission queue"),
+        )
+        for reply, reason in replies:
+            with self.subTest(reason=reason), \
+                 mock.patch.object(client, "admit", return_value=reply), \
+                 mock.patch.object(client, "release", side_effect=AssertionError("released a refusal")), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(queue.QueuePlaceRefused, reason):
+                    with queue.held_reservation(self.step_request()):
+                        self.fail("a refused request entered its holder")
+
+    def test_service_estimate_request_uses_the_service_estimate(self) -> None:
+        request = cast(wire.ServiceEstimateRequest, object())
+        with mock.patch.object(client, "admit", side_effect=AssertionError("service request used a step request")), \
+             mock.patch.object(client, "service_admit", return_value=self.grant) as service_admit, \
+             mock.patch.object(client, "release", return_value=wire.Ok()) as release, \
+             redirect_stderr(io.StringIO()):
+            with queue.held_reservation(request) as held:
+                held.status = 0
+        service_admit.assert_called_once()
+        self.assertEqual(service_admit.call_args, mock.call(request, mock.ANY))
+        release.assert_called_once_with("reservation-1", 0, self.grant.cleanup_timing)
+
+
+QUEUE_ENTRY_CALLS = frozenset({"admit", "launch", "service_admit", "release", "wait_for_admission", "wait_for_launch"})
+
+
+def queue_entry_uses(path: Path) -> list[str]:
+    """Name each admission_client queue entry call in a module, with its enclosing function."""
+    import ast
+    tree = ast.parse(path.read_text(), str(path))
+    aliases = {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+               and node.module == "scripts.build_queue" for alias in node.names if alias.name == "admission_client"}
+    uses = [f"{path.name}: imports {alias.name}" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+            and node.module == "scripts.build_queue.admission_client" for alias in node.names
+            if alias.name in QUEUE_ENTRY_CALLS]
+    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr in QUEUE_ENTRY_CALLS
+                and isinstance(node.value, ast.Name) and node.value.id in aliases):
+            owner = min((function for function in functions
+                         if function.lineno <= node.lineno <= (function.end_lineno or function.lineno)),
+                        key=lambda function: (function.end_lineno or function.lineno) - function.lineno, default=None)
+            uses.append(f"{path.name}:{owner.name if owner else '<module>'}: {node.attr}")
+    return uses
+
+
+class OneQueueEntryTests(unittest.TestCase):
+    """The build queue has one way in: queue_place requests and releases every place."""
+
+    def test_only_queue_place_requests_or_releases_a_place(self) -> None:
+        scripts = Path(__file__).resolve().parents[1]
+        outside = [use for path in sorted(scripts.rglob("*.py"))
+                   if not path.name.startswith("test_") and not path.name.endswith(("_test_support.py", "_fixture.py"))
+                   and path.name not in ("admission_client.py", "queue_place.py")
+                   and "admission_client" in path.read_text(errors="replace")
+                   for use in queue_entry_uses(path)]
+        self.assertEqual(outside, [])
+        self.assertEqual(sorted(queue_entry_uses(scripts / "build_queue/queue_place.py")), [
+            "queue_place.py:release_place: release", "queue_place.py:request_place: service_admit",
+            "queue_place.py:request_place: wait_for_admission", "queue_place.py:request_place: wait_for_launch"])
+
+    def test_the_admission_client_command_has_no_admit_launch_or_release_action(self) -> None:
+        for action in ("admit", "launch", "release"):
+            with self.subTest(action=action), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+                _ = client.main([action, "reservation-1", "0"])
+            self.assertEqual(refused.exception.code, 2)
+
+    def test_memory_gate_sends_admit_launch_and_release_to_queue_place(self) -> None:
+        gate_text = (Path(__file__).resolve().parents[1] / "lint/memory_gate.sh").read_text()
+        self.assertIn('"$BUILDLOG_QUEUE_PLACE_SCRIPT" "$action" --pid', gate_text)
+        self.assertIn('"$BUILDLOG_QUEUE_PLACE_SCRIPT" release "$reservation"', gate_text)
+        self.assertNotRegex(gate_text, r'BUILDLOG_MEM_ADMIT_SCRIPT" ("\$action"|admit|launch|release)\b')

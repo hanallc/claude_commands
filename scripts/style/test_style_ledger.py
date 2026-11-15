@@ -1055,6 +1055,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger = self.ledger()
         self.assertEqual(ledger.judged_at_base((cell,), base), (cell,))
         self.assertEqual(ledger.judged_at_base((cell,), changed), ())
+        # A later refill reads the stored comparisons and compares no inputs again.
+        with mock.patch.object(style_ledger.Ledger, "_compare_judgment_inputs") as compared:
+            self.assertEqual(self.ledger().judged_at_base((cell,), base), (cell,))
+            self.assertEqual(self.ledger().judged_at_base((cell,), changed), ())
+        compared.assert_not_called()
 
     def test_rule_reads_checkpoint_keeps_named_files_for_later_comparisons(self) -> None:
         rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
@@ -1328,8 +1333,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
             self.comment_only_change(relative)
         self.set_tip(self.commit("Change comments only"))
-        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
-        with self.ledger() as ledger, mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
+        with self.ledger() as ledger, self.tip_builds() as builds:
             for _ in range(2):
                 for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
                     with self.subTest(rule=rule):

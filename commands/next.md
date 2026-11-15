@@ -147,7 +147,8 @@ approved change; commit and push only when the user says so.
 
 ## question
 
-The current open question. Mark: `update_registration.py mark-important
+The current open question. A question with a follow-up that waits for the asker's reply is not shown.
+A question skipped on the Questions page comes after the other questions. Mark: `update_registration.py mark-important
 --production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,
 why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
 Throughout says, and remove the item through its Open-questions list.

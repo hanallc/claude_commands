@@ -17,7 +17,7 @@ from typing import ClassVar, Literal, final, override
 from unittest import mock
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
-from scripts.lib import models_registry, atomic_file  # noqa: E402
+from scripts.lib import models_registry, atomic_file, registry_rows  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
 from scripts.lib.main_push_lock_test_support import publish_after_contender
@@ -341,6 +341,11 @@ class RegistryPublishingTests(RegistryFixture):
                 self.git("diff", "--cached", "--", "dirty.txt", "staged.txt"),
                 self.git("ls-files", "--stage", "dirty.txt", "staged.txt"))
 
+    def assert_live_only(self, before: bytes) -> None:
+        """A refused publication keeps the edited row live and changes no other row."""
+        edits = registry_rows.changes(before.decode(), self.registry.read_text())
+        self.assertEqual([(edit.key, edit.replacement) for edit in edits], [("impl", "impl=gpt-b:max")])
+
     def assert_published(self, before: tuple[str, str, str], expected: str = "impl=gpt-b:max") -> None:
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.git("rev-parse", "origin/main").strip())
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(),
@@ -543,8 +548,13 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         obstruction_bytes = local_obstruction.read_bytes()
         refused = self.edit()
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("registry edit refused before writing", refused.stdout + refused.stderr)
-        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertIn("the rows are live; main does not have them yet: registry publication refused",
+                      refused.stdout + refused.stderr)
+        if accepted_push:
+            # The interrupted edit already wrote the row live.
+            self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        else:
+            self.assert_live_only(registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(local_obstruction.read_bytes(), obstruction_bytes)
@@ -617,6 +627,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
                          (snapshot.st_ino, snapshot.st_mtime_ns))
         self.assertEqual(self.dirty_state(), before)
 
+    @unittest.skipUnless(sys.platform == "linux", "the Mac publishes its catalog rows in place")
+    def test_catalog_rows_are_live_at_once_on_natedev_and_the_notes_pass_publishes_them(self) -> None:
+        prepare_catalog(self.root, self.environment)
+        _ = self.environment.pop("MODELS_CONFIG_PUBLISH")
+        before = self.dirty_state()
+        self.assert_ok(self.command("bash", str(AGENTS / "sync_codex_catalog.sh")))
+        self.assertIn("gpt-new=high", self.registry.read_text())
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.environment["MODELS_CONFIG_PUBLISH"] = "1"
+        self.assertEqual(self.publish_pending(), "True")
+        self.assert_published(before, "gpt-new=high")
+
     def test_a_behind_checkout_fast_forwards_before_applying_the_row_edit(self) -> None:
         path = self.competitor / "config/models.conf"
         _ = path.write_text(path.read_text().replace("review=gpt-a:high", "review=gpt-b:low"))
@@ -636,23 +659,19 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         _ = self.git("commit", "--only", "-m", "local work", "--", "local-commit.txt")
         return self.git("rev-parse", "HEAD").strip()
 
-    def test_an_ahead_checkout_publishes_one_registry_commit_on_its_local_tip(self) -> None:
+    def test_an_ahead_checkout_keeps_the_row_live_and_never_pushes_its_local_commits(self) -> None:
         local_head = self.commit_local_work()
-        self.assertEqual(self.git("rev-parse", "origin/main").strip(), self.initial)
-        before = self.dirty_state()
-        unrelated_index = self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf")
+        registry = self.registry.read_bytes()
         unrelated_files = {name: (self.checkout / name).read_bytes()
                            for name in ("dirty.txt", "staged.txt", "local-commit.txt")}
 
-        self.assert_ok(self.edit())
+        result = self.edit()
 
-        self.assert_published(before)
-        self.assertEqual(self.git("rev-parse", "HEAD^").strip(), local_head)
-        self.assertEqual(self.git("rev-list", "--count", f"{local_head}..HEAD").strip(), "1")
-        self.assertEqual(self.git("--git-dir", str(self.remote), "show", "main:local-commit.txt"),
-                         "local history\n")
-        self.assertEqual(self.git("ls-files", "--stage", "--", ".", ":(exclude)config/models.conf"),
-                         unrelated_index)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("commits that are not on origin/main", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.assert_live_only(registry)
         for name, contents in unrelated_files.items():
             self.assertEqual((self.checkout / name).read_bytes(), contents)
 
@@ -715,8 +734,9 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         refused = self.edit()
 
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("registry edit refused before writing", refused.stdout + refused.stderr)
-        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertIn("the rows are live; main does not have them yet: registry publication refused",
+                      refused.stdout + refused.stderr)
+        self.assert_live_only(registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main"), remote)
@@ -741,7 +761,7 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
     def test_unmerged_index_entries_refuse_publication_even_without_merge_head(self) -> None:
         self.assert_unfinished_merge_is_refused(ahead=False, unmerged=True, merge_head_present=False)
 
-    def test_divergence_refuses_before_writing_the_registry_or_touching_other_changes(self) -> None:
+    def test_divergence_refuses_publication_and_keeps_only_the_row_live(self) -> None:
         _ = (self.checkout / "local-commit.txt").write_text("local history\n")
         _ = self.git("add", "local-commit.txt")
         _ = self.git("commit", "--only", "-m", "local divergence", "--", "local-commit.txt")
@@ -754,7 +774,7 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         result = self.edit()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout + result.stderr, "(?i)fast.forward|diverg")
-        self.assertEqual(self.registry.read_bytes(), contents)
+        self.assert_live_only(contents)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.dirty_state(), before)
 
@@ -849,7 +869,7 @@ os.execv(real, [real, *arguments])
 
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
         self.assertIn(f"{self.registry} is shared, but local reconciliation failed", refused.stderr)
-        self.assertNotIn("refused before writing", refused.stderr)
+        self.assertNotIn("registry publication refused", refused.stderr)
         self.assertEqual(count.read_text(), "1")
         snapshot = self.root / "after-push"
         index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
@@ -895,7 +915,7 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "1", refused.stdout + refused.stderr)
         expected = "is shared, but local reconciliation failed" if accepted else "is edited but not shared"
         self.assertIn(expected, refused.stdout + refused.stderr)
-        self.assertNotIn("refused before writing", refused.stdout + refused.stderr)
+        self.assertNotIn("registry publication refused", refused.stdout + refused.stderr)
         snapshot = self.root / "before-retry"
         index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
         self.assertEqual(self.registry.read_bytes(), (snapshot / "models.conf").read_bytes())
@@ -939,21 +959,6 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "3")
         self.assertRegex(result.stdout + result.stderr, "(?i)edited.*not shared")
         self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
-        self.assertEqual(self.dirty_state(), before)
-
-    def test_an_ahead_checkout_keeps_its_local_parent_when_retrying_a_rejected_push(self) -> None:
-        local_head = self.commit_local_work()
-        count = self.install_push_race(always_refuse=True)
-        before = self.dirty_state()
-
-        refused = self.edit()
-
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertEqual(count.read_text(), "3")
-        self.assertIn("is edited but not shared", refused.stdout + refused.stderr)
-        self.assertIn("impl=gpt-b:max", self.registry.read_text())
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
         self.assertEqual(self.dirty_state(), before)
 

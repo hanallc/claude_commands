@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold import hold_enforcer
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -81,7 +82,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "stale-session",
         }):
-            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
+            self.assertEqual(session_owner.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_board_directory_takes_priority_over_session_directory(self) -> None:
         other_run = self.scratch / "other-run"
@@ -91,7 +92,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "UNIT_SESSION_DIR": str(other_run),
         }):
-            self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("board-owner")))
+            self.assertEqual(session_owner.owning_session(), OwningSession(fixture_runtime_id("board-owner")))
 
     def test_a_staff_run_under_either_run_folder_name_owns_the_run(self) -> None:
         for name in ("unit", "delegate"):
@@ -99,7 +100,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             run = self.scratch / name / "run"
             self.owner(identity, run)
             with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run)}):
-                self.assertEqual(build_hold.owning_session(), OwningSession(identity))
+                self.assertEqual(session_owner.owning_session(), OwningSession(identity))
 
     def test_session_directory_is_used_when_board_directory_is_unset_or_empty(self) -> None:
         self.owner(fixture_runtime_id("run-owner"), self.unit_run)
@@ -110,7 +111,7 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                         os.environ["UNIT_RUN_DIR"] = ""
                     else:
                         _ = os.environ.pop("UNIT_RUN_DIR", None)
-                    self.assertEqual(build_hold.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
+                    self.assertEqual(session_owner.owning_session(), OwningSession(fixture_runtime_id("run-owner")))
 
     def test_no_matching_staff_run_falls_back_to_shell_session(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
@@ -118,34 +119,34 @@ class OwningSessionTests(IsolatedBuildHoldTest):
             "UNIT_RUN_DIR": str(self.unit_run),
             "CLAUDE_CODE_SESSION_ID": "shell-session",
         }):
-            self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
+            self.assertEqual(session_owner.owning_session(), OwningSession("shell-session"))
 
     def test_run_resolution_names_the_owner_or_the_missing_run(self) -> None:
         identity = fixture_runtime_id("run-owner")
         self.owner(identity, self.unit_run)
         missing = self.scratch / "missing-run"
-        cases: tuple[tuple[dict[str, str], build_hold.RunOwner | build_hold.NoRunNamed | build_hold.RunNotInStaff], ...] = (
-            ({"UNIT_RUN_DIR": str(self.unit_run)}, build_hold.RunOwner(identity)),
-            ({}, build_hold.NoRunNamed()),
-            ({"UNIT_RUN_DIR": str(missing)}, build_hold.RunNotInStaff(missing)),
+        cases: tuple[tuple[dict[str, str], session_owner.RunOwner | session_owner.NoRunNamed | session_owner.RunNotInStaff], ...] = (
+            ({"UNIT_RUN_DIR": str(self.unit_run)}, session_owner.RunOwner(identity)),
+            ({}, session_owner.NoRunNamed()),
+            ({"UNIT_RUN_DIR": str(missing)}, session_owner.RunNotInStaff(missing)),
         )
         for environment, expected in cases:
             with self.subTest(environment=environment):
-                self.assertEqual(build_hold.run_resolution(environment), expected)
+                self.assertEqual(session_owner.run_resolution(environment), expected)
 
     def test_no_run_uses_shell_session_without_staff_lookup(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.unit_run)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shell-session"}):
             with mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("No run needs no staff read")):
-                self.assertEqual(build_hold.owning_session(), OwningSession("shell-session"))
+                self.assertEqual(session_owner.owning_session(), OwningSession("shell-session"))
 
     def test_no_matching_staff_run_and_no_shell_session_has_no_owner(self) -> None:
         self.owner(fixture_runtime_id("another-owner"), self.scratch / "another-run")
         with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.unit_run)}):
-            self.assertEqual(build_hold.owning_session(), NoOwningSession())
+            self.assertEqual(session_owner.owning_session(), NoOwningSession())
 
     def test_no_run_and_no_shell_session_has_no_owner(self) -> None:
-        self.assertEqual(build_hold.owning_session(), NoOwningSession())
+        self.assertEqual(session_owner.owning_session(), NoOwningSession())
 
     def test_owner_results_are_frozen(self) -> None:
         for owner in (OwningSession(fixture_runtime_id("run-owner")), NoOwningSession()):
@@ -2016,11 +2017,14 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("wait for release", build_hold.register_wait("waiter"))
         holder, = build_hold.natedev_holds(self.scratch / "holders").in_force
         self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        proc = self.scratch / "proc"
+        (proc / "10").mkdir(parents=True)
+        _ = (proc / "10/stat").write_text("10 (bash) S " + " ".join(["0"] * 18 + ["100"]))
         output = io.StringIO()
         with redirect_stdout(output):
-            self.assertEqual(build_hold.main(["status"]), 0)
+            self.assertEqual(build_hold.main(["status", "--proc-root", str(proc)]), 0)
         self.assertIn("kept by holder: pid 10, start 100", output.getvalue())
-        self.assertIn("kept by holder: pid 20, start 200", output.getvalue())
+        self.assertNotIn("pid 20", output.getvalue())
 
     def begin(self, name: str = "holder") -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),

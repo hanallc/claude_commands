@@ -48,7 +48,7 @@ A held target admits only work that its hold rules permit.
 - natedev is `Held` while `build_hold.natedev_holds` finds a hold in force: `ReleaseEstimated` with an ETA, else `UntilReleased`. The last release removes its file at once and natedev becomes free. Old cycle records still identify files left by a completed hold.
 - The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a live claim (a kept remote claim counts as live), with one `RunningJob` per live claim, oldest first, otherwise `Free`. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
 - `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. A failed-probe record also makes a target `Unreachable`, before any AWS state lookup.
-- `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown, its settings have no `linux_only.<repo>` key, or its workspace cannot be read. It is excluded with `linux_only` under the one rule in `eligibility.linux_only_policy`: a named package is checked alone, and no package checks every workspace member. Each `ssh` target is judged by its own settings file.
+- `target_eligibility(repo_root, package, routing: Routing) -> tuple[EligibleTarget | ExcludedTarget, ...]` gives one result per configured target in config order. `Routing = AnyEligibleTarget | LocalRequired(reason)`, with `ANY_ELIGIBLE_TARGET` as the shared value. A `linux` target is always eligible. A `macos` target is excluded with the `LocalRequired` reason under `--local`, with `repo` when the repository is unknown, its settings have no `linux_only.<repo>` key, or its workspace cannot be read. It is excluded with `linux_only` under the one rule in `eligibility.linux_only_policy`: a named package is checked alone, and no package checks every workspace member. A `check`, `lint` or `doc` step ignores `linux_only` (`eligibility.linux_only_applies`). Each `ssh` target is judged by its own settings file.
 
 ### The target command: `scripts/build_targets/build_targets.py`
 
@@ -89,7 +89,7 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
-`drain` keeps existing runs until they finish.
+`drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
 Both accept `--keep PID`, `--release-eta HH:MM`, and `--zone IANA`.
 Both keep the target held until explicit release.
 A holder file uses its holder's fixed staff ID.
@@ -112,8 +112,10 @@ See [build-memory-admission.md](build-memory-admission.md) for the keep list, en
   `owning_session() -> OwningSession(session_id) | NoOwningSession` uses this result before the shell session.
   A `RunOwner` supplies its session; otherwise, `owning_session` uses `CLAUDE_CODE_SESSION_ID`.
   Without either session, `owning_session` returns `NoOwningSession`.
-  `scripts.build_hold.owning_session` defines both session types and imports no repository module.
-  All callers import the types from this module.
+  `scripts.build_hold.owning_session` defines both functions, both session types and the three run results.
+  It imports no repository module at load; `run_resolution` imports `staff` only when a run variable is set.
+  So a session lookup does not load `build_hold`.
+  All callers import the functions and types from this module.
   `placement.SubmittingSession` uses their union directly.
   A worker can inherit a shell session id from an earlier server session.
 - Hold files decide whether work can run. The memory gate decides which build can start with the available memory.
@@ -147,7 +149,7 @@ The default order is Mac, then natedev.
 A pin keeps admission, spending, and version checks.
 Remote steps take no natedev grant or cargo token.
 A remote refusal never sends a pinned movable step to natedev.
-Lint repairs always run on natedev, including under `lint --mac`.
+Lint repairs run on natedev, including under `lint --mac`. The one exception is the Mac fix pass after a held Mac `mend-check` finding.
 
 | Step | Remote verb | Kind |
 | --- | --- | --- |
@@ -155,6 +157,7 @@ Lint repairs always run on natedev, including under `lint --mac`.
 | check | check | check |
 | doc | doc | doc |
 | lint judgment | clippy, mend-check | lint |
+| Mac lint fix pass | mend-fix (mend --fix, then clippy) | lint |
 | example | clippy with example arguments | example |
 | build | build | build |
 | final | check, nextest | check, test |
@@ -310,6 +313,9 @@ A run from the workspace root and a run from a member folder share that record.
 The temporary sweep uses `temporary-sweep.json`.
 A failure tells natedev once per failure episode, and a clean pass ends the episode.
 A workspace pass that finds no output root is skipped, so it keeps the episode open.
+A workspace sweep reads its working folder once, at start, for its output roots and budget.
+A gate can remove that checkout during the sweep, and the sweep continues.
+A sweep that starts in a removed folder prints one skip line and keeps the episode open.
 A clean workspace sweep with no saved record writes no state file.
 Each new `floor_scan` row names its filesystem and probe path.
 CI paths come from `sweep_ci_targets`; missing paths are skipped, and the sweep never takes CI output.
@@ -477,7 +483,7 @@ the run; the floor sweep discovers the configured gates root and may reclaim
 idle marked caches. See `gate-checkouts.md` for configuration and removal.
 The sweep still reads Cargo's general `build.build-dir` templates.
 
-`/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
+The copies root (`build_folders.conf` `roots.copies`: `/build/claude/copies` on natedev, `/tmp/claude/copies` on the Mac) is a kept root, with copies at `<pair>/<copy>`. On natedev the tmp sweep also drains the former `/tmp/claude/copies`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 

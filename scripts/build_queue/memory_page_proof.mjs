@@ -51,17 +51,21 @@ try {
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
-  const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
-    kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
+  const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
+    category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
+  const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
+    'outside', {owner_count:1}));
   const smaller = swapOwners.slice(base.swap_rows);
   const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
-  base.swap_total = 8;
-  base.swap_used = (swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031)/1024**3;
+  const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
+  base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
+    reserve_share_percent:50};
   base.swap_by = [...swapOwners.slice(0,base.swap_rows),
-    {name:smaller.length+' smaller groups',detail:'fixture owners',kind:'smaller',bytes:groupedBytes,swap:groupedBytes/1024**3},
-    {name:'not in a group',detail:'user.slice',kind:'ungrouped',bytes:1024,swap:1024/1024**3},
-    {name:'not attributed',detail:'Host swap minus the named groups.',kind:'unattributed',bytes:7,swap:7/1024**3},
-    {name:'Total',detail:'SwapTotal minus SwapFree',kind:'total',bytes:base.swap_used*1024**3,swap:base.swap_used}];
+    swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
+      {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
+    swapRow('Unclassified groups', 'ungrouped', 1024),
+    swapRow('Not attributed', 'unattributed', 7),
+    swapRow('All swap used', 'total', swapUsed, 'all')];
   readings.shrink = structuredClone(base);
   const extra = structuredClone(base.walk.find(row => row.queued));
   extra.name = 'second nextest'; extra.pid = 222;
@@ -258,7 +262,7 @@ try {
               };
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
               const swap = [...document.querySelectorAll('#swaprows .row')];
-              const small = swap.find(row => row.querySelector('small'))?.querySelector('small');
+              const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
               const gauges = ['some','full'].map(key => {
                 const value=document.querySelector('#gv-'+key), limit=document.querySelector('#limit-'+key);
                 return {value:rect(value), limit:rect(limit), text:value.textContent, nowrap:getComputedStyle(value).whiteSpace};
@@ -281,8 +285,7 @@ try {
                     table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
                 }),
                 machine:table.querySelector('td.machine')?.textContent,
-                cap:rect(document.querySelector('#mark')), room:text('#v-room'),
-                capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
+                capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
                 reportPoints:[...document.querySelectorAll('#history-charts svg circle')].map(point=>({
                   box:rect(point),color:getComputedStyle(point).fill})),
@@ -298,7 +301,7 @@ try {
                 cardColor:color('--card'), reservedColors:[color('--res-a'),color('--res-b')],
                 reservedRatios:['--res-a','--res-b'].map(name=>contrast(color(name),color('--card'))),
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
-                swapBytes:swap.map(e=>Number(e.dataset.bytes)),
+                swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
                 swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
                 swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
                 gauges, lower, values,
@@ -333,13 +336,16 @@ try {
             assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
             assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
             assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
-            assert.equal(proof.swapRows, base.swap_rows + 4);
-            assert.match(proof.swapText[base.swap_rows], /25 smaller groups/);
-            assert.match(proof.swapText[base.swap_rows], /5\.1 GiB/);
-            assert.match(proof.swapText.at(-2), /not attributed7 B/);
-            assert.match(proof.swapText.at(-1), /Total7\.8 GiB/);
+            assert.equal(proof.swapRows, base.swap_rows + 6);
+            assert.match(proof.swapText[0], /Outside builds and CI/);
+            assert.match(proof.swapText[base.swap_rows+1], /25 smaller groups/);
+            assert.match(proof.swapText[base.swap_rows+1], /5\.1 GiB/);
+            assert.match(proof.swapText.at(-3), /Not attributed7 B/);
+            assert.match(proof.swapText.at(-2), /Builds and CI/);
+            assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
-            assert.equal(proof.swapBytes.at(-1),base.swap_used*1024**3);
+            assert.equal(proof.swapBytes.at(-1),base.swap.used_bytes);
+            assert.equal(proof.capText,'Queue cap '+base.cap.toFixed(1)+' GiB');
             assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
             assert.equal(proof.swapBars, 3);
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -378,7 +384,6 @@ try {
               }
               assert.ok(matches,label+' '+JSON.stringify({x,y,actual,expected}));
             };
-            checkPixel(proof.cap.left+7,proof.cap.top+5,proof.capColor,'The cap pixels differ.');
             checkPixel(proof.roomBar.left+5,(proof.roomBar.top+proof.roomBar.bottom)/2,proof.roomColor,'The room pixels differ.');
             assert.ok(proof.reportPoints.length>0,'The report has no measured points.');
             const point=proof.reportPoints.at(-1);
@@ -444,12 +449,17 @@ try {
               unit.dispatchEvent(new Event('change'));
             })()`);
 
-            for(const [name,detail] of [
-              ['cloud_stage','tools ready'],
-              ['cloud_region','tests start · eu-south-2, zone a'],
-              ['cloud_zone','eu-south-2, zone us-east-1b'],
-              ['cloud_empty','']]) {
-              await show(readings[name]);
+            // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
+            const disagreeReading=structuredClone(readings.cloud_region);
+            disagreeReading.ram.agreement='disagree';
+            const detailLayouts={};
+            for(const [name,detail,reading] of [
+              ['cloud_stage','tools ready',readings.cloud_stage],
+              ['cloud_region','tests start · eu-south-2, zone a',readings.cloud_region],
+              ['cloud_region_disagree','tests start · eu-south-2, zone a',disagreeReading],
+              ['cloud_zone','eu-south-2, zone us-east-1b',readings.cloud_zone],
+              ['cloud_empty','',readings.cloud_empty]]) {
+              await show(reading);
               const detailProof=await evaluate(`(() => {
                 const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
                 const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
@@ -459,7 +469,11 @@ try {
                   rootFont:getComputedStyle(document.documentElement).fontSize,
                   beside:document.querySelector('#walk').classList.contains('beside'),
                   detailRight:amounts.getBoundingClientRect().right,
+                  detailWidth:amounts.getBoundingClientRect().width,
                   tableLeft:document.querySelector('.walk-table').getBoundingClientRect().left,
+                  barHidden:document.querySelector('#barwrap').hidden,
+                  bars:[...document.querySelectorAll('#walk .track .b')].map(bar=>{
+                    const rect=bar.getBoundingClientRect();return [Math.round(rect.left),Math.round(rect.width)];}),
                   chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
@@ -471,13 +485,21 @@ try {
                 'The AWS detail text crosses into the table.');
               assert.ok(Math.abs(detailProof.chartHeight-detailProof.rowHeight)<1,'The AWS row heights differ.');
               assert.ok(detailProof.scroll<=detailProof.client,'The AWS detail text overflows the page.');
-              if(name==='cloud_region' && process.env.MEMORY_PAGE_SHOT) {
+              detailLayouts[name]=detailProof;
+              if(name==='cloud_region_disagree') {
+                const agree=detailLayouts.cloud_region;
+                assert.ok(!detailProof.barHidden && !agree.barHidden,'The disagree reading hides the memory bar.');
+                for(const key of ['beside','tableLeft','detailWidth','chartHeight'])
+                  assert.equal(detailProof[key],agree[key],'The disagree note changes the Running chart '+key+'.');
+                assert.deepEqual(detailProof.bars,agree.bars,'The disagree note changes the Running chart bars.');
+              }
+              if(name.startsWith('cloud_region') && process.env.MEMORY_PAGE_SHOT) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
                 })()`);
                 const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-                await writeFile(join(folder,`${theme}-${width}-aws.png`),Buffer.from(shot.data,'base64'));
+                await writeFile(join(folder,`${theme}-${width}-${name==='cloud_region'?'aws':'aws-disagree'}.png`),Buffer.from(shot.data,'base64'));
               }
             }
 
@@ -584,6 +606,66 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
+            await show({...base, ram:{...base.ram, agreement:'disagree'}});
+            const disagree=await evaluate(`(() => {
+              const note=document.querySelector('#ram-disagree');
+              return {note:note.hidden?'':note.textContent,bar:document.querySelector('#barwrap').getBoundingClientRect().height,
+                scale:document.querySelector('#scale').hidden};
+            })()`);
+            assert.equal(disagree.note,'RAM readings do not agree: the named parts exceed the total.');
+            assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
+            assert.equal(disagree.scale,false,'A disagreement hides the scale.');
+            proof.disagree=disagree;
+            // Build tools and the CI file cache sit outside the memory bar's room block; the cap line still marks the cap.
+            const gib=1024**3, capReading=structuredClone(base);
+            Object.assign(capReading.ram,{builds_bytes:capReading.ram.queued_builds_bytes+2*gib,sccache_bytes:2*gib,
+              ci_bytes:gib/2,ci_counted_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
+            capReading.room-=1.5;
+            await show(capReading);
+            const capLine=await evaluate(`(() => {
+              const line=document.querySelector('#walk .walk-bud');
+              const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
+              const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
+              const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+              return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
+                left:box?box.left+1:null,top:box?.top,bottom:box?.bottom,roomRight:room?room.right:null,
+                expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:line?getComputedStyle(line).borderLeftColor:'',
+                scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+            })()`);
+            assert.ok(capLine.present,'The Running chart has no cap line.');
+            if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
+            assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
+            assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
+            const capClip={...capLine.card,scale:1};
+            const capShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:capClip})).data,'base64');
+            const capPixel=pngPixels(capShot)(Math.floor(capLine.left-capLine.card.x),Math.floor((capLine.top+capLine.bottom)/2+capLine.scrollY-capLine.card.y));
+            const capColor=capLine.color.match(/[0-9.]+/g).slice(0,3).map(Number);
+            assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
+              'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
+            if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
+            proof.capLine=capLine;
+            // The memory bar draws its cap marker and label at the cap value.
+            const barMark=await evaluate(`(() => {
+              const mark=document.querySelector('#barwrap #mark'), label=document.querySelector('#barwrap #marklabel');
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=mark?.getBoundingClientRect();
+              const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+              return {present:!!mark&&!mark.hidden&&getComputedStyle(mark).display!=='none'&&box.height>0,
+                label:label&&!label.hidden?label.textContent:'',left:box?box.left+7:null,middle:(bar.top+bar.bottom)/2,
+                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,
+                color:mark?getComputedStyle(mark,'::before').borderLeftColor:'',scrollY,
+                card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+            })()`);
+            assert.ok(barMark.present,'The memory bar has no cap marker.');
+            assert.equal(barMark.label,'cap '+capReading.cap.toFixed(1));
+            assert.ok(Math.abs(barMark.left-barMark.expected)<=1.5,'The memory bar cap marker is off the cap value. '+JSON.stringify(barMark));
+            const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{...barMark.card,scale:1}})).data,'base64');
+            const barPixel=pngPixels(barShot)(Math.floor(barMark.left-barMark.card.x),Math.floor(barMark.middle+barMark.scrollY-barMark.card.y));
+            const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
+            assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
+              'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
+            if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
+            proof.barMark=barMark;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
@@ -724,9 +806,9 @@ try {
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
-                cap:document.querySelector('#mark').hidden, text:document.body.textContent,
+                cap:document.querySelector('#cap-value').textContent, text:document.body.textContent,
                 room:document.querySelector('#v-room').textContent})`);
-              assert.ok(state.cap, 'The missing cap has a marker.');
+              assert.equal(state.cap, 'Queue cap unavailable', 'The missing cap has a value.');
               assert.ok(state.rows > 0);
               assert.equal(state.room, proof.room);
               assert.match(state.text, /unavailable/);
@@ -772,7 +854,9 @@ try {
             stale:document.querySelector('#dot').classList.contains('stale'),
             unavailable:document.body.classList.contains('queue-unavailable'),
             screen:document.querySelector('#queue-error').textContent,
-            cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join(''),
+            cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join('')
+              .replace(/<div class="last-reading"[^>]*>[^<]*<.div>/,'').replace(/--divider-top: [^;]*;/g,''),
+            lastReading:document.querySelector('#last-reading').hidden?'':document.querySelector('#last-reading').textContent,
             rows:document.querySelectorAll('.wrow').length,
             pill:document.querySelector('#pill-t').textContent,
             pillClass:document.querySelector('#pill').className,
@@ -805,6 +889,8 @@ try {
         const states=Object.fromEntries(failures.map(state=>[state.name,state]));
         assert.ok(states.initial.unavailable);
         assert.equal(states.initial.screen,'The queue did not answer');
+        assert.match(states.retained.lastReading,/^Last reading: /);
+        assert.equal(states.good.lastReading,'');
         for(const name of ['one_failure','stale','retained']) {
           assert.equal(states[name].cards,states.good.cards, name+' changes the good reading.');
           assert.equal(states[name].rows,states.good.rows);
@@ -1288,7 +1374,7 @@ try {
         if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
-          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
           const local = review.walk.find(row => row.queued);
           local.machine = 'natedev';
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));

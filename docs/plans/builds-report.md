@@ -1434,3 +1434,137 @@ From builds (not the user), 2026-11-14 00:06 and 00:08: put the missing period b
 - `memory_feed.py` keep_text descriptions carry no end mark: the compiler cache row, the unowned processes row and the group row.
 - `test_memory_hover.test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` covers a feed keep_text, a feed description and `res`.
 - Checkpoint e34c01903.
+
+### Phase 77 — The running-row memory sentence starts with a capital · status: done
+
+From builds (not the user), 2026-11-14 09:35: fix the lowercase "need" after "Started … ago." in the running-row hover.
+
+#### As-built
+
+- `rawTipText` writes `${r.keep_text ? sentence(r.keep_text) + "." : res}`: the page starts `keep_text` with a capital and ends it with a period. `keep_text` stays data.
+- `test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence` gives each row a start time and checks "Started 5 min ago. " followed by a capital.
+- Checkpoint b62309ba4.
+
+### Phase 78 — The AWS prices page joins the admin console · status: done
+
+From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the admin console from one source, with a filter for merge gates, targeted runs or both. From aws-unit (not the user), 2026-11-14: write the split on top of main; keep the math in `run_cost.py`; give the region state typed fields; `render()` output must not change.
+
+#### As-built
+
+- `spot_table.spot_tables()` returns `SpotTables`: `prices` and `quotas` as `Table` (title, headers, `right` number columns, rows), one `RegionRead` per region (`age_s`, `stale`, `failure`, `failure_age_s`; `note` and `detail` are properties) and one `RunCosts` per scope (explanation, one `Table` per type, `Cheapest`). `render()` draws `/aws_prices` from these values; its output is byte-identical (live snapshot, widths 40–400).
+- `run_cost.SCOPES` holds `RunScope` merge-gate, targeted-test and both (name, filter label, noun, modes). `RunEvidence.box_seconds` and `expected_usd` take `modes: tuple[str, ...]`; `cloud_gate.py` passes `(mode,)`.
+- `aws_page.py` writes `aws_prices.html` with the page data as JSON to `config/aws_page.conf` `output_folder`, and gives `page_url()` for `config/console.conf`. The hourly buildlog job "AWS prices page" publishes it after the AWS snapshot.
+- The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
+- Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
+- Checkpoint 0c64c36b5.
+
+### Phase 79 — The AWS tables take the user's review changes · status: done
+
+From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws owns `run_cost.py` data changes; report owns the display in `spot_table.py` and `aws_page.py`.
+
+#### As-built
+
+- `spot_table.spot_tables()` is the one typed source for `/aws_prices` and the page. `Table.right` names the number columns, and both views right-align them.
+- `render()` draws the price and quota tables with `split_table()`: the first column, then as many equal columns as fit the terminal width.
+- The quota table is `Spot quotas and boxes that fit`: standard and G and VT quotas, then boxes per type.
+- `SpotTables.snapshot_lines` gives one `Snapshot read N min ago` line when every region has the same state and minute. Otherwise it gives one line per region. A failed read always gives one line per region.
+- The run cost headers are region, Spot USD/h, the scope noun, estimate, paid USD/h, paid USD/run, refused, launched.
+- Refused and launched count only the requests of the selected scope (repair from builds (not the user), 2026-11-14). `RunEvidence` keys requests by type, region and mode. A request without a mode (`NO_MODE`, written before launch rows recorded a mode) counts only under Both (from builds (not the user), 2026-11-14). The refusal wait in the estimate still counts every request, because capacity refusals do not depend on the run kind.
+- `unbilled()` writes a paid cell without a bill: `bill due (N runs)` when runs of the scope wait for their day's bill, `no <scope noun> runs` when only other kinds ran, else `no runs`. The paid USD/h cell uses only `no runs` and `bill due`.
+- The cheapest line considers only `instance_types`, the types that placement picks. `runs_text()` writes `1 run` and `N runs`.
+- `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
+- Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
+- Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
+
+### Phase 80 — The Mac idle watch pushes the user only when the user must act · status: done
+
+From builds (not the user), 2026-11-14 15:10: the user could not understand the phone push `mac_idle.stuck` ("Waiting tests are not using the Mac", 13:22) and asked for a fix for good. A phone push goes out only when the user must act, in plain words; a session acts on all else.
+
+#### As-built
+
+- Cause of the 13:22 push: a kept claim (holder cargo-liner). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The takeover is live since that restart.
+- A free Mac, an idle claim, a block and the disk case send no phone push. `watch_once` sends them as the one message to builds (`notify_outage`), and free-Mac repairs still run.
+- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. After `push_seconds` it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
+- `mac_idle.unreachable` (`push_catalog.py`): title "Mac tests stopped", action "Wake the Mac or check its network.", body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." `waiting_tests()` writes "1 test waits" or "N tests wait".
+- `mac_idle.py cleared --since <since>` is the push's clears-when. It exits 1 while the fresh saved alert is unreachable with that start and waiting tests; else 0.
+- `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation` are gone from the catalog and from `push_texts_reviewed.json`. The unreadable state does not change.
+- Calls sent to builds, each a one-line revert: the idle states send no push; the new unreachable push; the unreadable state unchanged.
+- `mac_idle.unreachable` waits for the user's approval (`review.py texts --id mac_idle.unreachable --approve`). Until then `test_every_catalog_example_has_current_approval` fails for it. The other 117 tests in `test_mac_idle` and `test_push_texts` pass.
+
+### Phase 81 — The AWS prices page takes the user's second review · status: done
+
+From the user (via builds, 2026-11-14 20:2x): seven changes to the AWS prices page. Builds' calls (not the user): the row lowest gets a fill, the box-type lowest an outline; GPU and standard types get separate tables; refused and launched become sections; decimal minutes under a "merge gate" header with "(minutes)" below it.
+
+#### As-built
+
+- `spot_table.SpotTables` holds `prices` and `quotas` as (standard, GPU) table pairs, `runs`, `hours` and `hours_note`. The standard rows are `instance_types` then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
+- `Table.row_lowest` and `Table.group_lowest` hold the (row, column) cells with the lowest price of the row, and of the types with the same vCPU count (`largest_gate_vcpus`). Equal prices are all lowest.
+- Quota cells show no age: one region read writes the prices and both quotas together. The snapshot lines follow the prices. Answer sent to the user via builds.
+- Run tables: `region`, `Spot USD/h`, `<noun> (minutes)` (median seconds / 60, one decimal, `run_minutes`), `runs` (`N`, or `N elsewhere` when the time comes from other regions), `estimate`, `paid USD/h`, `paid USD/run`, `paid runs`. `unbilled()` writes `bill due` or `no runs`; a scope with no runs of its kind says `no runs` too (builds, 2026-11-14: one word set).
+- `RunCosts.refused` and `RunCosts.launched` are type x region tables per scope: "Refused <noun> requests (capacity and quota)" and "Launched <noun> boxes".
+- `billed_hours()` builds "Billed hours / box hours" from aws's `run_cost.hours_checks` over the last `run_cost_days`, with `max_ratio` from `billed_hours_gap_max_ratio`. Cells `9.2/8.8 (4%)`, `over`, `not billed`, or `—`. Only types with hours have a row. A region with hours that is not a candidate gets a column. An unreadable cost ledger gives a note and no rows.
+- `aws_page.PageData`: `prices` and `quotas` are lists, plus `hours` and `hours_note`. `TableData` adds `row_lowest` and `group_lowest`. `RunCostData` adds `refused` and `launched`.
+- `aws_prices.html`: one card per price and quota table; a legend under the standard prices; `.mark.low` (fill, `--low`) and `.mark.group-low` (inset 1.5 px accent outline) on a span in the cell. A header or title `name (unit)` shows the unit smaller. The filter also fills the Refused and Launched cards; the billed hours card is fixed. Cells have a 6 px right gutter so a mark in the last column does not overflow.
+- `/aws_prices` prints the same tables without marks, the cheapest line after the run tables, then Refused, Launched and the billed hours.
+- Proof: `phases/81/proof/before-*` and `after-*` (four shots each, plus the terminal text). Live: the one over cell is m7a.4xlarge us-east-2, `21.1/13.5 (56%) over`, as aws said.
+- Tests: 43 in `test_control` pass, with new tests for the marks and the hours table; basedpyright 0/0/0.
+
+### Phase 82 — A failed vault transfer names the machine at fault · status: done
+
+From builds (not the user), 2026-11-14: the 20:27 hourly vault sync stopped with exit 1. The question named the Mac, but natedev's own vault was damaged. Builds gave the go for this fix.
+
+#### As-built
+
+- Cause: natedev lost power at 18:18:27, 2 s after an agent-notes commit. The ref update was saved, but the loose commit object stayed empty. The fetch from the Mac then failed its connectivity check on natedev ("did not send all necessary objects").
+- `vault_pull.mac_git` keeps the unreachable rule. Any other failed transfer calls `failing_machine()`. It runs `git fsck --connectivity-only --no-dangling` on `LOCAL_VAULT` (about 0.3 s). A failed check gives `Machine.NATEDEV`; a good check gives `Machine.MAC`.
+- The failure in the Mac script (`remote_outcome`) still names the Mac.
+- Test `test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged`: a refused fetch names the Mac; after an empty loose commit object on natedev, the same failure names natedev. 46 tests in `test_vault_pull` pass; basedpyright 0/0/0.
+
+### Phase 83 — The AWS prices page filters by region · status: done
+
+From the user (via builds, 2026-11-14): "please add a filter at the top that allows for choosing any combination or all of the regions to narrow the focus of what is visible". From builds (not the user): put it in `aws_page` only, all regions by default, for every section; do not change `console.py`, `console.conf` or `change_page.py`.
+
+#### As-built
+
+- `aws_prices.html`: a sticky `Regions` bar under the title with an `All` chip and one chip for each region in `PageData.regions` (the candidates, plus a region that only the billed hours table shows). A chip toggles its region; the last chosen region stays on. The choice stays in browser storage (`aws-prices-regions`).
+- `spot_table.Table.region_axis` is `columns` for prices, refused, launched and billed hours, and `rows` for quotas and run tables. The page drops the columns or rows of other regions, and shows "Nothing to show in the chosen regions." for a table with nothing left.
+- `Table.row_lowest` and `group_lowest` became `row_ranks` and `group_ranks`: the cells of each row and each vCPU count from the lowest price up, with equal prices in one set (`ranks()`). The page marks the first set with a cell in the chosen regions, so the marks follow the filter. A ranking with fewer than two prices in view marks nothing, so one chosen region shows no fill and keeps the vCPU outline (from builds, not the user, 2026-11-14).
+- `RunCosts.cheapest` became `estimates`, every candidate estimate cheapest first (`cheapest` is now a property). The page data has `estimates` (region and summary) and `no_estimate`; the cheapest line names the first estimate in the chosen regions.
+- `SpotTables.snapshot_rows` gives (region, line) pairs; one line for all regions has no region. `snapshot_lines` reads them.
+- `/aws_prices` in the terminal does not change.
+- Proof: `phases/83/proof/before-*` (four shots) and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width).
+- Tests: 43 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 84 — The Spot price tables have one row per region · status: done
+
+From the user (via builds, 2026-11-15): "instead of saying 'not sold here' i think you should just do a dash and have a legend underneath that says dash = not sold here - if you can use an appropriate lucide icon that would be even better ... we should transpose the table because there are now so many more regions than machine types. and split the table into two side by side - one for standard and one for gpu based". From builds (not the user): the page uses the lucide `ban` icon with no legend; the terminal uses `—` with one legend line.
+
+#### As-built
+
+- `spot_table.price_table`: one row per region and one column per type, with `region_axis` `rows`. `Table.row_ranks` became `type_ranks`, one ranking per type column; `group_ranks` groups the type columns by vCPU count.
+- `Table.not_sold` holds the (row, column) cells of a type that the region does not sell. The terminal cell reads `—` (`NOT_SOLD`), and `render` adds one line `— not sold here` (`NOT_SOLD_LEGEND`) under the price tables. A region with a note (`no snapshot`, `read failed`, old age) keeps its note.
+- `aws_prices.html`: a not sold cell shows the lucide `ban` icon with the title `Not sold here`. The Standard and GPU price cards sit side by side and stack below 760 px. `lowestShown` uses only cells in the chosen rows and columns.
+- Proof: `phases/84/proof/before-*` and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width, all regions at phone width).
+- Tests: 44 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 85 — The price tables mark only the lowest price of each type · status: done
+
+From builds (not the user), 2026-11-15: remove the vCPU group mark, the outline and its legend line. The user could not tell what it meant, and the cost per run lines already compare the types.
+
+#### As-built
+
+- `Table.group_ranks` and its page data are gone. `price_table` ranks only each type column (`type_ranks`).
+- `aws_prices.html`: the `.mark` fill is the one mark, and the legend has one line, "lowest price of the type". The terminal table had no marks, so it does not change.
+- Proof: `phases/85/proof/before-*` (the phase 84 after shots) and `after-*`.
+
+### Phase 86 — The price cards switch between Spot price and cost per gate · status: done
+
+From the user (via builds, 2026-11-15): "let's have the same table be able to switch between displaying spot price and pricing (which has the subtypes of merge/targeted/both) - these filters apply to both standard and gpu tables ... i want to have the column values be a gradient like in google sheets - red being most expensive green being the cheapest and white in the middle range - the Green one that is the best price should have some extra outline". From builds (not the user): one view switch and one run kind switch for both cards, kept in the URL; remove the per-type Spot and estimate columns that repeat these numbers; the outline replaces the fill.
+
+#### As-built
+
+- `spot_table.Table.values` holds the number of each cell; `Table.type_ranks` and `ranks` are gone. `RunCosts.prices` holds the Standard and GPU cost per run tables (region rows, type columns), from the estimate that gate placement uses. A cell with no estimate is `NOT_SOLD`.
+- `aws_page`: each run kind sends its `prices` tables. The run tables drop the `Spot USD/h` and `estimate` columns (`without_prices`). The terminal does not change.
+- `aws_prices.html`: a `Spot price | Cost per gate` switch, and a `Merge gates | Targeted runs | Both` switch shown only for cost. The URL keeps both (`?prices=cost&runs=merge-gate`); the run kind left browser storage. Each column has a green, white (the card color in dark mode) and red scale from the minimum through the median to the maximum. A strong outline marks the cheapest cell of each table. One legend line explains both.
+- Proof: `phases/86/proof/before-*` (the phase 85 after shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, and phone width).
+- Tests: 45 in `test_control` pass; basedpyright 0/0/0.

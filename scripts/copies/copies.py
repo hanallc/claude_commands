@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, cancellation, conf, copy_record, file_lock, git_index, scratch
+from scripts.lib import build_folders, cancellation, cargo_target_config, conf, copy_record, file_lock, git_index, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -680,14 +680,37 @@ else:
     GateDirectoryBase = tempfile.TemporaryDirectory
 
 
+def cargo_output_outside(checkout: Path) -> bool:
+    """Resolve Cargo's folder settings from its config files, so a tree with no outside output starts no Cargo.
+    An unreadable setting counts as outside output, and the guard reads it from Cargo."""
+    if not (checkout / "Cargo.toml").is_file():
+        return False
+    environment = dict(os.environ)
+    cwd = str(checkout)
+    cargo_home = cargo_target_config.cargo_home_folder(cwd, environment)
+    inside = checkout.resolve()
+    try:
+        settings = cargo_target_config.cargo_folder_settings([], cwd, environment)
+        folders = [Path(cargo_target_config.cargo_build_folder(setting, [], cwd, cargo_home) if key == "build-dir"
+                        else os.path.realpath(setting.base / setting.value)) for key, setting in settings.items()]
+    except (OSError, ValueError):
+        return True
+    return any(not folder.is_relative_to(inside) and os.path.lexists(folder) for folder in folders)
+
+
 class GateCheckoutDirectory(GateDirectoryBase):
-    """Remove a private gate folder and report a removal failure separately."""
+    """Remove a private gate folder and its Cargo build folder; report a removal failure separately."""
 
     @override
     def cleanup(self) -> None:
         caller_error = sys.exception()
+        remove_tree = super().cleanup
+        tree = Path(self.name)
         try:
-            super().cleanup()
+            if cargo_output_outside(tree / "checkout"):
+                scratch.remove_with_cargo_output(tree, lambda _path: remove_tree())
+            else:
+                remove_tree()
         except OSError as error:
             raise PostUseError(f"{self.name}: fresh copy removal failed: {error}",
                                caller_error=caller_error) from error
@@ -863,31 +886,32 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         **(record.fields if isinstance(record, copy_record.Registered) else {}),
         "test_hana_clone": True, "source_path": str(source.resolve()),
     }, scratch_settings=scratch_settings)
-    checkout = path / "checkout"
     try:
-        # The task folder keeps one lock path while its checkout gains Git metadata.
+        # The task folder is the checkout, so its cargo build folder has the task folder's name.
         with claim_tree(path, create=False) as state:
             if state is not ClaimState.ACQUIRED:
                 raise CopyError(f"{path}: task folder is busy")
-            checkout.mkdir()
-            initialize_git(checkout, source.resolve())
-            _ = git(checkout, "reset", "--hard", "--quiet")
+            initialize_git(path, source.resolve())
+            scratch.exclude_copy_metadata(path)
+            _ = git(path, "reset", "--hard", "--quiet")
             from scripts.accounts import accounts
 
             if accounts.source_has_claude_trust(source):
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
-                    "claude_trust_folder": str(checkout.resolve()),
+                    "claude_trust_folder": str(path.resolve()),
                 }, scratch_settings=scratch_settings)
-                accounts.set_claude_folder_trust(checkout, trusted=True)
-            source_commit = git(checkout, "rev-parse", "HEAD").decode().strip()
+                accounts.set_claude_folder_trust(path, trusted=True)
+            source_commit = git(path, "rev-parse", "HEAD").decode().strip()
             _ = scratch.update_record(path, lambda record: {
                 **(record.fields if isinstance(record, copy_record.Registered) else {}),
                 "source_commit": source_commit,
             }, scratch_settings=scratch_settings)
+        # The claim began before .git existed; later claims lock .git/.claude-busy.
+        (path / scratch.BUSY).unlink(missing_ok=True)
     except (OSError, CopyError) as error:
         raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
-    return checkout
+    return path
 
 
 def apply_changes(tree: Path, worktree: Path, base: str) -> None:
@@ -1201,6 +1225,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                write_cache_build_dir(tree, cache / "target")
                 path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
@@ -1213,6 +1238,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 if isinstance(cache_lease, GateLease):
                     caller_error = sys.exception()
                     try:
+                        cache_build_dir_config(tree).unlink(missing_ok=True)
                         refresh_remotes(tree, source)
                         mark_target(cache_lease.tree)
                         commit = commit_at(tree, "HEAD")
@@ -1224,6 +1250,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def cache_build_dir_config(tree: Path) -> Path:
+    """Cargo reads this file in the gate folder above the checkout, outside the repository."""
+    return tree.parent / ".cargo" / "config.toml"
+
+
+def write_cache_build_dir(tree: Path, build_dir: Path) -> None:
+    """Put the gate's Cargo intermediates in the leased cache, so each gate builds warm.
+    The lease holds the cache for one gate at a time, so two gates never share one build-dir.
+    The file overrides the user's global build-dir; a repository's own Cargo config still wins."""
+    config = cache_build_dir_config(tree)
+    config.parent.mkdir(exist_ok=True)
+    write_text_atomic(config, f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
 
 
 def manifest_path_files(tree: Path) -> set[str]:
@@ -1942,7 +1982,8 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
             yield
         finally:
             COMMAND_LOCKS.reset(token)
-            if not tree.parent.exists():
+            # The parent lease guards the sibling lock; with both gone it guards nothing.
+            if not tree.exists() and not floor_claims.mirror_lock_path(tree).exists():
                 parent_lock.unlink(missing_ok=True)
             # Closing releases only our descriptor. Live children retain the flock.
 
@@ -2076,8 +2117,13 @@ def mirror_remove(args: CopyArguments) -> int:
             if tree.exists():
                 write_text_atomic(authority, json.dumps(raw) + "\n")
                 task_record = copy_record.record_path(tree)
-                if task_record is not None and task_record.parent != tree:
+                # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
+                if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
                     scratch.remove_marked(task_record.parent, scratch.remove)
+                    # A task clone is its task folder, so its lock files sit in the scratch root.
+                    if task_record.parent == tree.resolve():
+                        for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
+                            lock.unlink(missing_ok=True)
                 else:
                     clear_mirror_content(tree)
                     tree.rmdir()

@@ -135,7 +135,7 @@ HOLD_WAIT_DIR=$TEST_EVENT_ROOT/waits
 BOARD_DIR=$UNIT_RUN_DIR
 ROUTING_WAIT_STARTED="" PHASE_RESOURCE_WAIT="" PLACEMENT_WAIT_MEMORY=0
 BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/hold-seconds
-BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_EVENT_ROOT/event-client.py
+BUILDLOG_QUEUE_PLACE_SCRIPT=$TEST_EVENT_ROOT/event-client.py
 BUILDLOG_MEM_WAIT_SINCE=100
 BUILDLOG_MEM_WAIT_FIRST_FILE=$HOLD_WAIT_DIR/first-queued-at
 buildlog_memory_python() { "$PY" "$@"; }
@@ -910,8 +910,8 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
             "TEST_TAPLO_EVENTS": str(self.fixture.root / "taplo-events.jsonl"), "TEST_TAPLO_STATUS": "0",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})
         process = self.start("lint", "sample")
-        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 2, "both Mac judgments", (process,),
-                                directory=self.fixture.runner_state)
+        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 3, "the Mac judgments and fix pass",
+                                (process,), directory=self.fixture.runner_state)
         self.fixture.wait_until(lambda: sum(row["event_type"] == "wait_started" for row in wait_rows(session)) == 2,
                                 "the local repair interval", (process,), directory=session)
         self.assertFalse(any(row["args"][:1] == ["mend"] and "--fix" in row["args"]
@@ -925,7 +925,7 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
                             for row in self.fixture.cargo_events()))
         arguments = [row["args"] for row in self.fixture.runner_events()]
         self.assertEqual([words[words.index("--verb") + 1] for words in arguments],
-                         ["mend-check", "clippy", "clippy"])
+                         ["mend-check", "mend-fix", "clippy", "clippy"])
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, main_push_lock
+from scripts.lib import build_folders, cancellation, conf, main_push_lock, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review  # noqa: E402
@@ -159,6 +159,7 @@ class GateArguments(argparse.Namespace):
     promote_only: bool = False
     full: bool = False
     nightly: bool = False
+    modules: list[str] = field(default_factory=list)
 
 
 class SuiteMode(Enum):
@@ -1817,8 +1818,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     return run
 
 
-def promotion_edit_conflict(repo: Path, target: str) -> str:
-    """Name local edits on paths that the promotion changes."""
+def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
+    """Name local edits on paths that the promotion changes.
+
+    Files that the pathspec `waiting` names hold waiting rows; the move keeps them.
+    """
     environment = dict(os.environ)
     _ = environment.pop("GIT_INDEX_FILE", None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
@@ -1836,7 +1840,9 @@ def promotion_edit_conflict(repo: Path, target: str) -> str:
             _ = git("read-tree", "HEAD", index=index)
             files = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--", index=index)
         promoted = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", target, "--")
-        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - {b""})
+        kept: set[bytes] = set(git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--",
+                                   waiting).split(b"\0")) if waiting else set()
+        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - kept - {b""})
         if conflicts:
             return "promotion refused: tracked edits overlap promotion: " + "; ".join(
                 json.dumps(os.fsdecode(path)) for path in conflicts)
@@ -1845,10 +1851,50 @@ def promotion_edit_conflict(repo: Path, target: str) -> str:
     return ""
 
 
+def live_state_refusal(repo: Path, target: str) -> str:
+    """Run the target tree's live state checks before its code is installed."""
+    with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
+        tree = Path(temporary)
+        try:
+            archive = subprocess.run(["git", "archive", "--format=tar", target], cwd=repo, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, check=True).stdout
+            _ = subprocess.run(["tar", "-x", "-C", str(tree)], input=archive, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"promotion refused: live state check could not export {target}: {error}"
+        settings = tree / "config" / "merge_gate.conf"
+        if not settings.exists():
+            return ""
+        # A target tree from before these checks names none.
+        config = conf.read(settings)
+        if "live_state_checks" not in config.values():
+            return ""
+        try:
+            checks = config.words("live_state_checks")
+            seconds = config.whole("live_state_check_seconds")
+        except conf.Unusable as error:
+            return f"promotion refused: live state check settings: {error}"
+        environment = {**os.environ, "PYTHONPATH": str(tree), "PYTHONDONTWRITEBYTECODE": "1"}
+        for module in checks:
+            if not (tree / Path(*module.split("."))).with_suffix(".py").exists():
+                return f"promotion refused: live_state_checks names {module}, absent from {target}"
+            try:
+                result = subprocess.run([sys.executable, "-m", module, "state-check"], cwd=tree, env=environment,
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                        timeout=seconds, check=False)
+            except (OSError, subprocess.SubprocessError) as error:
+                return f"promotion refused: {module} state-check failed to run: {error}"
+            if result.returncode:
+                detail = "; ".join(failure_detail(result, lines=1).splitlines())
+                return (f"promotion refused: {target} cannot read live state: {module}: {detail}; "
+                        "run its conversion before the land")
+    return ""
+
+
 # Send the same function to a Mac without repository Python modules.
 PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pathlib import Path\n"
                            + inspect.getsource(promotion_edit_conflict)
-                           + "reason = promotion_edit_conflict(Path.cwd(), sys.argv[1])\n"
+                           + "reason = promotion_edit_conflict(Path.cwd(), *sys.argv[1:3])\n"
                            + "if reason: print(reason)\nraise SystemExit(bool(reason))\n")
 
 
@@ -1942,19 +1988,27 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             target = record.commit
         if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
-        if conflict := promotion_edit_conflict(main_repo, target):
+        if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
+        if refusal := live_state_refusal(main_repo, target):
+            raise GateRefused(refusal)
         write_push_record(path, RecordedPush(origin, target, target))
-        _ = checked_git(main_repo, "merge", "--ff-only", target)
+        try:
+            waiting_rows.move_to(main_repo, target)
+        except (OSError, UnicodeError) as error:
+            raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
         _ = checked_git(main_repo, "push", "origin", "main")
         promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
+              "if [ -f scripts/lib/waiting_rows.py ]; "
+              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward origin/main; "
+              f"else {check} && git merge --ff-only -q origin/main; fi); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, args.mac_host, remote],
@@ -2560,6 +2614,8 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
+    _ = parser.add_argument("--module", action="append", default=[], dest="modules",
+                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
 
 
 class CloudGateRoute(Protocol):
@@ -2631,13 +2687,24 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
+def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
+    """Run only the named modules, as a merge red's check on its base.
+
+    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
+    """
+    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
+                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+                      time_limit=gate_record.NoGateTimeLimit("named modules"))
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = run_gate_suites(repo, args.type_dirs,
-                                      module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode)
+                run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
+                       run_gate_suites(repo, args.type_dirs,
+                                       module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
@@ -2686,6 +2753,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --merge-branch")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
+    if args.modules and not args.tests_only:
+        parser.error("--module needs --tests-only")
     if args.nightly:
         args.type_dirs = list(NIGHTLY_TYPE_DIRS)
     if not args.tests_only and not args.promote_only and not args.nightly:

@@ -47,6 +47,8 @@ else:
     placement = _DeferredPlacement()
 from scripts.lib import process_start as process_identity
 from scripts.mac_test.abandoned_sessions import removal_script
+from scripts.mac_test import fix_return
+from scripts.mac_test.fix_return import FIX_NOT_RUN, FixResult
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
 from scripts.direct.step_selection import Pinned
@@ -77,6 +79,8 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+# The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
+MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
 
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
@@ -172,6 +176,7 @@ class PassedOnMac:
     seconds: float
     fetch: FetchResult = FetchNotRun()
     build_target_directory: str = ""
+    fix: FixResult = FIX_NOT_RUN
 
 
 @dataclass(frozen=True)
@@ -1180,7 +1185,9 @@ def write_result(
             "only a test that must run on Linux may rerun with --local to run it on natedev."
             if verb == "nextest" else "fix the finding in the local worktree; the mirror sends no edits back."
         )
-        if target:
+        if verb == "mend-fix":
+            print("mac_test: the Mac fix pass did not pass; natedev repairs the tree")
+        elif target:
             print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
         else:
             print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
@@ -1202,6 +1209,7 @@ def write_result(
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
+    fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
     if isinstance(destination, ResultFile):
         holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
@@ -1216,11 +1224,14 @@ def write_result(
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
-            + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else ""),
+            + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else "")
+            + (f"fix={fix_return.fix_word(fixed)}\n" if verb == "mend-fix" else ""),
             encoding="utf-8",
         )
     if isinstance(fetch, FetchFolder):
         report_fetch(fetch, fetched)
+    if verb == "mend-fix" and isinstance(result, PassedOnMac):
+        report_fix(fixed)
     return status
 
 
@@ -1337,8 +1348,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     if isinstance(request.placement, AssignedOffloadRequest):
         assignment = request.placement.assignment
         if isinstance(request.admission, UnclaimedMacRun):
-            identity = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-                placement.attempt_key(assignment.episode, assignment.attempt)).hex, assignment.episode, assignment.attempt)
+            identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                                 assignment.episode, assignment.attempt)
         leased_slots = (assignment.destination.slot,) if assignment.destination.slot else ()
     session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
                else claim_state.session_id(request.admission.submitting_session))
@@ -1779,6 +1790,27 @@ def escape_rsync_filter_path(path: str) -> str:
     return escaped
 
 
+# No trailing slash: a gate checkout's target is a symlink to the gate cache, not a folder.
+MIRROR_EXCLUDES = "/.git\n/target\n"
+
+
+@contextmanager
+def mirror_exclude_file(ignored: tuple[str, ...]) -> Generator[Path, None, None]:
+    """Write the rsync filter that keeps the mirror's own and git-ignored paths out of a copy."""
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", prefix="mac-test-exclude-", delete=False
+    ) as exclude_file:
+        exclude_path = Path(exclude_file.name)
+        try:
+            _ = exclude_file.write(MIRROR_EXCLUDES)
+            for path in ignored:
+                _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
+            exclude_file.flush()
+            yield exclude_path
+        finally:
+            exclude_path.unlink(missing_ok=True)
+
+
 def copy_tree(
     controller: ProcessController,
     config: OffloadConfig,
@@ -1793,20 +1825,10 @@ def copy_tree(
         return False
     mirror = request_mirror(config, request, repository)
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", prefix="mac-test-exclude-", delete=False
-        ) as exclude_file:
-            exclude_path = Path(exclude_file.name)
-            try:
-                _ = exclude_file.write("/.git\n/target/\n")
-                for path in ignored:
-                    _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
-                exclude_file.flush()
-                result = controller.capture_copy(copies.remote_rsync(
-                    request.source_root, mirror, exclude_path, ssh_options(config.connection)))
-                return isinstance(result, CommandOutput) and result.status == 0
-            finally:
-                exclude_path.unlink(missing_ok=True)
+        with mirror_exclude_file(ignored) as exclude_path:
+            result = controller.capture_copy(copies.remote_rsync(
+                request.source_root, mirror, exclude_path, ssh_options(config.connection)))
+            return isinstance(result, CommandOutput) and result.status == 0
     except OSError as error:
         controller.copy_failure_detail = f"copy: {error}"
         return False
@@ -1924,10 +1946,16 @@ def remote_test_command(
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
+    # The Mac cargo gate passes a placed run; its folder stays ahead of the real cargo.
+    mac_placement = (
+        "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
+        if isinstance(request.placement, AssignedOffloadRequest) else ""
+    )
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
-        'PATH="$HOME/.cargo/bin:$PATH" '
+        f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
+        f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
         f"{repo_identity}"
@@ -2044,6 +2072,71 @@ def fetch_folder(
     finally:
         if owns_partial and partial.exists():
             shutil.rmtree(partial)
+
+
+def return_fix(
+    controller: ProcessController,
+    config: OffloadConfig,
+    request: OffloadRequest,
+    repository: KnownRepository,
+    sent_tree_key: TreeKey,
+) -> FixResult:
+    """Bring a passed Mac fix pass back under the run's claim.
+
+    The worktree receives the files only when its tree key still equals the key
+    the copy sent. Any other worktree keeps its own edits, and natedev repairs it.
+    """
+    from scripts.mac_test import floor_claims
+
+    if not isinstance(sent_tree_key, KnownTreeKey):
+        return fix_return.FixRefused("the copy sent no tree key")
+    ignored = ignored_paths(controller, request.repo_root)
+    if isinstance(ignored, IgnoredPathListingFailed):
+        return fix_return.FixFailed("git did not list the ignored paths")
+    mirror = remote_mirror(repository, request.target, request.slot)
+    transport = ["-e", shlex.join(["ssh", *ssh_options(config.connection)])]
+    metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
+    root = request.repo_root
+    try:
+        with mirror_exclude_file(ignored) as exclude_path:
+            listing = controller.capture([
+                "rsync", "-rlpc", "--dry-run", "--itemize-changes", "--delete", *metadata,
+                f"--exclude-from={exclude_path}", *transport, f"{config.host}:{mirror}/", f"{root}/",
+            ])
+        if not isinstance(listing, CommandOutput) or listing.status != 0:
+            return fix_return.FixFailed("the Mac mirror could not be compared with the worktree")
+        changes = fix_return.parse_itemized(listing.stdout)
+        if isinstance(changes, fix_return.MirrorChanges):
+            changes = fix_return.without_ignored(root, changes)
+        if isinstance(changes, fix_return.FixFailed):
+            return changes
+        if not changes.changed and not changes.removed:
+            return fix_return.FixNone()
+        with tempfile.TemporaryDirectory(prefix="mac-fix-") as staging:
+            if changes.changed:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="mac-fix-files-") as names:
+                    _ = names.write("".join(f"{path}\n" for path in changes.changed))
+                    names.flush()
+                    fetched = controller.capture([
+                        "rsync", "-lpc", "--files-from", names.name, *transport,
+                        f"{config.host}:{mirror}/", f"{staging}/",
+                    ])
+                if not isinstance(fetched, CommandOutput) or fetched.status != 0:
+                    return fix_return.FixFailed("the changed files could not be fetched from the Mac")
+            return fix_return.apply_fix(root, Path(staging), changes,
+                                        lambda: read_tree_key(root) == sent_tree_key)
+    except OSError as error:
+        return fix_return.FixFailed(str(error))
+
+
+def report_fix(result: FixResult) -> None:
+    if isinstance(result, fix_return.FixApplied):
+        count = len(result.changed) + len(result.removed)
+        print(f"mac_test: the Mac fix pass passed; wrote {count} file{'s' if count != 1 else ''} into the worktree")
+    elif isinstance(result, fix_return.FixNone):
+        print("mac_test: the Mac fix pass passed and changed no file")
+    elif isinstance(result, (fix_return.FixRefused, fix_return.FixFailed)):
+        print(f"mac_test: the Mac fix pass passed, but no file was written: {result.reason}; natedev repairs the tree")
 
 
 def extended_regex_literal(text: str) -> str:
@@ -2245,8 +2338,8 @@ def claim_for_run(
         controller.expected_claim = request.admission.identity
     elif isinstance(request.placement, AssignedOffloadRequest):
         assigned = request.placement.assignment
-        controller.expected_claim = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-            placement.attempt_key(assigned.episode, assigned.attempt)).hex, assigned.episode, assigned.attempt)
+        controller.expected_claim = claim_state.ClaimIdentity(placement.assigned_claim_id(assigned.episode, assigned.attempt),
+                                                              assigned.episode, assigned.attempt)
     if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.expected_claim, claim_state.ClaimIdentity):
         assigned = request.placement.assignment
         identity = controller.expected_claim
@@ -2311,6 +2404,8 @@ def claimed_run(
     evidence.slot = request.slot
     try:
         linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
+        if linux and request.verb == "mend-fix":
+            return declined("target does not permit this command", started)
         if linux:
             expected = expected_linux_parity(controller, config)
             if isinstance(expected, UnavailableToolParity):
@@ -2472,7 +2567,9 @@ def claimed_run(
         if linux and remote_status.status == 75:
             return declined("state", started)
         if remote_status.status == 0:
-            return PassedOnMac(seconds, fetched, remote_status.build_target_directory)
+            fixed = (return_fix(controller, config, request, repository, copied.tree_key)
+                     if request.verb == "mend-fix" else FIX_NOT_RUN)
+            return PassedOnMac(seconds, fetched, remote_status.build_target_directory, fixed)
         if remote_status.status == 4 and request.verb == "nextest":
             return NoTestMatchedOnMac(seconds, fetched)
         return FailedOnMac(remote_status.status, seconds, fetched)
@@ -2518,13 +2615,6 @@ def run_offload(
             write_version_decline(request.target, repository.name)
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
-    if not linux and isinstance(request.source, StagedDocSnapshot):
-        try:
-            if eligibility.has_linux_only(request.source.root, request.package,
-                              eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
-                return declined("linux_only", started)
-        except (OSError, UnicodeError, ValueError):
-            return declined("repo", started)
 
     try:
         with ExitStack() as admission_leases:
@@ -2647,7 +2737,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--repo-root", required=True)
     _ = run.add_argument("--source-root", default="")
     _ = run.add_argument("--package", default="")
-    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc", "build"), default="nextest")
+    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"), default="nextest")
     _ = run.add_argument("--kind", default="")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
@@ -2668,9 +2758,9 @@ def parser() -> argparse.ArgumentParser:
 
 def holder_session() -> str:
     """Use the unit owner session before the shell session."""
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"

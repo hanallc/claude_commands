@@ -2,7 +2,8 @@
 
 `/showrunner:transfer_unit <unit> <receiving showrunner name>` changes a unit's staff parent.
 `scripts/production/transfer_unit.py` implements `plan`, `apply`, and `verify`.
-The giving showrunner supplies the source production name.
+The script takes `<plan|apply|verify> <giving showrunner name> <unit> <receiving showrunner name>`.
+Each name is a staff row `name`; the unit matches by name only.
 
 `build` reads one staff snapshot and resolves both productions through their showrunner rows.
 It searches the giving parent first, then the receiving parent for a repeated transfer.

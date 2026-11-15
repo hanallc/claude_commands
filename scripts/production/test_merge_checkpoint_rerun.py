@@ -7,6 +7,7 @@ import argparse
 import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -62,6 +63,9 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         # Merge commits must be identical in the uninterrupted and resumed cases.
         self.env["GIT_COMMITTER_DATE"] = "2026-11-06T12:00:00-05:00"
         self.env["GIT_AUTHOR_DATE"] = self.env["GIT_COMMITTER_DATE"]
+        # A row records the minute it is added; one fixed clock keeps both cases on the same minute.
+        _ = self.enterContext(patch.object(change_review, "now",
+                                           return_value=datetime.fromisoformat(self.env["GIT_COMMITTER_DATE"])))
         return snapshot
 
     def after_input(self, change: Callable[[Path], object]) -> AbstractContextManager[object]:

@@ -2854,13 +2854,13 @@ class RestartTests(RestartTestCase):
         self.assertIn("staff unavailable", errors.getvalue())
         self.assertEqual(self.launches, [])
 
-    def test_restart_skips_a_saved_name_after_another_row_reuses_it(self) -> None:
+    def test_restart_removes_a_saved_id_with_no_staff_row_and_never_selects_a_row_by_name(self) -> None:
         shutdown_record.save([str(self.rows[0].id), "missing"])
         self.running.clear()
         errors = io.StringIO()
         with redirect_stderr(errors):
             self.assertEqual(restart.restart(), 0)
-        self.assertEqual(shutdown_record.read(), ["missing"])
+        self.assertEqual(shutdown_record.read(), [])
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
         path = shutdown_record.record_path()
         before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
@@ -2872,21 +2872,19 @@ class RestartTests(RestartTestCase):
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
         self.assertEqual(errors.getvalue().splitlines(),
-            ["missing: restart anomaly: in the restart record, no fixed staff id"] * 3)
+            ["missing: restart anomaly: no staff row; removed from the restart record"])
         self.assertEqual(self.stops, [])
 
     def test_restart_saved_conversation_reference_does_not_select_a_member(self) -> None:
         reference = str(self.rows[0].current_session)
         shutdown_record.save([reference])
-        path = shutdown_record.record_path()
-        before = (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
         self.running.clear()
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(restart.restart(), 0)
         self.assertEqual(self.launches, [])
         self.assertEqual(errors.getvalue(),
-            f"{reference}: restart anomaly: in the restart record, no fixed staff id\n")
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns), before)
+            f"{reference}: restart anomaly: no staff row; removed from the restart record\n")
+        self.assertEqual(shutdown_record.read(), [])
 
     def test_restart_command_still_resolves_a_name_without_selecting_saved_entries(self) -> None:
         shutdown_record.save([str(self.rows[1].id), "missing"])
@@ -2903,7 +2901,7 @@ class RestartTests(RestartTestCase):
         self.assertEqual(output.getvalue().splitlines(), [f"restart record: 2 rows saved at {saved_at}",
             "unit-1: live, not in the restart record", "unit-2: live, not in the restart record",
             "unit-0: row-0, unit, workspace live, tab 1 (unit-0)"])
-        self.assertEqual(errors.getvalue(), "gone: restart anomaly: in the restart record, no fixed staff id\n")
+        self.assertEqual(errors.getvalue(), "gone: restart anomaly: no staff row; would leave the restart record\n")
         self.assertEqual(shutdown_record.read(), ["row-0", "gone"])
 
     def test_layout_error_keeps_the_live_rows_and_other_tab_saves(self) -> None:
@@ -2922,8 +2920,55 @@ class RestartTests(RestartTestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(restart.restart(stop_all=True), 0)
         self.assertEqual([name for name, _ in self.launches], [self.rows[0].name])
-        self.assertEqual(shutdown_record.read(), ["missing-row"])
-        self.assertIn("missing-row: restart anomaly: in the restart record, no fixed staff id", errors.getvalue())
+        self.assertEqual(shutdown_record.read(), [])
+        self.assertIn("missing-row: restart anomaly: no staff row; removed from the restart record", errors.getvalue())
+
+    def owner_and_worker(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffSnapshot]:
+        owner = self.rows[0]
+        child = replace(self.rows[1], kind="worker", unit_type=staff.NotUnit(), parent=staff.ReportsTo(owner.id))
+        return owner, child, staff.StaffSnapshot((owner, child))
+
+    def test_stop_all_saves_no_worker_that_a_restart_never_starts(self) -> None:
+        from scripts.production import worker
+
+        owner, child, record = self.owner_and_worker()
+
+        def not_restored(row: staff.StaffRow, _record: staff.StaffSnapshot, *,
+                         runs: dict[str, list[str]] | None = None) -> worker.NotRestored | None:
+            del runs
+            return worker.NotRestored("worker with no active dispatch") if row.id == child.id else None
+
+        with (patch.object(staff, "initial_snapshot", return_value=record),
+              patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([owner, child])),
+              patch.object(restart, "prune_live_rows"),
+              patch.object(restart.stop_resume, "stop_unit_workers", return_value=()) as stop_workers,
+              patch.object(restart, "stop_row", return_value=True) as stop,
+              patch.object(restart, "start_row") as start,
+              patch.object(staff, "row_operation"),
+              patch.object(worker, "not_restored", side_effect=not_restored)):
+            self.assertEqual(restart.stop_all(), 0)
+        self.assertEqual(shutdown_record.read(), [str(owner.id)])
+        self.assertEqual([item.args[0] for item in stop.call_args_list], [owner])
+        stop_workers.assert_called_once()
+        start.assert_not_called()
+
+    def test_restart_removes_a_saved_worker_that_restore_never_starts(self) -> None:
+        from scripts.production import worker
+
+        _owner, child, record = self.owner_and_worker()
+        shutdown_record.save([str(child.id)])
+        for dry_run, saved, action in ((True, [str(child.id)], "would leave"), (False, [], "removed from")):
+            with (self.subTest(dry_run=dry_run),
+                  patch.object(staff, "initial_snapshot", return_value=record),
+                  patch.object(worker, "not_restored", return_value=worker.NotRestored("Codex worker in no-worker mode")),
+                  patch.object(restart, "live_rows", return_value=restart.CompleteLiveRows([])),
+                  patch.object(restart, "start_row") as start,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(restart.restart(dry_run=dry_run), 0)
+                self.assertEqual(shutdown_record.read(), saved)
+                start.assert_not_called()
+                self.assertIn(f"{child.name}: restart anomaly: Codex worker in no-worker mode; {action} the restart record\n",
+                              errors.getvalue())
 
     def test_stop_all_saves_each_row_before_stop_and_starts_nothing(self) -> None:
         def stop(identity: str, *, deadline: float = math.inf,
@@ -3015,9 +3060,11 @@ class RestartTests(RestartTestCase):
         for command in (["stop", "--all"], ["restart", "--all"]):
             with self.subTest(command=command):
                 shutdown_record.save(["down-row"])
-                with patch.object(pane_launch, "reference_panes", return_value=[panes[0], duplicate]):
+                with (patch.object(pane_launch, "reference_panes", return_value=[panes[0], duplicate]),
+                      redirect_stderr(io.StringIO())):
                     self.assertEqual(shutdown.main(command), 0)
-                self.assertEqual(shutdown_record.read(), ["down-row"])
+                # A restart removes the saved id with no staff row; a stop reads no saved ids.
+                self.assertEqual(shutdown_record.read(), ["down-row"] if command[0] == "stop" else [])
                 self.assertIn(str(row.current_session), self.running)
                 self.assertEqual((self.stops, self.launches), ([], []))
 

@@ -24,7 +24,8 @@ from scripts.buildlog import store
 from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
-from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib import copy_record
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import linux_runner
@@ -42,12 +43,60 @@ class DiskTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
         self.enterContext(mock.patch.dict(os.environ, {
             "LINT_SWEEP_STATE_DIR": str(root / "sweep"), "USER_ZONE": "America/New_York",
+            copy_record.ROOT_ENV: str(root / "tmp" / "scratch"),
         }))
         _ = (root / "buildlog.conf").write_text(
             "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+
+    def test_mapping_asks_cargo_only_for_checkouts_no_saved_row_maps(self) -> None:
+        base = self.base()
+        rows: dict[str, CargoOutputRoots] = {}
+        for name in ("saved", "new"):
+            for checkout in (base / name, base / name / "member"):
+                checkout.mkdir(parents=True)
+                _ = (checkout / "Cargo.toml").write_text("[package]\n")
+            rows[name] = CargoOutputRoots(base / name, base / name / "target", base / "build" / name)
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((rows["saved"],)))
+        with mock.patch.object(disk, "read_cargo_output_roots", return_value=rows["new"]) as read:
+            outputs, unavailable = disk.mapped_output_paths([("base", str(base))])
+            again, _ = disk.mapped_output_paths([("base", str(base))])
+        read.assert_called_once_with(base / "new")
+        self.assertEqual(unavailable, [])
+        expected = sorted(path for row in rows.values() for path in (row.target_directory, row.build_directory))
+        self.assertEqual((outputs, again), (expected, expected))
+        self.assertIn(rows["new"], sweep.saved_cargo_output_roots().workspaces)
+
+    def test_an_unreadable_checkout_is_read_again_only_after_its_manifest_changes(self) -> None:
+        base = self.base()
+        checkout = base / "broken"
+        checkout.mkdir()
+        manifest = checkout / "Cargo.toml"
+        _ = manifest.write_text("[package\n")
+        failed = CargoOutputUnavailable("failed to parse manifest")
+        with mock.patch.object(disk, "read_cargo_output_roots", return_value=failed) as read:
+            first = disk.mapped_output_paths([("base", str(base))])
+            second = disk.mapped_output_paths([("base", str(base))])
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(first, second)
+            self.assertEqual(first[1], [f"{checkout}: failed to parse manifest"])
+            _ = manifest.write_text("[package]\nname = 'broken'\n")
+            _ = disk.mapped_output_paths([("base", str(base))])
+            self.assertEqual(read.call_count, 2)
+        checkout_rows = disk.saved_unreadable()
+        self.assertEqual(list(checkout_rows), [checkout])
+        self.assertEqual(checkout_rows[checkout].manifest_size, manifest.stat().st_size)
+
+    def test_scanned_folders_add_the_scratch_root_only_outside_the_folders(self) -> None:
+        base = self.base()
+        folders = [("tmp", str(base / "tmp"))]
+        for scratch, expected in ((base / "build" / "scratch", [*folders, ("scratch", str(base / "build" / "scratch"))]),
+                                  (base / "tmp" / "scratch", folders)):
+            with (self.subTest(scratch=scratch), mock.patch.object(disk, "FOLDERS", folders),
+                  mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch)})):
+                self.assertEqual(disk.scanned_folders(), expected)
 
     def test_linux_capacity_checks_the_external_output_device(self) -> None:
         base = self.base()
@@ -317,6 +366,7 @@ class DiskTests(unittest.TestCase):
             with (
                 self.subTest(previous=label),
                 mock.patch.object(disk, "FOLDERS", [("first", "first"), ("second", "second")]),
+                mock.patch.dict(os.environ, {copy_record.ROOT_ENV: "first/scratch"}),
                 mock.patch.object(disk, "read_floor", return_value=None),
                 mock.patch.object(disk, "read_snapshot", return_value=previous),
                 mock.patch.object(disk, "datetime", wraps=datetime, now=clock),

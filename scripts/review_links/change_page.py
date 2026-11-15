@@ -9,6 +9,7 @@ except FileNotFoundError:
 import argparse
 import html
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -38,7 +39,9 @@ from scripts.review_links import review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
+REBUILDS_NAME = "rebuilds.html"
 BROWSER_MANIFEST = ".review-link-browser.json"
+CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
@@ -49,10 +52,15 @@ class BrowserManifest(TypedDict):
     initial: str
 
 
+type ReviewKind = Literal["changes", "questions"]
+TITLES: dict[ReviewKind, str] = {"changes": "Changes to review", "questions": "Questions to answer"}
+
+
 @dataclass(frozen=True)
 class ReviewBrowser:
     token: str
     initial: str = ""
+    kind: ReviewKind = "changes"
 
 
 class PageManifest(TypedDict):
@@ -128,6 +136,9 @@ class SentCloseoutAlerts(TypedDict):
     messages: list[str]
 
 
+QuestionOutcome = Literal["answer", "followup", "skip"]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -136,6 +147,8 @@ class StoredUserAnswer(TypedDict):
     question: str
     answer: str
     message: str
+    # A record saved before follow-ups and skips has no kind; it is an answer.
+    kind: NotRequired[QuestionOutcome]
 
 
 @dataclass(frozen=True)
@@ -394,10 +407,10 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
-def document(content: str) -> bytes:
+def document(content: str, title: str = TITLES["changes"]) -> bytes:
     return ('''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Changes to review</title><style>
+<title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
 h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
@@ -485,11 +498,29 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
-    """Render review text as escaped text blocks and consecutive list runs."""
+LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def linked(text: str) -> str:
+    """Escape text and make each http or https address a link that opens in the same tab, outside the console frame."""
+    pieces = LINK.split(text)
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_top">{html.escape(piece)}</a>'
+                   if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
+
+
+def inline_html(text: str) -> str:
+    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
+    pieces = CODE_SPAN.split(text)
+    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{html.escape(text)}</{block}>"
+        return f"<{block}>{escape(text)}</{block}>"
     content: list[str] = []
     current = ""
     for line in lines:
@@ -507,9 +538,9 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
-            content.append(f"<li>{html.escape(item)}</li>")
+            content.append(f"<li>{escape(item)}</li>")
         elif tag:
-            content.append(html.escape(line))
+            content.append(escape(line))
         current = tag
     if current:
         content.append(f"</{current}>")
@@ -862,6 +893,26 @@ class DeliveryFailure:
     error: str
 
 
+def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
+                      pause: float) -> list[DeliveryFailure]:
+    """Send to all remaining recipients in each round, pause between rounds, and return the last failures."""
+    remaining = recipients
+    failures: list[DeliveryFailure] = []
+    for attempt in range(tries):
+        if not remaining:
+            break
+        failures = []
+        for target in remaining:
+            try:
+                send_to_staff(target, sender, message)
+            except SEND_ERRORS as error:
+                failures.append(DeliveryFailure(target, str(error)))
+        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
+        if remaining and attempt + 1 < tries:
+            time.sleep(pause)
+    return failures
+
+
 def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
     """Deliver each saved message and report exhausted attempts to its showrunner."""
     if isinstance(delivery, NoMessageDelivery):
@@ -878,22 +929,8 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
             _ = status.request_attempts.pop(delivery.attempt, None)
             return
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
-    remaining = delivery.recipients
-    failures: list[DeliveryFailure] = []
-    if not remaining:
-        failures.append(DeliveryFailure(MissingRecipient(), "no showrunner to send to"))
-    for attempt in range(tries):
-        if not remaining:
-            break
-        failures = []
-        for target in remaining:
-            try:
-                send_to_staff(target, SENDER, delivery.message)
-            except SEND_ERRORS as error:
-                failures.append(DeliveryFailure(target, str(error)))
-        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
-        if remaining and attempt + 1 < tries:
-            time.sleep(pause)
+    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
+                else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
     alert_delivery_failures(delivery, failures, tries)
     status.record(delivery)
 
@@ -1000,7 +1037,8 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 question = next((item for item in update_registration.question_records_for_document(page.production, identities)
                                  if item.path == page.review_list), None)
-                if question is None or question.status != "closed":
+                # An answer closes its question; a follow-up or a skip leaves it open.
+                if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):
@@ -1023,22 +1061,45 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                         del status.request_attempts[attempt]
 
 
-def publish_browser(initial: str = "") -> str:
-    """Publish one all-list page without copying change records."""
-    root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
-        source = Path(temporary) / PAGE_NAME
-        _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
-        url = review_link.snapshot_at(root, [source], new=True)[0]
-    folder = root / urlsplit(url).path.split("/")[1]
-    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
-    atomic_file.write_bytes_atomic(folder / BROWSER_MANIFEST, json.dumps(manifest).encode(), mode=0o600)
-    return url
+def console_folder(root: Path) -> Path:
+    """Create the fixed console folder and its browser token once; later calls keep both."""
+    folder = root / CONSOLE_FOLDER
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = folder / BROWSER_MANIFEST
+    if target.exists():
+        return folder
+    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": ""}
+    draft = folder / f"{BROWSER_MANIFEST}.{secrets.token_hex(8)}"
+    atomic_file.write_bytes_atomic(draft, json.dumps(manifest).encode(), mode=0o600)
+    try:
+        # A link never replaces a token that a concurrent first request created.
+        os.link(draft, target)
+    except FileExistsError:
+        pass
+    finally:
+        draft.unlink()
+    return folder
+
+
+def console_url() -> str:
+    """Return the fixed console address; the server renders it from the current code at each request."""
+    return f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}/{CONSOLE_FOLDER}/"
 
 
 def page_url() -> str:
-    """Publish the Changes page and return its path under the review root."""
-    return urlsplit(publish_browser()).path
+    """Return the fixed Changes page path under the review root."""
+    _ = console_folder(review_link.review_root().resolve())
+    return f"/{CONSOLE_FOLDER}/{PAGE_NAME}"
+
+
+def questions_url() -> str:
+    """Return the Questions page: the same browser, limited to questions."""
+    return page_url() + "?type=questions"
+
+
+def rebuilds_url() -> str:
+    """Return the open rebuild needs beside the console's browser."""
+    return page_url().rsplit("/", 1)[0] + "/" + REBUILDS_NAME
 
 
 def main(arguments: list[str]) -> int:
@@ -1072,9 +1133,7 @@ def main(arguments: list[str]) -> int:
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
-            from scripts.review_links import console
-
-            print(console.publish())
+            print(console_url())
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")

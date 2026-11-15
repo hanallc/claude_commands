@@ -303,6 +303,11 @@ This record changes no selection and refuses no run.
 
 **Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
+This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
+A red module runs once more alone, as in the gate.
+The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
+`--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -631,14 +636,23 @@ The daily rule removes these jobs from default gates.
 2. Verify that the promotion checkout uses main and has an eligible recorded tip.
 3. Verify the settings blob and ancestry of `origin/<merge branch>`.
 4. Check edited paths against the target through `promotion_edit_conflict(repo, target)`.
-5. Record the exact source commit and base for push recovery.
-6. Fast-forward local main and push it.
-7. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
+5. Check live stored state with the target code through `live_state_refusal(repo, target)`.
+6. Record the exact source commit and base for push recovery.
+7. Fast-forward local main and push it.
+8. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
 
 `promotion_edit_conflict` refuses only edited paths that the promotion also changes.
 A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
 The live index and edits stay unchanged; untracked files do not count.
 Local, Mac, and checkpoint promotion use this function.
+
+`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/merge_gate.conf`.
+It runs each listed module from that tree as `python3 -m <module> state-check`, within `live_state_check_seconds`.
+A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/merge_gate.conf` or without the `live_state_checks` key has no checks.
+A nonzero exit refuses the promotion before main moves, and names the module and its last error line.
+The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
+The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
+It exists because the Phase 44 re-land on 2026-11-14 promoted a strict reader over old-shape rows and stopped the service.
 A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
 Tree equality alone does not authorize that push.
 The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.
@@ -647,8 +661,9 @@ A failed Mac advance names the published local commit and leaves retry to main s
 - **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
   The `claude-sync` job runs every 15 minutes on both machines.
   It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  A `config/*.conf` edit that changes only setting values is a waiting row, not a tracked edit; the advance keeps it live.
   An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
-  It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
+  It removes those untracked files, restores those tracked files to HEAD, then advances with `waiting_rows.move_to`.
   A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
   An untracked path that collides with a path origin/main adds also blocks as `dirty`: `dir` blocks an incoming `dir/file`, and `dir/file` blocks an incoming file `dir`.
   The `dirty` detail names each path that blocks the update, or the last line of each git output stream when git cannot list them.
@@ -686,17 +701,22 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
-2. Check each item and make its own merge commit.
-3. Test all code paths changed from the published merge branch tip through HEAD once.
-4. Use one `tested_main_push` hold, one push, and one local promotion.
-5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+1. Take the production merge lock once.
+2. Resume each item that the merge branch already contains through the single command's route, in file order.
+3. Retain the starting tip and whether a merge is unfinished.
+4. Check each remaining item and make its own merge commit.
+5. Test all code paths changed from the published merge branch tip through HEAD once.
+6. Use one `tested_main_push` hold, one push, and one local promotion.
+7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
+A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
-Those paths still select tests when only shrink or as-built items remain.
+An interrupted batch's merged item retests its unpublished paths when it resumes.
+A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
@@ -732,7 +752,7 @@ Full tests, probes, main retests, and all retries append to that log.
 The search restores the starting tip and drops the causing item and that unit's later items.
 A cancelled probe or another non-red stop drops every candidate with that stop.
 A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-Already-merged items receive `resume it alone with the single command`.
+A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
 The push start is the boundary for drop, reset, and retry.
 Once the push starts, a failure drops no items and starts no batch reset or retry.
 Only `push_rollback` can undo a failed push after it checks the live origin.
@@ -740,7 +760,8 @@ Each item receives the stop report.
 
 `test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows include a shrink-only retry.
+The interruption rows resume the merged item alone, including a shrink-only batch.
+The rerun row resumes the promotion of two pushed items and then lands a new item.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
 They also land a clean item after two holds and remove a held unit's later item.
 The history rows merge closing items for an older plan after the configured plan changes.

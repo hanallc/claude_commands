@@ -254,6 +254,10 @@ buildlog_sample_anon() {
                                     fi
                                 done < <(readlink "${executables[@]}" 2>/dev/null)
                             fi
+                            # nextest_tokens.py wrote its width before the tests started.
+                            if [[ "$phase_started" != null && -n "${LINT_NEXTEST_WIDTH_FILE:-}" ]]; then
+                                buildlog_token_phase_context "$sampling_context" "${@:6}"
+                            fi
                         fi
                         if [[ "$phase_started" != null ]]; then
                             if [[ "$phase_peak" == null ]] || (( use > phase_peak )); then
@@ -289,6 +293,17 @@ buildlog_sample_anon() {
         fi
         sleep 1
     done
+}
+
+# Recompute the test-phase context at the width the token holder took.
+buildlog_token_phase_context() {
+    local sampling_context=$1 threads="" context
+    shift
+    [[ -s "$LINT_NEXTEST_WIDTH_FILE" ]] && IFS= read -r threads < "$LINT_NEXTEST_WIDTH_FILE" || return 0
+    [[ "$threads" =~ ^[1-9][0-9]*$ ]] || return 0
+    context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" \
+        "${@:1:4}" "$threads" "${@:6}") || return 0
+    [[ "$context" != \{*\} ]] || phase_context=$context
 }
 
 buildlog_finish_memory() {
@@ -398,9 +413,12 @@ run_step_attempt() {
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
-    if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
-        nextest_share_claim "$@"
-        set -- "${LINT_NEXTEST_SHARED_ARGV[@]}"
+    local holder=() LINT_NEXTEST_WIDTH_FILE=""
+    if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
+          && "${4:-}" == --test-threads ]]; then
+        LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
+        holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" --pool "$LINT_NEXTEST_POOL"
+                --width-file "$LINT_NEXTEST_WIDTH_FILE" --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
     elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
         nextest_thread_report "$@"
     fi
@@ -423,7 +441,7 @@ run_step_attempt() {
     if [[ -t 1 ]]; then
         tty=1
         set +e
-        buildlog_exec_with_progress "$@" 9>&-
+        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -433,11 +451,14 @@ run_step_attempt() {
         fi
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
-        buildlog_exec_with_progress "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
+        buildlog_exec_with_progress ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
-    nextest_share_end
+    if [[ -n "$LINT_NEXTEST_WIDTH_FILE" ]]; then
+        nextest_token_width "$LINT_NEXTEST_WIDTH_FILE"
+        [[ -z "$LINT_NEXTEST_TOKEN_WIDTH" ]] || set -- "${@:1:4}" "$LINT_NEXTEST_TOKEN_WIDTH" "${@:6}"
+    fi
     buildlog_finish_memory "$status" "$sampler_pid"
     if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
         rm -f -- "$BUILDLOG_PEAK.progress.log"
@@ -537,13 +558,12 @@ sweep_after_step() {
     )
 }
 
-have_nextest() {
-    cargo nextest --version >/dev/null 2>&1
-}
-
+# A failed version check prints its first error line, so a refusal such as the
+# Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
-    if ! have_nextest; then
-        echo "cargo nextest is required" >&2
+    local error
+    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+        echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
 }
@@ -601,73 +621,42 @@ nextest_width_arm() {
     fi
 }
 
-# Local nextest runs share the machine's test threads: a run takes the mode's
-# width divided by the runs in flight, itself included, never below
-# nextest_budget.FLOOR (4). A run claims its share only after the memory gate
-# admits it (run_once calls nextest_share_claim), so a run still waiting for
-# memory never counts and never narrows the runs already testing. Each run holds
-# an flock on its own marker through fd 9 for as long as it runs, so a killed run
-# stops counting with its shell. The test processes do not inherit the fd. The
-# trial mode stays unshared, since width_trial.py names its arm by width. Any
-# failure runs at the full width.
+# On a host whose CARGO_MAKEFLAGS names a jobserver pool (natedev's
+# /dev/steve), a test run holds one pool token for each test thread, so test
+# threads and compile jobs share the one CPU pool. run_once runs the step
+# through nextest_tokens.py, inside the step's scope: it builds with --no-run
+# while it holds no test token, takes the tokens, and runs the tests at one
+# thread for each token. It writes that width to LINT_NEXTEST_WIDTH_FILE, and
+# run_once records the step at that width. The trial mode takes no tokens,
+# since width_trial.py names its arm by width. A host with no pool (the Mac)
+# runs at the mode's width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
+LINT_TEST_TOKENS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_tokens.py"
 
-run_nextest_shared() {
-    local width=$1 status=0 dir name
-    shift
-    dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
-    name="$$.$RANDOM$RANDOM"
-    if ! mkdir -p "$dir" 2>/dev/null; then
-        run cargo nextest run --test-threads "$width" "$@"
-        return
+# Set LINT_NEXTEST_POOL to the pool CARGO_MAKEFLAGS names, or to empty.
+nextest_token_pool() {
+    LINT_NEXTEST_POOL=""
+    local pattern='(^|[[:space:]])--jobserver-auth=fifo:([^[:space:]]+)' pool
+    [[ "${CARGO_MAKEFLAGS:-}" =~ $pattern ]] || return 0
+    pool="${BASH_REMATCH[2]}"
+    if [[ ( -c "$pool" || -p "$pool" ) && -r "$pool" && -w "$pool" ]]; then
+        LINT_NEXTEST_POOL=$pool
     fi
-    # The block puts fd 9 back as it was, so the marker nextest_share_claim
-    # opens on it closes when the run ends.
-    {
-        LINT_NEXTEST_SHARE="$dir/$name" run cargo nextest run --test-threads "$width" "$@" || status=$?
-    } 9>&-
-    rm -f "$dir/$name.run" "$dir/$name.new"
-    return "$status"
+    return 0
 }
 
-# Print the same line for a run that does not claim a shared width.
+# Set LINT_NEXTEST_TOKEN_WIDTH to the width nextest_tokens.py wrote, or to
+# empty when the run ended before it took its tokens. The file goes.
+nextest_token_width() {
+    LINT_NEXTEST_TOKEN_WIDTH=""
+    [[ -s "$1" ]] && IFS= read -r LINT_NEXTEST_TOKEN_WIDTH < "$1" || true
+    rm -f -- "$1"
+    [[ "$LINT_NEXTEST_TOKEN_WIDTH" =~ ^[1-9][0-9]*$ ]] || LINT_NEXTEST_TOKEN_WIDTH=""
+}
+
+# Print the test threads and the load for a run that holds no tokens.
 nextest_thread_report() {
     buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" report "$@"
-}
-
-# nextest_share_claim ARGV... (`cargo nextest run --test-threads WIDTH ...`)
-# Called by run_once once the memory gate has admitted the step. It opens the
-# run's marker on fd 9, claims a share of WIDTH, and leaves the argv to run in
-# LINT_NEXTEST_SHARED_ARGV. A narrower share is written into the step's memory
-# reservation, so its peak is recorded against the width it ran at.
-nextest_share_claim() {
-    local claim="" shared="" width=$5
-    LINT_NEXTEST_SHARED_ARGV=("$@")
-    [[ "${4:-}" == --test-threads && "$width" =~ ^[1-9][0-9]*$ ]] || return 0
-    { exec 9>>"$LINT_NEXTEST_SHARE.new"; } 2>/dev/null || {
-        nextest_thread_report "$@"
-        return 0
-    }
-    claim="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "${LINT_NEXTEST_SHARE%/*}" \
-        "${LINT_NEXTEST_SHARE##*/}" "$width" 9 --show-load 2>/dev/null)" || claim=""
-    shared="${claim%%$'\n'*}"
-    [[ "$shared" =~ ^[1-9][0-9]*$ ]] || {
-        nextest_thread_report "$@"
-        return 0
-    }
-    printf '%s\n' "${claim#*$'\n'}"
-    [[ "$shared" != "$width" ]] || return 0
-    LINT_NEXTEST_SHARED_ARGV=("${@:1:4}" "$shared" "${@:6}")
-    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" width "$BUILDLOG_MEM_RESERVATION" "$shared" \
-            >/dev/null 2>&1 || true
-    fi
-}
-
-# The test run is over: drop the share before the build log write and the sweep
-# start in the background, so neither keeps the marker locked.
-nextest_share_end() {
-    [[ -z "${LINT_NEXTEST_SHARE:-}" ]] || exec 9>&-
 }
 
 run_nextest() {
@@ -676,7 +665,7 @@ run_nextest() {
         build_hold_wait_local || return $?
     fi
 
-    local arg arm="" width=""
+    local arg arm="" width="" LINT_NEXTEST_POOL=""
     if [[ "${NEXTEST_TEST_THREADS+x}" != x ]]; then
         for arg in "$@"; do
             case "$arg" in
@@ -710,11 +699,8 @@ run_nextest() {
                 ;;
         esac
         if [[ -n "$width" ]]; then
-            if [[ "$LINT_TEST_WIDTH" == trial ]]; then
-                run cargo nextest run --test-threads "$width" "$@"
-            else
-                run_nextest_shared "$width" "$@"
-            fi
+            [[ "$LINT_TEST_WIDTH" == trial ]] || nextest_token_pool
+            run cargo nextest run --test-threads "$width" "$@"
             return
         fi
     fi

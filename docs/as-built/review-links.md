@@ -85,33 +85,61 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
-`change_page.py` without rows prints `/<snapshot>/console.html?page=changes`.
-Selected-row links with `--production NAME C27` still open `changes.html` directly.
-`scripts/review_links/console.py` publishes the console beside its Changes snapshot.
-The server applies the same root, traversal, private-file, and symlink rules to both pages.
-The console adds a same-origin content policy and permits same-origin framing.
+`change_page.py` without rows prints one fixed link, `http://<host>:<server_port>/console/`.
+`/console` without the final slash forwards to `/console/` with the same query.
+The server renders `/console/` from the current code and configuration at each GET.
+A merge to main thus changes the console with no new link and no restart step.
+A render error gives a 503 page: **The console is not available.**
+Selected-row links with `--production NAME C27` still open their own signed `changes.html` directly.
+The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Changes and Builds.
+The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop top bar shows only the selected page title.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
 Each storage operation catches failures, so blocked storage does not stop navigation.
 The selected page fills a same-origin frame beside the navigation.
+Each page that the user opens keeps its own live frame, and the console hides the others.
+A navigation click back to a page shows it as the user left it: filter, card, type, scroll and typed text.
+A hidden frame keeps its layout with `visibility:hidden`, so its scroll position stays.
 The shell follows the system light or dark theme.
 At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
 The menu button opens the navigation above the frame.
 A page choice, the Escape key, or a click outside closes the navigation.
+When the rebuild overlay is open, the Escape key closes only the overlay.
 The phone navigation starts closed and does not change the stored desktop state.
 
 `?page=<id>` selects a page.
 Missing and unknown ids select the first configured entry.
 Navigation clicks update this query with `history.replaceState`.
 
+The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
+A reload or a shared link opens each page at its recorded place.
+The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
+A place equal to the configured URL removes its `at.<id>` key.
+The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
+A frame load that fails, such as a refused connection, shows the browser's error page.
+The console then loads the frame's last place again after `frame_retry_seconds` in `config/review_links.conf`, which starts at 2 seconds.
+A page that changes its place with `history.replaceState` posts `console-place` to its parent, so the console reads the place again.
+
+A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
+When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
+The Changes page follows both rules.
+The Builds page refreshes in a hidden frame until it reads the same signal.
+
+Older links forward to the fixed address with a 303 and keep their query.
+The server forwards `/<snapshot>/console.html` to `/console/`.
+It forwards an all-list `/<snapshot>/changes.html` to `/console/changes.html`.
+It forwards `/<snapshot>/rebuilds.html` to `/console/rebuilds.html`.
+A snapshot whose folder holds a selected-row manifest keeps its own `changes.html`.
+A forwarded link can come from a folder that the sweep already deleted.
+Older browser folders still accept answers that a page posts to them.
+
 `config/console.conf` defines entries in file order.
-The publisher reads it through `conf.read("console")` when it creates the link.
+The server reads it through `conf.read("console")` at each console request.
 Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
 The URL value has the form `python:<module>:<function>`.
 The function takes no arguments and returns a URL path under the review root.
@@ -119,34 +147,47 @@ The console also accepts a full URL from the configured review origin and conver
 The URL function raises one of `review_link.SNAPSHOT_ERRORS` when the page is unavailable.
 An absent function also makes the entry unavailable.
 That entry remains visible and shows **Not available** when selected.
-Publishing the console again resolves the current configuration and page availability.
+Each console request resolves the current configuration and page availability.
 
 A page joins with one configuration block and its URL function.
 The page serves itself at that path and permits same-origin framing.
 A link that leaves the page uses `target="_top"`.
 The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
-`change_page.page_url` reuses the existing Changes publisher.
+`change_page.page_url` returns the fixed `/console/changes.html` path.
+`change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
+The AWS prices entry calls `aws_page.page_url`.
+That function returns the AWS prices page URL without publishing the page.
 
-The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+The bottom-left rebuild link shows only while the Rebuilds page names a machine.
+`rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
+That function returns `/console/rebuilds.html`.
+The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
+Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
+A long label wraps to a second line and stays inside the sidebar.
+The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
+At phone width the link is a small fixed button at the bottom left, never wider than the open sidebar (220px), so it wraps and stays inside the sidebar.
+A click opens a modal overlay titled **Rebuilds needed** with the Rebuilds page content.
+The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
+When no machine needs a rebuild, the link hides and an open overlay closes.
+
+The console vendors ten SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
-### Questions, Changes, and Rebuilds
+### Questions and Changes
 
-The review page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
-The selected tab joins the content panel and has an accent line on its top edge.
-Arrow keys, Home, and End select tabs. Tab moves to the selected tab and then the page controls.
-Each type tab shows its own count. The page has no combined total.
-The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
-The document title remains Changes to review.
+`changes.html` shows one kind of item: Changes by default, Questions with `?type=questions`.
+Any other `type` value gets a 503 page.
+The page has no tab bar and no combined total.
+The heading and document title follow the kind: **Changes to review** or **Questions to answer**.
 The page updates itself through its existing GET URL without a full reload.
 `page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
 The page loads updates only while its browser tab is visible.
 It loads an update at once when the tab becomes visible again.
-Updates retain the selected type, showrunner, waiting card, open Details sections, and scroll position.
+Updates retain the selected showrunner, waiting card, open Details sections, and scroll position.
 If the card no longer waits, the page selects the next waiting item in the same filter.
 Typed text or an active save holds replacement; the page keeps only the newest loaded update.
 The page applies that update when all unsaved fields are empty or the save ends.
@@ -154,16 +195,16 @@ A successful save requests a fresh update so an older response cannot restore th
 Updates preserve a retained field's focus and cursor.
 A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
-Questions and Changes show one card at a time.
+The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
 All is the default and includes every showrunner in the existing item order.
 The menu keeps the existing showrunner order.
-The tab bar and menu stay on one line at phone and desktop widths.
-Switching types retains each type's selected showrunner and card.
-The URL fragment records the type, showrunner, and card.
+The menu stays on one line at phone and desktop widths.
+The URL fragment records the showrunner and card.
+All with no card keeps the URL without a fragment.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
-An empty type shows **No questions to answer.** or **No changes to review.**
+An empty page shows **No questions to answer.** or **No changes to review.**
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.
@@ -171,7 +212,34 @@ A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
 Owned cards show the title before the filed text, choices, and **Asked by <session>**.
 They have no separate Question label.
-The field label stays **Answer**, and its action stays **Save answer**.
+A question filed with parts (`ask --ask`) shows each part as its own section:
+- the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;
+- **Context**;
+- **Items** as a numbered list, with each line of an item on its own line;
+- **Recommended**;
+- **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
+A question stored as one text, from before the parts form, shows in sections too:
+- the text up to its first numbered item;
+- **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
+- the text after the first sentence of the last item, as its own paragraph;
+- **Choices**: the text after `Choices:`. Numbered choices show as radio items; other choice text shows as text;
+- **Recommended**: the text after `Recommended:`.
+A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
+In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
+A right click can open it in a new tab.
+In all question text, a span in backticks shows as code, and an address in a code span is not a link.
+An item that is only one backtick span, such as a command, shows as a code block.
+The form of a new question is in `~/.claude/docs/question_template.md`.
+The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
+Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
+Answer and Followup stay disabled until the box holds text.
+- **Answer** records the answer and sends it to the asker.
+- **Followup** sends the text to the asker as a question about the question.
+  The question leaves the page, the counts and `/next` until the asker replies.
+  The message gives the asker the `update_registration.py reply` command.
+- **Skip** saves no answer. It moves the question to the end of the list that the page and `/next` use, and tells the asker that it stays open.
+A question card shows each earlier follow-up and its reply as **Follow-up** and **Reply** sections.
+A question card has no Skip for now control.
 An **Owner unavailable** card shows the question and `No showrunner owns this question.`
 It has no answer form, and the server refuses an answer.
 It has no Ask showrunner to check or Ask a question controls.
@@ -183,6 +251,7 @@ An answer without a relay goes to the question's showrunner.
 Each message starts with `From the user (via the review page): ` and names the question.
 
 A saved answer opens the next waiting question and shows **Answer saved.** above the card.
+A follow-up shows **Follow-up sent.**, and a skip shows **Skipped.**
 A failed save retains the typed answer and shows **Not saved: <reason>**.
 An answer to a question already answered elsewhere fails without sending another message.
 Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.
@@ -193,23 +262,98 @@ A save error clears that attempt's delivery intent and releases its claim.
 Recovery sends only answers with `saved: true` whose canonical question record is closed.
 Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
-The Changes tab retains its existing cards, controls, and count rules.
+Answers to questions and changes both post to `changes.html`.
 
-Rebuilds shows one block per machine, with natedev first, then the Mac, then other machines in name order.
-It has no showrunner menu, card navigation, Skip for now, or answer form.
-Its count is the number of machines with open rebuild needs.
-Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
-The Mac instruction states that updates can take five minutes while the Mac is reachable.
-A machine with multiple needs shows `One rebuild applies all listed changes.`
-Under `After the rebuild`, bullets show the stored reasons unchanged, newest first by creation time.
-A closed `Details` disclosure shows each full configuration commit in the same order.
-It shows `Affected session: <name> (<kind>)` from the current staff record.
-It shows `Requested by: <name> (<kind>)` only for a different, recorded requester.
-Unknown staff IDs appear as `Unknown session: <id>`.
-The reader uses the same staff record as the page routing.
-Each render calls `rebuild.need.read_needs()` once.
-The final line states `Completed requests clear automatically. Refresh this page after the rebuild.`
-An empty or missing needs folder shows only `No rebuilds needed.` beneath the tabs, with a count of 0.
+### Images page
+
+`/console/images.html` shows registered images with their instructions, oldest first.
+A new image goes to the end, so the cards above it keep their places.
+The console lists it as **Images**, with the Lucide `image` icon.
+A showrunner or unit registers each image with one command:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register --image PATH --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+```
+
+- The caption says what changed and what to look at.
+- The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
+- It prints the image file link and the image's own console link:
+  `http://<host>:<server_port>/console/?page=images&at.images=%2Fconsole%2Fimages.html%23image%3D<id>`.
+  `console.place_query` builds the query from the console's place key.
+- The server serves the copy, so the user never needs the source path.
+
+Each card shows, in this order:
+
+1. The caption as the card title, in a larger font.
+2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
+3. The image, as a link to the full size.
+4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
+5. The **Delete** and **Send feedback** buttons.
+
+**Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
+**Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
+The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
+A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
+
+A group is a run of shown cards in a row with the same owner.
+A panel at the top left of the images pane lists one row per group, in three columns: owner name, count and the time of its first image.
+The owner name has no kind, such as `(unit)`.
+The panel has a rounded outline and thin lines between its rows and columns.
+The panel stays in place while the cards scroll.
+Each row shows a hover color, and a click on a row goes to the first image of its group.
+On a narrow screen the panel goes above the cards and scrolls with them.
+An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
+The page refreshes its cards when the console shows it again and when the tab becomes visible.
+A hidden frame makes no request.
+
+**Delete** posts the image id and a token signed with the console browser token.
+The server checks the token and removes the image folder at once under `images/.review-link-images.lock`.
+No message goes to the owner.
+The page does not wait: the card leaves the page at once, and the request runs in the background.
+A failed delete puts the card back in its place with one line: **Not deleted: <reason>**.
+The page skips its refresh while a delete or a feedback send runs.
+
+**Send feedback** posts the same signed form with the feedback text.
+The page refuses empty feedback with **Enter feedback first.** and keeps the card.
+Otherwise the card leaves the page at once, and the request runs in the background.
+The server sends one message to the owner's staff id, resolved to its current session at each try.
+It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
+The message holds the feedback, the image link, the caption, the For line and the delete command for the owner to run after it acts.
+After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
+When no try reaches the owner, the server answers 503 and writes nothing.
+The card goes back in its place with one line: **Not sent: <reason>**.
+An agent deletes an image with this command:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id ID
+```
+
+### Rebuilds page
+
+`/console/rebuilds.html` lists the machines that the status line names for a rebuild, for the console's rebuild link.
+Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
+That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
+The server serves it only in a folder that holds the browser manifest.
+It is not in the navigation.
+A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
+The page shows one block per machine, with natedev first, then the Mac.
+Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then one entry per change, newest first.
+Each entry is a list of three rows: Who, When and Reason.
+The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
+A commit's reason is its subject and its time is the author time.
+Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
+A filed need is an entry with its requester (else the affected session), its creation time and its reason.
+A need covers its own commit, so that commit shows once.
+Names come from the current staff record as `<name> (<kind>)`.
+An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
+When shows the time in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+A listed machine without a recorded change list shows `The change list is not available yet.`
+When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
 The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
 The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
@@ -330,7 +474,8 @@ A reload restores that place when the row waits, awaits validation, or has an op
 An answered row stays absent from the browser list during delivery and after a reload.
 An empty showrunner filter shows **No changes for this showrunner.** or **No questions for this showrunner.** and hides Skip for now.
 The showrunner filter supplies the count; the card has no separate remaining count.
-Each successful save opens the next waiting change in the same filter.
+Works and Does not work open the next waiting change at once, before the server answers.
+Other answers open the next waiting change in the same filter after a successful save.
 Skip for now skips a change without saving an answer.
 The page keeps the current row if the user selects Skip for now or another tab during the save.
 
@@ -422,12 +567,17 @@ Owner unavailable changes retain their verdict controls and hide every showrunne
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving** during a save.
-An automatic move shows **Answer saved.** or **Review saved.** above the next card.
+After Works or Does not work, the next card shows **Saving review.** until the save ends, then **Review saved.**
+An automatic move after another answer shows **Answer saved.**, **Follow-up sent.**, **Skipped.** or **Review saved.** above the next card.
+A failed Works or Does not work save puts the row back in the list with its typed text and answer form.
+The notice then shows **Not saved: <row>. <reason> It is back in the list.** and an **Open it** button that shows the row.
 Skip for now stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 A failed save keeps the row in that count and does not change the current row.
 
-The all-list publisher stores a private `.review-link-browser.json` beside a placeholder HTML file.
+The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
+The first `change_page.page_url` call creates the folder and the manifest with a hard link, so two first requests keep one secret.
+Later calls keep the same manifest, so a page stays valid across merges and restarts.
 This manifest contains a random page secret and an optional initial row key.
 It stores no copied rows or answers.
 Each prepared row receives a token signed from that secret and its qualified list/row key.
@@ -604,11 +754,15 @@ The server reads the current settings when it needs them.
   A changed or unreadable file requires a restart.
   The server checks live delivery attempts under the delivery lock.
   It defers the restart while an attempt is live and keeps the old stamps for the next check.
-  When no attempt is live, an exception closes the server socket.
-  The server prints `review-links: code changed: <path>` and calls `os.execv(sys.executable, sys.orig_argv)`.
+  When no attempt is live, an exception leaves the serve loop and the listening socket stays open.
+  The server prints `review-links: code changed: <path>` and calls `os.execve(sys.executable, sys.orig_argv, …)`.
+  It passes the listening socket's descriptor in `REVIEW_LINKS_LISTEN_FD`.
   The new process keeps the pid, arguments and environment.
+  It takes that socket when the socket listens on the same address and port, and binds a new one otherwise.
+  The kernel holds connections that arrive during the restart, and the new process answers them, so no request is refused.
   A failed process replacement or new start exits 1, and the service manager starts the service again.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
+- `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.
 - A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
@@ -623,6 +777,7 @@ That interval starts at one hour.
   Each publish resets the folder modification time.
   The sweep deletes expired folders at its next run.
   A stopped server sweeps at its next start.
+- The sweep never deletes the fixed `console/` folder or the `images/` folder, at any age. Only a delete removes an image.
 - At the root, the sweep checks `is_symlink()` before `is_dir()`, so it never follows a symlink. It skips symlinks and entries that are not folders, for example `.index.json`, `.index.lock` and temporary files.
 - A root folder is a flat snapshot when its name is six lowercase letters or digits and it holds no subfolder and no symlink. The sweep deletes a flat snapshot as one folder.
 - Any other root folder is a session folder of the older `<session>/<UTC stamp>-<label>-<unique suffix>/` layout. The sweep checks each child folder on its own, skips child symlinks and never deletes the session folder.

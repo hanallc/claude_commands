@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -29,10 +30,12 @@ STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
 from scripts.production import change_routing
-from scripts.review_links import branch_page, change_page, change_browser, console
+from scripts.review_links import branch_page, change_page, change_browser, console, images
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
+# A restart passes the listening socket to the new process in this variable.
+LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 
 
 class TailscaleAddressLost(RuntimeError):
@@ -64,6 +67,29 @@ def loaded_module_stamps() -> dict[Path, tuple[int, int] | ModuleStampUnavailabl
     return stamps
 
 
+def inherited_listener(address: tuple[str, int]) -> socket.socket | None:
+    """Take the socket a restart passed on when it still listens on this address."""
+    descriptor = os.environ.pop(LISTEN_FD, None)
+    if descriptor is None:
+        return None
+    try:
+        listener = socket.socket(fileno=int(descriptor))
+    except (ValueError, OSError) as error:
+        print(f"review-links: inherited socket {descriptor}: {error}", file=sys.stderr)
+        return None
+    if tuple(cast(tuple[str, int], listener.getsockname())[:2]) != address:
+        listener.close()
+        return None
+    return listener
+
+
+def restart(server: ReviewLinksServer) -> None:
+    """Run the changed code in this process and keep the listening socket open, so no request is refused."""
+    descriptor = server.socket.fileno()
+    os.set_inheritable(descriptor, True)
+    os.execve(sys.executable, sys.orig_argv, os.environ | {LISTEN_FD: str(descriptor)})
+
+
 def tailscale_ip() -> str:
     result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
                             text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
@@ -83,7 +109,8 @@ def sweep_snapshots(root: Path, now: float) -> int:
         return removed
     for entry in entries:
         try:
-            if entry.is_symlink() or not entry.is_dir():
+            # The console folder holds the browser token; the images folder holds registered images until a delete.
+            if entry.name in (change_page.CONSOLE_FOLDER, images.FOLDER) or entry.is_symlink() or not entry.is_dir():
                 continue
             children = list(entry.iterdir())
             # New snapshots contain regular files. Check symlinks before their
@@ -108,12 +135,60 @@ def sweep_snapshots(root: Path, now: float) -> int:
     return removed
 
 
+def old_console_link(root: Path, path: str) -> str:
+    """Give the fixed console address for an older console, browser or rebuild link."""
+    parts = urlsplit(path)
+    match = re.fullmatch(r"/([a-z0-9]{6})/(" + "|".join(map(re.escape, (
+        console.PAGE_NAME, change_page.PAGE_NAME, change_page.REBUILDS_NAME))) + ")", parts.path)
+    # A selected-row page keeps its own signed link.
+    if match is None or (match[2] == change_page.PAGE_NAME and (root / match[1] / change_page.MANIFEST).exists()):
+        raise FileNotFoundError("not an older console link")
+    page = "" if match[2] == console.PAGE_NAME else match[2]
+    return f"/{change_page.CONSOLE_FOLDER}/{page}" + (f"?{parts.query}" if parts.query else "")
+
+
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
     @override
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
+        route = urlsplit(self.path)
+        if route.path == f"/{change_page.CONSOLE_FOLDER}":
+            self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
+            return None
+        if route.path == f"/{change_page.CONSOLE_FOLDER}/":
+            try:
+                content = console.render(console.read_pages(), console.read_rebuilds())
+            except (OSError, ValueError, ImportError) as error:
+                print(f"review-links console: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The console is not available.</p>"))
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
+                             + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
+            self.end_headers()
+            return BytesIO(content)
+        if route.path == images.PAGE_PATH:
+            try:
+                content = images.render(root)
+            except (OSError, ValueError) as error:
+                print(f"review-links images: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
+        try:
+            location = old_console_link(root, self.path)
+        except FileNotFoundError:
+            pass
+        else:
+            self.redirect(location)
+            return None
         try:
             branches = branch_page.page_at(root, self.path)
         except FileNotFoundError:
@@ -132,6 +207,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
                     return None
             self.html_response(200, branch_page.render(branches))
+            return None
+        try:
+            change_browser.rebuilds_at(root, self.path)
+            content = change_browser.render_rebuilds()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links rebuilds: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The rebuild list is not available.</p>"))
+            return None
+        else:
+            self.html_response(200, content)
             return None
         try:
             browser = change_browser.page_at(root, self.path)
@@ -194,10 +281,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(stat.st_size))
             self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
             self.send_header("X-Content-Type-Options", "nosniff")
-            if file.name == console.PAGE_NAME:
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
-                                 + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
         except BaseException:
             stream.close()
@@ -243,6 +326,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
+            return
+        if urlsplit(self.path).path == images.PAGE_PATH:
+            self.image_post()
             return
         try:
             branches = branch_page.page_at(server.root, self.path)
@@ -370,6 +456,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def image_post(self) -> None:
+        """Delete an image or send its feedback; the page shows the reason of a failure on the card."""
+        root = cast(ReviewLinksServer, self.server).root
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty image request")
+            images.submit(root, self.rfile.read(length).decode("utf-8"))
+        except change_page.AnswerRefused as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except images.FeedbackNotSent as error:
+            self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
+            return
+        except ValueError as error:
+            self.browser_failure(400, "Use the form on this page.", error)
+            return
+        except OSError as error:
+            self.browser_failure(503, "The image could not be changed. Try again.", error)
+            return
+        self.json_response(200, {"state": "done"})
+
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
@@ -410,6 +518,19 @@ class ReviewLinksServer(ThreadingHTTPServer):
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
         threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
+
+    @override
+    def server_bind(self) -> None:
+        host, port = cast(tuple[str, int], self.server_address)
+        listener = inherited_listener((host, port))
+        if listener is None:
+            super().server_bind()
+            return
+        # Point the server's own socket object at the inherited listening socket.
+        _ = os.dup2(listener.fileno(), self.socket.fileno(), inheritable=False)
+        listener.close()
+        self.server_name: str = socket.getfqdn(host)
+        self.server_port: int = port
 
     @override
     def service_actions(self) -> None:
@@ -455,13 +576,13 @@ def main(arguments: list[str]) -> int:
         address = tailscale_ip()
         root = change_routing.review_root()
         root.mkdir(parents=True, exist_ok=True)
-        try:
-            with ReviewLinksServer((address, cast(int, args.port)), root) as server:
-                print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+        with ReviewLinksServer((address, cast(int, args.port)), root) as server:
+            print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+            try:
                 server.serve_forever()
-        except CodeChanged as error:
-            print(f"review-links: {error}", file=sys.stderr)
-            os.execv(sys.executable, sys.orig_argv)
+            except CodeChanged as error:
+                print(f"review-links: {error}", file=sys.stderr)
+                restart(server)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, TailscaleAddressLost) as error:

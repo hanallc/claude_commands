@@ -525,6 +525,15 @@ class NativeRuntimeIdentityTests(StaffCommandTestCase):
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(staff.by_id(worker.id), worker)
 
+    def test_removing_a_worker_removes_its_id_from_the_restart_record(self) -> None:
+        from scripts.agents import shutdown_record
+
+        _, unit, worker = self.tree()
+        shutdown_record.save([str(unit.id), str(worker.id)])
+        with mock.patch.object(session_records, "session_liveness", return_value=sessions.SessionNotLive()):
+            self.assertEqual(staff.retire(worker.id), worker)
+        self.assertEqual(shutdown_record.read(), [str(unit.id)])
+
     def test_runtime_session_changes_only_current_session_in_one_write_and_rerun_changes_no_byte(self) -> None:
         runner, unit, worker = self.tree()
         new_id = staff.StaffId("00000000-0000-4000-8000-000000000004")

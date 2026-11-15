@@ -380,7 +380,11 @@ with (state / "refreshed-test-locks").open("a") as output:
         failed = self.run_checkpoint(sha)
         self.assertIn("red: failed", failed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
-        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"]])
+        # The base check runs the red tests alone on the tip before the merge; they pass there.
+        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"],
+                                                    ["test", "cargo-tile", "--filter", locale, "--filter", reader]])
+        self.assertIn(f"send alpha: repair merge test 1 ({locale}, {reader})", failed.process.stdout)
+        self.assertNotIn("merge director:", failed.process.stdout)
         (self.state / "events.jsonl").unlink()
         self.known_flaky_tests = f"`{reader}`, `{locale}` — red only under load"
         self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")

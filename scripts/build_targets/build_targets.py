@@ -19,7 +19,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from contextvars import ContextVar
@@ -29,10 +28,11 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
-from scripts.build_queue.placement import ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
+from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
 
@@ -325,7 +325,7 @@ class NatedevOnly:
     reason: str
 
 
-def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
+def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
                       selection: TargetSelection = ROUTED, *, writes_tree: bool = False
                       ) -> AnyTarget | NatedevOnly:
     """Choose the run location for each step before target admission."""
@@ -343,7 +343,7 @@ def step_routing_rule(kind: StepKind, routing: Routing = ANY_ELIGIBLE_TARGET,
 
 
 def fixed_placement_constraints(
-    repo_root: Path, package: str, kind: StepKind, command: tuple[str, ...],
+    repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
     session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
     provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
@@ -381,8 +381,7 @@ def fixed_placement_constraints(
                 host_eligibility = placement.FixedExclusion("repo")
             else:
                 excluded = eligibility.comma_values(config.values[key])
-                if (package in excluded if package
-                        else eligibility.workspace_has_linux_only(repo_root, excluded)):
+                if eligibility.linux_only_applies(kind) and eligibility.has_linux_only(repo_root, package, excluded):
                     host_eligibility = placement.FixedExclusion("linux_only")
         elif not eligibility.linux_kind_permitted(config.values, kind):
             host_eligibility = placement.FixedExclusion("target does not permit this command")
@@ -397,7 +396,8 @@ def fixed_placement_constraints(
             candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
     source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
-        placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder())
+        placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
+        command_kind=kind)
 
 
 def command_constraints(args: CliArguments) -> int:
@@ -804,9 +804,8 @@ def reserve_assigned(args: CliArguments) -> int:
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-                    placement.attempt_key(assignment.episode, assignment.attempt)).hex,
-                    assignment.episode, assignment.attempt)
+                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                                     assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78
@@ -1139,7 +1138,7 @@ def caller_waits_on_hold(holds: build_hold.NatedevHolds, directory: Path) -> boo
     """Check whether a hold makes the calling session wait."""
     from scripts.build_hold import build_hold
 
-    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory,
+    return isinstance(hold_waited_on(holds, session_owner.owning_session(), directory,
                                     current_caller_lineage()), build_hold.Holder)
 
 
@@ -1242,8 +1241,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 print(f"{name}: natedev is held by {display_field(blocking.name)} for "
                       + f"{display_field(blocking.purpose)}{waiting}",
                       file=sys.stderr, flush=True)
-                resolution = build_hold.run_resolution()
-                if isinstance(resolution, build_hold.RunNotInStaff):
+                resolution = session_owner.run_resolution()
+                if isinstance(resolution, session_owner.RunNotInStaff):
                     line = (f"{name}: build has no run pointer ({display_field(str(resolution.run))}); "
                             + f"waits on {display_field(blocking.name)} hold for {display_field(blocking.purpose)}.")
                 elif isinstance(session, NoOwningSession):

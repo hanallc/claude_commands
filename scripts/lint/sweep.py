@@ -190,10 +190,9 @@ from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import conf
 from scripts.lib.cargo_target_config import (
-    CargoFolderSetting,
+    cargo_build_folder,
     cargo_folder_settings,
     cargo_home_folder,
-    cargo_workspace_manifest,
 )
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -450,7 +449,8 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     from scripts.buildlog import index as build_index
 
     known_trees: dict[str, list[str]] = {}
-    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
+    checkouts: list[str] = []
+    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees, checkouts=checkouts)
     recorded = recorded_output_roots(build_index.index_path(), store.host_name())
     cached = saved_cargo_output_roots()
     mappings: tuple[CargoOutputRoots, ...] = ()
@@ -462,6 +462,7 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     combined = tuple(dict.fromkeys(CargoOutputRoots(*(resolve(path) for path in (
         item.workspace_root, item.target_directory, item.build_directory)))
         for item in (*mappings, *cached.workspaces, *cached.history)))
+    combined = (*combined, *scratch_checkout_roots(checkouts, combined))
     mapped_paths = {path for item in combined for path in (item.target_directory, item.build_directory)}
     mapped = {str(path) for path in mapped_paths if path.is_dir()}
     added = sorted(mapped - set(discovered))
@@ -470,6 +471,23 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     protected = tuple(NoRecordedEvidence(path) for path in discovered if path not in mapped)
     index = CargoOutputIndex(combined, no_recorded_evidence=protected, known_trees=known_trees)
     return sorted(set(discovered) | mapped), index
+
+
+def scratch_checkout_roots(checkouts: Sequence[str],
+                           known: Sequence[CargoOutputRoots]) -> tuple[CargoOutputRoots, ...]:
+    """Ask Cargo once for each scratch checkout that no row maps; a task build writes no record."""
+    scratch = copy_record.root().resolve()
+    workspaces = [item.workspace_root for item in known]
+    found: list[CargoOutputRoots] = []
+    for checkout in sorted({Path(path).resolve() for path in checkouts}):
+        # A member crate sorts after its workspace, so its workspace row covers it.
+        if not checkout.is_relative_to(scratch) or any(checkout.is_relative_to(root) for root in workspaces):
+            continue
+        roots = read_cargo_output_roots(checkout)
+        if isinstance(roots, CargoOutputRoots):
+            found.append(roots)
+            workspaces.append(roots.workspace_root)
+    return tuple(found)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,9 +1059,9 @@ def copied_name(name: str) -> str:
     return (stem + dot + rest).replace("-", "_")
 
 
-def cargo_roots() -> list[str]:
-    """Read both output roots through the shared Cargo reader."""
-    result = read_cargo_output_roots(Path.cwd())
+def cargo_roots(cwd: str) -> list[str]:
+    """Read both output roots of the workspace at cwd through the shared Cargo reader."""
+    result = read_cargo_output_roots(Path(cwd))
     if isinstance(result, CargoOutputUnavailable):
         return []
     index = CargoOutputIndex((result,))
@@ -1590,100 +1608,6 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     holders = [FloorHolder(root, sizes.get(root, 0), pid, how, sessions.get(pid) if pid is not None else None)
                for root, pid, how in uses]
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
-
-
-def cargo_short_hash(data: bytes) -> str:
-    """Cargo's StableSipHasher128, reduced and written as little-endian hex.
-
-    Sources: Cargo src/cargo/util/{hasher,hex}.rs at 58bab51c and
-    https://github.com/rust-lang/rustc-stable-hash/blob/main/src/sip128.rs
-    """
-    mask = (1 << 64) - 1
-    v0, v1, v2, v3 = 0x736f6d6570736575, 0x646f72616e646f83, 0x6c7967656e657261, 0x7465646279746573
-
-    def rotate(value: int, bits: int) -> int:
-        return ((value << bits) | (value >> (64 - bits))) & mask
-
-    def rounds(count: int) -> None:
-        nonlocal v0, v1, v2, v3
-        for _ in range(count):
-            v0 = (v0 + v1) & mask
-            v2 = (v2 + v3) & mask
-            v1 = rotate(v1, 13) ^ v0
-            v3 = rotate(v3, 16) ^ v2
-            v0 = rotate(v0, 32)
-            v2 = (v2 + v1) & mask
-            v0 = (v0 + v3) & mask
-            v1 = rotate(v1, 17) ^ v2
-            v3 = rotate(v3, 21) ^ v0
-            v2 = rotate(v2, 32)
-
-    end = len(data) - len(data) % 8
-    for offset in range(0, end, 8):
-        word = int.from_bytes(data[offset:offset + 8], "little")
-        v3 ^= word
-        rounds(1)
-        v0 ^= word
-    tail = int.from_bytes(data[end:], "little") | ((len(data) & 0xff) << 56)
-    v3 ^= tail
-    rounds(1)
-    v0 ^= tail
-    v2 ^= 0xee
-    rounds(3)
-    low = v0 ^ v1 ^ v2 ^ v3
-    v1 ^= 0xdd
-    rounds(3)
-    high = v0 ^ v1 ^ v2 ^ v3
-    return ((low * 3 + high) & mask).to_bytes(8, "little").hex()
-
-
-def cargo_workspace_path_hash(manifest: Path) -> str:
-    """Cargo hashes the canonical workspace manifest, then splits first two/rest.
-
-    https://rust.googlesource.com/cargo/+/58bab51ca444e109a21ae9e0f17c27e38173a660/src/cargo/util/context/mod.rs
-    Path's component bytes and boundary bits follow Rust's Unix Hash for Path:
-    https://github.com/rust-lang/rust/blob/1.91.0/library/std/src/path.rs
-    """
-    if os.name != "posix" or sys.maxsize != (1 << 63) - 1:
-        raise ValueError("Cargo workspace path hashing is unavailable on this platform")
-    try:
-        path = manifest.resolve(strict=True)
-    except OSError:
-        path = manifest
-    if not path.is_absolute():
-        raise ValueError("Cargo workspace manifest path is not absolute")
-    data = bytearray()
-    boundaries = 0
-    for component in os.fsencode(path).split(b"/"):
-        if component:
-            data.extend(component)
-            boundaries = (boundaries + len(component)) & ((1 << 64) - 1)
-            boundaries = (boundaries >> 2) | ((boundaries & 3) << 62)
-    data.extend(boundaries.to_bytes(8, "little"))
-    hashed = cargo_short_hash(bytes(data))
-    return os.path.join(hashed[:2], hashed[2:])
-
-
-def cargo_build_folder(setting: CargoFolderSetting, argv: list[str], cwd: str, cargo_home: str) -> str:
-    """Expand build.build-dir before resolving it against its configuration root.
-
-    https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir
-    Unreadable workspace state and unknown templates must keep all caches busy.
-    """
-    value = setting.value
-    replacements: dict[str, str] = {}
-    if "{workspace-root}" in value or "{workspace-path-hash}" in value:
-        manifest = cargo_workspace_manifest(argv, cwd, cargo_home)
-        replacements["workspace-root"] = str(manifest.parent)
-        if "{workspace-path-hash}" in value:
-            replacements["workspace-path-hash"] = cargo_workspace_path_hash(manifest)
-    if cargo_home:
-        replacements["cargo-cache-home"] = os.path.realpath(os.path.join(cwd, cargo_home))
-    for name in ("workspace-root", "cargo-cache-home", "workspace-path-hash"):
-        value = value.replace("{" + name + "}", replacements.get(name, "{" + name + "}"))
-    if "{" in value or "}" in value:
-        raise ValueError("Cargo build folder template cannot be resolved")
-    return os.path.realpath(setting.base / value)
 
 
 def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
@@ -3553,7 +3477,9 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     label = home_relative(str(folder))
     if name.casefold() in ("trash", ".trash"):
         return FolderChoice(label, size, FolderChoiceKind.TRASH)
-    if any(part.casefold() == "scratch" for part in folder.parts):
+    # Only the configured scratch roots hold temporary work; a "scratch" name elsewhere is no proof.
+    resolved = folder.expanduser().resolve()
+    if any(resolved.is_relative_to(root.expanduser().resolve()) for root in scratch_roots()):
         return FolderChoice(label, size, FolderChoiceKind.SCRATCH)
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 
@@ -3883,10 +3809,14 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
 
 
 def floor_roots(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[str, ...]:
-    """Include the standing pool wherever copies configuration places it."""
+    """Include the standing pool and the scratch root wherever configuration places them."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    return (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+    roots = (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+    scratch = copy_record.root()
+    if any(scratch.is_relative_to(Path(root).expanduser()) for root in roots):
+        return roots
+    return (*roots, str(scratch))
 
 
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
@@ -4990,17 +4920,22 @@ def read_rebuild_steps(root: Path) -> list[RebuildStep]:
     return read_rebuild_evidence(root).steps
 
 
-def clone_kind(folder: str) -> str:
+def scratch_roots() -> tuple[Path, ...]:
+    return copy_record.root(), copy_record.FORMER_ROOT
+
+
+def clone_kind(folder: str, scratch_roots: tuple[Path, ...]) -> str:
     path = Path(folder)
     parts = path.parts
     # A scratch HOME sits under /tmp, so its ~/rust worktrees are named before the /tmp groups.
     if path.is_relative_to(Path.home() / "rust"):
         return "~/rust worktrees"
-    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp"):
+    in_scratch = any(path.is_relative_to(root) for root in scratch_roots)
+    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp") or in_scratch:
         # Older copies include gate57e, mergeclone and p34-merge-<sha>.
         if any(re.search(r"(?:^|[-_])(gate|merge)", part) for part in parts):
             return "gate and merge copies"
-        if path.is_relative_to("/tmp/claude/scratch"):
+        if in_scratch:
             return "scratch.py folders"
         if "phases" in parts or any(re.search(r"(?:^|[-_])phase(?:\d|[-_])", part) for part in parts):
             return "phase clones"
@@ -5083,8 +5018,9 @@ def rebuilds_main(argv: list[str]) -> int:
         print(f"lint sweep: cannot read rebuild evidence: {error}", file=sys.stderr)
         return 2
     totals: dict[tuple[str, RebuildCause], float] = {}
+    roots = scratch_roots()
     for rebuild in cold:
-        key = (clone_kind(rebuild.step.workspace), rebuild.cause)
+        key = (clone_kind(rebuild.step.workspace, roots), rebuild.cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
     print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")
@@ -5192,9 +5128,16 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    # Read the working folder once: a gate can remove its checkout while this sweep runs in it.
+    try:
+        cwd = os.getcwd()
+    except FileNotFoundError:
+        print("lint sweep: the working folder was removed; workspace sweep skipped")
+        return 0
+    repo = repo_name(cwd)
     token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        roots = (cargo_roots() if target_dir is None else
+        roots = (cargo_roots(cwd) if target_dir is None else
                  [os.path.realpath(target_dir)] if os.path.isdir(target_dir) else [])
         def assess() -> tmp_sweep.SweepAssessment:
             if not dry_run and target_dir is None:
@@ -5205,14 +5148,14 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
                         Path(root, USE_STAMP).touch()
                     except OSError:
                         pass
-            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, lint_settings=lint_settings)
+            return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings)
         return report_assessment(assess, WorkspaceFailureScope(tuple(sorted(roots))), dry_run, lint_settings)
     finally:
         OUTPUT_ROOTS.reset(token)
 
 
 def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
-                    recent_minutes: float, *,
+                    recent_minutes: float, repo: str | None, *,
                     lint_settings: conf.ConfigRead) -> tmp_sweep.SweepAssessment:
     """Sweep the resolved output roots to their budget."""
     from scripts.lint import tmp_sweep
@@ -5220,7 +5163,7 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
     if not roots:
         print("lint sweep: no target directory to sweep")
         return tmp_sweep.SkippedSweepAssessment()
-    budget, source = budget_bytes(dict(os.environ), budget_config, repo_name(os.getcwd()))
+    budget, source = budget_bytes(dict(os.environ), budget_config, repo)
     if budget is None:
         print(f"lint sweep: {source} must be a non-negative number of GiB", file=sys.stderr)
         return tmp_sweep.CompletedSweepAssessment(2)

@@ -12,12 +12,16 @@ from scripts.lib import build_folders
 
 
 RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
+BUILDLOG_ENV = "BUILDLOG_DIR"
 
 
 @contextmanager
 def test_run_folder() -> Generator[Path]:
-    """Set TMPDIR for one run and restore the caller's temporary parent afterward."""
-    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV)}
+    """Set TMPDIR for one run and restore the caller's temporary parent afterward.
+
+    A run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
+    """
+    previous = {name: os.environ.get(name) for name in ("TMPDIR", RUN_FOLDER_ENV, BUILDLOG_ENV)}
     old_tempdir = tempfile.tempdir
     inherited = build_folders.inherited_temporary_parent().resolve()
     parent = (inherited.parent if str(inherited) == previous[RUN_FOLDER_ENV]
@@ -28,6 +32,8 @@ def test_run_folder() -> Generator[Path]:
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)
         os.environ[RUN_FOLDER_ENV] = str(path)
+        if not previous[BUILDLOG_ENV]:
+            os.environ[BUILDLOG_ENV] = str(path / "buildlog")
         tempfile.tempdir = None
         try:
             yield path
