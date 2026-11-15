@@ -9,24 +9,28 @@
   color-scheme: light;
   --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
+  --low: #d9e8fa;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
+    --low: #1f3a5c;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
+    --low: #1f3a5c;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
 h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 h2 { font-size: 1.05rem; margin: 0 0 4px; }
+h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
 .status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
@@ -38,7 +42,7 @@ h2 { font-size: 1.05rem; margin: 0 0 4px; }
   background: linear-gradient(to left, var(--card) 40%, transparent) right / 36px 100% no-repeat local,
               radial-gradient(farthest-side at 100% 50%, var(--edge), transparent) right / 14px 100% no-repeat scroll; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
-th, td { text-align: left; padding: 5px 0 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th, td { text-align: left; padding: 5px 6px 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 thead th { white-space: normal; vertical-align: bottom; }
 /* A header wraps only between words, never at the hyphen of a region name. */
 thead th span { white-space: nowrap; }
@@ -48,6 +52,14 @@ th:first-child, td:first-child { padding-left: 0; position: sticky; left: 0; z-i
 th { color: var(--ink-2); font-weight: 600; }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover td { background: var(--hover); }
+/* A header "name (unit)" shows the unit on a smaller second line. */
+thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-3); white-space: nowrap; }
+/* Lowest prices: a fill for the lowest of the type, an outline for the lowest of its vCPU count; a cell can be both. */
+.mark { display: inline-block; padding: 1px 6px; margin: -1px -6px; border-radius: 4px; }
+.mark.low { background: var(--low); }
+.mark.group-low { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
+.legend .mark { margin: 0 6px 0 0; }
 .snapshot { list-style: none; padding: 0; margin: 12px 0 0; font-size: 0.86rem; color: var(--ink-2); }
 .snapshot li { padding: 2px 0; }
 .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -61,8 +73,8 @@ tbody tr:hover td { background: var(--hover); }
 <main>
 <h1>AWS prices</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
-<section class="card" id="prices"></section>
-<section class="card" id="quotas"></section>
+<div id="prices"></div>
+<div id="quotas"></div>
 <section class="card" id="runs">
   <div class="card-head">
     <h2>Cost per run</h2>
@@ -72,6 +84,9 @@ tbody tr:hover td { background: var(--hover); }
   <p class="note" id="explanation"></p>
   <div id="run-tables"></div>
 </section>
+<section class="card" id="refused"></section>
+<section class="card" id="launched"></section>
+<section class="card" id="hours"></section>
 </main>
 <script id="aws-prices-data" type="application/json">__AWS_PRICES_DATA__</script>
 <script>
@@ -95,7 +110,9 @@ function tableElement(tables, titled) {
   const head = grid.createTHead().insertRow();
   first.headers.forEach((header, index) => {
     const cell = element("th", undefined, right.has(index) ? "n" : "");
-    header.split(" ").forEach((word, position) => cell.append(...(position ? [" "] : []), element("span", word)));
+    const [, name, unit] = header.match(/^(.*?)(?: (\(.*\)))?$/);
+    name.split(" ").forEach((word, position) => cell.append(...(position ? [" "] : []), element("span", word)));
+    if (unit) cell.appendChild(element("small", unit));
     cell.scope = "col";
     head.appendChild(cell);
   });
@@ -107,29 +124,65 @@ function tableElement(tables, titled) {
       title.scope = "rowgroup";
       body.insertRow().appendChild(title);
     }
-    for (const row of table.rows) {
+    const low = new Set((table.row_lowest || []).map(String));
+    const groupLow = new Set((table.group_lowest || []).map(String));
+    table.rows.forEach((row, rowIndex) => {
       const line = body.insertRow();
-      row.forEach((value, index) => line.appendChild(element("td", value, right.has(index) ? "n" : "")));
-    }
+      row.forEach((value, index) => {
+        const place = String([rowIndex, index]);
+        const marks = [low.has(place) ? "low" : "", groupLow.has(place) ? "group-low" : ""].filter(Boolean);
+        const cell = element("td", marks.length ? undefined : value, right.has(index) ? "n" : "");
+        if (marks.length) cell.appendChild(element("span", value, ["mark", ...marks].join(" ")));
+        line.appendChild(cell);
+      });
+    });
   }
   wrap.appendChild(grid);
   return wrap;
 }
 
-function card(id, heading, table) {
-  const section = document.getElementById(id);
-  section.append(element("h2", heading), tableElement([table], false));
+function heading(text) {
+  const [, name, unit] = text.match(/^(.*?)(?: (\(.*\)))?$/);
+  const title = element("h2", name);
+  if (unit) title.appendChild(element("small", " " + unit, "unit"));
+  return title;
+}
+
+function fill(section, table, note) {
+  section.replaceChildren(heading(table.title));
+  if (note) section.appendChild(element("p", note, "note"));
+  if (table.rows.length) section.appendChild(tableElement([table], false));
   return section;
+}
+
+function cards(id, tables) {
+  const holder = document.getElementById(id);
+  return tables.map(table => {
+    const section = fill(element("section", undefined, "card"), table);
+    holder.appendChild(section);
+    return section;
+  });
+}
+
+function swatch(marks, text) {
+  const item = element("span");
+  item.append(element("span", "0.00", ["mark", ...marks].join(" ")), text);
+  return item;
 }
 
 const published = new Date(data.read_at * 1000);
 document.getElementById("published").textContent =
   `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
 
-card("prices", data.prices.title, data.prices);
+const priceCards = cards("prices", data.prices);
+const legend = element("p", undefined, "legend");
+legend.append(swatch(["low"], "lowest price of the type"), swatch(["group-low"], "lowest price of the types with the same vCPU count"));
+priceCards[0].appendChild(legend);
 const snapshot = element("ul", undefined, "snapshot");
 for (const line of data.snapshot) snapshot.appendChild(element("li", line));
-card("quotas", data.quotas.title, data.quotas).appendChild(snapshot);
+priceCards[priceCards.length - 1].appendChild(snapshot);
+cards("quotas", data.quotas);
+fill(document.getElementById("hours"), data.hours, data.hours_note);
 
 function markOverflow() {
   for (const wrap of document.querySelectorAll(".scroll")) wrap.classList.toggle("overflows", wrap.scrollWidth > wrap.clientWidth + 1);
@@ -144,6 +197,8 @@ function showScope(scope) {
   document.getElementById("explanation").textContent = costs.explanation;
   const tables = document.getElementById("run-tables");
   tables.replaceChildren(...(costs.tables.length ? [tableElement(costs.tables, true)] : []));
+  fill(document.getElementById("refused"), costs.refused);
+  fill(document.getElementById("launched"), costs.launched);
   markOverflow();
   try { localStorage.setItem(STORE_KEY, costs.scope); } catch (error) { /* The choice is kept only for this view. */ }
 }

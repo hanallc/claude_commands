@@ -21,6 +21,9 @@ class TableData(TypedDict):
     headers: list[str]
     right: list[int]
     rows: list[list[str]]
+    # [row, column] cells: the lowest price of the row, and of the types with the same vCPU count.
+    row_lowest: list[list[int]]
+    group_lowest: list[list[int]]
 
 
 class RunCostData(TypedDict):
@@ -29,30 +32,38 @@ class RunCostData(TypedDict):
     explanation: str
     tables: list[TableData]
     summary: str
+    refused: TableData
+    launched: TableData
 
 
 class PageData(TypedDict):
     read_at: int
     snapshot: list[str]
-    prices: TableData
-    quotas: TableData
+    prices: list[TableData]
+    quotas: list[TableData]
     runs: list[RunCostData]
+    hours: TableData
+    hours_note: str
 
 
 def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, 'headers': list(table.headers), 'right': sorted(table.right),
-            'rows': [list(row) for row in table.rows]}
+            'rows': [list(row) for row in table.rows], 'row_lowest': [list(cell) for cell in sorted(table.row_lowest)],
+            'group_lowest': [list(cell) for cell in sorted(table.group_lowest)]}
 
 
 def page_data(tables: spot_table.SpotTables, now: int) -> PageData:
     return {
         'read_at': now,
         'snapshot': list(tables.snapshot_lines),
-        'prices': table_data(tables.prices),
-        'quotas': table_data(tables.quotas),
+        'prices': [table_data(table) for table in tables.prices],
+        'quotas': [table_data(table) for table in tables.quotas],
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
-                  'tables': [table_data(table) for table in costs.tables], 'summary': costs.summary}
+                  'tables': [table_data(table) for table in costs.tables], 'summary': costs.summary,
+                  'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
+        'hours': table_data(tables.hours),
+        'hours_note': tables.hours_note,
     }
 
 
