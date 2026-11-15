@@ -3965,3 +3965,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Any other host value keeps one host and `TOP_CHECKOUT`. The trend view uses the same prefix constant.
 - `commands/test_times.md` names the new value.
 - Commit 5f1f770a6. Production change; sdlc gave the go.
+
+### Phase 271 — The Mac-only verify tests run fewer full verify.sh calls  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change in `scripts/direct/test_verify_mac_only.py`).
+
+#### As-built
+
+- `test_runner_refusals_never_fall_back_or_retry` checks all 12 reason texts through the real `mac_only_refuse` in one shell. Five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class.
+- The fetch test keeps a written word and the absent word. The two environment tests forward all their names in one call each.
+- AWS pair (c7a.4xlarge, 3 rounds, same box): `direct/test_verify_mac_only.py` 59.28 -> 38.39 CPU s.
+- Commit f0a59896a. Test-only change.
