@@ -215,6 +215,26 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Acceptance gate:** the Step log has the after numbers with n and window, the matching result and the phase-time check; `test_phase_process.py` passes; the result is sent.
 
+### Phase 31 — Every read-only Claude run has no file-edit tools  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every read-only Claude launch from `agent_exec.sh` removes Edit, Write and NotebookEdit (next item, user approved via sdlc, 2026-11-02).
+
+**Spec:**
+- `scripts/agents/agent_exec.sh` readonly Claude mode adds `--disallowedTools Edit,Write,NotebookEdit` beside `--permission-mode plan`.
+- Delete the `direct.simplify`-only tool branch.
+- Tests: the readonly argv for a plain task, a tier task and simplify carry the removal; the write argv does not.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_agent_exec.sh`
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`.
+
+**Acceptance gate:** `test_agent_exec.sh` and `test_agent_exec.py` pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
