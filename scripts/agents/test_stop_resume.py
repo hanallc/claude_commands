@@ -4488,5 +4488,106 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(launched["name"], row.name)
 
 
+REAL_BUILD_HOLDERS = stop_resume._build_holders  # pyright: ignore[reportPrivateUsage]
+_BUILD_QUEUE_ISOLATION = ExitStack()
+
+
+def setUpModule() -> None:
+    # No test reads the live build queue; BuildWaitTests calls the real reader against a fake view.
+    _ = _BUILD_QUEUE_ISOLATION.enter_context(patch.object(stop_resume, "_build_holders", return_value={}))
+
+
+def tearDownModule() -> None:
+    _BUILD_QUEUE_ISOLATION.close()
+
+
+@final
+class BuildWaitTests(unittest.TestCase):
+    """An automatic move waits for the build steps a session owns; a move by hand does not."""
+    moved: list[list[str]] = []
+    up: dict[str, stop_resume.ClaudeUp] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.moved = []
+        self.up = {name: stop_resume.ClaudeUp(name, "w1:p1", "claude3") for name in ("alpha", "beta")}
+
+        def move_now(selected: list[str], *_args: object, **_options: object) -> list[stop_resume.MoveResult]:
+            self.moved.append(list(selected))
+            return [self.up[name] for name in selected]
+
+        _ = self.enterContext(patch.object(stop_resume, "_move_now", side_effect=move_now))
+        _ = self.enterContext(patch.object(time, "sleep"))
+
+    def batch(self) -> None:
+        token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
+        self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_move_by_hand_never_reads_the_build_queue(self) -> None:
+        with patch.object(stop_resume, "_build_holders", side_effect=AssertionError("queue read")):
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="by hand")
+        self.assertEqual(results, [self.up["alpha"]])
+
+    def test_a_caller_hands_build_owners_to_the_batch_and_moves_the_others(self) -> None:
+        with patch.object(stop_resume, "_build_holders", return_value={"alpha": ("nextest in /w",)}), \
+                patch.object(stop_resume, "_handoff_batch") as handoff:
+            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="auto")
+        self.assertEqual(results, [stop_resume.MoveHandedOff("alpha"), self.up["beta"]])
+        self.assertEqual(handoff.call_args.args[:2], (["alpha"], "claude3"))
+        self.assertEqual(self.moved, [["beta"]])
+
+    def test_the_batch_moves_an_owner_when_its_steps_end(self) -> None:
+        self.batch()
+        held = {"alpha": ("nextest in /w",)}
+        with patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
+                redirect_stdout(io.StringIO()) as shown:
+            results = stop_resume.move_sessions(["alpha", "beta"], "claude3", why="auto: head", cause="refusal")
+        self.assertEqual(results, [self.up["alpha"], self.up["beta"]])
+        self.assertEqual(self.moved, [["beta"], ["alpha"]])
+        self.assertEqual(shown.getvalue(), "build wait: alpha owns nextest in /w; the move waits for its steps to end\n")
+
+    def test_the_batch_moves_an_owner_at_the_limit_and_names_the_steps_it_ends(self) -> None:
+        self.batch()
+        held = {"alpha": ("nextest in /w", "check in /w")}
+        with patch.object(stop_resume, "_build_holders", return_value=held), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 30 * 60.0]), \
+                redirect_stdout(io.StringIO()) as shown:
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        self.assertEqual(results, [self.up["alpha"]])
+        self.assertEqual(self.moved, [["alpha"]])
+        self.assertIn("build wait limit: alpha: the move ends nextest in /w; check in /w\n", shown.getvalue())
+
+    def test_an_unread_queue_holds_the_owner_until_a_read_proves_its_steps_ended(self) -> None:
+        self.batch()
+        held = {"alpha": ("nextest in /w",)}
+        unread = stop_resume.BuildQueueUnreadable("no socket")
+        with patch.object(stop_resume, "_build_holders", side_effect=[held, unread, {}]), \
+                redirect_stdout(io.StringIO()):
+            _ = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        self.assertEqual(self.moved, [["alpha"]])
+
+    def test_an_unread_queue_at_the_start_moves_at_once(self) -> None:
+        with patch.object(stop_resume, "_build_holders", return_value=stop_resume.BuildQueueUnreadable("no socket")), \
+                redirect_stdout(io.StringIO()) as shown:
+            results = stop_resume.move_sessions(["alpha"], "claude3", why="auto: head", cause="auto")
+        self.assertEqual(results, [self.up["alpha"]])
+        self.assertEqual(shown.getvalue(), "build wait: the build queue is unreadable (no socket); the move does not wait\n")
+
+    def test_the_reader_names_running_and_waiting_steps_of_the_selected_sessions(self) -> None:
+        from types import SimpleNamespace
+        from scripts.build_queue import admission_client, admission_protocol
+
+        def step(session: str, name: str, folder: str) -> SimpleNamespace:
+            return SimpleNamespace(session_id=session, step=name, folder=folder)
+
+        reading = SimpleNamespace(view=SimpleNamespace(
+            running=(step("alpha", "nextest", "/w"), step("", "compile", ""), step("gamma", "check", "/g")),
+            waiting=(step("alpha", "clippy", ""),)))
+        with patch.object(admission_client, "view", return_value=reading):
+            self.assertEqual(REAL_BUILD_HOLDERS(["alpha", "beta"]), {"alpha": ("nextest in /w", "clippy")})
+        with patch.object(admission_client, "view", side_effect=admission_protocol.AdmissionUnavailable("no socket")):
+            self.assertEqual(REAL_BUILD_HOLDERS(["alpha"]), stop_resume.BuildQueueUnreadable("no socket"))
+
+
 if __name__ == "__main__":
     _ = unittest.main()
