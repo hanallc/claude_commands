@@ -7,6 +7,7 @@
 // Add --cloud-owner as the fourth argument for cloud worker owner images.
 // Add --blocks as the fourth argument for the target block and hold images.
 // Add --identity as the fourth argument for the row hover identity block images.
+// Add --wait-tip as the fourth argument for the waiting step hover images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -35,6 +36,7 @@ try {
   const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
   const blocksComparison = process.argv[4] === '--blocks';
   const identityComparison = process.argv[4] === '--identity';
+  const waitTipComparison = process.argv[4] === '--wait-tip';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -544,7 +546,7 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
+                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.kind==='cloud'),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
             assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
@@ -566,7 +568,7 @@ try {
             assert.equal(cloudProof.waitingMachine,'');
             assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
-            assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
+            assert.match(cloudProof.slots,/can run on: AWS only/);
             assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
             assert.ok(!cloudProof.cloudMemory,'Cloud work has a memory reservation.');
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
@@ -1217,7 +1219,8 @@ try {
         if (blocksComparison) {
           assert.ok(beforePage, 'The block comparison needs the previous page.');
           const blockReason='research P16 Hana palette Command-shortcut shots (kept binary, no cargo)';
-          const blockLine='Mac: blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST';
+          const blockLine='yes, blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST';
+          const runsOn=(answer,note)=>[{target:'natedev',answer:'yes',note:''},{target:'Mac',answer,note}];
           const blocked=structuredClone(readings.spacing);
           Object.assign(blocked,{room:1.0,pressure:'some stall above its limit',psi:{some:31.0,full:6.2},
             mac_idle_alert:'MAC IDLE 8 min: 1 steps wait for the Mac. Blocked by research since 15:32 ('+blockReason
@@ -1229,7 +1232,7 @@ try {
                since:'since 15:20 EST',until:'expected release 16:00 EST'},
               {target:'natedev',state:'Held',reason:'cargo sweep of the shared target folder',holder:'cables',unit:'cables',
                showrunner:'builds',since:'start not recorded',until:'until released'}]});
-          blocked.waiters[0].mac_text=blockLine;
+          blocked.waiters[0].runs_on=runsOn('yes','blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST');
           const after=structuredClone(blocked);
           after.mac_idle_alert='';
           const contrast=`(() => {
@@ -1299,19 +1302,61 @@ try {
           }
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-          const lines=[blockLine,'Mac: busy with nextest hana','Mac: natedev only, makes natedev artifacts',
-            'Mac: kind not offloaded','Mac: excluded, linux_only; package not recorded','Mac: unreachable, retry backoff',
-            'Mac: state unreadable, retry backoff: backoff time is not finite',
-            'Mac: no recorded block or claim; availability not checked'];
-          for (const [index,line] of lines.entries()) {
+          const lines=[['yes','blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST'],
+            ['yes','busy with nextest hana'],['no','makes natedev artifacts'],['no','this step kind does not run on the Mac'],
+            ['no','this package runs only on Linux; package not recorded'],['yes','unreachable, retry backoff'],
+            ['unknown','Mac state unreadable, retry backoff: backoff time is not finite'],['yes','no block or claim recorded']];
+          for (const [index,[answer,note]] of lines.entries()) {
+            const line=`${answer}, ${note}`;
             const reading=structuredClone(after);
-            reading.waiters[0].mac_text=line;
+            reading.waiters[0].runs_on=runsOn(answer,note);
             await show(reading);
             await evaluate(`showTip('wait:0',700,420)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             assert.ok(tooltip.includes(line),tooltip);
             await capture(`after-mac-line-${index+1}`,'#tip');
             comparisons.push({line,tooltip});
+          }
+        }
+        if (waitTipComparison) {
+          assert.ok(beforePage, 'The wait hover comparison needs the previous page.');
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const owner={name:'demo build',showrunner:'hana',unit:'demo',runner:'unit director',worker:'',detail:'demo',
+            pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
+          const priority="queue priority: demo (the user's bump)";
+          const natedevOnly=[{target:'natedev',answer:'yes',note:''},
+            {target:'Mac',answer:'no',note:'makes natedev artifacts'},
+            {target:'AWS',answer:'no',note:'AWS runs only the ~/.claude test gate'}];
+          const room={rows:[{label:'free RAM',gib:28.4},{label:'− safety margin',gib:3.0},
+            {label:'− swapped out by other work',gib:9.8},{label:'− reserved for running builds',gib:8.5},
+            {label:'= room for builds',gib:7.1},{label:'needs',gib:16.3}],note:''};
+          const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
+            reason:'behind #1: the first step in line gets memory first',
+            runs_on:[{target:'natedev',answer:'yes',note:''},{target:'Mac',answer:'yes',note:'busy with nextest hana'},
+              {target:'AWS',answer:'no',note:'AWS runs only the ~/.claude test gate'}]};
+          const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
+          Object.assign(cloud,{since:now-3*60,runs_on:[{target:'AWS',answer:'yes',note:''},
+            {target:'natedev',answer:'no',note:'only when AWS cannot start the gate'}]});
+          const old={...owner,priority_text:priority,mac_text:'Mac: natedev only, makes natedev artifacts',
+            head_text:'Head: need 16.3 GiB > room 7.1 GiB (free 28.4 GiB − safety 3.0 GiB − 9.8 GiB swapped outside builds − kept aside 8.5 GiB) · cloud 2 of 9 slots'};
+          const cases=[['before','before.html',[old]],['after','memory_live.html',[{...owner,priority_text:priority,runs_on:natedevOnly,head_room:room},behind,cloud]]];
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const [version,path,waiters] of cases) {
+              await navigate(path);
+              await show({...structuredClone(readings.spacing),waiters});
+              for (const index of waiters.keys()) {
+                await evaluate(`showTip('wait:${index}',700,420)`);
+                const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+                if (version==='after') {
+                  assert.ok(!tooltip.includes('Head'),tooltip);
+                  assert.ok(/\nreason\s/.test(tooltip),tooltip);
+                  assert.ok(tooltip.includes('can run on'),tooltip);
+                }
+                await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
+                comparisons.push({version,theme,index,tooltip});
+              }
+            }
           }
         }
         if (identityComparison) {
@@ -1371,7 +1416,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -1388,7 +1433,9 @@ try {
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
-            head_text:review.head_text,priority_text:review.priority_text}];
+            head_text:review.head_text,priority_text:review.priority_text,
+            head_room:{rows:[{label:'free RAM',gib:8.5},{label:'− safety margin',gib:3.0},
+              {label:'− swapped out by other work',gib:6.0},{label:'= room for builds',gib:0.0},{label:'needs',gib:1.9}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.used + review.ci_ram + review.reserved;
           for (const theme of ['light','dark']) {
@@ -1462,7 +1509,7 @@ try {
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                  for(const value of ['First in line',review.priority_text,'free memory'])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }

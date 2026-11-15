@@ -1,4 +1,4 @@
-"""Name each target block and hold, and why a natedev step does not go to the Mac.
+"""Name each target block and hold, and whether a natedev step may run on the Mac.
 
 Every fact comes from one `targets.target_snapshots()` reading and the
 `build_targets.step_policy` reader. This module reads no block, hold, claim or
@@ -89,6 +89,9 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
+# Plain words for the static Mac exclusions; other reasons show as recorded.
+EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac",
+                  "linux_only": "this package runs only on Linux"}
 
 
 @dataclass(frozen=True)
@@ -96,9 +99,28 @@ class NoMacTarget:
     """No configured target runs macOS."""
 
 
+@dataclass(frozen=True)
+class Allowed:
+    """The step may run on the target; the note names the target's state."""
+    note: str
+
+
+@dataclass(frozen=True)
+class NotAllowed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class FitUnreadable:
+    reason: str
+
+
+TargetFit = Allowed | NotAllowed | FitUnreadable
+
+
 @final
 class MacRoutes:
-    """Explain, for each natedev step, why it does not run on the Mac."""
+    """Say, for each natedev step, whether it may run on the Mac, and why not."""
 
     def __init__(self, snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels], zone: tzinfo) -> None:
         self.mac: targets.TargetSnapshot | NoMacTarget | SnapshotsUnreadable = (
@@ -106,64 +128,63 @@ class MacRoutes:
             else next((snapshot for snapshot in snapshots if snapshot.target.platform == "macos"), NoMacTarget()))
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
-        self.policies: dict[tuple[str, str | PackageNotRecorded, str], str] = {}
+        self.policies: dict[tuple[str, str | PackageNotRecorded, str], TargetFit | None] = {}
 
-    def line(self, step: str, folder: str, package: str | PackageNotRecorded) -> str:
+    def fit(self, step: str, folder: str, package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
         mac = self.mac
         if isinstance(mac, SnapshotsUnreadable):
-            return "Mac: state unreadable, " + mac.reason
+            return FitUnreadable("Mac state unreadable, " + mac.reason)
         if isinstance(mac, NoMacTarget):
-            return ""
+            return mac
         kind = build_targets.recorded_step_kind(step)
         if isinstance(kind, build_targets.KindNotOffloaded):
-            return "Mac: kind not offloaded"
+            return NotAllowed("this step kind does not run on the Mac")
         rule = build_targets.step_routing_rule(kind)
         if isinstance(rule, build_targets.NatedevOnly):
-            return "Mac: natedev only, " + rule.reason
+            return NotAllowed(rule.reason)
         excluded = self.policy(mac, folder, package, kind)
-        if excluded:
-            return excluded
-        return self.state_line(mac.states[0])
+        return excluded or self.state_fit(mac.states[0])
 
     def policy(self, mac: targets.TargetSnapshot, folder: str, package: str | PackageNotRecorded,
-               kind: build_targets.StepKind) -> str:
+               kind: build_targets.StepKind) -> TargetFit | None:
         """Read each repository, package and kind once in a page reading.
 
-        Backoff and unreadable state are not policy: the Mac state line names them.
+        Backoff and unreadable state are not policy: the Mac state names them.
         """
         key = (folder, package, kind)
         if key not in self.policies:
             name = package if isinstance(package, str) else ""
             try:
                 result = build_targets.step_policy(mac.target, Path(folder), name, kind, backoff=mac.backoff)
-                text = ""
+                fit: TargetFit | None = None
                 if isinstance(result, ExcludedTarget) and result.reason not in DYNAMIC_REASONS:
-                    text = "Mac: excluded, " + result.reason
+                    reason = EXCLUSION_TEXT.get(result.reason, result.reason)
                     if isinstance(package, PackageNotRecorded) and result.reason == "linux_only":
-                        text += "; package not recorded"
+                        reason += "; package not recorded"
+                    fit = NotAllowed(reason)
             except (ConfigError, OSError, UnicodeError, ValueError) as error:
-                text = f"Mac: state unreadable, {error}"
-            self.policies[key] = text
+                fit = FitUnreadable(f"Mac state unreadable, {error}")
+            self.policies[key] = fit
         return self.policies[key]
 
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
 
-    def state_line(self, state: targets.TargetState) -> str:
+    def state_fit(self, state: targets.TargetState) -> TargetFit:
         if isinstance(state, targets.Held):
             identity = holder_labels(state, self.labels)
             owner = identity.unit if identity.unit != "—" else identity.session
             if identity.showrunner != "—":
                 owner += f" ({identity.showrunner})"
-            return f"Mac: blocked by {owner} {targets.end_text(state.end, self.zone)}"
+            return Allowed(f"blocked by {owner} {targets.end_text(state.end, self.zone)}")
         if isinstance(state, targets.Running):
-            return "Mac: busy with " + "; ".join(job.what for job in state.jobs)
+            return Allowed("busy with " + "; ".join(job.what for job in state.jobs))
         if isinstance(state, targets.Unreachable):
-            return "Mac: unreachable, " + state.reason
+            return Allowed("unreachable, " + state.reason)
         if isinstance(state, targets.StateUnreadable):
-            return "Mac: state unreadable, " + state.reason
-        return "Mac: no recorded block or claim; availability not checked"
+            return FitUnreadable("Mac state unreadable, " + state.reason)
+        return Allowed("no block or claim recorded")
 
 
 def mac_claims(snapshots: Snapshots) -> Sequence[mac_test.HeldClaim]:

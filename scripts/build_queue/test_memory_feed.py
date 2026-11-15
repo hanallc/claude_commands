@@ -21,7 +21,7 @@ import textwrap
 import tempfile
 import time
 import unittest
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest import mock
 
 from scripts.buildlog import charts, costs, moments
@@ -1236,9 +1236,28 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("priority_text", ""), expected)
                 self.assertEqual(page["unmatched_priority_text"],
                     "queue priority: research (the user's bump)" if priority and unit == "other" else "")
-                notes = [row["head_text"] for row in page["waiters"] if "head_text" in row]
-                self.assertEqual(notes, [page["head_text"]])
-                self.assertIn("cloud 1 of 1 slots", notes[0])
+                self.assertEqual([row for row in page["waiters"] if "head_room" in row], [])
+                self.assertNotIn("head_text", page)
+
+    def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
+        gib = admission_records.GIB
+        reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
+        states: tuple[tuple[Literal["admit", "hold"], list[list[tuple[str, float]]]], ...] = (("admit", []), ("hold", [[
+                ("free RAM", 30.0), ("− safety margin", 3.0), ("− reserved for running builds", 9.0),
+                ("− held for other waiting steps", 3.0), ("= room for builds", 15.0), ("needs", 20.0)]]))
+        for state, expected in states:
+            with self.subTest(state=state):
+                head = admission_records.HeadExplanation(reading.view.waiting[0], admission_records.NeedSourceNotRecorded(),
+                    admission_records.AdmissionDecision(state, 0, 0, 0, 0), room,
+                    admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False,
+                    cause=admission_records.NeedsMemory())
+                current = replace(reading, explanation=replace(reading.explanation, head=head))
+                with mock.patch.object(admission_client, "view", return_value=current):
+                    page = memory_feed.reading()
+                shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
+                         for waiter in page["waiters"] if "head_room" in waiter]
+                self.assertEqual(shown, expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -1297,8 +1316,9 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["targets"], [{"target": "mac", "state": "Blocked", "reason": "P15 F11 L0 run",
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
-                self.assertEqual({waiter.get("mac_text") for waiter in page["waiters"]},
-                                 {"Mac: blocked by research (hana) until released"})
+                self.assertEqual({str(waiter.get("runs_on")) for waiter in page["waiters"]}, {str([
+                    {"target": "natedev", "answer": "yes", "note": ""},
+                    {"target": "Mac", "answer": "yes", "note": "blocked by research (hana) until released"}])})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())
@@ -1460,12 +1480,14 @@ process.stdout.write(JSON.stringify({
                 self.assertNotIn("cloud_heading", payload)
                 self.assertEqual(page["cloud_slots_used"], 1)
                 self.assertEqual(page["cloud_slots"], 1)
-                self.assertIn("cloud 1 of 1 slots", page["head_text"])
                 runs = cast(list[dict[str, object]], payload["walk"])
                 waits = cast(list[dict[str, object]], payload["waiters"])
                 remote, = [row for row in runs if row.get("kind") == "cloud"]
                 local, = [row for row in runs if row.get("kind") != "cloud"]
                 waiter, = [row for row in waits if row.get("kind") == "cloud"]
+                self.assertEqual(waiter["runs_on"], memory_feed.cloud_runs_on())
+                self.assertEqual([cast(list[object], row["runs_on"])[-1] for row in waits if row.get("kind") != "cloud"],
+                                 [{"target": "AWS", "answer": "no", "note": memory_feed.AWS_GATE_ONLY}] * (len(waits) - 1))
                 self.assertEqual(remote["machine"], "aws")
                 self.assertEqual(remote["vcpus"], 32 if isinstance(cloud.progress, cloud_progress.CloudProgress)
                                  else {"kind": "UnknownCpuCount"})

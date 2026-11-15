@@ -95,7 +95,8 @@ Small text under the line shows the module count and failed modules.
 The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
-The Head line shows `cloud N of M slots`.
+The queue pane's Head line shows `cloud N of M slots`.
+When no step waits, the build page's queue summary hover shows `AWS: N of M slots in use`.
 The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
@@ -356,6 +357,14 @@ The page and the queue pane show the same saved Mac idle alert first, in red.
 The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
+A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
+`can run on` names the targets that can take the step now: natedev, the Mac, or AWS.
+Each target with a note gets its own line with `yes`, `no` or `unknown` and the note.
+`MacRoutes.fit()` in `target_availability.py` gives the Mac answer and its note.
+AWS runs only the ~/.claude test gate. A cloud gate runs on natedev only when AWS cannot start it.
+When memory holds the first step in line, its hover adds a `First in line` table.
+The table starts at free RAM, subtracts each term that is not zero, and ends with the room for builds and the need.
+`queue_evidence.room_terms()` gives the terms to the table and to the queue pane's Head line.
 The unit-board queue pane keeps `build_queue.py --json` and its selected cards.
 A position, session, folder, or `mine` selects cards in the pane.
 The pane resolves labels once and reads optional history once through `head_facts.read_head_facts()`.

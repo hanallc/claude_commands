@@ -103,9 +103,12 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
-#tip .mac-tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
-#tip .mac-tip-fields dt { text-align: left; }
-#tip .mac-tip-fields dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tip .tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
+#tip .tip-fields dt { text-align: left; }
+#tip .tip-fields dd { margin: 0; overflow-wrap: anywhere; }
+#tip .tip-fields.numbers dd { text-align: right; font-variant-numeric: tabular-nums; }
+#tip .tip-section { display: block; margin-top: 8px; font-weight: 700; }
+#tip .tip-line { display: block; margin-top: 6px; }
 #tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
 #tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
 #tip .identity dd { margin: 0; overflow-wrap: anywhere; }
@@ -609,8 +612,8 @@ function identityFields(row) {
     : [showrunner, ["unit", unit]];
   return fields.filter(([, value]) => value);
 }
-function identityHtml(row) {
-  const fields = identityFields(row);
+function identityHtml(row, more = []) {
+  const fields = identityFields(row).concat(more);
   return fields.length ? `<dl class="identity">` + fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd class="colon" aria-hidden="true">:</dd><dd>${esc(value)}</dd>`).join("") + `</dl>` : "";
 }
 function stageText(row) {
@@ -641,10 +644,36 @@ function tooltipHtml(key, data) {
   const [head, body] = tipText(key, data);
   const row = stepRow(key, data);
   if (!row) return `<b>${esc(head)}</b>${esc(body)}`;
+  if (key.startsWith("wait:")) return `<b>${esc(head)}</b>${waitTipHtml(row, data)}`;
   if (!macRow(row)) return `<b>${esc(head)}</b>${identityHtml(row)}${esc(body)}`;
-  return `<b>${esc(head)}</b>${identityHtml(row)}<dl class="mac-tip-fields">` +
-    macTipFields(row, data).map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(value)}</dd>`).join("") +
-    `</dl><span class="mac-note">Mac memory does not count against natedev.</span>`;
+  return `<b>${esc(head)}</b>${identityHtml(row)}${fieldsHtml(macTipFields(row, data), "numbers")}` +
+    `<span class="mac-note">Mac memory does not count against natedev.</span>`;
+}
+function fieldsHtml(fields, kind = "") {
+  return fields.length ? `<dl class="tip-fields${kind ? " " + kind : ""}">` +
+    fields.map(([name, value]) => `<dt>${esc(name)}</dt><dd>${esc(memoryText(value))}</dd>`).join("") + `</dl>` : "";
+}
+function lineHtml(text) { return text ? `<span class="tip-line">${esc(memoryText(text))}</span>` : ""; }
+function runsOnText(targets) {
+  const yes = targets.filter(target => target.answer === "yes").map(target => target.target);
+  return yes.length === 1 ? `${yes[0]} only` : yes.length ? yes.join(" or ") : "no target now";
+}
+function targetFields(row) {
+  const targets = row.runs_on || [];
+  return targets.length ? [["can run on", runsOnText(targets)],
+    ...targets.filter(target => target.note).map(target => [target.target, `${target.answer}, ${target.note}`])] : [];
+}
+function waitFields(w, d) {
+  return [["waiting", ago(w.since, d.read_at)], ["reason", w.reason], ...targetFields(w)];
+}
+function roomFields(w) { return (w.head_room?.rows || []).map(row => [row.label, `${f1(row.gib)} GiB`]); }
+function waitNotes(w) {
+  return [w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
+}
+function waitTipHtml(w, d) {
+  const room = roomFields(w);
+  return identityHtml(w, waitFields(w, d)) + (room.length ? `<span class="tip-section">First in line</span>${fieldsHtml(room, "numbers")}` : "") +
+    waitNotes(w).map(lineHtml).join("");
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
@@ -737,9 +766,10 @@ function rawTipText(key, d) {
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    if (w.kind === "cloud") return [`Waits · ${w.name}`, `${w.reason}. No local memory reservation.`];
-    const need = w.head_text?.startsWith("Head: need ") ? "" : `Needs ${f1(w.need)} GiB. `;
-    return [`Waits · ${w.name}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    const room = roomFields(w);
+    const fields = waitFields(w, d).concat(room.length ? [["First in line", ""], ...room] : room);
+    return [`Waits · ${w.name}`, [...fields.map(([name, value]) => value ? `${name}: ${value}` : name), ...waitNotes(w)]
+      .filter(Boolean).join("\n")];
   }
   return TIPS[key](d);
 }
@@ -753,7 +783,9 @@ function tipText(key, d) {
   if (!text[0] && !text[1]) return text;
   if (/^swap(-pool)?:/.test(key)) return text;
   const row = stepRow(key, d);
-  const notes = row ? [row.head_text, row.priority_text, row.mac_text] : key === "walksum" && !d.waiters.length ? [d.head_text] : [];
+  if (key.startsWith("wait:")) return text.map(memoryText);
+  const notes = row ? [...targetFields(row).map(([name, value]) => `${name}: ${value}`), row.priority_text]
+    : key === "walksum" && !d.waiters.length && d.cloud_slots ? [`AWS: ${d.cloud_slots_used} of ${d.cloud_slots} slots in use`] : [];
   if (key === "walkhead") notes.push(d.unmatched_priority_text);
   text[1] = [text[1], ...notes].filter(Boolean).join("\n");
   return text.map(memoryText);

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -140,24 +140,37 @@ def room_check_text(check: admission_records.RoomCheck) -> str:
     return f"Room: {room_relation_text(check)}: {result}{room_basis_text(check.basis)}"
 
 
+@dataclass(frozen=True)
+class RoomTerms:
+    """The terms of the first waiting step's room, in the order of the page's room equation."""
+    available: int
+    safety: int
+    swapped: int
+    reserved: int
+    ahead: int
+
+
+def room_terms(check: admission_records.RoomCheck, room: admission_records.MemoryRoom) -> RoomTerms:
+    """Split the room check into free memory less each term; a head override does not count reserved memory."""
+    reserved = 0 if isinstance(check.basis, admission_records.OverrideRoom) else room.kept
+    ahead = room.available - room.safety - reserved - room.agent_swap_demand - check.room
+    return RoomTerms(room.available, room.safety, room.agent_swap_demand, reserved, max(0, ahead))
+
+
 def head_room_text(check: admission_records.RoomCheck,
                    room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> str:
     """Show the head's room check with the same terms as the cap line, so it never reads as fitting."""
     text = room_relation_text(check)
     if isinstance(room, admission_records.ReadingUnavailable):
         return text + room_basis_text(check.basis)
-    # A head override does not count the memory kept aside for running builds.
-    override = isinstance(check.basis, admission_records.OverrideRoom)
-    kept = 0 if override else room.kept
-    # The terms keep the order of the page's room equation: free, safety, swap, then kept aside.
-    terms = [f"free {gib(room.available)}", f"safety {gib(room.safety)}"]
-    if room.agent_swap_demand:
-        terms.append(f"{gib(room.agent_swap_demand)} swapped outside builds")
-    if kept:
-        terms.append(f"kept aside {gib(kept)}")
-    protected = room.available - room.safety - kept - room.agent_swap_demand - check.room
-    if protected > 0:
-        terms.append(f"head protection {gib(protected)}")
+    split = room_terms(check, room)
+    terms = [f"free {gib(split.available)}", f"safety {gib(split.safety)}"]
+    if split.swapped:
+        terms.append(f"{gib(split.swapped)} swapped outside builds")
+    if split.reserved:
+        terms.append(f"kept aside {gib(split.reserved)}")
+    if split.ahead:
+        terms.append(f"head protection {gib(split.ahead)}")
     return f"{text} ({' − '.join(terms)}){room_basis_text(check.basis)}"
 
 

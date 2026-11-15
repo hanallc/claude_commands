@@ -77,7 +77,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='duration']"), expected)
                 tips = self.page_expression("[tipText('row:0', data), tipText('wait:0', data)]", data)
                 self.assertIn(f"Started {expected} ago.", str(tips))
-                self.assertIn(f"Waiting for {expected}.", str(tips))
+                self.assertIn(f"waiting: {expected}\\nreason: free memory", str(tips))
 
     def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
         for units, expected in (([], "Queued, in order of submission"),
@@ -205,7 +205,8 @@ class MemoryHoverTests(unittest.TestCase):
                     rendered = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
                     root = ElementTree.fromstring(f"<root>{rendered}</root>")
                     self.assertEqual(root[0].tag, "b")
-                    if not expected:
+                    fields = expected + ([("waiting", "2 min"), ("reason", "start spacing")] if key == "wait:0" else [])
+                    if not fields:
                         self.assertIsNone(root.find("dl[@class='identity']"), rendered)
                         self.assertNotIn("not recorded", rendered)
                         continue
@@ -213,7 +214,7 @@ class MemoryHoverTests(unittest.TestCase):
                     names = [cell.text for cell in root[1].findall("dt")]
                     values = field_values(root[1])
                     self.assertEqual([cell.text for cell in root[1].findall("dd[@class='colon']")], [":"] * len(names))
-                    self.assertEqual(list(zip(names, values, strict=True)), expected)
+                    self.assertEqual(list(zip(names, values, strict=True)), fields)
                     self.assertEqual({cell.get("aria-hidden") for cell in root[1].findall("dd[@class='colon']")}, {"true"})
 
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
@@ -428,24 +429,38 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
-        head = "Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − kept aside 6.0 GiB) · cloud 2 of 9 slots"
         priority = "queue priority: port (the user's bump)"
+        room = {"rows": [{"label": "free RAM", "gib": 8.5}, {"label": "− safety margin", "gib": 3.0},
+                         {"label": "− reserved for running builds", "gib": 6.0},
+                         {"label": "= room for builds", "gib": 0.0}, {"label": "needs", "gib": 1.9}], "note": ""}
+        natedev_only = [{"target": "natedev", "answer": "yes", "note": ""},
+                        {"target": "Mac", "answer": "no", "note": "makes natedev artifacts"},
+                        {"target": "AWS", "answer": "no", "note": "AWS runs only the ~/.claude test gate"}]
         data = {"read_at": 200, "waiters": [
             {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
-             "reason": "free memory", "head_text": head, "priority_text": priority},
+             "reason": "free memory", "head_room": room, "priority_text": priority, "runs_on": natedev_only},
             {"name": "trunk nextest", "unit": "trunk", "need": 2, "since": 100,
-             "reason": "head protection · behind #1"},
+             "reason": "behind #1: the first step in line gets memory first",
+             "runs_on": [{"target": "natedev", "answer": "yes", "note": ""},
+                         {"target": "Mac", "answer": "yes", "note": "busy with nextest hana"}]},
             {"name": "fps nextest", "unit": "fps", "need": 2, "since": 100,
              "reason": "estimate expired"}]}
-        for index, reason in enumerate(("free memory", "head protection · behind #1", "estimate expired")):
+        expected = ("\n".join((
+            "waiting: 2 min", "reason: free memory", "can run on: natedev only", "Mac: no, makes natedev artifacts",
+            "AWS: no, AWS runs only the ~/.claude test gate", "First in line", "free RAM: 8.5 GiB",
+            "− safety margin: 3.0 GiB", "− reserved for running builds: 6.0 GiB", "= room for builds: 0.0 GiB",
+            "needs: 1.9 GiB", priority)), "\n".join((
+            "waiting: 2 min", "reason: behind #1: the first step in line gets memory first",
+            "can run on: natedev or Mac", "Mac: yes, busy with nextest hana")),
+            "waiting: 2 min\nreason: estimate expired")
+        for index, body in enumerate(expected):
             with self.subTest(index=index):
-                hover = str(self.page_expression(f"tipText('wait:{index}', data)", data))
-                self.assertEqual(hover.count(reason), 1)
-                # The page names kept-aside memory "reserved".
-                self.assertEqual(hover.count(head.replace("kept aside", "reserved")), int(index == 0))
-                self.assertEqual(hover.count(priority), int(index == 0))
-                if index == 0:
-                    self.assertNotIn("Needs 1.9 GiB", hover)
+                hover = cast(list[str], self.page_expression(f"tipText('wait:{index}', data)", data))
+                self.assertEqual(hover[1], body)
+                self.assertNotIn("Head", hover[1])
+                html = str(self.page_expression(f"tooltipHtml('wait:{index}', data)", data, walk=True))
+                self.assertEqual(html.count("First in line"), int(index == 0))
+                self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
             self.assertNotIn(removed, page)
