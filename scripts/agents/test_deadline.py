@@ -18,6 +18,7 @@ from scripts.agents import restart
 from scripts.lib import atomic_file, conf, operation_deadline
 from scripts.production import staff
 from scripts.agents import stop_resume
+from scripts.agents.test_support import write_machine_config
 
 
 class DeadlineTests(unittest.TestCase):
@@ -30,6 +31,7 @@ class DeadlineTests(unittest.TestCase):
         config = Path(self.enterContext(tempfile.TemporaryDirectory()))
         atomic_file.write_text_atomic(config / "shutdown.conf",
             "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n")
+        write_machine_config(config)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(patch.object(time, "monotonic", lambda: self.now))
         _ = self.enterContext(patch.object(stop_resume, "monotonic", lambda: self.now))
