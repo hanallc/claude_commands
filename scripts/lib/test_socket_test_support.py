@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts.lib import build_folders
 from scripts.lib.socket_test_support import PARENT, short_socket_directory
 from scripts.lint.memory_test_support import config_environment
 
@@ -64,11 +65,24 @@ class ShortSocketDirectoryTests(unittest.TestCase):
                 left = Path(subprocess.run([sys.executable, "-c", killed], check=True, capture_output=True,
                                            text=True, cwd=Path(__file__).resolve().parents[2]).stdout.strip())
                 self.assertTrue(left.is_dir())
-                with short_socket_directory() as held, short_socket_directory() as current:
+                with short_socket_directory() as held:
                     self.assertFalse(left.exists())
                     self.assertFalse(left.with_name(left.name + ".lease.json").exists())
+                    build_folders.sweep_temporary_build_folders(Path(held).parent, wait=False)
                     self.assertTrue(Path(held).is_dir())
-                    self.assertTrue(Path(current).is_dir())
+
+    def test_one_process_sweeps_a_parent_once(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            config = root / "build_folders.conf"
+            _ = config_environment(root)
+            _ = config.write_text(config.read_text().replace("roots.system=/tmp", f"roots.system={root}"))
+            with (patch.dict(os.environ, {"CONF_DIR": str(root)}),
+                  patch.object(build_folders, "sweep_temporary_build_folders") as sweep):
+                for _ in range(3):
+                    with short_socket_directory():
+                        pass
+            sweep.assert_called_once_with(root / PARENT, wait=False)
 
 
 if __name__ == "__main__":

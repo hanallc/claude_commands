@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.lib.socket_test_support import socket_parent
 from scripts.production.fake_showrunner import write_session
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -25,7 +26,7 @@ class FakeShowrunnerTests(unittest.TestCase):
             path = Path(cast(str, record["messagingSocketPath"]))
             self.assertLess(len(os.fsencode(path)), 108)
             self.assertTrue(path.is_socket())
-            self.assertEqual(path.parent.parent, Path("/tmp"))
+            self.assertEqual(path.parent.parent, socket_parent())
             held.listen(1)
             held.settimeout(TEST_HANG_GUARD_SECS)
             with socket.socket(socket.AF_UNIX) as client:

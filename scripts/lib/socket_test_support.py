@@ -14,13 +14,17 @@ from typing import override
 
 # The socket folders' own parent under the configured system root.
 PARENT = "test-sockets"
+# Each process sweeps a parent once: parallel test runs hold many folders there.
+_swept: set[Path] = set()
 
 
 def socket_parent() -> Path:
-    """Remove the free folders that killed test runs left, then return the parent."""
+    """Return the parent; the first call in a process removes the free folders killed runs left."""
     parent = Path(conf.read_or_repository("build_folders").text("roots.system")) / PARENT
     parent.mkdir(mode=0o700, exist_ok=True)
-    build_folders.sweep_temporary_build_folders(parent)
+    if parent not in _swept:
+        _swept.add(parent)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
     return parent
 
 
