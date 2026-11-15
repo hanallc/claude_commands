@@ -311,6 +311,10 @@ Builder slots, warm mirrors, idle shutdown, and queue-based starts are historica
 Only historical cost, ownership, and teardown compatibility remain.
 The foundation template has no builder instance, launch template, data volume, roles or stop action.
 The `remove-builder` command and the `down` compute stage are removed.
+The foundation template has no builder parameters or outputs, such as `EnableCompute` or `ComputeEnabled`, since 2026-11-15.
+`deploy.py` has no legacy record migration, data volume adoption, saved builder image or compute request reconcile.
+`down` reads a record without `ComputeEnabled` as a foundation with no builder.
+The ledger still prices the recorded builder hours with `instance_type` and `spot_max_usd_per_hour`.
 
 On 2026-11-04 an `up` with `cloudformation deploy` replaced the builder instance, and the update failed.
 The rollback terminated the new instance, so its persistent Spot request opened again.
