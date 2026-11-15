@@ -73,7 +73,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>] [--image <png>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -90,6 +90,31 @@ shows each unit's phase" --check "In a showrunner session on natedev, type
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. The Merged cell holds the date and time of the add, in the
 user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
+
+## Change images
+
+Attach one image wherever possible. A line without an image stays valid.
+Use `add --image <png>` to attach an existing screenshot to a manual row.
+For a checkpoint, register the image first:
+
+```sh
+… image --image <png>
+… image --output <text file>
+```
+
+Use one option. `--output` renders the text as a dark terminal screenshot with headless Chrome.
+The action prints an image id and a hint.
+Add ` | image <id>` as the last Change-Review field, after ` | after <step>` when present.
+The id contains twelve lowercase hexadecimal characters.
+`list-ready` and `live` copy it into the row's `Image` cell.
+A missing image prints one line and leaves the cell empty.
+
+The console card and the one-row page show a 280px thumbnail beside the change text.
+The thumbnail moves below the text on narrow screens.
+Select it to open the full image in a new tab.
+A landing or return verdict deletes the image and clears its cell.
+Change images use `change-images/` and never appear on the Images page.
+The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
 

@@ -413,13 +413,33 @@ def script_version(script: str) -> str:
     return hashlib.sha256(script.encode()).hexdigest()[:12]
 
 
+CHANGE_IMAGE_STYLE = """main:has(.change-image){max-width:1056px}
+:is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
+.change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
+.change-image img{display:block;box-sizing:border-box;width:280px;max-width:100%;max-height:420px;object-fit:cover;object-position:top left;border:1px solid #8886;border-radius:6px}
+[data-showrunner-filter]{max-width:680px}
+@media(max-width:999px){:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){display:block;max-width:680px}.change-image{margin-top:24px}}
+"""
+
+
+def change_content(row: dict[str, str], content: str) -> str:
+    """Place the change text beside its thumbnail when its image exists."""
+    path = change_review.image_path(row.get(change_review.IMAGE, ""))
+    if not path:
+        return content
+    alt = html.escape("Screenshot: " + row.get("Change", "Change preview"), quote=True)
+    thumbnail = (f'<a class="change-image" href="{path}" target="_blank" rel="noopener">'
+                 + f'<img src="{path}" alt="{alt}"></a>')
+    return '<div class="change-text">' + content + '</div>' + thumbnail
+
+
 def document(content: str, title: str = TITLES["changes"]) -> bytes:
     return ('''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}''' + page_frame.STYLE + '''main{max-width:744px}
-h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
+''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
 .answer-actions{display:flex;flex-wrap:wrap;gap:8px}.answer-actions button{margin:0}
@@ -643,12 +663,12 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text and (verdict or not warning) else
                   "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
-        sections.append(f'''<section id="{row_id}">
-{alert}
+        content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
 <h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
 {question_html(question)}{answer}
-{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}</section>''')
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
+        sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
     queue = next_item.change_queue(page.production)
