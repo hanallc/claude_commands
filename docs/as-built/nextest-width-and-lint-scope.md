@@ -19,6 +19,7 @@ Two policies in the cargo layer that every session's builds go through. First, e
 - `nextest_physical_cores [sysfs_root]` sets `LINT_PHYSICAL_CORES` once per shell. On Linux it counts distinct `physical_package_id:core_id` pairs under `${1:-/sys/devices/system/cpu}/cpu[0-9]*/topology/`; on darwin it reads `sysctl -n hw.physicalcpu`. A value that is not a positive integer leaves it empty.
 - `nextest_logical_cores` sets `LINT_LOGICAL_CORES` once from `getconf _NPROCESSORS_ONLN`, with the same rule.
 - `nextest_width_arm EPOCH` sets `LINT_TEST_WIDTH_ARM` to `physical` when `(EPOCH / 6000) % 2 == 0`, else `logical`. `trial` mode passes `${EPOCHSECONDS:-$(date +%s)}`.
+- `require_nextest` runs `cargo nextest --version`. On a failure it prints `cargo nextest is required`, then the first error line when there is one, such as a Mac cargo gate refusal. It exits 2.
 - `run_nextest` runs `require_nextest`, waits out any build hold (`build_hold_wait_local`), then picks the width and runs `cargo nextest run --test-threads <N> "$@"`. It adds no flag when `NEXTEST_TEST_THREADS` is set, when an argument before `--` is `--test-threads`, `--test-threads=*`, `--jobs`, `--jobs=*`, `-j` or `-j*`, or when the core count is unreadable. Arguments after `--` belong to the test binaries and never suppress the width. The exit status passes through unchanged.
 
 ### Jobserver tokens (`scripts/lint/nextest_tokens.py`)

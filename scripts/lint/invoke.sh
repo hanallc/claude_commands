@@ -558,13 +558,12 @@ sweep_after_step() {
     )
 }
 
-have_nextest() {
-    cargo nextest --version >/dev/null 2>&1
-}
-
+# A failed version check prints its first error line, so a refusal such as the
+# Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
-    if ! have_nextest; then
-        echo "cargo nextest is required" >&2
+    local error
+    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+        echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
 }
