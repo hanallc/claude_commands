@@ -61,7 +61,13 @@ def publish(folder: Path, settings: PageSettings) -> Path:
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
-    write_text_atomic(page_path, page, new_file_mode=0o644)
+    try:
+        unchanged = page_path.read_text(encoding="utf-8") == page
+    except OSError:
+        unchanged = False
+    # The console reads page_url on each load, so the page is written only when it changes.
+    if not unchanged:
+        write_text_atomic(page_path, page, new_file_mode=0o644)
     return page_path
 
 
