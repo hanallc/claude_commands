@@ -544,6 +544,13 @@ function fitLabels() {}
                     "reason":reason_phrase(reason, reading.view.waiting)}]})
                 self.assertIn(expected, str(hover))
 
+    def test_a_wait_hover_puts_need_wait_reason_and_route_on_their_own_lines(self) -> None:
+        waiter = {"name":"tile nextest", "unit":"", "showrunner":"", "need":1, "since":200_000 - 240,
+                  "reason":"start spacing", "mac_text":"Runs on the Mac or natedev, whichever is available first"}
+        hover = cast(list[str], self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[waiter]}))
+        self.assertEqual(hover[1].split("\n"), ["Needs 1.0 GiB.", "Waiting for 4 min.", "Reason: start spacing.",
+                                                 "Runs on the Mac or natedev, whichever is available first"])
+
     def test_missing_run_use_has_a_page_hover_reason(self) -> None:
         hover = self.page_expression("tipText('row:0', data)", {"read_at":200_000, "walk":[{
             "name":"fixture", "unit":"", "showrunner":"", "used":{

@@ -43,6 +43,11 @@ def claim(scope: claim_state.ClaimScope, what: str) -> mac_test.HeldClaim:
     return mac_test.HeldClaim(scope, Path("/fixture/claims") / (what + ".json"), record)
 
 
+def either(*mac_lines: str) -> str:
+    """A step either host can take: the route line, then what keeps its repository off the Mac."""
+    return "\n".join((target_availability.EITHER_LINE, *mac_lines))
+
+
 def scope_of(scopes: Mapping[str, claim_state.ClaimScope]) -> Callable[[claim_state.StatePaths, str], claim_state.ClaimScope]:
     def find(_paths: claim_state.StatePaths, folder: str) -> claim_state.ClaimScope:
         return scopes[folder]
@@ -110,11 +115,11 @@ class MacRouteTests(unittest.TestCase):
 
     def test_each_mac_state_gives_its_line(self) -> None:
         cases: tuple[tuple[targets.TargetState, str], ...] = (
-            (MAC_BLOCK, "Mac: blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC"),
-            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER)), "Mac: blocked by solo until 15:10 UTC"),
-            (targets.Unreachable("probe failed"), "Mac: unreachable, probe failed"),
-            (targets.StateUnreadable("block.json: bad"), "Mac: state unreadable, block.json: bad"),
-            (targets.Free(), "Mac: no recorded block or claim; availability not checked"),
+            (MAC_BLOCK, either("Mac: blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC")),
+            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER)), either("Mac: blocked by solo until 15:10 UTC")),
+            (targets.Unreachable("probe failed"), either("Mac: unreachable, probe failed")),
+            (targets.StateUnreadable("block.json: bad"), either("Mac: state unreadable, block.json: bad")),
+            (targets.Free(), either()),
         )
         for state, expected in cases:
             with self.subTest(expected=expected), \
@@ -136,10 +141,10 @@ class MacRouteTests(unittest.TestCase):
              mock.patch.object(mac_test, "run_is_live", return_value=True), \
              mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)) as scope:
             self.assertEqual(routes.line("nextest", "/fixture/cargo-liner-tile", "tile", ANY),
-                             "Mac: busy with check cargo-handler")
+                             either("Mac: busy with check cargo-handler"))
             self.assertEqual(routes.line("nextest", "/fixture/cargo-liner-tile", "berth", ANY),
-                             "Mac: busy with check cargo-handler")
-            self.assertEqual(routes.line("nextest", "/fixture/organon", "organon", ANY), "Mac: no claim for this repository")
+                             either("Mac: busy with check cargo-handler"))
+            self.assertEqual(routes.line("nextest", "/fixture/organon", "organon", ANY), either())
         self.assertEqual(scope.call_count, 2)
 
     def test_a_whole_mac_claim_or_an_unknown_repository_names_every_live_claim(self) -> None:
@@ -154,9 +159,9 @@ class MacRouteTests(unittest.TestCase):
              mock.patch.object(mac_test, "run_is_live", side_effect=live_unless("nextest hana")), \
              mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)):
             self.assertEqual(routes.line("check", "/fixture/cargo-liner", "liner", ANY),
-                             "Mac: busy with mac setup; check cargo-handler")
+                             either("Mac: busy with mac setup; check cargo-handler"))
             self.assertEqual(routes.line("check", "/fixture/outside", "x", ANY),
-                             "Mac: busy with mac setup; check cargo-handler")
+                             either("Mac: busy with mac setup; check cargo-handler"))
 
     def test_a_local_step_names_the_run_and_no_mac_state(self) -> None:
         for state in (MAC_BLOCK, targets.Running((targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle()),)),
@@ -164,10 +169,10 @@ class MacRouteTests(unittest.TestCase):
             with self.subTest(state=type(state).__name__), \
                  mock.patch.object(build_targets, "step_policy", side_effect=AssertionError("no policy read")):
                 self.assertEqual(self.routes(state).line("nextest", "/fixture/cargo-liner", "berth", LOCAL_CALLER),
-                                 "Runs on natedev because the run asks for it (--local)")
+                                 "Runs on natedev because the run asks for it")
         unreadable = target_availability.MacRoutes(target_availability.SnapshotsUnreadable("targets.conf: missing"), {}, UTC)
         self.assertEqual(unreadable.line("nextest", "/r", "p", LOCAL_CALLER),
-                         "Runs on natedev because the run asks for it (--local)")
+                         "Runs on natedev because the run asks for it")
 
     def test_kind_and_routing_rule_come_before_target_state(self) -> None:
         routes = self.routes(MAC_BLOCK)
@@ -191,7 +196,7 @@ class MacRouteTests(unittest.TestCase):
             with self.subTest(reason=reason), \
                  mock.patch.object(build_targets, "step_policy", return_value=ExcludedTarget(MAC, reason)):
                 self.assertEqual(self.routes(targets.Unreachable("retry backoff")).line("check", "/fixture/hana", "hana", ANY),
-                                 "Mac: unreachable, retry backoff")
+                                 either("Mac: unreachable, retry backoff"))
 
     def test_a_policy_read_error_shows_as_unreadable(self) -> None:
         with mock.patch.object(build_targets, "step_policy", side_effect=ConfigError("offload.conf: bad")):

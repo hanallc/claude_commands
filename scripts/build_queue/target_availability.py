@@ -92,6 +92,11 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 
 
+# The first line of a step's route: a step the run pins to natedev, or a step either host can take.
+LOCAL_LINE = "Runs on natedev because the run asks for it"
+EITHER_LINE = "Runs on the Mac or natedev, whichever is available first"
+
+
 @dataclass(frozen=True)
 class NoMacTarget:
     """No configured target runs macOS."""
@@ -115,7 +120,7 @@ class MacRoutes:
         if isinstance(mac, NoMacTarget):
             return ""
         if isinstance(routing, LocalRequired):
-            return "Runs on natedev because the run asks for it (--local)"
+            return LOCAL_LINE
         if isinstance(mac, SnapshotsUnreadable):
             return "Mac: state unreadable, " + mac.reason
         kind = build_targets.recorded_step_kind(step)
@@ -127,7 +132,7 @@ class MacRoutes:
         excluded = self.policy(mac, folder, package, kind)
         if excluded:
             return excluded
-        return self.state_line(mac, folder)
+        return "\n".join(filter(None, (EITHER_LINE, self.state_line(mac, folder))))
 
     def policy(self, mac: targets.TargetSnapshot, folder: str, package: str | PackageNotRecorded,
                kind: build_targets.StepKind) -> str:
@@ -155,7 +160,10 @@ class MacRoutes:
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
 
     def state_line(self, mac: targets.TargetSnapshot, folder: str) -> str:
-        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim."""
+        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim.
+
+        A Mac free for this repository adds no line.
+        """
         state = mac.states[0]
         if isinstance(state, targets.Held):
             identity = holder_labels(state, self.labels)
@@ -166,13 +174,13 @@ class MacRoutes:
         if isinstance(state, targets.Running):
             jobs = self.repository_jobs(mac, folder)
             if not jobs:
-                return "Mac: no claim for this repository"
+                return ""
             return "Mac: busy with " + "; ".join(job.what for job in jobs)
         if isinstance(state, targets.Unreachable):
             return "Mac: unreachable, " + state.reason
         if isinstance(state, targets.StateUnreadable):
             return "Mac: state unreadable, " + state.reason
-        return "Mac: no recorded block or claim; availability not checked"
+        return ""
 
     def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
         """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""

@@ -171,6 +171,8 @@ class MemoryFeedTests(unittest.TestCase):
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
                     if label.startswith("placement "):
                         self.assertNotIn("placement", row["name"])
+                        if "gate_label" not in row:
+                            self.fail("A placed Mac row keeps its gate label.")
                         self.assertEqual(row["gate_label"], label)
                     else:
                         self.assertIn(label, row["name"])
@@ -1303,7 +1305,7 @@ process.stdout.write(JSON.stringify({
                     "holder": "research", "unit": "research", "showrunner": "hana", "since": "since " + since.strftime("%H:%M UTC"),
                     "until": "until released"}])
                 self.assertEqual({waiter.get("mac_text") for waiter in page["waiters"]},
-                                 {"Mac: blocked by research (hana) until released"})
+                                 {target_availability.EITHER_LINE + "\nMac: blocked by research (hana) until released"})
 
     def test_cloud_rows_show_stage_and_location(self) -> None:
         reading = cloud_reading(reservation_reading())

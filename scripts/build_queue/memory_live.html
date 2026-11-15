@@ -753,8 +753,8 @@ function rawTipText(key, d) {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
     if (w.kind === "cloud") return [`Waits · ${w.name}`, `${w.reason}. No local memory reservation.`];
-    const need = w.head_text?.startsWith("Head: need ") ? "" : `Needs ${f1(w.need)} GiB. `;
-    return [`Waits · ${w.name}`, `${need}Waiting for ${ago(w.since, d.read_at)}. Reason: ${w.reason}.`];
+    const need = w.head_text?.startsWith("Head: need ") ? [] : [`Needs ${f1(w.need)} GiB.`];
+    return [`Waits · ${w.name}`, [...need, `Waiting for ${ago(w.since, d.read_at)}.`, `Reason: ${w.reason}.`].join("\n")];
   }
   return TIPS[key](d);
 }

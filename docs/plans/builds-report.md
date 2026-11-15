@@ -1660,9 +1660,73 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - `admission_service._placement_row`: a step with the `LOCAL_CALLER` fixed Mac exclusion writes `local_reason` into its waiter record.
 - `admission_records.waiter_routing`: reads `local_reason` back. `WaitingStep` and `RunningStep` carry `routing`, and `memory_admit` fills it from the waiter record.
 - `target_availability.MacRoutes.line` takes the routing:
-  - A `LocalRequired` step reads "Runs on natedev because the run asks for it (--local)", with no Mac line.
+  - A `LocalRequired` step reads "Runs on natedev because the run asks for it", with no Mac line.
+  - A step either host can take reads "Runs on the Mac or natedev, whichever is available first". A second line names what keeps its repository off the Mac: a block, an unreachable or unreadable Mac, or a live claim. A Mac free for this repository adds no line.
   - A busy Mac names only the live claims of this step's repository. A whole-Mac claim matches every repository. A repository matches by key, else by name.
-  - With no claim for this repository, the line reads "Mac: no claim for this repository".
+- `memory_live.html`: a waiting step's tooltip puts Needs, Waiting and Reason on their own lines (user feedback on the proof shots, 2026-11-15).
 - `memory_feed` passes each step's routing to the line.
 - Tests: `test_target_availability` (repository filter, whole-Mac claim, local step) and `test_placement` (a local step keeps its routing in the waiting and running views).
-- Proof: `phases/94/proof/before.png` ("Mac: busy with nextest hana; check cargo-handler") and `after-local.png` ("Runs on natedev because the run asks for it (--local)").
+- Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`.
+
+### Phases 95–99 — The Disks page · status: planned
+
+From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
+1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
+2. The cache time, the default slider value and the measure limits are config values.
+3. The measure runs at the lowest disk priority under a memory cap, one at a time, and never blocks the page.
+4. Slot "Used by" reads the lease and lock. "deleted tonight" uses the 7-day config value. Sessions read held folders from the hold records.
+5. A part that depends on code not yet merged shows nothing until that code exists.
+
+Proof: one dark desktop shot for the user when the drive cards are live, and one when each later card shows data. I check light and phone widths myself.
+
+Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. The page and its data live in the review root, as the AWS prices page does.
+
+| Phase | Deliverable | Hours | Depends on |
+| --- | --- | ---: | --- |
+| 95 | Measure and data file | 2 | None |
+| 96 | Drive cards: slider and walk | 3 | 95 |
+| 97 | Measure on open; console entry | 1 | 96; owner review of `serve.py` and `console.conf` |
+| 98 | Slots card | 2 | 96; shows nothing until the slot roots exist |
+| 99 | Sessions card | 1.5 | 96; shows nothing until the session root and hold records exist |
+| **Total** | | **9.5** | |
+
+#### Phase 95 — Measure and data file
+
+1. `config/disks.conf` keys: `drives.<machine>` (the mount points, natedev `/build` and `/`), `cache_seconds=600`, `slider.default_gib=10`, `slider.min_gib=1`, `measure.keep_bytes` (the smallest folder the data keeps, below the slider minimum), `measure.memory_max=2G`, `measure.timeout_seconds`.
+2. `scripts/disks/measure.py` measures one drive at a time. It runs `du -x -B1 --threshold=<keep_bytes>` under `systemd-run --user --scope -p MemoryMax=<memory_max>`, `nice -n 19` and `ionice -c3`.
+3. A file lock lets only one measure run. A second request while one runs does nothing.
+4. The result is a tree for each drive: path, size and children. The size of a folder's "Other" is its size minus its named children, so each level adds up to its parent.
+5. A chain of single large children collapses into one row, such as `/home/natepiano`.
+6. Free and total space come from `scripts/buildlog/filesystem`. The floor line comes from the sweep's floor settings in `lint.conf`.
+7. The measure writes `disks.json` atomically, with `measured_at`, in the page folder.
+8. Tests: the tree from a fixture `du` output, the Other sizes, the chain collapse, the lock, and the timeout.
+
+#### Phase 96 — Drive cards: slider and walk
+
+1. `disks.html` reads `disks.json` and shows the two drive cards of mockup 2: the used bar with the floor mark, the slider and the folder table.
+2. Each card has its own slider, on a log scale from `slider.min_gib` to the largest top folder. The start value is `slider.default_gib`.
+3. A click opens or closes a folder's children, at any depth. Each row shows Size, "Of parent" and a walk bar inside its parent's span.
+4. The status line names the measure time and its age.
+5. Tests: the page renders the fixture data at desktop and phone widths in light and dark mode, with no clipped text.
+
+#### Phase 97 — Measure on open; console entry
+
+1. The page asks for a measure when `disks.json` is older than `cache_seconds`. It shows the old data at once and the line "Measuring…".
+2. The request goes to a new POST route in `scripts/review_links/serve.py`. The route starts `measure.py` in the background and returns at once. The page reads `disks.json` again until `measured_at` changes.
+3. `config/console.conf` gets `page.disks.*` (label Disks). These are new keys.
+4. `serve.py` and `console.conf` are not report's files. The owner reviews the change, or makes it.
+5. Proof: one dark desktop shot of the live page.
+
+#### Phase 98 — Slots card
+
+1. The card reads `roots.slots.<machine>` and `roots.slot_cargo.<machine>` from `build_folders.conf`. With no such key, the card does not show.
+2. Each `<repository>-slotN` row shows one Size (checkout plus compiled output), Last used, and Used by.
+3. Used by comes from `build_folders.build_folder_state` and the lease record: showrunner, unit and purpose. A free slot shows "—".
+4. "deleted tonight" shows when the last use is older than the nightly delete's day count, read from config. With no such key, the tag does not show.
+5. The slot sizes come from the same measure as the drive cards.
+
+#### Phase 99 — Sessions card
+
+1. The card reads the session root from config when verify adds it. With no such key, the card does not show.
+2. Each session row shows its size, the held folders from verify's hold records, and its state.
+3. An ended session shows when its folder is deleted, from the same records.
