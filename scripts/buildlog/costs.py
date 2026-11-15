@@ -119,11 +119,24 @@ def idle_seconds(events: list[tuple[float, int, int]]) -> float:
 
 
 @dataclass(frozen=True)
+class StepKind:
+    """A step program in one repository, such as hana nextest."""
+    repo: str
+    step: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.repo} {self.step}" if self.repo else self.step
+
+
+@dataclass(frozen=True)
 class CostContribution:
     at: float
     machine: str
     cause: Cause
     seconds: float | CostUnavailable
+    # The step that paid the cost; a CI run has none.
+    kind: StepKind | None = None
 
 
 @dataclass(frozen=True)
@@ -303,15 +316,16 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         machine = machine_name(target, host, legacy_hosts)
         seconds, wait_s = max(0.0, duration or 0.0), max(0.0, wait or 0.0)
         selected = lower <= at < upper
+        step_kind = StepKind(repo or "", kind)
         if selected:
             observations.append(SourceObservation(at, machine))
             if kind != "launch":
                 wait_value = CostUnavailable("memory wait not recorded") if wait is None else wait_s
-                contributions.append(CostContribution(at, machine, "Memory wait", wait_value))
+                contributions.append(CostContribution(at, machine, "Memory wait", wait_value, step_kind))
             if crates is not None and crates >= moments.COLD_BUILD_MIN_CRATES:
-                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds))
+                contributions.append(CostContribution(at, machine, "Cold rebuilds", seconds, step_kind))
             if failed:
-                contributions.append(CostContribution(at, machine, "Failed runs", seconds))
+                contributions.append(CostContribution(at, machine, "Failed runs", seconds, step_kind))
         if machine == "mac" and seconds and at < upper and at + seconds > lower:
             intervals.extend(((max(lower, at), 0, 1), (min(upper, at + seconds), 0, -1)))
         if machine == "natedev" and wait_s and at > lower and at - wait_s < upper:
@@ -325,7 +339,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         preceding = sessions.get((machine, session))
         if (selected and preceding is not None
                 and moments.passed_tree_rerun(preceding[0], moments.nextest_outcome(status), at - wait_s, preceding[1], key)):
-            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds))
+            contributions.append(CostContribution(at, machine, "Reruns after a pass", seconds, step_kind))
         sessions[machine, session] = (moments.previous_nextest(at, duration, moments.nextest_outcome(status)), key)
     timeline = [(at, wait, run, 0, 0) for at, wait, run in intervals]
     if idle_seconds(intervals) > 0:

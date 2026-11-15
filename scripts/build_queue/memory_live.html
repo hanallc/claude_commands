@@ -364,10 +364,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .report-key span::before { content: ""; display: inline-block; width: 14px; height: 3px; background: var(--series); margin-right: 5px; vertical-align: middle; }
 .report-table { overflow-x: auto; }
 .report-table th, .report-table td { padding: 5px 12px 5px 0; vertical-align: top; }
-.report-top-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
-.report-top-row p { margin: 3px 0; }
-.report-top-row .action { color: var(--ink-2); }
+.report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+#history-details { margin-top: 12px; }
+#history-details > summary { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -493,14 +494,15 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="swaprows" id="swaprows"></div>
   </section>
   <section class="card" id="report-charts">
-    <div class="section-head">Build history charts</div>
+    <div class="section-head">Build history</div>
+    <div id="report-top">
+      <h3>Top 3 costs</h3>
+      <p class="report-window" id="cost-window"></p>
+      <div id="top-costs">Reading…</div>
+      <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
+    </div>
     <p class="report-window" id="history-window"></p>
     <div id="history-charts">Reading…</div>
-  </section>
-  <section class="card" id="report-top">
-    <div class="section-head">Top 3 costs</div>
-    <p class="report-window" id="cost-window"></p>
-    <div id="top-costs">Reading…</div>
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
@@ -1069,6 +1071,12 @@ function reportCost(value, unit = "h/day") {
     ? `${known} known; ${(value.unknown || 0).toFixed(2)} ${unit} unknown; upper bound ${((value.value || 0) + (value.unknown || 0)).toFixed(2)} ${unit}`
     : known;
 }
+// The lowest and highest day of a top cost, or its window value when no day is measured.
+function costRange(row) {
+  if (!row.range.length) return reportCost(row.recent);
+  const [low, high] = row.range.map(hours => hours.toFixed(hours >= 10 ? 0 : 1));
+  return `${low === high ? low : `${low}–${high}`} h/day`;
+}
 function sumReportCosts(points) {
   const values = points.filter(point => point.state !== "no data yet");
   if (!values.length) return {state: "no data yet"};
@@ -1097,18 +1105,19 @@ function reportPlot(title, buckets, series, unit) {
     return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}`;
   }).join("");
   const labels = buckets.map((bucket, index) => `<text x="${x(index)}" y="202" text-anchor="middle">${esc(bucket.label)}</text>`).join("");
-  const table = `<details><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
+  const table = `<details class="table-view"><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
   return `<h3>${esc(title)}</h3><svg class="report-chart" viewBox="0 0 900 220" role="img" aria-label="${esc(title)}"><line class="grid" x1="48" x2="848" y1="180" y2="180"/><line class="grid" x1="48" x2="848" y1="30" y2="30"/><text x="4" y="184">0</text><text x="4" y="34">${maximum.toFixed(1)}</text><text x="48" y="16">${esc(unit)}</text>${lines}${labels}${!points.length ? '<text x="450" y="100" text-anchor="middle">No measured data</text>' : ""}</svg>` +
     `<div class="report-key">${series.map((line, slot) => `<span style="--series:${colors[slot % colors.length]}">${esc(line.label)}</span>`).join("")}</div>${table}`;
 }
-const reportView = {machine: "", cause: "", unit: "daily", tables: new Set()};
+const reportView = {machine: "", cause: "", unit: "daily", details: false, tables: new Set()};
 let reportStamp = "";
 function captureReportView() {
   if (!$("history-machine")) return;
   reportView.machine = $("history-machine").value;
   reportView.cause = $("history-cause").value;
   reportView.unit = $("history-unit").value;
-  const tables = [...document.querySelectorAll("#history-plots details")];
+  reportView.details = $("history-details").open;
+  const tables = [...document.querySelectorAll("#history-charts details.table-view")];
   if (tables.length) reportView.tables = new Set(tables.filter(table => table.open).map(table => table.querySelector("summary").textContent));
 }
 function reportDate(value, zone) {
@@ -1129,10 +1138,12 @@ function renderReport(report) {
   }
   const data = report.charts;
   $("history-window").textContent = `${reportDate(data.start, report.zone)} – ${reportDate(data.end, report.zone)} · ${report.zone}`;
-  $("cost-window").textContent = `${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone} · ${report.recent_days} days · hours per day`;
+  const days = Math.round((data.end - data.start) / 86400000);
+  $("cost-window").textContent = `Last ${report.recent_days} days: ${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone}`;
   $("top-costs").innerHTML = report.top.length ? report.top.map(row =>
-    `<div class="report-top-row"><strong>${esc(row.machine)} · ${esc(row.cause)}</strong><p>${esc(reportCost(row.recent))}${row.window.state === "matches recent" ? "" : ` · Window: ${esc(reportCost(row.window))}`}</p><p class="action">${esc(row.action)} · ${esc(row.owner)}</p></div>`).join("") : "No data yet for this window.";
-  $("history-charts").innerHTML = `<div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p><div id="history-moments"></div>`;
+    `<p class="report-top-row"><strong>${esc(row.cause)} on ${esc(row.machine)}: ${esc(costRange(row))}.</strong>${row.window.state === "matches recent" ? "" : ` ${days}-day mean: ${esc(reportCost(row.window))}.`}${row.share ? ` ${esc(row.share)}` : ""}<span class="action">${esc(row.action)}</span></p>`).join("") : "No data yet for this window.";
+  $("history-charts").innerHTML = `<div id="history-phase"></div><details id="history-details"><summary>Details: costs by cause and by machine</summary><div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p></details><div id="history-moments"></div>`;
+  $("history-details").open = reportView.details;
   if (data.machines.includes(reportView.machine)) $("history-machine").value = reportView.machine;
   if (data.causes.includes(reportView.cause)) $("history-cause").value = reportView.cause;
   $("history-unit").value = reportView.unit;
@@ -1148,9 +1159,10 @@ function renderReport(report) {
       sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
     const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
-    $("history-plots").innerHTML = reportPlot("Hana phase time", data.buckets, phases, "h/phase") +
-      reportPlot("Costs by cause", data.buckets, causes, unitText) + reportPlot("Costs by machine", data.buckets, machines, unitText);
-    for (const table of document.querySelectorAll("#history-plots details")) {
+    $("history-phase").innerHTML = reportPlot("Hana phase time", data.buckets, phases, "h/phase");
+    $("history-plots").innerHTML = reportPlot("Costs by cause", data.buckets, causes, unitText) +
+      reportPlot("Costs by machine", data.buckets, machines, unitText);
+    for (const table of document.querySelectorAll("#history-charts details.table-view")) {
       table.open = reportView.tables.has(table.querySelector("summary").textContent);
     }
   };

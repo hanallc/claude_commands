@@ -24,7 +24,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, costs, moments
+from scripts.buildlog import charts, cost_actions, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
@@ -84,7 +84,9 @@ def report_fixture(*, empty: bool = False) -> charts.PageData:
         {} if empty else {"fixture": start.timestamp()})
     rows = charts.NoDataYet.VALUE if empty else (charts.TopCost("fixture", "Memory wait",
         charts.MeasuredCost(120), charts.WindowDiffers(charts.MeasuredCost(240)),
-        charts.CostAction("Reduce the memory wait.", "fixture-owner")),)
+        (charts.MeasuredCost(30), charts.MeasuredCost(60), charts.MeasuredCost(30)),
+        cost_actions.LargestShare(costs.StepKind("fixture", "nextest"), 0.75),
+        cost_actions.LowerMemoryPeak(costs.StepKind("fixture", "nextest"), 12.4, 3 << 30)),)
     return charts.PageData(charts.ChartSet(start, end, "UTC", (bucket,), ("fixture",), ()),
         charts.TopCosts(end - timedelta(days=3), end, 3, rows))
 
@@ -2003,9 +2005,13 @@ process.stdout.write(JSON.stringify({
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
             page = memory_feed.reading()
         provider.assert_called_once_with(7, n=3)
-        text = memory_feed.page_json(page)
-        for expected in ("Memory wait", "fixture-owner", "Reduce the memory wait."):
-            self.assertIn(expected, text)
+        report = page["report"]
+        assert isinstance(report, memory_feed.ReportSections)
+        row = report.top[0]
+        self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
+        self.assertEqual(row["share"], "fixture nextest paid 75% of it.")
+        self.assertEqual(row["action"], "Action: lower the memory peak of fixture nextest. It holds the most build memory: "
+                                        + "12 GiB·h/day, peak p90 3.0 GiB.")
 
     def test_report_failures_keep_the_queue_reading(self) -> None:
         for failure in (charts.IndexUnavailable("private index is missing"),

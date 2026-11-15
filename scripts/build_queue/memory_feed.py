@@ -40,7 +40,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, mac_idle_alert, parse
+from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -622,8 +622,10 @@ class ReportCost(TypedDict):
     cause: str
     recent: dict[str, object]
     window: dict[str, object]
+    # The lowest and highest measured day in hours; empty when no day is measured.
+    range: list[float]
+    share: str
     action: str
-    owner: str
 
 
 @dataclass(frozen=True)
@@ -1007,9 +1009,12 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
             for row in top.rows:
                 window: dict[str, object] = ({"state": "matches recent"} if isinstance(row.window, charts.WindowMatchesRecent)
                           else charts.cost_json(row.window.value, 3600))
+                measured = [seconds for seconds in map(charts.known_seconds, row.days) if seconds is not None]
                 rows.append({"machine": row.machine, "cause": row.cause,
                              "recent": charts.cost_json(row.recent, 3600 * top.recent_days),
-                             "window": window, "action": row.action.text, "owner": row.action.owner})
+                             "window": window, "range": list(cost_actions.daily_range(measured) or ()),
+                             "share": cost_actions.share_text(row.share),
+                             "action": cost_actions.action_text(row.action)})
         zone = user_zone()
         return ReportSections(charts.chart_data(report.charts), tuple(rows), top.start.astimezone(zone).isoformat(),
                               top.end.astimezone(zone).isoformat(), top.recent_days, str(zone))

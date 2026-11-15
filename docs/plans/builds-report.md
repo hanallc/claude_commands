@@ -1807,3 +1807,27 @@ Builds asked for verify's folder layout phase 4 (10c25b033) in this branch befor
 - `scripts/review_links/serve.py`: the measure answer adds `sessions`.
 - `scripts/disks/disks.html`: the Sessions card follows mockup 2: Session, Size, a bar on the largest session's scale, Held folders and State. `page.sessions_shown` in `disks.conf` (10) names the largest sessions; one row adds up the rest. On a phone the bar does not show.
 - Tests: `test_sessions` (sizes through the mount, held folders, states, no root), `test_measure` (the mount table and `drive_path`), `test_disks_page` (the card HTML), `test_serve` (the answer). Chrome check with fixture sessions: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
+
+### Phases 100–101 — Build history names the cost and its action · status: in progress
+
+Builds' order (11-15): above the plots, show the top three costs as sentences with the number, the cause and the action that cuts it.
+Name each action only from the data the page has. Drop the h/day sum plots, or move them under Details. Fix the Hana phase p90 where the phase record stays open.
+
+#### Phase 100 — Top costs as sentences, sum plots under Details
+
+##### Phase 100 as-built
+
+- `scripts/buildlog/cost_actions.py` (new) names the action from the rows behind each cost:
+  - Memory wait: the step kind that holds the most build memory (peak times run time), with its peak p90.
+  - Failed runs: the test that failed most on the machine, else the step kind that failed most.
+  - Any other cause: "No action known."
+  - The step kind that paid the largest part of the cost ("hana nextest paid 34% of it").
+- `scripts/buildlog/costs.py`: each contribution carries its `StepKind` (repository and step).
+- `scripts/buildlog/charts.py`: `TopCost` carries each day of the window, the largest share and the action. The 12 `COST_ACTION_*`/`COST_OWNER_*` keys are no longer read; builds takes their deletion to the user.
+- `scripts/build_queue/memory_feed.py`: each top cost sends its daily range, share and action text.
+- `scripts/build_queue/memory_live.html`: the Build history card starts with "Top 3 costs" for the last `TOP_COST_RECENT_DAYS` days. Then the Hana phase time plot. The cause and machine plots are under "Details: costs by cause and by machine".
+- Tests: `test_charts` (memory holder, failed test, failed step, no action), `test_memory_feed` (the sent text), `memory_page_proof.mjs` (the sentences and the Details state).
+
+#### Phase 101 — Hana phase time counts only active time
+
+The design goes to builds first.
