@@ -282,8 +282,8 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 A question stored as one text, from before the parts form, shows in sections too:
 
 1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
-2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
-3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+2. The title uses the first reviewed line when that line contains `?`. Otherwise, it uses that line's first sentence. For raw text, the title uses the first sentence that ends with `?`.
+3. For reviewed text, the body starts with the rest of the first line and excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
 4. A raw question stored on one line shows each context sentence as a separate paragraph.
 5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
 6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
@@ -295,6 +295,9 @@ In all question text, each `http` or `https` address is a link that opens in the
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
 An item that is only one backtick span, such as a command, shows as a code block.
+A fenced block or a backtick-only line after an item ending with `:` stays inside that item.
+The code block gets no separate number in either the parts form or the one-text form.
+Numbers inside code do not affect the item numbers.
 The form of a new question is in `~/.claude/docs/question_template.md`.
 The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
 Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
