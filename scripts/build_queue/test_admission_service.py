@@ -6001,6 +6001,11 @@ class CutoverServiceTests(unittest.TestCase):
         self.assertIn("clients: 1:", output)
         self.assertIn("waiters: 0\nreservations: 0\n", output)
 
+    def test_service_drain_other_folder_counts_queue_place(self) -> None:
+        status, output = self.service_drain_with_process("queue_place.py", default_folder=False)
+        self.assertEqual(status, 1)
+        self.assertIn("clients: 1:", output)
+
     def test_service_drain_default_folder_counts_verify_process(self) -> None:
         status, output = self.service_drain_with_process("verify.sh", default_folder=True)
         self.assertEqual(status, 1)
@@ -6801,7 +6806,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
         for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
-                         "mac_test/offload.py", "mac_test/copy_watch.py"):
+                         "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
                 script = fixture.root / Path(relative).name

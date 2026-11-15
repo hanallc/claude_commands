@@ -275,7 +275,7 @@ The value contains its PID and the start-time string from `/proc/<pid>/stat`, se
 Nested calls retain that value.
 The Mac uses `NoRun` and retains claim admission without reading `/proc`.
 
-`admission_client.py admit` inherits the exported `BUILDLOG_RUN` through `memory_gate.sh`.
+`queue_place.py admit` inherits the exported `BUILDLOG_RUN` through `memory_gate.sh`.
 The client parses the value once into `RunIdentity` or `NoRun`.
 A missing or malformed value gives the step its own place.
 
@@ -842,10 +842,15 @@ Wait for a run's result as the next message, or put more files in one run.
 Exit 3 still means the caller is not a registered worker; only that exit permits attached execution.
 
 `queue_place` uses the client in process. Its public call retains `before_check`.
-`queue_place.held_reservation` is the one place that requests and releases a reservation.
-It takes a `RefreshedRequest` (a step or program request, local or cloud) or a `ServiceEstimateRequest` (a CI cargo call).
-It waits for the grant, then releases it with the holder's status when the holder exits, also after an exception.
-`queue_place`, the cloud route's `cloud_reservation` and `ci_cargo_front.py` use it.
+The build queue has one way in. `queue_place.request_place` is the one requester, and `queue_place.release_place` is the one releaser.
+`request_place` takes a `RefreshedRequest` (a step or program request, local or cloud), a `RefreshedLaunch` or a `ServiceEstimateRequest` (a CI cargo call).
+`release_place` defers cleanup signals while it releases.
+`queue_place.held_reservation` uses both. It waits for the grant, then releases it with the holder's status when the holder exits, also after an exception.
+`queue_place`, the cloud route's `cloud_reservation` and `ci_cargo_front.py` use `held_reservation`.
+`memory_gate.sh` runs `queue_place.py admit`, `launch` and `release` (`BUILDLOG_QUEUE_PLACE_SCRIPT`) for verify steps and BRP launches. These shell actions use the same two calls.
+`admission_client.py` has no `admit`, `launch` or `release` action. It keeps the placement actions, `width` and `token-wait`.
+A first refresh that fails maps to a checker refusal. A queue exit during it maps to `LeftQueue`, and an unreachable queue maps to a refusal.
+`test_queue_place.OneQueueEntryTests` fails when code outside `request_place` and `release_place` calls the client's wait or release functions.
 `release()` and `token_wait()` take explicit cleanup timing or the place's acquisition configuration.
 `Admitted.cleanup_timing` supplies `CleanupTiming`; the shell retains it in `BUILDLOG_MEM_CLEANUP_TIMING`.
 Stored `Admitted` replies without cleanup timing receive `PROTOCOL_CLEANUP_TIMING` before strict parsing.

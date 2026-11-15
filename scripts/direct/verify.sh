@@ -583,7 +583,7 @@ verify_helper() {
         input="${input%$'\001'}"
     fi
     if [[ -n "${VERIFY_HELPER_INPUT:-}" && -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then
-        if [[ "$1" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" ]]; then
+        if [[ "$1" == "${BUILDLOG_MEM_ADMIT_SCRIPT:-}" || "$1" == "${BUILDLOG_QUEUE_PLACE_SCRIPT:-}" ]]; then
             export VERIFY_HELPER_STDERR_PATH="/proc/${BASHPID:-$$}/fd/2"
         fi
         if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" ]]; then
