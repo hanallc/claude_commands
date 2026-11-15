@@ -96,6 +96,42 @@ class StatusBoardTests(unittest.TestCase):
             "60% left · role showrunners ✓ · busy 1 · idle 0 · paused 0 · exited 1 · total 2 · resets 14:00 · credits unlimited · enabled",
             "role unit directors · busy 2 · idle 1 · paused 0 · exited 0 · total 3"])
 
+    def test_quota_boundaries_color_the_left_cell_and_keep_the_dot(self) -> None:
+        rows = tuple(row(f"Level {value:02}", ("workers",), (counts(0, 0, 0, 0),), value, None, None) for value in (9, 10, 24, 25))
+        board = accounts.status_board(accounts.StatusReading(rows, (), (), ZONE, NOW))
+        cells = [line["cells"] for line in board["rows"][:-1]]
+        self.assertEqual([(text(cell["left"]), cell["left"][0]["tone"]) for cell in cells],
+                         [("9%", "error"), ("10%", "warning"), ("24%", "warning"), ("25%", "default")])
+        self.assertEqual({cell["dot"][0]["tone"] for cell in cells}, {"success"})
+
+    def test_reset_text_is_the_clock_the_weekday_or_the_date_in_the_zone(self) -> None:
+        for at, expected in (("2026-10-17T02:00:00+00:00", "22:00"),  # The same New York day, the next UTC day.
+                             ("2026-10-10T18:00:00+00:00", "Sat 14:00"), ("2026-10-22T18:00:00+00:00", "Thu 14:00"),
+                             ("2026-10-09T18:00:00+00:00", "9 Oct"), ("2026-10-24T18:00:00+00:00", "24 Oct")):
+            with self.subTest(at=at):
+                board = accounts.status_board(accounts.StatusReading(
+                    (row("Low", ("workers",), (counts(0, 0, 0, 0),), 50, at, None),), (), (), ZONE, NOW))
+                self.assertEqual(text(board["rows"][0]["cells"]["resets"]), expected)
+
+    def test_zero_is_a_value_and_spare_has_no_counts(self) -> None:
+        reading = accounts.StatusReading((row("Zero", ("spare",), (accounts.NoRoleCount(),), 0, None, 0),), (), (), ZONE, NOW)
+        cells = accounts.status_board(reading)["rows"][0]["cells"]
+        self.assertEqual([text(cells[key]) for key in ("left", "roles", "busy", "total", "credits")], ["0%", "spare", "", "", "0"])
+
+    def test_each_worker_role_keeps_its_own_counts_and_the_total_adds_them(self) -> None:
+        reading = accounts.StatusReading((row("Watch", ("workers", "reviewers"), (counts(2, 3, 0, 0), counts(1, 4, 0, 0)),
+                                              50, None, None),), (), (), ZONE, NOW)
+        board = accounts.status_board(reading)
+        keys = ("roles", "busy", "idle", "paused", "exited", "total")
+        self.assertEqual([[text(line["cells"][key]) for key in keys] for line in board["rows"]],
+                         [["workers", "2", "3", "0", "0", "5"], ["reviewers", "1", "4", "0", "0", "5"], ["", "3", "7", "0", "0", "10"]])
+
+    def test_the_board_is_stale_at_the_next_local_midnight(self) -> None:
+        self.assertEqual(accounts.status_board(fixture())["stale_at"], "2026-10-17T04:00:00+00:00")
+        late = accounts.StatusReading((), (), (), ZONE, datetime(2026, 11, 1, 3, 30, tzinfo=timezone.utc))
+        # 23:30 EDT on 31 Oct; the clocks go back at 02:00 on 1 Nov, so midnight is still EDT.
+        self.assertEqual(accounts.status_board(late)["stale_at"], "2026-11-01T04:00:00+00:00")
+
     def test_no_accounts_is_an_empty_table_and_a_stale_read_is_red(self) -> None:
         self.assertEqual(accounts.status_board(accounts.StatusReading((), (), (), ZONE, NOW))["rows"], [])
         stale = replace(fixture().rows[0], read_at=NOW - timedelta(hours=1))

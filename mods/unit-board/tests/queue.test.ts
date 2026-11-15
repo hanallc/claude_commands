@@ -69,7 +69,7 @@ function queueHost(on: On, environment: Record<string, string> = {}) {
   const opened: string[] = [];
   const closed: string[] = [];
   const clock = mock.clock(on, { now: NOW });
-  mock.env(on, { HOME, USER_ZONE: 'UTC', ...environment });
+  mock.env(on, { HOME, ...environment });
   const processes: string[][] = [];
   const writes: QueuePaneState[] = [];
   const escaped: string[] = [];
@@ -890,7 +890,7 @@ function tablePaneLifetimeHost() {
   let accountsGate = { pending: Promise.resolve(), started: () => {} };
   const services = {
     session: sessionFixture,
-    env: { get: async (name: string) => name === 'USER_ZONE' ? 'UTC' : HOME },
+    env: { get: async () => HOME },
     command: { register: async () => ({}) },
     ui: {
       open: async ({ id }: { id: string }) => { panes.add(id); return {}; },
@@ -926,7 +926,7 @@ function tablePaneLifetimeHost() {
       }
       const exitCode = !accounts && failQueue ? 1 : 0;
       if (!accounts) failQueue = false;
-      return { exitCode, stdout: JSON.stringify(accounts ? { accounts: [], problems: [] } : snapshot()),
+      return { exitCode, stdout: JSON.stringify(accounts ? { board: { columns: [], rows: [], stale_at: '2026-10-17T04:00:00+00:00' }, problems: [] } : snapshot()),
         stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
     } },
   } as unknown as EngineInterface;
