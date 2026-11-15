@@ -82,7 +82,7 @@ This plan has nine phases and an estimate of **64 worker hours**.
 ## Configuration and user decisions
 
 The builds queue unit owns `config/build_folders.conf`.
-The user approved the slot values on 2026-11-12 (relayed by builds). Count x complete size limit:
+The user approved the slot values on 2026-11-12 (relayed by builds). On 2026-11-14 the user deferred slot work until the build disk is in (#88); the Mac counts stand. Count x complete size limit:
 
 | Machine | Repository | Slots | Size limit |
 | --- | --- | ---: | ---: |
@@ -105,6 +105,21 @@ The private-config helper supplies test roots and values, not another allocation
 Do not add per-module production fixture keys or a parent lease that blocks its child fixture slots.
 Mac hana's approved count remains two; its size limit still needs user go.
 
+### Slot values after the build disk (2026-11-14)
+
+#88 is closed with no limits set. The user, 2026-11-14 12:15: "We should only implement this after we install the disk." Slot work starts only after the build disk is installed. The values are measured again then and go to the user for approval.
+
+The user questioned the first #88 values: "Why are we allocating more than we have? And why have 16 Claude folders?" After Phase 8, nothing deletes at the floor, so the sum of count x size limit on each machine must fit its budget. builds set these rules on 2026-11-14 for the next measure:
+
+1. A machine's budget is the space that build folders use at the measure, plus the free space above the floor.
+2. A count is the measured 7-day peak of tasks of that repository that built at the same time on that machine (build log). A count the user approved stays: Mac hana and Mac cargo-liner stay at 2.
+3. A size limit is the largest measured folder plus a small margin. When the budget does not hold that, the proposal names the repository that gets less and the cost.
+4. Pools are keyed by the origin URL as owner/name. Every worktree of one origin is in one pool. A repository with no origin uses its shared git folder.
+5. Each repository is named. No line covers "every other repository".
+6. A repository with count 0 waits for a slot and prints one line that names the repository and the /tune key to set. A missing key still stops admission with a named config error.
+7. The claude folders are on tmpfs. They count against memory, not the disk sum.
+8. When a slot take deletes a target above its size limit, verify.sh prints one line that names the slot and its measured size. The target is deleted once and the next build starts from nothing; it is not made smaller.
+
 ## Rollout and estimates
 
 Hours include implementation, focused tests, review fixes, and owner coordination.
@@ -118,7 +133,7 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | --- | --- | --- | ---: | --- |
 | bf1 | Maker and process lock; landed | devtools; queue reviews B files | 6 | None |
 | 2 | Rescue and legacy collector protection | queue; resources and devtools own collector edits | 8 | bf1 |
-| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; values approved 2026-11-12 |
+| 3 | Slots, limits, affinity, and queue fields | queue; resources wires capacity | 10 | 2; the build disk installed; values measured again and approved |
 | 4 | Gate caches become slots | queue and aws | 8 | 3 |
 | 5 | Other repository callers | verify, style, and devtools | 8 | 4 |
 | 6 | One-offs and review folders | devtools; builds owners edit B files | 6 | 5 |
@@ -239,7 +254,7 @@ Run maker, scratch, temporary sweep, and folder audit tests before Phase 3 activ
 **Goal:** Implement D2–D4 through the maker and existing queue page.
 **Owner units:** queue implements slots and queue fields; resources wires capacity.
 **Estimate:** 10 worker hours.
-**Depends on:** Phase 2; user go before production activation.
+**Depends on:** Phase 2; the build disk installed; values measured again and approved; user go before production activation.
 **Files:** Maker/config files and the Phase 3 queue/target inventory row with adjacent tests.
 
 1. Define fixed pools by machine and repository identity.

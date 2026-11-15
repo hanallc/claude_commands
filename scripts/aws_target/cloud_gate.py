@@ -8,7 +8,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -27,9 +27,9 @@ from typing import Literal, cast, final
 from uuid import uuid4
 
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges, largest_gate_vcpus
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
@@ -285,18 +285,16 @@ def cloud_reservation(repo: Path, sidecar: Path, mode: gate.SuiteMode) -> Genera
         request = admission_client.step_request([mode.value], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
         return replace(request, place=wire.CloudPlace('aws'))
-    output = admission_client.WaitOutput()
-    reply = admission_client.admit(refresh(), output, refresh)
-    if isinstance(reply, wire.Refused):
-        raise GateRefused(reply.reason)
-    if isinstance(reply, admission_client.LeftQueue):
-        raise GateRefused('The cloud route left the admission queue')
-    reservation = CloudReservation(sidecar)
-    try:
-        yield reservation
-    finally:
-        with cancellation.defer_cleanup_signals():
-            _ = admission_client.release(reply.reservation, reservation.status, reply.cleanup_timing)
+    with ExitStack() as held_slot:
+        try:
+            held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
+        except queue_place.QueuePlaceRefused as error:
+            raise GateRefused(str(error)) from error
+        reservation = CloudReservation(sidecar)
+        try:
+            yield reservation
+        finally:
+            held.status = reservation.status
 
 
 @dataclass(frozen=True)
@@ -539,6 +537,24 @@ class GateWorker:
             print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
                   + f'is above max_gate_minutes={cap}.', flush=True)
         variants = [variant for variant in variants if (variant.instance_type, variant.region) not in slow]
+        try:
+            quotas = {row.region: row for row in ledger.read_spot_quotas(self.book.directory) if 0 <= now - row.read_at <= max_age}
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+            quotas = {}
+        gpu_types = set(values.words('gpu_instance_types'))
+        def quota_vcpus(variant: GateLaunchVariant) -> Decimal | None:
+            row = quotas.get(variant.region)
+            if row is None:
+                return None
+            return row.gpu_vcpus if variant.instance_type in gpu_types else row.standard_vcpus
+        # A region whose Spot quota is below one box refuses every launch of that type; an unread quota is still tried.
+        small = {(variant.instance_type, variant.region): quota for variant in variants
+                 if (quota := quota_vcpus(variant)) is not None
+                 and 0 < (box := largest_gate_vcpus((variant.instance_type,))) and quota < box}
+        for (size, region), quota in sorted(small.items()):
+            print(f'Cloud gate skips {size} in {region}: its Spot quota {quota.normalize():f} vCPUs is below one box '
+                  + f'({largest_gate_vcpus((size,))} vCPUs).', flush=True)
+        variants = [variant for variant in variants if (variant.instance_type, variant.region) not in small]
         if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
             return sorted(variants, key=cooled)
         default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
@@ -589,7 +605,7 @@ class GateWorker:
                 variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
                 if not variants:
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                    return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes')
+                    return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes or a Spot quota below one box')
                 launch = {'variant': 0, 'variants': [asdict(row) for row in variants],
                     'spot_price_reads': [dict(region=row.region, seconds=row.seconds, used=row.used) for row in readings]}
             save(path, launch)

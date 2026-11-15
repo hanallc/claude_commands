@@ -8,19 +8,19 @@
 :root {
   color-scheme: light;
   --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --cap: #c22d2c;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --cap: #ef7372;
+    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --cap: #ef7372;
+  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -33,21 +33,23 @@ h2 { font-size: 1.05rem; margin: 0 0 4px; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
 .note { color: var(--ink-2); font-size: 0.86rem; margin: 6px 0 0; max-width: 78ch; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
-.scroll { overflow-x: auto; }
+/* A wide table scrolls inside its card: the first column stays, and a shadow marks more columns at the right edge. */
+.scroll { overflow-x: auto;
+  background: linear-gradient(to left, var(--card) 40%, transparent) right / 36px 100% no-repeat local,
+              radial-gradient(farthest-side at 100% 50%, var(--edge), transparent) right / 14px 100% no-repeat scroll; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
 th, td { text-align: left; padding: 5px 0 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 thead th { white-space: normal; vertical-align: bottom; }
 /* A header wraps only between words, never at the hyphen of a region name. */
 thead th span { white-space: nowrap; }
 tbody th.group { color: var(--ink); padding-top: 16px; }
-th:first-child, td:first-child { padding-left: 0; }
+th:first-child, td:first-child { padding-left: 0; position: sticky; left: 0; z-index: 1; background: var(--card); }
+.scroll.overflows th:first-child, .scroll.overflows td:first-child { padding-right: 12px; box-shadow: inset -1px 0 var(--line); }
 th { color: var(--ink-2); font-weight: 600; }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover td { background: var(--hover); }
-.regions { list-style: none; padding: 0; margin: 12px 0 0; font-size: 0.86rem; color: var(--ink-2); }
-.regions li { padding: 2px 0; }
-.regions b { color: var(--ink); font-weight: 600; }
-.regions .warn::before { content: "⚠ "; color: var(--cap); }
+.snapshot { list-style: none; padding: 0; margin: 12px 0 0; font-size: 0.86rem; color: var(--ink-2); }
+.snapshot li { padding: 2px 0; }
 .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
 .filter button + button { border-left: 1px solid var(--line); }
@@ -125,13 +127,14 @@ document.getElementById("published").textContent =
   `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
 
 card("prices", data.prices.title, data.prices);
-const regions = element("ul", undefined, "regions");
-for (const read of data.regions) {
-  const item = element("li", undefined, read.failed || read.stale || read.age_s === null ? "warn" : "");
-  item.append(element("b", read.region), `: ${read.detail}`);
-  regions.appendChild(item);
+const snapshot = element("ul", undefined, "snapshot");
+for (const line of data.snapshot) snapshot.appendChild(element("li", line));
+card("quotas", data.quotas.title, data.quotas).appendChild(snapshot);
+
+function markOverflow() {
+  for (const wrap of document.querySelectorAll(".scroll")) wrap.classList.toggle("overflows", wrap.scrollWidth > wrap.clientWidth + 1);
 }
-card("quotas", data.quotas.title, data.quotas).appendChild(regions);
+addEventListener("resize", markOverflow);
 
 const filter = document.getElementById("filter");
 function showScope(scope) {
@@ -141,6 +144,7 @@ function showScope(scope) {
   document.getElementById("explanation").textContent = costs.explanation;
   const tables = document.getElementById("run-tables");
   tables.replaceChildren(...(costs.tables.length ? [tableElement(costs.tables, true)] : []));
+  markOverflow();
   try { localStorage.setItem(STORE_KEY, costs.scope); } catch (error) { /* The choice is kept only for this view. */ }
 }
 for (const costs of data.runs) {

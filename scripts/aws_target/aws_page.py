@@ -23,15 +23,6 @@ class TableData(TypedDict):
     rows: list[list[str]]
 
 
-class RegionData(TypedDict):
-    region: str
-    note: str
-    detail: str
-    age_s: int | None
-    stale: bool
-    failed: bool
-
-
 class RunCostData(TypedDict):
     scope: str
     label: str
@@ -42,7 +33,7 @@ class RunCostData(TypedDict):
 
 class PageData(TypedDict):
     read_at: int
-    regions: list[RegionData]
+    snapshot: list[str]
     prices: TableData
     quotas: TableData
     runs: list[RunCostData]
@@ -56,8 +47,7 @@ def table_data(table: spot_table.Table) -> TableData:
 def page_data(tables: spot_table.SpotTables, now: int) -> PageData:
     return {
         'read_at': now,
-        'regions': [{'region': read.region, 'note': read.note, 'detail': read.detail, 'age_s': read.age_s,
-                     'stale': read.stale, 'failed': read.failure is not None} for read in tables.regions],
+        'snapshot': list(tables.snapshot_lines),
         'prices': table_data(tables.prices),
         'quotas': table_data(tables.quotas),
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,

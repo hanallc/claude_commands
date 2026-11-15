@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+import uuid
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test.claim_state import ClaimScope
@@ -462,6 +463,11 @@ class NoLaunchPermission:
 def attempt_key(episode: str, attempt: str) -> str:
     """Length framing keeps different episode and attempt pairs distinct."""
     return f"{len(episode)}:{episode}{attempt}"
+
+
+def assigned_claim_id(episode: str, attempt: str) -> str:
+    """The provider claim id of one assigned attempt."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, attempt_key(episode, attempt)).hex
 
 
 def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:

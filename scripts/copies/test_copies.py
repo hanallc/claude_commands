@@ -384,14 +384,14 @@ class StandingTests(unittest.TestCase):
         self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
         self.assertFalse((checkout / scratch.BUSY).exists())
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:camera")
         self.assertIs(record.fields["test_hana_clone"], True)
         self.assertEqual(record.fields["source_path"], str(self.source))
         self.assertEqual(record.fields["source_commit"], self.git(checkout, "rev-parse", "HEAD"))
-        self.assertEqual(scratch.end("gate:camera"), [checkout.parent])
-        self.assertFalse(checkout.parent.exists())
+        self.assertEqual(scratch.end("gate:camera"), [checkout])
+        self.assertFalse(checkout.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
 
     def clone_trust_files(self, trusted_homes: tuple[int, ...] = (0, 1, 2)) -> tuple[Path, ...]:
@@ -415,7 +415,7 @@ class StandingTests(unittest.TestCase):
 
     def assert_clone_trust(self, checkout: Path, paths: tuple[Path, ...]) -> None:
         key = str(checkout.resolve())
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["claude_trust_folder"], key)
         for path in paths:
@@ -445,7 +445,7 @@ class StandingTests(unittest.TestCase):
         paths = self.clone_trust_files(())
         before = {path: path.read_bytes() for path in paths}
         checkout = copies.clone(self.source, "gate:untrusted")
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         self.assertNotIn("claude_trust_folder", record.fields)
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
@@ -519,31 +519,31 @@ class StandingTests(unittest.TestCase):
             result = self.cli("mirror-remove", "--path", str(checkout), "--owner", "clone-owner",
                               "--repository", "hana", "--session", "fixture")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(checkout.exists())
         self.assert_clone_project_removed(checkout, paths)
 
     def test_temporary_sweep_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:sweep-trust")
         self.add_clone_project_settings(checkout, paths)
-        entry = tmp_sweep.RemovableEntry(str(checkout.parent), str(checkout.parent.parent), time.time(), 1)
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(checkout.parent), time.time(), 1)
         self.assertTrue(tmp_sweep.remove_entry(entry, tmp_sweep.Sweep(), False))
-        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(checkout.exists())
         self.assert_clone_project_removed(checkout, paths)
 
     def test_folder_audit_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:audit-trust")
         self.add_clone_project_settings(checkout, paths)
-        self.assertEqual(folder_audit.remove(checkout.parent, time.time(), time.time()), folder_audit.REMOVED)
-        self.assertFalse(checkout.parent.exists())
+        self.assertEqual(folder_audit.remove(checkout, time.time(), time.time()), folder_audit.REMOVED)
+        self.assertFalse(checkout.exists())
         self.assert_clone_project_removed(checkout, paths)
 
     def test_task_end_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:end-trust")
         self.add_clone_project_settings(checkout, paths)
-        self.assertEqual(scratch.end("gate:end-trust"), [checkout.parent])
+        self.assertEqual(scratch.end("gate:end-trust"), [checkout])
         self.assert_clone_project_removed(checkout, paths)
 
     def test_removal_retries_with_only_the_external_mark_and_changes_no_account_file(self) -> None:
@@ -556,13 +556,13 @@ class StandingTests(unittest.TestCase):
             raise OSError("stopped removal")
 
         with self.assertRaisesRegex(OSError, "stopped removal"):
-            scratch.remove_marked(checkout.parent, stopped)
-        self.assertTrue(scratch.removal_mark(checkout.parent).exists())
+            scratch.remove_marked(checkout, stopped)
+        self.assertTrue(scratch.removal_mark(checkout).exists())
         self.assert_clone_project_removed(checkout, paths)
         before = {path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}
-        scratch.remove_marked(checkout.parent, scratch.remove)
-        self.assertFalse(checkout.parent.exists())
-        self.assertFalse(scratch.removal_mark(checkout.parent).exists())
+        scratch.remove_marked(checkout, scratch.remove)
+        self.assertFalse(checkout.exists())
+        self.assertFalse(scratch.removal_mark(checkout).exists())
         self.assertEqual({path: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns) for path in paths}, before)
 
     def test_clone_records_the_trust_key_before_writing_account_files(self) -> None:
@@ -574,7 +574,7 @@ class StandingTests(unittest.TestCase):
         folder = next(folder.path for folder in scratch.folders() if folder.task == "gate:stop-before-trust")
         record = scratch.task_of(folder)
         assert isinstance(record, copy_record.Registered)
-        self.assertEqual(record.fields["claude_trust_folder"], str((folder / "checkout").resolve()))
+        self.assertEqual(record.fields["claude_trust_folder"], str(folder.resolve()))
         self.assertEqual(scratch.end("gate:stop-before-trust"), [folder])
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
@@ -583,16 +583,16 @@ class StandingTests(unittest.TestCase):
         checkout = copies.clone(self.source, "gate:no-trust-field")
         accounts.set_claude_folder_trust(checkout, trusted=True)
         before = {path: path.read_bytes() for path in paths}
-        self.assertEqual(scratch.end("gate:no-trust-field"), [checkout.parent])
+        self.assertEqual(scratch.end("gate:no-trust-field"), [checkout])
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
     def test_clone_trust_key_survives_task_transfer_and_renewal(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:original")
-        scratch.hand_over(checkout.parent, "next-unit", "gate:transferred")
-        scratch.renew(checkout.parent)
+        scratch.hand_over(checkout, "next-unit", "gate:transferred")
+        scratch.renew(checkout)
         self.assert_clone_trust(checkout, paths)
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         fields = scratch.fields_for_task(record.fields, "gate:another")
         self.assertEqual(fields["claude_trust_folder"], str(checkout.resolve()))
@@ -612,7 +612,7 @@ class StandingTests(unittest.TestCase):
         checkout = copies.clone(source, task="gate:shared-source")
         self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), commit)
         self.assertEqual((checkout / "tracked.txt").read_text(), "shared source commit\n")
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["source_commit"], commit)
 
@@ -632,17 +632,17 @@ class StandingTests(unittest.TestCase):
             result = self.cli("clone", str(self.source), "--until", "2099-01-01 09:30", "--name", name)
             self.assertEqual(result.returncode, 0, result.stderr)
             checkout = Path(result.stdout.strip())
-            record = scratch.task_of(checkout.parent)
+            record = scratch.task_of(checkout)
             assert isinstance(record, copy_record.Registered)
             checkouts.append(checkout)
             records.append(record)
         self.assertNotEqual(records[0].task, records[1].task)
 
-        self.assertEqual(scratch.end(records[0].task), [checkouts[0].parent])
-        self.assertFalse(checkouts[0].parent.exists())
+        self.assertEqual(scratch.end(records[0].task), [checkouts[0]])
+        self.assertFalse(checkouts[0].exists())
         self.assertEqual((checkouts[1] / "tracked.txt").read_text(), "source HEAD\n")
         self.assertEqual(self.git(checkouts[1], "rev-parse", "HEAD"), self.head)
-        self.assertEqual(scratch.task_of(checkouts[1].parent), records[1])
+        self.assertEqual(scratch.task_of(checkouts[1]), records[1])
 
     def symlink_scratch_root(self) -> Path:
         physical = self.base / "physical-scratch"
@@ -663,8 +663,8 @@ class StandingTests(unittest.TestCase):
                          str((checkout / ".git").resolve()))
         self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
-        self.assertEqual(scratch.end("gate:symlink"), [checkout.parent])
-        self.assertFalse(checkout.parent.exists())
+        self.assertEqual(scratch.end("gate:symlink"), [checkout])
+        self.assertFalse(checkout.exists())
 
     def test_symlink_scratch_clone_refuses_foreign_git_directory(self) -> None:
         _ = self.symlink_scratch_root()
@@ -1068,7 +1068,7 @@ class StandingTests(unittest.TestCase):
             self.assertFalse((tree / ".git/objects/info/alternates").exists())
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             saved = copies.clone(tree, task="gate:retained-proof")
-        shutil.rmtree(source.parent)
+        shutil.rmtree(source)
         self.assertEqual(self.git(saved, "rev-list", "--objects", "--all", "--quiet"), "")
         self.assertEqual(self.git(saved, "show", "HEAD:tracked.txt"), "source HEAD")
 
@@ -1080,7 +1080,7 @@ class StandingTests(unittest.TestCase):
             self.assertFalse((tree / ".git/objects/info/alternates").exists())
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
             saved = copies.clone(tree, task="gate:retained-proof")
-        shutil.rmtree(source.parent)
+        shutil.rmtree(source)
         self.assertEqual(self.git(saved, "rev-list", "--objects", "--all", "--quiet"), "")
         self.assertEqual(self.git(saved, "show", "HEAD:tracked.txt"), "source HEAD")
 

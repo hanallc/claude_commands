@@ -186,6 +186,37 @@ class PlacementStatusTests(unittest.TestCase):
                     waiting, = fixture.server.handle_request(request)
                     self.assertIsInstance(waiting, wire.PlacementWait)
 
+    def test_a_kept_claim_frees_its_assignment_when_holder_and_owner_end(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+            coordinator_holder,
+        )
+
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("consume-kept", assignment, claim)),
+                [wire.FirstAuthorization(assignment, claim)])
+            kept = placement.AdoptedProviderClaim(claim, coordinator_holder(assignment), assignment.session,
+                                                  assignment.destination.host, "host-generation-a")
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, request, claims=(kept,))
+            status = self.read_only_status(fixture, assignment)
+            assert isinstance(status, status_wire.KnownPlacementStatus)
+            self.assertEqual(status.state, placement.ClosedAssignment("provider claim released"))
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+            following = placement_request(fixture)
+            _ = publish_candidate(fixture, following, claims=(kept,))
+            reply, = fixture.server.handle_request(following)
+            assert isinstance(reply, wire.Assignment)
+            self.assertEqual(reply.assignment.destination, assignment.destination)
+
     def test_status_and_replay_keep_pending_terminal_reports_current(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
@@ -1295,6 +1326,28 @@ class ReplyPublicationTests(unittest.TestCase):
                     self.assertEqual(read.call_count, 2)
                 finally:
                     reader.close()
+
+    def test_a_reading_finds_build_runs_and_accounts_only_for_the_owners_a_pass_asks_about(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, records.MemoryConfig)
+            original = ScopeActivityReader.run
+            asked: list[int] = []
+
+            def run(reader: ScopeActivityReader, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+                asked.append(pid)
+                return original(reader, pid)
+
+            with mock.patch.object(ScopeActivityReader, "run", run), mock.patch.object(
+                    service, "process_uid", side_effect=AssertionError("a reading reads no account")):
+                evidence = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                                               fixture.readings, fixture.proc, fixture.clock)
+                self.assertIn(request.owner.pid, evidence.processes)
+                self.assertEqual(asked, [])
+                expected = original(ScopeActivityReader(evidence.processes, fixture.proc.path), request.owner.pid)
+                self.assertEqual(evidence.build_run(request.owner.pid), expected)
+                self.assertEqual(asked, [request.owner.pid])
 
     def test_unknown_admit_and_launch_owners_request_one_early_read(self) -> None:
         for launch in (False, True):
@@ -5970,6 +6023,11 @@ class CutoverServiceTests(unittest.TestCase):
         self.assertIn("clients: 1:", output)
         self.assertIn("waiters: 0\nreservations: 0\n", output)
 
+    def test_service_drain_other_folder_counts_queue_place(self) -> None:
+        status, output = self.service_drain_with_process("queue_place.py", default_folder=False)
+        self.assertEqual(status, 1)
+        self.assertIn("clients: 1:", output)
+
     def test_service_drain_default_folder_counts_verify_process(self) -> None:
         status, output = self.service_drain_with_process("verify.sh", default_folder=True)
         self.assertEqual(status, 1)
@@ -6770,7 +6828,7 @@ class AdmissionConfigurationTests(unittest.TestCase):
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
         for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
-                         "mac_test/offload.py", "mac_test/copy_watch.py"):
+                         "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()
                 script = fixture.root / Path(relative).name

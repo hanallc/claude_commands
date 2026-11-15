@@ -93,9 +93,9 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         queue.unlink()
         queue.mkdir()
         for path in (source.parent / "build_queue").iterdir():
-            if path.name != "admission_client.py":
+            if path.name != "queue_place.py":
                 (queue / path.name).symlink_to(path, target_is_directory=path.is_dir())
-        self.memory = queue / "admission_client.py"
+        self.memory = queue / "queue_place.py"
         self.restore_client()
         self.invoke = lint / "invoke.sh"
         self.targets = self.fixture.root / "check.py"
@@ -124,7 +124,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
         shim = str(Path(__file__).resolve().parents[1] / "lib/py")
         _ = self.memory.write_text(
             f"import os, sys\nos.execv({shim!r}, [{shim!r}, '-c', "
-            + "\"from scripts.build_queue.admission_client import main; raise SystemExit(main())\", *sys.argv[1:]])\n"
+            + "\"from scripts.build_queue.queue_place import main; raise SystemExit(main())\", *sys.argv[1:]])\n"
         )
 
     def failure_line(self, line: str) -> str:

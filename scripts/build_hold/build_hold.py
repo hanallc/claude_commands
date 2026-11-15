@@ -1893,7 +1893,7 @@ def main(arguments: list[str]) -> int:
             else:
                 for holder in state.holders:
                     print(f"{holder.name} since {holder.since.astimezone(user_zone()):%H:%M %Z}, for {holder.purpose} - release eta: {release_eta_text(holder.release)} - {holder_state(holder, cast(Path, options.proc_root))}")
-                    for run in holder.keep:
+                    for run in live_kept_runs(holder, cast(Path, options.proc_root)):
                         print(f"  kept by {holder.name}: pid {run.pid}, start {run.start_time}")
                 for line in ci_placement_lines(cast(Path, options.proc_root)):
                     print(line)

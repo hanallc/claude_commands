@@ -8,6 +8,7 @@ a list either inline as `[a, b]` or as `- item` lines below its key. Obsidian wr
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -82,7 +83,8 @@ def source_paths(folder: Path, pattern: str, *, sources: list[Path] | None = Non
         return list(folder.glob(pattern))
     sources.append(folder)
     try:
-        return sorted(path for path in folder.iterdir() if path.match(pattern))
+        # fnmatch on the name: Path.match costs about 15 µs a path, and an issues folder holds 1600.
+        return sorted(path for path in folder.iterdir() if fnmatch.fnmatchcase(path.name, pattern))
     except FileNotFoundError:
         return []
 

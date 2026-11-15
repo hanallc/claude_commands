@@ -22,8 +22,9 @@ still applies; the log distinguishes an ended owner from the 7-day fallback.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
-folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
-(/tmp/claude/scratch), where each task's folder is an entry: it stays while its task is open, goes
+folder of each /tmp/claude-<uid> this user owns, or a scratch root of scripts/lib/scratch.py
+(build_folders.conf roots.scratch, and /tmp/claude/scratch, which natedev used before /build),
+where each task's folder is an entry: it stays while its task is open, goes
 when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
 session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays, as does each run's tmp/ (its TMPDIR).
 Run keep reasons keep the run folder. Its tmp/ entries use the 4 h and process-use rules.
@@ -149,6 +150,8 @@ WORKS_IN = "works in it"
 MAPS_FILE = "maps a file in it"
 HOLDS_FILE = "holds a file open in it"
 WRITES_FILE = "holds a file open for writing in it"
+# The kept reason when the Cargo output guard keeps a folder's external output.
+CARGO_OUTPUT_KEPT = "its Cargo output is kept"
 # The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
@@ -370,7 +373,7 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
                   scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
                   session_temp_roots: Sequence[str] | None = None) -> Roots:
-    """The same roots on natedev and the Mac, each by its real path: the Mac's /tmp is a link to
+    """Each root by its real path; only the scratch and copies roots differ by host. The Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
     runs = tuple(str(root) for root in unit_runs.run_roots()) if run_roots is None else run_roots
@@ -378,17 +381,19 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
     temp = temp_folders() if temp_roots is None else temp_roots
-    task_roots = (str(copy_record.root()),) if scratch_roots is None else scratch_roots
+    live = os.path.realpath(tmp_root) == os.path.realpath(TMP_ROOT)
+    task_roots = ((str(copy_record.root()), str(copy_record.FORMER_ROOT)) if live else (str(copy_record.root()),)
+                  ) if scratch_roots is None else scratch_roots
     temp_real = tuple(os.path.realpath(root) for root in temp)
     wide = ("/tmp",) if wide_roots is None else wide_roots
     session_parent = str(_session_temp.temp_parent()) if SESSION_TEMP_ROOT == _session_temp.ROOT else SESSION_TEMP_ROOT
     session_temp = (session_parent,) if session_temp_roots is None else session_temp_roots
-    copies = copy_record.copies_root() if os.path.realpath(tmp_root) == os.path.realpath(TMP_ROOT) else Path(tmp_root) / "copies"
+    copies = (copy_record.copies_root(), copy_record.FORMER_COPIES_ROOT) if live else (Path(tmp_root) / "copies",)
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in runs), projects,
-                 temp_real, tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)),
+                 temp_real, tuple(dict.fromkeys(os.path.realpath(root) for root in task_roots if os.path.isdir(root))),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
                  tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
-                 (os.path.realpath(copies),))
+                 tuple(dict.fromkeys(os.path.realpath(root) for root in copies)))
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -1179,6 +1184,10 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         try:
             path = Path(entry.path)
             scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
+        except scratch.CargoOutputKept as error:
+            print(f"tmp sweep: keep {entry.path}: {error}")
+            result.keep(entry.path, CARGO_OUTPUT_KEPT)
+            return False
         except OSError as error:
             if os.path.lexists(entry.path):
                 result.failed.append(FailedEntry(path=entry.path, error=str(error)))

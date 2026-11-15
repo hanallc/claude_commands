@@ -2889,6 +2889,36 @@ class HerdrTests(unittest.TestCase):
             self.assertEqual(scan, expected)
             self.assertEqual(errors.getvalue(), notice if printed else "")
 
+    def test_claude_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
+        client = self.herdr
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("changing-owner")), "unit", "changing",
+                              staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("changing-session")))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
+        info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
+                                "foreground_processes": [{"pid": 992001, "argv": ["claude"]}]}}
+        registry = self.root / "changing-sessions"
+        registry.mkdir()
+        unavailable = "pid 992001: native registry identity is unavailable"
+        for case, births, record, notice in (
+                ("starting", ["birth", "birth"], False, ""),
+                ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("steady", ["birth", "birth"], True,
+                 f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
+            with (self.subTest(case=case),
+                  patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  patch.object(client, "result", return_value=info),
+                  patch.object(herdr, "_process_birth", side_effect=births),
+                  patch.object(herdr, "process_environment", return_value={}),
+                  patch.object(staff, "runtime_id", return_value=""),
+                  redirect_stderr(io.StringIO()) as errors):
+                (registry / "992001.json").unlink(missing_ok=True)
+                if record:
+                    _ = (registry / "992001.json").write_text("{}")
+                scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
+            reason = unavailable if notice else "starting or exiting"
+            self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
+            self.assertEqual(errors.getvalue(), notice)
+
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{
             "pane_id": "w1:p1", "workspace_id": "w1", "terminal_id": "terminal", "agent_session": {"value": 7}}]}}))

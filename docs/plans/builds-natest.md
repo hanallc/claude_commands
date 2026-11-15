@@ -3954,3 +3954,71 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The events each command writes stay the same.
 - AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
 - Commit 0a9c37dd6. Production change; sdlc gave the go.
+
+### Phase 270 — The test times report ranks the AWS gate hosts  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/test_times/show.py`, `config/test_times.conf` and `commands/test_times.md`; sdlc gives the go).
+
+#### As-built
+
+- `show.py top --host aws` selects each host that starts with `AWS_HOST_PREFIX` (`ip-`) and counts runs from the new key `TOP_AWS_CHECKOUT`.
+- Any other host value keeps one host and `TOP_CHECKOUT`. The trend view uses the same prefix constant.
+- `commands/test_times.md` names the new value.
+- Commit 5f1f770a6. Production change; sdlc gave the go.
+
+### Phase 271 — The Mac-only verify tests run fewer full verify.sh calls  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change in `scripts/direct/test_verify_mac_only.py`).
+
+#### As-built
+
+- `test_runner_refusals_never_fall_back_or_retry` checks all 12 reason texts through the real `mac_only_refuse` in one shell. Five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class.
+- The fetch test keeps a written word and the absent word. The two environment tests forward all their names in one call each.
+- AWS pair (c7a.4xlarge, 3 rounds, same box): `direct/test_verify_mac_only.py` 59.28 -> 38.39 CPU s.
+- Commit f0a59896a. Test-only change.
+
+### Phase 272 — Fixture processes read a step row without the step state test imports  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `scripts/direct/step_row_test_support.py` holds `read_step_row` and imports only `step_record` and `step_selection`.
+- `test_verify_step_state` and the nine fixture imports read it from there.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 7 verify modules 182.56 -> 171.38 CPU s.
+- Commit a9fed9fdd. Test-only change.
+
+### Phase 273 — The step-routes targets fixture runs inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- The step-routes `targets.py` fixture has a top-level `main`, so verify_helper runs it inside the helper process.
+- It loads the real `build_targets.py` once for each helper and calls its `main`. Each answer and route event stays the same.
+- The four tests that edit the fixture text use the indented layout.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 9 verify modules 175.06 -> 116.08 CPU s; `test_verify_lint_local_writes` 59.44 -> 31.14.
+- Commit a8e5d997f. Test-only change.
+
+### Phase 274 — The status line reads staff.json with one jq start  · status: done
+**Depends on:** none
+**Owner:** natest (production change; needs the sdlc go).
+
+#### As-built
+
+- One jq call in `statusline.sh` reads staff.json. It prints `unit <id> <session>` for the payload session's unit row, or else the showrunner ids.
+- The payload goes in with `--arg` and `fromjson` in a `try`. A bad payload matches no unit row; `/dev/null` staff gives no owners.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_statusline` 45.11 -> 44.66 CPU s.
+- Commit 9d9e95bab. Production change; sdlc go 2026-11-14.
+
+### Phase 275 — The ssh-targets wrapper fixtures run inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `verify_ssh_targets_test_support.BUILD_TARGETS_STATUS` loads the real `build_targets.py` once for each process and returns its `main` status. It replaces `RUN_BUILD_TARGETS`.
+- `reserve-refusal.py` and `reserve-response-loss.py` have a top-level `main`, so verify_helper runs them inside its process. Each answer and observation stays the same.
+- `interrupted-reservation.py` uses the same loader and stays a separate process.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_verify_ssh_targets_routing` 45.76 -> 36.50 CPU s.
+- Commit 785de7dbe. Test-only change.

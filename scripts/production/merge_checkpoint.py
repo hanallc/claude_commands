@@ -710,19 +710,60 @@ def checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...], che
     scratch.mkdir(parents=True, exist_ok=True)
     log = scratch / f"merge_{checkpoint[:7]}_test.log"
     _ = log.write_text("", encoding="utf-8")
-    return run_checkpoint_tests(production, paths, merge_tests, flakes, flaky_tests, log, merge_head, before_merge_tip)
+    # A resumed merge resets to a pushed tip that holds the checkpoint, so that tip is no base to compare.
+    has_base = bool(before_merge_tip) and git(production.checkout, "merge-base", "--is-ancestor",
+                                                checkpoint, before_merge_tip).returncode == 1
+    return run_checkpoint_tests(production, paths, merge_tests, flakes, flaky_tests, log, merge_head, before_merge_tip,
+                                base_tip=before_merge_tip if has_base else "")
 
 
 def run_checkpoint_tests(production: ProductionDocument, paths: tuple[str, ...],
                          merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], flaky_tests: frozenset[str],
-                         log: Path, merge_head: str, before_merge_tip: str) -> str:
-    """Append test output and undo an unpublished red checkpoint."""
+                         log: Path, merge_head: str, before_merge_tip: str, *, base_tip: str) -> str:
+    """Append test output and undo an unpublished red checkpoint.
+
+    With a base tip, a red is checked on that tip with main merged; the unit hears only of its own red.
+    """
     try:
         return checkpoint_gate.run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log)
+    except checkpoint_gate.RedCheckpointTests as error:
+        undo_unpushed_merge(production, merge_head, before_merge_tip)
+        if not base_tip:
+            raise
+        raise base_red_check(production, error, log, base_tip, paths, merge_tests) from error
     except checkpoint_gate.Stop as error:
         if error.step == "red" and error.state == "failed":
             undo_unpushed_merge(production, merge_head, before_merge_tip)
         raise
+
+
+def base_red_check(production: ProductionDocument, red: checkpoint_gate.RedCheckpointTests, log: Path,
+                   base_tip: str, paths: tuple[str, ...], merge_tests: tuple[tuple[str, ...], ...]) -> checkpoint_gate.Stop:
+    """Run the red commands on the base tip with main merged, and return the stop that the red earns.
+
+    Main merges as it did in the tested tree. A main conflict leaves the red as the unit's red.
+    """
+    checkout = production.checkout
+    main = git(checkout, "rev-parse", "-q", "--verify", "refs/remotes/origin/main")
+    try:
+        if main.returncode == 0:
+            merge_main_commit(production, main.stdout.strip())
+        base = good(git(checkout, "rev-parse", "HEAD"), "red")
+        split = checkpoint_gate.split_base_red(red, checkpoint_gate.test_steps(production, paths, merge_tests), log)
+    except MainConflict:
+        return red
+    finally:
+        _ = good(git(checkout, "reset", "--keep", base_tip), "red")
+    if not split.base:
+        return red
+    base_labels = checkpoint_gate.red_labels(split.base)
+    print(f"merge director: {base_labels} red on base {base} without the checkpoint; "
+          + f"repair the base, then run the checkpoint again; test log: {log}", flush=True)
+    if split.unit:
+        return checkpoint_gate.unit_red(split.unit, log)
+    return checkpoint_gate.Stop("red", "held", f"{base_labels} red on base {base}; log {log}",
+                                "your checkpoint adds no red; the merge director repairs the base red "
+                                + "and runs your checkpoint again, so send nothing")
 
 
 def undo_failed_push(production: ProductionDocument, old_origin: str, before_merge_tip: str) -> None:
@@ -1488,7 +1529,8 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
                 merge_main_commit(reference.production, main_commit)
                 selected = checkpoint_gate.test_steps(reference.production, paths, reference.merge_tests)
                 commands = {(tuple(step.command), step.folder) for step in selected}
-                red_steps = tuple(step for step in red.steps if (tuple(step.command), step.folder) in commands)
+                red_steps = tuple(checkpoint_gate.narrowed(item) for item in red.red
+                                  if (tuple(item.step.command), item.step.folder) in commands)
                 try:
                     _ = checkpoint_gate.run_test_steps(reference.production, red_steps, reference.flakes,
                                                         reference.flaky_tests, log, raise_start_errors=True)
@@ -1553,9 +1595,10 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                     _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
                 tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
-                                                   reference.flakes, reference.flaky_tests, log, test_tip, start_tip)
+                                                   reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
+                                                   base_tip=start_tip)
         except checkpoint_gate.RedCheckpointTests as error:
-            red_commands = {(tuple(step.command), step.folder) for step in error.steps}
+            red_commands = {(tuple(red.step.command), red.step.folder) for red in error.red}
             affected = tuple(item for item, steps in selections
                              if any((tuple(step.command), step.folder) in red_commands for step in steps))
             candidates = affected or tuple(code_items) or tuple(items)

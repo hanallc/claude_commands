@@ -157,11 +157,20 @@ class PushTextTests(unittest.TestCase):
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
 
-    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertIsInstance(push.action, ActionRequired)
-        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
+    def test_unreachable_mac_catalog_requires_an_action_and_names_the_waiting_tests(self) -> None:
+        entries = [entry for entry in push_texts.catalog() if entry.id.startswith("mac_idle.")]
+        self.assertEqual([entry.id for entry in entries], ["mac_idle.unreachable"])
+        entry = entries[0]
+        for example, minutes, tests in (("one_test", "10", "1 test waits"),
+                                         ("three_tests", "12", "3 tests wait")):
+            with self.subTest(example=example):
+                values = next(row.values for row in entry.examples if row.name == example)
+                push = push_texts.render_entry(entry, values)
+                self.assertEqual(push.action, ActionRequired("Wake the Mac or check its network."))
+                self.assertEqual(push.title, "Mac tests stopped")
+                self.assertEqual(push.body, f"Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.")
+                self.assertEqual(push.message.splitlines(), ["Action: Wake the Mac or check its network.",
+                    f"Mac tests stopped {minutes} min ago.", f"{tests}; builds cannot reach the Mac."])
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
