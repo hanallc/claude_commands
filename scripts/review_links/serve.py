@@ -30,7 +30,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
 from scripts.production import change_routing
-from scripts.review_links import branch_page, change_page, change_browser, console, images
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, images
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -173,6 +173,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == accounts_page.PAGE_PATH:
+            try:
+                content = accounts_page.render()
+            except (OSError, ValueError) as error:
+                print(f"review-links accounts: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == images.PAGE_PATH:
             try:
                 content = images.render(root)

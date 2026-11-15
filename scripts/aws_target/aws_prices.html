@@ -5,49 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AWS prices</title>
 <style>
-:root {
-  color-scheme: light;
-  --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
-  /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
-  --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
-}
+/*__CONSOLE_THEME__*/
+/* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
+:root { --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73; }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-    --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
-  }
+  :root:not([data-theme="light"]) { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
 }
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
-  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-  --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
-h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
-h2 { font-size: 1.05rem; margin: 0 0 4px; }
+:root[data-theme="dark"] { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
 .status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
-.note { color: var(--ink-2); font-size: 0.86rem; margin: 6px 0 0; max-width: 78ch; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
-/* A wide table scrolls inside its card: the first column stays, and a shadow marks more columns at the right edge. */
-.scroll { overflow-x: auto;
-  background: linear-gradient(to left, var(--card) 40%, transparent) right / 36px 100% no-repeat local,
-              radial-gradient(farthest-side at 100% 50%, var(--edge), transparent) right / 14px 100% no-repeat scroll; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
 th, td { text-align: left; padding: 5px 6px 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 thead th { white-space: normal; vertical-align: bottom; }
 /* A header wraps only between words, never at the hyphen of a region name. */
 thead th span { white-space: nowrap; }
 tbody th.group { color: var(--ink); padding-top: 16px; }
+/* The first column stays while a wide table scrolls. */
 th:first-child, td:first-child { padding-left: 0; position: sticky; left: 0; z-index: 1; background: var(--card); }
 .scroll.overflows th:first-child, .scroll.overflows td:first-child { padding-right: 12px; box-shadow: inset -1px 0 var(--line); }
 th { color: var(--ink-2); font-weight: 600; }

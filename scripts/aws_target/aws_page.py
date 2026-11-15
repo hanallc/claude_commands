@@ -12,7 +12,7 @@ from typing import TypedDict
 from scripts.aws_target import spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import review_link
+from scripts.review_links import console_theme, review_link
 
 PAGE_NAME = 'aws_prices.html'
 
@@ -110,7 +110,7 @@ def output_folder() -> Path:
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), now)
-    source = Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8')
+    source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
     page = source.replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
     page_path = folder / PAGE_NAME

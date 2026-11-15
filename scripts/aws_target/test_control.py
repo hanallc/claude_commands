@@ -22,7 +22,7 @@ from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
 from scripts.notify import push_texts
-from scripts.review_links import review_link
+from scripts.review_links import console_theme, review_link
 
 
 class ControlTests(CostFixture):
@@ -432,6 +432,7 @@ class ControlTests(CostFixture):
         self.assertEqual(page.stat().st_mode & 0o777, 0o644)
         source = page.read_text()
         self.assertNotIn('__AWS_PRICES_DATA__', source)
+        self.assertIn(console_theme.CSS, source)
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
