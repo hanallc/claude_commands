@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ from scripts.review_links import branch_page, change_page, change_browser, conso
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
+# A restart passes the listening socket to the new process in this variable.
+LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 
 
 class TailscaleAddressLost(RuntimeError):
@@ -62,6 +65,29 @@ def loaded_module_stamps() -> dict[Path, tuple[int, int] | ModuleStampUnavailabl
             except OSError:
                 stamps[path] = ModuleStampUnavailable.UNREADABLE
     return stamps
+
+
+def inherited_listener(address: tuple[str, int]) -> socket.socket | None:
+    """Take the socket a restart passed on when it still listens on this address."""
+    descriptor = os.environ.pop(LISTEN_FD, None)
+    if descriptor is None:
+        return None
+    try:
+        listener = socket.socket(fileno=int(descriptor))
+    except (ValueError, OSError) as error:
+        print(f"review-links: inherited socket {descriptor}: {error}", file=sys.stderr)
+        return None
+    if tuple(cast(tuple[str, int], listener.getsockname())[:2]) != address:
+        listener.close()
+        return None
+    return listener
+
+
+def restart(server: ReviewLinksServer) -> None:
+    """Run the changed code in this process and keep the listening socket open, so no request is refused."""
+    descriptor = server.socket.fileno()
+    os.set_inheritable(descriptor, True)
+    os.execve(sys.executable, sys.orig_argv, os.environ | {LISTEN_FD: str(descriptor)})
 
 
 def tailscale_ip() -> str:
@@ -499,6 +525,19 @@ class ReviewLinksServer(ThreadingHTTPServer):
         threading.Thread(target=images.recover_pending, args=(self.root,), daemon=True).start()
 
     @override
+    def server_bind(self) -> None:
+        host, port = cast(tuple[str, int], self.server_address)
+        listener = inherited_listener((host, port))
+        if listener is None:
+            super().server_bind()
+            return
+        # Point the server's own socket object at the inherited listening socket.
+        _ = os.dup2(listener.fileno(), self.socket.fileno(), inheritable=False)
+        listener.close()
+        self.server_name: str = socket.getfqdn(host)
+        self.server_port: int = port
+
+    @override
     def service_actions(self) -> None:
         now = time.monotonic()
         if now >= self.next_tailscale_check:
@@ -542,13 +581,13 @@ def main(arguments: list[str]) -> int:
         address = tailscale_ip()
         root = change_routing.review_root()
         root.mkdir(parents=True, exist_ok=True)
-        try:
-            with ReviewLinksServer((address, cast(int, args.port)), root) as server:
-                print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+        with ReviewLinksServer((address, cast(int, args.port)), root) as server:
+            print(f"review-links: serving {root} on {address}:{server.server_port}", flush=True)
+            try:
                 server.serve_forever()
-        except CodeChanged as error:
-            print(f"review-links: {error}", file=sys.stderr)
-            os.execv(sys.executable, sys.orig_argv)
+            except CodeChanged as error:
+                print(f"review-links: {error}", file=sys.stderr)
+                restart(server)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, subprocess.SubprocessError, TailscaleAddressLost) as error:

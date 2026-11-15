@@ -121,6 +121,8 @@ A reload or a shared link opens each page at its recorded place.
 The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
 A place equal to the configured URL removes its `at.<id>` key.
 The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
+A frame load that fails, such as a refused connection, shows the browser's error page.
+The console then loads the frame's last place again after `frame_retry_seconds` in `config/review_links.conf`, which starts at 2 seconds.
 A page that changes its place with `history.replaceState` posts `console-place` to its parent, so the console reads the place again.
 
 A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
@@ -690,9 +692,12 @@ The server reads the current settings when it needs them.
   A changed or unreadable file requires a restart.
   The server checks live delivery attempts under the delivery lock.
   It defers the restart while an attempt is live and keeps the old stamps for the next check.
-  When no attempt is live, an exception closes the server socket.
-  The server prints `review-links: code changed: <path>` and calls `os.execv(sys.executable, sys.orig_argv)`.
+  When no attempt is live, an exception leaves the serve loop and the listening socket stays open.
+  The server prints `review-links: code changed: <path>` and calls `os.execve(sys.executable, sys.orig_argv, …)`.
+  It passes the listening socket's descriptor in `REVIEW_LINKS_LISTEN_FD`.
   The new process keeps the pid, arguments and environment.
+  It takes that socket when the socket listens on the same address and port, and binds a new one otherwise.
+  The kernel holds connections that arrive during the restart, and the new process answers them, so no request is refused.
   A failed process replacement or new start exits 1, and the service manager starts the service again.
 - The server percent-decodes the path and removes the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. Folders and targets outside the root get 404. Index names, the `.review-link-` prefix, and atomic temporary names get 404. The server never lists a folder.
 - `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.

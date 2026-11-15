@@ -115,8 +115,10 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
                        + ('' if available else ' · Not available') + '</span></a>')
     content = DOCUMENT.replace("<!-- ENTRIES -->", "\n".join(entries))
     rebuilds_path = rebuilds.path if isinstance(rebuilds, AvailablePage) else ""
+    settings = conf.read("review_links")
     content = content.replace("<!-- SHELL -->", f'data-rebuilds="{html.escape(rebuilds_path, quote=True)}" '
-                              + f'data-refresh-seconds="{conf.read("review_links").number("page_refresh_seconds")}"')
+                              + f'data-refresh-seconds="{settings.number("page_refresh_seconds")}" '
+                              + f'data-frame-retry-seconds="{settings.number("frame_retry_seconds")}"')
     content = content.replace("<!-- REBUILD -->", icon_svg("refresh-cw"))
     content = content.replace("<!-- X -->", icon_svg("x"))
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
@@ -280,7 +282,16 @@ aria-controls="rebuild-dialog" hidden><!-- REBUILD --><span class="entry-label" 
     frame = document.createElement('iframe');
     frame.hidden = true;
     frame.src = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    let place = frame.src;
     frame.addEventListener('load', () => {
+      let loaded = false;
+      try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}
+      if (!loaded) {
+        // A refused load, such as during a server restart, shows the browser's error page; load the page again.
+        setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);
+        return;
+      }
+      place = frame.contentWindow.location.href;
       record(entry);
       try { frame.contentWindow.addEventListener('hashchange', () => record(entry)); } catch (_) {}
     });
