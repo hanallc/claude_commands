@@ -455,6 +455,38 @@ class MemoryHoverTests(unittest.TestCase):
                     **data, "unmatched_priority_text": unmatched}))
                 self.assertEqual(heading.count(priority), int(bool(unmatched)))
 
+    def test_a_hidden_console_frame_reads_nothing_until_the_console_shows_it(self) -> None:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        javascript = """
+const calls = [];
+let listener = null;
+const parent = {name: "console"};
+const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
+const window = {frameElement: JSON.parse(process.argv[1])};
+const SECONDS = 5;
+const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
+const setInterval = () => 0;
+const addEventListener = (kind, handler) => { listener = handler; };
+""" + loop + """
+const loaded = calls.length;
+listener({source: {}, origin: location.origin, data: "console-shown"});
+listener({source: parent, origin: "http://other", data: "console-shown"});
+const foreign = calls.length;
+if (window.frameElement) window.frameElement.hidden = false;
+listener({source: parent, origin: location.origin, data: "console-shown"});
+process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(0, 2)]));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        reads = ["memory.json", "/memory_live.html"]
+        for frame, expected in (("null", [2, 2, 4, reads]), ('{"hidden": false}', [2, 2, 4, reads]),
+                                ('{"hidden": true}', [0, 0, 2, reads])):
+            with self.subTest(frame=frame):
+                result = subprocess.run([executable, "-e", javascript, frame], text=True, capture_output=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("const TIPS ="):html.index("const tip =")]
@@ -512,10 +544,10 @@ function fitLabels() {}
         self.assertIn("1.0", str(result))
         self.assertIn("20.0 GiB", str(result))
 
-    def test_the_bar_and_legend_show_the_eleven_blocks_in_order(self) -> None:
+    def test_the_bar_and_legend_show_the_twelve_blocks_in_order(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        order = ["builds", "ci", "reserved", "room", "safety", "swap", "agents", "programs", "kernel", "cache",
-                 "unattributed"]
+        order = ["builds", "ci", "reserved", "room", "safety", "desktop", "swap", "agents", "programs", "kernel",
+                 "cache", "unattributed"]
         bar = page[page.index('<div class="bar">'):page.index('<div class="scale')]
         legend = page[page.index('<div class="legend">'):page.index('<details class="room-explainer">')]
         self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], order)
@@ -526,28 +558,32 @@ function fitLabels() {}
             self.assertNotIn(removed, page)
 
     def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:
-        keys = ["builds", "ci", "reserved", "room", "safety", "swap", "agents", "programs", "kernel", "cache",
-                "unattributed", "cap", "budget"]
+        keys = ["builds", "ci", "reserved", "room", "safety", "desktop", "swap", "agents", "programs", "kernel",
+                "cache", "unattributed", "cap", "budget"]
         tips = cast(list[list[str]], self.page_expression(
             "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]", {"cap": 40, "cap_text": "fixture"}))
         self.assertEqual(dict(zip(keys, tips, strict=True)), {
-            "builds": ["Builds and tools · 5.0 GiB",
+            "builds": ["Builds and tools · 5.0 GiB", "RAM that builds and build tools use now.\n" +
                        "Queued builds: 3.0 GiB.\nrust-analyzer: 1.0 GiB.\nsccache: 0.5 GiB.\nOther build tools: 0.5 GiB."],
             "ci": ["hana CI · 2.0 GiB", "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
             "reserved": ["Reserved RAM · 6.0 GiB",
-                         "RAM held for running builds and accepted work.\nReservation target: 6.0 GiB."],
-            "room": ["Next step room · 18.0 GiB", "Available RAM: 30.0 GiB.\n− Safety target: 4.0 GiB.\n" +
+                         "RAM the queue holds for running builds until they reach their expected peak.\n" +
+                         "Reservation target: 6.0 GiB."],
+            "room": ["Next step room · 18.0 GiB", "RAM that the next waiting step can start in.\nAvailable RAM: 30.0 GiB.\n− Safety target: 4.0 GiB.\n" +
                      "− Swap reserve target: 2.0 GiB.\n− Build reservation target: 6.0 GiB."],
-            "safety": ["Safety and desktop · 7.0 GiB", "Safety reserve: 4.0 GiB; target 4.0 GiB.\n" +
-                       "Desktop programs: 3.0 GiB.\nDesktop protection setting: 2.0 GiB.\n" +
-                       "Protection does not add RAM to this block."],
-            "swap": ["RAM for swap · 2.0 GiB", "RAM held against swap outside builds and CI.\nReserve target: 2.0 GiB."],
+            "safety": ["Safety · 4.0 GiB",
+                       "RAM the queue always leaves free, so the machine does not run out of memory.\nTarget: 4.0 GiB."],
+            "desktop": ["Desktop · 3.0 GiB",
+                        "RAM that the desktop session uses, so the mouse and keyboard stay responsive.\n" +
+                        "The system never takes back the first 2.0 GiB."],
+            "swap": ["RAM for swap · 2.0 GiB", "RAM the queue leaves free for memory in swap, mostly agents' memory.\n" +
+                     "That memory can come back into RAM at any time.\nTarget: 2.0 GiB."],
             "agents": ["Agents · 8.0 GiB",
                        "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."],
             "programs": ["Other programs · 4.0 GiB",
-                         "firefox: 2.0 GiB\nzed: 1.0 GiB\nand 5 smaller programs: 1.0 GiB"],
+                         "RAM that programs other than builds, agents and the desktop use.\nfirefox: 2.0 GiB\nzed: 1.0 GiB\nand 5 smaller programs: 1.0 GiB"],
             "kernel": ["Kernel, measured · 3.0 GiB",
-                       "Compressed swap (zram): 1.5 GiB.\nSlab, stacks and page tables: 1.0 GiB.\n" +
+                       "RAM that the kernel uses for itself.\nCompressed swap (zram): 1.5 GiB.\nSlab, stacks and page tables: 1.0 GiB.\n" +
                        "Other kernel counters: 0.5 GiB.\n" +
                        "Reclaimable kernel cache appears in the cache block."],
             "cache": ["File and kernel cache · 7.0 GiB", "Estimated cache outside available RAM.\n" +
@@ -574,18 +610,20 @@ function fitLabels() {}
             " ramAmount(0), tipText('unattributed', data)]", {"ram": ram}))
         self.assertEqual(tips[0], ["Shortfall · 3.0 GiB",
                                    "Swap reserve missing: 1.0 GiB.\nBuild reservation missing: 6.0 GiB."])
-        self.assertEqual(tips[1], ["Reserved RAM · 0.0 GiB", "RAM held for running builds and accepted work.\n" +
+        self.assertEqual(tips[1], ["Reserved RAM · 0.0 GiB",
+                                   "RAM the queue holds for running builds until they reach their expected peak.\n" +
                                    "Reservation target: 6.0 GiB.\nMissing RAM: 6.0 GiB."])
         self.assertEqual(tips[2], ["Kernel, measured · unavailable",
                                    "The latest reading is unavailable.\nThis amount is unknown."])
-        self.assertEqual(tips[3][1], "Queued builds: 3.0 GiB.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
+        self.assertEqual(tips[3][1], "RAM that builds and build tools use now.\nQueued builds: 3.0 GiB.\nsccache: <0.1 GiB.\nOther build tools: 0.5 GiB.")
         self.assertEqual(tips[5], ["Not attributed · 2.0 GiB",
                                    "RAM that the readings do not explain.\nNo program name is available for this amount."])
         self.assertEqual(tips[4], "0.0 GiB")
         empty = {**RAM_FIXTURE, "builds_bytes": 0, "queued_builds_bytes": 0, "rust_analyzer_bytes": 0,
                  "sccache_bytes": 0, "other_build_tools_bytes": 0}
         self.assertEqual(self.page_expression("tipText('builds', data)", {"ram": empty}),
-                         ["Builds and tools · 0.0 GiB", "No build program RAM is recorded."])
+                         ["Builds and tools · 0.0 GiB",
+                          "RAM that builds and build tools use now.\nNo build program RAM is recorded."])
 
     def test_the_status_line_names_the_one_reason_a_start_waits(self) -> None:
         for code, ram, expected in (
