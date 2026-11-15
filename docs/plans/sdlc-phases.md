@@ -314,20 +314,22 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 37 — An Images card can show a before and after pair  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-User request 11-15 10:24: "if you're going to do a before and after scenario on the image page we need the functionality of having them show side byy side - with a single metadata and delete button - tghis will make comparisons much simpler in the future". Moved from admin-console by sdlc [595a5918]. Base: sdlc-fix-rounds at 304c80d16, merged into this branch.
+User request 11-15 10:24: before and after shots side by side, with one metadata block and one Delete. The user accepted the mockup.
 
-1. `images.py register --before <path> --after <path>` files one pair: one folder, one record, one caption, one id and one image link. `--image` still files one image.
-2. The record keeps the after image in `file` and adds `before` for a pair. A record without `before` reads as before.
-3. A pair card shows the two images side by side, each under a "Before" or "After" label and linked to its full size. The card has one caption, one details block, one Feedback field, one Send feedback and one Delete. Delete removes both images.
-4. The feedback message names both images.
-5. On a wide page a pair card uses more width than a single card, which keeps its 680px width and place. When the card is narrow, the two images stack, before on top.
-6. `commands/show_image.md` tells a proof to file its before and after shots as one pair.
-7. admin-console keeps `change_page.py` and `change_browser.py`; this phase does not edit them.
+- `images.py register (--image PATH | --before PATH --after PATH)`: a pair is one folder with `before<suffix>` and `after<suffix>`, one record, one id and one image link. The record keeps the after image in `file` and the before image in `before`.
+- A pair card (`article.pair`) shows Before and After side by side in `.image-pair`, each linked to its full size. It has one caption, one details block, one Feedback field, one Send feedback and one Delete, which removes the folder.
+- The feedback message has a `Before:` and an `After:` link for a pair.
+- On a page 1104px or wider, a single card is 680px and a pair card is up to 1376px, both centered. A pair card under 600px stacks its images, before on top (container query).
+- `/show_image`, `docs/as-built/review-links.md` and the proof rule in `docs/production_format.md` say: file before and after shots as one pair.
 
-**Tests:** `scripts/review_links/test_images.py` (pair register, refusals, card, delete, feedback, old record), `test_serve.py`, `test_console.py`.
-**Proof:** Images page shots before and after, at wide and narrow width.
+**Files:**
+- `scripts/review_links/images.py` — `register(before=)`, `shown_files`, `picture`, the pair card, the CSS and the `register` options
+- `scripts/review_links/test_images.py` — `ImagePairTests` and the pair server test
+- `commands/show_image.md`, `docs/as-built/review-links.md`, `docs/production_format.md`
+
+**Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
