@@ -294,7 +294,7 @@ Each card shows, in this order:
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image, as a link to the full size.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The **Delete** and **Send feedback** buttons.
+5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
@@ -316,20 +316,18 @@ The card list carries `data-script`, the page script hash.
 When a refresh brings a different hash, the page loads again in place of the swap.
 An older script does not bind the new card forms, so a form would post outside the script.
 
-**Delete** posts the image id and a token signed with the console browser token.
-The server checks the token and removes the image folder at once under `images/.review-link-images.lock`.
-No message goes to the owner.
-The page does not wait: the card leaves the page at once, and the request runs in the background.
-A failed delete puts the card back in its place with one line: **Not deleted: <reason>**.
-The page skips its refresh while a delete or a feedback send runs.
-
-**Send feedback** posts the same signed form with the feedback text.
-The page refuses empty feedback with **Enter feedback first.** and keeps the card.
+Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.
+The server checks the token.
+**Approved** and **Not Approved** need no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Otherwise the card leaves the page at once, and the request runs in the background.
+The page skips its refresh while a send runs.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The message holds the feedback, the image link, the caption, the For line and the delete command for the owner to run after it acts.
+The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
+A `Feedback:` line follows when the user wrote text.
+Then come the image link, the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
+A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.
 The card goes back in its place with one line: **Not sent: <reason>**.
 An agent deletes an image with this command:
