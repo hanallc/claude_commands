@@ -620,6 +620,10 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    A day with a bill read and no usage row for the type bills 0 hours.
 2. Box hours: each gate in the cost ledger, from its reservation to its confirmed end, split at UTC midnight.
    Open and absent gates do not count. A gate without a region ran in the home region.
+   The builder box also counts, as the `aws_target.conf` `instance_type` in the home region.
+   Its time runs from each `running` observation in the cost ledger to the next other state.
+   A `running` observation with no later state counts to the window end.
+   Reason: on 2026-11-08 the builder box ran 8.8 h, and the check reported its Spot hours as a gate gap.
 3. The gap ratio is `abs(billed - box) / box`.
    A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
    Billed hours with no box hours are also over.

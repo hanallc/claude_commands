@@ -153,6 +153,7 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
     start = end - timedelta(days=configuration.whole('run_cost_days'))
     try:
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
+                                           configuration.text('instance_type'),
                                            gate_sizes(conf.read_or_repository('cloud_gate')), limit)
     except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
