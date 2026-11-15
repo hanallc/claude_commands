@@ -2652,7 +2652,7 @@ mac_only_refuse() {
         disk) text="the Mac is below its free-space floor" ;;
         off) text="Mac offload is off" ;;
         repo) text="this repository has no Mac setting" ;;
-        linux_only) text="$PKG is Linux only on the Mac" ;;
+        linux_only) text="the step covers a package that is Linux only on the Mac" ;;
         state) text="the Mac claim state cannot be read" ;;
         copy) text="the tree copy to the Mac failed" ;;
         no_tests) text="no test matched on the Mac" ;;

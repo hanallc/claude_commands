@@ -2532,7 +2532,8 @@ def run_offload(
         decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
-            if eligibility.has_linux_only(request.source.root, request.package,
+            scoped_package = eligibility.step_package(request.kind or eligibility.verb_kind(request.verb), request.package)
+            if eligibility.has_linux_only(request.source.root, scoped_package,
                               eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
                 return declined("linux_only", started)
         except (OSError, UnicodeError, ValueError):
