@@ -407,6 +407,12 @@ class ControlTests(CostFixture):
                 self.assertEqual(table.rows[0][2:5], (*run_time, usd))
                 self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0)):.4f}', usd)
                 self.assertEqual(costs.summary, f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
+                # The Cost per gate view shows the same estimate; a GPU type without runs has none.
+                standard, gpu = costs.prices
+                self.assertEqual((standard.title, standard.headers[1]), (f'Standard cost per {costs.scope.noun} (USD; estimate)', size))
+                self.assertEqual((standard.rows[0][1], f'{standard.values[0][1]:.4f}'), (usd, usd))
+                self.assertEqual({cell for row in gpu.rows for cell in row[1:]}, {spot_table.NOT_SOLD})
+                self.assertEqual({value for row in gpu.values for value in row}, {None})
         # The terminal table shows the merge gate scope only.
         table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
         self.assertIn('merge gate (minutes)', table)
@@ -434,11 +440,17 @@ class ControlTests(CostFixture):
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
                          [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
-        # Every fixture price is equal, so each type's ranking is one set.
+        # The fixture lowest zone price is 0.25 USD/h for every type and region; the region column has no number.
         prices = data['prices'][0]
-        columns = range(1, len(prices['headers']))
         self.assertEqual([row[0] for row in prices['rows']], list(self.regions))
-        self.assertEqual(prices['type_ranks'], [[[[row, column] for row in range(len(self.regions))]] for column in columns])
+        self.assertEqual(prices['values'], [[None, *(0.25 for _ in prices['headers'][1:])] for _ in self.regions])
+        # The run tables leave out the Spot price and the estimate, which the Cost per gate view shows.
+        run_headers = data['runs'][0]['tables'][0]['headers']
+        self.assertNotIn(spot_table.SPOT_HEADER, run_headers)
+        self.assertNotIn(spot_table.ESTIMATE_HEADER, run_headers)
+        self.assertEqual(data['runs'][0]['tables'][0]['right'], list(range(1, len(run_headers))))
+        self.assertEqual([table['title'] for table in data['runs'][0]['prices']],
+                         ['Standard cost per merge gate (USD; estimate)', 'GPU cost per merge gate (USD; estimate)'])
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], list(self.regions))
@@ -475,7 +487,7 @@ class ControlTests(CostFixture):
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
 
-    def test_prices_split_gpu_types_and_mark_the_lowest_of_each_type(self) -> None:
+    def test_prices_split_gpu_types_and_carry_each_price_for_the_color_scale(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         path = self.state / 'spot-prices.json'
         document = ledger.mapping(cast(object, json.loads(path.read_text())))
@@ -487,11 +499,8 @@ class ControlTests(CostFixture):
         standard, gpu = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).prices
         self.assertEqual((standard.headers[1:], gpu.headers[1:]), ((*self.standard, *self.compare), self.gpu))
         self.assertEqual([row[0] for row in standard.rows], list(self.regions))
-        row = len(self.regions) - 1
-        rows = range(len(self.regions))
-        # The lower price ranks first in its type, then the equal prices; a type of equal prices is one set.
-        self.assertEqual(standard.type_ranks[0], (frozenset({(row, 1)}), frozenset((index, 1) for index in rows[:-1])))
-        self.assertEqual(standard.type_ranks[1], (frozenset((index, 2) for index in rows),))
+        self.assertEqual([row[1] for row in standard.values], [*(Decimal('0.25') for _ in self.regions[:-1]), Decimal('0.2000')])
+        self.assertEqual({row[0] for row in standard.values}, {None})
 
     def test_snapshot_line_is_one_line_only_when_every_region_agrees(self) -> None:
         reads = tuple(spot_table.RegionRead(region, 3364, False, None, 0) for region in ('a', 'b'))

@@ -635,26 +635,31 @@ An unreadable cost ledger shows a note in place of the billed hours.
 
 The AWS prices page shows the same tables, published by `aws_page.publish`.
 The user asked for these page changes on 2026-11-14 through builds:
-1. A price with the lowest value of its type has a fill. Equal prices are all lowest.
-   A legend under the standard prices names the fill.
-2. No mark compares the types with the same vCPU count. Builds removed that outline on 2026-11-15,
-   because the user could not tell what it meant, and the cost per run lines already compare the types.
+1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
+   `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
+   The cost cells are the estimate in USD for one run (`RunCosts.prices`), the estimate that gate placement uses.
+   A type and region with no estimate shows a dash. GPU types have no runs, so their cost cells are dashes.
+   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=merge-gate`.
+2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
+   In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
+   A strong outline marks the cheapest cell of each table. Equal cheapest cells all have the outline.
+   One legend line explains the colors and the outline. Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
    The user asked for the side by side cards on 2026-11-15 through builds.
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
 5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
+   The page run tables have no Spot or estimate column, because the cost view shows those numbers.
 6. A `Table.not_sold` cell shows the lucide `ban` icon, with the title `Not sold here` on hover, and no legend.
    The user asked for it on 2026-11-15 through builds.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The fill marks the lowest price in the chosen regions. `Table.type_ranks` holds each type from the lowest price up,
-   so the page marks the first set that has a chosen region.
-   A type with fewer than two prices in the chosen regions has no mark: one region shows no fill.
+3. The colors and the outline use only the chosen regions. `Table.values` holds the number of each cell.
+   One region shows no color and no outline.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
-6. The page keeps the choice in browser storage, with the run kind.
+6. The page keeps the region choice in browser storage. The URL keeps the price view and the run kind.
 
 ### Billed hours check
 

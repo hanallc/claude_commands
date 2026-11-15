@@ -9,21 +9,22 @@
   color-scheme: light;
   --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
-  --low: #d9e8fa;
+  /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
+  --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
     --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-    --low: #1f3a5c;
+    --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
   --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70; --edge: rgb(0 0 0 / 0.6);
-    --low: #1f3a5c;
+  --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -54,8 +55,8 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover td { background: var(--hover); }
 /* A header "name (unit)" shows the unit on a smaller second line. */
 thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-3); white-space: nowrap; }
-/* The lowest price of each type has a fill. */
-.mark { display: inline-block; padding: 1px 6px; margin: -1px -6px; border-radius: 4px; background: var(--low); }
+/* The cheapest cell of a price table has an outline over its scale color. */
+td.best { box-shadow: inset 0 0 0 2px var(--ink); font-weight: 700; }
 .ban { width: 14px; height: 14px; vertical-align: -2px; fill: none; stroke: var(--ink-3); stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 /* The Standard and GPU price cards sit side by side, and stack on a narrow screen. */
@@ -64,7 +65,13 @@ thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: va
 /* A half width card fits four type columns with less space between them. */
 #prices th:not(:first-child), #prices td:not(:first-child) { padding-left: 10px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
-.legend .mark { margin: 0 6px 0 0; }
+.swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.swatch.scale { background: linear-gradient(to right, var(--scale-low), var(--scale-mid), var(--scale-high));
+  box-shadow: inset 0 0 0 1px var(--line); }
+.swatch.best { width: 16px; background: var(--scale-low); box-shadow: inset 0 0 0 2px var(--ink); }
+.price-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 4px 0 0; }
+.price-bar + .legend { margin: 8px 0 12px; }
+.filter[hidden] { display: none; }
 .snapshot { list-style: none; padding: 0; margin: 12px 0 0; font-size: 0.86rem; color: var(--ink-2); }
 .snapshot li { padding: 2px 0; }
 .filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -93,6 +100,11 @@ thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: va
   <span class="regions-label" id="regions-label">Regions</span>
   <div class="chips" role="group" aria-labelledby="regions-label" id="regions"></div>
 </nav>
+<div class="price-bar">
+  <div class="filter" role="group" aria-label="Price to show" id="price-view"></div>
+  <div class="filter" role="group" aria-label="Runs to count" id="price-scope"></div>
+</div>
+<p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span><span><span class="swatch best" aria-hidden="true"></span>Outline: the cheapest in the table.</span></p>
 <div id="prices"></div>
 <div id="quotas"></div>
 <section class="card" id="runs">
@@ -112,13 +124,16 @@ thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: va
 <script>
 "use strict";
 const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
-const SCOPE_KEY = "aws-prices-scope";
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
+const VIEWS = [["spot", "Spot price"], ["cost", "Cost per gate"]];
+const query = new URLSearchParams(location.search);
 let shown = new Set(data.regions);
-let scope = null;
+// The price tables show the Spot price or the cost per gate of one run kind; the URL keeps both choices.
+let view = query.get("prices") === "cost" ? "cost" : "spot";
+let scope = query.get("runs");
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -159,17 +174,33 @@ function visible(table) {
   return { columns, rows };
 }
 
-// For each ranking, the cells of its first set that has a cell in view: the lowest price in the chosen regions.
-// A ranking with fewer than two prices in view compares nothing, so it marks no cell.
-function lowestShown(rankings, view) {
-  const rows = new Set(view.rows);
-  const columns = new Set(view.columns);
-  const marked = new Set();
-  for (const ranking of rankings || []) {
-    const sets = ranking.map(ties => ties.filter(([row, column]) => rows.has(row) && columns.has(column))).filter(ties => ties.length);
-    if (sets.flat().length > 1) sets[0].forEach(cell => marked.add(String(cell)));
+// A three-color scale as in a spreadsheet: the low color at the minimum, the middle color at the median,
+// and the high color at the maximum, mixed in proportion between them.
+function scaleColor(value, low, middle, high) {
+  const [end, share] = value <= middle ? ["low", middle > low ? (middle - value) / (middle - low) : 0]
+    : ["high", high > middle ? (value - middle) / (high - middle) : 0];
+  return `color-mix(in srgb, var(--scale-${end}) ${(share * 100).toFixed(1)}%, var(--scale-mid))`;
+}
+
+// The scale color of each numbered cell in view, column by column, and the cheapest cells of the whole table.
+// A column or a table with fewer than two different numbers in view compares nothing, so it has no color or outline.
+function scaleCells(table, cells) {
+  const colors = new Map();
+  const best = new Set();
+  const numbered = [];
+  for (const column of cells.columns) {
+    const columnCells = cells.rows.map(row => [String([row, column]), (table.values[row] || [])[column]])
+      .filter(([, value]) => typeof value === "number");
+    numbered.push(...columnCells);
+    const sorted = columnCells.map(([, value]) => value).sort((a, b) => a - b);
+    if (sorted.length < 2 || sorted[0] === sorted[sorted.length - 1]) continue;
+    const half = Math.floor(sorted.length / 2);
+    const middle = sorted.length % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
+    for (const [place, value] of columnCells) colors.set(place, scaleColor(value, sorted[0], middle, sorted[sorted.length - 1]));
   }
-  return marked;
+  const values = numbered.map(([, value]) => value);
+  if (new Set(values).size > 1) for (const [place, value] of numbered) if (value === Math.min(...values)) best.add(place);
+  return { colors, best };
 }
 
 // Draw tables with the same headers as one grid, so their columns line up; a titled row starts each table.
@@ -197,20 +228,20 @@ function tableElement(tables, titled) {
       title.scope = "rowgroup";
       body.insertRow().appendChild(title);
     }
-    const low = lowestShown(table.type_ranks, view);
+    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), best: new Set() };
     const notSold = new Set((table.not_sold || []).map(String));
     for (const rowIndex of view.rows) {
       const line = body.insertRow();
       for (const index of columns) {
         const value = table.rows[rowIndex][index];
         const place = String([rowIndex, index]);
-        const lowest = low.has(place);
-        const cell = element("td", lowest || notSold.has(place) ? undefined : value, right.has(index) ? "n" : "");
+        const cell = element("td", notSold.has(place) ? undefined : value, right.has(index) ? "n" : "");
         if (notSold.has(place)) {
           cell.title = NOT_SOLD;
           cell.appendChild(banIcon());
         }
-        if (lowest) cell.appendChild(element("span", value, "mark"));
+        if (scale.colors.has(place)) cell.style.background = scale.colors.get(place);
+        if (scale.best.has(place)) cell.classList.add("best");
         line.appendChild(cell);
       }
     }
@@ -258,24 +289,33 @@ function markOverflow() {
 }
 addEventListener("resize", markOverflow);
 
-function drawFixed() {
-  const priceCards = cards("prices", data.prices);
-  const legend = element("p", undefined, "legend");
-  const item = element("span");
-  item.append(element("span", "0.00", "mark"), "lowest price of the type");
-  legend.appendChild(item);
-  priceCards[0].appendChild(legend);
+function scopeCosts() {
+  return data.runs.find(entry => entry.scope === scope) || data.runs[0];
+}
+
+const priceView = document.getElementById("price-view");
+const priceScope = document.getElementById("price-scope");
+function drawPrices() {
+  for (const button of priceView.children) button.setAttribute("aria-pressed", String(button.dataset.view === view));
+  priceScope.hidden = view !== "cost";
+  const priceCards = cards("prices", view === "cost" ? scopeCosts().prices : data.prices);
   const snapshot = element("ul", undefined, "snapshot");
   for (const line of data.snapshot) if (!line.region || shown.has(line.region)) snapshot.appendChild(element("li", line.text));
   priceCards[priceCards.length - 1].appendChild(snapshot);
+}
+
+function drawFixed() {
   cards("quotas", data.quotas);
   fill(document.getElementById("hours"), data.hours, data.hours_note);
 }
 
-const filter = document.getElementById("filter");
+// Both run kind switches, above the prices and in the Cost per run card, set the same run kind.
+const scopeFilters = [priceScope, document.getElementById("filter")];
 function drawScope() {
-  const costs = data.runs.find(entry => entry.scope === scope) || data.runs[0];
-  for (const button of filter.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
+  const costs = scopeCosts();
+  for (const group of scopeFilters) {
+    for (const button of group.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
+  }
   const cheapest = costs.estimates.find(entry => shown.has(entry.region));
   document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;
   document.getElementById("explanation").textContent = costs.explanation;
@@ -286,23 +326,44 @@ function drawScope() {
 }
 
 function draw() {
+  drawPrices();
   drawFixed();
   drawScope();
   markOverflow();
 }
 
+function keepInUrl() {
+  const next = new URLSearchParams(location.search);
+  next.set("prices", view);
+  next.set("runs", scopeCosts().scope);
+  try { history.replaceState(null, "", `?${next}${location.hash}`); } catch (error) { /* The URL keeps no choice. */ }
+}
+
 function showScope(next) {
   scope = next;
+  drawPrices();
   drawScope();
   markOverflow();
-  remember(SCOPE_KEY, scope);
+  keepInUrl();
 }
-for (const costs of data.runs) {
-  const button = element("button", costs.label);
-  button.type = "button";
-  button.dataset.scope = costs.scope;
-  button.addEventListener("click", () => showScope(costs.scope));
-  filter.appendChild(button);
+
+function showView(next) {
+  view = next;
+  drawPrices();
+  markOverflow();
+  keepInUrl();
+}
+
+function button(text, key, value, action) {
+  const node = element("button", text);
+  node.type = "button";
+  node.dataset[key] = value;
+  node.addEventListener("click", () => action(value));
+  return node;
+}
+for (const [name, label] of VIEWS) priceView.appendChild(button(label, "view", name, showView));
+for (const group of scopeFilters) {
+  for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
 }
 
 // The region filter: all regions by default, any combination; the last chosen region stays on.
@@ -336,7 +397,6 @@ for (const chip of regionChips) {
 let saved = [];
 try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
 const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
-scope = remembered(SCOPE_KEY);
 showRegions(new Set(known.length ? known : data.regions));
 </script>
 </body>

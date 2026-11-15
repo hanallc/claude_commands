@@ -1556,3 +1556,15 @@ From builds (not the user), 2026-11-15: remove the vCPU group mark, the outline 
 - `Table.group_ranks` and its page data are gone. `price_table` ranks only each type column (`type_ranks`).
 - `aws_prices.html`: the `.mark` fill is the one mark, and the legend has one line, "lowest price of the type". The terminal table had no marks, so it does not change.
 - Proof: `phases/85/proof/before-*` (the phase 84 after shots) and `after-*`.
+
+### Phase 86 — The price cards switch between Spot price and cost per gate · status: done
+
+From the user (via builds, 2026-11-15): "let's have the same table be able to switch between displaying spot price and pricing (which has the subtypes of merge/targeted/both) - these filters apply to both standard and gpu tables ... i want to have the column values be a gradient like in google sheets - red being most expensive green being the cheapest and white in the middle range - the Green one that is the best price should have some extra outline". From builds (not the user): one view switch and one run kind switch for both cards, kept in the URL; remove the per-type Spot and estimate columns that repeat these numbers; the outline replaces the fill.
+
+#### As-built
+
+- `spot_table.Table.values` holds the number of each cell; `Table.type_ranks` and `ranks` are gone. `RunCosts.prices` holds the Standard and GPU cost per run tables (region rows, type columns), from the estimate that gate placement uses. A cell with no estimate is `NOT_SOLD`.
+- `aws_page`: each run kind sends its `prices` tables. The run tables drop the `Spot USD/h` and `estimate` columns (`without_prices`). The terminal does not change.
+- `aws_prices.html`: a `Spot price | Cost per gate` switch, and a `Merge gates | Targeted runs | Both` switch shown only for cost. The URL keeps both (`?prices=cost&runs=merge-gate`); the run kind left browser storage. Each column has a green, white (the card color in dark mode) and red scale from the minimum through the median to the maximum. A strong outline marks the cheapest cell of each table. One legend line explains both.
+- Proof: `phases/86/proof/before-*` (the phase 85 after shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, and phone width).
+- Tests: 45 in `test_control` pass; basedpyright 0/0/0.

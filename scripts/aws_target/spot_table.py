@@ -19,8 +19,9 @@ from scripts.lib import conf
 
 # Where a table puts its regions: one region in each row (the first column), or in each column after the first.
 RegionAxis = Literal['rows', 'columns']
-# The (row, column) price cells of one group from the lowest price up; equal prices share a set.
-Ranking = tuple[frozenset[tuple[int, int]], ...]
+# The run table columns that the page shows in its price tables, so the page leaves them out of the run tables.
+SPOT_HEADER = 'Spot USD/h'
+ESTIMATE_HEADER = 'estimate'
 
 
 @dataclass(frozen=True)
@@ -31,8 +32,8 @@ class Table:
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
     region_axis: RegionAxis
-    # One ranking for each type. The page marks the first set of each ranking that has a cell in the chosen regions.
-    type_ranks: tuple[Ranking, ...] = ()
+    # The number of each cell, row by row, for the page's color scale; None for a cell without a number.
+    values: tuple[tuple[Decimal | None, ...], ...] = ()
     # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
     not_sold: frozenset[tuple[int, int]] = frozenset()
 
@@ -97,6 +98,8 @@ class RunCosts:
     scope: run_cost.RunScope
     explanation: str
     tables: tuple[Table, ...]
+    # The estimate of each type and region, one row per region: the standard types, then the GPU types.
+    prices: tuple[Table, ...]
     # Every estimate of a placement candidate, cheapest first; equal estimates keep the table order.
     estimates: tuple[Cheapest, ...]
     refused: Table
@@ -164,43 +167,43 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
         stale = age is not None and (age < 0 or age > configuration.whole('price_max_age_seconds'))
         reads.append(RegionRead(region, age, stale, failure, now - failure.at if failure else 0))
     notes = {read.region: read.note for read in reads}
+    not_sold = frozenset((region, size) for region in regions for size in (*standard, *gpu)
+                         if (region, size) not in minimum and not notes[region])
     days = configuration.whole('run_cost_days')
     home = configuration.text('region')
     hours, hours_note = billed_hours(directory, now, regions, gate_sizes(values), days, home,
                                      configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
-        (price_table('Standard Spot prices (USD/h; lowest zone)', standard, regions, minimum, notes),
-         price_table('GPU Spot prices (USD/h; lowest zone)', gpu, regions, minimum, notes)),
+        (price_table('Standard Spot prices (USD/h; lowest zone)', standard, regions, minimum, notes, not_sold),
+         price_table('GPU Spot prices (USD/h; lowest zone)', gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard Spot quotas and boxes that fit', 'Standard quota', 'standard_vcpus', standard, regions,
                      readings, notes),
          quota_table('GPU Spot quotas and boxes that fit', 'G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
-        run_costs(directory, now, standard, frozenset(values.words('instance_types')), regions, minimum, days, home),
+        run_costs(directory, now, (standard, gpu), frozenset(values.words('instance_types')), regions, minimum, not_sold,
+                  days, home),
         hours, hours_note)
 
 
-def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], minimum: dict[tuple[str, str], Decimal],
-                notes: Mapping[str, str]) -> Table:
-    """One row per region and one column per type, with the lowest price of each type marked."""
-    def cell(size: str, region: str) -> str:
+def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],
+                notes: Mapping[str, str], not_sold: frozenset[tuple[str, str]]) -> Table:
+    """One row per region and one column per type: the lowest zone Spot price."""
+    def cell(region: str, size: str) -> str:
         price = minimum.get((region, size))
         note = notes[region]
         return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or NOT_SOLD
 
-    places = {(row, column): (region, size) for row, region in enumerate(regions) for column, size in enumerate(sizes, 1)}
-    prices = {place: minimum[key] for place, key in places.items() if key in minimum}
-    not_sold = frozenset(place for place, key in places.items() if key not in minimum and not notes[key[0]])
+    return region_type_table(title, sizes, regions, minimum, cell, not_sold)
+
+
+def region_type_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], numbers: Mapping[tuple[str, str], Decimal],
+                      cell: Callable[[str, str], str], not_sold: frozenset[tuple[str, str]]) -> Table:
+    """One row per region and one column per type, with the number of each (region, type) cell for the color scale."""
     return Table(title, ('region', *sizes), frozenset(range(1, len(sizes) + 1)),
-                 tuple((region, *(cell(size, region) for size in sizes)) for region in regions), 'rows',
-                 ranks(prices, lambda place: place[1]), not_sold)
-
-
-def ranks(prices: dict[tuple[int, int], Decimal], group: Callable[[tuple[int, int]], int]) -> tuple[Ranking, ...]:
-    """For each group in order, its cells from the lowest price up; equal prices share a set."""
-    grouped: dict[int, dict[Decimal, set[tuple[int, int]]]] = {}
-    for place, price in prices.items():
-        grouped.setdefault(group(place), {}).setdefault(price, set()).add(place)
-    return tuple(tuple(frozenset(ties[price]) for price in sorted(ties)) for _key, ties in sorted(grouped.items()))
+                 tuple((region, *(cell(region, size) for size in sizes)) for region in regions), 'rows',
+                 tuple((None, *(numbers.get((region, size)) for size in sizes)) for region in regions),
+                 frozenset((row, column) for row, region in enumerate(regions) for column, size in enumerate(sizes, 1)
+                           if (region, size) in not_sold))
 
 
 def quota_table(title: str, label: str, field: str, sizes: tuple[str, ...], regions: tuple[str, ...],
@@ -220,9 +223,12 @@ def quota_table(title: str, label: str, field: str, sizes: tuple[str, ...], regi
                  frozenset(range(1, 2 + len(fits))), tuple(rows), 'rows')
 
 
-def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: frozenset[str], regions: tuple[str, ...],
-              minimum: dict[tuple[str, str], Decimal], days: int, home: str) -> tuple[RunCosts, ...]:
-    """For each scope, one table per type and one row per region: price, run time, expected and paid cost of a run."""
+def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str, ...]], candidates: frozenset[str],
+              regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal], not_sold: frozenset[tuple[str, str]],
+              days: int, home: str) -> tuple[RunCosts, ...]:
+    """For each scope, one table per standard type and one row per region: price, run time, expected and paid cost of a run.
+    Then the estimate of every standard and GPU type in each region."""
+    sizes, gpu = kinds
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
@@ -244,7 +250,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
                        + 'so the time comes from the other regions.')
         estimates: list[Cheapest] = []
-        headers = ('region', 'Spot USD/h', f'{scope.noun} (minutes)', 'runs', 'estimate', 'paid USD/h', 'paid USD/run',
+        grid: dict[tuple[str, str], Decimal] = {}
+        for size in (*sizes, *gpu):
+            for region in regions:
+                price = minimum.get((region, size))
+                seconds, _own = evidence.box_seconds(size, region, scope.modes)
+                if price is not None and seconds:
+                    grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds)
+        headers = ('region', SPOT_HEADER, f'{scope.noun} (minutes)', 'runs', ESTIMATE_HEADER, 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []
         refused_rows: list[tuple[str, ...]] = []
@@ -256,8 +269,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
             for region in regions:
                 price = minimum.get((region, size))
                 seconds, own = evidence.box_seconds(size, region, scope.modes)
-                estimate = (evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds)
-                            if price is not None and seconds else None)
+                estimate = grid.get((region, size))
                 # Placement picks only the instance_types, so only they can be the cheapest.
                 if estimate is not None and size in candidates:
                     estimates.append(Cheapest(estimate, size, region))
@@ -279,7 +291,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
             refused_rows.append((size, *refused_cells))
             launched_rows.append((size, *launched_cells))
         right = frozenset(range(1, len(counts)))
-        scopes.append(RunCosts(scope, explanation, tuple(tables), tuple(sorted(estimates, key=lambda entry: entry.usd)),
+
+        def estimate_cell(region: str, size: str) -> str:
+            estimate = grid.get((region, size))
+            return f'{estimate:.4f}' if estimate is not None else NOT_SOLD
+
+        prices = tuple(region_type_table(f'{title} cost per {scope.noun} (USD; estimate)', kind, regions, grid,
+                                         estimate_cell, not_sold) for title, kind in (('Standard', sizes), ('GPU', gpu)))
+        scopes.append(RunCosts(scope, explanation, tuple(tables), prices, tuple(sorted(estimates, key=lambda entry: entry.usd)),
                                Table(f'Refused {scope.noun} requests (capacity and quota)', counts, right,
                                      tuple(refused_rows), 'columns'),
                                Table(f'Launched {scope.noun} boxes', counts, right, tuple(launched_rows), 'columns')))
