@@ -1457,3 +1457,21 @@ From builds (not the user), 2026-11-14 14:2x: put the /aws_prices tables on the 
 - The page right-aligns number columns, draws the cost per run tables of one scope as one grid, and keeps the filter choice per browser.
 - Tests: `test_each_scope_counts_only_its_run_kinds` (against `run_evidence`), `test_page_holds_the_tables_as_data_and_its_link_needs_the_page`, `test_page_data_cannot_end_its_script_element`, and the hourly job tests in `test_sync`.
 - Checkpoint 0c64c36b5.
+
+### Phase 79 — The AWS tables take the user's review changes · status: done
+
+From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws owns `run_cost.py` data changes; report owns the display in `spot_table.py` and `aws_page.py`.
+
+#### As-built
+
+- `spot_table.spot_tables()` is the one typed source for `/aws_prices` and the page. `Table.right` names the number columns, and both views right-align them.
+- `render()` draws the price and quota tables with `split_table()`: the first column, then as many equal columns as fit the terminal width.
+- The quota table is `Spot quotas and boxes that fit`: standard and G and VT quotas, then boxes per type.
+- `SpotTables.snapshot_lines` gives one `Snapshot read N min ago` line when every region has the same state and minute. Otherwise it gives one line per region. A failed read always gives one line per region.
+- The run cost headers are region, Spot USD/h, the scope noun, estimate, paid USD/h, paid USD/run, refused, launched.
+- Refused and launched count only the requests of the selected scope (repair from builds (not the user), 2026-11-14). `RunEvidence` keys requests by type, region and mode. A request without a mode (`NO_MODE`, written before launch rows recorded a mode) counts only under Both (from builds (not the user), 2026-11-14). The refusal wait in the estimate still counts every request, because capacity refusals do not depend on the run kind.
+- `unbilled()` writes a paid cell without a bill: `bill due (N runs)` when runs of the scope wait for their day's bill, `no <scope noun> runs` when only other kinds ran, else `no runs`. The paid USD/h cell uses only `no runs` and `bill due`.
+- The cheapest line considers only `instance_types`, the types that placement picks. `runs_text()` writes `1 run` and `N runs`.
+- `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
+- Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
+- Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
