@@ -2177,13 +2177,11 @@ def _rust_code(content: bytes) -> RustCode | NotTokenized:
         text = content.decode()
     except UnicodeDecodeError:
         return NOT_TOKENIZED
-    code = declarations.source_tokens(text)
     try:
         spans = declarations.source_spans(text)
     except style_footprint.UnreadableTokenSpans:
         return NOT_TOKENIZED
-    if len(spans) != len(code):
-        return NOT_TOKENIZED
+    code = tuple(span.token for span in spans)
     # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
     gaps = (text[start:end] for start, end in zip((0, *(span.end for span in spans)), (*(span.start for span in spans), len(text))))
     # Module docs count toward a facade (when-to-split-a-module.md), so `//!` and `/*!` text is read as code.

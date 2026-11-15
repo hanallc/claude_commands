@@ -18,10 +18,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import IO, cast, final
 from unittest import mock
 from scripts.style import rules, candidate_generators
-from scripts.style import style_ledger
+from scripts.style import style_footprint, style_ledger
 from scripts.style.refill_facts import RefillFacts
 from scripts.style.refill_inputs import RefillInputs
 from scripts.style.approved_renames import AppliedInCode
@@ -1329,6 +1330,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                 before = {"file.rs": style_ledger.TreeEntry("100644", "blob", "old")}
                 after = {"file.rs": style_ledger.TreeEntry("100644", "blob", "new")}
                 self.assertEqual(_only_comments_changed(before, after, code.__getitem__), expected)
+        reads = mock.Mock(wraps=style_footprint.tokenized_text.__wrapped__)
+        with mock.patch.object(style_footprint, "tokenized_text", lru_cache(maxsize=128)(reads)):
+            _ = _rust_code(source.encode())
+        # One token read gives both the code fingerprint and the comment gaps.
+        self.assertEqual(reads.call_count, 1)
         file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
         for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
             self.comment_only_change(relative)
