@@ -4130,3 +4130,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Live ~/.claude repo: 104 heads, 42 merged; old and new rows agree; 0.11 s against 0.93 s.
 - AWS pair (3 rounds): `review_links/test_branch_page` 16.67 -> 9.29 CPU s, wall 16.9 -> 9.7 s; all pass, same tests.
 - Commit b4b5396bb. Production change (sdlc go 11-15).
+
+### Phase 285 — The report speed test builds the full index once  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+- **Goal:** `test_report_cli_work_grows_near_linearly_at_the_live_index_size` builds the index of the full rows once.
+- **Spec:** Measure the CLI on the full rows right after the first `index.update`. Then write the quarter rows, reindex and measure them. The assertions stay the same.
+- **Files:** `scripts/buildlog/test_report.py`.
+- **Workers:** 1 writer: one file; the director writes it (no-worker mode).
+- **Constraints from prior phases:** none.
+- **Acceptance gate:** `buildlog/test_report` passes; basedpyright 0 errors; the AWS pair shows a CPU gain.
