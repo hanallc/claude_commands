@@ -611,6 +611,7 @@ Pane labels do not identify a consultation.
   Showrunner sessions retain the full production counts.
   `counts_row.py --unit <staff id>` writes `<showrunner state>/counts/<unit staff id>`.
   Each cache retains the counts line, deadline, and watched paths.
+  A refresh reads each proposal issue file once; the watched paths and the proposals count use that one read.
   A unit cache ends with `source=unit:<staff id>`.
   A source marker mismatch forces a refresh, even when the cache is newer than staff.
   The status line refreshes only that unit's cache when a watched path changes or the deadline passes.
