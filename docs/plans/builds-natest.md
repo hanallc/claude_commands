@@ -4095,3 +4095,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `lib/test_py_floor_sources` keeps its full parse: it must parse each file at the floor version.
 - AWS pair (3 rounds, median CPU s): 46.0 -> 15.5 in total; `session_send_sources` 7.23 -> 0.33, `launch_accounts_sources` 9.86 -> 3.23, `push_texts_sources` 8.64 -> 2.77.
 - Commit bddca5e1e. Test-only change.
+
+### Phase 282 — A full gate time limit counts only runs that ran test modules  · status: done
+**Depends on:** none
+**Owner:** natest (production change; nightly red e986a7389d0cf7a911935fe5).
+
+#### Work Order
+
+**Goal:** a natedev full gate takes its time limit only from passing full runs that ran test modules.
+
+**Spec:**
+- `history_time_limit` in `scripts/test_times/gate_record.py`: the full query adds `modules_run > 0`. A run of the type check alone does not count.
+- Cause: the five newest passing full runs at 32 vCPUs and 16 jobs ran the type check alone (104-135 s). The limit became 1.5 x 116.7 = 175.09 s, and it cut the 11-15 nightly after 747 of 788 modules had not started.
+- `scripts/test_times/test_gate_record.py`: a new test for runs of the type check alone; existing rows set `modules_run`.
+- `scripts/aws_target/test_cloud_gate.py`: the two history rows set `modules_run`.
+
+**Files:** `scripts/test_times/gate_record.py`, `scripts/test_times/test_gate_record.py`, `scripts/aws_target/test_cloud_gate.py`.
+
+**Workers:** 1 writer; no split (one query). impl: all three files. test opens as impl.
+
+**Constraints from prior phases:** phase 219 added the gate time limit; 0f37a8042 (sdlc-fix-rounds) matched the job count.
+
+**Acceptance gate:** test_gate_record, test_cloud_gate, test_gate_box and the three test_merge_gate_suites modules pass.
