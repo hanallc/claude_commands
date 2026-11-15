@@ -8,6 +8,7 @@ from pathlib import Path
 
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.herdr import herdr_types
+from scripts.whoami.account_test_support import store_usage
 from scripts.whoami.note_file import note_name
 
 import ast
@@ -8542,10 +8543,7 @@ class PickerTests(unittest.TestCase):
                 resets=(self.now + timedelta(hours=3)).isoformat(), at=at)
         if tool == "Codex":
             usage["credits"] = usage_store.StoredCredits(balance=credits, at=at)
-        with usage_store.read_lock():
-            saved = usage_store.load()
-            saved[usage_store.key(tool, login)] = usage
-            usage_store.write(saved)
+        store_usage(tool, login, usage)
 
     def selection(self, *, tool: Literal["claude", "codex"] = "claude",
                   exclude: frozenset[str] = NO_PICK_EXCLUSIONS,

@@ -43,6 +43,8 @@ class ImageRecord(TypedDict):
     owner: str
     subject: str
     registered_at: str
+    # A before and after pair keeps the after image in `file` and the before image here.
+    before: NotRequired[str]
     # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
 
@@ -61,8 +63,15 @@ def page_url() -> str:
     return PAGE_PATH
 
 
-def image_path(record: ImageRecord) -> str:
-    return f"/{FOLDER}/{record['id']}/{record['file']}"
+def image_path(record: ImageRecord, file: str = "") -> str:
+    return f"/{FOLDER}/{record['id']}/{file or record['file']}"
+
+
+def shown_files(record: ImageRecord) -> tuple[tuple[str, str], ...]:
+    """Return each image's label and file: a pair shows Before, then After; one image has no label."""
+    if "before" in record:
+        return ("Before", record["before"]), ("After", record["file"])
+    return ("", record["file"]),
 
 
 def read_record(folder: Path) -> ImageRecord:
@@ -78,8 +87,13 @@ def read_record(folder: Path) -> ImageRecord:
     record: ImageRecord = {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]),
                            "caption": cast(str, fields["caption"]), "owner": cast(str, fields["owner"]),
                            "subject": cast(str, fields["subject"]), "registered_at": cast(str, fields["registered_at"])}
-    feedback_at = fields.get("feedback_at")
-    if isinstance(feedback_at, str):
+    for key in ("before", "feedback_at"):
+        value = fields.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{folder.name}: invalid image record")
+    if isinstance(before := fields.get("before"), str):
+        record["before"] = before
+    if isinstance(feedback_at := fields.get("feedback_at"), str):
         record["feedback_at"] = feedback_at
     return record
 
@@ -107,13 +121,18 @@ def records(root: Path) -> list[ImageRecord]:
     return sorted(found, key=lambda record: record["registered_at"])
 
 
-def register(image: Path, caption: str, owner: staff.StaffId, subject: str) -> ImageRecord:
-    """Copy the image into a folder that its record owns, so the server serves it and a delete removes it."""
-    suffix = image.suffix.casefold()
-    if suffix not in SUFFIXES:
-        raise ValueError(f"{image}: use one of {', '.join(sorted(SUFFIXES))}")
-    if not image.is_file():
-        raise ValueError(f"{image}: no such image file")
+def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
+             *, before: Path | None = None) -> ImageRecord:
+    """Copy the image, or a before and after pair, into a folder that its record owns.
+
+    The server serves the folder's images, and a delete removes the folder.
+    """
+    sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
+    for _, source in sources:
+        if source.suffix.casefold() not in SUFFIXES:
+            raise ValueError(f"{source}: use one of {', '.join(sorted(SUFFIXES))}")
+        if not source.is_file():
+            raise ValueError(f"{source}: no such image file")
     if not caption.strip():
         raise ValueError("the caption is empty; say what changed and what to look at")
     if staff.snapshot().by_id(owner) is None:
@@ -124,9 +143,15 @@ def register(image: Path, caption: str, owner: staff.StaffId, subject: str) -> I
     draft = folder / (DRAFT_PREFIX + identity)
     draft.mkdir(mode=0o755)
     try:
-        record: ImageRecord = {"id": identity, "file": "image" + suffix, "caption": caption.strip(), "owner": owner,
-                               "subject": subject, "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
-        _ = shutil.copyfile(image, draft / record["file"])
+        files = {stem: stem + source.suffix.casefold() for stem, source in sources}
+        # The last source is the after image of a pair, or the one image.
+        record: ImageRecord = {"id": identity, "file": files[sources[-1][0]],
+                               "caption": caption.strip(), "owner": owner, "subject": subject,
+                               "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
+        if "before" in files:
+            record["before"] = files["before"]
+        for stem, source in sources:
+            _ = shutil.copyfile(source, draft / files[stem])
         write_record(draft, record)
         # The page shows a folder only after its image and record are complete.
         _ = draft.rename(folder / identity)
@@ -162,21 +187,30 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
     return f"{member.name} ({member.kind})", member.name
 
 
+def picture(record: ImageRecord, label: str, file: str) -> str:
+    """Link one image to its full size; a pair image shows its label above it."""
+    path = html.escape(image_path(record, file), quote=True)
+    alt = record["caption"].splitlines()[0]
+    linked = (f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
+              + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
+    return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
+
+
 def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
-    """Show the caption as the title, then the aligned details, the image, the feedback field and the answer buttons."""
-    path = html.escape(image_path(record), quote=True)
+    """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
+    pair = "before" in record
+    pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
     owner, name = owner_names(members, record["owner"])
-    return (f'<article id="image-{record["id"]}" data-image="{record["id"]}" data-registered="{int(added.timestamp())}" '
+    return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" data-registered="{int(added.timestamp())}" '
             + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{html.escape(owner)}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
-            + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
-            + f'alt="{html.escape(caption.splitlines()[0], quote=True)}" loading="lazy"></a>'
+            + (f'<div class="image-pair">{pictures}</div>' if pair else pictures)
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
@@ -235,7 +269,8 @@ def answer_message(record: ImageRecord, answer: str, feedback: str) -> str:
     return "\n".join((
         f"From the user (via the Images page): {ANSWERS[answer]}",
         *((f"Feedback: {feedback}",) if feedback else ()),
-        f"Image: {origin}{image_path(record)}", f"Caption: {record['caption']}", f"For: {record['subject']}",
+        *(f"{label or 'Image'}: {origin}{image_path(record, file)}" for label, file in shown_files(record)),
+        f"Caption: {record['caption']}", f"For: {record['subject']}",
         "After you act on it, delete the image: "
         + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
 
@@ -267,11 +302,17 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
 
 # At 1108px and wider, the page fills the frame inside its 32px gutters, and the
 # image column keeps its full 680px. 1108 = 32 + 300 + 64 + 680 + 32.
+# There a single card keeps 680px, and a pair card takes up to two of them: 1376 = 680 + 16 + 680.
+# A pair stacks, before on top, when its card is narrower than 600px.
 STYLE = """<style>[hidden]{display:none!important}
 [data-image-filter]{display:flex;align-items:center;gap:8px;margin-bottom:16px}
 [data-image-filter] select{font:inherit;min-height:44px;color:CanvasText;background:Canvas}
 [data-images] article{padding:24px 0;border-top:1px solid #8886}[data-images] article:first-child{border-top:0;padding-top:8px}
 [data-images] img{display:block;max-width:100%;height:auto;border:1px solid #8886;border-radius:6px}
+[data-images] article{container-type:inline-size}
+.image-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.image-pair figure{margin:0}.image-pair figcaption{margin:0 0 6px;font-weight:600}
+@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}
 .caption{margin:0 0 8px;font-size:1.25rem;line-height:1.35;font-weight:600;white-space:pre-line}
 .image-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:0 0 12px;font:14px/1.45 ui-monospace,monospace;opacity:.8}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
@@ -293,7 +334,8 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
 @media (min-width:1108px){main{max-width:none}
 [data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
-[data-image-layout]>div{width:100%;max-width:680px;justify-self:center}}
+[data-image-layout]>div{width:100%;max-width:1376px;justify-self:center}
+[data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
 SCRIPT = r"""(() => {
@@ -419,8 +461,10 @@ SCRIPT_VERSION = change_page.script_version(SCRIPT)
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Register an image for the console's Images page, or delete one.")
     actions = parser.add_subparsers(dest="action", required=True)
-    add = actions.add_parser("register", help="copy an image to the Images page with its caption, owner and subject")
-    _ = add.add_argument("--image", type=Path, required=True, help="the image file to copy")
+    add = actions.add_parser("register", help="copy an image or a before and after pair to the Images page")
+    _ = add.add_argument("--image", type=Path, help="the image file to copy")
+    _ = add.add_argument("--before", type=Path, help="the before image of a pair; give --after with it")
+    _ = add.add_argument("--after", type=Path, help="the after image of a pair; give --before with it")
     _ = add.add_argument("--caption", required=True, help="what changed and what to look at")
     _ = add.add_argument("--owner", required=True, help="the staff id that owns the image")
     subject = add.add_mutually_exclusive_group(required=True)
@@ -432,10 +476,19 @@ def main(arguments: list[str]) -> int:
     try:
         if cast(str, args.action) == "register":
             change, phase = cast(str | None, args.change), cast(str | None, args.phase)
-            record = register(cast(Path, args.image), cast(str, args.caption), staff.StaffId(cast(str, args.owner)),
-                              f"Change {change}" if change is not None else f"Phase {phase}")
+            image, before, after = (cast(Path | None, args.image), cast(Path | None, args.before),
+                                    cast(Path | None, args.after))
+            if image is not None and before is None and after is None:
+                shown = image
+            elif image is None and before is not None and after is not None:
+                shown = after
+            else:
+                parser.error("give --image, or --before and --after")
+            record = register(shown, cast(str, args.caption), staff.StaffId(cast(str, args.owner)),
+                              f"Change {change}" if change is not None else f"Phase {phase}", before=before)
             origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
-            print(f"registered {record['id']}: {origin}{image_path(record)}")
+            print(f"registered {record['id']}: "
+                  + " ".join(f"{origin}{image_path(record, file)}" for _, file in shown_files(record)))
             place = console.place_query("images", f"{PAGE_PATH}#image={record['id']}")
             print(f"Image link: {origin}/{change_page.CONSOLE_FOLDER}/{place}")
         else:
