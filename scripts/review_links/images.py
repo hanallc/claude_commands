@@ -265,8 +265,8 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
         write_record(folder, current)
 
 
-# At 1104px and wider, the page starts at the console's 30px header padding, so
-# the groups panel sits under the header title. 1104 = 30 + 300 + 64 + 680 + 30.
+# At 1104px and wider, the page keeps a 30px gutter, so the groups panel sits
+# 30px from the frame edge. 1104 = 30 + 300 + 64 + 680 + 30.
 STYLE = """<style>[hidden]{display:none!important}
 [data-image-filter]{display:flex;align-items:center;gap:8px;margin-bottom:16px}
 [data-image-filter] select{font:inherit;min-height:44px;color:CanvasText;background:Canvas}

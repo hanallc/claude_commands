@@ -95,7 +95,7 @@ The console sends `Cache-Control: no-store`, a same-origin content policy, and p
 Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
-The desktop top bar shows only the selected page title.
+The desktop has no top bar: each page shows its title once, as its own heading.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
