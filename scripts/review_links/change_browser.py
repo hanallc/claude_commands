@@ -225,22 +225,25 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     page, row = change.page, change.row
     shown = change_review.display_id(row, change.tab)
     anomaly = f"<p>{html.escape(change.anomaly)}</p>" if change.anomaly else ""
+    attributes = (f'hidden data-type="changes" data-key="{html.escape(change.key)}" '
+                  + f'data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" '
+                  + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
-        return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<h1>{html.escape(row.get('Change', ''))}</h1>
+        content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
-{change_page.change_details(row, shown)}</section>'''
-    form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
-        '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
-    text = change_page.answer_status(row.get("Verdict", ""), change.slots)
-    saved = f'<p>{html.escape(text)}</p>' if text else ""
-    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
-<h1>{html.escape(row.get('Change', ''))}</h1>
+{change_page.change_details(row, shown)}'''
+    else:
+        form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
+            '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
+        text = change_page.answer_status(row.get("Verdict", ""), change.slots)
+        saved = f'<p>{html.escape(text)}</p>' if text else ""
+        content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
-{change_page.change_details(row, shown)}</section>'''
+{change_page.change_details(row, shown)}'''
+    return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
 
 # A question stored as one text marks its parts inline: numbered items, then "Choices:" and "Recommended:".

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, images, serve
+from scripts.review_links import change_page, image_store, images, serve
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
                     + "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
@@ -62,16 +62,44 @@ class ImagesFixture(unittest.TestCase):
         assert self.owner is not None
         return self.owner.id
 
-    def register(self, caption: str = "The nav shows Images. Look at the left column.") -> images.ImageRecord:
+    def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+
+class ChangeImageTests(ImagesFixture):
+    def test_change_images_do_not_appear_on_the_images_page(self) -> None:
+        identity = image_store.register_change(self.shot)
+        self.assertEqual(images.records(self.root), [])
+        self.assertNotIn(identity, images.render(self.root).decode())
+        self.assertTrue(image_store.change_image(self.root, identity).startswith("/change-images/"))
+
+    def test_output_registers_a_dark_terminal_image_with_a_private_profile(self) -> None:
+        output = self.temporary / "output.txt"
+        _ = output.write_text("$ verify\nAll <checks> passed & ready\n")
+
+        def chrome(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            page = Path(arguments[-1].removeprefix("file://"))
+            self.assertIn("All &lt;checks&gt; passed &amp; ready", page.read_text())
+            self.assertIn("background:#161b22", page.read_text())
+            profile = next(value.split("=", 1)[1] for value in arguments if value.startswith("--user-data-dir="))
+            self.assertTrue(Path(profile).is_relative_to(page.parent))
+            shot = next(value.split("=", 1)[1] for value in arguments if value.startswith("--screenshot="))
+            _ = Path(shot).write_bytes(PNG)
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        with patch("scripts.review_links.image_store.subprocess.run", side_effect=chrome) as run:
+            identity = image_store.register_output(output)
+        self.assertTrue(image_store.change_image(self.root, identity))
+        arguments = cast(list[str], run.call_args.args[0])
+        self.assertFalse(Path(arguments[-1].removeprefix("file://")).parent.exists())
+
 
 class ImagesTests(ImagesFixture):
     def test_register_copies_the_image_into_a_folder_that_the_record_owns(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
-        self.assertEqual(sorted(path.name for path in folder.iterdir()), [images.RECORD, "image.png"])
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), [image_store.RECORD, "image.png"])
         self.assertEqual((folder / "image.png").read_bytes(), PNG)
-        self.assertEqual(images.read_record(folder), record)
+        self.assertEqual(image_store.read_record(folder), record)
         self.assertEqual(record["subject"], "Phase console-images")
         self.shot.unlink()
         self.assertEqual(images.records(self.root), [record])
@@ -115,7 +143,7 @@ class ImagesTests(ImagesFixture):
         older, newer = self.register("Older shot"), self.register("Newer shot")
         older_folder = self.root / images.FOLDER / older["id"]
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
-        images.write_record(older_folder, older)
+        image_store.write_record(older_folder, older)
         source = images.render(self.root).decode()
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
@@ -240,7 +268,7 @@ class ImagesTests(ImagesFixture):
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
-        images.write_record(self.root / images.FOLDER / record["id"], record)
+        image_store.write_record(self.root / images.FOLDER / record["id"], record)
         card = images.card(record, "token", staff.snapshot(), 3)
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
@@ -288,15 +316,15 @@ class ImagesTests(ImagesFixture):
     def test_an_old_record_with_a_delete_request_reads_and_shows_the_answer_buttons(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
-        stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
+        stored = cast(dict[str, object], json.loads((folder / image_store.RECORD).read_text()))
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
-        _ = (folder / images.RECORD).write_text(json.dumps(stored))
-        self.assertEqual(images.read_record(folder), record)
+        _ = (folder / image_store.RECORD).write_text(json.dumps(stored))
+        self.assertEqual(image_store.read_record(folder), record)
         page = images.render(self.root).decode()
         self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
         self.assertNotIn('value="delete"', page)
 
-    def feedback_body(self, record: images.ImageRecord, feedback: str, action: str = "feedback") -> str:
+    def feedback_body(self, record: image_store.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
 
@@ -314,7 +342,7 @@ class ImagesTests(ImagesFixture):
                     "Caption: After: the panel.", "For: Phase console-images",
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
-                self.assertIn("feedback_at", images.read_record(self.root / images.FOLDER / record["id"]))
+                self.assertIn("feedback_at", image_store.read_record(self.root / images.FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.root).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
@@ -334,7 +362,7 @@ class ImagesTests(ImagesFixture):
             + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}")))
         folder = self.root / images.FOLDER / record["id"]
         self.assertTrue((folder / "image.png").is_file())
-        self.assertIn("feedback_at", images.read_record(folder))
+        self.assertIn("feedback_at", image_store.read_record(folder))
         self.assertNotIn(record["id"], images.render(self.root).decode())
         images.delete(self.root, record["id"])
         self.assertEqual(images.records(self.root), [])
@@ -393,7 +421,7 @@ class ImagesServerTests(ImagesFixture):
         self.assertIn(record["id"], body.decode())
         status, kind, body = self.http("GET", images.image_path(record))
         self.assertEqual((status, kind, body), (200, "image/png", PNG))
-        status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{images.RECORD}")
+        status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{image_store.RECORD}")
         self.assertEqual(status, 404)
 
     def test_server_deletes_the_image_and_refuses_a_bad_token(self) -> None:
