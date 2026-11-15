@@ -218,22 +218,17 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 31 — Every read-only Claude run has no file-edit tools  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every read-only Claude launch from `agent_exec.sh` removes Edit, Write and NotebookEdit (next item, user approved via sdlc, 2026-11-02).
-
-**Spec:**
-- `scripts/agents/agent_exec.sh` readonly Claude mode adds `--disallowedTools Edit,Write,NotebookEdit` beside `--permission-mode plan`.
-- Delete the `direct.simplify`-only tool branch.
-- Tests: the readonly argv for a plain task, a tier task and simplify carry the removal; the write argv does not.
+- `scripts/agents/agent_exec.sh` readonly Claude mode passes `--permission-mode plan --disallowedTools Edit,Write,NotebookEdit`. Write mode keeps every tool.
+- The `direct.simplify`-only tool branch and its readonly-only guard are deleted. The one caller, `simplify_daily.py`, runs readonly.
+- `test_agent_exec.sh` checks the exact readonly argv for a plain task and a tier task, and the removed tools for simplify.
 
 **Files:**
 - `scripts/agents/agent_exec.sh`
 - `scripts/agents/test_agent_exec.sh`
 
-**Workers:** `director only (no Codex workers until the workers-back notice)`.
-
-**Acceptance gate:** `test_agent_exec.sh` and `test_agent_exec.py` pass.
+**Gotchas:** the dry run prints each argument with `%q`, so the expected argv has `Edit\,Write\,NotebookEdit`.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
