@@ -2640,7 +2640,9 @@ try_reserved_target() {
 }
 
 pinned_target_refuse() {
-    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$1" >&2
+    local reason=$1
+    [[ "$reason" != command ]] || reason="the target cannot run this command"
+    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
     note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
@@ -2662,6 +2664,7 @@ mac_only_refuse() {
         no_tests) text="no test matched on the Mac" ;;
         lost) text="the link to the Mac dropped during the run" ;;
         runner) text="the Mac runner gave no usable result" ;;
+        command) text="the Mac cannot run this command" ;;
         *) text=$reason ;;
     esac
     export BUILDLOG_TARGET=""

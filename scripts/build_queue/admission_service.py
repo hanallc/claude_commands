@@ -2274,7 +2274,7 @@ class AdmissionServer:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, mac_test
-        from scripts.mac_test.eligibility import MacVerb, verb_kind
+        from scripts.mac_test.eligibility import recorded_step_kind
         from scripts.build_hold import build_hold
 
         destination = key.destination
@@ -2304,9 +2304,10 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
             target = replace(target, settings=key.settings.path)
-        kind = verb_kind(cast(MacVerb, request.profile.step))
+        kind = recorded_step_kind(request.profile.step)
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
-            return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
+            # The target can never run this command, so a pinned step refuses at once.
+            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         if isinstance(target, target_config.SshTarget):
             answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                 request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
