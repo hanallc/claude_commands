@@ -265,10 +265,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus { text-align: right; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
-.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus { text-align: left; }
+.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .walk-table .unit .cell-text { max-width: none; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
@@ -291,18 +291,19 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
 /* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
-.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto; column-gap: 12px; width: 100%; }
+.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto; column-gap: 12px; width: 100%; }
 .walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
 .walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
 .walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
 .walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
-.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 5; contain: inline-size; }
-.walk.compact .walk-table .done { grid-area: 1 / 5; }
+.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 6; contain: inline-size; }
+.walk.compact .walk-table .done { grid-area: 1 / 6; }
 .walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
 .walk.compact .walk-table .unit { grid-area: 2 / 2; }
 .walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
 .walk.compact .walk-table .machine { grid-area: 2 / 4; }
 .walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
+.walk.compact .walk-table .slot { grid-area: 2 / 6; }
 .walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
 .walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
@@ -504,12 +505,12 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <script>
 let latest = null;
 const TIPS = {
-  "g-builds": (d) => [`Builds · ${ramAmount(groupBytes(d.ram, "builds"))}`, lines("RAM that builds use now.",
+  "g-builds": (d) => [`Builds · ${ramAmount(legendBytes(d.ram, "builds"))}`, lines("RAM that builds use now.",
     amountLines([["Build tools", d.ram.build_tools_bytes], ["Queued builds", d.ram.queued_builds_bytes], ["hana CI", d.ram.ci_bytes]]))],
   "g-free": (d) => [`Free RAM · ${ramAmount(d.ram.available_bytes)}`, lines(
     "RAM that no program holds. It includes cache that Linux can take back.",
     "The queue divides it into build reserved, free and system reserved.")],
-  "g-else": (d) => [`Everything else · ${ramAmount(groupBytes(d.ram, "else"))}`,
+  "g-else": (d) => [`Everything else · ${ramAmount(legendBytes(d.ram, "else"))}`,
     "RAM that the desktop, agents, other programs, the kernel and the cache use."],
   tools: (d) => [`Build tools · ${ramAmount(d.ram.build_tools_bytes)}`, lines("RAM that build tools use now.",
     amountLines([["rust-analyzer", d.ram.rust_analyzer_bytes], ["sccache", d.ram.sccache_bytes],
@@ -555,7 +556,7 @@ const TIPS = {
         `Memory with no program name: ${ramAmount(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes)}.`))
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
-    "What builds may use.", `Builds: ${ramAmount(groupBytes(d.ram, "builds"))}.`,
+    "What builds may use.", `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`,
     `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`, `+ Free: ${ramAmount(d.ram.room_bytes)}.`,
     "A step starts when the memory it needs fits in free.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines("Reserves that free RAM does not cover.",
@@ -577,10 +578,16 @@ const RAM_BLOCKS = [
   ["programs", "Other programs", r => r.other_programs_bytes, "else"], ["kernel", "Kernel", r => r.kernel_bytes, "else"],
   ["cache", "File and kernel cache", r => r.cache_bytes, "else"], ["unattributed", "Not attributed", r => r.unattributed_bytes, "else"],
 ];
-// The bar draws unavailable readings as zero, so each group adds the amounts it draws.
+// Bar widths exclude unavailable readings and negative values.
 function shownBytes(bytes) { return recorded(bytes) ? Math.max(0, bytes) : 0; }
 function groupBytes(r, group) {
   return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => sum + shownBytes(block[2](r)), 0);
+}
+function legendBytes(r, group) {
+  return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => {
+    const bytes = block[2](r);
+    return sum + (recorded(bytes) ? bytes : 0);
+  }, 0);
 }
 function lines(...items) { return items.filter(Boolean).join("\n"); }
 function optional(bytes, text) { return recorded(bytes) && bytes > 0 ? text : ""; }
@@ -633,7 +640,7 @@ function swapTip(row) {
   return [title, lines("Swap charged to this program or build.", ...owner)];
 }
 // The fraction of all RAM at the queue cap: both charts draw their cap line here.
-// The Running chart bars use the cap terms (queued use, CI use counted, covered reservations, room), which add to the cap.
+// Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
 function capEnd(d) {
   const total = recorded(d.ram.total_bytes) && d.ram.total_bytes > 0 ? d.ram.total_bytes : 1;
   return hasCap(d) ? d.cap * GIB / total : 0;
@@ -658,7 +665,7 @@ function level(d) {
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
   walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
-    `Builds: ${ramAmount(groupBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`,
+    `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`,
     `= Taken: ${f1(d.taken)} GiB.`, `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
   walkhead: () => ["Running, in start order", "The build tools row shows RAM that build tools use. Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
   ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The queue cap is unavailable." : "The red line is the queue cap."}`],
@@ -828,11 +835,11 @@ function rawTipText(key, d) {
     const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
     if (r.group) {
       const parts = (r.parts || []).map((p) => `${p.who}${typeof p.pid === "number" ? ` · pid ${p.pid}` : ""} · ${p.age || ""} · ${f1(p.gib)} GiB`).join(", ");
-      const how = r.group === "Codex servers" ? "Codex servers hold this memory outside the build queue." : "Worker background runs hold this memory outside the build queue.";
+      const how = r.group === "Codex servers" ? "Codex servers hold this memory. The queue did not start them." : "Worker background runs hold this memory. The queue did not start them.";
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
     const detail = !r.queued || r.between_steps ? visibleDetail(r) : "";
-    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text ? sentence(r.keep_text) + "." : res} ${src}${progressTip(r)}`];
+    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text ? sentence(r.keep_text).replace(/\.$/, "") + "." : res} ${src}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
@@ -949,8 +956,9 @@ function render(d) {
   }
   $("barwrap").setAttribute("aria-label", `RAM ${ramAmount(r.total_bytes)}: ${parts.join(", ")}`);
   const builds = groupBytes(r, "builds"), system = r.safety_covered_bytes + r.swap_covered_bytes;
-  for (const [id, bytes] of [["g-builds", builds], ["g-free", r.available_bytes], ["g-else", groupBytes(r, "else")],
-    ["system", system], ["cap-builds", builds], ["cap-reserved", r.build_covered_bytes], ["cap-room", r.room_bytes]]) {
+  const buildTotal = legendBytes(r, "builds");
+  for (const [id, bytes] of [["g-builds", buildTotal], ["g-free", r.available_bytes], ["g-else", legendBytes(r, "else")],
+    ["system", system], ["cap-builds", buildTotal], ["cap-reserved", r.build_covered_bytes], ["cap-room", r.room_bytes]]) {
     $(`v-${id}`).textContent = ramAmount(bytes);
   }
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(d.cap)} GiB`;
@@ -1179,12 +1187,14 @@ function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
-  const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
+  const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
+    `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    (running ? '<th scope="col" class="slot">Slot</th>' : "");
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
-      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
+      `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
+      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>`) + '</tr>');
   };
   const running = d.walk.map((row, index) => ({row, index}));
   const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
@@ -1196,12 +1206,12 @@ function renderWalk(d) {
   rows.push(...ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r), r.slot);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus"];
+  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
@@ -1225,7 +1235,7 @@ function renderWalk(d) {
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
     `<div class="walk-table"><table aria-label="Running and waiting steps"><thead><tr>` +
-    `${columns("Stage", STEP_TABLE_HEADERS.duration)}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
+    `${columns("Stage", STEP_TABLE_HEADERS.duration, true)}</tr></thead><tbody>${tableRows.join("")}</tbody></table></div>`;
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
