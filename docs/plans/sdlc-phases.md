@@ -173,7 +173,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `docs/plans/sdlc-phases-design.md` — Step log, Steps
 
-### Phase 29 — Each worker pass records its model  · status: todo
+### Phase 29 — Each worker pass records its model  · status: done
 **Depends on:** Phase 5
 
 #### Work Order
