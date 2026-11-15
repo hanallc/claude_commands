@@ -89,7 +89,7 @@ Use `/build:mac block <why>` and `/build:mac unblock` for the Mac.
 The retained remote helpers remain unreachable from these three commands.
 
 `clear` stops existing queued gates and running builds outside the hold's allow rules.
-`drain` keeps existing runs until they finish.
+`drain` keeps existing runs that work until they finish; a run that only waits waits for the release.
 Both accept `--keep PID`, `--release-eta HH:MM`, and `--zone IANA`.
 Both keep the target held until explicit release.
 A holder file uses its holder's fixed staff ID.
