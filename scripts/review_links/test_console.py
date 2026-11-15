@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import unittest
 from typing import cast, override
 from unittest.mock import patch
@@ -13,6 +15,8 @@ from unittest.mock import patch
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.lib import conf
+from scripts.production import staff
+from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_browser, change_page, console, review_link
 
 
@@ -178,6 +182,16 @@ class ConsoleTests(unittest.TestCase):
         unavailable = tuple(console.ConsolePage(page.identity, page.label, page.icon, page.title, console.UnavailablePage(), page.items)
                             for page in self.news_pages({"a/C1"}, {"q1", "q2"}))
         self.assertEqual(console.news(root, unavailable, "changes"), ())
+
+    def test_one_news_request_reads_the_change_lists_once_for_both_pages(self) -> None:
+        change = change_browser.WaitingChange("a/C1", "a", UnavailableProduction(Path("fixture.md")), {"#": "C1"})
+        question = cast(change_browser.WaitingQuestion, cast(object, SimpleNamespace(key="question/q1")))
+        reviews = change_browser.PreparedReviews((change,), {}, (question,), (), cast(staff.StaffSnapshot, cast(object, None)))
+        with patch.object(change_browser, "console_reviews", return_value=reviews) as read:
+            self.assertEqual(console.news(self.root / "snapshots", console.read_pages(), "changes"), ())
+        self.assertEqual(read.call_count, 1)
+        seen = cast(dict[str, list[str]], json.loads((self.root / "snapshots" / change_page.CONSOLE_FOLDER / console.SEEN_NAME).read_text()))
+        self.assertEqual((seen["changes"], seen["questions"]), (["a/C1"], ["question/q1"]))
 
 
 if __name__ == "__main__":
