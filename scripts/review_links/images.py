@@ -290,7 +290,7 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8883;outline:none}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
-[data-image-groups]{position:static;max-height:none;margin-bottom:16px}}
+[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
 @media (min-width:1104px){main{max-width:none;margin:0;padding-left:30px;padding-right:30px}
 [data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
 [data-image-layout]>div{width:100%;max-width:680px;justify-self:center}}

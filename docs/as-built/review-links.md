@@ -166,7 +166,7 @@ The link reads that page when the console loads, then at each `page_refresh_seco
 Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
 A long label wraps to a second line and stays inside the sidebar.
 The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
-At phone width the link is a small fixed button at the bottom left, never wider than the open sidebar (220px), so it wraps and stays inside the sidebar.
+At phone width the link fills a bar below the page, so it never covers the page content.
 A click opens the Rebuilds page in the frame, titled **Rebuilds needed**, as a navigation entry opens its page.
 `?page=rebuilds` selects it, and the link shows an inset outline while the page is open.
 Each read of the page for the link also replaces the list on an open Rebuilds page, so that page needs no refresh of its own.
@@ -187,6 +187,7 @@ A page with no record takes its present keys, so the first visit marks nothing.
 Opening a page clears its icon at once.
 An item that leaves a page and comes back after the user opens the page shows as new again.
 An items function that fails writes one line to the server log, and its page shows no icon.
+In the open sidebar the icon's center lines up with the status dots of unavailable pages.
 In the collapsed rail the icon sits at the top right of the page icon.
 At phone width the menu button shows the icon while any page holds new items.
 Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
@@ -327,7 +328,7 @@ The owner name has no kind, such as `(unit)`.
 The panel has a rounded outline and thin lines between its rows and columns.
 The panel stays in place while the cards scroll.
 Each row shows a hover color, and a click on a row goes to the first image of its group.
-On a narrow screen the panel goes above the cards and scrolls with them.
+On a narrow screen the panel goes above the cards and scrolls with them, and its owner column takes the spare width.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
@@ -376,7 +377,7 @@ A filed need is a change with its requester (else the affected session) as owner
 A need covers its own commit, so that commit shows once.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
-The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray text that keeps at least 4.5:1 contrast.
 A listed machine without a recorded change list shows `The change list is not available yet.`
 When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
