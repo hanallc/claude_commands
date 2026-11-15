@@ -30,6 +30,42 @@ from pathlib import Path
 from scripts.lib import conf
 from scripts.lint import nextest_budget as budget
 
+# `cargo nextest run` options that only change how tests run or report: the runner,
+# stress and reporter options of `cargo nextest run --help`. nextest refuses some of
+# them with --no-run (--fail-fast, --no-fail-fast, --max-fail, --debugger and --tracer
+# in 0.9.143), so the build drops all of them.
+RUN_ONLY_VALUE_OPTIONS = frozenset({
+    "-j", "--test-threads", "--retries", "--flaky-result", "--max-fail", "--debugger", "--tracer",
+    "--no-tests", "--stress-count", "--stress-duration", "--failure-output", "--success-output",
+    "--status-level", "--final-status-level", "--show-progress", "--max-progress-running",
+    "--message-format", "--message-format-version",
+})
+RUN_ONLY_FLAGS = frozenset({
+    "--fail-fast", "--no-fail-fast", "--no-capture", "--nocapture", "--no-output-indent",
+    "--hide-progress-bar", "--no-input-handler",
+})
+
+
+def build_selection(arguments: Sequence[str]) -> list[str]:
+    """Keep the options that choose what to build; drop the run-only options and their values."""
+    kept: list[str] = []
+    skip_value = False
+    for argument in arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        name = argument.partition("=")[0]
+        if argument in RUN_ONLY_FLAGS or name in RUN_ONLY_VALUE_OPTIONS and "=" in argument:
+            continue
+        if argument in RUN_ONLY_VALUE_OPTIONS:
+            skip_value = True
+            continue
+        if argument.startswith("-j") and argument[2:].isdecimal():
+            continue
+        kept.append(argument)
+    return kept
+
+
 @dataclass(frozen=True)
 class SizedTestRun:
     """`cargo nextest run --test-threads WIDTH ARGS...`, the shape run_nextest passes."""
@@ -39,9 +75,9 @@ class SizedTestRun:
     rest: tuple[str, ...]
 
     def build_only(self) -> list[str]:
-        """Build every test binary the run needs; test binary arguments do not apply."""
+        """Build every test binary the run needs; run-only and test binary arguments do not apply."""
         selection = self.rest[:self.rest.index("--")] if "--" in self.rest else self.rest
-        return [*self.head, "--no-run", *selection]
+        return [*self.head, "--no-run", *build_selection(selection)]
 
     def with_threads(self, threads: int) -> list[str]:
         return [*self.head, "--test-threads", str(threads), *self.rest]
