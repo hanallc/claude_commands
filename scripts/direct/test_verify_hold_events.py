@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ from scripts.direct.verify_hold_wait_test_support import (
     release_registered_call,
 )
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -133,6 +135,30 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertTrue(removed.is_set(), "The directory must disappear before the watch.")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.fixture.local_runs()), 1)
+
+
+class PlacementWaitModeTests(unittest.TestCase):
+    def test_only_the_first_empty_reply_of_an_episode_wakes_at_the_next_pass(self) -> None:
+        source = (Path(__file__).resolve().parent / "verify.sh").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            calls = Path(directory) / "calls"
+            script = "\n".join((
+                "set -euo pipefail",
+                'record() { printf \'%s\\n\' "$4 $5" >> "$CALLS"; }',
+                "PY=record LOCAL_RELEASE_WAIT_SCRIPT=wait BUILDLOG_CALL_ID=call PHASE_RESOURCE_WAIT=''",
+                "PLACEMENT_WAIT_MEMORY=0 PLACEMENT_EVIDENCE_EPISODE='' HOLD_WAITER_PID=''",
+                "start_routing_wait() { :; }",
+                "build_hold_nothing_held() { return 0; }",
+                shell_function(source, "wait_for_placement"),
+                "PLACEMENT_EPISODE=one; wait_for_placement; wait_for_placement; wait_for_placement",
+                "PLACEMENT_EPISODE=two; wait_for_placement",
+                "PLACEMENT_WAIT_MEMORY=1; PLACEMENT_EPISODE=three; wait_for_placement",
+            ))
+            result = subprocess.run(["bash", "-c", script], env={**os.environ, "CALLS": str(calls)},
+                                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().splitlines(), [
+                "one evidence", "one resource", "one resource", "two evidence", "three resource"])
 
 
 class ReleaseDeadlineTests(unittest.TestCase):

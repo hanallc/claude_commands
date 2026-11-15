@@ -257,11 +257,11 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with merge_gate.gate_reservation(self.checkout, self.state, merge_gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
 
-    def test_memory_wait_reports_changes_and_only_one_reminder_per_minute(self) -> None:
+    def test_memory_wait_reports_only_reason_and_place_changes(self) -> None:
         clock = FakeClock()
         formatter = client.WaitOutput()
         reported_at: list[float] = []
@@ -280,9 +280,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 before = len(output.getvalue().splitlines())
                 formatter(replace(reply, snapshot=snapshot))
                 reported_at.extend([float(at)] * (len(output.getvalue().splitlines()) - before))
-        self.assertEqual(reported_at, [0.0, 60.0, 61.0, 63.0], output.getvalue())
+        self.assertEqual(reported_at, [0.0, 61.0], output.getvalue())
         self.assertIn("memory pressure", output.getvalue())
-        self.assertIn("0.750 GiB needed", output.getvalue())
+        self.assertIn("needs 0.5 GiB", output.getvalue())
         self.assert_gate_released()
 
     @gate_suites("hooks")

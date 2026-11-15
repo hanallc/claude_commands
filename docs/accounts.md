@@ -687,6 +687,7 @@ Each session attempt has its own `move_id`, with a request and one confirmed or 
 The request uses the session process account as its source.
 Saved launch settings cannot replace the requested destination account.
 The notes timer delegates moves to a detached batch before it stops any session.
+A session that owns a live build step moves when its steps end, or after `MOVE_BUILD_WAIT_MINUTES` in `config/shutdown.conf`; the others move at once.
 The batch records each outcome when its resume and existing stay observation finish.
 A failed resume uses the existing move failure report to tell the showrunners.
 Blocked notices use the current queue head and target at delivery.

@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from threading import Event
 import time
 import unittest
@@ -462,19 +463,43 @@ if arguments[:1] == ["clippy"]:''')
         _ = self.verify("lint", "sample")
         self.assert_lint_calls()
 
-    def test_each_lint_script_edit_invalidates_a_previously_reused_pass(self) -> None:
-        verify, invoke = self.private_scripts()
+    def test_a_lint_script_edit_invalidates_a_previously_reused_pass(self) -> None:
+        verify, _ = self.private_scripts()
         _ = self.enable_cache()
         with mock.patch.object(lint_support, "VERIFY", verify):
             _ = self.verify("lint", "sample")
             _ = self.verify("lint", "sample")
             self.assertEqual(self.calls("clippy"), [])
-            for script in (verify, invoke, self.config):
-                with self.subTest(script=script.name):
-                    with script.open("a") as output:
-                        _ = output.write("\n# cache input changed\n")
-                    _ = self.verify("lint", "sample")
-                    self.assert_lint_calls()
+            # LintKeyInputTests checks that the tree key reads each lint script. This complete run checks that
+            # an edit to one of them changes the key and stops the reuse of the cached pass.
+            with verify.open("a") as output:
+                _ = output.write("\n# cache input changed\n")
+            _ = self.verify("lint", "sample")
+            self.assert_lint_calls()
+
+
+class LintKeyInputTests(unittest.TestCase):
+    def test_the_lint_tree_key_reads_verify_invoke_and_the_lint_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "verify.sh"
+            config = root / "lint.conf"
+            _ = script.write_text(shell_functions(VERIFY, "tree_key") + "\n" + r'''
+verify_helper() { printf '%s\0' "$@"; }
+CMD=lint ARGS=(sample) FILTER_RUN=0 CACHE_DIR=cache GATE_METADATA={} VERIFY_USER_ENVIRONMENT=()
+TREE_WATCH_SCRIPT=tree_watch.py
+tree_key --with-tree-content
+''')
+            result = subprocess.run(["bash", "-e", str(script)], cwd=root, text=True, capture_output=True,
+                                    env={**os.environ, "HOME": str(root), "LINT_CONFIG_FILE": str(config)},
+                                    timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        words = result.stdout.split("\0")[:-1]
+        separator = words.index("--")
+        self.assertEqual(words[:2], ["--stdin", "tree_watch.py"])
+        self.assertEqual(words[separator - 3:separator],
+                         [str(script), str(root / ".claude/scripts/lint/invoke.sh"), str(config)])
+        self.assertEqual(words[separator + 1:], ["lint"])
 
 if __name__ == "__main__":
     _ = unittest.main()

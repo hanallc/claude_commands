@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import textwrap
 import time
 import traceback
 import unittest
@@ -556,8 +557,9 @@ if sys.argv[1:2] == ["call"]:
     path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
     Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
 '''
-        _ = recorder.write_text(source.replace('runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")',
-            observation_code + 'runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")'))
+        anchor = "    return real_record()\n"
+        assert source.count(anchor) == 1
+        _ = recorder.write_text(source.replace(anchor, textwrap.indent(observation_code, "    ") + anchor))
         observation = self.fixture.root / "wait-observation"
         self.fixture.environment.update({"CLAUDE_PYTHON": str(observer), "TEST_REAL_PYTHON": sys.executable, "TEST_WAIT_OBSERVATION": str(observation), "TEST_STEP_OBSERVATIONS": str(self.fixture.root / "step-observations")})
         return observation
