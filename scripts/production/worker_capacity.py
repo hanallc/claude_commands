@@ -101,6 +101,7 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
                 _ = worker_panes.close(parent.id, name, lock=hold)
             except (herdr_types.HerdrFailure, OSError, ValueError) as error:
                 print(f"worker-capacity: {row.name}: pane not closed: {' '.join(str(error).split())}", file=sys.stderr)
+        worker_panes.forget_restart(row)
         return WorkerStopped(row.name, process, canceled, detached)
 
 
