@@ -4265,7 +4265,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
 - Commit abe4afc09. Production change.
 
-### Phase 297 — The verify helper reads each request in large reads  · status: todo
+### Phase 297 — The verify helper reads each request in large reads  · status: done
 **Depends on:** none
 **Owner:** natest (production change; the diff goes to sdlc).
 
