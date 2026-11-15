@@ -4252,3 +4252,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
 - AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
 - Commit 232d9f01e. Production change.
+
+### Phase 296 — A paired trial box keeps its full lifetime after a queue wait  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the crate_run trial timeout; builds gave the go on 11-15; sdlc has no objection).
+
+#### As-built
+
+- Cause of the crate_run trial 124: `gate_trial.py` set the box expiry before the slot queue wait, and `gate_box.py` splits the time left into run budgets.
+- `coordinate_trial` sets each pending request expiry to launch time + `lifetime_minutes` after every slot is held; `paired_module` reads request.json after `launch`. Branch names keep their start stamp.
+- Test `test_paired_queue_wait_does_not_shorten_the_box_lifetime` in `test_cloud_gate.py`.
+- AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
+- Commit abe4afc09. Production change.
