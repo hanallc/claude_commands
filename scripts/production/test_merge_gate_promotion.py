@@ -318,7 +318,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
         _ = self.publish_for_promotion()
         result = self.run_promote_only()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("cannot read live state: state_reader: stored rows need conversion", result.stderr)
+        self.assertIn("cannot read live state: state_reader: stderr: stored rows need conversion; run its conversion",
+                      result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 

@@ -1884,9 +1884,9 @@ def live_state_refusal(repo: Path, target: str) -> str:
             except (OSError, subprocess.SubprocessError) as error:
                 return f"promotion refused: {module} state-check failed to run: {error}"
             if result.returncode:
-                detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
-                return (f"promotion refused: {target} cannot read live state: {module}: "
-                        f"{detail[-1] if detail else f'exit {result.returncode}'}; run its conversion before the land")
+                detail = "; ".join(failure_detail(result, lines=1).splitlines())
+                return (f"promotion refused: {target} cannot read live state: {module}: {detail}; "
+                        "run its conversion before the land")
     return ""
 
 
