@@ -302,6 +302,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .legend .row .name { min-width: 0; }
   .walk-table table { font-size: 0.78rem; }
   .walk.stacked .walk-table .cell-text { max-width: min(4.5rem, var(--table-label, 4.5rem)); }
+  .walk.stacked .walk-table td.token-wait { white-space: normal; min-width: 7em; }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
@@ -608,7 +609,8 @@ function identityHtml(row) {
 }
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
-  return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
+  return row.progress?.kind === "RowProgress" ? row.progress.phase
+    : row.progress?.kind === "TokenWaitProgress" ? row.progress.stage : "—";
 }
 function doneText(row) {
   const progress = row.progress;
@@ -1052,8 +1054,8 @@ function renderWalk(d) {
   const tableRows = [];
   const columns = (place, duration) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>`;
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", placeClass = "") => {
+    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place${placeClass}">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || (className.startsWith("wait") ? "" : "—"))}</td><td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td></tr>`);
   };
@@ -1062,7 +1064,8 @@ function renderWalk(d) {
   const rows = ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r));
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r),
+      r.progress?.kind === "TokenWaitProgress" ? " token-wait" : "");
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });

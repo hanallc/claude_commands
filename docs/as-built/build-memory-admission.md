@@ -1860,6 +1860,11 @@ The view shows zero room during a shortfall and records that shortfall in the ca
 The queue view and cards show captured process ids as `pid N` for each process row.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
+A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+`progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
+The wait ends at the next line, which reports the tokens taken.
+`NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
+`build_queue.py --json` shows it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, merge gates, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.

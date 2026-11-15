@@ -308,6 +308,12 @@ class NoProgress(TypedDict):
     reason: str
 
 
+class TokenWaitProgress(TypedDict):
+    kind: Literal["TokenWaitProgress"]
+    stage: str
+    tokens: int
+
+
 class RowProgress(TypedDict):
     kind: Literal["RowProgress"]
     phase: Literal["building", "testing"]
@@ -357,7 +363,7 @@ class RunRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
-    progress: RowProgress | NoProgress
+    progress: RowProgress | TokenWaitProgress | NoProgress
     state: str
     pid: int | admission_records.PidNotRecorded
     detail: str
@@ -708,14 +714,17 @@ def build_ci_row(used: float, now: float,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
-    """Use the newest step counter from the admission reading."""
+def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | TokenWaitProgress | NoProgress:
+    """Use the newest step counter or token wait from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
         counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
+            if isinstance(counter.token_wait, progress.TokenWait):
+                return {"kind": "TokenWaitProgress", "stage": progress.TOKEN_WAIT_REASON,
+                        "tokens": counter.token_wait.tokens}
             reason = counter.reason
             continue
         if counter.phase == "modules" or counter.phase.startswith("suites"):

@@ -1825,6 +1825,31 @@ class RunnerAuthorizationTests(unittest.TestCase):
                     self.assertEqual(measured.counter, counter)
             fixture.release(grant)
 
+    def test_a_token_wait_in_the_step_log_is_the_step_counter(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            write_process(fixture.proc.path, owner.pid, 2 * GIB, start=owner.start_time)
+            status = fixture.proc.path / str(owner.pid) / "status"
+            _ = status.write_text(status.read_text() + f"Uid: {uid} {uid} {uid} {uid}\n")
+            sidecar = fixture.root / "runner-wait/cargo.cgroup"
+            sidecar.parent.mkdir(mode=0o755)
+            _ = sidecar.write_text("")
+            _ = progress.progress_path(sidecar, "log").write_text(
+                "Finished `test` profile in 29s\n" + progress.token_wait_line(4) + "\n")
+            request = replace(fixture.service_request(owner=owner), episode=f"uid:{uid}:wait", sidecar=str(sidecar))
+            with fixture.peer_account(uid):
+                grant = only_admitted(fixture.server.handle_request(request))
+            # The capture fallback runs only with a boot identity.
+            fixture.server.boot_id = "fixture-boot"
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            measured = reply.reading.view.running[0].measured
+            assert isinstance(measured, records.ProgressAdjustedMemory)
+            self.assertEqual(measured.counter, progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4)))
+            fixture.release(grant)
+
     def test_runner_cannot_change_priority_or_admit_the_head(self) -> None:
         with AdmissionFixture() as fixture, fixture.peer_account(os.getuid() + 10000):
             for request in (wire.PrioritySetRequest("set", "unit", "why", "director"),

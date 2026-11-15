@@ -1592,3 +1592,16 @@ From the user (via builds, 2026-11-15): "the filter for regions shouldn't take 3
 - Each price card with a box has a legend line under its table: "Lowest and highest of each type" and "Lowest and highest of the table". The legend line above the cards explains only the colors.
 - The price cells have 10 px padding at the right, so a number does not touch an outline.
 - Proof: `phases/88/proof/after-*` (1920 px Spot and cost, dark and light, two full pages, 1400 px Spot, and phone width). The before shots are the phase 87 after shots.
+
+### Phase 89 — The Builds page shows a jobserver token wait as a stage · status: done
+
+From builds (not the user), from a defect the user saw at 11:00 EST (via sdlc, from cargo-liner): a `port nextest` step built its tests in 29 s, printed `nextest: waiting for 4 more jobserver tokens`, and waited about 11 min while `widget nextest` held the tokens. Its Builds page Running row showed `Stage —` and `Done —`. Fix: show the wait as the stage `waiting for jobserver tokens` on the Builds page and in `/build:queue`, set from the place that prints the line.
+
+#### As-built
+
+- `progress_profile`: `token_wait_line` prints the wait line, and `TOKEN_WAIT_LINE` reads it. `nextest_tokens.py` prints the line with `token_wait_line`. `CounterParser` reads it as `NoCounter("waiting for jobserver tokens", TokenWait(K))`. The next line, which reports the tokens taken, ends the wait.
+- `NoCounter.token_wait` (`TokenWait | NoTokenWait`) is an optional field, so the counter wire union does not change for pinned clients. An older snapshot reads as `NoTokenWait`.
+- `admission_service`: a token wait from the step log skips the Cargo capture fallback. Before, that fallback replaced the wait with "missing or competing Cargo captures".
+- `memory_feed.row_progress` returns `TokenWaitProgress` (`stage`, `tokens`) for a natedev row. `memory_live.html` shows its `stage` in the Stage column; `Done` stays `—`. At phone width the stage wraps in its cell.
+- `/build:queue` prints only the Builds page link; `build_queue.py --json` shows the wait in the running step's `measured.counter.token_wait`.
+- Proof: `phases/89/proof/before-*` and `after-*` (the Running table at 1400 px dark and light, and at phone width), from a fixture of the live feed with one natedev nextest row in the wait.

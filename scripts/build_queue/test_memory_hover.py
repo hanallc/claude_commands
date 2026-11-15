@@ -134,6 +134,25 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(row[1].text, expected)
                 self.assertEqual(root.findtext(".//tr[@data-tip='row:1']/td[@class='done']"), "—")
 
+    def test_a_token_wait_is_the_stage_of_its_running_row(self) -> None:
+        row = memory_tests.ProgressKeepAsideTests.reservation("nextest", need=4 * GIB)
+        memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
+        counter = progress.parse_progress("Finished `test` profile in 29s\n" + progress.token_wait_line(4) + "\n")
+        adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True), counter,
+            progress.NoMatchingProfile("no profile"), admission_policy_fixture())
+        inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
+        stage = memory_feed.row_progress(inputs.running)
+        self.assertEqual(stage, {"kind": "TokenWaitProgress", "stage": "waiting for jobserver tokens", "tokens": 4})
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                "walk": [{"name": "hana nextest", "queued": True, "progress": stage}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        cells = root.find(".//tr[@data-tip='row:0']")
+        assert cells is not None
+        self.assertEqual(cells[0].text, "waiting for jobserver tokens")
+        self.assertEqual(cells[0].get("class"), "place token-wait")
+        self.assertEqual(cells[1].text, "—")
+
     def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
         data = {"read_at": 200, "walk": [{"kind": "mac-build", "machine": "mac", "name": "hana nextest",
             "used": 3.5, "started_at": 100, "read_at": 190, "stage": {"kind": "MacTesting"},
