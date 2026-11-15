@@ -190,18 +190,35 @@ def transcript_fixture(row: staff.StaffRow, backend: staff.ClaudeBackend | staff
 
 
 def stopped_worker_module(directory: Path) -> Path:
-    """Install a child-process lifecycle stub that records the source row."""
+    """Install a child-process lifecycle stub that records the source row.
+
+    The stub patches `stop_resume` when a child imports it, so other children skip that import.
+    """
     directory.mkdir()
-    _ = (directory / "sitecustomize.py").write_text('''import json, os
+    _ = (directory / "sitecustomize.py").write_text('''import json, os, sys
+from importlib.machinery import PathFinder
 from pathlib import Path
-from scripts.production import staff
-from scripts.agents import stop_resume
 def stop(reference, kind=""):
+    from scripts.production import staff
+    from scripts.agents import stop_resume
     row = staff.by_id(staff.StaffId(reference))
     if os.environ.get("FIXTURE_STOPPED"):
         Path(os.environ["FIXTURE_STOPPED"]).write_text(json.dumps(row.to_json()))
     return stop_resume.Stopped(row.current_session, 987654)
-stop_resume.stop = stop
+class StopPatch:
+    @classmethod
+    def find_spec(cls, name, path, target=None):
+        if name != "scripts.agents.stop_resume":
+            return None
+        sys.meta_path.remove(cls)
+        spec = PathFinder.find_spec(name, path)
+        load = spec.loader.exec_module
+        def exec_module(module):
+            load(module)
+            module.stop = stop
+        spec.loader.exec_module = exec_module
+        return spec
+sys.meta_path.insert(0, StopPatch)
 ''')
     return directory
 

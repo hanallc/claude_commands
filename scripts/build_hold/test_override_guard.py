@@ -108,6 +108,7 @@ class OverrideGuardPythonTests(unittest.TestCase):
             ("build_hold/test_hold_enforcer.py", False, True),
             ("build_targets/test_targets.py", False, True),
             ("lint/test_nextest_budget.py", False, True),
+            ("lint/test_nextest_tokens.py", False, True),
             ("lint/test_nextest_width.py", True, True),
         )
         for relative, package_import, direct_run in modules:

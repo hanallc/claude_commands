@@ -26,6 +26,7 @@ class UnguardedLaunch:
 
 PROCESS_CALLS = {"Popen", "run", "call", "check_call", "check_output", "execvp", "execvpe", "execv", "execve", "execl", "execlp", "system"}
 NO_ARGV_REFERENCES: frozenset[str] = frozenset()
+PYTHON_START_WORDS = re.compile(r"""(?:claude|codex)/*["']""")
 NON_START_COMMANDS = {"agents", "logs", "queue", "stop", "auth", "login", "--version", "--help"}
 
 
@@ -148,7 +149,11 @@ def unguarded_launches(scripts: Path) -> list[UnguardedLaunch]:
             continue
         relative = path.relative_to(scripts).as_posix()
         source = path.read_text(encoding="utf-8")
-        found.extend(python_launches(path, source, relative) if path.suffix == ".py" else shell_launches(source, relative))
+        if path.suffix == ".sh":
+            found.extend(shell_launches(source, relative))
+        # A Python start needs a literal that ends in claude or codex, or the words agent and start.
+        elif PYTHON_START_WORDS.search(source) or ("agent" in source and "start" in source):
+            found.extend(python_launches(path, source, relative))
     return found
 
 

@@ -164,6 +164,13 @@ Delegated callers and sessions proved live on the target write nothing.
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
 The notes timer delegates account moves to this detached batch before any stop.
+An automatic move (cause `auto`, `refusal` or `credits off`) reads the build admission queue before any stop.
+A session that owns a running, waiting or cloud build step does not stop with the others.
+The others move at once; only the detached batch waits, so a caller hands owners to it.
+The batch reads the queue every `MOVE_BUILD_POLL_SECONDS` and moves each owner when it owns no step.
+At `MOVE_BUILD_WAIT_MINUTES` the batch moves the remaining owners and logs each step that the move ends.
+An unread queue before the wait means no wait; during the wait it keeps the owner held.
+A move by hand never reads the queue. The batch writes its wait lines to its move log.
 The supervisor needs a restart request; an exited child alone does not cause a restart.
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
