@@ -100,7 +100,7 @@ agents_exec_main() {
                 unset AGENT_EXEC_CLAUDE_MODEL
             else
                 source "$script_dir/claude_account.sh"
-                if [[ "$task" == direct.simplify ]]; then
+                if [[ "$AGENT_CLAUDE_ACCOUNT" == caller ]]; then
                     claude_launch_environment || return 1
                 else
                     claude_launch_environment workers || return 1

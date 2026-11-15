@@ -37,6 +37,7 @@ codex_service_tier=fast
 
 Options sections hold launch flags instead of agent rows.
 `[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
+It can also set `claude_account` and `claude_account.<subtask>`: the Claude launch account, `workers` (the default) or `caller`. `agent_exec.sh` runs a `caller` task on the caller's own account; `[direct.options] claude_account.simplify=caller` keeps the /simplify review there.
 The editor excludes options sections from family enumeration.
 
 A family is `codex` or `claude`.

@@ -273,6 +273,29 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `scripts/whoami/quota_alert.py` — the call sites
 - `scripts/whoami/test_agent_notes.py` — the `ahead` tests
 
+### Phase 35 — The launch account for a Claude task lives in models.conf  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `agent_exec.sh` reads the Claude launch account from a `models.conf` row, not from the task name `direct.simplify` (next item 8, sdlc 2026-11-02).
+
+**Spec:**
+- A `[<function>.options]` key `claude_account.<subtask>`, then `claude_account`, selects the Claude launch account: `workers` (the default when absent) or `caller`.
+- `agents_resolve` sets `AGENT_CLAUDE_ACCOUNT` for a claude task through `_models_registry_get`, and refuses another value with `ERROR:`.
+- `agent_exec.sh` passes `workers` to `claude_launch_environment` unless the value is `caller`. No task-name test stays.
+- `config/models.conf` gets `[direct.options]` with `claude_account.simplify=caller`.
+- Tests prove each value: the row key, the function key, the default and a refused value.
+
+**Files:**
+- `config/models.conf`, `scripts/agents/models_config.sh`, `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh`, `scripts/lib/test_nix_env_launches.py`
+- `docs/as-built/agent-registry.md`
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`.
+
+**Acceptance gate:** test_models_config.sh, test_agent_exec.sh and test_agent_exec.py pass.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
