@@ -4205,18 +4205,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/lib/test_models_registry.py` runs 50 shell resolutions in place of 100 in its launch settings test, with the same checks of behavior.
-
-**Spec:**
-- `test_launch_settings_match_shell_role_resolution_and_tier_precedence` checks the keys `direct` (`impl`, `review`), `design_roles` (`designer`), `producers` (`morty`) and `producer_only`. It keeps both families and all five tiers.
-- Neither `models_registry.py` nor `models_config.sh` has a branch for one key name, so the other keys in a section take the same path. Each case starts the shell resolver's registry reader once.
-
-**Files:** `scripts/lib/test_models_registry.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
-
-**Constraints from prior phases:** Phases 287-290 cut repeated heavy runs in the same way.
-
-**Acceptance gate:** the module passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
+- `test_launch_settings_match_shell_role_resolution_and_tier_precedence` in `scripts/lib/test_models_registry.py` checks `direct` (`impl`, `review`), `design_roles` (`designer`), `producers` (`morty`) and `producer_only`, for both families and all five tiers. Neither resolver has a branch for one key name.
+- AWS pair (3 rounds): 11.20 -> 6.09 CPU s, all pass.
+- Commit 3a8806fd6. Test-only change.
