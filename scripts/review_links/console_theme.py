@@ -1,6 +1,8 @@
-"""The color tokens and base type of the console pages, one source for each page that uses them."""
+"""The color tokens and base type of the console pages: the Accounts, AWS prices and Builds pages."""
 from __future__ import annotations
 
+# A page takes the tokens alone, or the tokens and the base rules.
+TOKENS_PLACEHOLDER = "/*__CONSOLE_TOKENS__*/"
 PLACEHOLDER = "/*__CONSOLE_THEME__*/"
 
 _LIGHT = ("--bg:#f6f5f2;--card:#fcfcfb;--line:#dcdad4;--hover:#efede8;--ink:#0b0b0b;--ink-2:#52514e;--ink-3:#66645f;"
@@ -8,9 +10,10 @@ _LIGHT = ("--bg:#f6f5f2;--card:#fcfcfb;--line:#dcdad4;--hover:#efede8;--ink:#0b0
 _DARK = ("--bg:#121211;--card:#1a1a19;--line:#34332f;--hover:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--ink-3:#9a988f;"
          "--accent:#3987e5;--room:#199e70;--error:#ef7372;--warning:#e3a83f;--edge:rgb(0 0 0 / 0.6)")
 
-CSS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
-       f'@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{color-scheme:dark;{_DARK}}}}}\n'
-       f':root[data-theme="dark"]{{color-scheme:dark;{_DARK}}}\n'
+TOKENS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
+          f'@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{color-scheme:dark;{_DARK}}}}}\n'
+          f':root[data-theme="dark"]{{color-scheme:dark;{_DARK}}}\n')
+CSS = TOKENS + (
        "*{box-sizing:border-box}\n"
        'body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'
        "main{max-width:1120px;margin:0 auto;padding:24px 16px 48px}\n"
@@ -23,7 +26,7 @@ CSS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
 
 
 def with_theme(source: str) -> str:
-    """Put the theme where the page source holds the placeholder."""
-    if PLACEHOLDER not in source:
-        raise ValueError(f"the page source has no {PLACEHOLDER}")
-    return source.replace(PLACEHOLDER, CSS, 1)
+    """Put the theme, or only its tokens, where the page source holds a placeholder."""
+    if source.count(PLACEHOLDER) + source.count(TOKENS_PLACEHOLDER) != 1:
+        raise ValueError(f"the page source needs one {PLACEHOLDER} or one {TOKENS_PLACEHOLDER}")
+    return source.replace(PLACEHOLDER, CSS).replace(TOKENS_PLACEHOLDER, TOKENS)

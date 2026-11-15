@@ -67,11 +67,15 @@ class AccountsPageTests(unittest.TestCase):
 
 
 class ConsoleThemeTests(unittest.TestCase):
-    def test_the_theme_goes_in_at_the_placeholder_once(self) -> None:
+    def test_a_page_takes_the_theme_or_only_its_tokens_at_one_placeholder(self) -> None:
         self.assertEqual(console_theme.with_theme(f"<style>{console_theme.PLACEHOLDER}p{{}}</style>"),
                          f"<style>{console_theme.CSS}p{{}}</style>")
-        with self.assertRaisesRegex(ValueError, "no /\\*__CONSOLE_THEME__\\*/"):
-            _ = console_theme.with_theme("<style></style>")
+        self.assertEqual(console_theme.with_theme(f"<style>{console_theme.TOKENS_PLACEHOLDER}p{{}}</style>"),
+                         f"<style>{console_theme.TOKENS}p{{}}</style>")
+        self.assertTrue(console_theme.CSS.startswith(console_theme.TOKENS))
+        for source in ("<style></style>", console_theme.PLACEHOLDER + console_theme.TOKENS_PLACEHOLDER):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "needs one"):
+                _ = console_theme.with_theme(source)
 
 
 if __name__ == "__main__":
