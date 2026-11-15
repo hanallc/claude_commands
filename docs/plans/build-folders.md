@@ -122,6 +122,30 @@ The user questioned the first #88 values: "Why are we allocating more than we ha
 7. The claude folders are on tmpfs. They count against memory, not the disk sum.
 8. When a slot take deletes a target above its size limit, verify.sh prints one line that names the slot and its measured size. The target is deleted once and the next build starts from nothing; it is not made smaller.
 
+### Slot proposal on /build (2026-11-15, waits for the user)
+
+Measured on natedev 2026-11-15 00:59 to 01:04 EST. The Mac values of 2026-11-14 stand.
+A slot is one fixed workspace path. Its build-dir follows from its folder name, `/build/cargo/<name>`, so a slot folder name is unique across `~/rust` and `~/worktrees`.
+A size limit covers the build-dir and the workspace `target/` together. The budget check is per disk.
+
+| Machine | Repository | Peak | Count | Largest folder | Size limit | Sum |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| natedev | hana (all natepiano/hana worktrees and gate caches) | 7 | 7 | 74.1 GiB | 78 GiB | 546 GiB |
+| natedev | cargo-liner | 5 | 5 | 30.2 GiB | 32 GiB | 160 GiB |
+| natedev | bevy_brp | 0 | 1 | 18.4 GiB | 20 GiB | 20 GiB |
+| natedev | nateroids | 0 | 1 | 16.7 GiB | 18 GiB | 18 GiB |
+| natedev | obsidian_knife | 0 | 1 | not measured | 3 GiB (estimate) | 3 GiB |
+| natedev | gltf-ibl-sampler-egui | 0 | 1 | not measured | 5 GiB (estimate) | 5 GiB |
+| natedev | claude (on /build since 2026-11-14) | 11 | 11 | 0.05 GiB | 0.25 GiB | 2.75 GiB |
+| Mac | hana | 1 | 2 | 63.8 GiB | 66 GiB | 132 GiB |
+| Mac | cargo-liner | 1 | 2 | 24.7 GiB | 26 GiB | 52 GiB |
+
+Sums:
+
+1. natedev `/build`: pools 755 GiB plus sccache 26 GiB is 781 GiB. The budget is 817 GiB used plus 2117 GiB free above the 733 GiB floor (20 percent), 2934 GiB.
+2. natedev `/`: final outputs in `target/` are at most 2.6 GiB for each slot, about 25 GiB, against 283 GiB free above the 300 GiB floor.
+3. Mac: 184 of 188.4 GiB, as on 2026-11-14.
+
 ## Rollout and estimates
 
 Hours include implementation, focused tests, review fixes, and owner coordination.
@@ -330,8 +354,10 @@ Verify owns mirror execution; resources does not own this migration.
 4. Remove `~/rust/repro` row folders after the row verdict and a verified rescue ref.
 5. Retain a row folder when rescue fails.
 6. Migrate adjacent fixtures through the maker and private config.
+7. Give each one-off Cargo build-dir a lease with its workspace. On natedev, Cargo puts the build-dir of a workspace at `/build/paths<workspace path>`, outside the workspace. The release that removes the workspace also removes that build-dir. On 2026-11-15, 22 gate copies left 283 GiB of build-dirs under `/build/paths/tmp` with no workspace.
 
 **Acceptance gate:** Run affected scratch, review, and temporary-file caller tests.
+Verify that the removal of a one-off workspace removes its build-dir outside the workspace.
 Verify lease inheritance for shell and browser workers.
 Verify row-verdict cleanup after rescue and folder retention after rescue failure.
 Verify that no one-off request silently contains repository work.
