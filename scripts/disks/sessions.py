@@ -33,11 +33,15 @@ class SessionReport(TypedDict):
     sessions: list[SessionRow]
 
 
-def session_state(session_id: str) -> State:
-    observed = session_records.session_liveness(session_id)
-    if isinstance(observed, session_records.LiveSessionProcess):
-        return "running"
-    return "ended" if isinstance(observed, session_records.SessionNotLive) else "unknown"
+def session_states(registry: session_records.RegistryRead) -> Callable[[str], State]:
+    """Each session's state from one read of the session registry."""
+    def state(session_id: str) -> State:
+        observed = session_records.session_liveness(session_id, registry)
+        if isinstance(observed, session_records.LiveSessionProcess):
+            return "running"
+        return "ended" if isinstance(observed, session_records.SessionNotLive) else "unknown"
+
+    return state
 
 
 def held_folders(folder: Path, holds: Mapping[str, scratch.Hold]) -> list[HeldFolder]:
@@ -49,7 +53,7 @@ def held_folders(folder: Path, holds: Mapping[str, scratch.Hold]) -> list[HeldFo
 
 
 def read_sessions(root: Path, data: DisksData | None, holds: Mapping[str, scratch.Hold], mounts: Sequence[Mount],
-                  state: Callable[[str], State] = session_state) -> SessionReport:
+                  state: Callable[[str], State]) -> SessionReport:
     """Each session folder under root, largest first, with its held folders and whether its session runs."""
     rows: list[SessionRow] = []
     folders: list[Path] = sorted(root.iterdir()) if root.is_dir() else []
@@ -69,4 +73,5 @@ def session_report() -> SessionReport | None:
     root = session_folder.session_root()
     if root is None:
         return None
-    return read_sessions(root, measure.read_data(), scratch.holds(), measure.read_mounts())
+    return read_sessions(root, measure.read_data(), scratch.holds(), measure.read_mounts(),
+                         session_states(session_records.read_registry()))

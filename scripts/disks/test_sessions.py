@@ -6,10 +6,11 @@ import unittest
 from pathlib import Path, PurePath
 from unittest import mock
 
-from scripts.disks import sessions
+from scripts.disks import measure, sessions
 from scripts.disks.measure import DisksData, Folder, Mount
 from scripts.disks.sessions import State
 from scripts.lib import scratch, session_folder
+from scripts.message import session_records
 
 GIB = 1 << 30
 
@@ -55,6 +56,22 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual(report["sessions"][0]["held"], [{"name": "center-shot", "task": "phase:fps/3", "ended": True},
                                                          {"name": "run", "task": "phase:fps/3", "ended": False}])
         self.assertEqual([row["held"] for row in report["sessions"][1:]], [[], [], []])
+
+    def test_a_report_reads_the_session_registry_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("fps", "lfo"):
+                (root / name).mkdir()
+                session_folder.write_record(root / name, {"owner": name, "session_id": name + "-id"})
+            with (mock.patch.object(session_folder, "session_root", return_value=root),
+                  mock.patch.object(measure, "read_data", return_value=None),
+                  mock.patch.object(scratch, "holds", return_value={}),
+                  mock.patch.object(session_records, "read_registry",
+                                    return_value=session_records.RegistryRead((), ())) as registry):
+                report = sessions.session_report()
+        self.assertEqual(registry.call_count, 1)
+        self.assertEqual([(row["name"], row["state"]) for row in report["sessions"]] if report else None,
+                         [("fps", "ended"), ("lfo", "ended")])
 
     def test_no_session_root_gives_no_report(self) -> None:
         with mock.patch.object(session_folder, "session_root", return_value=None):
