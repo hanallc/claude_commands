@@ -95,7 +95,10 @@ The console sends `Cache-Control: no-store`, a same-origin content policy, and p
 Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
-The desktop top bar shows only the selected page title.
+The desktop has no top bar: each page shows its title once, as its own heading.
+Every page uses `page_frame.STYLE`: the content column starts 32px from the top and left edges of the frame, and the title uses bold 26px text.
+At 560px or less, the edge space is 24px at the top and 16px at the sides.
+AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -381,7 +384,7 @@ The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour), in gray te
 A listed machine without a recorded change list shows `The change list is not available yet.`
 When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
-The page heading uses 26px text; machine headings use 20px text; owner headings use 17px; the changes use 15px.
+Machine headings use 20px text; owner headings use 17px; the changes use 15px.
 The content column is up to 1060px wide.
 The machine blocks sit side by side when each block has at least 420px, with 48px between them; otherwise they stack with 32px between them.
 At 480px or less, each time sits above its reasons.

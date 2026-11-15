@@ -255,8 +255,6 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .collapsed nav{padding:22px 12px}.collapsed .nav-entry{padding:13px 14px}.collapsed .open-icon{display:block}.collapsed .close-icon{display:none}
 .collapsed .nav-entry:hover .tooltip,.collapsed .nav-entry:focus .tooltip{display:block}
 .workspace{grid-column:2;display:flex;flex-direction:column;min-width:0;min-height:0}
-.page-header{height:80px;flex:none;display:flex;align-items:center;padding:0 30px;border-bottom:1px solid var(--border);gap:12px}
-.page-header h2{font-size:17px;line-height:1.3;letter-spacing:-.3px;margin:0;font-weight:600}
 .frame-area{flex:1;min-height:0;position:relative}
 .frame-area iframe{position:absolute;inset:0;display:block;border:0;width:100%;height:100%;background:var(--page)}
 .frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}
@@ -277,7 +275,7 @@ border-radius:9px;background:var(--notice-text);color:var(--notice);font-size:11
 .mobile-header{height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;
 background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .sidebar{position:fixed;inset:56px auto 0 0;width:244px;box-shadow:10px 0 32px #0002;overflow-y:auto}
-.sidebar .brand,.collapsed .sidebar,.page-header{display:none}
+.sidebar .brand,.collapsed .sidebar{display:none}
 .workspace{flex:1;width:100%}
 .shell:not(.collapsed) .dismiss{display:block;position:fixed;inset:56px 0 0;border:0;background:#0003;z-index:2}
 .rebuild-slot,.collapsed .rebuild-slot{position:static;order:1;width:auto;padding:0;border-top:1px solid var(--border);background:var(--nav)}
@@ -296,7 +294,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <!-- REBUILDS --> data-title="Rebuilds needed" hidden><!-- REBUILD --><span class="entry-label" id="rebuild-label"></span>
 <span class="rebuild-count" id="rebuild-count" aria-hidden="true"></span><span class="tooltip" id="rebuild-tooltip" aria-hidden="true"></span></a></div>
 <button class="dismiss" id="nav-dismiss" type="button" aria-label="Collapse navigation" tabindex="-1"></button>
-<main class="workspace"><header class="page-header"><h2 id="page-title"></h2></header>
+<main class="workspace">
 <div class="frame-area">
 <section class="empty" id="page-unavailable" hidden><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></section></div></main>
 </div>
@@ -418,7 +416,6 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     });
     const title = selected.dataset.title;
     document.title = 'Hana console · ' + title;
-    document.getElementById('page-title').textContent = title;
     const url = new URL(location.href);
     url.searchParams.set('page', selected.dataset.page);
     history.replaceState(null, '', url);
