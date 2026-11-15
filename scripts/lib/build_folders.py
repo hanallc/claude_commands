@@ -234,7 +234,8 @@ def _open_lock(path: Path, directory: int, *, create: bool) -> int:
     descriptor = os.open(path.name + ".lock", flags, 0o600, dir_fd=directory)
     try:
         inode = os.fstat(descriptor)
-        if not stat.S_ISREG(inode.st_mode) or inode.st_nlink != 1:
+        # Another process can remove the lock after this open; _lock_current refuses a lock with no link.
+        if not stat.S_ISREG(inode.st_mode) or inode.st_nlink > 1:
             raise ValueError("a build folder lock must be a regular file with one link")
         return descriptor
     except BaseException:
@@ -318,7 +319,8 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec) -> None:
     else:
         if stat.S_ISLNK(existing.st_mode):
             raise OSError(errno.ELOOP, "a build folder lease cannot be a symbolic link", name)
-        if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+        # A concurrent os.replace can unlink the lease after this lookup, so no link is not a fault.
+        if not stat.S_ISREG(existing.st_mode) or existing.st_nlink > 1:
             raise ValueError("a build folder lease must be a regular file with one link")
     text = json.dumps(record) + "\n"
     temporary = name + "." + secrets.token_hex(8) + ".tmp"

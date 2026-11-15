@@ -27,7 +27,7 @@ from typing import cast, override
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.review_links import change_page, serve
+from scripts.review_links import change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -122,7 +122,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
         self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
-        self.assertIn(b'data-rebuilds="/console/rebuilds.html"', body)
+        self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):
             with self.subTest(path=path):
@@ -131,6 +131,34 @@ class ReviewLinksServerTests(unittest.TestCase):
         for path in ("/../console/", "/%2e%2e/console/", "/.review-link-console.html"):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path).status, 404)
+
+    def post(self, path: str, body: str) -> tuple[int, bytes]:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+            "STAFF_FILE": str(self.root.parent / "staff.json")})))
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
+        questions = self.enterContext(patch.object(change_browser, "waiting_questions", return_value=frozenset({"q1"})))
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": []}'))
+        questions.return_value = frozenset({"q1", "q2"})
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
+        self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        # The Rebuilds page names no open page; the marks still follow new items.
+        questions.return_value = frozenset({"q1", "q2", "q3"})
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
+        for body in ("open=nowhere", "", "open=changes&open=questions"):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/console/news", body)[0], 400)
+        self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (

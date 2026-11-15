@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -405,6 +406,11 @@ class DeliveryReadView:
         if not self.paths or self.status.path(page, row) not in self.paths:
             return DeliverySlots(NoDelivery(), NoDelivery())
         return self.status.slots(page, row)
+
+
+def script_version(script: str) -> str:
+    """Name a page script by its content; an open page reloads, not updates, when the server's script differs."""
+    return hashlib.sha256(script.encode()).hexdigest()[:12]
 
 
 def document(content: str, title: str = TITLES["changes"]) -> bytes:

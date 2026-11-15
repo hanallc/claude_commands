@@ -376,7 +376,7 @@ class ChangePageTests(unittest.TestCase):
         console = self.request(url.path, {})
         self.assertEqual(console.status, 200)
         self.assertIn('data-url="/console/changes.html" data-title="Changes"', console.body)
-        self.assertIn('data-rebuilds="/console/rebuilds.html"', console.body)
+        self.assertIn('data-url="/console/rebuilds.html" data-title="Rebuilds needed"', console.body)
         manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
         token = manifest.read_bytes()
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
@@ -1312,18 +1312,17 @@ class ChangePageTests(unittest.TestCase):
                 self.assertNotIn(removed, block)
             self.assertLess(block.index("Apply the second settings."), block.index("Apply the first &lt;settings&gt;."))
             natedev, mac = block.split('</article>', 1)
-            newer, older = natedev.split('</li>', 1)
-            self.assertIn('<li><dl><dt>Who</dt><dd>second-session (unit)</dd><dt>When</dt>'
-                          + '<dd><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dd>'
-                          + '<dt>Reason</dt><dd>Apply the second settings.</dd></dl>', newer)
-            self.assertIn('<dt>Who</dt><dd>page-owner (showrunner)</dd>', older)
-            self.assertIn('<dt>Who</dt><dd>Unknown session: unknown-requester</dd>', mac)
+            self.assertIn('<div data-owner><h3>second-session (unit)</h3>'
+                          + '<dl><dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
+                          + '<dd>Apply the second settings.</dd></dl></div><div data-owner><h3>page-owner (showrunner)</h3>',
+                          natedev)
+            self.assertIn('<h3>Unknown session: unknown-requester</h3>', mac)
             for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
                 self.assertNotIn(control, block)
 
-            with self.subTest(rebuilds="entry spacing"):
-                self.assertIn('[data-rebuilds] li+li{margin-top:16px}', body)
-                self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr)', body)
+            with self.subTest(rebuilds="time column"):
+                self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr)', body)
+                self.assertIn('[data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;', body)
 
             with self.subTest(rebuilds="requester absent"):
                 natedev_needs = next(item for item in need.read_needs() if item.newest["machine"] == "natedev")
@@ -1332,7 +1331,7 @@ class ChangePageTests(unittest.TestCase):
                 content = change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), {}, staff.snapshot())
                 self.assertIn('data-count="1" data-label="Rebuild natedev"', content)
-                self.assertIn('<dt>Who</dt><dd>second-session (unit)</dd>', content)
+                self.assertIn('<h3>second-session (unit)</h3>', content)
 
             with self.subTest(rebuilds="status line comparison"):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
@@ -1353,18 +1352,33 @@ class ChangePageTests(unittest.TestCase):
                 mac = block.split('</article>', 1)[1]
                 # The filed need covers its commit, so that commit shows once, with the need's requester.
                 self.assertEqual(mac.count("Apply the Mac settings."), 1)
-                self.assertIn('<ul><li><dl><dt>Who</dt><dd>page-owner (showrunner)</dd><dt>When</dt>'
-                              + '<dd><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dd>'
-                              + '<dt>Reason</dt><dd>memory: &lt;defer&gt; defrag</dd></dl></li><li>', mac)
+                self.assertIn('<h2>Rebuild the Mac</h2><div data-owner><h3>page-owner (showrunner)</h3>'
+                              + '<dl><dt><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dt>'
+                              + '<dd>memory: &lt;defer&gt; defrag</dd></dl></div><div data-owner>', mac)
                 only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
                                                    {"mac": (rebuild_row.Change("f" * 40, "2026-11-12T15:00:00+00:00",
                                                                                "Turn on swap", ""),)},
                                                    staff.snapshot())
                 self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
                                  + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
-                                 + '<ul><li><dl><dt>Who</dt><dd>Unknown session</dd><dt>When</dt>'
-                                 + '<dd><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dd>'
-                                 + '<dt>Reason</dt><dd>Turn on swap</dd></dl></li></ul></article></div>')
+                                 + '<div data-owner><h3>Unknown session</h3>'
+                                 + '<dl><dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
+                                 + '<dd>Turn on swap</dd></dl></div></article></div>')
+
+            with self.subTest(rebuilds="one owner and one time each"):
+                grouped = change_browser.rebuild_list(
+                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
+                    {"mac": (rebuild_row.Change("1" * 40, "2026-11-12T13:00:00+00:00", "Older", owner.id),
+                             rebuild_row.Change("2" * 40, "2026-11-12T15:00:00+00:00", "First", owner.id),
+                             rebuild_row.Change("3" * 40, "2026-11-12T14:00:00+00:00", "Between", ""),
+                             rebuild_row.Change("4" * 40, "2026-11-12T15:00:00+00:00", "Second", owner.id))},
+                    staff.snapshot())
+                self.assertEqual(grouped.count('<h3>page-owner (showrunner)</h3>'), 1)
+                self.assertIn('<div data-owner><h3>page-owner (showrunner)</h3><dl>'
+                              + '<dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
+                              + '<dd>First</dd><dd>Second</dd>'
+                              + '<dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
+                              + '<dd>Older</dd></dl></div><div data-owner><h3>Unknown session</h3>', grouped)
                 self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
                     rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
 
@@ -2216,6 +2230,9 @@ class ChangePageTests(unittest.TestCase):
                 path, _, content = self.browser()
                 del path
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
+                # An open page reloads, not updates, when the server's page script is newer than its own.
+                self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
+                self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
                 _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
@@ -2570,7 +2587,9 @@ class ChangePageTests(unittest.TestCase):
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
                          "row.dataset.key===current?.dataset.key", "rows.slice(previous+1)"):
                 self.assertIn(rule, body)
-            self.assertNotIn('location.reload', body)
+            # The one full reload is for a page whose script is older than the server's.
+            self.assertEqual(body.count('location.reload'), 1)
+            self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads++", body)

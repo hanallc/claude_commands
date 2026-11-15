@@ -29,7 +29,11 @@ DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
 SENDER = Path(__file__).stem
-ACTIONS = frozenset(("delete", "feedback"))
+# Each answer button and the first line of the message that it sends to the owner.
+ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
+           "feedback": "feedback on your image."}
+# A page loaded before the answer buttons existed can still post delete.
+ACTIONS = frozenset(("delete", *ANSWERS))
 
 
 class ImageRecord(TypedDict):
@@ -39,11 +43,11 @@ class ImageRecord(TypedDict):
     owner: str
     subject: str
     registered_at: str
-    # Set when the owner received the user's feedback; the page hides the image until the owner deletes it.
+    # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
 
 
-class FeedbackNotSent(Exception):
+class AnswerNotSent(Exception):
     """No try reached the owner; the image stays on the page."""
 
 
@@ -159,7 +163,7 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 
 
 def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
-    """Show the caption as the title, then the aligned details, the image, the feedback field and the buttons."""
+    """Show the caption as the title, then the aligned details, the image, the feedback field and the answer buttons."""
     path = html.escape(image_path(record), quote=True)
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
@@ -178,8 +182,9 @@ def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
             + f'<label for="feedback-{record["id"]}">Feedback</label>'
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
-            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
+            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
+            + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '<span role="status" data-image-status></span></div></form></article>')
 
 
@@ -192,14 +197,14 @@ def render(root: Path) -> bytes:
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
-               + f'<div><div data-images>{cards}</div><p hidden data-empty></p></div></div>'
-               + '<noscript>Enable JavaScript to filter images, delete an image or send feedback.</noscript>'
+               + f'<div><div data-images data-script="{SCRIPT_VERSION}">{cards}</div><p hidden data-empty></p></div></div>'
+               + '<noscript>Enable JavaScript to filter images or answer on an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return change_page.document(content, "Images")
 
 
 def submit(root: Path, body: str) -> None:
-    """Delete the image that a signed form names, or send its feedback to the image's owner."""
+    """Send the answer on the image that a signed form names to its owner, or delete the image for an older page."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action"} or any(
@@ -214,8 +219,8 @@ def submit(root: Path, body: str) -> None:
     action = fields.get("action", ["delete"])[0]
     if action not in ACTIONS:
         raise change_page.AnswerRefused("use the form on this page")
-    if action == "feedback":
-        send_feedback(root, identity, fields.get("feedback", [""])[0].strip())
+    if action in ANSWERS:
+        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip())
         return
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
@@ -224,19 +229,20 @@ def submit(root: Path, body: str) -> None:
             raise change_page.AnswerRefused(str(error)) from error
 
 
-def feedback_message(record: ImageRecord, feedback: str) -> str:
+def answer_message(record: ImageRecord, answer: str, feedback: str) -> str:
+    """Name the answer, then the feedback when the user wrote some, the image, and the delete command."""
     origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
     return "\n".join((
-        "From the user (via the Images page): feedback on your image.",
-        f"Feedback: {feedback}", f"Image: {origin}{image_path(record)}", f"Caption: {record['caption']}",
-        f"For: {record['subject']}",
+        f"From the user (via the Images page): {ANSWERS[answer]}",
+        *((f"Feedback: {feedback}",) if feedback else ()),
+        f"Image: {origin}{image_path(record)}", f"Caption: {record['caption']}", f"For: {record['subject']}",
         "After you act on it, delete the image: "
         + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
 
 
-def send_feedback(root: Path, identity: str, feedback: str) -> None:
-    """Send the feedback to the owner's current session, then hide the image until the owner deletes it."""
-    if not feedback:
+def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
+    """Send the answer to the owner's current session, then hide the image until the owner deletes it."""
+    if answer == "feedback" and not feedback:
         raise change_page.AnswerRefused("enter feedback")
     folder = images_root(root) / identity
     try:
@@ -245,10 +251,10 @@ def send_feedback(root: Path, identity: str, feedback: str) -> None:
         raise change_page.AnswerRefused(f"no image {identity}") from error
     settings = conf.read("review_links")
     failures = change_page.send_with_retries(SENDER, (staff.StaffId(record["owner"]),),
-                                             feedback_message(record, feedback), settings.whole("delivery_tries"),
+                                             answer_message(record, answer, feedback), settings.whole("delivery_tries"),
                                              settings.number("delivery_pause_seconds"))
     if failures:
-        raise FeedbackNotSent(failures[-1].error)
+        raise AnswerNotSent(failures[-1].error)
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
             current = read_record(folder)
@@ -271,7 +277,8 @@ STYLE = """<style>[hidden]{display:none!important}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
 [data-images] form{display:grid;gap:8px;margin-top:12px}
 [data-images] textarea{font:inherit;width:100%;box-sizing:border-box;color:CanvasText;background:Canvas}
-.image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.image-actions button{margin:0}
+@media (max-width:480px){.image-actions{gap:6px}.image-actions button{font-size:15px;padding:6px 8px}}
 main{max-width:1060px}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
@@ -283,7 +290,7 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8883;outline:none}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
-[data-image-groups]{position:static;max-height:none;margin-bottom:16px}}
+[data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
 @media (min-width:1104px){main{max-width:none;margin:0;padding-left:30px;padding-right:30px}
 [data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
 [data-image-layout]>div{width:100%;max-width:680px;justify-self:center}}
@@ -359,7 +366,7 @@ function bind(root) {
       }
     } catch (error) {
       home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = (feedback ? 'Not sent: ' : 'Not deleted: ') + error.message;
+      status.textContent = 'Not sent: ' + error.message;
       apply();
     } finally {
       sending--;
@@ -374,6 +381,11 @@ async function refresh() {
     if (!response.ok) return;
     const fresh = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('[data-images]');
     if (!fresh || sending) return;
+    // A page from an older server script cannot bind the new cards, so it loads again.
+    if (fresh.dataset.script !== list.dataset.script) {
+      location.reload();
+      return;
+    }
     const top = scrollY;
     list.replaceWith(fresh);
     list = fresh;
@@ -401,6 +413,7 @@ if (target) {
   target.scrollIntoView({block: 'start'});
 }
 })();"""
+SCRIPT_VERSION = change_page.script_version(SCRIPT)
 
 
 def main(arguments: list[str]) -> int:
