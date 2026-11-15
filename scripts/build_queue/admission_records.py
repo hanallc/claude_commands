@@ -835,6 +835,13 @@ class ReadingUnavailable:
 class EstimateExpired:
     estimated_at: float
 
+
+@dataclass(frozen=True)
+class NatedevHeld:
+    """A CI step waits for the release of a natedev hold."""
+    holder: str
+    purpose: str
+
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
              | BehindHead | GpuSlotWait | ReadyForAdmission)
 
@@ -847,7 +854,12 @@ class HeadAdmissionStatus:
     cause: HeadCause = field(kw_only=True)
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
-              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter)
+              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
+              | NatedevHeld)
+
+
+def held_text(wait: NatedevHeld) -> str:
+    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
 
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
@@ -1457,6 +1469,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "estimate expired"
         case ReadingUnavailable():
             return reason.reason
+        case NatedevHeld():
+            return held_text(reason)
         case MemoryPressure():
             return "memory pressure"
         case PressureUnavailable():
