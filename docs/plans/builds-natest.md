@@ -4368,3 +4368,30 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `record.keep_result` keeps a result gzipped at `<host>/results/<YYYY-MM>/<record id>.json.gz` in the buildlog store (`store.RESULTS_DIR`). `keep_log` and `keep_result` share `_keep_compressed`.
 - `cloud_gate.import_record` keeps the imported row after the record append, deletes `remote-result.json` from the gate folder and names the stored file in imported.json `result`. A store write failure is reported with `report_not_written` and leaves the folder file.
 - Commit ce1875a45. Production change.
+
+### Phase 306 — verify.sh reads a runner result in its helper, and tests check the reading in process  · status: done
+**Depends on:** Phase 305
+**Owner:** natest (builds gave a go on 11-15 if small: one module and a few test moves; holds, routing and waits are dropped).
+
+#### Work Order
+
+**Goal:** the unusable runner result checks run in process, not as full verify.sh flows. Measured saving: about 19 AWS CPU s.
+
+**Spec:**
+- A new `scripts/direct/runner_result.py` holds one pure reader. Its input is the result file path, the runner exit status and whether the selected target is a Mac. It returns the usable result fields (word, reason, seconds, holder, fetch, fix, build_target_directory) or an unusable verdict.
+- The reader keeps the current rules from `try_mac_test` (verify.sh lines 2188-2232): only a readable, non-empty regular file is read; `outcome=` counts only for a non-Mac target; `mac=` always counts; exactly one word; the word is passed, failed, lost or declined; passed needs status 0; failed needs a non-zero status.
+- The module has a top-level `main`, so `verify_helper` runs it inside the helper process. The output is one field per line in a fixed order. verify.sh reads the lines and keeps all other `try_mac_test` steps as they are. A failed helper call is an unusable result.
+- The new module uses no signal handlers.
+- A new `scripts/direct/test_runner_result.py` calls the reader in process with every case of the moved tests, and with the ones the reader adds.
+- Delete `test_verify_mac_result_status.py`, `test_verify_mac_result_shape.py` and `test_verify_mac_failed_status.py`. `test_verify_mac_malformed.py` keeps one flow (none/75). `test_verify_step_routes_results.py` keeps the `declined busy` and `invalid` subtests and drops `lost`.
+- Every behavior check stays.
+
+**Files:** `scripts/direct/runner_result.py` (new), `scripts/direct/test_runner_result.py` (new), `scripts/direct/verify.sh`, `scripts/direct/test_verify_mac_malformed.py`, `scripts/direct/test_verify_step_routes_results.py`, and the three deleted modules.
+
+**Workers:** 1 writer; one small module and its tests.
+- impl: all files.
+
+**Constraints from prior phases:** Phase 232: no signal handlers. verify-unit's acffebbc6 adds `finish_mac_fix` to verify.sh; `test_fix_return.py` reads it by its `finish_mac_fix() {` line; do not touch it.
+
+**Acceptance gate:** the changed and new modules, test_verify_mac_results, test_verify_mac_copy_results, test_verify_ssh_targets_results and test_verify_verbs pass on natedev; basedpyright is clean; `bash -n` and shellcheck on verify.sh are clean; verify-unit reviews the diff; an AWS pair shows the saving.
+

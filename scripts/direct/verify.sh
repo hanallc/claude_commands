@@ -2085,8 +2085,8 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
-    local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
+    local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 name
     MAC_FIX_RESULT=""
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1"
@@ -2185,28 +2185,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PID=""
     release_wait_claim
 
-    if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
-          && -s "$MAC_RESULT_FILE" ]]; then
-        result_text="$(< "$MAC_RESULT_FILE")"
-        while IFS= read -r line; do
-            case "$line" in
-                outcome=*)
-                    if [[ "$selected_is_mac" == 0 ]]; then
-                        ((mac_words += 1)); result_word="${line#outcome=}"
-                    fi
-                    ;;
-                mac=*)
-                    ((mac_words += 1))
-                    result_word="${line#mac=}"
-                    ;;
-                reason=*) result_reason="${line#reason=}" ;;
-                seconds=*) result_seconds="${line#seconds=}" ;;
-                holder=*) result_holder="${line#holder=}" ;;
-                fetch=*) result_fetch="${line#fetch=}" ;;
-                fix=*) MAC_FIX_RESULT="${line#fix=}" ;;
-                build_target_directory=*) REMOTE_BUILD_TARGET_DIR="${line#build_target_directory=}" ;;
-            esac
-        done <<< "$result_text"
+    if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
+        "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
+        result_usable=1
+        {
+            IFS= read -r result_word || true
+            IFS= read -r result_reason || true
+            IFS= read -r result_seconds || true
+            IFS= read -r result_holder || true
+            IFS= read -r result_fetch || true
+            IFS= read -r MAC_FIX_RESULT || true
+            IFS= read -r REMOTE_BUILD_TARGET_DIR || true
+        } <<< "$result_text"
+    else
+        result_status=$?
+        if [[ "$result_status" != 1 ]]; then
+            printf 'verify.sh: runner_result.py failed (status %s); the Mac result is not used\n' "$result_status" >&2
+        fi
     fi
     if [[ -d "$MAC_RESULT_FILE" ]]; then
         rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
@@ -2215,10 +2210,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
-    if [[ "$mac_words" -ne 1 \
-          || ! "$result_word" =~ ^(passed|failed|lost|declined)$ \
-          || ( "$result_word" == passed && "$runner_status" -ne 0 ) \
-          || ( "$result_word" == failed && "$runner_status" -eq 0 ) ]]; then
+    if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
