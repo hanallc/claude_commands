@@ -356,7 +356,7 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())
+                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
         return 0
