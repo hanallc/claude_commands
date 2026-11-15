@@ -11,6 +11,7 @@
   --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a; --edge: rgb(0 0 0 / 0.18);
   /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
   --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
+  --box: #ffffff; --box-edge: rgb(0 0 0 / 0.45);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -56,7 +57,8 @@ tbody tr:hover td { background: var(--hover); }
 /* A header "name (unit)" shows the unit on a smaller second line. */
 thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-3); white-space: nowrap; }
 /* The cheapest cell of a price table has an outline over its scale color. */
-td.best { box-shadow: inset 0 0 0 2px var(--ink); font-weight: 700; }
+td.end { box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 3px var(--box); }
+td.best { font-weight: 700; }
 .ban { width: 14px; height: 14px; vertical-align: -2px; fill: none; stroke: var(--ink-3); stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 /* The Standard and GPU price cards sit side by side, and stack on a narrow screen. */
@@ -68,7 +70,7 @@ td.best { box-shadow: inset 0 0 0 2px var(--ink); font-weight: 700; }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 .swatch.scale { background: linear-gradient(to right, var(--scale-low), var(--scale-mid), var(--scale-high));
   box-shadow: inset 0 0 0 1px var(--line); }
-.swatch.best { width: 16px; background: var(--scale-low); box-shadow: inset 0 0 0 2px var(--ink); }
+.swatch.end { width: 18px; background: var(--scale-low); box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 3px var(--box); }
 .price-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 4px 0 0; }
 .price-bar + .legend { margin: 8px 0 12px; }
 .filter[hidden] { display: none; }
@@ -104,7 +106,7 @@ td.best { box-shadow: inset 0 0 0 2px var(--ink); font-weight: 700; }
   <div class="filter" role="group" aria-label="Price to show" id="price-view"></div>
   <div class="filter" role="group" aria-label="Runs to count" id="price-scope"></div>
 </div>
-<p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span><span><span class="swatch best" aria-hidden="true"></span>Outline: the cheapest in the table.</span></p>
+<p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span><span><span class="swatch end" aria-hidden="true"></span>White box: the lowest and the highest of each type.</span><span><b>Bold</b>: the cheapest in the table.</span></p>
 <div id="prices"></div>
 <div id="quotas"></div>
 <section class="card" id="runs">
@@ -126,6 +128,7 @@ td.best { box-shadow: inset 0 0 0 2px var(--ink); font-weight: 700; }
 const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
+const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
 const VIEWS = [["spot", "Spot price"], ["cost", "Cost per gate"]];
@@ -182,10 +185,13 @@ function scaleColor(value, low, middle, high) {
   return `color-mix(in srgb, var(--scale-${end}) ${(share * 100).toFixed(1)}%, var(--scale-mid))`;
 }
 
-// The scale color of each numbered cell in view, column by column, and the cheapest cells of the whole table.
-// A column or a table with fewer than two different numbers in view compares nothing, so it has no color or outline.
+// The scale color of each numbered cell in view, column by column, the lowest and highest cells of each column,
+// and the cheapest cells of the whole table.
+// A column or a table with fewer than two different numbers in view compares nothing, so it has no color or mark.
+// A column with two numbers has no box: each is an end, and the colors already show which.
 function scaleCells(table, cells) {
   const colors = new Map();
+  const ends = new Set();
   const best = new Set();
   const numbered = [];
   for (const column of cells.columns) {
@@ -196,11 +202,15 @@ function scaleCells(table, cells) {
     if (sorted.length < 2 || sorted[0] === sorted[sorted.length - 1]) continue;
     const half = Math.floor(sorted.length / 2);
     const middle = sorted.length % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
-    for (const [place, value] of columnCells) colors.set(place, scaleColor(value, sorted[0], middle, sorted[sorted.length - 1]));
+    const [low, high] = [sorted[0], sorted[sorted.length - 1]];
+    for (const [place, value] of columnCells) {
+      colors.set(place, scaleColor(value, low, middle, high));
+      if (sorted.length > 2 && (value === low || value === high)) ends.add(place);
+    }
   }
   const values = numbered.map(([, value]) => value);
   if (new Set(values).size > 1) for (const [place, value] of numbered) if (value === Math.min(...values)) best.add(place);
-  return { colors, best };
+  return { colors, ends, best };
 }
 
 // Draw tables with the same headers as one grid, so their columns line up; a titled row starts each table.
@@ -228,7 +238,7 @@ function tableElement(tables, titled) {
       title.scope = "rowgroup";
       body.insertRow().appendChild(title);
     }
-    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), best: new Set() };
+    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), ends: new Set(), best: new Set() };
     const notSold = new Set((table.not_sold || []).map(String));
     for (const rowIndex of view.rows) {
       const line = body.insertRow();
@@ -241,6 +251,7 @@ function tableElement(tables, titled) {
           cell.appendChild(banIcon());
         }
         if (scale.colors.has(place)) cell.style.background = scale.colors.get(place);
+        if (scale.ends.has(place)) cell.classList.add("end");
         if (scale.best.has(place)) cell.classList.add("best");
         line.appendChild(cell);
       }
@@ -269,7 +280,7 @@ function fill(section, table, note) {
   section.replaceChildren(heading(table.title));
   if (note) section.appendChild(element("p", note, "note"));
   if (shows([table])) section.appendChild(tableElement([table], false));
-  else if (table.rows.length) section.appendChild(element("p", NOTHING_SHOWN, "note"));
+  else if (table.rows.length) section.appendChild(element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
   return section;
 }
 
@@ -320,7 +331,7 @@ function drawScope() {
   document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;
   document.getElementById("explanation").textContent = costs.explanation;
   const tables = document.getElementById("run-tables");
-  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", NOTHING_SHOWN, "note"));
+  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
   fill(document.getElementById("refused"), costs.refused);
   fill(document.getElementById("launched"), costs.launched);
 }
@@ -366,7 +377,7 @@ for (const group of scopeFilters) {
   for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
 }
 
-// The region filter: all regions by default, any combination; the last chosen region stays on.
+// The region filter: all regions by default, any combination. None clears every region, so one click then shows only that one.
 const chips = document.getElementById("regions");
 const allChip = element("button", "All", "all");
 allChip.type = "button";
@@ -378,19 +389,24 @@ const regionChips = data.regions.map(region => {
   chips.appendChild(chip);
   return chip;
 });
+const noneChip = element("button", "None", "all");
+noneChip.type = "button";
+chips.appendChild(noneChip);
 function showRegions(next) {
   shown = next;
   allChip.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+  noneChip.setAttribute("aria-pressed", String(shown.size === 0));
   for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
 allChip.addEventListener("click", () => showRegions(new Set(data.regions)));
+noneChip.addEventListener("click", () => showRegions(new Set()));
 for (const chip of regionChips) {
   chip.addEventListener("click", () => {
     const next = new Set(shown);
     if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
-    if (next.size) showRegions(next);
+    showRegions(next);
   });
 }
 

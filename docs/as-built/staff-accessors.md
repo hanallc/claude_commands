@@ -294,6 +294,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/update_registration.py` | read | snapshot |
 | `scripts/production/update_registration_test_support.py` | write | by_id, initial_snapshot, set_doc |
 | `scripts/production/waiting.py` | read | snapshot |
+| `scripts/production/waits_on.py` | read | active, StaffRow, OpenRun |
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |

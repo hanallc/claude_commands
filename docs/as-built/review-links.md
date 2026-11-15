@@ -178,8 +178,12 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
-The function takes the review root and returns the keys of the items that wait on the page.
-Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes`.
+Questions uses `change_browser.waiting_questions`.
+Images uses `images.waiting_images` for registered images without `feedback_at`.
+The Images page and its items function share the same waiting-record filter.
+Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
 The console posts `open=<id>` for the page it shows to `/console/news`.
 While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
@@ -194,7 +198,8 @@ An items function that fails writes one line to the server log, and its page sho
 In the open sidebar the icon's center lines up with the status dots of unavailable pages.
 In the collapsed rail the icon sits at the top right of the page icon.
 At phone width the menu button shows the icon while any page holds new items.
-Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+Each poll reads the change lists once, about 0.1 seconds of server time.
+The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
 The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
@@ -233,6 +238,35 @@ Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
 
+Each change can hold one image id in its optional `Image` cell.
+`change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py edit --row <id> --image <png>` attaches or replaces an image without changing the other cells.
+It adds the `Image` column when needed and deletes the old image after writing the row.
+`change_review.py image --image <png>` registers a screenshot for a checkpoint line.
+`image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
+The parser accepts twelve lowercase hexadecimal characters.
+`list-ready` and `live` leave the cell empty and print one line when the image is missing.
+
+Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
+The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
+It has a 420px height limit and crops from the top left.
+A plain click opens the shared image zoom over the page.
+Escape or a click on the zoom closes it and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
+Below 1000px, it moves under the text.
+A row without an image retains its text width and position.
+
+`image_store.register_file` shares draft creation, image suffix checks, and atomic publication between the two image stores.
+It stores a single image or a before and after pair with one record.
+`image_store.read_record` checks the optional `before` and `feedback_at` fields.
+Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
+The snapshot sweep skips both image stores during normal snapshot deletion.
+It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
+The setting starts at 14 days and is read at each sweep.
+
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.
 A question without a staff owner appears under **Owner unavailable**.
@@ -246,12 +280,17 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 - **Recommended**;
 - **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
 A question stored as one text, from before the parts form, shows in sections too:
-- the text up to its first numbered item;
-- **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
-- the text after the first sentence of the last item, as its own paragraph;
-- **Choices**: the text after `Choices:`. Numbered choices show as radio items; other choice text shows as text;
-- **Recommended**: the text after `Recommended:`.
-A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
+
+1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
+2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
+3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+4. A raw question stored on one line shows each context sentence as a separate paragraph.
+5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
+6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
+7. Reviewed text can end with two or more labeled choice paragraphs. These paragraphs use the same radio items.
+8. Choices without clear labels or numbers remain separate text items. The page does not invent answer values.
+9. **Recommended** uses explicit `Recommended:` text. A reviewed choice keeps its `(recommended)` mark without a second section.
+
 In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
@@ -322,9 +361,20 @@ Each card shows, in this order:
 
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
+3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
 5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
+
+A plain click on a single image or either pair image opens the shared image zoom.
+The zoom centers the full image over a dark backdrop within the page view.
+It fits the view with a 16px margin and never exceeds the image's natural size.
+Escape or a click on the backdrop or image closes it.
+The page keeps its scroll position and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
+`page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.
+One document click listener handles `data-image-zoom` links, including links from later page updates.
+The modal dialog takes focus and uses the image's alt text as its accessible name.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).

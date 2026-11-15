@@ -28,7 +28,7 @@ from typing import cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
@@ -42,20 +42,6 @@ HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
 CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
 
 
-UP_STAGE_LABELS = {
-    'price': 'reading the Spot price',
-    'bootstrap': 'preparing the boot script',
-    'stacks': 'updating the stack',
-    'scaler-key': 'preparing the scaler credentials',
-    'tailscale-policy': 'checking the Tailscale policy',
-    'box-join': 'joining the box to Tailscale',
-    'box-configuration': 'configuring the box',
-    'checks': 'checking the box',
-    'image': 'preparing the box image',
-    'idle-stop': 'configuring the idle timer',
-    'activation': 'activating the builder',
-    'routing-proof': 'checking the build route',
-}
 
 
 @contextmanager
@@ -172,17 +158,11 @@ def deployment_parameters(path: Path, settings: DeploymentSettings,
                           notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
     spending = read_settings(path)
     return {
-        'InstanceType': settings.instance_type, 'AmiId': settings.ami_id,
-        'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
-        'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
-        'RootVolumeGiB': str(settings.root_volume_gib), 'DataVolumeGiB': str(settings.data_volume_gib),
-        'DataVolumeIops': str(settings.data_volume_iops), 'DataVolumeThroughput': str(settings.data_volume_throughput),
-        'SpotMaxPrice': str(settings.spot_max_usd_per_hour), 'MonthlyLimitUsd': str(spending.monthly_limit_usd),
+        'VpcId': settings.vpc_id, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
+        'MonthlyLimitUsd': str(spending.monthly_limit_usd),
         'NoticeLowPercent': str(settings.notice_low), 'NoticeHighPercent': str(settings.notice_high),
         'StopPercent': str(settings.stop_percent), 'CostTagKey': spending.cost_explorer_tag_key,
-        'CostTagValue': spending.cost_explorer_tag_value, 'Bootstrap': '',
-        'ExistingDataVolumeId': settings.existing_data_volume_id,
-        'ScalerUserName': settings.scaler_user_name,
+        'CostTagValue': spending.cost_explorer_tag_value, 'ScalerUserName': settings.scaler_user_name,
         'DeploymentId': deployment_id,
     }
 
@@ -209,60 +189,8 @@ class Deployment:
         self.notify = notify
         self.admin: admin_secrets.AdminSecretSession = admin_secrets.AdminSecretSession(settings_path)
 
-    def _migrate_legacy(self, settings: DeploymentSettings) -> None:
-        saved = deployment_record(self.directory)
-        outputs = ledger.mapping(saved.get('outputs', {}))
-        if saved.get('stack_id') or not outputs.get('InstanceId') or saved.get('stack') != settings.stack_name:
-            return
-        api = self._api(settings)
-        account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
-        if saved.get('region') != settings.region or saved.get('account_id', account) != account:
-            raise DeploymentRefused('legacy deployment account or region differs; restore the matching configuration')
-        stacks = ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name, service='cloudformation'), 'Stacks')
-        if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
-            raise DeploymentRefused('legacy migration requires one complete stack')
-        stack_id = ledger.text(stacks[0], 'StackId')
-        if not stack_id.startswith(f'arn:aws:cloudformation:{settings.region}:{account}:stack/{settings.stack_name}/'):
-            raise DeploymentRefused('legacy stack account or region differs; restore the matching configuration')
-        def physical(logical: str) -> str:
-            resource = ledger.mapping(api.call('describe-stack-resource', '--stack-name', stack_id,
-                '--logical-resource-id', logical, service='cloudformation').get('StackResourceDetail'))
-            return ledger.text(resource, 'PhysicalResourceId')
-        if physical('Instance') != outputs['InstanceId']:
-            raise DeploymentRefused('legacy InstanceId differs; restore the matching deployment record')
-        live = self._stack(settings)
-        volume_id, budget_name = live.get('DataVolumeId', ''), live.get('BudgetName', '')
-        if not volume_id or not budget_name:
-            raise DeploymentRefused('legacy migration requires the live volume ID and Budget name')
-        if outputs.get('DataVolumeId', volume_id) != volume_id or outputs.get('BudgetName', budget_name) != budget_name:
-            raise DeploymentRefused('legacy resources differ; restore the matching deployment record')
-        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume_id), 'Volumes')
-        if len(volumes) != 1 or volumes[0].get('VolumeId') != volume_id:
-            raise DeploymentRefused('legacy volume identity differs')
-        tags = {ledger.text(row, 'Key'): str(row.get('Value', '')) for row in ledger.rows(volumes[0], 'Tags')}
-        if tags.get('aws:cloudformation:stack-id') != stack_id:
-            raise DeploymentRefused('legacy volume lacks the verified StackId tag')
-        # The immutable StackId keeps a migration retry stable after a lost tagging response.
-        deployment_id = str(saved.get('deployment_id') or sha256(stack_id.encode()).hexdigest()[:32])
-        if tags.get('DeploymentId') and tags['DeploymentId'] != deployment_id:
-            raise DeploymentRefused('legacy volume belongs to another deployment')
-        budget = ledger.mapping(api.call('describe-budget', '--account-id', account,
-            '--budget-name', budget_name, service='budgets').get('Budget'))
-        if budget.get('BudgetName') != budget_name:
-            raise DeploymentRefused('legacy Budget identity differs')
-        name = physical('ScalerUser')
-        user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
-        scaler = {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
-        if not scaler['arn'].startswith(f'arn:aws:iam::{account}:user/'):
-            raise DeploymentRefused('legacy scaler account differs')
-        _ = api.call('create-tags', '--resources', volume_id, '--tags', 'Key=DeploymentId,Value=' + deployment_id)
-        saved.update(account_id=account, region=settings.region, stack_id=stack_id, deployment_id=deployment_id,
-                     scaler_user=scaler, data_volume_id=volume_id, budget_name=budget_name, preserve_budget_name=True, outputs=live)
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
-
     def _deployment_id(self) -> str:
-        settings = read_deployment_settings(self.settings_path, self.directory)
-        self._migrate_legacy(settings)
+        settings = read_deployment_settings(self.settings_path)
         saved = deployment_record(self.directory)
         if saved.get('stack') and saved['stack'] != settings.stack_name:
             if not saved.get('replacement_deployment_id'):
@@ -281,15 +209,11 @@ class Deployment:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
         parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id)
-        image = box.saved_image(self._api(settings), self.directory)
-        if image.get('State') == 'available':
-            parameters['AmiId'] = ledger.text(image, 'ImageId')
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
     def _reserve_stack(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
         api = self._api(settings)
-        self._migrate_legacy(settings)
         saved = deployment_record(self.directory)
         account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
         if saved.get('account_id', account) != account or saved.get('region') != settings.region:
@@ -308,9 +232,6 @@ class Deployment:
         if stacks and saved.get('stack_id') and saved.get('stack_id') == stacks[0].get('StackId'):
             return
         if saved.get('stack') != settings.stack_name:
-            outputs = ledger.mapping(saved.get('outputs', {}))
-            outputs['ExistingDataInput'] = parameters['ExistingDataVolumeId']
-            saved['outputs'] = outputs
             for key in ('scaler_user', 'stack_id', 'budget_name', 'replacement_deployment_id', 'preserve_budget_name'):
                 _ = saved.pop(key, None)
         saved.update(account_id=account, region=settings.region, stack=settings.stack_name,
@@ -340,7 +261,7 @@ class Deployment:
                                  '--template-body', 'file://' + str(self.output / 'template.json'),
                                  '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps([
                                      {'ParameterKey': key, 'ParameterValue': value} for key, value in
-                                     {**parameters, 'EnableCompute': 'false'}.items()]), service='cloudformation')
+                                     parameters.items()]), service='cloudformation')
                 reserved = True
             saved['stack_id'] = ledger.text(reply, 'StackId')
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
@@ -354,7 +275,7 @@ class Deployment:
                                  '--change-set-name', change_name, service='cloudformation')
             except (AwsUnavailable, subprocess.SubprocessError):
                 pass
-            failure = self._stack_failure(api, settings, stack_id, started, error, reply, parameters['NotificationEmail'])
+            failure = self._stack_failure(api, stack_id, started, error, reply, parameters['NotificationEmail'])
             leftover = self._discard_change_set(api, stack_id, change_name) if reserved else ''
             raise AwsUnavailable(str(failure) + leftover) from None
 
@@ -399,40 +320,9 @@ class Deployment:
             print(f'{api.region}: cannot run one gate ({largest} vCPUs); ask AWS for a Spot vCPU quota increase in this region.')
 
 
-    def _observe(self, settings: DeploymentSettings, instance_id: str, *,
-                 confirms_transition: bool = False) -> ledger.InstanceObservation:
-        evidence = self._api(settings).observe(instance_id, int(self.clock()))
-        observation = ledger.InstanceObservation(evidence.observed_at, evidence.state, 'confirmed deployment instance state')
-        ledger.CostLedger(self.directory).observe(observation, confirms_transition=confirms_transition)
-        return observation
-
-
-    def _reconcile_compute_request(self, settings: DeploymentSettings, request: ledger.ComputeRequest) -> dict[str, str]:
-        requested = replace(settings, stack_name=request.stack, region=request.region)
-        stack = self._stack(requested)
-        book = ledger.CostLedger(self.directory)
-        if not stack or stack.get('ComputeEnabled') == 'false' and not stack.get('InstanceId'):
-            now = int(self.clock())
-            book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed absence of requested compute resources'),
-                         confirms_transition=True)
-            book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
-            return {}
-        if stack.get('ComputeEnabled') != 'true' or not stack.get('InstanceId') or not stack.get('DataVolumeId'):
-            raise DeploymentRefused('resource identities are missing; reconcile the stack before retry')
-        write_text_atomic(self.directory / 'deployment.json', json.dumps({
-            **deployment_record(self.directory), 'stack': request.stack, 'region': request.region, 'at': int(self.clock()), 'outputs': stack,
-        }, sort_keys=True) + '\n')
-        observation = self._observe(requested, stack['InstanceId'], confirms_transition=True)
-        previous_instances = {r.resolution.instance_id for r in book.read_snapshot().compute_requests
-                              if isinstance(r.resolution, ledger.ComputeInstanceConfirmed)}
-        if observation.state == 'terminated' and stack['InstanceId'] in previous_instances:
-            raise DeploymentRefused('the previous instance does not confirm the requested compute resources')
-        book.resolve_compute_request(request, ledger.ComputeInstanceConfirmed(observation.at, stack['InstanceId']))
-        return stack
-
     def _load(self, notification: BudgetNotificationAddress
               ) -> tuple[DeploymentSettings, dict[str, str]]:
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         parameters = self._parameters(settings, notification)
         self._before_request(settings, parameters)
         return settings, parameters
@@ -473,7 +363,7 @@ class Deployment:
             _ = self._guard()
             api = self._api(settings)
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
-                self._validate_inputs(settings, parameters)
+                self._validate_inputs(settings)
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path)
             book = ledger.CostLedger(self.directory)
@@ -537,9 +427,11 @@ class Deployment:
                            *, keep: str) -> None:
         """Change the Hana stack through a change set that refuses a box or disk replacement.
 
-        The Hana box and disk are retained, so CloudFormation never ends them. A failed change can leave a
-        retained box with its persistent request, so a failure ends every Hana box except the kept one."""
+        The Hana box, disks and bucket are retained, so CloudFormation never deletes them. A failed change
+        ends every Hana box except the kept one, then deletes what the rollback kept.
+        A failed create also deletes the failed stack and every unattached Hana disk."""
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        started = self.clock()
         try:
             kind = 'UPDATE' if ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name,
                                                     service='cloudformation'), 'Stacks') else 'CREATE'
@@ -583,16 +475,25 @@ class Deployment:
             _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
                          '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
         except (AwsUnavailable, subprocess.SubprocessError) as error:
+            tag = ('HanaDeployment', parameters['DeploymentId'])
             try:
-                ended = spot_end.end_boxes(api, ('HanaDeployment', parameters['DeploymentId']), keep=keep)
+                ended = spot_end.end_boxes(api, tag, keep=keep)
+                # Read the rollback events before a stack delete makes them unreadable by name.
+                kept = retained.skipped_since(api, settings.stack_name, started)
+                if kind == 'CREATE':
+                    _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
+                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                                 service='cloudformation', timeout_s=timeout)
+                retained.delete(api, kept, wait_s=timeout)
             except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
-                raise AwsUnavailable(f'{error}\nthe Hana Spot boxes did not end: {end_error}') from None
-            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests') from None
+                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
+            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
+                                 + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
-        """Cancel every Hana Spot request, terminate its boxes, then delete the Hana stack."""
+        """Cancel every Hana Spot request, terminate its boxes, delete the Hana stack, then its data disk and bucket."""
         print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
-        print('down --workload hana keeps the retained data disk and control bucket.')
+        print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
         if not approve_destroy:
             print('Run deploy.py down --workload hana --approve-destroy to remove the Hana box.')
             return True
@@ -605,9 +506,14 @@ class Deployment:
         settings, _, _ = self._hana_inputs()
         api = self._api(settings)
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
         with control_lock(self.directory):
+            # Read the stack's disk and bucket before the stack delete removes the record of them.
+            kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
+                frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
+                frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
             with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
-                ended = spot_end.end_boxes(api, ('HanaDeployment', ledger.text(saved, 'deployment')))
+                ended = spot_end.end_boxes(api, tag)
             if 'generation' in saved:
                 hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
                     hana_spend.read_settings(conf.read_or_repository('hana_aws'))).reconcile(
@@ -616,9 +522,12 @@ class Deployment:
                 _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
                 _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
                              service='cloudformation', timeout_s=timeout)
+            with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
+                retained.delete(api, kept, wait_s=timeout)
             for name in ('lifecycle.json', 'setup.json'):
                 (self.directory / 'hana' / name).unlink(missing_ok=True)
-        print(f'down --workload hana: done; {ended} Spot boxes ended; data disk and control bucket kept')
+        print(f'down --workload hana: done; {ended} Spot boxes ended; '
+              + f'{len(kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
         return True
 
     def _hana_inputs(self) -> tuple[DeploymentSettings, dict[str, str], bytes]:
@@ -628,10 +537,8 @@ class Deployment:
         names = {key: workload.text(key) for key in ('stack_name', 'availability_zone', 'ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')}
         if not all(names.values()):
             raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
-        settings = replace(read_deployment_settings(self.settings_path, self.directory), **names,
-            region=limits.region, instance_type=limits.instance_type, root_volume_gib=limits.root_gib,
-            data_volume_gib=limits.data_gib, spot_max_usd_per_hour=limits.spot_max_usd_per_hour,
-            existing_data_volume_id='', timeout_s=workload.whole('aws_timeout_s'))
+        settings = replace(read_deployment_settings(self.settings_path), **names,
+            region=limits.region, timeout_s=workload.whole('aws_timeout_s'))
         if settings.stack_name == conf.read(self.settings_path).text('stack_name'):
             raise DeploymentRefused('The Hana stack must differ from the gate stack')
         if not settings.availability_zone.startswith(settings.region):
@@ -674,7 +581,7 @@ class Deployment:
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
         with control_lock(self.directory):
-            settings = read_deployment_settings(self.settings_path, self.directory)
+            settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
             parameters = self._parameters(settings, notification)
@@ -715,7 +622,7 @@ class Deployment:
             outputs[ledger.text(item, 'OutputKey')] = value
         return outputs
 
-    def _validate_inputs(self, settings: DeploymentSettings, parameters: dict[str, str], instance: str = '') -> None:
+    def _validate_inputs(self, settings: DeploymentSettings) -> None:
         reply = self._api(settings).call('describe-images', '--image-ids', settings.ami_id,
                            '--owners', settings.ami_owner_id)
         images = ledger.rows(reply, 'Images')
@@ -732,44 +639,6 @@ class Deployment:
         rows = ledger.rows(subnet, 'Subnets')
         if len(rows) != 1 or rows[0].get('VpcId') != settings.vpc_id or rows[0].get('AvailabilityZone') != settings.availability_zone:
             raise DeploymentRefused('the subnet does not match the VPC and availability zone')
-        if settings.existing_data_volume_id:
-            reply = self._api(settings).call('describe-volumes', '--volume-ids', settings.existing_data_volume_id)
-            volumes = ledger.rows(reply, 'Volumes')
-            if len(volumes) != 1:
-                raise DeploymentRefused('the retained volume is unavailable')
-            volume = volumes[0]
-            tags = {str(tag.get('Key')): str(tag.get('Value')) for tag in ledger.rows(volume, 'Tags')}
-            attached = (volume.get('State') == 'in-use' and bool(instance)
-                        and len(ledger.rows(volume, 'Attachments')) == 1
-                        and ledger.rows(volume, 'Attachments')[0].get('InstanceId') == instance)
-            if (volume.get('AvailabilityZone') != settings.availability_zone or volume.get('Encrypted') is not True
-                    or (volume.get('State') != 'available' and not attached) or volume.get('Size') != settings.data_volume_gib
-                    or volume.get('VolumeType') != 'gp3' or volume.get('Iops') != settings.data_volume_iops
-                    or volume.get('Throughput') != settings.data_volume_throughput
-                    or tags.get(parameters['CostTagKey']) != parameters['CostTagValue']):
-                raise DeploymentRefused('the retained volume must match its instance, encryption, tags and selected zone')
-
-    def _adopt_volume(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
-        volume_id = settings.existing_data_volume_id
-        if not volume_id:
-            return
-        api = self._api(settings)
-        volumes = ledger.rows(api.call('describe-volumes', '--volume-ids', volume_id), 'Volumes')
-        if len(volumes) != 1 or volumes[0].get('VolumeId') != volume_id:
-            raise DeploymentRefused('the reused volume identity differs')
-        tags = {ledger.text(row, 'Key'): str(row.get('Value', '')) for row in ledger.rows(volumes[0], 'Tags')}
-        owner = tags.get('DeploymentId', '')
-        if owner and owner != parameters['DeploymentId']:
-            receipt = self.directory / 'down-complete.json'
-            previous = remote.read_record(receipt) if receipt.exists() else {}
-            if previous.get('deployment_id') != owner or previous.get('data_volume_id') != volume_id:
-                raise DeploymentRefused('the reused volume owner has no matching down-complete receipt')
-        if owner != parameters['DeploymentId']:
-            _ = api.call('create-tags', '--resources', volume_id,
-                         '--tags', 'Key=DeploymentId,Value=' + parameters['DeploymentId'])
-        saved = deployment_record(self.directory)
-        saved['data_volume_id'] = volume_id
-        write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
 
     @staticmethod
     def _discard_change_set(api: AwsCli, stack_id: str, name: str) -> str:
@@ -779,7 +648,7 @@ class Deployment:
             return '\nunexecuted change set remains: ' + name
         return ''
 
-    def _stack_failure(self, api: AwsCli, settings: DeploymentSettings, stack_id: str, started: float,
+    def _stack_failure(self, api: AwsCli, stack_id: str, started: float,
                        error: Exception, change: dict[str, object], notification: str) -> AwsUnavailable:
         lines = [str(error)]
         if change.get('StatusReason'):
@@ -791,15 +660,7 @@ class Deployment:
                 status = ledger.text(stack, 'StackStatus')
                 lines.append('stack status: ' + status)
                 if status == 'UPDATE_ROLLBACK_COMPLETE':
-                    lines.append('the stack rolled back; the box and the volume did not change')
-                uncertain = (isinstance(error, subprocess.TimeoutExpired)
-                             or any(word in str(error).lower() for word in ('timed out', 'timeout', 'max attempts exceeded')))
-                if status.endswith('_COMPLETE') and not uncertain:
-                    try:
-                        for request in ledger.CostLedger(self.directory).pending_compute_requests():
-                            _ = self._reconcile_compute_request(settings, request)
-                    except (ValueError, OSError, AwsUnavailable, subprocess.SubprocessError):
-                        lines.append('compute request reconciliation is unavailable')
+                    lines.append('the stack rolled back; its resources did not change')
         except (ValueError, AwsUnavailable, subprocess.SubprocessError):
             lines.append('stack status is unavailable')
         return AwsUnavailable('\n'.join(lines).replace(notification, '<notification address>'))
@@ -807,12 +668,10 @@ class Deployment:
     def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
         api = self._api(settings)
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
-        live = self._stack(settings)
+        _ = self._stack(settings)
         notification = parameters.get('NotificationEmail') or '<notification address>'
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
-            else {'ParameterKey': key, 'ParameterValue': value}
-            for key, value in {**parameters, 'EnableCompute': 'false'}.items()
+            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
         ]
         if (self.directory / 'gate-deployment.json').exists():
             template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
@@ -876,13 +735,12 @@ class Deployment:
             leftover = self._discard_change_set(api, stack_id, name) if created and not executed else ''
             if isinstance(error, ValueError):
                 raise DeploymentRefused((str(error) + leftover).replace(notification, '<notification address>')) from None
-            failure = self._stack_failure(api, settings, stack_id, started, error, change, notification)
+            failure = self._stack_failure(api, stack_id, started, error, change, notification)
             raise AwsUnavailable(str(failure) + leftover) from None
 
 
     def _deploy(self, settings: DeploymentSettings, parameters: dict[str, str], ) -> None:
         self._before_request(settings, parameters)
-        self._adopt_volume(settings, parameters)
         self._reserve_stack(settings, parameters)
         live = self._stack(settings)
         try:
@@ -909,22 +767,20 @@ class Deployment:
                     '--template-file', str(self.output / 'template.json'),
                     '--capabilities', 'CAPABILITY_NAMED_IAM', '--no-fail-on-empty-changeset',
                     '--parameter-overrides', *[f'{key}={value}' for key, value in parameters.items()],
-                    'EnableCompute=false', service='cloudformation')
+                    service='cloudformation')
             except (AwsUnavailable, subprocess.SubprocessError) as error:
-                raise self._stack_failure(api, settings, ledger.text(deployment_record(self.directory), 'stack_id'),
+                raise self._stack_failure(api, ledger.text(deployment_record(self.directory), 'stack_id'),
                                           started, error, {}, parameters['NotificationEmail']) from None
         self._save_scaler_identity(settings)
         outputs = self._stack(settings)
         saved = deployment_record(self.directory)
         saved['outputs'] = {**ledger.mapping(saved.get('outputs', {})), **outputs}
-        if outputs.get('DataVolumeId'):
-            saved['data_volume_id'] = outputs['DataVolumeId']
         if outputs.get('BudgetName'):
             saved['budget_name'] = outputs['BudgetName']
         write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
-        current = read_deployment_settings(self.settings_path, self.directory)
+        current = read_deployment_settings(self.settings_path)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
         current_parameters = self._parameters(current, notification)
         self.confirm_preparation_evidence(settings, parameters, TEMPLATE.read_bytes(), renew=renew,
@@ -968,35 +824,22 @@ class Deployment:
             previous_path = self.directory / 'deployment.json'
             if previous_path.exists() and ledger.mapping(remote.read_record(previous_path).get('outputs', {})):
                 previous = remote.read_record(previous_path)
-                saved = ledger.mapping(previous.get('outputs'))
                 if previous.get('region') != settings.region:
                     raise DeploymentRefused('preserve the region of the saved deployment')
-                same_stack = previous.get('stack') == settings.stack_name
-                if not same_stack or not stack:
-                    if settings.existing_data_volume_id != saved.get('DataVolumeId'):
-                        raise DeploymentRefused('replacement requires existing_data_volume_id equal to the saved DataVolumeId')
-                    if not same_stack:
-                        old_settings = replace(settings, stack_name=ledger.text(previous, 'stack'))
-                        if self._stack(old_settings):
-                            raise DeploymentRefused('stop and delete the old stack before replacement')
-                    elif not stack:
-                        raise DeploymentRefused('use a new stack_name and its saved DataVolumeId to preserve the retained Budget')
-                elif stack.get('InstanceId') != saved.get('InstanceId') or stack.get('DataVolumeId') != saved.get('DataVolumeId'):
-                    raise DeploymentRefused('the stack differs from the saved resource identities')
-            if stack and stack.get('ExistingDataInput', '') != settings.existing_data_volume_id:
-                raise DeploymentRefused('stop and delete the old stack, then select its saved DataVolumeId and a new stack_name')
-            self._validate_inputs(settings, parameters, stack.get('InstanceId', ''))
+                if previous.get('stack') != settings.stack_name:
+                    if self._stack(replace(settings, stack_name=ledger.text(previous, 'stack'))):
+                        raise DeploymentRefused('delete the old stack before replacement')
+                elif not stack:
+                    raise DeploymentRefused('use a new stack_name to preserve the retained Budget')
+            self._validate_inputs(settings)
             if not stack:
                 self._deploy(settings, parameters)
                 stack = self._stack(settings)
-                if not stack.get('BudgetName') or stack.get('ComputeEnabled') != 'false':
+                if not stack.get('BudgetName'):
                     raise DeploymentRefused('the Budget foundation has no confirmed evidence')
                 self._confirm_preparation(settings, parameters, renew=True)
             self._deploy(settings, parameters)
-            pending = ledger.CostLedger(self.directory).pending_compute_requests()
             outputs = self._stack(settings)
-            for request in pending:
-                outputs = self._reconcile_compute_request(settings, request)
             saved = deployment_record(self.directory)
             saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
@@ -1005,21 +848,21 @@ class Deployment:
 
 
     def _scaler_api(self) -> AwsCli:
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         profile = conf.read(self.settings_path).text('credentials_profile')
         return AwsCli(profile, settings.region, settings.timeout_s, self.execute)
 
     def _scaler_present(self) -> bool:
         try:
             reply = self._scaler_api().call('get-caller-identity', service='sts')
-            user = read_deployment_settings(self.settings_path, self.directory).scaler_user_name
+            user = read_deployment_settings(self.settings_path).scaler_user_name
             return ledger.text(reply, 'Arn').endswith('user/' + user)
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError):
             return False
 
 
     def scaler_key(self) -> None:
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         credential_file = admin_secrets.credentials_file()
         previous = credential_file.read_bytes()
@@ -1090,7 +933,7 @@ class Deployment:
             print(teardown.IMAGES_DRY_RUN)
             return True
         self._check_credentials()
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         with control_lock(self.directory / 'gate-up'):
             deployment = gate_deployment(self.directory / 'gate-deployment.json', settings.region)
@@ -1259,7 +1102,7 @@ class Deployment:
 
     def prices(self) -> None:
         """Print regional Spot prices without resource identities."""
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         from scripts.aws_target import cloud_gate
         values = cloud_gate.settings()
@@ -1297,7 +1140,7 @@ class Deployment:
 
     def quota_request(self) -> bool:
         """Request both regional Spot quotas without duplicating open requests."""
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         success = True
         for regions, code, desired, label in quota_targets(settings.region):
@@ -1309,7 +1152,7 @@ class Deployment:
     def quota_status(self) -> bool:
         """Report applied quotas and request history without changing AWS or local state."""
         from scripts.aws_target import gpu_size_trial
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
         needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
         regional: dict[str, list[tuple[str, str]]] = {}
@@ -1392,7 +1235,7 @@ class Deployment:
         from scripts.aws_target import cloud_gate, gate_trial, gpu_size_trial
         self._authorize(approve_resources)
         with control_lock(self.directory / 'gate-up'):
-            settings = read_deployment_settings(self.settings_path, self.directory)
+            settings = read_deployment_settings(self.settings_path)
             regions = gate_regions(settings.region)
             api = self._api(settings)
             saved = deployment_record(self.directory)
@@ -1485,7 +1328,7 @@ class Deployment:
             print(teardown.DRY_RUN)
             return True
         self._check_credentials()
-        settings = read_deployment_settings(self.settings_path, self.directory)
+        settings = read_deployment_settings(self.settings_path)
         with step('down', 'removing local and cloud resources', self.settings_path):
             return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()

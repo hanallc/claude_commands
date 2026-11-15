@@ -1105,14 +1105,13 @@ class RamBlocks(TypedDict):
     safety_missing_bytes: int
     swap_missing_bytes: int
     build_missing_bytes: int
-    builds_bytes: int
     queued_builds_bytes: int
+    build_tools_bytes: int
     rust_analyzer_bytes: int
     sccache_bytes: int
     other_build_tools_bytes: int
-    ci_bytes: RamReading
-    # The queue cap counts the CI working set, file cache included.
-    ci_counted_bytes: int
+    # The CI use that the queue cap counts: swap-backed use.
+    ci_bytes: int
     agents_bytes: RamReading
     desktop_bytes: RamReading
     desktop_protection_bytes: RamReading
@@ -1360,25 +1359,16 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
     return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
 
 
-def ci_program_ram(running: Sequence[admission_records.ExplainedRunningStep]) -> RamReading:
-    """Read the hana CI swap-backed RAM from the capture; its file cache counts in the cache block."""
-    total = 0
-    for reading in gate.ci_readings(entry.step.measured for entry in running):
-        if reading.diagnostic:
-            continue
-        if isinstance(reading.anonymous, admission_records.RunUseUnavailable):
-            return admission_records.ReadingUnavailable(reading.anonymous.reason)
-        total += reading.anonymous.bytes
-    return total
-
-
 def known_bytes(value: RamReading) -> int:
     return value if isinstance(value, int) else 0
 
 
-def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamReading, capture_time: float,
+def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_time: float,
                program_rows: int) -> RamBlocks:
-    """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest."""
+    """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest.
+
+    The queued builds, CI, reservation and room blocks are the queue cap terms; they add to the cap.
+    """
     available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
     safety_covered = min(safety, available)
     swap_covered = min(swap, max(0, available - safety))
@@ -1391,13 +1381,13 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamR
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    builds = room.used + tools.rust_analyzer + tools.sccache + tools.other
+    build_tools = tools.rust_analyzer + tools.sccache + tools.other
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
-    named = (builds + known_bytes(ci) + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
+    named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
              + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
-    readings = ((SWAP_NAMES["ci"], ci), (RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
+    readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
                 (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
     missing = [f"{name}: {value.reason}" for name, value in readings
                if isinstance(value, admission_records.ReadingUnavailable)]
@@ -1409,9 +1399,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamR
         "safety_covered_bytes": safety_covered, "swap_covered_bytes": swap_covered, "build_covered_bytes": build_covered,
         "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
         "build_missing_bytes": build - build_covered,
-        "builds_bytes": builds, "queued_builds_bytes": room.used, "rust_analyzer_bytes": tools.rust_analyzer,
-        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": ci,
-        "ci_counted_bytes": room.ci_use,
+        "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
+        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
         "other_programs_bytes": other_programs_bytes,
@@ -1701,7 +1690,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
-        "ram": ram_blocks(captured, build_tool_ram(explanation.running, captured.used), ci_program_ram(explanation.running),
+        "ram": ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
                           explanation.now, configuration.other_rows),
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,

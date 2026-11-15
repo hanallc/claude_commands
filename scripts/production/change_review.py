@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read unit commit trailers and write change review rows.
 
-A visible trailer has three fields and an optional fourth field: after <step>.
+A visible trailer has three fields, optional after <step>, and optional last image <id>.
 An invisible change uses Change-Review: none — <reason>.
 Every supplied review line must parse, whatever the commit subject.
 Only checkpoints that change more than Markdown require a review line.
@@ -45,8 +45,9 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 
 from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
-from scripts.production import change_routing, session_staff, showrunner_tree, staff, unit_config, unit_lookup
+from scripts.production import change_routing, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
 from scripts.production.production_doc import Refusal, production_field
+from scripts.review_links import image_store
 from scripts.agents import remote
 
 TRAILER = "Change-Review"
@@ -62,10 +63,11 @@ URGENCY = "Urgency"
 # Open rows hold the owner's fixed staff id. Reviewed rows keep their recorded production.
 PRODUCTION = "Production"
 PRODUCER = change_routing.PRODUCER
+IMAGE = "Image"
 KIND = "Kind"
 REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
-FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] [| image <id>]"
 SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
@@ -125,6 +127,7 @@ class Visible:
     check: str
     see: str
     readiness: ReadyNow | AfterStep = ReadyNow()
+    image: str = ""
 
     def how(self) -> str:
         """The row's How to check cell: how to try the change, then what the user sees."""
@@ -169,11 +172,16 @@ def parse(value: str) -> Entry:
     if (none := _NONE.match(text)) is not None:
         return Invisible(none.group("why").strip())
     parts = [part.strip() for part in text.split(SEPARATOR)]
+    image = ""
+    if len(parts) in (4, 5) and parts[-1].startswith("image "):
+        image = parts.pop().removeprefix("image ").strip()
+        if image_store.IDENTITY.fullmatch(image) is None:
+            return Malformed(text)
     if len(parts) == 3 and all(parts):
-        return Visible(parts[0], parts[1], parts[2])
+        return Visible(parts[0], parts[1], parts[2], image=image)
     if (len(parts) == 4 and all(parts) and parts[3].startswith("after ")
             and (step := parts[3].removeprefix("after ").strip())):
-        return Visible(parts[0], parts[1], parts[2], AfterStep(step))
+        return Visible(parts[0], parts[1], parts[2], AfterStep(step), image)
     return Malformed(text)
 
 
@@ -198,7 +206,7 @@ def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>`: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>` and then ` | image <12-hex id>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
     return ""
 
@@ -235,7 +243,6 @@ def _require_main(repo: Path, merged: str) -> None:
 
 def registered_productions() -> Iterable[Path]:
     """Production docs named by the registered update timers."""
-    from scripts.production import showrunners
 
     return showrunners.timer_docs().values()
 
@@ -724,21 +731,26 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             selected.append(index)
         if not selected:
             return []
+        number = next_number("".join(lines))
+        row_images = {index: _row_image(items[index].image, f"C{number + offset}")
+                      for offset, index in enumerate(selected)}
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
         _add_column(path, lines, SECTION, PRODUCTION)
         _add_column(path, lines, SECTION, PRODUCER)
+        if any(row_images.values()):
+            _add_column(path, lines, SECTION, IMAGE)
         columns, first, end = _table(path, lines, SECTION)
         plain = [change for change in changes if isinstance(change, Visible)]
         if merged and (held := _held(columns, lines[first:end], plain, merged)):
             raise ChangeReviewError(f"{held} already holds that change from merge {merged}; no row added")
-        number = next_number("".join(lines))
         added = f"{day.isoformat()} {added_at:%H:%M}" if added_at is not None else day.isoformat()
         when = f"{added} · {_cell(merged)}" if merged else added
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(items[index].change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(items[index].how()), URGENCY: _cell(rank),
                                      KIND: "", PRODUCER: str(row_producers[index]) if isinstance(row_producers[index], str) else "",
-                                     PRODUCTION: _cell(identities[index])})
+                                     PRODUCTION: _cell(identities[index]),
+                                     IMAGE: row_images[index]})
                 for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
         unregistered.update(change.unit_name for index in selected
@@ -759,6 +771,20 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
+
+
+def image_path(identity: str) -> str:
+    """Return the public path of a change row's image, or an empty string."""
+    if not identity:
+        return ""
+    return image_store.change_image(change_routing.review_root(), identity)
+
+
+def _row_image(identity: str, row: str) -> str:
+    if not identity or image_path(identity):
+        return identity
+    print(f"change review: no image {identity}; row {row} has no image")
+    return ""
 
 
 def _covered(rows: list[dict[str, str]], change: PublicationChange, repo: Path) -> bool:
@@ -1399,20 +1425,37 @@ def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
     return columns, index
 
 
-def edit_row(path: Path, row: str, item: Visible, day: date, production: Path) -> str:
-    """Rewrite the Change and How to check cells of `row` in To review; return the row written.
+@dataclass(frozen=True)
+class KeepRowText:
+    """Keep the current Change and How to check cells."""
 
-    The row keeps its id, its Merged cell, every other cell and its place in the table.
-    """
+
+def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, production: Path,
+             *, image: str = "") -> str:
+    """Edit the selected text and image cells without changing the row's identity or position."""
+    removed_image = ""
 
     def write(lines: list[str]) -> str:
+        nonlocal removed_image
+        _ = _to_review(path, lines, row)
+        if image:
+            _add_column(path, lines, SECTION, IMAGE)
         columns, index = _to_review(path, lines, row)
         cells = dict(zip(columns, _cells(lines[index])))
-        written = _row(path, columns, {**cells, "Change": _cell(item.change), CHECK: _cell(item.how())})
+        if isinstance(item, Visible):
+            cells.update({"Change": _cell(item.change), CHECK: _cell(item.how())})
+        if image:
+            previous = _plain(cells.get(IMAGE, ""))
+            removed_image = previous if previous != image else ""
+            cells[IMAGE] = _cell(image)
+        written = _row(path, columns, cells)
         lines[index] = written + "\n"
         return written
 
-    return _edit(path, production, day, write, lambda _: f"edit {row}")
+    written = _edit(path, production, day, write, lambda _: f"edit {row}")
+    if removed_image:
+        image_store.remove_change(change_routing.review_root(), removed_image)
+    return written
 
 
 def mark_row(path: Path, row: str, now: datetime, production: Path) -> str:
@@ -1468,8 +1511,10 @@ def record_verdict(
     report_warning: Callable[[str], None] = _print_warning,
 ) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
     """Record a verdict once. Retain its merge and the result of an earlier write."""
+    removed_image = ""
 
     def write(lines: list[str]) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
+        nonlocal removed_image
         columns, first, end = _table(path, lines, SECTION)
         index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
         if index is None:
@@ -1482,6 +1527,10 @@ def record_verdict(
                 return VerdictAlreadyRecorded(verdict, _plain(cells.get("Date", "")), row_merge(cells))
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
+        image = _plain(cells.get(IMAGE, ""))
+        if image:
+            removed_image = image
+            cells[IMAGE] = ""
         identity = staff.initial_snapshot()
         member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
         if member is not None:
@@ -1506,7 +1555,10 @@ def record_verdict(
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
-    return _edit(path, production, day, write, lambda _: f"verdict {row}", report_warning=report_warning)
+    result = _edit(path, production, day, write, lambda _: f"verdict {row}", report_warning=report_warning)
+    if removed_image:
+        image_store.remove_change(change_routing.review_root(), removed_image)
+    return result
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -1638,7 +1690,6 @@ def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
 
 def production_doc(production: str, *, record: staff.StaffSnapshot | None = None) -> Path:
     """The production doc given; without one, the calling showrunner's."""
-    from scripts.production import showrunners
 
     if production:
         row = showrunners.owner_for(production, record)
@@ -1882,6 +1933,8 @@ class CommandLine(argparse.Namespace):
     after: str = ""
     write: bool = False
     hold: list[str] | None = None
+    image: str = ""
+    output: str = ""
 
 
 def _list(options: CommandLine) -> Path:
@@ -1896,6 +1949,14 @@ def _visible(options: CommandLine) -> Visible:
         if not value.strip():
             _ = _words(name, value)
     return Visible(change, options.check.strip(), options.see.strip())
+
+
+def _register_image(image: str) -> str:
+    """Register a file and report store failures as command errors."""
+    try:
+        return image_store.register_change(Path(image).expanduser())
+    except (ValueError, subprocess.SubprocessError) as error:
+        raise ChangeReviewError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -1974,7 +2035,6 @@ def _rank_option(options: CommandLine, destination: Path) -> str:
 
 
 def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
-    from scripts.production import showrunners
 
     documents = list(showrunners.timer_docs().values())
     lists = [Path(options.list).expanduser()] if options.list else sorted(lists_directory().glob(f"{PREFIX}*.md"))
@@ -1983,6 +2043,16 @@ def _backfill_targets(options: CommandLine) -> tuple[list[Path], list[Path]]:
 
 def _run(options: CommandLine) -> int:
     match options.action:
+        case "image":
+            if bool(options.image) == bool(options.output):
+                raise ChangeReviewError("image needs one of --image or --output")
+            try:
+                identity = (image_store.register_change(Path(options.image).expanduser()) if options.image
+                            else image_store.register_output(Path(options.output).expanduser()))
+            except (ValueError, subprocess.SubprocessError) as error:
+                raise ChangeReviewError(str(error)) from error
+            print(identity)
+            print(f"Put `| image {identity}` at the end of the Change-Review line.")
         case "add":
             repo = Path(options.repo).expanduser().resolve()
             merged = options.merged.strip()
@@ -1990,6 +2060,8 @@ def _run(options: CommandLine) -> int:
                 _require_main(repo, merged)
             path = _list(options)
             item, rank = _visible(options), _rank_option(options, path)
+            if options.image:
+                item = replace(item, image=_register_image(options.image))
             record = staff.snapshot()
             stamp = now()
             rows = append_rows(path, [item], stamp.date(), merged, production_doc(options.production), rank,
@@ -1999,8 +2071,11 @@ def _run(options: CommandLine) -> int:
             for line in hold_for_row(path, row, options.hold or []):
                 print(line)
         case "edit":
-            target, item = _row_option(options), _visible(options)
-            print(edit_row(target.path, target.row, item, today(), production_doc(options.production)))
+            target = _row_option(options)
+            edited_item = (KeepRowText() if options.image and not any((options.change, options.check, options.see))
+                           else _visible(options))
+            image = _register_image(options.image) if options.image else ""
+            print(edit_row(target.path, target.row, edited_item, today(), production_doc(options.production), image=image))
         case "show":
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             if options.list and not options.production:
@@ -2069,10 +2144,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
-                                                   "backfill-production"))
+                                                   "backfill-production", "image"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after", "kind"):
+                 "row", "verdict", "production", "urgency", "due", "after", "kind", "image", "output"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")
