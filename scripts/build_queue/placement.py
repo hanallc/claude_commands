@@ -472,7 +472,7 @@ def assigned_claim_id(episode: str, attempt: str) -> str:
 
 def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
-    if reason in ("no_tests", "off", "repo", "linux_only", "local_flag"):
+    if reason in ("no_tests", "off", "repo", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)

@@ -1820,9 +1820,6 @@ finish_hold_wait() {
     phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
-    if [[ -n "$MAC_IDLE_MARKER" && -f "${MAC_IDLE_SCRIPT:-/nonexistent}" ]]; then
-        verify_helper "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
-    fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
         verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
@@ -2126,8 +2123,6 @@ note_event() {
 
 MAC_RUNNER="${VERIFY_MAC_RUNNER:-$HOME/.claude/scripts/mac_test/offload.py}"
 MAC_TEST_SCRIPT="${VERIFY_MAC_TEST_SCRIPT:-$HOME/.claude/scripts/mac_test/mac_test.py}"
-MAC_IDLE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/../buildlog/mac_idle.py"
-MAC_IDLE_MARKER=""
 export BUILDLOG_MAC_IDLE_HOOK=""
 MAC_COPY_WATCH="${VERIFY_MAC_COPY_WATCH:-$(dirname "$MAC_RUNNER")/copy_watch.py}"
 COPY_WATCH_PID=""
@@ -2195,7 +2190,6 @@ try_mac_test() {
     if [[ "$(target_platform "$selected_target")" == macos ]]; then selected_is_mac=1; fi
     if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
     MAC_PASSED=0
-    [[ -z "$MAC_IDLE_MARKER" ]] || rm -f -- "$MAC_IDLE_MARKER"
     local caller_traps
     caller_traps="$(trap -p INT TERM HUP)"
     trap 'forward_mac_runner_signal INT 130' INT
@@ -2640,7 +2634,9 @@ try_reserved_target() {
 }
 
 pinned_target_refuse() {
-    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$1" >&2
+    local reason=$1
+    [[ "$reason" != command ]] || reason="the target cannot run this command"
+    printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
     note_event failed "$SECONDS" 0 "" 0 2
     exit 2
 }
@@ -2662,6 +2658,7 @@ mac_only_refuse() {
         no_tests) text="no test matched on the Mac" ;;
         lost) text="the link to the Mac dropped during the run" ;;
         runner) text="the Mac runner gave no usable result" ;;
+        command) text="the Mac cannot run this command" ;;
         *) text=$reason ;;
     esac
     export BUILDLOG_TARGET=""
@@ -2678,6 +2675,7 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
@@ -2758,7 +2756,13 @@ start_routing_wait() {
 
 wait_for_placement() {
     local wait_kind=resource wait_target=hold
-    [[ -n "$PHASE_RESOURCE_WAIT" || "${PLACEMENT_WAIT_MEMORY:-0}" != 0 ]] || wait_kind=evidence
+    # Only the first empty reply of an episode wakes at the next pass. Later empty
+    # replies wait the interval, so waiters cannot wake each other through state.json.
+    if [[ -z "$PHASE_RESOURCE_WAIT" && "${PLACEMENT_WAIT_MEMORY:-0}" == 0
+            && "${PLACEMENT_EVIDENCE_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
+        wait_kind=evidence
+        PLACEMENT_EVIDENCE_EPISODE=$PLACEMENT_EPISODE
+    fi
     if [[ "${PLACEMENT_WAIT_MEMORY:-0}" == 0 ]]; then start_routing_wait; fi
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment

@@ -312,6 +312,9 @@ A run from the workspace root and a run from a member folder share that record.
 The temporary sweep uses `temporary-sweep.json`.
 A failure tells natedev once per failure episode, and a clean pass ends the episode.
 A workspace pass that finds no output root is skipped, so it keeps the episode open.
+A workspace sweep reads its working folder once, at start, for its output roots and budget.
+A gate can remove that checkout during the sweep, and the sweep continues.
+A sweep that starts in a removed folder prints one skip line and keeps the episode open.
 A clean workspace sweep with no saved record writes no state file.
 Each new `floor_scan` row names its filesystem and probe path.
 CI paths come from `sweep_ci_targets`; missing paths are skipped, and the sweep never takes CI output.

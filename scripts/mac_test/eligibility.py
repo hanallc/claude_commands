@@ -380,6 +380,11 @@ def verb_kind(verb: MacVerb) -> str:
     return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check") else verb
 
 
+def recorded_step_kind(step: str) -> str:
+    """Map a recorded step to its command kind; a recorded mend is the mend-check verb."""
+    return verb_kind(cast(MacVerb, "mend-check" if step == "mend" else step))
+
+
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:

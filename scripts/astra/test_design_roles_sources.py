@@ -17,6 +17,9 @@ class LiveDesignRoleNamesTests(unittest.TestCase):
                 continue
             relative = path.relative_to(root).as_posix()
             text = path.read_text(encoding="utf-8")
+            # Each finding names GUILD_ or guilds: a parse of each other file only costs time.
+            if "GUILD_" not in text and "guilds" not in text:
+                continue
             if path.suffix == ".sh":
                 violations.extend(f"{relative}:{number}: {line.strip()}"
                                   for number, line in enumerate(text.splitlines(), 1)

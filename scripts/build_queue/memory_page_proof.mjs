@@ -51,17 +51,21 @@ try {
   base.walk.find(row => row.queued).progress = {kind:'RowProgress', phase:'testing', done:8, total:10, percent:80, unit:'modules'};
   base.walk.find(row => row.queued).unit = 'fixture-unit';
   base.walk.find(row => row.queued).showrunner = 'fixture-production';
-  const swapOwners = Array.from({length:31}, (_, index) => ({name:'group '+index, detail:'fixture owner',
-    kind:'owner', bytes:(31-index)*1024**3/64, swap:(31-index)/64}));
+  const swapRow = (name, kind, bytes, pool='outside', extra={}) => ({name, detail:'fixture owner', kind, pool,
+    category:'', members:[], owner_count:0, bytes, swap:bytes/1024**3, ...extra});
+  const swapOwners = Array.from({length:31}, (_, index) => swapRow('group '+index, 'owner', (31-index)*1024**3/64,
+    'outside', {owner_count:1}));
   const smaller = swapOwners.slice(base.swap_rows);
   const groupedBytes = smaller.reduce((sum,row)=>sum+row.bytes,0);
-  base.swap_total = 8;
-  base.swap_used = (swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031)/1024**3;
+  const swapUsed = swapOwners.reduce((sum,row)=>sum+row.bytes,0)+1031;
+  base.swap = {used_bytes:swapUsed, capacity_bytes:8*1024**3, builds_ci_bytes:0, outside_bytes:swapUsed,
+    reserve_share_percent:50};
   base.swap_by = [...swapOwners.slice(0,base.swap_rows),
-    {name:smaller.length+' smaller groups',detail:'fixture owners',kind:'smaller',bytes:groupedBytes,swap:groupedBytes/1024**3},
-    {name:'not in a group',detail:'user.slice',kind:'ungrouped',bytes:1024,swap:1024/1024**3},
-    {name:'not attributed',detail:'Host swap minus the named groups.',kind:'unattributed',bytes:7,swap:7/1024**3},
-    {name:'Total',detail:'SwapTotal minus SwapFree',kind:'total',bytes:base.swap_used*1024**3,swap:base.swap_used}];
+    swapRow(smaller.length+' smaller groups', 'smaller', groupedBytes, 'outside',
+      {members:smaller.map(row=>({name:row.name, bytes:row.bytes})), owner_count:smaller.length}),
+    swapRow('Unclassified groups', 'ungrouped', 1024),
+    swapRow('Not attributed', 'unattributed', 7),
+    swapRow('All swap used', 'total', swapUsed, 'all')];
   readings.shrink = structuredClone(base);
   const extra = structuredClone(base.walk.find(row => row.queued));
   extra.name = 'second nextest'; extra.pid = 222;
@@ -258,7 +262,7 @@ try {
               };
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
               const swap = [...document.querySelectorAll('#swaprows .row')];
-              const small = swap.find(row => row.querySelector('small'))?.querySelector('small');
+              const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
               const gauges = ['some','full'].map(key => {
                 const value=document.querySelector('#gv-'+key), limit=document.querySelector('#limit-'+key);
                 return {value:rect(value), limit:rect(limit), text:value.textContent, nowrap:getComputedStyle(value).whiteSpace};
@@ -281,8 +285,7 @@ try {
                     table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
                 }),
                 machine:table.querySelector('td.machine')?.textContent,
-                cap:rect(document.querySelector('#mark')), room:text('#v-room'),
-                capColor:getComputedStyle(document.querySelector('#mark'),'::before').borderLeftColor,
+                capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
                 reportPoints:[...document.querySelectorAll('#history-charts svg circle')].map(point=>({
                   box:rect(point),color:getComputedStyle(point).fill})),
@@ -298,7 +301,7 @@ try {
                 cardColor:color('--card'), reservedColors:[color('--res-a'),color('--res-b')],
                 reservedRatios:['--res-a','--res-b'].map(name=>contrast(color(name),color('--card'))),
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
-                swapBytes:swap.map(e=>Number(e.dataset.bytes)),
+                swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
                 swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
                 swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
                 gauges, lower, values,
@@ -333,13 +336,16 @@ try {
             assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
             assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
             assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
-            assert.equal(proof.swapRows, base.swap_rows + 4);
-            assert.match(proof.swapText[base.swap_rows], /25 smaller groups/);
-            assert.match(proof.swapText[base.swap_rows], /5\.1 GiB/);
-            assert.match(proof.swapText.at(-2), /not attributed7 B/);
-            assert.match(proof.swapText.at(-1), /Total7\.8 GiB/);
+            assert.equal(proof.swapRows, base.swap_rows + 6);
+            assert.match(proof.swapText[0], /Outside builds and CI/);
+            assert.match(proof.swapText[base.swap_rows+1], /25 smaller groups/);
+            assert.match(proof.swapText[base.swap_rows+1], /5\.1 GiB/);
+            assert.match(proof.swapText.at(-3), /Not attributed7 B/);
+            assert.match(proof.swapText.at(-2), /Builds and CI/);
+            assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
-            assert.equal(proof.swapBytes.at(-1),base.swap_used*1024**3);
+            assert.equal(proof.swapBytes.at(-1),base.swap.used_bytes);
+            assert.equal(proof.capText,'Queue cap '+base.cap.toFixed(1)+' GiB');
             assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
             assert.equal(proof.swapBars, 3);
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -378,7 +384,6 @@ try {
               }
               assert.ok(matches,label+' '+JSON.stringify({x,y,actual,expected}));
             };
-            checkPixel(proof.cap.left+7,proof.cap.top+5,proof.capColor,'The cap pixels differ.');
             checkPixel(proof.roomBar.left+5,(proof.roomBar.top+proof.roomBar.bottom)/2,proof.roomColor,'The room pixels differ.');
             assert.ok(proof.reportPoints.length>0,'The report has no measured points.');
             const point=proof.reportPoints.at(-1);
@@ -724,9 +729,9 @@ try {
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
-                cap:document.querySelector('#mark').hidden, text:document.body.textContent,
+                cap:document.querySelector('#cap-value').textContent, text:document.body.textContent,
                 room:document.querySelector('#v-room').textContent})`);
-              assert.ok(state.cap, 'The missing cap has a marker.');
+              assert.equal(state.cap, 'Queue cap unavailable', 'The missing cap has a value.');
               assert.ok(state.rows > 0);
               assert.equal(state.room, proof.room);
               assert.match(state.text, /unavailable/);
@@ -772,7 +777,9 @@ try {
             stale:document.querySelector('#dot').classList.contains('stale'),
             unavailable:document.body.classList.contains('queue-unavailable'),
             screen:document.querySelector('#queue-error').textContent,
-            cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join(''),
+            cards:[...document.querySelectorAll('.card')].map(card=>card.innerHTML).join('')
+              .replace(/<div class="last-reading"[^>]*>[^<]*<.div>/,'').replace(/--divider-top: [^;]*;/g,''),
+            lastReading:document.querySelector('#last-reading').hidden?'':document.querySelector('#last-reading').textContent,
             rows:document.querySelectorAll('.wrow').length,
             pill:document.querySelector('#pill-t').textContent,
             pillClass:document.querySelector('#pill').className,
@@ -805,6 +812,8 @@ try {
         const states=Object.fromEntries(failures.map(state=>[state.name,state]));
         assert.ok(states.initial.unavailable);
         assert.equal(states.initial.screen,'The queue did not answer');
+        assert.match(states.retained.lastReading,/^Last reading: /);
+        assert.equal(states.good.lastReading,'');
         for(const name of ['one_failure','stale','retained']) {
           assert.equal(states[name].cards,states.good.cards, name+' changes the good reading.');
           assert.equal(states[name].rows,states.good.rows);
@@ -1288,7 +1297,7 @@ try {
         if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
-          review.head_text = 'Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots';
+          review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
           const local = review.walk.find(row => row.queued);
           local.machine = 'natedev';
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));

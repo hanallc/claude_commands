@@ -878,6 +878,13 @@ class DeferredOwnerRequest:
     arrived_monotonic: float
 
 
+@dataclass(frozen=True)
+class ParkedPlacement:
+    """A placement request whose reply waits for the next pass."""
+    request: wire.PlacementRequest
+    connection: Connection
+
+
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest
 
 
@@ -930,6 +937,15 @@ def _no_fault(_stage: str) -> None:
 
 def _place_key(owner: wire.Owner, since: float) -> str:
     return f"{records.run_owner(owner.pid, owner.start_time)}:{since:.17g}"
+
+
+def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
+    """A new estimate for the same episode keeps its connection, so the waiter keeps its place."""
+    same_kind = ((isinstance(first, wire.AdmitRequest) and isinstance(request, wire.AdmitRequest))
+                 or (isinstance(first, wire.LaunchRequest) and isinstance(request, wire.LaunchRequest)))
+    return (same_kind and isinstance(first, (wire.AdmitRequest, wire.LaunchRequest))
+            and isinstance(request, (wire.AdmitRequest, wire.LaunchRequest))
+            and (request.episode, request.owner, request.since) == (first.episode, first.owner, first.since))
 
 
 def _notify(message: str) -> None:
@@ -989,6 +1005,15 @@ class StateIntents:
 @dataclass(frozen=True)
 class ServiceEstimatedAdmission(wire.AdmitRequest):
     """Retain service estimation for this connection without changing saved records."""
+
+
+def wait_line_name(waiting: WaitingAdmission) -> str:
+    """Name a queued build from its recorded owner and step."""
+    row = waiting.row
+    identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
+    name = (f"hana CI · {identity.get('unit', '')}" if isinstance(waiting.request, ServiceEstimatedAdmission)
+            else gate.waiter_unit_name(identity, row["pid"]))
+    return f"{name} · {identity['step']}" if identity["step"] else name
 
 
 def peer_uid(connection: Connection | NoConnection) -> int:
@@ -1078,6 +1103,8 @@ class AdmissionServer:
         self.system_evidence: SystemEvidence | NoPass = NoPass()
         self.reader_requested: bool = False
         self.deferred_requests: list[DeferredOwnerRequest] = []
+        self.parked_placements: list[ParkedPlacement] = []
+        self.last_pass_started: float = float("-inf")
         self.override_reconnect_until: ReconnectDeadline | ReconnectAwaitingListener | NoReconnectGrace = NoReconnectGrace()
         self.receiving_requests: bool = False
         self.connections: dict[int, Connection] = {}
@@ -1757,16 +1784,46 @@ class AdmissionServer:
         except (OSError, ValueError, RuntimeError) as error:
             print(f"memory admission: cannot start reading alert: {error}", file=sys.stderr)
 
+    def _pass_allowed_at(self) -> float:
+        """Passes start at least min_pass_gap_seconds apart, so a burst of requests shares one pass."""
+        config = self.last_usable_configuration
+        gap = config.min_pass_gap_seconds if isinstance(config, records.MemoryConfig) else 0
+        return self.last_pass_started + gap
+
+    def _pass_gap_open(self) -> bool:
+        return self.clock.monotonic() >= self._pass_allowed_at()
+
+    def _pass_when_open(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
+                        ) -> bool:
+        """Run a pass now when the gap allows it. Otherwise keep the configuration and mark a pass due."""
+        if self._pass_gap_open():
+            _ = self._run_pass(configuration)
+            return True
+        if isinstance(self.pending_configuration, NoPass):
+            self.pending_configuration = configuration
+        self.next_pass = min(self.next_pass, self.clock.monotonic())
+        return False
+
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         from scripts.build_targets import target_config
 
         # One pass reads the target list once; each placement check in the pass uses that read.
         with target_config.command_configuration():
-            return self._pass(configuration)
+            result = self._pass(configuration)
+        self._answer_parked_placements()
+        return result
+
+    def _answer_parked_placements(self) -> None:
+        parked, self.parked_placements = self.parked_placements, []
+        for item in parked:
+            if not item.connection.finished and item.connection.socket.fileno() >= 0:
+                self._send(item.connection, self._placement_reply(item.request,
+                    self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
+        self.last_pass_started = self.clock.monotonic()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -1814,6 +1871,10 @@ class AdmissionServer:
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
         cloud_started = self._cloud_pass(inputs, self.configuration)
         by_owner = {records.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()}
+        head = result.policy.queued_head
+        head_label = (wait_line_name(self.waiters[by_owner[records.waiter_owner(head.waiter)]])
+                      if isinstance(head, gate.QueuedHead) else "")
+        head_need = head.waiter["need"] if isinstance(head, gate.QueuedHead) else 0
         starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                         key=lambda row: cast(gate.ProposedAdmission, row.admission).rank)
         if not starts:
@@ -1838,11 +1899,11 @@ class AdmissionServer:
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
-                head = inputs.ordered[0][1].get("session_name", "") if inputs.ordered else ""
                 waiting = self.waiters[episode]
                 reason = decision.reason
-                reply = wire.Wait(reason, position, head, reason_phrase(reason, waiting_steps),
-                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder))
+                reply = wire.Wait(reason, position, head_label, reason_phrase(reason, waiting_steps),
+                    self._wait_snapshot(waiting, decision.decision, inputs, config, reason, decision.holder,
+                                        head_label, head_need))
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -1851,7 +1912,7 @@ class AdmissionServer:
             reason = records.ReadingUnavailable(text)
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
             reply = wire.Wait(reason, position, "", text,
-                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder()))
+                self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
@@ -2042,10 +2103,8 @@ class AdmissionServer:
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: records.AdmissionDecision,
                        inputs: records.QueueInputs, config: records.MemoryConfig,
-                       reason: records.WaitReason, holder: WaitHolder) -> AdmissionWaitSnapshot:
-        head = gate.first_queued_waiter(row for _, row in inputs.ordered)
-        head_need = head.waiter["need"] if isinstance(head, gate.QueuedWaiter) else 0
-        head_label = head.waiter.get("session_name", "") if isinstance(head, gate.QueuedWaiter) else ""
+                       reason: records.WaitReason, holder: WaitHolder, head_label: str,
+                       head_need: int) -> AdmissionWaitSnapshot:
         return AdmissionWaitSnapshot(decision, waiting.request.profile.peak, inputs.running,
             inputs.host.available if isinstance(inputs.host, records.HostMemory) else 0,
             waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics,
@@ -2274,7 +2333,7 @@ class AdmissionServer:
         """Read local hold policy or remote provider claims."""
         from scripts.build_targets import build_targets, target_config
         from scripts.mac_test import claim_state, mac_test
-        from scripts.mac_test.eligibility import MacVerb, verb_kind
+        from scripts.mac_test.eligibility import recorded_step_kind
         from scripts.build_hold import build_hold
 
         destination = key.destination
@@ -2304,9 +2363,10 @@ class AdmissionServer:
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
         if isinstance(target, target_config.SshTarget) and isinstance(key.settings, placement.ExplicitProviderSettings):
             target = replace(target, settings=key.settings.path)
-        kind = verb_kind(cast(MacVerb, request.profile.step))
+        kind = recorded_step_kind(request.profile.step)
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
-            return placement.HostEvidenceUnavailable(key, self.clock.now(), "command policy is unavailable")
+            # The target can never run this command, so a pinned step refuses at once.
+            return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
         if isinstance(target, target_config.SshTarget):
             answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                 request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
@@ -2951,7 +3011,8 @@ done
                 placement.retry_decision(saved.assignment.destination, outcome.reason, report.received_at))
 
     def _handle_placement(self, request: wire.PlacementRequest | wire.ConsumePermission | wire.ClaimFailure | wire.ExecutionReport
-                          | wire.PrerequisiteReport | wire.CancelPlacement) -> list[wire.Reply]:
+                          | wire.PrerequisiteReport | wire.CancelPlacement,
+                          connection: Connection | NoConnection = NO_CONNECTION) -> list[wire.Reply]:
         if isinstance(request, wire.ConsumePermission):
             return [self._consume_permission(request)]
         if isinstance(request, (wire.PrerequisiteReport, wire.CancelPlacement)):
@@ -3003,6 +3064,10 @@ done
                 self.prerequisites[request.episode] = request.prerequisite
             self._watch_owner(request.owner)
             self.persist()
+            if isinstance(connection, Connection) and not self._pass_gap_open():
+                self.parked_placements.append(ParkedPlacement(request, connection))
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                return []
             _ = self.run_pass()
             return [self._placement_reply(request,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
@@ -3144,7 +3209,7 @@ done
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
-            replies = self._handle_placement(request)
+            replies = self._handle_placement(request, connection)
             if (isinstance(request, wire.ConsumePermission) and isinstance(connection, Connection)
                     and not any(isinstance(reply, wire.FirstAuthorization) for reply in replies)):
                 self.persist()
@@ -3246,9 +3311,15 @@ done
                 self.pass_stale = True
             self.next_pass = self.clock.monotonic()
             return [self.ledger[key].reply]
-        _ = self._run_pass(configuration)
+        if isinstance(connection, Connection):
+            # The pass delivers admission replies on the connection, now or at the next pass.
+            ran = self._pass_when_open(configuration)
+        else:
+            _ = self._run_pass(configuration)
+            ran = True
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest)):
-            return self._pending_replies.pop(key, [])
+            replies = self._pending_replies.pop(key, [])
+            return replies if ran else []
         return [self.ledger[key].reply]
 
     def _submit_queue_change(self, request: QueueChange,
@@ -3439,6 +3510,7 @@ done
     def _drop_deferred_requests(self, connection: Connection) -> None:
         self.deferred_requests = [pending for pending in self.deferred_requests
                                   if pending.connection is not connection]
+        self.parked_placements = [item for item in self.parked_placements if item.connection is not connection]
 
     def _disconnect(self, connection: Connection) -> None:
         self._drop_deferred_requests(connection)
@@ -3449,7 +3521,7 @@ done
         del self.connections[descriptor]
         connection.socket.close()
         if self._detach_admission(connection):
-            _ = self.run_pass()
+            _ = self._pass_when_open(self._take_configuration())
 
     def _detach_admission(self, connection: Connection) -> bool:
         """End this connection's eligibility before a later pass can grant it."""
@@ -3515,7 +3587,7 @@ done
                 if len(line) + 1 > (wire.CLEANUP_REQUEST_MAX_BYTES if cleanup else request_limit):
                     raise ValueError(reason)
                 if not isinstance(request, wire.BuildHistoryRequest):
-                    if not isinstance(connection.request, NoRequest):
+                    if not (isinstance(connection.request, NoRequest) or _refreshes(connection.request, request)):
                         raise ValueError("one request for admission per connection")
                     connection.request = request
                 connection.received = b""
@@ -3657,7 +3729,8 @@ done
     def run_once(self, timeout: float = 0) -> None:
         self.start()
         now = self.clock.monotonic()
-        delay = min(timeout, max(0, min(self.next_pass, self.next_source_check, self.next_config_watch_retry) - now))
+        due = max(self.next_pass, self._pass_allowed_at())
+        delay = min(timeout, max(0, min(due, self.next_source_check, self.next_config_watch_retry) - now))
         ready = self.epoll.poll(-1 if delay == float("inf") else delay)
         if any(descriptor == self.priority_events for descriptor, _events in ready):
             _ = os.eventfd_read(self.priority_events)
@@ -3715,7 +3788,7 @@ done
                 self._prune_watches()
                 self.next_pass = self.clock.monotonic()
         self._finish_priority_roster()
-        if self.clock.monotonic() >= self.next_pass:
+        if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
@@ -3775,6 +3848,7 @@ done
             connection.socket.close()
         self.connections.clear()
         self.deferred_requests.clear()
+        self.parked_placements.clear()
         for descriptor in self.watchers:
             os.close(descriptor)
         self.watchers.clear()
@@ -3816,6 +3890,20 @@ def read_state(directory: Path) -> ServiceState:
 
     check_placement_shape(cast(object, json.loads(text)))
     return wire.parse_record(text, ServiceState)
+
+
+def state_check(directory: Path) -> int:
+    """Read stored state as serve does, without changing it."""
+    if not (directory / "state.json").exists():
+        print("state-check: no state.json")
+        return 0
+    try:
+        _ = read_state(directory)
+    except ValueError as error:
+        print(f"state-check: {error}", file=sys.stderr)
+        return 2
+    print("state-check: state.json reads")
+    return 0
 
 
 def _older_caller(pid: int, args: list[str], proc: Proc, scripts: dict[str, bytes],
@@ -3934,7 +4022,7 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority"))
+    _ = parser.add_argument("command", choices=("serve", "drain-check", "export-priority", "state-check"))
     default_state_dir = store.root() / "admission"
     _ = parser.add_argument("--state-dir", type=Path, default=default_state_dir)
     _ = parser.add_argument("--service", action="store_true")
@@ -3947,6 +4035,8 @@ def main() -> int:
     if args.command == "drain-check":
         return drain_check(args.state_dir, service=args.service,
                            include_gate_callers=args.state_dir == default_state_dir, proc=SystemProc())
+    if args.command == "state-check":
+        return state_check(args.state_dir)
     if args.command == "export-priority":
         export_priority(args.state_dir)
         return 0

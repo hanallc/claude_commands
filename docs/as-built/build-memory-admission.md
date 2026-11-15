@@ -914,6 +914,8 @@ The builds showrunner owns cut-over. Workers do not change live units or admissi
 `drain-check` counts live imported waiters, reservations, and processes that retain old admission functions.
 `drain-check --service` counts live service waiters, reservations, and clients through the same process list.
 Both commands only read state. A nonempty count refuses the drain.
+`state-check` reads `state.json` with the same strict reader as `serve`, from the same directory: `--state-dir`, which defaults to the live admission directory `serve` uses. It exits 0 when the file reads or is absent, and 2 with the error otherwise.
+Promotion runs it from the target tree, so code that cannot read the live state does not reach main.
 
 1. Hold natedev before rollback.
 2. Require quiet builds and `drain-check --service` reporting `drained`.
