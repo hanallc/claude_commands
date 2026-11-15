@@ -96,7 +96,8 @@ Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
-Every page uses `page_frame.STYLE`: the content column starts 32px from the top and left edges of the frame, and the title uses bold 26px text.
+Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
 AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
