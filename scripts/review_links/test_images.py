@@ -139,7 +139,7 @@ class ImagesTests(ImagesFixture):
         token = images.request_token("token", record["id"])
         self.assertEqual(card, (
             f'<article id="image-{record['id']}" data-image="{record['id']}" data-registered="1794712140"'
-            + f' data-owner="{record['owner']}">'
+            + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'

@@ -277,9 +277,11 @@ The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
 
 A group is a run of shown cards in a row with the same owner.
-A panel at the top left of the images pane lists one row per group, in three columns: owner, count and the time of its first image.
+A panel at the top left of the images pane lists one row per group, in three columns: owner name, count and the time of its first image.
+The owner name has no kind, such as `(unit)`.
+The panel has a rounded outline and thin lines between its rows and columns.
 The panel stays in place while the cards scroll.
-Each row links to the first image of its group.
+Each row shows a hover color, and a click on a row goes to the first image of its group.
 On a narrow screen the panel goes above the cards and scrolls with them.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
