@@ -105,35 +105,48 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 
 
 GPU_SLOT_SUFFIX = "_gpu_slot"
+NATEDEV_HOLD_SUFFIX = "_natedev_hold"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX)
 
 
 @lru_cache(maxsize=None)
 def wait_reason_fields(schema: type) -> frozenset[str]:
-    """Name the fields that accept a wait behind the head, so an older client reads a GPU slot wait there."""
+    """Name the fields that accept a wait behind the head, so an older client reads a newer wait there."""
     return frozenset(name for name, hint in snapshot_fields(schema).items()
                      if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
 
 
 def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
-    """Older clients at 7fdfd9a6a have no GPU slot wait, so they read it as a wait behind the slot."""
+    """Write each newer wait as a wait behind the head, with the newer wait beside it.
+
+    Clients at 7fdfd9a6a have no GPU slot wait. The CI client pinned at bbc8803f4 has no natedev hold wait,
+    and it refuses its step on a wait that it cannot read.
+    """
     shaped = dict(record)
     for key in wait_reason_fields(schema):
         item = record.get(key)
-        if isinstance(item, dict) and cast(dict[str, object], item).get("kind") == "GpuSlotWait":
-            wait = cast(dict[str, object], item)
-            shaped[key] = {"kind": "BehindHead", "head_name": f"the GPU test slot ({wait['used']} of {wait['slots']} in use)",
-                           "joined_at": 0.0, "head_session_id": ""}
-            shaped[key + GPU_SLOT_SUFFIX] = wait
+        if not isinstance(item, dict):
+            continue
+        wait = cast(dict[str, object], item)
+        if wait.get("kind") == "GpuSlotWait":
+            head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "NatedevHeld":
+            head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        else:
+            continue
+        shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
+        shaped[key + suffix] = wait
     return shaped
 
 
 def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
-    """Restore each GPU slot wait that the writer kept beside its older shape."""
+    """Restore each newer wait that the writer kept beside its older shape."""
     shaped = dict(record)
     for key, item in record.items():
-        if key.endswith(GPU_SLOT_SUFFIX) and key.removesuffix(GPU_SLOT_SUFFIX) in record:
-            shaped[key.removesuffix(GPU_SLOT_SUFFIX)] = item
-            del shaped[key]
+        for suffix in LEGACY_WAIT_SUFFIXES:
+            if key.endswith(suffix) and key.removesuffix(suffix) in record:
+                shaped[key.removesuffix(suffix)] = item
+                del shaped[key]
     return shaped
 
 

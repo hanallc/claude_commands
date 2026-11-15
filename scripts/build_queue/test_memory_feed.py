@@ -169,7 +169,11 @@ class MemoryFeedTests(unittest.TestCase):
                     memory_feed.notify_unplaced_mac_runs(reading, notified)
                     self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
-                    self.assertIn(label, row["name"])
+                    if label.startswith("placement "):
+                        self.assertNotIn("placement", row["name"])
+                        self.assertEqual(cast(memory_feed.MacBuildRow, row)["gate_label"], label)
+                    else:
+                        self.assertIn(label, row["name"])
                     if label == "unplaced":
                         self.assertIn("pid 710001", str(send.call_args))
                         self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])
@@ -1625,16 +1629,17 @@ process.stdout.write(JSON.stringify({
             (3 * gib, (3 * gib, 0, 0), (gib, 2 * gib, 6 * gib), 0, 9 * gib),
         ):
             with self.subTest(available=available):
-                blocks = memory_feed.ram_blocks(self.fixture_room(available), tools, gib, 100.0, 1)
+                blocks = memory_feed.ram_blocks(self.fixture_room(available), tools, 100.0, 1)
                 self.assertEqual((blocks["safety_covered_bytes"], blocks["swap_covered_bytes"],
                                   blocks["build_covered_bytes"]), covered)
                 self.assertEqual((blocks["safety_missing_bytes"], blocks["swap_missing_bytes"],
                                   blocks["build_missing_bytes"]), missing)
                 self.assertEqual((blocks["room_bytes"], blocks["shortfall_bytes"]), (room, shortfall))
                 self.assertEqual(sum(missing), shortfall)
-                self.assertEqual((blocks["queued_builds_bytes"], blocks["build_tools_bytes"]), (gib, 5 * gib))
-                self.assertEqual(blocks["ci_bytes"], gib)
-                self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + gib + covered[2] + room)
+                self.assertEqual(blocks["build_tools_bytes"], 5 * gib)
+                self.assertEqual(blocks["queued_builds_bytes"], gib)
+                self.assertEqual(blocks["ci_bytes"], 2 * gib)
+                self.assertEqual(blocks["cap_bytes"], gib + 5 * gib + 2 * gib + covered[2] + room)
                 self.assertEqual((blocks["agents_bytes"], blocks["desktop_bytes"]), (5 * gib, gib * 3 // 2))
                 self.assertEqual(blocks["desktop_protection_bytes"], 2 * gib)
                 self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
@@ -1644,7 +1649,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
                                   blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
                                  (3 * gib, 2 * gib, gib, gib))
-                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"] + gib
+                shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"] + blocks["ci_bytes"]
                          + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
                          + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
@@ -1671,26 +1676,16 @@ process.stdout.write(JSON.stringify({
     def test_ram_blocks_name_a_missing_reading_and_a_disagreement(self) -> None:
         gib = admission_records.GIB
         self.ram_fixture(meminfo=False)
-        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 0, 100.0, 6)
+        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)
         self.assertIsInstance(blocks["kernel_bytes"], admission_records.ReadingUnavailable)
         self.assertIsInstance(blocks["cache_bytes"], admission_records.ReadingUnavailable)
         self.assertEqual([line.split(":")[0] for line in blocks["missing"]], ["Kernel, measured", "File and kernel cache"])
         small = replace(self.fixture_room(20 * gib), total=30 * gib)
         self.ram_fixture()
-        self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 0, 100.0, 6)["agreement"], "disagree")
-        unread = admission_records.ReadingUnavailable("hana CI stat unreadable")
-        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), unread, 100.0, 6)
-        self.assertEqual(blocks["missing"], ["hana CI: hana CI stat unreadable"])
-        self.assertEqual(blocks["ci_bytes"], unread)
-        self.assertEqual(blocks["cap_bytes"], blocks["queued_builds_bytes"] + blocks["build_covered_bytes"] + blocks["room_bytes"])
+        self.assertEqual(memory_feed.ram_blocks(small, memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)["agreement"], "disagree")
 
-    def test_the_ci_block_counts_swap_backed_use_and_leaves_the_file_cache_to_the_cache_block(self) -> None:
+    def test_the_cap_and_ci_block_count_ci_swap_backed_use_and_leave_the_file_cache_to_the_cache_block(self) -> None:
         gib = admission_records.GIB
-
-        def running(*memories: admission_records.UnownedSliceMemory) -> tuple[admission_records.ExplainedRunningStep, ...]:
-            return tuple(admission_records.ExplainedRunningStep(admission_records.RunningStep(
-                "ci", "ci", "service", "/ci", 0, memory, pid=admission_records.PidNotRecorded()),
-                admission_records.AdmissionTimeNotRecorded(), 0, 0, 0) for memory in memories)
 
         def unowned(working_set: int, anonymous: admission_records.AnonymousRunUse | admission_records.RunUseUnavailable,
                     job_state: IdleService | NotServiceSlice, diagnostic: str = "") -> admission_records.UnownedSliceMemory:
@@ -1701,9 +1696,10 @@ process.stdout.write(JSON.stringify({
         ci = unowned(3 * gib, admission_records.AnonymousRunUse(gib // 4), IdleService())
         build_scope = unowned(2 * gib, admission_records.AnonymousRunUse(gib), NotServiceSlice())
         absent = unowned(0, admission_records.RunUseUnavailable("not read"), IdleService(), diagnostic="CI slice absent")
-        self.assertEqual(memory_feed.ci_program_ram(running(ci, build_scope, absent)), gib // 4)
+        self.assertEqual(gate.ci_cap_use((ci, build_scope, absent)), gib // 4)
+        # A reading without its swap-backed use counts its working set.
         unread = unowned(3 * gib, admission_records.RunUseUnavailable("stat unreadable"), IdleService())
-        self.assertEqual(memory_feed.ci_program_ram(running(ci, unread)), admission_records.ReadingUnavailable("stat unreadable"))
+        self.assertEqual(gate.ci_cap_use((ci, unread)), gib // 4 + 3 * gib)
 
     def test_the_memory_status_names_the_one_reason_a_start_waits(self) -> None:
         gib = admission_records.GIB
