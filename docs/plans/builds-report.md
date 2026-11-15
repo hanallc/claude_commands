@@ -1580,3 +1580,15 @@ From the user (via builds, 2026-11-15): "we should white box outline both the lo
 - A column with only two values in view has no box, because the colors already show which is which.
 - From the user (via builds, 2026-11-15): "the filter on the aws page - we need a None at the end that turns all fiters off so i can quickly just select one or two i want to look at". From builds (not the user): add it to this phase. The region filter has a `None` chip after the last region. It clears every region, and each card then says "No region chosen." A region chip can now turn off the last chosen region. The view and run kind switches choose one value each, so they have no `None`.
 - Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, phone width, and the region filter with All, None, None then one region, and None then two regions).
+
+### Phase 88 — The AWS prices page fills the window and outlines the lowest and highest of each table · status: done
+
+From the user (via builds, 2026-11-15): "the filter for regions shouldn't take 3 rows - it should be either smaller fonts or we should make the content section wider to fit - probably the latter is fine - i don't mind dense information". Also: "on the cost lowest and highest- it looks as if you did a per instance type - which is fine - but we should have a different outline for overall lowest and overall highest as well". From builds (not the user): fill the window width, tighten the chips so 21 fit one row at 1920 px with the same font, and give the overall lowest and highest of each table a stronger outline, with one legend line under each table.
+
+#### As-built
+
+- `aws_prices.html`: `main` has no maximum width. The region chips have 6 px padding and a 4 px gap, and the label gap is 8 px. The 21 chips need about 1857 px, so they fit one row at 1920 px; at 1400 px they take two rows.
+- `scaleCells` returns `extremes`, the lowest and the highest cells of each table with two or more different values. An `extreme` cell has only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes; gold differs from white and from the green and red scale. It replaces the bold `best` mark. The per-type box is now 1 px white inside the 1 px dark edge. From builds (not the user): the sizes and the one outline color.
+- Each price card with a box has a legend line under its table: "Lowest and highest of each type" and "Lowest and highest of the table". The legend line above the cards explains only the colors.
+- The price cells have 10 px padding at the right, so a number does not touch an outline.
+- Proof: `phases/88/proof/after-*` (1920 px Spot and cost, dark and light, two full pages, 1400 px Spot, and phone width). The before shots are the phase 87 after shots.
