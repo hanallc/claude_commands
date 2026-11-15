@@ -350,12 +350,11 @@ This applies when a phase is parked, a round fails, a newer tree replaces the
 run's tree, or a result already in hand answers the question. No run finishes
 only to complete a report.
 
-- For a `detached_runs.py` run, read `pid` from its record in
-  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). Signal only while
-  its `status` is `running` and `ps -p <pid> -o args=` shows
-  `detached_runs.py supervise` with that record's path, so a reused pid is never
-  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
-  prints no pid: read it from that run's record.
+- For a `detached_runs.py` run, run
+  `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>` with its record in
+  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). It checks the
+  supervisor and the command identity, so a reused pid is never hit, and stops
+  the command's process group. The supervisor delivers the stopped result.
 - A detached `verify.sh` run uses the same record and command: `verify.sh`
   detaches through `detached_runs.py` and handles TERM to stop its step.
 - For a run in the memory queue, cancel its owning run as above. The queue

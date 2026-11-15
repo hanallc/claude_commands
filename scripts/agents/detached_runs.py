@@ -5,7 +5,8 @@ Start writes a run record and returns after it starts the supervisor.
 The supervisor runs the command and delivers its result to the current worker.
 A unit director that names its run folder owns its run; its result goes through send.py.
 Reap finishes records whose supervisor disappeared and delivers their results.
-Stop a run through its supervisor's process group, including scoped commands.
+The command runs in its own session; the record names its process group.
+`stop` signals that group, and the supervisor records the exit status and delivers the result.
 Exit 3 means that the caller is neither a registered worker nor a director with a run folder.
 """
 
@@ -37,7 +38,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
-from scripts.lib import conf, process_start, unit_runs
+from scripts.lib import conf, process_group, process_start, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
@@ -84,6 +85,8 @@ class RunRecord(TypedDict):
     pid: int
     supervisor_started: NotRequired[str]
     command_pid: NotRequired[int]
+    # The command leads its own session, so this group is the command's process group.
+    command_group: NotRequired[int]
     command_started: NotRequired[str]
     director_dir: str
     done_message_file: str
@@ -214,6 +217,45 @@ def stop_with_reason(
                 write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
+@dataclass(frozen=True)
+class CommandGroup:
+    """The recorded process group of a running command and the start identity of its leader."""
+    group: int
+    started: str
+
+
+def command_group(path: Path) -> CommandGroup | None:
+    """Read the command group of a running record, or None before the supervisor publishes it."""
+    record = worker_lifecycle.read_json_object(path)
+    group, started = record.get("command_group"), record.get("command_started")
+    if (record.get("status") == "running" and isinstance(group, int) and group > 0
+            and isinstance(started, str) and started):
+        return CommandGroup(group, started)
+    return None
+
+
+def stop_command(path: Path, reason: str) -> bool:
+    """Save the reason and TERM the command group while the supervisor and command leader are current."""
+    record = worker_lifecycle.read_json_object(path)
+    supervisor = _integer(record.get("pid"))
+
+    def still_current() -> bool:
+        command = command_group(path)
+        return (command is not None and detached_run_process.supervises(supervisor, path)
+                and process_start.process_start(command.group) == process_start.Started(command.started))
+
+    def signal_run() -> None:
+        command = command_group(path)
+        if command is None:
+            raise ProcessLookupError(f"{path.name}: no running command group")
+        process_group.send_process_group(command.group, signal.SIGTERM)
+
+    try:
+        return stop_with_reason(path, reason, still_current=still_current, signal_run=signal_run)
+    except ProcessLookupError:
+        return False
+
+
 def seat_name(session_dir: str, name: str) -> str:
     """Resolve the current staff worker through its active recorder slot."""
     run = Path(session_dir)
@@ -278,6 +320,10 @@ def _orphaned(path: Path, raw: dict[str, object], now: float) -> bool:
         command = _saved_process(raw.get("command_pid"), raw.get("command_started"))
         if isinstance(command, (process_start.Started, process_start.Unreadable)):
             return False
+        group = _integer(raw.get("command_group"))
+        if group > 0:
+            # POSIX reuses no PID while a process group of that ID has members, so live members are this command's.
+            return not _group_is_live(group)
         supervisor = _saved_process(pid, raw.get("supervisor_started"))
         owns_group = isinstance(supervisor, (process_start.Started, process_start.Zombie))
         if not owns_group and isinstance(command, process_start.Zombie):
@@ -651,12 +697,13 @@ def _exit_words(result: CommandResult) -> str:
 
 def result_text(record: RunRecord, result: CommandResult) -> str:
     exit_code = result.code if isinstance(result, CompletedCommand) else result
+    stop_reason = record.get("stop_reason", "")
     verdict = (ORPHAN_VERDICT if isinstance(exit_code, SupervisorLost) else "PASS (exit 0)" if exit_code == 0
                else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
-               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
+               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS
+               else f"STOPPED (exit {exit_code})" if stop_reason else f"FAIL (exit {exit_code})")
     heading = "Run ended with no result" if isinstance(exit_code, SupervisorLost) else "Run finished"
     lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
-    stop_reason = record.get("stop_reason", "")
     if stop_reason:
         lines.append(f"Stop reason: {stop_reason}")
     cancellation = ""
@@ -781,13 +828,16 @@ def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
-    """Publish the child identity before the command runs in the supervisor's group."""
+    """Publish the command identity and group, then run the command in its own session.
+
+    A stop signals the command group only, so the supervisor stays alive to record and deliver.
+    """
     # The shell keeps its PID across exec and waits for identity publication.
     gate = 'read -r ready || exit 125; exec 0</dev/null; exec "$@"'
     try:
         with log.open("ab") as output:
             child = subprocess.Popen(["/bin/sh", "-c", gate, "detached-command", *command],
-                                     env=environment, process_group=os.getpgrp(),
+                                     env=environment, start_new_session=True,
                                      stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT)
     except OSError as exc:
         with log.open("a", encoding="utf-8") as output:
@@ -795,7 +845,8 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
         return 127
 
     assert child.stdin is not None
-    with child.stdin:
+    # A group stop can end the gate shell before it reads its start line.
+    with contextlib.suppress(BrokenPipeError), child.stdin:
         started = process_start.process_start(child.pid)
         if not isinstance(started, process_start.Started):
             with log.open("a", encoding="utf-8") as output:
@@ -804,7 +855,8 @@ def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
             path = Path(environment["UNIT_DETACHED_RECORD"])
             with record_lock(path):
                 record = _read_record(path)
-                record.update(command_pid=child.pid, command_started=started.start)
+                record.update(command_pid=child.pid, command_group=os.getpgid(child.pid),
+                              command_started=started.start)
                 supervisor = process_start.process_start(os.getpid())
                 if isinstance(supervisor, process_start.Started):
                     record["supervisor_started"] = supervisor.start
@@ -876,6 +928,15 @@ def command_record_exit(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_stop(args: argparse.Namespace) -> int:
+    path = Path(str(getattr(args, "record", ""))).resolve()
+    if stop_command(path, str(getattr(args, "reason", ""))):
+        print(f"stopped {path.stem}: its result comes from the supervisor")
+        return 0
+    print(f"{path.stem} is not running or its process identity changed; nothing stopped", file=sys.stderr)
+    return 1
+
+
 def command_reap(args: argparse.Namespace) -> int:
     for run_id in reap_orphans(str(getattr(args, "session_dir", "")), str(getattr(args, "worker", "") or "")):
         print(f"run {run_id} ended: its supervisor is gone")
@@ -904,6 +965,10 @@ def main(argv: list[str] | None = None) -> int:
     delivery = verbs.add_parser("deliver", help="deliver one recorded result from the current code tree")
     _ = delivery.add_argument("record")
     delivery.set_defaults(handler=command_deliver)
+    stop = verbs.add_parser("stop", help="stop a running command; its supervisor delivers the stopped result")
+    _ = stop.add_argument("--reason", required=True, help="the Stop reason line of the result")
+    _ = stop.add_argument("record")
+    stop.set_defaults(handler=command_stop)
     reap = verbs.add_parser("reap", help="end the running records whose supervisor is gone")
     _ = reap.add_argument("--session-dir", required=True)
     _ = reap.add_argument("--worker", default="")

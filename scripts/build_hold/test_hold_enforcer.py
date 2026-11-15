@@ -543,9 +543,11 @@ class HoldEnforcerTests(unittest.TestCase):
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
-        for outcome in ("record failure", "identity change", "stopped"):
+        for outcome in ("record failure", "identity change", "no command group", "stopped"):
             with self.subTest(outcome=outcome):
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                # The command leads its own group; a record without one has not started its command.
+                command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
                 _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
                 table = self.table()
                 classified = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
@@ -592,10 +594,10 @@ class HoldEnforcerTests(unittest.TestCase):
                             signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
                             supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
                         )
-                        expected = hold_enforcer.RunIdentityChanged if outcome == "identity change" else hold_enforcer.StoppedRun
+                        expected = hold_enforcer.StoppedRun if outcome == "stopped" else hold_enforcer.RunIdentityChanged
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
-                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -640,7 +642,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running",
+                                                  "command_group": 10, "command_started": "11000"}))
                 signals: list[tuple[int, int]] = []
                 inspected: list[int] = []
 
@@ -666,7 +669,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIn(100, inspected)
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
-                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])
