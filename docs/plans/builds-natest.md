@@ -4078,19 +4078,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `lib/test_process_group_sources` finds the same group signals with less CPU.
-
-**Spec:**
 - `unguarded_group_signals` in `scripts/lib/test_process_group.py` skips a file whose text, with line continuations joined, has no "kill". Each finding needs that word.
-- It walks each syntax tree once. It collects the `Name` nodes and matches them to the `killpg` import names after the walk.
-- It checks a string constant or a shell line only when the text has "kill".
-
-**Files:** `scripts/lib/test_process_group.py`.
-
-**Workers:** 1 writer; no split (one function). impl: `scripts/lib/test_process_group.py`. test opens as impl.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `lib/test_process_group` and `lib/test_process_group_sources` pass; AWS pair shows a CPU saving.
+- One `ast.walk` for each file; the `Name` nodes match the `killpg` import names after the walk. The shell and `killpg` checks run only on a string constant or shell line that has "kill".
+- AWS pair (3 rounds, median CPU s): `lib/test_process_group_sources` 16.41 -> 5.21.
+- Commit f7d26d4c5. Test-only change.
