@@ -351,6 +351,10 @@ It also includes Rust and Markdown files that hold the old name as a word at eit
 A file with another item of that name also waits.
 
 A restructure includes its own Rust file and files that declare its module at either commit.
+A rename of its own file that `file_rename` does not approve counts the same way (`edits_module_owners`).
+An example is `After the moves, rename <a> to <b>.`.
+The finding waits while its parent mod file is busy.
+`Ledger.pipeline_footprint` adds the same files for another unit's open ticket.
 The module name is the file stem, or the folder name for `mod.rs`.
 `DeclarationScan.declares` reads `mod <name>;` lines and `#[path]` strings.
 Moving a test file into its owner removes the owner's declaration.

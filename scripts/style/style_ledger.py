@@ -4271,10 +4271,11 @@ class Ledger:
                 files.update(self.finding_needs(finding.finding_id))
                 moved = file_rename(finding.kind, finding.path, finding.after)
                 pair = approved_rename(finding.kind, finding.before, finding.after)
+                owners = approved_renames.edits_module_owners(finding.kind, finding.path, finding.after)
                 if isinstance(moved, FileRename):
                     files.add(moved.new)
                     name = moved.old_stem
-                elif finding.kind == "restructure" and finding.path.endswith(".rs"):
+                elif owners:
                     path = PurePosixPath(finding.path)
                     name = path.parent.name if path.name == "mod.rs" else path.stem
                 elif isinstance(pair, ApprovedRename):
@@ -4283,7 +4284,7 @@ class Ledger:
                     continue
                 for commit in commits:
                     files.update(self.files_naming(commit, name, ("*.rs", "*.md")))
-                    if isinstance(moved, FileRename) or finding.kind == "restructure":
+                    if isinstance(moved, FileRename) or finding.kind == "restructure" or owners:
                         files.update(self.files_naming(commit, "path"))
         if not files:
             raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
