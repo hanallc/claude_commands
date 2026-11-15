@@ -58,14 +58,15 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+The gate regions in `regions` are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1` and `eu-south-1`.
+The price reads in `spot_candidate_regions` add `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
 `us-east-2` is the home region for shared artifacts.
-Before European deployment:
+Before deployment:
 
 1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
 2. Confirm that each status is `ENABLED`.
-3. Add every configured region to the Organizations `RegionFloor` policy.
-4. Preserve the home and US region permissions.
+3. Allow all 19 regions in the Organizations `RegionFloor` policy: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+4. Preserve the current region permissions.
 
 Use these commands at your terminal:
 

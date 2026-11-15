@@ -496,7 +496,7 @@ The spending limits do not change.
 European deployment needs account and policy changes before the regional stacks can start.
 Enable `eu-south-1` and `eu-south-2` on the AWS Account page and wait until each status is `ENABLED`.
 See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
-Add `eu-north-1`, `eu-south-1`, `eu-south-2`, `us-east-1` and `us-west-1` to the allowed regions in `RegionFloor` before deployment.
+Allow every region in `regions` and `spot_candidate_regions` in `RegionFloor` before deployment; the runbook names all 19.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
