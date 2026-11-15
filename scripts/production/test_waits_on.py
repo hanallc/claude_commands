@@ -92,23 +92,35 @@ class WaitsOnTests(unittest.TestCase):
             view = land_queue.LandView(dict.fromkeys(running or (), ""), line, results or {}, frozenset(), {})
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
-        self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland — after builds/589: done, waits to merge, 10th in line")
+        self.assertEqual(text(waits_on.OnMain("a" * 40)),
+                         "acctland. Ready: builds/589 is on the local copy of main.")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40)),
+                         "acctland. After builds/589: waiting to merge, 10th in line.")
         self.assertEqual(text(waits_on.NotOnMain("c" * 40), results={"c" * 40: failed}),
-                         "acctland — after builds/589: waits to merge, 10th in line; last try failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland — after builds/589: done, merging now")
-        self.assertEqual(text(waits_on.NotOnMain("d" * 40)), "acctland — after builds/589: not on main")
+                         "acctland. After builds/589: absent from the local copy of main; waiting to merge, "
+                         + "10th in line; last attempt failed at red: test_x red; 13:30.")
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})),
+                         "acctland. After builds/589: merging now.")
+        self.assertEqual(text(waits_on.NotOnMain("d" * 40)),
+                         "acctland. After builds/589: absent from the local copy of main.")
         self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: {**failed, "commit": "d" * 40}}),
-                         "acctland — after builds/589: did not merge: failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseOpen(now + 3600)), "acctland — after builds/589: in work, ETA 14:40")
-        self.assertEqual(text(waits_on.PhaseOpen(None)), "acctland — after builds/589: in work, no ETA")
-        self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland — after builds/589: not started")
-        self.assertEqual(text(waits_on.NotFound()), "acctland — after builds/589: not found")
+                         "acctland. After builds/589: absent from the local copy of main; "
+                         + "did not merge: failed at red: test_x red; 13:30.")
+        for found, expected in ((waits_on.PhaseOpen(now + 3600), "started"),
+                                (waits_on.PhaseOpen(None), "started"),
+                                (waits_on.PhaseNotStarted(), "not started"),
+                                (waits_on.NotFound(), "dependency not found locally"),
+                                (waits_on.PhaseSent("d" * 40),
+                                 "submitted; absent from the merge line; reason not recorded")):
+            with self.subTest(state=found):
+                self.assertEqual(text(found), f"acctland. After builds/589: {expected}.")
         self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("plain"), None,
                                                  land_queue.LandView({}, {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
-                         "acctland — after builds/589: done, merged 13:30, not on main yet")
+                         "acctland. After builds/589: merged 13:30.")
+        self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: landed}),
+                         "acctland. After builds/589: absent from the local copy of main; merged 13:30.")
 
     def test_the_first_row_names_each_sent_checkpoint_of_the_unit(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
@@ -124,46 +136,62 @@ class WaitsOnTests(unittest.TestCase):
         view = land_queue.LandView({"0" * 40: "shelled images-card", "1" * 40: "other 1"}, line,
                                    {"e" * 40: held, "f" * 40: later, "9" * 40: older}, frozenset(), {})
 
-        failures = ("center-column did not merge: merge conflict in docs/a.md, b.md 13:30 "
-                    + "· images did not merge: merge conflict in docs/a.md, b.md 13:40")
-        paired = "2 phases done, merge together, 2nd in line: workers-why, land-line"
+        failures = (
+            "center-column did not merge: merge conflict in docs/a.md, b.md; 13:30.",
+            "images did not merge: merge conflict in docs/a.md, b.md; 13:40.")
+        running = "images-card is done; merging now."
+        first = "shot-rule is done; waiting to merge, 1st in line."
+        paired = "workers-why and land-line are done; merge together, 2nd in line."
         carried_view = view._replace(carried_line={"7" * 40: line["c" * 40]})
         running_view = view._replace(running={"0" * 40: "shelled images-card", "8" * 40: "shelled live-owner"},
                                     carried_running=frozenset({"7" * 40}))
-        cases: list[tuple[str, land_queue.LandView, dict[str, unit_phases.PhaseSentWork], bool, str, frozenset[str]]] = [
-            ("no open rows", view, {}, False,
-             f"merging now: images-card · shot-rule done, waits to merge, 1st in line · {paired} · {failures}", frozenset()),
+        cases: list[tuple[str, land_queue.LandView, dict[str, unit_phases.PhaseSentWork], bool,
+                          tuple[str, ...], frozenset[str]]] = [
+            ("no open rows", view, {}, False, (running, first, paired, *failures), frozenset()),
             ("open rows before other phases", view,
              {"images-card": unit_phases.SentCommit("0" * 40), "shot-rule": unit_phases.SentCommit("a" * 40),
               "land-line": unit_phases.SentCommit("c" * 40), "images": unit_phases.SentCommit("f" * 40)}, True,
-             "2 phases done, merge together, 2nd in line: land-line, workers-why", frozenset({"land-line"})),
+             (running, first, "land-line and workers-why are done; merge together, 2nd in line.", failures[1]),
+             frozenset({"land-line"})),
             ("single open row", view, {"shot-rule": unit_phases.SentCommit("a" * 40)}, False,
-             f"merging now: images-card · {paired} · {failures}", frozenset()),
+             (running, first, paired, *failures), frozenset()),
             ("carried commit joins its item", carried_view,
              {"workers-why": unit_phases.SentCommit("b" * 40), "checkpoint-wait": unit_phases.SentCommit("7" * 40),
               "land-line": unit_phases.SentCommit("c" * 40)}, False,
-             "merging now: images-card · shot-rule done, waits to merge, 1st in line · "
-             + f"3 phases done, merge together, 2nd in line: workers-why, checkpoint-wait, land-line · {failures}",
+             (running, first, "workers-why, checkpoint-wait and land-line are done; merge together, 2nd in line.", *failures),
              frozenset({"workers-why", "checkpoint-wait", "land-line"})),
             ("running direct and carried commits", running_view,
              {"carried": unit_phases.SentCommit("7" * 40), "images-card": unit_phases.SentCommit("0" * 40)}, False,
-             "merging now: carried, images-card, live-owner · shot-rule done, waits to merge, 1st in line · "
-             + f"{paired} · {failures}", frozenset({"carried", "images-card"})),
+             ("carried, images-card and live-owner are done; merging now.", first, paired, *failures),
+             frozenset({"carried", "images-card"})),
             ("single running open row", view, {"images-card": unit_phases.SentCommit("0" * 40)}, False,
-             f"shot-rule done, waits to merge, 1st in line · {paired} · {failures}", frozenset()),
-            ("open failed work stays on its row", view, {"images": unit_phases.SentCommit("f" * 40)}, False,
-             "merging now: images-card · shot-rule done, waits to merge, 1st in line · "
-             + f"{paired} · center-column did not merge: merge conflict in docs/a.md, b.md 13:30", frozenset()),
+             (running, first, paired, *failures), frozenset()),
+            ("open failed work remains in Merge", view, {"images": unit_phases.SentCommit("f" * 40)}, False,
+             (running, first, paired, failures[1], failures[0]), frozenset()),
+            ("carried phase names its other unit", view._replace(carried_line={
+                "7" * 40: land_queue.Place(4, "builds batch", "builder carrier")}),
+             {"carried": unit_phases.SentCommit("7" * 40)}, False,
+             (running, first, paired, "carried is done; merges with builder carrier, 4th in line.", *failures), frozenset()),
+            ("submitted work has no line", view,
+             {"absent": unit_phases.SentCommit("6" * 40), "no-hash": unit_phases.SentCommitUnrecorded(),
+              "not-sent": unit_phases.NoSentWork()}, False,
+             (running, first, paired,
+              "absent was submitted; absent from the merge line; reason not recorded.",
+              "no-hash was submitted; merge position not recorded.", *failures), frozenset()),
         ]
         for name, found, open_sent, on_main, expected, grouped in cases:
             with self.subTest(group=name):
                 result = unit_phases.unit_lands("shelled", found, open_sent=open_sent, now=now, zone=utc,
                                                 on_main=lambda _commit: on_main)
-                self.assertEqual(result.text, expected)
+                self.assertEqual(result.entries, expected)
+                self.assertEqual(result.text, " · ".join(expected))
                 self.assertEqual(result.grouped_phases, grouped)
+                self.assertTrue(result.pending)
         result = unit_phases.unit_lands("nobody", view, open_sent={}, now=now, zone=utc, on_main=lambda _commit: False)
         self.assertEqual(result.text, "")
+        self.assertEqual(result.entries, ())
         self.assertEqual(result.grouped_phases, frozenset())
+        self.assertFalse(result.pending)
 
 
 if __name__ == "__main__":
