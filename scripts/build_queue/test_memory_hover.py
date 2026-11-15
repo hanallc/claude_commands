@@ -29,7 +29,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
-        self.assertIn("<h1>Builds</h1>", page)
+        self.assertIn('<h1 class="page-title">Builds</h1>', page)
         elements: list[tuple[str, dict[str, str]]] = []
 
         def collect(tag: str, attrs: list[tuple[str, str | None]]) -> None:
