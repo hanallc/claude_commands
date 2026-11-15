@@ -106,13 +106,16 @@ class ImagesTests(ImagesFixture):
             self.assertEqual(images.main(["delete", "--id", record["id"]]), 0)
         self.assertEqual(images.records(self.root), [])
 
-    def test_page_lists_newest_first_with_owner_subject_and_signed_forms(self) -> None:
+    def test_page_lists_oldest_first_with_owner_subject_group_links_and_signed_forms(self) -> None:
         older, newer = self.register("Older shot"), self.register("Newer shot")
         older_folder = self.root / images.FOLDER / older["id"]
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         images.write_record(older_folder, older)
         source = images.render(self.root).decode()
-        self.assertLess(source.index(newer["id"]), source.index(older["id"]))
+        self.assertLess(source.index(older["id"]), source.index(newer["id"]))
+        self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
+        self.assertIn("last.owner === card.dataset.owner", source)
+        self.assertIn("link.href = '#' + row.card.id;", source)
         self.assertIn("Newer shot", source)
         self.assertIn("shot-owner (unit)", source)
         self.assertIn("Phase console-images", source)
@@ -132,7 +135,8 @@ class ImagesTests(ImagesFixture):
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
         self.assertEqual(card, (
-            f'<article data-image="{record['id']}" data-registered="1794712140">'
+            f'<article id="image-{record['id']}" data-image="{record['id']}" data-registered="1794712140"'
+            + f' data-owner="{record['owner']}">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'

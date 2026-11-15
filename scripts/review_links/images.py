@@ -73,7 +73,7 @@ def write_record(folder: Path, record: ImageRecord) -> None:
 
 
 def records(root: Path) -> list[ImageRecord]:
-    """Read every registered image, newest first; an unreadable record prints one line and stays out."""
+    """Read every registered image, oldest first; an unreadable record prints one line and stays out."""
     folder = images_root(root)
     found: list[ImageRecord] = []
     try:
@@ -87,7 +87,8 @@ def records(root: Path) -> list[ImageRecord]:
             found.append(read_record(entry))
         except (OSError, ValueError) as error:
             print(f"review-links images: {error}", file=sys.stderr)
-    return sorted(found, key=lambda record: record["registered_at"], reverse=True)
+    # A new image goes to the end, so the cards above it keep their places.
+    return sorted(found, key=lambda record: record["registered_at"])
 
 
 def register(image: Path, caption: str, owner: staff.StaffId, subject: str) -> ImageRecord:
@@ -146,9 +147,11 @@ def card(record: ImageRecord, token: str, members: staff.StaffSnapshot) -> str:
     path = html.escape(image_path(record), quote=True)
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
-    return (f'<article data-image="{record["id"]}" data-registered="{int(added.timestamp())}">'
+    owner = html.escape(owner_name(members, record["owner"]))
+    return (f'<article id="image-{record["id"]}" data-image="{record["id"]}" data-registered="{int(added.timestamp())}" '
+            + f'data-owner="{html.escape(record["owner"], quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
-            + f'<dt>Owner:</dt><dd>{html.escape(owner_name(members, record["owner"]))}</dd>'
+            + f'<dt>Owner:</dt><dd>{owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
@@ -167,7 +170,8 @@ def render(root: Path) -> bytes:
     content = (STYLE + '<h1>Images</h1><div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
-               + f'<div data-images>{cards}</div><p hidden data-empty></p>'
+               + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
+               + f'<div><div data-images>{cards}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to filter images and to delete an image.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return change_page.document(content, "Images")
@@ -200,12 +204,23 @@ STYLE = """<style>[hidden]{display:none!important}
 .image-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:0 0 12px;font:14px/1.45 ui-monospace,monospace;opacity:.8}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
 [data-images] form{margin-top:12px}[data-delete-status]{margin-left:8px}
+main{max-width:1060px}
+[data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
+[data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
+grid-template-columns:minmax(0,max-content) max-content max-content;column-gap:12px;font-size:14px}
+[data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;padding:6px 8px;border-radius:6px;
+color:inherit;text-decoration:none;overflow-wrap:anywhere}
+[data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8882}
+[data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
+@media (max-width:900px){[data-image-layout]{display:block}
+[data-image-groups]{position:static;max-height:none;margin-bottom:16px}}
 </style>"""
 
 SCRIPT = r"""(() => {
 const menu = document.getElementById('image-window');
 const empty = document.querySelector('[data-empty]');
 const spans = {day: 86400, week: 604800, all: Infinity};
+const groups = document.querySelector('[data-image-groups]');
 let list = document.querySelector('[data-images]');
 let deleting = 0;
 function apply() {
@@ -216,10 +231,37 @@ function apply() {
     if (!card.hidden) shown++;
   });
   empty.hidden = shown > 0;
+  showGroups();
   empty.textContent = list.children.length ? 'No images in this period. Choose a longer period.' : 'No images registered.';
   // The default period keeps a plain URL; the console records any other period.
   history.replaceState(null, '', menu.value === 'week' ? location.pathname : '#' + new URLSearchParams({show: menu.value}));
   if (parent !== window) parent.postMessage('console-place', location.origin);
+}
+// One row for each run of shown images from the same owner; the row opens the first image of the run.
+function showGroups() {
+  const rows = [];
+  list.querySelectorAll('article:not([hidden])').forEach(card => {
+    const last = rows[rows.length - 1];
+    if (last && last.owner === card.dataset.owner) { last.count++; return; }
+    rows.push({owner: card.dataset.owner, card, count: 1});
+  });
+  groups.replaceChildren(...rows.map(row => {
+    const link = document.createElement('a');
+    link.href = '#' + row.card.id;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      row.card.scrollIntoView({block: 'start'});
+    });
+    const name = row.card.querySelector('.image-details dd').textContent;
+    [name, String(row.count), row.card.querySelector('time').textContent].forEach((text, index) => {
+      const cell = document.createElement('span');
+      cell.textContent = text;
+      if (index === 1) cell.className = 'group-count';
+      link.append(cell);
+    });
+    return link;
+  }));
+  groups.hidden = rows.length === 0;
 }
 function bind(root) {
   root.querySelectorAll('form[data-delete]').forEach(form => form.addEventListener('submit', async event => {

@@ -246,7 +246,8 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Images page
 
-`/console/images.html` shows registered images with their instructions, newest first.
+`/console/images.html` shows registered images with their instructions, oldest first.
+A new image goes to the end, so the cards above it keep their places.
 The console lists it as **Images**, with the Lucide `image` icon.
 A showrunner or unit registers each image with one command:
 
@@ -273,6 +274,12 @@ Each card shows, in this order:
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+
+A group is a run of shown cards in a row with the same owner.
+A panel at the top left of the images pane lists one row per group, in three columns: owner, count and the time of its first image.
+The panel stays in place while the cards scroll.
+Each row links to the first image of its group.
+On a narrow screen the panel goes above the cards and scrolls with them.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.

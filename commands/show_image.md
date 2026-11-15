@@ -24,6 +24,6 @@ A file path alone is not something the user can view.
 4. Give the user the `Images page:` link that the command prints.
    In a notice to a showrunner, give the same link and the image ids.
 
-The page shows the newest image first.
+The page shows the oldest image first, and a new image goes to the end.
 The user removes an image with its **Delete** button.
 To remove your own image, run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id <id>`.
