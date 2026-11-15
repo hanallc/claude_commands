@@ -27,15 +27,11 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
+from scripts.buildlog import parse
 from scripts.lib import cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
-BUILDING = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                      "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "miri", "mend"})
-GLOBAL_VALUES = frozenset({"-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path",
-                          "--target-dir", "--target", "-j", "--jobs", "-p", "--package", "--exclude",
-                          "-F", "--features", "--profile", "--message-format", "--artifact-dir", "--out-dir"})
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
 
@@ -46,18 +42,16 @@ class JobTemporaryFolder:
 
 
 def building_call(arguments: Sequence[str]) -> bool:
-    values = iter(arguments)
-    for value in values:
-        if value in GLOBAL_VALUES:
-            _ = next(values, "")
-        elif not value.startswith(("-", "+")):
-            for argument in values:
-                if argument == "--":
-                    break
-                if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
-                    return False
-            return value in BUILDING
-    return False
+    index = parse.cargo_subcommand_index(arguments)
+    if index is None:
+        return False
+    value = arguments[index]
+    for argument in arguments[index + 1:]:
+        if argument == "--":
+            break
+        if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
+            return False
+    return value in parse.CARGO_BUILD_VERBS
 
 
 def cargo_path(explicit: str, front: Path) -> tuple[str, str]:

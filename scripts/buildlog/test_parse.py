@@ -92,6 +92,13 @@ class ArgvTests(unittest.TestCase):
         self.assertIsNone(parse.toolchain(["cargo", "clippy", "--workspace"]))
         self.assertIsNone(parse.toolchain(["rustup", "+nightly"]))
 
+    def test_global_options_before_the_subcommand_are_skipped(self) -> None:
+        self.assertEqual(parse.step_name(["cargo", "-q", "nextest", "run"]), "nextest")
+        self.assertEqual(parse.step_name(["cargo", "--color", "always", "clippy"]), "clippy")
+        self.assertEqual(parse.step_name(["cargo", "+nightly", "--locked", "-Z", "x", "fmt"]), "fmt")
+        self.assertEqual(parse.step_name(["cargo", "--config=term.color=never", "t"]), "t")
+        self.assertEqual(parse.step_name(["cargo", "--version"]), "cargo")
+
     def test_sweep_and_other_programs(self) -> None:
         sweep = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py", "--dry-run"]
         self.assertEqual(parse.step_name(sweep), "sweep")
@@ -411,6 +418,24 @@ class NextestFormTests(unittest.TestCase):
         result = parse.log_facts("nextest", "  TRY 1 FAIL [   0.003s] (───) alpha tests::fails\n")
         self.assertIsNone(result["tests_run"])
         self.assertEqual([row["test"] for row in result["tests"] or []], ["tests::fails"])
+
+
+class CargoSubcommandTests(unittest.TestCase):
+    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
+        wrapper = (Path(__file__).parents[1] / "build_hold" / "cargo").read_text()
+        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
+        self.assertEqual(parse.CARGO_BUILD_VERBS, frozenset(branch.split("|")))
+        for verb in parse.CARGO_BUILD_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
+            with self.subTest(verb=verb):
+                self.assertEqual(parse.cargo_subcommand(("+nightly", "--config=term.color=never", verb)), verb)
+        self.assertEqual(parse.cargo_subcommand(("+stable", "-v")), "")
+
+    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
+        for option in parse.CARGO_VALUE_OPTIONS:
+            with self.subTest(option=option):
+                self.assertEqual(parse.cargo_subcommand((option, "build", "metadata")), "metadata")
+                self.assertEqual(parse.cargo_subcommand((option, "metadata", "check")), "check")
+        self.assertEqual(parse.cargo_subcommand(("--config",)), "")
 
 
 if __name__ == "__main__":
