@@ -135,6 +135,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
             "read_metadata", "load_metadata", "workspace_taplo",
+            "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         scripts = Path(step_record.__file__).resolve().parent.parent
         functions += shell_functions(INVOKE, "buildlog_step_compiles", "fmt_cargo", "invoke_mend", "invoke_clippy", "invoke_clippy_fix")
@@ -151,6 +152,7 @@ TOKEN_USED=0 TOKEN_WAITED=0
 HOLD_LINT=0 CHECK_LINT=0 METADATA_READY=0
 FEATURE_FLAGS=()
 VERIFY_METADATA_SCRIPT=$TEST_REAL_DIRECT/verify_metadata.py
+FIX_RETURN_SCRIPT=$TEST_REAL_DIRECT/../mac_test/fix_return.py
 source "$LINT_CONFIG_READER"
 run_once() { "$@"; }
 BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
