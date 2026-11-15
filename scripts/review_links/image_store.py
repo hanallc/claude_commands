@@ -29,6 +29,8 @@ class ImageRecord(TypedDict):
     owner: str
     subject: str
     registered_at: str
+    # A before and after pair keeps the after image in `file` and the before image here.
+    before: NotRequired[str]
     # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
     feedback_at: NotRequired[str]
 
@@ -46,8 +48,13 @@ def read_record(folder: Path) -> ImageRecord:
     record: ImageRecord = {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]),
                            "caption": cast(str, fields["caption"]), "owner": cast(str, fields["owner"]),
                            "subject": cast(str, fields["subject"]), "registered_at": cast(str, fields["registered_at"])}
-    feedback_at = fields.get("feedback_at")
-    if isinstance(feedback_at, str):
+    for key in ("before", "feedback_at"):
+        value = fields.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{folder.name}: invalid image record")
+    if isinstance(before := fields.get("before"), str):
+        record["before"] = before
+    if isinstance(feedback_at := fields.get("feedback_at"), str):
         record["feedback_at"] = feedback_at
     return record
 
@@ -56,23 +63,31 @@ def write_record(folder: Path, record: ImageRecord) -> None:
     atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
 
 
-def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "") -> ImageRecord:
-    """Copy an image and its record into the selected folder with an atomic rename."""
-    suffix = image.suffix.casefold()
-    if suffix not in SUFFIXES:
-        raise ValueError(f"{image}: use one of {', '.join(sorted(SUFFIXES))}")
-    if not image.is_file():
-        raise ValueError(f"{image}: no such image file")
+def register_file(image: Path, folder: Path, caption: str = "", owner: str = "", subject: str = "",
+                  *, before: Path | None = None) -> ImageRecord:
+    """Publish one image or a pair with one record and one atomic folder rename."""
+    sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
+    for _, source in sources:
+        if source.suffix.casefold() not in SUFFIXES:
+            raise ValueError(f"{source}: use one of {', '.join(sorted(SUFFIXES))}")
+        if not source.is_file():
+            raise ValueError(f"{source}: no such image file")
     folder.mkdir(parents=True, exist_ok=True)
     identity = secrets.token_hex(6)
     draft = folder / (DRAFT_PREFIX + identity)
     draft.mkdir(mode=0o755)
     try:
-        record: ImageRecord = {"id": identity, "file": "image" + suffix, "caption": caption.strip(), "owner": owner,
-                               "subject": subject, "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
-        _ = shutil.copyfile(image, draft / record["file"])
+        files = {stem: stem + source.suffix.casefold() for stem, source in sources}
+        # The last source is the after image of a pair, or the single image.
+        record: ImageRecord = {"id": identity, "file": files[sources[-1][0]],
+                               "caption": caption.strip(), "owner": owner, "subject": subject,
+                               "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
+        if "before" in files:
+            record["before"] = files["before"]
+        for stem, source in sources:
+            _ = shutil.copyfile(source, draft / files[stem])
         write_record(draft, record)
-        # The page shows a folder only after its image and record are complete.
+        # The page shows a folder only after its images and record are complete.
         _ = draft.rename(folder / identity)
     except BaseException:
         shutil.rmtree(draft, ignore_errors=True)

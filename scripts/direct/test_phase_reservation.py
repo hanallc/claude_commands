@@ -513,13 +513,14 @@ class AcquisitionRecordingTests(unittest.TestCase):
         self.assertEqual(phase_reservation.read_state(self.phases[1].directory), {
             "kind": phase_reservation.AWAITING_FIRST_TOUCH, "phase": "16"})
 
-    def test_a_mapped_acquisition_records_without_a_lock(self) -> None:
+    def test_a_mapped_acquisition_takes_only_its_phase_lock(self) -> None:
         acquisition = phase_reservation.Acquisition("r2", "c1", "a" * 40)
         answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "", acquisition)
         with mock.patch.object(worker_lifecycle, "acquire_flock") as acquire:
             result = phase_reservation.record_own_acquisition(
                 answer, self.repo, self.phases, "director", self.phases[0])
-        acquire.assert_not_called()
+        self.assertEqual([Path(cast(io.TextIOWrapper, each.args[0]).name) for each in acquire.call_args_list],
+                         [self.phases[0].directory / (phase_reservation.BASELINE_FILE + ".lock")])
         self.assertEqual(result, acquisition)
         self.assertEqual(phase_reservation.read_state(self.phases[0].directory), {
             "kind": phase_reservation.ACTIVE, "active_phase_reservation": {
@@ -692,11 +693,11 @@ class PhaseRepairTests(unittest.TestCase):
         phase_reservation.committed(self.directory, "b" * 40)
         self.assertTrue(phase_reservation.clear(self.directory, "b" * 40))
         self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
-        before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
+        before = self.record_bytes()
         result = self.repair()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("checkpoint released its reservation", result.stderr)
-        self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
+        self.assertEqual(self.record_bytes(), before)
         self.assertFalse((self.root / "berth.log").exists())
         self.assertFalse((self.root / "posts.log").exists())
 
@@ -743,8 +744,16 @@ class PhaseRepairTests(unittest.TestCase):
         self.assertEqual([shlex.split(command) for command in commands], [
             ["python3", script, "enroll", *common, "--board", "board_ready"],
             ["python3", script, "claim", *common, "--repo", str(self.repo)]])
-        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), [phase_reservation.BASELINE_FILE])
+        self.assertEqual(self.record_files(), [phase_reservation.BASELINE_FILE])
         self.assertFalse((self.root / "posts.log").exists())
+
+    def record_bytes(self) -> dict[str, bytes]:
+        """The phase directory's file contents apart from the phase lock."""
+        return {name: (self.directory / name).read_bytes() for name in self.record_files()}
+
+    def record_files(self) -> list[str]:
+        """The phase directory's files apart from the phase lock, which any state read may create."""
+        return sorted(path.name for path in self.directory.iterdir() if path.name != phase_reservation.BASELINE_FILE + ".lock")
 
     def test_a_lost_record_is_restored_from_the_live_phase_mapping_and_logged(self) -> None:
         source = DIRECTOR_SESSION + ".phase-34h"
@@ -876,10 +885,10 @@ class PhaseRepairTests(unittest.TestCase):
                     self.board({"r1": "released_after_checkpoint", "r2": ""})
                 else:
                     self.board({"r1": case})
-                before = {path.name: path.read_bytes() for path in self.directory.iterdir()}
+                before = self.record_bytes()
                 result = self.repair()
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual({path.name: path.read_bytes() for path in self.directory.iterdir()}, before)
+                self.assertEqual(self.record_bytes(), before)
                 self.assertNotIn(" enroll ", result.stderr)
                 self.assertNotIn(" claim ", result.stderr)
                 self.assertFalse((self.root / "posts.log").exists())
@@ -935,7 +944,7 @@ class PhaseRepairTests(unittest.TestCase):
         self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r1"})
         (self.directory / phase_reservation.BASELINE_FILE).unlink()
         self.assertEqual(self.repair().returncode, 2)
-        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(self.record_files(), [])
         _ = (self.directory / phase_reservation.BASELINE_FILE).write_text("a" * 40)
         _ = (self.root / "board.json").write_text("not JSON")
         self.assert_reopen_refusal(self.repair())
@@ -957,6 +966,51 @@ class PhaseRepairTests(unittest.TestCase):
                 self.assertEqual((self.directory / phase_reservation.STATE_FILE).read_bytes(), original)
                 self.assertFalse((self.directory / phase_reservation.REPAIRS_FILE).exists())
                 self.assertFalse((self.root / "posts.log").exists())
+
+    def test_a_checkpoint_during_a_repair_keeps_its_pending_release_record(self) -> None:
+        _ = phase_reservation.enroll(self.directory, "34h", "board_ready")
+        self.assertTrue(phase_reservation.record_active(self.directory, phase_reservation.Acquisition("r1", "c1", "a" * 40)))
+        self.map_sessions({DIRECTOR_SESSION + ".phase-34h": "r2"})
+        repair_thread = current_thread()
+        checkpoint_waits = Event()
+        guard = LauncherHangGuard("checkpoint during repair")
+        acquire = worker_lifecycle.acquire_flock
+        statuses = {"r1": "released_after_checkpoint", "r2": "active"}
+        checkpoints: list[Future[None]] = []
+
+        def contend(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            if current_thread() is not repair_thread:
+                try:
+                    acquire(handle, mode=mode | fcntl.LOCK_NB, deadline=deadline)
+                    checkpoint_waits.set()
+                    return
+                except BlockingIOError:
+                    checkpoint_waits.set()
+            acquire(handle, mode=mode, deadline=deadline)
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def board_status(_root: Path, reservation: str) -> str:
+                if reservation == "r1" and not checkpoints:
+                    # The checkpoint starts after the repair has read the record and before it writes.
+                    checkpoints.append(worker.submit(phase_reservation.committed, self.directory, "b" * 40))
+                    # Without the phase lock the checkpoint finishes here, and the repair then overwrites it.
+                    checkpoints[0].add_done_callback(lambda _: checkpoint_waits.set())
+                    guard.event(checkpoint_waits)
+                return statuses[reservation]
+
+            with guard.protect(), mock.patch.dict(os.environ, self.environment), \
+                    mock.patch.object(phase_reservation, "lifecycle", board_status), \
+                    mock.patch.object(worker_lifecycle, "acquire_flock", contend), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(phase_reservation.main(["repair", "--session-dir", str(self.session),
+                                                         "--phase", "34h", "--repo", str(self.repo)]), 0)
+                guard.result(checkpoints[0])
+        state = self.state()
+        self.assertEqual(state["kind"], phase_reservation.PENDING)
+        self.assertEqual(cast(dict[str, object], state[phase_reservation.PENDING_FIELD])["checkpoint_commit"], "b" * 40)
+        self.assertEqual(cast(dict[str, object], state[phase_reservation.PENDING_FIELD])["reservation_id"], "r2")
+
 
 HELD_BERTH = r'''#!__PYTHON__
 import json, os, subprocess, sys

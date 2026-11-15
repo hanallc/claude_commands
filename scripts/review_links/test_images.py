@@ -386,6 +386,108 @@ class ImagesTests(ImagesFixture):
         self.assertEqual((images.records(self.root), self.sent), ([record], []))
 
 
+class ImagePairTests(ImagesFixture):
+    def register_pair(self, caption: str = "The panel. Look at the counts.") -> image_store.ImageRecord:
+        after = self.temporary / "after.webp"
+        _ = after.write_bytes(PNG[::-1])
+        return images.register(after, caption, self.owner_id(), "Phase image-pairs", before=self.shot)
+
+    def test_a_pair_is_one_record_in_one_folder_and_one_delete_removes_both(self) -> None:
+        record = self.register_pair()
+        folder = self.root / images.FOLDER / record["id"]
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), [image_store.RECORD, "after.webp", "before.png"])
+        self.assertEqual(((folder / "before.png").read_bytes(), (folder / "after.webp").read_bytes()), (PNG, PNG[::-1]))
+        self.assertEqual((record["file"], record.get("before")), ("after.webp", "before.png"))
+        self.assertEqual(images.records(self.root), [record])
+        images.delete(self.root, record["id"])
+        self.assertFalse(folder.exists())
+
+    def test_a_failed_pair_copy_removes_the_draft_and_publishes_no_record(self) -> None:
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        copy = shutil.copyfile
+
+        def copy_image(source: Path, target: Path) -> str:
+            if source == after:
+                raise OSError("the after image cannot be copied")
+            return str(copy(source, target))
+
+        with patch("scripts.review_links.image_store.shutil.copyfile", side_effect=copy_image), \
+                self.assertRaisesRegex(OSError, "the after image cannot be copied"):
+            _ = images.register(after, "caption", self.owner_id(), "Phase image-pairs", before=self.shot)
+        self.assertEqual(list((self.root / images.FOLDER).iterdir()), [])
+        self.assertEqual(images.records(self.root), [])
+
+    def test_a_pair_with_a_bad_before_image_leaves_no_folder(self) -> None:
+        text = self.temporary / "notes.txt"
+        _ = text.write_text("not an image")
+        for before, reason in ((text, "use one of"), (self.temporary / "absent.png", "no such image file")):
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                _ = images.register(self.shot, "caption", self.owner_id(), "Phase image-pairs", before=before)
+        self.assertFalse((self.root / images.FOLDER).exists())
+
+    def test_a_record_whose_before_is_not_text_stays_off_the_page(self) -> None:
+        record = self.register_pair()
+        folder = self.root / images.FOLDER / record["id"]
+        stored = cast(dict[str, object], json.loads((folder / image_store.RECORD).read_text()))
+        stored["before"] = 7
+        _ = (folder / image_store.RECORD).write_text(json.dumps(stored))
+        with redirect_stderr(StringIO()) as errors:
+            self.assertEqual(images.records(self.root), [])
+        self.assertIn("invalid image record", errors.getvalue())
+
+    def test_command_files_a_pair_and_refuses_a_half_pair(self) -> None:
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        output = StringIO()
+        with redirect_stdout(output):
+            code = images.main(["register", "--before", str(self.shot), "--after", str(after), "--caption", "Cards",
+                                "--owner", self.owner_id(), "--phase", "image-pairs"])
+        self.assertEqual(code, 0)
+        record = images.records(self.root)[0]
+        origin = f"http://127.0.0.1:8765/images/{record['id']}"
+        self.assertEqual(output.getvalue().splitlines(), [
+            f"registered {record['id']}: {origin}/before.png {origin}/after.png",
+            "Image link: http://127.0.0.1:8765/console/?page=images&at.images="
+            + f"%2Fconsole%2Fimages.html%23image%3D{record['id']}"])
+        for options in (["--before", str(self.shot)], ["--image", str(self.shot), "--after", str(after)], []):
+            with self.subTest(options=options), redirect_stderr(StringIO()) as errors, \
+                    self.assertRaises(SystemExit):
+                _ = images.main(["register", *options, "--caption", "Cards", "--owner", self.owner_id(),
+                                 "--phase", "image-pairs"])
+            self.assertIn("give --image, or --before and --after", errors.getvalue())
+        self.assertEqual(images.records(self.root), [record])
+
+    def test_a_pair_card_shows_before_then_after_with_one_form(self) -> None:
+        record = self.register_pair("Look at <the> counts")
+        card = images.card(record, "token", staff.snapshot(), 3)
+        before, after = (f"/images/{record['id']}/before.png", f"/images/{record['id']}/after.webp")
+        self.assertTrue(card.startswith(f'<article id="image-{record['id']}" class="pair" data-image='))
+        self.assertIn(
+            '<div class="image-pair">'
+            + f'<figure><figcaption>Before</figcaption><a href="{before}" target="_blank" rel="noopener">'
+            + f'<img src="{before}" alt="Before: Look at &lt;the&gt; counts" loading="lazy"></a></figure>'
+            + f'<figure><figcaption>After</figcaption><a href="{after}" target="_blank" rel="noopener">'
+            + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
+            + '<form method="post" data-image-form>', card)
+        self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
+                          card.count("<h2"), card.count("<dl")), (1, 1, 1, 1, 1))
+        self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
+        # A narrow card stacks the pair, before on top.
+        self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
+
+    def test_pair_feedback_names_the_before_and_after_images(self) -> None:
+        record = self.register_pair()
+        token = images.request_token(images.console_token(self.root), record["id"])
+        images.submit(self.root, urlencode({"image": record["id"], "token": token, "feedback": "Good.",
+                                            "action": "feedback"}))
+        lines = self.sent[0][2].splitlines()
+        self.assertEqual(lines[1:4], ["Feedback: Good.",
+                                      f"Before: http://127.0.0.1:8765/images/{record['id']}/before.png",
+                                      f"After: http://127.0.0.1:8765/images/{record['id']}/after.webp"])
+        self.assertNotIn(record["id"], images.render(self.root).decode())
+
+
 class ImagesServerTests(ImagesFixture):
     port: int = 0
 
@@ -423,6 +525,14 @@ class ImagesServerTests(ImagesFixture):
         self.assertEqual((status, kind, body), (200, "image/png", PNG))
         status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{image_store.RECORD}")
         self.assertEqual(status, 404)
+
+    def test_server_serves_both_images_of_a_pair(self) -> None:
+        after = self.temporary / "after.png"
+        _ = after.write_bytes(PNG)
+        record = images.register(after, "Cards", self.owner_id(), "Phase image-pairs", before=self.shot)
+        for file in ("before.png", "after.png"):
+            with self.subTest(file=file):
+                self.assertEqual(self.http("GET", images.image_path(record, file)), (200, "image/png", PNG))
 
     def test_server_deletes_the_image_and_refuses_a_bad_token(self) -> None:
         record = self.register()

@@ -306,9 +306,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 
    Shots the user must look at go on the console Images page: register each
    with `/show_image` (`~/.claude/commands/show_image.md`) and give the user
-   each image's own link, never a path alone. Each is one dark mode shot at
-   desktop width; send a light mode or phone width shot only when the user
-   asks for it.
+   each image's own link, never a path alone. File the before and after shots
+   of one state as one pair, so they show side by side.
+   Each shot is dark mode at desktop width; send a light mode or phone width
+   shot only when the user asks for it.
 
    Such a notice carries the third line: the verdict of the design check
    (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends

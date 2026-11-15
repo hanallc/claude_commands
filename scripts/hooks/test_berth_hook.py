@@ -773,7 +773,7 @@ class BerthHookTests(unittest.TestCase):
         phase = phase_reservation.phase_directory(self.session_dir, "15")
         self.assertEqual(sorted(path.name for path in phase.iterdir()),
                          [phase_reservation.STATE_FILE, phase_reservation.BASELINE_FILE,
-                          phase_reservation.BASELINE_STATUS_FILE])
+                          phase_reservation.BASELINE_FILE + ".lock", phase_reservation.BASELINE_STATUS_FILE])
         self.assertEqual(sorted(path.name for path in self.session_dir.iterdir()), [phase_reservation.PHASES_DIR, "progress_history_state.json"])
 
     def backstop(self, phase: str = "15") -> tuple[int, str]:
