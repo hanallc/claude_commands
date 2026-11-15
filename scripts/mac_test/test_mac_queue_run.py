@@ -16,6 +16,7 @@ from typing import cast
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -174,13 +175,13 @@ class QueueRunTests(unittest.TestCase):
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
                         if waiting:
                             # A signal to the group also ends the queue call that waits.
-                            os.killpg(process.pid, signum)
+                            send_process_group(process.pid, signum)
                         else:
                             process.send_signal(signum)
                         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     finally:
                         if process.poll() is None:
-                            os.killpg(process.pid, signal.SIGKILL)
+                            send_process_group(process.pid, signal.SIGKILL)
                             _ = process.communicate()
                 self.assertEqual(process.returncode, -signum, output + errors)
                 events = [event[0] for event in self.events(root)]
@@ -188,7 +189,7 @@ class QueueRunTests(unittest.TestCase):
                     # Python's own KeyboardInterrupt runs the finally path, which returns the placement.
                     self.assertEqual(events, ["place-step", "finish-step"])
                     self.assertEqual(self.events(root)[-1][-1], "1")
-                    self.assertIn("kill -TERM", (root / "stop").read_text())
+                    self.assertIn("signal_group TERM", (root / "stop").read_text())
                 else:
                     # The queue ends the placement when this process ends.
                     self.assertEqual(events, ["place-step"])
@@ -248,7 +249,7 @@ class QueueRunTests(unittest.TestCase):
                             os.kill(int((root / "app").read_text()), signal.SIGTERM)
                     finally:
                         if process.poll() is None:
-                            os.killpg(process.pid, signal.SIGKILL)
+                            send_process_group(process.pid, signal.SIGKILL)
                             _ = process.wait()
 
     def test_callers_have_no_plain_ssh_build_path(self) -> None:

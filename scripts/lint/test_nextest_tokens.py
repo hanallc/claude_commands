@@ -15,6 +15,7 @@ from typing import IO, cast, override
 from unittest import mock
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lib.process_group import send_process_group
 from scripts.lint import nextest_tokens as tokens
 
 require_checkout(Path(__file__))
@@ -22,7 +23,8 @@ require_checkout(Path(__file__))
 
 INVOKE = Path(__file__).with_name("invoke.sh")
 HOLDER = Path(__file__).with_name("nextest_tokens.py")
-PY = Path.home() / ".claude/scripts/lib/py"
+# The repository's own launcher: the gate box has no installed ~/.claude copy.
+PY = Path(__file__).resolve().parents[1] / "lib/py"
 
 # The fake cargo logs each call. A test run can end itself by a signal, or wait
 # until the case stops it.
@@ -169,7 +171,7 @@ class HolderTests(PoolCase):
         tests = os.pidfd_open(int(read_line(child).removeprefix("started ")))
         self.addCleanup(os.close, tests)
         self.assertEqual(self.free_tokens(), 0)
-        os.killpg(child.pid, signal.SIGTERM)
+        send_process_group(child.pid, signal.SIGTERM)
         self.assertEqual(child.wait(timeout=30), -signal.SIGTERM)
         self.assertEqual(select.select([tests], [], [], 30)[0], [tests])
 
@@ -178,7 +180,7 @@ class HolderTests(PoolCase):
         child = self.holder("cargo", "nextest", "run", "--test-threads", "8")
         self.assertEqual(read_line(child), "built\n")
         self.assertEqual(read_line(child), "nextest: waiting for 1 more jobserver tokens\n")
-        os.killpg(child.pid, signal.SIGTERM)
+        send_process_group(child.pid, signal.SIGTERM)
         self.assertEqual(child.wait(timeout=30), -signal.SIGTERM)
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run"])
 

@@ -117,10 +117,12 @@ def stop_remote(placement: MacPlacement, remote: RemoteRun) -> bool:
     if remote.group == 0:
         return False
     grace = conf.read("mac_gate").number("terminate_grace_seconds")
+    # The installed helper checks the group id before it sends; the ps check below proves the stop.
     script = f"""group={remote.group}
-kill -TERM -- -"$group" 2>/dev/null
+signal_group() {{ "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/process_group.py" "$group" "$1" 2>/dev/null }}
+signal_group TERM
 sleep {grace}
-kill -KILL -- -"$group" 2>/dev/null
+signal_group KILL
 groups=$(ps -axo pgid=) || exit 1
 if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
 printf 'mac_stopped=%s\\n' "$group"
