@@ -1475,3 +1475,18 @@ From builds (not the user), 2026-11-14 14:42, the user's AWS table review. aws o
 - `aws_page.PageData` carries `snapshot` and no regions list. In `aws_prices.html`, each table scrolls inside its card, with a sticky first column and an edge shadow; `markOverflow()` adds the column line when the table is wider than its card.
 - Calls sent to builds, each a one-line revert: the third label names the scope (`no merge gate runs`); paid USD/h uses two labels; tables scroll; regions that differ get one line each.
 - Proof: 1661 aws_target and buildlog tests pass; page shots of each filter in dark and light mode and at 390 px width.
+
+### Phase 80 — The Mac idle watch pushes the user only when the user must act · status: done
+
+From builds (not the user), 2026-11-14 15:10: the user could not understand the phone push `mac_idle.stuck` ("Waiting tests are not using the Mac", 13:22) and asked for a fix for good. A phone push goes out only when the user must act, in plain words; a session acts on all else.
+
+#### As-built
+
+- Cause of the 13:22 push: a kept claim (holder cargo-liner). The kept-claim takeover 5214a5d reached `~/.claude` main at 12:41, but the admission service ran from its 12:01 start until 13:40. The takeover is live since that restart.
+- A free Mac, an idle claim, a block and the disk case send no phone push. `watch_once` sends them as the one message to builds (`notify_outage`), and free-Mac repairs still run.
+- An unreachable Mac with waiting calls past `alert_seconds` messages builds once. After `push_seconds` it pushes `mac_idle.unreachable` once (need blocked, key `mac-idle-<since>`) and runs no repairs. The unreachable state writes `idle.json`, so its outage start holds across passes.
+- `mac_idle.unreachable` (`push_catalog.py`): title "Mac tests stopped", action "Wake the Mac or check its network.", body "Mac tests stopped {minutes} min ago." and "{tests}; builds cannot reach the Mac." `waiting_tests()` writes "1 test waits" or "N tests wait".
+- `mac_idle.py cleared --since <since>` is the push's clears-when. It exits 1 while the fresh saved alert is unreachable with that start and waiting tests; else 0.
+- `mac_idle.stuck`, `mac_idle.blocked` and `mac_idle_reservation` are gone from the catalog and from `push_texts_reviewed.json`. The unreadable state does not change.
+- Calls sent to builds, each a one-line revert: the idle states send no push; the new unreachable push; the unreadable state unchanged.
+- `mac_idle.unreachable` waits for the user's approval (`review.py texts --id mac_idle.unreachable --approve`). Until then `test_every_catalog_example_has_current_approval` fails for it. The other 117 tests in `test_mac_idle` and `test_push_texts` pass.
