@@ -661,6 +661,8 @@ The user asked for these page changes on 2026-11-14 through builds:
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it. `All` shows every region again.
+   The chips show the groups `us`, `eu`, `ap`, `ca` and `sa` in that order, each A to Z; a region outside them comes last.
+   `aws_page.region_filter_key` sets the order; the user asked for it on 2026-11-15 through sdlc and builds.
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.

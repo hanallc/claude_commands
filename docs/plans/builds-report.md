@@ -1638,3 +1638,14 @@ From builds (not the user), 2026-11-15: the lfo row shows its step name as "lfo 
 
 - `memory_feed.mac_work_row`: a placed Mac run's name leaves out `placement <id>`. The id stays in the row's `gate_label`. A `user`, `hana-ci` or `unplaced` run still adds that one word to its name, because it marks an exception.
 - `test_memory_feed`: a placed run's name has no `placement`, and its `gate_label` keeps the id.
+
+### Phase 93 — The AWS prices region filter sorts by group, then A to Z · status: done
+
+From the user (via sdlc and builds), 2026-11-15, for the AWS prices page: "it needs top sort the filters alphabetically within the following groups us eu ap ca sa". sdlc reads it as: the region filters show in the group order us, eu, ap, ca, sa, and each group sorts its regions alphabetically.
+
+#### As-built
+
+- `aws_page.page_data`: `regions` sorts by `region_filter_key`, which takes the group from `REGION_GROUPS` (`us`, `eu`, `ap`, `ca`, `sa`), then the region name. A region outside the groups comes last, A to Z.
+- The tables keep their row order; only the filter chips change.
+- `test_control`: the page data regions follow the key, and a mixed list sorts into the group order.
+- Proof: `phases/93/proof/before-1400-dark.png` and `after-1400-dark.png`, from the live AWS state.
