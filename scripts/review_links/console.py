@@ -1,4 +1,4 @@
-"""Publish one navigation shell for the administrative pages."""
+"""Render one navigation shell for the administrative pages."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,11 +7,10 @@ import html
 import importlib
 from pathlib import Path
 import re
-import tempfile
 from typing import cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from scripts.lib import atomic_file, conf
+from scripts.lib import conf
 from scripts.review_links import review_link
 
 PAGE_NAME = "console.html"
@@ -124,25 +123,6 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu"))
     return content.encode("utf-8")
-
-
-def publish() -> str:
-    """Publish the console beside Changes, or in its own snapshot when Changes is unavailable."""
-    root = review_link.review_root().resolve()
-    pages = read_pages()
-    content = render(pages, read_rebuilds())
-    for page in pages:
-        if page.identity == "changes" and isinstance(page.destination, AvailablePage):
-            path = unquote(urlsplit(page.destination.path).path)
-            target = (root / path.lstrip("/")).with_name(PAGE_NAME)
-            if not target.resolve().is_relative_to(root) or not target.parent.is_dir():
-                raise ValueError("the Changes page is outside the review root or is not available")
-            atomic_file.write_bytes_atomic(target, content, mode=0o600)
-            return review_link.snapshot_url(root, target) + "?page=changes"
-    with tempfile.TemporaryDirectory(prefix="admin-console-") as temporary:
-        source = Path(temporary) / PAGE_NAME
-        _ = source.write_bytes(content)
-        return review_link.snapshot_at(root, [source], new=True)[0] + "?page=" + pages[0].identity
 
 
 DOCUMENT = """<!doctype html>

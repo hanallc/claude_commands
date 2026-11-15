@@ -55,7 +55,7 @@ The JSON output contains the newest record fields with the joined `reason`.
 `read_needs() -> list[MachineNeeds]` gives the rebuilds page the same summaries as the list command.
 Each `MachineNeeds` contains `newest: NeedRecord` and `reasons: tuple[str, ...]`.
 Its `records: tuple[NeedRecord, ...]` retains each open record, from oldest to newest.
-The Hana console's bottom-left rebuild link reads `/<snapshot>/rebuilds.html` and shows only while a need is open.
+The Hana console's bottom-left rebuild link reads `/console/rebuilds.html` and shows only while a need is open.
 Its label names each machine and the count of open needs.
 A click opens an overlay that lists the records newest first for each machine, after the rebuild instruction.
 Each record shows its reason, source agent, affected session when different, and full commit, with current staff names and kinds.
