@@ -10,10 +10,10 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from collections.abc import Generator, Sequence
+from collections.abc import Collection, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -25,9 +25,12 @@ KEPT_RESULTS = 300
 
 
 class LandRecord(TypedDict):
+    """A running land; owners[i] is the "unit phase" of commits[i]. An older record has no owners."""
+
     pid: int
     start: str
     commits: list[str]
+    owners: NotRequired[list[str]]
 
 
 class LandResult(TypedDict):
@@ -56,15 +59,15 @@ def results_path() -> Path:
 
 
 @contextmanager
-def landing(commits: Sequence[str]) -> Generator[None]:
-    """Record the commits of this land while the caller runs it."""
+def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[None]:
+    """Record the commits of this land, and the "unit phase" that owns each, while the caller runs it."""
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
         yield
         return
     path = lands_dir() / f"{os.getpid()}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    record: LandRecord = {"pid": os.getpid(), "start": identity.start, "commits": list(commits)}
+    record: LandRecord = {"pid": os.getpid(), "start": identity.start, "commits": list(commits), "owners": list(owners)}
     write_text_atomic(path, json.dumps(record) + "\n")
     try:
         yield
@@ -72,28 +75,31 @@ def landing(commits: Sequence[str]) -> Generator[None]:
         path.unlink(missing_ok=True)
 
 
-def running_commits() -> frozenset[str]:
-    """The commits of every land whose process still runs; remove the record of a land that ended."""
-    commits: set[str] = set()
+def running_lands() -> dict[str, str]:
+    """The commits of every land whose process still runs, each with its "unit phase" or "".
+
+    It removes the record of a land that ended.
+    """
+    commits: dict[str, str] = {}
     try:
         paths = sorted(lands_dir().glob("*.json"))
     except OSError:
-        return frozenset()
+        return {}
     for path in paths:
         try:
             record = cast(LandRecord, json.loads(path.read_text()))
-            pid, start, listed = record["pid"], record["start"], record["commits"]
-        except (OSError, ValueError, KeyError, TypeError):
+            pid, start, listed, owners = record["pid"], record["start"], record["commits"], record.get("owners", [])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             continue
         owner = process_start(pid)
         if owner == Started(start):
-            commits.update(listed)
+            commits.update((commit, owners[index] if index < len(owners) else "") for index, commit in enumerate(listed))
         elif not isinstance(owner, Unreadable):
             path.unlink(missing_ok=True)
-    return frozenset(commits)
+    return commits
 
 
-def holds(running: frozenset[str], commit: str) -> bool:
+def holds(running: Collection[str], commit: str) -> bool:
     """True when a running land names this commit; a land can name a short hash."""
     return any(commit.startswith(listed) or listed.startswith(commit) for listed in running if listed and commit)
 
