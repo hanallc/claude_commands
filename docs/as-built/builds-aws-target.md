@@ -230,6 +230,9 @@ Setup changes the stack through a change set, never through `cloudformation depl
 It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
 A failed create or update calls `spot_end.end_boxes` before it reports the error.
 That call keeps only the box that `hana/setup.json` records.
+It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
+It also deletes the root disks of the ended boxes, because the Hana launch template keeps a root disk after termination.
+A failed create also deletes the failed stack and every unattached disk with the deployment tag.
 
 ## Ending persistent Spot boxes
 
@@ -242,10 +245,12 @@ The request then launches a new box with no tags.
 4. Terminate the boxes and wait until they are terminated.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
-`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, deletes the Hana stack, and removes the local Hana records.
-It keeps the retained data volume and control bucket.
+`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
+It then deletes the data disk, the root disks and the control bucket, and removes the local Hana records.
+The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
-It shows that a failed create, a failed update and the Hana `down` each leave zero open requests and zero boxes.
+It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
+A failed update keeps only the recorded box and its root disk.
 It also shows that each one-time launch uses one-time Spot with terminate.
 
 The provider maps every remote operation through `PROVIDER_OPERATIONS`.
