@@ -328,7 +328,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         if urlsplit(self.path).path == images.PAGE_PATH:
-            self.image_delete()
+            self.image_post()
             return
         try:
             branches = branch_page.page_at(server.root, self.path)
@@ -456,23 +456,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
-    def image_delete(self) -> None:
+    def image_post(self) -> None:
+        """Delete an image or send its feedback; the page shows the reason of a failure on the card."""
         root = cast(ReviewLinksServer, self.server).root
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
-                raise ValueError("empty delete request")
+                raise ValueError("empty image request")
             images.submit(root, self.rfile.read(length).decode("utf-8"))
         except change_page.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
+        except images.FeedbackNotSent as error:
+            self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
+            return
         except ValueError as error:
-            self.browser_failure(400, "Use the delete form on this page.", error)
+            self.browser_failure(400, "Use the form on this page.", error)
             return
         except OSError as error:
-            self.browser_failure(503, "The image could not be deleted. Try again.", error)
+            self.browser_failure(503, "The image could not be changed. Try again.", error)
             return
-        self.json_response(200, {"state": "deleted"})
+        self.json_response(200, {"state": "done"})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)

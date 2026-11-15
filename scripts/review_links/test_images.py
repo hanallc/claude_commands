@@ -1,4 +1,4 @@
-"""Test image registration, the Images page, and deletes in private folders."""
+"""Test image registration, the Images page, deletes and feedback in private folders."""
 from __future__ import annotations
 
 import json
@@ -40,6 +40,8 @@ class ImagesFixture(unittest.TestCase):
         for stem in ("console", "review_links", "change_review"):
             _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
                                 configuration / f"{stem}.conf")
+        settings = configuration / "review_links.conf"
+        _ = settings.write_text(settings.read_text().replace("delivery_pause_seconds=5", "delivery_pause_seconds=0"))
         self.root = self.temporary / "snapshots"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
@@ -125,13 +127,14 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<option value="week" selected>', source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("'Not deleted: ' + error.message", source)
+        self.assertIn("(feedback ? 'Not sent: ' : 'Not deleted: ') + error.message", source)
+        self.assertIn("new FormData(form, event.submitter)", source)
 
-    def test_card_shows_the_caption_then_aligned_details_then_the_image_and_delete(self) -> None:
+    def test_card_shows_the_caption_details_image_feedback_field_delete_and_send_feedback(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         images.write_record(self.root / images.FOLDER / record["id"], record)
-        card = images.card(record, "token", staff.snapshot())
+        card = images.card(record, "token", staff.snapshot(), 3)
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
         self.assertEqual(card, (
@@ -141,11 +144,15 @@ class ImagesTests(ImagesFixture):
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
             + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
-            + f'<form method="post" data-delete><input type="hidden" name="image" value="{record['id']}">'
+            + f'<form method="post" data-image-form><input type="hidden" name="image" value="{record['id']}">'
             + f'<input type="hidden" name="token" value="{token}">'
-            + '<button type="submit">Delete</button><span role="status" data-delete-status></span></form></article>'))
+            + f'<label for="feedback-{record['id']}">Feedback</label>'
+            + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
+            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
+            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<span role="status" data-image-status></span></div></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
-            self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot()))
+            self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
 
     def test_delete_removes_the_image_at_once_and_sends_no_message(self) -> None:
         record = self.register()
@@ -177,7 +184,52 @@ class ImagesTests(ImagesFixture):
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
         _ = (folder / images.RECORD).write_text(json.dumps(stored))
         self.assertEqual(images.read_record(folder), record)
-        self.assertIn('<button type="submit">Delete</button>', images.render(self.root).decode())
+        self.assertIn('<button type="submit" name="action" value="delete">Delete</button>',
+                      images.render(self.root).decode())
+
+    def feedback_body(self, record: images.ImageRecord, feedback: str) -> str:
+        token = images.request_token(images.console_token(self.root), record["id"])
+        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": "feedback"})
+
+    def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
+        record = self.register("After: the panel. Look at the counts.")
+        images.submit(self.root, self.feedback_body(record, "  The counts are wrong.  "))
+        assert self.owner is not None
+        self.assertEqual(len(self.sent), 1)
+        recipient, sender, message = self.sent[0]
+        self.assertEqual((recipient, sender), (f"session:{self.owner.current_session}", "images"))
+        self.assertEqual(message, "\n".join((
+            "From the user (via the Images page): feedback on your image.",
+            "Feedback: The counts are wrong.",
+            f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
+            "Caption: After: the panel. Look at the counts.",
+            "For: Phase console-images",
+            "After you act on it, delete the image: "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}")))
+        folder = self.root / images.FOLDER / record["id"]
+        self.assertTrue((folder / "image.png").is_file())
+        self.assertIn("feedback_at", images.read_record(folder))
+        self.assertNotIn(record["id"], images.render(self.root).decode())
+        images.delete(self.root, record["id"])
+        self.assertEqual(images.records(self.root), [])
+
+    def test_feedback_that_reaches_no_one_keeps_the_image_shown(self) -> None:
+        record = self.register()
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")) as send:
+            with self.assertRaisesRegex(images.FeedbackNotSent, "session gone"):
+                images.submit(self.root, self.feedback_body(record, "Wrong colors."))
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(images.records(self.root), [record])
+        self.assertIn(record["id"], images.render(self.root).decode())
+
+    def test_feedback_refuses_empty_text_and_an_unknown_action(self) -> None:
+        record = self.register()
+        token = images.request_token(images.console_token(self.root), record["id"])
+        for body, reason in ((self.feedback_body(record, "   "), "enter feedback"),
+                             (urlencode({"image": record["id"], "token": token, "action": "move"}), "use the form")):
+            with self.subTest(reason=reason), self.assertRaisesRegex(change_page.AnswerRefused, reason):
+                images.submit(self.root, body)
+        self.assertEqual((images.records(self.root), self.sent), ([record], []))
 
 
 class ImagesServerTests(ImagesFixture):
@@ -225,11 +277,24 @@ class ImagesServerTests(ImagesFixture):
         self.assertEqual(cast(dict[str, str], json.loads(body)), {"reason": "the image token does not match this page"})
         token = images.request_token(images.console_token(self.root), record["id"])
         status, _, body = self.http("POST", images.PAGE_PATH, urlencode({"image": record["id"], "token": token}))
-        self.assertEqual((status, cast(dict[str, str], json.loads(body))), (200, {"state": "deleted"}))
+        self.assertEqual((status, cast(dict[str, str], json.loads(body))), (200, {"state": "done"}))
         self.assertEqual(images.records(self.root), [])
         self.assertEqual(self.sent, [])
         status, _, _ = self.http("GET", images.image_path(record))
         self.assertEqual(status, 404)
+
+    def test_server_sends_feedback_and_answers_503_when_it_reaches_no_one(self) -> None:
+        record = self.register()
+        token = images.request_token(images.console_token(self.root), record["id"])
+        body = urlencode({"image": record["id"], "token": token, "feedback": "Too dark.", "action": "feedback"})
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")):
+            status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual((status, cast(dict[str, str], json.loads(answer))),
+                         (503, {"reason": "the owner did not get the message (session gone). Try again."}))
+        status, _, answer = self.http("POST", images.PAGE_PATH, body)
+        self.assertEqual((status, cast(dict[str, str], json.loads(answer))), (200, {"state": "done"}))
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn(record["id"], self.http("GET", images.PAGE_PATH)[2].decode())
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()
