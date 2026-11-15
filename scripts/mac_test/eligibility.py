@@ -13,6 +13,7 @@ from typing import Literal, NewType, cast
 from urllib.parse import quote
 
 from scripts.build_targets import target_config
+from scripts.direct.step_selection import MAC_FLAG_ABSENT, MacFlag, MacFlagGiven
 from scripts.buildlog import repository, store
 from scripts.lib import conf
 from scripts.mac_test import cargo_manifest
@@ -350,6 +351,15 @@ def step_package(kind: str, package: str) -> str:
     return "" if kind in WORKSPACE_STEP_KINDS else package
 
 
+# These kinds only compile. linux_only exists to keep tests off the Mac.
+COMPILE_ONLY_STEP_KINDS = frozenset({"check", "lint", "doc"})
+
+
+def linux_only_applies(kind: str, mac_flag: MacFlag) -> bool:
+    """Apply linux_only unless the caller gave --mac for a kind that only compiles."""
+    return not (isinstance(mac_flag, MacFlagGiven) and kind in COMPILE_ONLY_STEP_KINDS)
+
+
 def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     """Check a named package alone, or the whole workspace when no package is named.
 
@@ -396,7 +406,8 @@ def recorded_step_kind(step: str) -> str:
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
-                         backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
+                         backoff: BackoffState | ReadBackoff = READ_BACKOFF,
+                         mac_flag: MacFlag = MAC_FLAG_ABSENT) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     if not config.enabled:
         return IneligibleMacStep("off")
@@ -407,8 +418,9 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
         if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
             return IneligibleMacStep("target does not permit this command")
         return backoff_eligibility(repository, target, backoff)
-    policy = linux_only_policy(config, repository, repo_root, step_package(kind or verb_kind(verb), package))
-    if isinstance(policy, IneligibleMacStep):
+    step_kind = kind or verb_kind(verb)
+    policy = linux_only_policy(config, repository, repo_root, step_package(step_kind, package))
+    if isinstance(policy, IneligibleMacStep) and (policy.reason != "linux_only" or linux_only_applies(step_kind, mac_flag)):
         return policy
     return backoff_eligibility(repository, target, backoff)
 

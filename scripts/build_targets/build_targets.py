@@ -162,7 +162,7 @@ from scripts.build_targets.target_config import (
     SshTarget,
     read_targets,
 )
-from scripts.direct.step_selection import Pinned, ROUTED, TargetSelection
+from scripts.direct.step_selection import MAC_FLAG_ABSENT, MAC_FLAG_GIVEN, MacFlag, Pinned, ROUTED, TargetSelection
 
 
 class ActiveWaitProcess(TypedDict):
@@ -346,7 +346,7 @@ def fixed_placement_constraints(
     repo_root: Path, package: str, kind: StepKind, command: tuple[str, ...],
     session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
-    provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
+    provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS, mac_flag: MacFlag = MAC_FLAG_ABSENT,
 ) -> placement.PlacementConstraints:
     """Keep dynamic host conditions out of the submitted candidate set."""
     from scripts.build_queue import placement
@@ -381,7 +381,8 @@ def fixed_placement_constraints(
                 host_eligibility = placement.FixedExclusion("repo")
             else:
                 excluded = eligibility.comma_values(config.values[key])
-                if eligibility.has_linux_only(repo_root, eligibility.step_package(kind, package), excluded):
+                if (eligibility.linux_only_applies(kind, mac_flag)
+                        and eligibility.has_linux_only(repo_root, eligibility.step_package(kind, package), excluded)):
                     host_eligibility = placement.FixedExclusion("linux_only")
         elif not eligibility.linux_kind_permitted(config.values, kind):
             host_eligibility = placement.FixedExclusion("target does not permit this command")
@@ -418,7 +419,8 @@ def command_constraints(args: CliArguments) -> int:
     selection = Pinned(args.target or "mac") if args.target or args.mac_only else ROUTED
     rule = step_routing_rule(cast(StepKind, args.kind), routing, selection)
     constraints = fixed_placement_constraints(Path(args.repo_root).resolve(), args.package,
-        cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
+        cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection,
+        mac_flag=MAC_FLAG_GIVEN if args.mac_only else MAC_FLAG_ABSENT)
     print("any_target" if isinstance(rule, AnyTarget) else f"natedev_only {rule.reason}")
     shown: set[str] = set()
     for candidate in constraints.candidates:
@@ -463,7 +465,7 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 
 
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
-                backoff: eligibility.BackoffState | eligibility.ReadBackoff,
+                backoff: eligibility.BackoffState | eligibility.ReadBackoff, mac_flag: MacFlag = MAC_FLAG_ABSENT,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
@@ -472,12 +474,12 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
-        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff)
+        remote_verb(cast(StepKind, first)), name, kind=first, backoff=backoff, mac_flag=mac_flag)
     if isinstance(repository, eligibility.IneligibleMacStep):
         return ExcludedTarget(target, repository.reason)
     for step in rest:
         policy = eligibility.mac_step_eligibility(config, repo_root, package,
-            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff)
+            remote_verb(cast(StepKind, step)), name, kind=step, backoff=backoff, mac_flag=mac_flag)
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     return repository
@@ -578,6 +580,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_flag: MacFlag = MAC_FLAG_ABSENT,
                            ) -> EligibleTarget | ExcludedTarget:
 
     from scripts.mac_test import eligibility, mac_test
@@ -588,7 +591,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     try:
         config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
         name = target.name if isinstance(target, SshTarget) else "mac"
-        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF)
+        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF, mac_flag=mac_flag)
         if isinstance(repository, ExcludedTarget):
             return repository
         if isinstance(answer, CapacityNotRead):
@@ -629,6 +632,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+                           mac_flag: MacFlag = MAC_FLAG_ABSENT,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
 
@@ -640,7 +644,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if new_step and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
-            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer, session=session)
+            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer, session=session,
+                                          mac_flag=mac_flag)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
     config = ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
@@ -981,7 +986,8 @@ def command_kind_eligible(repo_root: Path, package: str, kind: StepKind, routing
             ExcludedTarget(target, decision.reason) if isinstance(target, SshTarget) and isinstance(decision, NatedevOnly) and not new_step
             else ssh_target_eligibility(target, repo_root, package, kind,
                 LocalRequired(decision.reason) if isinstance(decision, NatedevOnly) else routing,
-                selection=Pinned(target.name) if mac_only else ROUTED, new_step=new_step)
+                selection=Pinned(target.name) if mac_only else ROUTED, new_step=new_step,
+                mac_flag=MAC_FLAG_GIVEN if mac_only else MAC_FLAG_ABSENT)
             if isinstance(target, SshTarget) else EligibleTarget(target)
             for target in read_targets()
             if not mac_only or isinstance(target, SshTarget) and target.platform == "macos"

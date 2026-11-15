@@ -49,7 +49,7 @@ from scripts.lib import process_start as process_identity
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
-from scripts.direct.step_selection import Pinned
+from scripts.direct.step_selection import MAC_FLAG_ABSENT, MAC_FLAG_GIVEN, MacFlag, Pinned
 
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -523,6 +523,7 @@ class OffloadRequest:
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
     placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    mac_flag: MacFlag = MAC_FLAG_ABSENT
 
     @property
     def source_root(self) -> Path:
@@ -802,6 +803,7 @@ class CliArguments(argparse.Namespace):
         self.nextest_words: list[str] = []
         self.verb: MacVerb = "nextest"
         self.kind: str = ""
+        self.mac_only: bool = False
         self.claim_owner_pid: int = 0
         self.claim_id: str = ""
         self.episode: str = ""
@@ -2516,7 +2518,8 @@ def run_offload(
 ) -> MacOffloadResult:
     from scripts.copies import copies
 
-    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target, kind=request.kind)
+    decision = eligibility.mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target,
+                                                kind=request.kind, mac_flag=request.mac_flag)
     if isinstance(decision, IneligibleMacStep):
         return declined(decision.reason, started)
     repository = decision
@@ -2532,9 +2535,10 @@ def run_offload(
         decline_path.unlink(missing_ok=True)
     if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
-            scoped_package = eligibility.step_package(request.kind or eligibility.verb_kind(request.verb), request.package)
-            if eligibility.has_linux_only(request.source.root, scoped_package,
-                              eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
+            step_kind = request.kind or eligibility.verb_kind(request.verb)
+            if eligibility.linux_only_applies(step_kind, request.mac_flag) and eligibility.has_linux_only(
+                    request.source.root, eligibility.step_package(step_kind, request.package),
+                    eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
                 return declined("linux_only", started)
         except (OSError, UnicodeError, ValueError):
             return declined("repo", started)
@@ -2662,6 +2666,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--package", default="")
     _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc", "build"), default="nextest")
     _ = run.add_argument("--kind", default="")
+    _ = run.add_argument("--mac-only", action="store_true")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
     _ = run.add_argument("--target", default="")
@@ -2724,6 +2729,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         copy=arguments.copy,
         verb=arguments.verb,
         kind=arguments.kind,
+        mac_flag=MAC_FLAG_GIVEN if arguments.mac_only else MAC_FLAG_ABSENT,
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
         fetch=FetchFolder(arguments.fetch.removesuffix("/")) if arguments.fetch is not None else NO_FETCH,

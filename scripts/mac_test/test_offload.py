@@ -23,6 +23,7 @@ from unittest import mock
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, offload, claim_state
+from scripts.direct import step_selection
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission
 if TYPE_CHECKING:
@@ -1259,6 +1260,45 @@ class OffloadCommandTests(OffloadCommandFixture):
                                  eligibility.IneligibleMacStep("linux_only"))
         self.assertIsInstance(eligibility.mac_step_eligibility(config, self.repository, "portable", "clippy", kind="example"),
                               eligibility.KnownRepository)
+
+    def test_mac_flag_compiles_a_linux_only_package_and_keeps_tests_off(self) -> None:
+        # linux_only exists for tests; --mac on a kind that only compiles may judge the package's macOS code.
+        self.write_portable_workspace()
+        _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
+        member = self.repository / "linux-part"
+        member.mkdir(exist_ok=True)
+        _ = (member / "Cargo.toml").write_text('[package]\nname="linux-part"\nversion="0.1.0"\n')
+        self.config["linux_only.hana"] = "linux-part"
+        self.sync_config()
+        config = eligibility.read_config(self.config_path)
+        steps: tuple[tuple[eligibility.MacVerb, str, bool], ...] = (
+            ("clippy", "lint", True), ("mend-check", "lint", True), ("check", "check", True), ("doc", "doc", True),
+            ("nextest", "test", False), ("build", "build", False), ("clippy", "example", False))
+        for verb, kind, compiles in steps:
+            with self.subTest(verb=verb, kind=kind):
+                for package in ("linux-part", "portable"):
+                    given = eligibility.mac_step_eligibility(config, self.repository, package, verb, kind=kind,
+                                                             mac_flag=step_selection.MAC_FLAG_GIVEN)
+                    if compiles or package == "portable" and kind not in eligibility.WORKSPACE_STEP_KINDS:
+                        self.assertIsInstance(given, eligibility.KnownRepository)
+                    else:
+                        self.assertEqual(given, eligibility.IneligibleMacStep("linux_only"))
+                self.assertEqual(eligibility.mac_step_eligibility(config, self.repository, "linux-part", verb, kind=kind),
+                                 eligibility.IneligibleMacStep("linux_only"))
+        _ = self.config.pop("linux_only.hana")
+        self.sync_config()
+        self.assertEqual(eligibility.mac_step_eligibility(eligibility.read_config(self.config_path), self.repository,
+                                                          "linux-part", "clippy", kind="lint",
+                                                          mac_flag=step_selection.MAC_FLAG_GIVEN),
+                         eligibility.IneligibleMacStep("repo"))
+
+    def test_runner_reads_the_mac_flag(self) -> None:
+        for words, flag in ((["--mac-only"], step_selection.MAC_FLAG_GIVEN), ([], step_selection.MAC_FLAG_ABSENT)):
+            with self.subTest(words=words):
+                arguments = offload.parser().parse_args(
+                    ["run", "--repo-root", str(self.repository), "--call-id", "call-1", *words],
+                    namespace=offload.CliArguments())
+                self.assertEqual(offload.request_from_arguments(arguments).mac_flag, flag)
 
     def test_workspace_test_with_a_linux_only_member_declines_before_claim(self) -> None:
         self.write_portable_workspace()

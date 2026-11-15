@@ -444,6 +444,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
                 self.assertEqual(event["args"][index:index + len(forwarded)], forwarded)
                 self.assertNotIn("a secret\nvalue", event["args"])
                 self.assertNotIn("--mac", event["args"])
+                self.assertIn("--mac-only", event["args"])
                 self.assertEqual(self.last_call()["command"], "test sample")
                 self.assertEqual({path: path.read_bytes() for path in self.saved_results()}, cache)
                 self.assertEqual(self.local_runs(), [])

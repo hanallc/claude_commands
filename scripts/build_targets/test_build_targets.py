@@ -30,6 +30,7 @@ from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
 from scripts.build_queue import placement
+from scripts.direct import step_selection
 from scripts.build_targets import targets, target_config
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.message import roster
@@ -824,6 +825,27 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, placement.FixedExclusion("linux_only"))
         self.assertIn("mac\teligible", self.kind_output("check", "portable"))
+
+    def test_mac_flag_compiles_a_linux_only_package_and_keeps_its_tests_off(self) -> None:
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\n')
+        cases: tuple[tuple[build_targets.StepKind, bool], ...] = (
+            ("lint", True), ("check", True), ("doc", True), ("test", False))
+        for kind, allowed in cases:
+            with self.subTest(kind=kind):
+                for mac_flag, expected in ((step_selection.MAC_FLAG_GIVEN, allowed), (step_selection.MAC_FLAG_ABSENT, False)):
+                    constraints = build_targets.fixed_placement_constraints(
+                        self.root, "linux-part", kind, ("cargo", kind), NoOwningSession(), "fixed-source",
+                        mac_flag=mac_flag)
+                    mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+                    self.assertEqual(mac.eligibility,
+                                     placement.AllowedHost() if expected else placement.FixedExclusion("linux_only"))
+                for flags, expected in ((["--mac"], allowed), (["--target", "mac"], False)):
+                    output = io.StringIO()
+                    with (mock.patch.object(sys, "argv", ["build_targets.py", "constraints", "--repo-root", str(self.root),
+                                                           "--kind", kind, "--package", "linux-part", *flags]),
+                          redirect_stdout(output)):
+                        self.assertEqual(build_targets.main(), 0)
+                    self.assertIn("mac\teligible" if expected else "mac\texcluded\tlinux_only", output.getvalue())
 
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")

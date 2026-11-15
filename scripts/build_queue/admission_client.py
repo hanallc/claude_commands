@@ -54,7 +54,8 @@ class PlacementConstraintBuilder(Protocol):
                  kind: Literal["check", "lint", "doc", "test", "build", "example", "final"],
                  command: tuple[str, ...], session: placement.SubmittingSession,
                  source_key: placement.SourceIdentity, routing: target_config.Routing,
-                 selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
+                 selection: step_selection.TargetSelection, *, writes_tree: bool,
+                 mac_flag: step_selection.MacFlag) -> placement.PlacementConstraints: ...
 
 
 CLOCK: ClientClock = SystemClock()
@@ -1240,7 +1241,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             cast(Literal["check", "lint", "doc", "test", "build", "example", "final"], kind), tuple(step_argv), session,
             placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
-            writes_tree=args.writes_tree)
+            writes_tree=args.writes_tree,
+            mac_flag=step_selection.MAC_FLAG_GIVEN if args.mac_only else step_selection.MAC_FLAG_ABSENT)
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())

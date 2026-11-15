@@ -15,3 +15,18 @@ class Pinned:
 
 TargetSelection = Routed | Pinned
 ROUTED = Routed()
+
+
+@dataclass(frozen=True)
+class MacFlagGiven:
+    """The caller gave --mac."""
+
+
+@dataclass(frozen=True)
+class MacFlagAbsent:
+    """The caller did not give --mac."""
+
+
+MacFlag = MacFlagGiven | MacFlagAbsent
+MAC_FLAG_GIVEN = MacFlagGiven()
+MAC_FLAG_ABSENT = MacFlagAbsent()

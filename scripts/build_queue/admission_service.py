@@ -43,6 +43,7 @@ from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
+from scripts.direct import step_selection
 from scripts.lint import memory_admit as gate
 
 from scripts.buildlog import store
@@ -2367,13 +2368,16 @@ class AdmissionServer:
         if kind not in ("check", "lint", "doc", "test", "build", "example", "final"):
             # The target can never run this command, so a pinned step refuses at once.
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.FixedExclusion("command"))
+        mac_flag = (step_selection.MAC_FLAG_GIVEN if isinstance(request.constraints.selection, placement.MacOnlyHost)
+                    else step_selection.MAC_FLAG_ABSENT)
         if isinstance(target, target_config.SshTarget):
             answer = build_targets.ssh_target_eligibility(target, Path(request.constraints.repository),
                 request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET,
-                new_step=True, session=key.session)
+                new_step=True, session=key.session, mac_flag=mac_flag)
         else:
             answer = build_targets.mac_target_eligibility(target, Path(request.constraints.repository),
-                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session)
+                request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
+                mac_flag=mac_flag)
         eligibility: placement.HostEligibility = (placement.TemporaryExclusion(answer.reason)
             if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
         paths = claim_state.state_paths(destination.target)

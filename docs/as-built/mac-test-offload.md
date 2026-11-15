@@ -17,6 +17,13 @@ A step with no package refuses Mac offload when any workspace member is `linux_o
 `lint` and `doc` steps cover the whole workspace for every package, so they always use the workspace check.
 `eligibility.step_package` holds this rule.
 Without it, a `lint hana_diegetic --check` on the Mac judged the macOS code of `hana_video`, which CI never judges.
+`linux_only` exists to keep tests off the Mac.
+An explicit `--mac` on a `check`, `lint` or `doc` step ignores `linux_only`, so these steps can judge macOS code.
+`test`, `build` and `example` steps keep the rule with `--mac`.
+Only `--mac` counts: `--target mac` and the held lint sequence keep the rule.
+`eligibility.linux_only_applies` holds this rule, with `COMPILE_ONLY_STEP_KINDS`.
+verify.sh passes `--mac` to the constraints command, `--mac-only` to `place-step` and to the runner.
+Admission reads it from the `MacOnlyHost` selection.
 
 `fixed_placement_constraints` retains every configured candidate that a fixed rule permits.
 Disk, busy, spending, reachability, and hold results remain refreshed evidence.

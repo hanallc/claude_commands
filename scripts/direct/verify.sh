@@ -2218,6 +2218,7 @@ try_mac_test() {
     local remote_kind
     remote_kind=$(remote_step_kind)
     runner_args+=(--kind "$remote_kind")
+    if [[ "$MAC_ONLY" == 1 ]]; then runner_args+=(--mac-only); fi
     if [[ -n "$MAC_SOURCE_ROOT" ]]; then runner_args+=(--source-root "$MAC_SOURCE_ROOT"); fi
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
         runner_args+=(--last-decline "$2")
