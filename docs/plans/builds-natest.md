@@ -4066,20 +4066,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; sdlc go 2026-11-15).
 
-#### Work Order
+#### As-built
 
-**Goal:** each `lock_file_descriptor` call costs one small perl start, with the same exit codes.
-
-**Spec:**
-- `scripts/direct/file_lock.sh` finds perl once, when a script sources it: `command -v perl`, then `/run/current-system/sw/bin/perl`, then `/usr/bin/perl`. It keeps the result in `FILE_LOCK_PERL`.
-- The perl text uses the numbers 2 (LOCK_EX) and 4 (LOCK_NB), the same on Linux and macOS, so it loads no Fcntl.
-- It saves the errno and loads Errno only after a refusal. Exit codes: 0 lock, 75 busy, 2 error.
-- One perl path stays for Linux and the Mac (534089ccf: the Mac has no flock(1)).
-
-**Files:** `scripts/direct/file_lock.sh`.
-
-**Workers:** 1 writer; no split (one file). impl: `scripts/direct/file_lock.sh`. test opens as impl.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** AWS pair on the verify modules shows a CPU saving with all tests passing.
+- `scripts/direct/file_lock.sh` finds perl once, when a script sources it, and keeps it in `FILE_LOCK_PERL`. The lookup is `command -v perl`, then `/run/current-system/sw/bin/perl`, then `/usr/bin/perl`.
+- The perl text uses 2 (LOCK_EX) and 4 (LOCK_NB) and loads no Fcntl. It saves the errno and loads Errno only after a refusal: exit 0 lock, 75 busy, 2 error.
+- Each lock costs 0.9 ms CPU, not 5.8 ms. One perl path stays for Linux and the Mac.
+- AWS pair (3 rounds, median CPU s): 9 modules 228.02 -> 213.42; `test_verify_mac_only` 31.38 -> 27.88; `test_verify_ssh_targets_routing` 28.63 -> 25.83.
+- Commit 55ba55287. Production change (sdlc go 2026-11-15).
