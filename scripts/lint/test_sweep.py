@@ -4518,6 +4518,9 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
                                ("Mac", "git checkout target root"), ("natedev", "git checkout target root"),
                                ("Mac", "recorded git checkout target root"), ("natedev", "recorded git checkout target root")):
             with self.subTest(machine=machine, links=links), self.crossing_delivery({}) as delivery:
+                # The fixture paths are under TMPDIR, so their length varies. This test checks the choice
+                # text, not the length fit, so neither limit may drop a folder line.
+                _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=100000\nsweep_push_text_limit=100000\n")
                 held_targets: tuple[str, ...] = ()
                 if machine == "Mac":
                     root = delivery.base / "rust"
