@@ -4384,27 +4384,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 306
 **Owner:** natest (builds gave a go on 11-15: fix 2 of the flow cost plan, with the git_identity cache folded in; verify-unit reviews the verify.sh diff).
 
-#### Work Order
+#### As-built
 
-**Goal:** each `verify_helper` call in verify.sh starts no `env` process and forks no request subshell, and place-step runs its git identity checks once per process. Measured cost now: about 100 natedev ms per flow, about 70 AWS s over the verify family (estimate from p305/flowcost.txt: perl 1.27 ms per call, env 1.0 ms per call, one inner subshell fork per call, 23.5 calls per flow).
-
-**Spec:**
-1. **Request write without a fork.** In `verify_helper` (verify.sh about line 596), the `( printf …; env -0; … ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null` subshell becomes a `{ …; }` group with the same redirections. The bytes on the pipe do not change.
-2. **Environment without `env`.** When bash is 5.3 or newer (`BASH_VERSINFO`), write the exported variables with `compgen -V names -e` and one `printf '%s=%s\0' "$name" "${!name}"` for each name. Check bash on natedev, the Mac and the AWS gate image. If all three run 5.3 or newer, ship one path and remove `env -0`. Otherwise keep `env -0` only for the machine that needs it, and name it. verify.sh exports no functions (no `export -f`); state in the report what `env -0` sends that the builtin form does not (for example `BASH_FUNC_*` entries from a caller) and why no helper program needs it. A test checks that the helper sees the same environment as `env -0` for a fixture environment with spaces, `=`, newlines and empty values in values.
-3. **Lock stays as it is.** Every call keeps the perl `flock` (file_lock.sh `lock_file_descriptor`). Builds dropped the windowed lock on 11-15: it adds a mode the code must track by hand, and a missed set is silent and unsafe. About 30 ms per flow does not pay for that. Simple ranks above fast. A later phase may propose a lock that is always on and starts no process, with its measured gain.
-4. **git identity once per helper process.** `step_estimator.git_identity(argv, cwd)` runs 3-4 git processes per call (record.git_facts, repository.repository_key) and place-step calls it 2.9 times per flow. Cache its result for each git directory for the life of the process. Check every caller and test of `git_identity` (`ci_cargo_front.py`, `width_trial.py`, `test_memory_admit.py`, `test_admission_client.py`, `test_admission_service.py`, `test_merge_gate_suites_admission.py`) for a case that changes a repository's origin or root within one process; such a test clears the cache.
-5. No signal handlers in new Python code. Do not touch `finish_mac_fix` (verify-unit's acffebbc6; test_fix_return.py reads it by its `finish_mac_fix() {` line), or the berth guard area (`run_lint_sequence`, the clippy fix loop in `run_lint_judgment`), which verify has in flight.
-6. Tests: new checks run in process or in one small bash program each; no new full verify.sh flow. Every behavior check stays.
-7. Measure with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <copy> --commands 15` on the 8 sample modules, before and after, in `copies.py run` copies (fresh TMPDIR). Report CPU s, process starts and env starts per module.
-
-**Files:** `scripts/direct/verify.sh`, `scripts/build_queue/step_estimator.py`, `scripts/direct/test_verify_helper.py`, and a test beside `step_estimator` for the cache (`scripts/build_queue/test_step_estimator.py` if it exists, otherwise the closest existing module). The worker may read every file named above.
-
-**Workers:** 1 writer; one shell function and one cache.
-- impl: all files.
-
-**Constraints from prior phases:** Phase 306: `try_mac_test` reads the runner result through `runner_result.py` in the helper. Phase 232: no signal handlers. Shellcheck baseline on verify.sh: 23 findings; add none.
-
-**Acceptance gate:** test_verify_helper, test_verify_step_routes_helpers, the 8 sample modules, test_verify_mac_only, test_verify_wait_holder, test_verify_token_renew and every module that calls `git_identity` pass on natedev; basedpyright is clean on changed Python; `bash -n` and shellcheck on verify.sh add no finding; verify-unit reviews the diff; an AWS pair shows the saving.
+- `verify_helper` in verify.sh writes each request in a `{ ...; }` group (no subshell). `compgen -V names -e` and `printf '%s=%s\0'` send the exported variables in place of `env -0`; array exports and `BASH_FUNC_*` entries are not sent. A compgen failure fails the write, so the local fallback runs. `trap '' PIPE` during the write keeps the dead-helper fallback. The perl lock and the `--stdin` capture are unchanged.
+- natedev, the Mac and the AWS gate run bash 5.3.9 (the gate takes bash from natedev's locked nixpkgs rev), so there is one path.
+- `step_estimator.git_identity` caches by `(git directory, cwd)` for the life of the process; `clear_git_identity_cache` clears it for tests.
+- Tests: new `scripts/build_queue/test_step_estimator.py` (2 cache tests); `test_verify_helper` checks environment equality, the same-shell write and the compgen fallback in one bash program.
+- Paired A/B on 4 verify modules, 3 rounds: about 11% fewer process starts; env starts on the 8 sample modules 1,128 to 102; the natedev CPU change is below load noise. The AWS pair measures it.
+- Builds dropped the windowed lock (spec item 3) on 11-15: a mode tracked by hand, and a missed set is silent and unsafe.
+- Commit effcb3c11. verify-unit reviewed the diff.
 
 ### Phase 308 — A Mac clippy failure in verify.sh lint starts no local mend fix  · status: todo
 **Depends on:** Phase 307
