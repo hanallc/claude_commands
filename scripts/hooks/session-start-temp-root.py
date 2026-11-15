@@ -3,7 +3,7 @@
 
 Test runs, mktemp and tempfile left their folders loose in /tmp, and nothing named their maker
 (user, 2026-10-27). Each session gets its session folder at start (and again at resume, clear and
-compact, should it be gone): /session/<member name> (scripts/lib/session_folder.py), or
+compact, should it be gone): /session/<shown name> (scripts/lib/session_folder.py), or
 /tmp/claude/session/<session id> until the session root exists. Claude Code reads the
 `export TMPDIR=...` line this hook writes to $CLAUDE_ENV_FILE before each Bash command. The path
 stays short, so a Unix socket made in TMPDIR fits the 104-byte limit on the Mac.
@@ -44,13 +44,14 @@ def main() -> int:
         raw = cast(object, json.loads(sys.stdin.read()))
     except (ValueError, UnicodeDecodeError):
         return 0
-    session_id = cast(dict[str, object], raw).get("session_id") if isinstance(raw, dict) else None
+    fields = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+    session_id, cwd = fields.get("session_id"), fields.get("cwd")
     env_file = os.environ.get("CLAUDE_ENV_FILE")
     if not isinstance(session_id, str) or not session_folder.SESSION_ID.fullmatch(session_id) or not env_file:
         return 0
     try:
         # The session uses this TMPDIR after the startup hook exits.
-        path = session_folder.session_folder(session_id) or build_folders.create_build_folder(
+        path = session_folder.session_folder(session_id, cwd if isinstance(cwd, str) else "") or build_folders.create_build_folder(
             build_folders.StableOwnerFolder(
                 session_id, build_folders.ExplicitBuildParent(session_folder.former_root()), mode=0o700))
         line = export_line(path)

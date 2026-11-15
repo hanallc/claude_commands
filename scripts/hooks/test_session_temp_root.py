@@ -45,16 +45,16 @@ class SessionTempRootTests(unittest.TestCase):
             self.assertFalse((base / "session").exists())
             self.assert_exported(env_file, root)
 
-    def test_with_the_session_root_a_session_without_staff_gets_its_id_name(self) -> None:
+    def test_with_the_session_root_a_session_without_staff_takes_its_working_folder_name(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             (base / "session").mkdir()
             env_file = base / "env.sh"
             for _ in range(2):
-                self.run_hook(base, {"session_id": "abc123-x"}, env_file)
-            root = base / "session" / "session-abc123"
+                self.run_hook(base, {"session_id": "abc123-x", "cwd": "/home/x/worktrees/hana-fix"}, env_file)
+            root = base / "session" / "hana-fix"
             self.assertTrue(root.is_dir())
-            self.assertEqual(os.readlink(base / "session" / ".id" / "abc123-x"), "session-abc123")
+            self.assertEqual(os.readlink(base / "session" / ".id" / "abc123-x"), "hana-fix")
             self.assertFalse((base / "former").exists())
             self.assert_exported(env_file, root)
 

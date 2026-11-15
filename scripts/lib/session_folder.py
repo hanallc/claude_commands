@@ -1,12 +1,13 @@
-"""One folder per Claude session in the session root, named for the session's staff member.
+"""One folder per Claude session in the session root, named for the session's shown name.
 
 The session root is build_folders.conf roots.session (/session on natedev, ~/session on the Mac).
 A session folder holds the session's TMPDIR, its Claude Code scratchpad (claude-<uid>), its tool
-folders and a unit's run folder. The folder name is the member's name (`verify`, `builds`). A
-session with no staff row gets `session-<first 6 characters of its id>`. A second member with the
-same name gets `-2`, `-3` and so on.
+folders and a unit's run folder. The folder name is the staff member's name (`verify`, `builds`);
+a worker adds its unit (`demo-impl`); a session with no staff row takes its working folder's name.
+A name gets `-2`, `-3` and so on only while a live session holds the plain name (user decision 2,
+2026-11-15).
 
-The member owns the folder, not the conversation: a new conversation of the same member uses the
+The name, not the conversation, keeps the folder: a new conversation of the same member uses the
 same folder, so a unit's run folder stays in place. `.session.json` in the folder names the owner
 and the latest session id. `<root>/.id/<session id>` is a link to the folder name, so a hook finds
 its session's folder with one readlink.
@@ -28,7 +29,10 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 ROOT_ENV = "SESSION_TEMP_ROOT"
 # Tests point the former root elsewhere.
@@ -80,10 +84,21 @@ def former_folder(session_id: str) -> Path:
     return former_root() / session_id
 
 
-def folder_name(member: Member | None, session_id: str) -> str:
-    if member is None:
-        return f"session-{session_id[:6]}"
-    return UNSAFE.sub("-", member.name).strip(".-") or f"member-{member.id[:6]}"
+def folder_name(member: Member | None, session_id: str, cwd: str = "") -> str:
+    """The member's name, else the working folder's name, as one safe path component."""
+    shown = member.name if member is not None else Path(cwd).name
+    return UNSAFE.sub("-", shown).strip(".-") or f"session-{session_id[:6]}"
+
+
+def member_for(row: staff.StaffRow, record: staff.StaffSnapshot) -> Member:
+    """The row as a folder owner: a worker's name starts with its unit's name (demo-impl)."""
+    from scripts.production import staff
+
+    name = row.name
+    parent = record.by_id(row.parent.id) if row.kind == "worker" and isinstance(row.parent, staff.ReportsTo) else None
+    if parent is not None and not name.startswith(f"{parent.name}-"):
+        name = f"{parent.name}-{name}"
+    return Member(str(row.id), name)
 
 
 def member_of(session_id: str) -> Member | None:
@@ -91,10 +106,24 @@ def member_of(session_id: str) -> Member | None:
     from scripts.production import staff
 
     try:
-        row = staff.local_snapshot().by_current_session(session_id)
+        record = staff.local_snapshot()
+        row = record.by_current_session(session_id)
     except (OSError, ValueError):
         return None
-    return Member(str(row.id), row.name) if row is not None else None
+    return member_for(row, record) if row is not None else None
+
+
+def held_by_another(record: FolderRecord | None, session_id: str) -> bool:
+    """Whether a live session other than this one holds the folder; unknown counts as live."""
+    if record is None or not record["session_id"] or record["session_id"] == session_id:
+        return False
+    from scripts.message import session_records
+
+    try:
+        observed = session_records.session_liveness(record["session_id"])
+    except (OSError, ValueError):
+        return True
+    return not isinstance(observed, session_records.SessionNotLive)
 
 
 def read_record(folder: Path) -> FolderRecord | None:
@@ -144,7 +173,7 @@ def link(root: Path, session_id: str, folder: Path) -> None:
 
 
 def claim(root: Path, owner: str, base: str, session_id: str) -> Path:
-    """The owner's folder: its own existing one, else the first free name. Hold the root lock."""
+    """The first name no other live session holds, made or taken over. Hold the root lock."""
     number = 1
     while True:
         folder = root / (base if number == 1 else f"{base}-{number}")
@@ -153,8 +182,8 @@ def claim(root: Path, owner: str, base: str, session_id: str) -> Path:
             write_record(folder, FolderRecord(owner=owner, session_id=session_id))
             return folder
         record = read_record(folder)
-        if record is not None and record["owner"] == owner:
-            if session_id and record["session_id"] != session_id:
+        if folder.is_dir() and not folder.is_symlink() and not held_by_another(record, session_id):
+            if record != FolderRecord(owner=owner, session_id=session_id):
                 write_record(folder, FolderRecord(owner=owner, session_id=session_id))
             return folder
         number += 1
@@ -180,7 +209,7 @@ def adopted(root: Path) -> Path | None:
     return root / name
 
 
-def session_folder(session_id: str) -> Path | None:
+def session_folder(session_id: str, cwd: str = "") -> Path | None:
     """Find or make this session's folder; None until the session root exists."""
     root = session_root()
     if root is None:
@@ -192,13 +221,13 @@ def session_folder(session_id: str) -> Path | None:
         launched = adopted(root)
         if launched is not None:
             record = read_record(launched)
-            owner = record["owner"] if record is not None else session_id
-            write_record(launched, FolderRecord(owner=owner, session_id=session_id))
+            holder = record["owner"] if record is not None else session_id
+            write_record(launched, FolderRecord(owner=holder, session_id=session_id))
             folder = launched
         else:
-            member = member_of(session_id)
-            folder = claim(root, member.id if member is not None else session_id,
-                           folder_name(member, session_id), session_id)
+            owner = member_of(session_id)
+            folder = claim(root, owner.id if owner is not None else session_id,
+                           folder_name(owner, session_id, cwd), session_id)
         link(root, session_id, folder)
     return folder
 
@@ -213,9 +242,9 @@ def restore(session_id: str) -> None:
                 with root_lock(root):
                     folder = root / os.readlink(index)
                     if folder.parent == root and not os.path.lexists(folder):
-                        member = member_of(session_id)
+                        owner = member_of(session_id)
                         folder.mkdir(mode=0o700)
-                        write_record(folder, FolderRecord(owner=member.id if member is not None else session_id,
+                        write_record(folder, FolderRecord(owner=owner.id if owner is not None else session_id,
                                                           session_id=session_id))
             return
         folder = former_folder(session_id)

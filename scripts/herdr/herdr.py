@@ -5667,7 +5667,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         if owner is not None:
             session_id = owner.current_session
             member = owner.id
-            folder_member = session_folder.Member(str(owner.id), owner.name)
+            folder_member = session_folder.member_for(owner, membership)
         observed = (read_conversation(session_id, kind,
                     **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
                     if session_id else StoppedConversation())
