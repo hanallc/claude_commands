@@ -742,12 +742,16 @@ def same_waiter(left: admission_records.WaitingStep, right: admission_records.Wa
     return left.pid == right.pid and left.since == right.since
 
 
-def step_checks(model: QueueModel, position: int) -> admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable:
+StepChecks = (admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable
+              | admission_records.NatedevHeld)
+
+
+def step_checks(model: QueueModel, position: int) -> StepChecks:
     explanation = model.reading.explanation
     if isinstance(explanation.host, admission_records.ReadingUnavailable):
         return explanation.host
     step = model.reading.view.waiting[position - 1]
-    if isinstance(step.reason, admission_records.ReadingUnavailable):
+    if isinstance(step.reason, (admission_records.ReadingUnavailable, admission_records.NatedevHeld)):
         return step.reason
     if isinstance(explanation.head, admission_records.HeadExplanation) and same_waiter(explanation.head.waiter, step):
         return explanation.head
@@ -824,9 +828,8 @@ def check_line(passes: bool, text: str) -> Line:
     return (Span("✓ " if passes else "✗ ", "success" if passes else "error"), Span(text))
 
 
-def check_lines(checks: admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable,
-                model: QueueModel) -> list[Line]:
-    if isinstance(checks, admission_records.ReadingUnavailable):
+def check_lines(checks: StepChecks, model: QueueModel) -> list[Line]:
+    if isinstance(checks, (admission_records.ReadingUnavailable, admission_records.NatedevHeld)):
         return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
     return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
 
@@ -1230,6 +1233,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     waiting_status = [
         (Span(" " + reason_phrase(step.reason, waiting), "error"),)
         if isinstance(step.reason, admission_records.ReadingUnavailable) else
+        (Span(" " + reason_phrase(step.reason, waiting)),)
+        if isinstance(step.reason, admission_records.NatedevHeld) else
         status if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else ()
         for step in waiting]
     place_width = max(5 if any(isinstance(row.wait, wire.CloudSlotWait) for row in cloud) else 3, len(str(len(waiting))))

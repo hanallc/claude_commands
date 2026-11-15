@@ -1368,7 +1368,7 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ci_hold_reasons(self) -> dict[str, str]:
+    def _ci_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
         """Apply the existing hold policy to legacy CI admission requests."""
         waiting = {episode: item for episode, item in self.waiters.items()
                    if isinstance(item.request, ServiceEstimatedAdmission)}
@@ -1381,14 +1381,14 @@ class AdmissionServer:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
-            return {episode: f"natedev hold state is unreadable: {error}" for episode in waiting}
-        reasons: dict[str, str] = {}
+            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}") for episode in waiting}
+        reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         for episode, item in waiting.items():
             owner = item.request.owner
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
             blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
             if isinstance(blocking, build_hold.Holder):
-                reasons[episode] = f"natedev is held by {blocking.name} for {blocking.purpose}; waiting for release"
+                reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
 
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
@@ -1751,7 +1751,8 @@ class AdmissionServer:
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
             if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
-            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+            if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
+                    and row["step"] != "merge-gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -1965,11 +1966,10 @@ class AdmissionServer:
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
-        for position, (episode, text) in enumerate(ci_holds.items(), len(result.rows) + 1):
+        for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
             waiting = self.waiters[episode]
-            reason = records.ReadingUnavailable(text)
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
-            reply = wire.Wait(reason, position, "", text,
+            reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
                 self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
@@ -2103,8 +2103,8 @@ class AdmissionServer:
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], records.ReadingUnavailable(text),
-                row.get("unit", "")) for episode, text in ci_holds.items() for row in (self.waiters[episode].row,))
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
+                row.get("unit", "")) for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
@@ -2610,7 +2610,7 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        return (self._ended_claim_holder(saved)
+        return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
             and not self._start_pending(saved))
@@ -2633,6 +2633,17 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderIdentity)
                 and saved.holder.host == self.host
                 and not self._live(wire.Owner(saved.holder.pid, saved.holder.start_time)))
+
+    def _unconfirmed_holder_owner_ended(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A claim with no confirmed holder frees its assignment after its submitting owner ends.
+
+        No holder process can be checked, so only fresh evidence without the claim releases it.
+        Without this rule, the assignment stays current with no process behind it.
+        """
+        return (saved.assignment.destination.provider != "local"
+                and isinstance(saved.provider, placement.ProviderClaimReference)
+                and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
+                and not self._placement_owner_live(saved.assignment.owner))
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
@@ -3131,6 +3142,10 @@ done
                 self._close_for_report(saved, report)
                 continue
             if assignment.destination.provider == "local":
+                # A coordinator that ends before its execution report leaves the local assignment current.
+                state = self._assignment_state(saved)
+                if isinstance(state, placement.ClosedAssignment) and not self._placement_owner_live(assignment.owner):
+                    self._close_placement(saved, state.reason, placement.DoNotRetry("coordinator ended"))
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:

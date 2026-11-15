@@ -218,6 +218,69 @@ class PlacementStatusTests(unittest.TestCase):
             assert isinstance(reply, wire.Assignment)
             self.assertEqual(reply.assignment.destination, assignment.destination)
 
+    def test_an_unconfirmed_claim_holder_frees_its_assignment_after_its_owner_ends(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+            coordinator_holder,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        for case in ("pass", "restart", "owner live", "claim listed", "start pending"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-unconfirmed", assignment, claim)),
+                    [wire.FirstAuthorization(assignment, claim)])
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                fixture.server.assignments[key] = replace(fixture.server.assignments[key],
+                    holder=placement.ClaimHolderUnconfirmed("not consumed"))
+                fixture.server.persist()
+                if case != "owner live":
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+                if case == "start pending":
+                    pending = offload.pending_start_path(assignment.destination.target,
+                        claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    _ = pending.write_text("")
+                if case == "restart":
+                    fixture.restart()
+                fixture.clock.advance(1)
+                claims = ((placement.AdoptedProviderClaim(claim, coordinator_holder(assignment), assignment.session,
+                                                          assignment.destination.host, "host-generation-a"),)
+                          if case == "claim listed" else ())
+                _ = publish_candidate(fixture, request, claims=claims)
+                _ = fixture.run_pass()
+                if case in ("pass", "restart"):
+                    self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+                    self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                else:
+                    self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+
+    def test_a_local_assignment_closes_after_its_owner_ends_without_a_report(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
+
+        for case in ("owner ended", "owner live"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints,
+                    candidates=(local_candidate(fixture),)))
+                granted, = fixture.connect(request).replies()
+                assert isinstance(granted, wire.LocalPlacementGranted)
+                key = placement.attempt_key(granted.assignment.episode, granted.assignment.attempt)
+                fixture.release(granted.grant)
+                if case == "owner ended":
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+                _ = fixture.run_pass()
+                if case == "owner ended":
+                    self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
+                    self.assertNotIn(request.episode, fixture.server.current_assignments)
+                else:
+                    self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                    self.assertEqual(fixture.server.current_assignments[request.episode], key)
+
     def test_status_and_replay_keep_pending_terminal_reports_current(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
@@ -1736,6 +1799,27 @@ class RunnerAuthorizationTests(unittest.TestCase):
             finally:
                 folder.chmod(0o755)
 
+    def test_a_ci_step_waits_during_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        from scripts.build_hold import build_hold
+        from scripts.build_targets import build_targets
+
+        holder = build_hold.Holder("fps", datetime.now(user_zone()), "Phase 3 timing", build_hold.UnknownReleaseEta(), "fps")
+        held = records.NatedevHeld("fps", "Phase 3 timing")
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            request = fixture.service_request()
+            with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.Wait)
+                self.assertEqual(waiting.reason, held)
+                self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                step, = view.reading.view.waiting
+                self.assertEqual(step.reason, held)
+            fixture.allow_next_start()
+            fixture.release(only_admitted(fixture.server.handle_request(request)))
+
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             fixture.configure(**{"program_first_peak_gib.cargo": 4})
@@ -1824,6 +1908,31 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 self.assertIsInstance(measured, records.ProgressAdjustedMemory)
                 if isinstance(measured, records.ProgressAdjustedMemory):
                     self.assertEqual(measured.counter, counter)
+            fixture.release(grant)
+
+    def test_a_token_wait_in_the_step_log_is_the_step_counter(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            write_process(fixture.proc.path, owner.pid, 2 * GIB, start=owner.start_time)
+            status = fixture.proc.path / str(owner.pid) / "status"
+            _ = status.write_text(status.read_text() + f"Uid: {uid} {uid} {uid} {uid}\n")
+            sidecar = fixture.root / "runner-wait/cargo.cgroup"
+            sidecar.parent.mkdir(mode=0o755)
+            _ = sidecar.write_text("")
+            _ = progress.progress_path(sidecar, "log").write_text(
+                "Finished `test` profile in 29s\n" + progress.token_wait_line(4) + "\n")
+            request = replace(fixture.service_request(owner=owner), episode=f"uid:{uid}:wait", sidecar=str(sidecar))
+            with fixture.peer_account(uid):
+                grant = only_admitted(fixture.server.handle_request(request))
+            # The capture fallback runs only with a boot identity.
+            fixture.server.boot_id = "fixture-boot"
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            measured = reply.reading.view.running[0].measured
+            assert isinstance(measured, records.ProgressAdjustedMemory)
+            self.assertEqual(measured.counter, progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4)))
             fixture.release(grant)
 
     def test_runner_cannot_change_priority_or_admit_the_head(self) -> None:

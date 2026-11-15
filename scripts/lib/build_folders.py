@@ -124,7 +124,18 @@ def _check_name(name: str) -> None:
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
-                          "scratch", "legacy-unique", "legacy-stable", "tool"]
+                          "scratch", "legacy-unique", "legacy-stable", "tool", "slot"]
+
+
+@dataclass(frozen=True)
+class SlotCheckout:
+    source: Path
+    commit: str
+
+
+@dataclass(frozen=True)
+class NoSlotCheckout:
+    """The folder does not contain a repository slot."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -142,6 +153,8 @@ class BuildFolderSpec:
     work: str = ""
     # The process the lease names; 0 names the allocating process.
     owner_pid: int = 0
+    slot_checkout: SlotCheckout | NoSlotCheckout = NoSlotCheckout()
+    machine: str = ""
 
 
 def _settings() -> ConfigRead:
@@ -177,6 +190,8 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     settings = _settings()
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
+    if spec.kind == "slot":
+        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     if spec.suffix_length < 0:
         raise ValueError("a suffix length cannot be negative")
     suffix = spec.suffix
@@ -309,10 +324,17 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         os.close(descriptor)
 
 
-def _write_lease(path: Path, directory: int, spec: BuildFolderSpec) -> None:
+def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released: bool = False,
+                 ready: bool = True) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
-              "start_time": datetime.now(timezone.utc).isoformat()}
+              "start_time": now}
+    if spec.kind == "slot" and isinstance(spec.slot_checkout, SlotCheckout):
+        if released:
+            record = cast(dict[str, str | int], json.loads(path.with_name(path.name + ".lease.json").read_text()))
+        record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
+                      commit=spec.slot_checkout.commit, last_use=now, ready=ready)
     name = path.name + ".lease.json"
     try:
         existing = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -362,7 +384,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable")
+    return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot")
 
 
 def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
@@ -379,7 +401,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
             directories: dict[Path, int] = {}
             while True:
                 allocation = (replace(spec, work=_new_suffix(spec.suffix_length, _settings()))
-                              if (spec.showrunner or spec.unit) and not spec.work else spec)
+                              if spec.kind != "slot" and (spec.showrunner or spec.unit) and not spec.work else spec)
                 path = build_folder_path(allocation)
                 directory = directories.get(path.parent)
                 if directory is None:
@@ -390,7 +412,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                 made_inode: os.stat_result | None = None
                 new_folder = False
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable else fcntl.LOCK_EX):
+                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" else fcntl.LOCK_EX,
+                                      wait=spec.kind != "slot"):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -407,8 +430,26 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             continue
                         if not stat.S_ISDIR(existing.st_mode):
                             raise FileExistsError(errno.EEXIST, "build folder is not a directory", str(path))
+                    if isinstance(spec.slot_checkout, SlotCheckout):
+                        import subprocess
+
+                        try:
+                            lease = cast(dict[str, object], json.loads(
+                                path.with_name(path.name + ".lease.json").read_text()))
+                        except FileNotFoundError:
+                            lease = {}
+                        if existing is not None and lease.get("ready") is not True:
+                            _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
+                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                            _remove_folder(path, directory, existing)
+                            _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
+                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                            existing = None
                     new_folder = existing is None
-                    _write_lease(path, directory, allocation)
+                    if isinstance(spec.slot_checkout, SlotCheckout):
+                        _write_lease(path, directory, allocation, ready=not new_folder)
+                    else:
+                        _write_lease(path, directory, allocation)
                     if existing is None:
                         mode = request.mode if isinstance(request, StableOwnerFolder) else 0o777 if stable else 0o700
                         try:
@@ -420,6 +461,13 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if new_folder and isinstance(spec.slot_checkout, SlotCheckout):
+                        import subprocess
+
+                        _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
+                                            str(path), spec.slot_checkout.commit], check=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,))
+                        _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
@@ -492,14 +540,18 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack) -> bool:
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold path's lease lock when it is free. A missing lock file means no lease."""
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
         return True
     _ = stack.callback(os.close, descriptor)
-    return _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
+    held = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) and _lock_current(path, directory, descriptor)
+    if held:
+        _ = stack.callback(_locks.pop, descriptor, None)
+        _locks[descriptor] = path
+    return held
 
 
 def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
@@ -518,10 +570,11 @@ def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
 
 
 @contextmanager
-def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
+def collector_lease(path: Path, *, children: bool = False, wait: bool = True) -> Generator[bool]:
     """Hold a managed folder's lease lock while a collector judges and removes it.
 
     Yield False when an owner holds the lease. A folder without a lock file has no lease.
+    Use build_folder_lock_fd while the collector holds the lock.
     A lock file or lease record is judged by its folder's lease. With children, also hold every lease below the folder; a held one, or an unreadable
     folder, is busy.
     """
@@ -530,13 +583,27 @@ def collector_lease(path: Path, *, children: bool = False) -> Generator[bool]:
     with ExitStack() as stack:
         try:
             directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
-            free = (_hold_free_lease(folder, directory, stack)
+            free = (_hold_free_lease(folder, directory, stack, wait=wait)
                     and (metadata is not None or not children or _hold_child_leases(folder, stack)))
         except FileNotFoundError:
             free = True
         except (OSError, ValueError):
             free = False
         yield free
+
+
+@contextmanager
+def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+    """Keep a slot and update its last use before releasing its lock."""
+    path = create_build_folder(spec)
+    try:
+        yield path
+    finally:
+        try:
+            with _folder_parent(path, spec.parent, create=False) as directory:
+                _write_lease(path, directory, spec, released=True)
+        finally:
+            _release_build_folder(path)
 
 
 def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
@@ -666,18 +733,62 @@ def tool_folder(tool: str, parent: Path | None = None) -> Generator[Path]:
 OWNER_MARKER = ".build-folder-owner.json"
 
 
-def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str = "", unit: str = "",
-              work: str = "") -> int:
-    """Keep the folder until the command and its descendants stop."""
-    import json
+def run_build_command(command: Sequence[str], *, path: Path, environment: Mapping[str, str],
+                      pass_fds: Sequence[int]) -> int:
+    """Keep the caller until the command and its descendants stop."""
     import subprocess
     from scripts.lib.descendants import adopt_descendants
 
     if not command:
         raise ValueError("run needs a command after --")
-    if sys.platform != "linux":
-        raise ValueError("run requires Linux descendant adoption")
-    _ = adopt_descendants()
+    pid = os.getpid()
+    if sys.platform == "darwin":
+        child = subprocess.Popen(command, cwd=path, env=environment,
+                                 pass_fds=pass_fds, start_new_session=True)
+    else:
+        _ = adopt_descendants()
+        child = subprocess.Popen(command, cwd=path, env=environment,
+                                 pass_fds=pass_fds, process_group=os.getpgrp())
+    try:
+        status = child.wait()
+    finally:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        _ = child.wait()
+        if sys.platform == "darwin":
+            # A descendant outside the group still holds the slot if it inherits the lock descriptor.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            while True:
+                try:
+                    os.killpg(child.pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+        else:
+            while True:
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                for descendant in children:
+                    try:
+                        os.kill(int(descendant), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    _ = os.waitpid(-1, 0)
+                except ChildProcessError:
+                    break
+    return status if status >= 0 else 128 - status
+
+
+def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str = "", unit: str = "",
+              work: str = "") -> int:
+    """Keep the folder until the command and its descendants stop."""
+    import json
+
     settings = _settings()
     root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
     spec = BuildFolderSpec(kind="temporary", parent=root, repository=repository_key(Path.cwd()),
@@ -691,29 +802,10 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
                   "boot_id": boot_identity()}
         _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
         descriptor = build_folder_lock_fd(path)
-        child = subprocess.Popen(command, cwd=path,
-                                 env={**os.environ, "BUILD_FOLDER": str(path), "BUILD_FOLDER_LOCK_FD": str(descriptor)},
-                                 pass_fds=(descriptor,), process_group=os.getpgrp())
-        try:
-            status = child.wait()
-        finally:
-            try:
-                child.kill()
-            except ProcessLookupError:
-                pass
-            _ = child.wait()
-            while True:
-                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
-                for descendant in children:
-                    try:
-                        os.kill(int(descendant), signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                try:
-                    _ = os.waitpid(-1, 0)
-                except ChildProcessError:
-                    break
-        return status if status >= 0 else 128 - status
+        return run_build_command(command, path=path,
+                                 environment={**os.environ, "BUILD_FOLDER": str(path),
+                                              "BUILD_FOLDER_LOCK_FD": str(descriptor)},
+                                 pass_fds=(descriptor,))
 
 
 def main(argv: Sequence[str]) -> int:
