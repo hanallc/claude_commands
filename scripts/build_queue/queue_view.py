@@ -132,6 +132,7 @@ class MacBuildReading:
     builds: tuple[MacBuild, ...]
     error: str = ""
     unplaced_runs: tuple[UnplacedMacRun, ...] = ()
+    home: str = ""
 
 
 def mac_reading_path() -> Path:
@@ -234,7 +235,8 @@ def read_mac_builds() -> MacBuildReading:
         rows = cast(list[dict[str, object]], data["builds"])
         return MacBuildReading(float(cast(float, data["read_at"])), tuple(mac_build_from_record(row) for row in rows),
                                str(data.get("error", "")), tuple(unplaced_run_from_record(row)
-                                   for row in cast(list[dict[str, object]], data.get("unplaced_runs", []))))
+                                   for row in cast(list[dict[str, object]], data.get("unplaced_runs", []))),
+                               str(data.get("home", "")))
     except (OSError, ValueError, TypeError, KeyError) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
         return MacBuildReading(0, (), "Mac reading unavailable")
@@ -653,7 +655,7 @@ def read_reading():
     processes = read_processes()
     records = read_gate_records()
     captures = read_captures(processes)
-    return dict(builds=read_builds(processes, records, captures),
+    return dict(home=str(Path.home()), builds=read_builds(processes, records, captures),
                 unplaced_runs=unplaced_runs(processes, records, captures))
 
 
@@ -683,13 +685,16 @@ def refresh_mac_builds() -> None:
             row["counter"] = ({"phase": counter.phase, "done": counter.done, "total": counter.total}
                               if isinstance(counter, progress_profile.ProgressCounter) else {})
             builds.append(mac_build_from_record(row))
-        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)), unplaced_runs=unplaced)
+        reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)),
+                                  unplaced_runs=unplaced, home=str(data.get("home", "")))
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
         logging.getLogger(__name__).warning("Mac reading unavailable: %s", error)
-        reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable", previous.unplaced_runs)
+        reading = MacBuildReading(previous.read_at, previous.builds, "Mac reading unavailable",
+                                  previous.unplaced_runs, previous.home)
     write_text_atomic(mac_reading_path(), json.dumps({"read_at": reading.read_at, "error": reading.error,
         "builds": [mac_build_record(build) for build in reading.builds],
-        "unplaced_runs": [unplaced_run_record(run) for run in reading.unplaced_runs]}), new_file_mode=0o644)
+        "unplaced_runs": [unplaced_run_record(run) for run in reading.unplaced_runs],
+        "home": reading.home}), new_file_mode=0o644)
 
 def step_counter(step: admission_records.RunningStep) -> progress_profile.ProgressCounter | progress_profile.NoCounter:
     """Read the counter from the local memory reading."""
@@ -742,12 +747,16 @@ def same_waiter(left: admission_records.WaitingStep, right: admission_records.Wa
     return left.pid == right.pid and left.since == right.since
 
 
-def step_checks(model: QueueModel, position: int) -> admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable:
+StepChecks = (admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable
+              | admission_records.NatedevHeld)
+
+
+def step_checks(model: QueueModel, position: int) -> StepChecks:
     explanation = model.reading.explanation
     if isinstance(explanation.host, admission_records.ReadingUnavailable):
         return explanation.host
     step = model.reading.view.waiting[position - 1]
-    if isinstance(step.reason, admission_records.ReadingUnavailable):
+    if isinstance(step.reason, (admission_records.ReadingUnavailable, admission_records.NatedevHeld)):
         return step.reason
     if isinstance(explanation.head, admission_records.HeadExplanation) and same_waiter(explanation.head.waiter, step):
         return explanation.head
@@ -824,9 +833,8 @@ def check_line(passes: bool, text: str) -> Line:
     return (Span("✓ " if passes else "✗ ", "success" if passes else "error"), Span(text))
 
 
-def check_lines(checks: admission_records.HeadExplanation | admission_records.LineWaiter | admission_records.ReadingUnavailable,
-                model: QueueModel) -> list[Line]:
-    if isinstance(checks, admission_records.ReadingUnavailable):
+def check_lines(checks: StepChecks, model: QueueModel) -> list[Line]:
+    if isinstance(checks, (admission_records.ReadingUnavailable, admission_records.NatedevHeld)):
         return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
     return [check_line(checks.room.passes, queue_evidence.room_check_text(checks.room))]
 
@@ -1230,6 +1238,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     waiting_status = [
         (Span(" " + reason_phrase(step.reason, waiting), "error"),)
         if isinstance(step.reason, admission_records.ReadingUnavailable) else
+        (Span(" " + reason_phrase(step.reason, waiting)),)
+        if isinstance(step.reason, admission_records.NatedevHeld) else
         status if isinstance(head, admission_records.HeadExplanation) and same_waiter(head.waiter, step) else ()
         for step in waiting]
     place_width = max(5 if any(isinstance(row.wait, wire.CloudSlotWait) for row in cloud) else 3, len(str(len(waiting))))

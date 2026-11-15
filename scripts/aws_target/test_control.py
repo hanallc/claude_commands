@@ -468,10 +468,17 @@ class ControlTests(CostFixture):
                          ['Standard cost per merge gate (USD; estimate)', 'GPU cost per merge gate (USD; estimate)'])
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
-        self.assertEqual(data['regions'], list(self.regions))
+        self.assertEqual(data['regions'], sorted(self.regions, key=aws_page.region_filter_key))
         self.assertEqual([line['text'] for line in data['snapshot']], [text for _region, text in tables.snapshot_rows])
         summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
         self.assertEqual(summaries, [costs.summary_of(costs.cheapest) for costs in tables.runs])
+
+    def test_region_filter_sorts_each_group_alphabetically_in_the_group_order(self) -> None:
+        regions = ('us-west-2', 'sa-east-1', 'me-south-1', 'ap-south-1', 'eu-west-1', 'ca-central-1',
+                   'us-east-2', 'ap-northeast-1', 'eu-central-1', 'af-south-1')
+        self.assertEqual(sorted(regions, key=aws_page.region_filter_key),
+                         ['us-east-2', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-northeast-1', 'ap-south-1',
+                          'ca-central-1', 'sa-east-1', 'af-south-1', 'me-south-1'])
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'

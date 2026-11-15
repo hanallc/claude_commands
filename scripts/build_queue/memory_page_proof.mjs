@@ -7,6 +7,7 @@
 // Add --cloud-owner as the fourth argument for cloud worker owner images.
 // Add --blocks as the fourth argument for the target block and hold images.
 // Add --identity as the fourth argument for the row hover identity block images.
+// Add --wait-tip as the fourth argument for the waiting step hover images.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
@@ -35,6 +36,7 @@ try {
   const cloudOwnerComparison = process.argv[4] === '--cloud-owner';
   const blocksComparison = process.argv[4] === '--blocks';
   const identityComparison = process.argv[4] === '--identity';
+  const waitTipComparison = process.argv[4] === '--wait-tip';
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -206,7 +208,8 @@ try {
         await navigate('memory_live.html');
 
         const proofs = [];
-        const show = async (reading, clearTip=true) => evaluate(`(async () => {
+        const show = async (reading, clearTip=true) => {
+          const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
           const data = ${JSON.stringify(reading)};
@@ -216,8 +219,24 @@ try {
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return [...document.querySelectorAll('.legend-group')].map(group=>({
+            name:group.querySelector('.group-head .name').textContent,
+            total:group.querySelector(':scope > .group-head .v,:scope > .row.total .v').textContent,
+            rows:[...group.querySelectorAll(':scope > .row:not(.in):not(.total)')]
+              .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
+              .map(row=>row.querySelector('.v').textContent)}));
+          })()`);
+          for(const group of totals) {
+            if(group.total==='unavailable') continue;
+            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const sum=group.rows.reduce((total,text)=>total+amount(text),0);
+            // Each displayed amount rounds to tenths of a GiB.
+            const tolerance=(group.rows.length+1)*0.05+group.rows.filter(text=>text.startsWith('<')).length*0.05;
+            assert.ok(Math.abs(amount(group.total)-sum)<=tolerance+1e-9,
+              'A legend total differs from its rows: '+JSON.stringify(group));
+          }
           return true;
-        })()`);
+        };
         for (const theme of ['light','dark']) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of [1400,900,390]) {
@@ -263,6 +282,8 @@ try {
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
+              // A long detail wraps at phone width, so compare the first text lines, not the boxes.
+              const firstLine = element => { const range=document.createRange(); range.selectNodeContents(element); return range.getClientRects()[0]; };
               const gauges = ['some','full'].map(key => {
                 const value=document.querySelector('#gv-'+key), limit=document.querySelector('#limit-'+key);
                 return {value:rect(value), limit:rect(limit), text:value.textContent, nowrap:getComputedStyle(value).whiteSpace};
@@ -272,6 +293,8 @@ try {
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
                 headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                runningSlots:[...table.querySelectorAll('tr[data-tip^="row:"] .slot')].map(cell=>cell.textContent),
+                queuedSlots:table.querySelectorAll('tr[data-tip^="wait:"] .slot,tr.queue-head .slot').length,
                 answer:text('#answer'),
                 queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
@@ -282,8 +305,23 @@ try {
                   const chart=document.querySelector('.wrow[data-tip="'+metadata.dataset.tip+'"]') ||
                     document.querySelector('.wrow.room');
                   return {chart:rect(chart).top-rect(document.querySelector('.walk-chart-head')).bottom,
-                    table:rect(metadata).top-rect(table.querySelector('thead')).bottom};
+                    table:rect(metadata).top-rect(table.querySelector('thead tr')).bottom};
                 }),
+                compact:document.querySelector('#walk').classList.contains('compact'),
+                cut:(() => {
+                  // A cell is cut when it ends outside the table box or its text is wider than its box.
+                  const box=rect(table);
+                  const cells=[...table.querySelectorAll('tr > *')].filter(cell=>cell.getClientRects().length);
+                  return [...cells.map(cell=>[cell,cell.querySelector('.cell-text')||cell]),
+                    ...[...document.querySelectorAll('.walk-chart .row-label .name')].map(name=>[name,name])]
+                    .filter(([cell,text])=>rect(cell).left<box.left-0.5 || rect(cell).right>box.right+0.5 ||
+                      text.scrollWidth>text.clientWidth)
+                    .map(([cell])=>cell.className+': '+cell.textContent);
+                })(),
+                roomRow:(() => {
+                  const room=table.querySelector('tr.room');
+                  return room.getClientRects().length?room.textContent:null;
+                })(),
                 machine:table.querySelector('td.machine')?.textContent,
                 capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
@@ -303,7 +341,7 @@ try {
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
                 swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
                 swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
-                swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
+                swapBaseline:small?firstLine(small).bottom-firstLine(small.parentElement.querySelector('.name')).bottom:0,
                 gauges, lower, values,
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
@@ -314,14 +352,20 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
-            assert.equal(proof.answer,'Next step room');
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
+            assert.equal(proof.queuedSlots,0);
+            assert.equal(proof.answer,'Free for the next step');
             assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
             assert.ok(proof.stages.includes('testing'));
             assert.ok(proof.stages.every(stage => ['building','testing','—'].includes(stage)));
-            for(const offsets of proof.rowOffsets)
-              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify(offsets));
+            // The stacked table leaves out the room row, so only the beside table matches the chart row for row.
+            if(proof.layout==='beside') for(const offsets of proof.rowOffsets)
+              assert.ok(Math.abs(offsets.chart-offsets.table)<=1,'The chart and table rows differ. '+JSON.stringify({theme,width,offsets,all:proof.rowOffsets}));
+            if(proof.layout==='stacked') assert.deepEqual(proof.cut,[],'A stacked table cell is cut at '+width+' px.');
+            assert.equal(proof.roomRow,proof.layout==='beside'?'':null,'The table room row is empty beside the chart and left out under it.');
+            assert.equal(proof.compact,width===390,'Only the phone table uses two lines for each step.');
             assert.equal(proof.machine, 'fixture');
             assert.match(proof.room, /GiB/);
             for (const age of ['45 min','19 h','2 d']) assert.ok(proof.leftover.includes(age), age);
@@ -357,7 +401,7 @@ try {
             assert.ok(!proof.owner.includes('fixture-unit'), 'The page repeats the unit beside the name.');
             assert.ok(proof.amountHeader.includes('Used · reserved'), 'The memory amounts have no header.');
             assert.ok(proof.scroll <= proof.client, 'The page overflows. '+JSON.stringify({theme,width,scroll:proof.scroll,client:proof.client}));
-            const roomLegend=proof.values.find(row=>row.label==='Next step room');
+            const roomLegend=proof.values.find(row=>row.label==='Free');
             assert.ok(Math.abs(roomLegend.labelBox.top-roomLegend.value.top)<2, 'The room value uses a second line.');
             assert.ok(roomLegend.value.left-roomLegend.labelBox.right<80, 'The legend value is too far from its label.');
             for (const gauge of proof.gauges) assert.equal(gauge.nowrap, 'nowrap');
@@ -389,6 +433,34 @@ try {
             const point=proof.reportPoints.at(-1);
             checkPixel((point.box.left+point.box.right)/2,(point.box.top+point.box.bottom)/2,point.color,'The report pixels differ.',true);
             proofs.push({theme,width,metrics:proof});
+            const slotReview=structuredClone(base);
+            const running=slotReview.walk.find(row=>row.queued&&!row.ci);
+            slotReview.walk=[
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2},
+              {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
+            ];
+            slotReview.waiters=[];
+            slotReview.ram.build_tools_bytes=0;
+            await show(slotReview);
+            const slotColumn=await evaluate(`(()=>{
+              const table=document.querySelector('.walk-table');
+              const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const box=table.getBoundingClientRect();
+              const bottom=rows.at(-1).getBoundingClientRect().bottom;
+              return {slots:rows.map(row=>row.querySelector('.slot').textContent),
+                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
+                overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
+                clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
+            })()`);
+            assert.deepEqual(slotColumn.slots,['2','—']);
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot'],['vcpus','slot']]);
+            assert.equal(slotColumn.overflow,false);
+            if(theme==='dark'&&width===1400) {
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
+              await writeFile(join(folder,'slot-column-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+            }
+            await show(base);
 
             proof.swapRefresh=await evaluate(`(async () => {
               const originalFetch=window.fetch, originalRender=window.render;
@@ -544,10 +616,10 @@ try {
                 staleColor:stale?getComputedStyle(stale).color:null,
                 errorColor:(() => {const span=document.createElement('span');span.style.color='var(--cap)';
                   document.body.append(span);const color=getComputedStyle(span).color;span.remove();return color;})(),
-                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.head_text),latest).join(' '),
+                slots:tipText('wait:'+latest.waiters.findIndex(row=>row.kind==='cloud'),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -566,7 +638,7 @@ try {
             assert.equal(cloudProof.waitingMachine,'');
             assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
-            assert.match(cloudProof.slots,/cloud 1 of 1 slots/);
+            assert.match(cloudProof.slots,/can run on: AWS \(natedev only when AWS cannot start the gate\)/);
             assert.ok(!cloudProof.cloudCard,'The page retains a separate Cloud card.');
             assert.ok(!cloudProof.cloudMemory,'Cloud work has a memory reservation.');
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
@@ -606,6 +678,25 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
+            const signedLegend=structuredClone(base), legendGib=1024**3;
+            Object.assign(signedLegend.ram,{desktop_bytes:2*legendGib,agents_bytes:3*legendGib,
+              other_programs_bytes:legendGib,kernel_bytes:2*legendGib,cache_bytes:2*legendGib,
+              unattributed_bytes:0});
+            await show(signedLegend);
+            const unsignedWidths=await evaluate(`RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)`);
+            signedLegend.ram.unattributed_bytes=-legendGib;
+            await show(signedLegend);
+            const signedProof=await evaluate(`({
+              total:document.querySelector('#v-g-else').textContent,
+              unattributed:document.querySelector('#v-unattributed').textContent,
+              tip:TIPS['g-else'](latest)[0],
+              widths:RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)
+            })`);
+            assert.equal(signedProof.total,'9.0 GiB','The legend total omits the negative reading.');
+            assert.equal(signedProof.unattributed,'-1.0 GiB');
+            assert.equal(signedProof.tip,'Everything else · 9.0 GiB');
+            assert.deepEqual(signedProof.widths,unsignedWidths,'The negative reading changes bar widths.');
+            proof.signedLegend=signedProof;
             await show({...base, ram:{...base.ram, agreement:'disagree'}});
             const disagree=await evaluate(`(() => {
               const note=document.querySelector('#ram-disagree');
@@ -616,23 +707,42 @@ try {
             assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
             assert.equal(disagree.scale,false,'A disagreement hides the scale.');
             proof.disagree=disagree;
-            // Build tools and the CI file cache sit outside the memory bar's room block; the cap line still marks the cap.
-            const gib=1024**3, capReading=structuredClone(base);
-            Object.assign(capReading.ram,{builds_bytes:capReading.ram.queued_builds_bytes+2*gib,sccache_bytes:2*gib,
-              ci_bytes:gib/2,ci_counted_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
+            // Build tools and hana CI sit inside the queue cap: more of them leaves less free, and the cap stays.
+            const gib=1024**3, capReading=structuredClone(base), known=value=>typeof value==='number'?value:0;
+            Object.assign(capReading.ram,{build_tools_bytes:capReading.ram.build_tools_bytes+gib,
+              sccache_bytes:capReading.ram.sccache_bytes+gib,ci_bytes:known(capReading.ram.ci_bytes)+gib/2,
+              available_bytes:capReading.ram.available_bytes-3*gib/2,
+              room_bytes:capReading.ram.room_bytes-3*gib/2});
             capReading.room-=1.5;
+            capReading.taken=capReading.cap-capReading.room;
             await show(capReading);
             const capLine=await evaluate(`(() => {
               const line=document.querySelector('#walk .walk-bud');
               const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
               const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
+              const tools=document.querySelector('#walk .wrow.tools .seg-tools').getBoundingClientRect();
+              const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
+              const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
+              const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
               const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+              // The line stops at chart text, so the pixel check reads the longest part of it.
+              const drawn=[...(line?.querySelectorAll('.cap-part')||[])];
+              const part=(drawn.length?drawn:line?[line]:[]).map(element=>({element,box:element.getBoundingClientRect()}))
+                .sort((a,b)=>b.box.height-a.box.height)[0];
               return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
-                left:box?box.left+1:null,top:box?.top,bottom:box?.bottom,roomRight:room?room.right:null,
-                expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:line?getComputedStyle(line).borderLeftColor:'',
+                left:box?box.left+1:null,top:part?.box.top,bottom:part?.box.bottom,roomRight:room?room.right:null,
+                tools:{left:tools.left,right:tools.right,width:tools.width,trackLeft:track.left},
+                memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
+                  barLeft:memoryBar.left,capRight:memoryCap.right},
+                expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
                 scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
+            assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
+            assert.ok(Math.abs(capLine.tools.left-capLine.tools.trackLeft)<=1,'Build tools do not start at the chart left edge.');
+            assert.ok(capLine.tools.right<capLine.left,'Build tools extend beyond the chart cap mark.');
+            assert.ok(Math.abs(capLine.memoryTools.left-capLine.memoryTools.barLeft)<=1,'Build tools do not start at the memory bar left edge.');
+            assert.ok(capLine.memoryTools.right<capLine.memoryTools.capRight,'Build tools extend beyond the memory bar cap mark.');
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
             assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
             assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
@@ -643,27 +753,82 @@ try {
             assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
               'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
+            if(theme==='dark'&&width===1400) {
+              const clip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+              await writeFile(join(folder,'build-tools-inside-cap-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              const legendClip=await evaluate(`(()=>{
+                const box=document.querySelector('.legend-box .legend').getBoundingClientRect();
+                return {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(box.height)+8,scale:1};
+              })()`);
+              const legendShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:legendClip});
+              await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
+            }
             proof.capLine=capLine;
-            // The memory bar draws its cap marker and label at the cap value.
+            // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
+            const cloudReading=structuredClone(base);
+            cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
+              machine:'aws',vcpus:32,state:'setup',status:'setup · boot · us-east-2, zone c',
+              progress:{kind:'NoProgress',reason:'no current counter'},stale:false,late_age:'',started_at:base.read_at-60});
+            cloudReading.waiters.push({kind:'cloud',name:'cloud wait',showrunner:'fixture-owner',unit:'cloud',pid:32,detail:'cloud',
+              machine:'aws',status:'waits for a cloud slot: 9 of 9 in use',progress:{kind:'NoProgress',reason:'waiting'},since:base.read_at-60});
+            await show(cloudReading);
+            const capCrossings=await evaluate(`(() => { const rect = element => element.getBoundingClientRect();
+              return (() => {
+                  // Chart text that shows on a part of the cap line.
+                  const line=document.querySelector('.walk-chart .walk-bud');
+                  // A page without line parts draws the whole line on its own box.
+                  const drawn=[...line.querySelectorAll('.cap-part')];
+                  const parts=(drawn.length?drawn:[line]).filter(part=>parseFloat(getComputedStyle(part).borderLeftWidth)>0&&
+                    getComputedStyle(part).borderLeftColor!=='rgba(0, 0, 0, 0)').map(rect);
+                  const walker=document.createTreeWalker(line.parentElement,NodeFilter.SHOW_TEXT);
+                  const crossings=[];
+                  for(let node=walker.nextNode();node;node=walker.nextNode()){
+                    if(!node.textContent.trim()) continue;
+                    let right=Infinity;
+                    for(let box=node.parentElement;box!==line.parentElement;box=box.parentElement)
+                      if(getComputedStyle(box).overflowX!=='visible') right=Math.min(right,rect(box).right);
+                    const range=document.createRange(); range.selectNodeContents(node);
+                    for(const text of range.getClientRects())
+                      if(text.width&&parts.some(part=>text.left<part.right&&Math.min(text.right,right)>part.left&&
+                        text.top<part.bottom&&text.bottom>part.top)) crossings.push(node.textContent.trim());
+                  }
+                  return {parts:parts.length,crossings};
+                })(); })()`);
+            assert.ok(capCrossings.parts>0,'The cap line shows.');
+            assert.deepEqual(capCrossings.crossings,[],'Text shows on the cap line at '+width+' px, '+theme+'.');
+            proof.capCrossings=capCrossings;
+            await show(capReading);
+            // The user, 11-15: the queue cap brace runs from 0 to the end of free, under the bar.
             const barMark=await evaluate(`(() => {
-              const mark=document.querySelector('#barwrap #mark'), label=document.querySelector('#barwrap #marklabel');
-              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=mark?.getBoundingClientRect();
+              const cap=document.querySelector('#barwrap #b-cap'), free=document.querySelector('#barwrap #b-room');
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=cap?.getBoundingClientRect();
               const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
-              return {present:!!mark&&!mark.hidden&&getComputedStyle(mark).display!=='none'&&box.height>0,
-                label:label&&!label.hidden?label.textContent:'',left:box?box.left+7:null,middle:(bar.top+bar.bottom)/2,
-                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,
-                color:mark?getComputedStyle(mark,'::before').borderLeftColor:'',scrollY,
+              return {present:!!cap&&!cap.hidden&&getComputedStyle(cap).display!=='none'&&box.height>0,
+                label:cap?cap.querySelector('.brace-label').textContent:'',left:box?.left,right:box?.right,
+                freeRight:free?.getBoundingClientRect().right,barLeft:bar.left,below:box?box.top>=bar.bottom-1:false,
+                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,bottom:box?.bottom,
+                color:cap?getComputedStyle(cap).borderBottomColor:'',scrollY,
                 card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
             })()`);
-            assert.ok(barMark.present,'The memory bar has no cap marker.');
-            assert.equal(barMark.label,'cap '+capReading.cap.toFixed(1));
-            assert.ok(Math.abs(barMark.left-barMark.expected)<=1.5,'The memory bar cap marker is off the cap value. '+JSON.stringify(barMark));
+            assert.ok(barMark.present,'The memory bar has no queue cap brace.');
+            assert.match(barMark.label,new RegExp(capReading.cap.toFixed(1).replace('.','\\.')+'$'));
+            assert.ok(barMark.below,'The queue cap brace is not under the bar.');
+            assert.ok(Math.abs(barMark.left-barMark.barLeft)<=1.5,'The queue cap does not start at 0. '+JSON.stringify(barMark));
+            assert.ok(Math.abs(barMark.right-barMark.expected)<=1.5,'The queue cap brace is off the cap value. '+JSON.stringify(barMark));
+            assert.ok(Math.abs(barMark.freeRight-barMark.expected)<=1.5,'Free does not end at the queue cap. '+JSON.stringify(barMark));
             const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
               clip:{...barMark.card,scale:1}})).data,'base64');
-            const barPixel=pngPixels(barShot)(Math.floor(barMark.left-barMark.card.x),Math.floor(barMark.middle+barMark.scrollY-barMark.card.y));
+            const barPixel=pngPixels(barShot)(Math.floor((barMark.left+barMark.right)/2-barMark.card.x),
+              Math.floor(barMark.bottom-1+barMark.scrollY-barMark.card.y));
             const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
             assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
-              'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
+              'The queue cap brace pixels differ. '+JSON.stringify({barPixel,barColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
             proof.barMark=barMark;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
@@ -704,7 +869,11 @@ try {
                 counted:0,started_at:now-60,unit:'hana-ci.slice',machine:'fixture',pid:701,vcpus:4,
                 progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
-              ciReading.taken=ciReading.used+ciReading.ci_ram+ciReading.reserved;
+              ciReading.ram.ci_bytes=known(ciReading.ram.ci_bytes)+gib/8;
+              ciReading.ram.available_bytes-=gib/8;
+              ciReading.ram.room_bytes-=gib/8;
+              ciReading.room-=0.125;
+              ciReading.taken=ciReading.cap-ciReading.room;
               await show(ciReading);
               const ciProof=await evaluate(`(() => {
                 const key='row:'+(latest.walk.length-1);
@@ -736,7 +905,7 @@ try {
                   expected:row.used*unit,hatched:!!chart.querySelector('.hatch'),
                   tip:tooltipHtml('row:'+index,latest),
                   chartTop:chart.getBoundingClientRect().top-document.querySelector('.walk-chart-head').getBoundingClientRect().bottom,
-                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead').getBoundingClientRect().bottom};
+                  tableTop:table.getBoundingClientRect().top-document.querySelector('.walk-table thead tr').getBoundingClientRect().bottom};
               });
             })()`);
             assert.equal(macProof.length,3);
@@ -989,7 +1158,7 @@ try {
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
               assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
@@ -1217,7 +1386,7 @@ try {
         if (blocksComparison) {
           assert.ok(beforePage, 'The block comparison needs the previous page.');
           const blockReason='research P16 Hana palette Command-shortcut shots (kept binary, no cargo)';
-          const blockLine='Mac: blocked by research (hana) awaiting unblock; requested expiry was 16:30 EST';
+          const blockLine='natedev or Mac';
           const blocked=structuredClone(readings.spacing);
           Object.assign(blocked,{room:1.0,pressure:'some stall above its limit',psi:{some:31.0,full:6.2},
             mac_idle_alert:'MAC IDLE 8 min: 1 steps wait for the Mac. Blocked by research since 15:32 ('+blockReason
@@ -1229,7 +1398,7 @@ try {
                since:'since 15:20 EST',until:'expected release 16:00 EST'},
               {target:'natedev',state:'Held',reason:'cargo sweep of the shared target folder',holder:'cables',unit:'cables',
                showrunner:'builds',since:'start not recorded',until:'until released'}]});
-          blocked.waiters[0].mac_text=blockLine;
+          blocked.waiters[0].runs_on='natedev or Mac';
           const after=structuredClone(blocked);
           after.mac_idle_alert='';
           const contrast=`(() => {
@@ -1299,19 +1468,53 @@ try {
           }
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
           await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
-          const lines=[blockLine,'Mac: busy with nextest hana','Mac: natedev only, makes natedev artifacts',
-            'Mac: kind not offloaded','Mac: excluded, linux_only; package not recorded','Mac: unreachable, retry backoff',
-            'Mac: state unreadable, retry backoff: backoff time is not finite',
-            'Mac: no recorded block or claim; availability not checked'];
+          const lines=['natedev or Mac','natedev only','natedev only (Mac state unknown)'];
           for (const [index,line] of lines.entries()) {
             const reading=structuredClone(after);
-            reading.waiters[0].mac_text=line;
+            reading.waiters[0].runs_on=line;
             await show(reading);
             await evaluate(`showTip('wait:0',700,420)`);
             const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
             assert.ok(tooltip.includes(line),tooltip);
             await capture(`after-mac-line-${index+1}`,'#tip');
             comparisons.push({line,tooltip});
+          }
+        }
+        if (waitTipComparison) {
+          assert.ok(beforePage, 'The wait hover comparison needs the previous page.');
+          await call('Emulation.setDeviceMetricsOverride',{width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
+            pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
+          const priority="queue priority: research (the user's bump)";
+          const room={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
+            {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
+            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],
+            note:'Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.'};
+          const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
+            reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
+          const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
+          Object.assign(cloud,{since:now-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
+            runs_on:'AWS (natedev only when AWS cannot start the gate)'});
+          const old={...owner,priority_text:priority,mac_text:'Mac: natedev only, makes natedev artifacts',
+            head_text:'Head: need 16.3 GiB > room 7.1 GiB (free 28.4 GiB − safety 3.0 GiB − 9.8 GiB swapped outside builds − kept aside 8.5 GiB) · cloud 2 of 9 slots'};
+          const cases=[['before','before.html',[old]],['after','memory_live.html',[{...owner,priority_text:priority,runs_on:'natedev only',head_room:room},behind,cloud]]];
+          for (const theme of ['light','dark']) {
+            await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
+            for (const [version,path,waiters] of cases) {
+              await navigate(path);
+              await show({...structuredClone(readings.spacing),waiters});
+              for (const index of waiters.keys()) {
+                await evaluate(`showTip('wait:${index}',700,420)`);
+                const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
+                if (version==='after') {
+                  assert.ok(!tooltip.includes('Head'),tooltip);
+                  assert.ok(/\nreason\s/.test(tooltip),tooltip);
+                  assert.ok(tooltip.includes('can run on'),tooltip);
+                }
+                await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
+                comparisons.push({version,theme,index,tooltip});
+              }
+            }
           }
         }
         if (identityComparison) {
@@ -1371,7 +1574,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -1388,9 +1591,11 @@ try {
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
-            head_text:review.head_text,priority_text:review.priority_text}];
+            head_text:review.head_text,priority_text:review.priority_text,
+            head_room:{rows:[{label:'free RAM',gib:8.5},{label:'− safety net',gib:3.0},
+              {label:'− swap coming back',gib:6.0},{label:'= free',gib:0.0},{label:'needs',gib:1.9}],note:''}}];
           review.ci_ram = 0.125;
-          review.taken = review.used + review.ci_ram + review.reserved;
+          review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const version of ['before','after']) {
@@ -1462,7 +1667,7 @@ try {
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of [review.head_text,review.priority_text,'free memory'])
+                  for(const value of ['First in line',review.priority_text,'free memory'])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }

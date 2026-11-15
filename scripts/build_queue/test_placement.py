@@ -29,6 +29,7 @@ from scripts.message.unit_labels import UnitLabels
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -247,6 +248,38 @@ class PlacementTests(unittest.TestCase):
                     if prioritize_movable:
                         granted, = fixture.connect(movable).replies()
                         self.assertIsInstance(granted, wire.LocalPlacementGranted)
+
+    def test_each_step_carries_its_request_route_into_the_waiting_and_running_views(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            local = placement_request(fixture, since=fixture.clock.now() - 60)
+            mac = local.constraints.candidates[0]
+            local = replace(local, prerequisite=placement.TokenNotRequired(), route=LOCAL_CALLER,
+                constraints=replace(local.constraints, candidates=(local_candidate(fixture),
+                    replace(mac, eligibility=placement.FixedExclusion(LOCAL_CALLER.reason)))))
+            pinned = placement_request(fixture, since=fixture.clock.now() - 30)
+            pinned = replace(pinned, route=PinnedTarget("natedev"),
+                constraints=replace(pinned.constraints, candidates=(local_candidate(fixture),)))
+            routed = placement_request(fixture, since=fixture.clock.now() - 10)
+            routed = replace(routed, constraints=replace(routed.constraints,
+                candidates=(local_candidate(fixture), replace(mac, eligibility=placement.FixedExclusion("linux_only")))))
+            for request in (local, pinned, routed):
+                self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([(row.pid, row.route) for row in view.reading.view.waiting],
+                             [(local.owner.pid, LOCAL_CALLER), (pinned.owner.pid, PinnedTarget("natedev")),
+                              (routed.owner.pid, ANY_ELIGIBLE_TARGET)])
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            _ = fixture.run_pass()
+            granted, = fixture.connect(local).replies()
+            self.assertIsInstance(granted, wire.LocalPlacementGranted)
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual([step.route for step in view.reading.view.running if step.pid == local.owner.pid],
+                             [LOCAL_CALLER])
 
     def test_token_readiness_blocks_local_memory_but_allows_remote_placement(self) -> None:
         cases = ((False, False, False, True), (True, False, False, True),
