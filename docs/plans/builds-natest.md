@@ -4362,21 +4362,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 304
 **Owner:** natest (builds asked on 11-15: gate copies become reused slots; production change, the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** after a cloud gate is imported, its result is in the buildlog store beside the gate run record, and the copy keeps no result file.
-
-**Spec:**
-- `store.RESULTS_DIR = "results"`. `record.keep_result(data, host, epoch, record_id)` writes `<host>/results/<YYYY-MM>/<record_id>.json.gz` with the same atomic gzip write as `keep_log`, and returns the relative path. One private helper does the write for both.
-- `cloud_gate.import_record` keeps the result after the record append: the data is the imported row as JSON. It then deletes `remote-result.json` from the gate folder. `imported.json` names the stored file in `result`.
-- A store write failure reports with `gate_record.report_not_written` and leaves the folder file. The gate verdict does not change.
-- A result that fails validation is not imported and stays in its folder.
-- Nothing reads `remote-result.json` after import: a complete outcome makes `run_cloud` use a new folder.
-
-**Files:** `scripts/buildlog/store.py`, `scripts/buildlog/record.py`, `scripts/aws_target/cloud_gate.py`, and their tests.
-
-**Workers:** 1 writer (the director; no-worker mode).
-
-**Constraints from prior phases:** Phase 304: outcome.json names `cloud_gate.RESULT_FILE`; `outcome_result` reads it.
-
-**Acceptance gate:** the aws_target and buildlog record test modules pass on natedev; a cloud gate test shows the stored result and no folder result; every behavior check stays.
+- Gate copies become reused slots; the largest copy held 11.2 GB of gate results in 472 folders of .git/cloud-gates.
+- `record.keep_result` keeps a result gzipped at `<host>/results/<YYYY-MM>/<record id>.json.gz` in the buildlog store (`store.RESULTS_DIR`). `keep_log` and `keep_result` share `_keep_compressed`.
+- `cloud_gate.import_record` keeps the imported row after the record append, deletes `remote-result.json` from the gate folder and names the stored file in imported.json `result`. A store write failure is reported with `report_not_written` and leaves the folder file.
+- Commit ce1875a45. Production change.
