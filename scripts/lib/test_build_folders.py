@@ -1478,6 +1478,32 @@ os._exit(0)
                     self.assertTrue(made.is_dir())
                     self.assertEqual(folders.build_folder_state(made), "held")
 
+    def test_a_lease_replaced_after_its_lookup_is_not_a_fault(self) -> None:
+        request = folders.StableOwnerFolder("replaced-lease", folders.ExplicitBuildParent(self.root))
+        first = folders.create_build_folder(request)
+        real_stat = os.stat
+        replaced: list[str] = []
+
+        def stat_then_replace(name: str | os.PathLike[str], *, dir_fd: int | None = None,
+                              follow_symlinks: bool = True) -> os.stat_result:
+            if not os.fspath(name).endswith(".lease.json") or replaced:
+                return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            # Another holder replaces the lease between this lookup and the read of its link count.
+            descriptor = os.open(name, os.O_RDONLY, dir_fd=dir_fd)
+            try:
+                newer = os.fspath(name) + ".newer"
+                os.close(os.open(newer, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=dir_fd))
+                os.replace(newer, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                replaced.append(os.fspath(name))
+                return os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+        with mock.patch.object(os, "stat", side_effect=stat_then_replace):
+            again = folders.create_build_folder(request)
+        self.assertEqual(replaced, [first.name + ".lease.json"])
+        self.assertEqual(again, first)
+
     def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
         for stage in ("folder", "lease", "temporary-lease", "lock"):
             for held in (False, True):

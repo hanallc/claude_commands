@@ -319,7 +319,8 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec) -> None:
     else:
         if stat.S_ISLNK(existing.st_mode):
             raise OSError(errno.ELOOP, "a build folder lease cannot be a symbolic link", name)
-        if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+        # A concurrent os.replace can unlink the lease after this lookup, so no link is not a fault.
+        if not stat.S_ISREG(existing.st_mode) or existing.st_nlink > 1:
             raise ValueError("a build folder lease must be a regular file with one link")
     text = json.dumps(record) + "\n"
     temporary = name + "." + secrets.token_hex(8) + ".tmp"
