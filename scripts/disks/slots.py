@@ -2,21 +2,15 @@
 from __future__ import annotations
 
 import json
-import os
-import re
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePath
 from typing import Literal, TypedDict, cast
 
 from scripts.buildlog.store import host_name
 from scripts.disks import disks_page
 from scripts.disks.measure import DisksData, Folder
-from scripts.lib import build_folders, conf
-
-SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
-LEASE_SUFFIX = ".lease.json"
-DAY_SECONDS = 86400
+from scripts.lib import build_folders, build_slots, conf
 
 State = Callable[[Path], Literal["held", "free"]]
 
@@ -71,21 +65,21 @@ def tree_size(data: DisksData | None, path: PurePath) -> int | None:
 
 def lease_record(path: Path) -> dict[str, object]:
     try:
-        record = cast(object, json.loads(path.with_name(path.name + LEASE_SUFFIX).read_text(encoding="utf-8")))
+        record = cast(object, json.loads(build_slots.lease_path(path).read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return {}
     return cast(dict[str, object], record) if isinstance(record, dict) else {}
 
 
-def last_use(record: Mapping[str, object]) -> float | None:
+def last_use(record: Mapping[str, object]) -> datetime | None:
     value = record.get("last_use")
     try:
-        return datetime.fromisoformat(value).timestamp() if isinstance(value, str) else None
+        return datetime.fromisoformat(value) if isinstance(value, str) else None
     except ValueError:
         return None
 
 
-def slot_row(path: Path, number: int, cargo_root: Path, data: DisksData | None, now: float, unused_days: int,
+def slot_row(path: Path, number: int, cargo_root: Path, settings: conf.ConfigRead, data: DisksData | None, now: float,
              state: State) -> SlotRow:
     record = lease_record(path)
     held = state(path) == "held"
@@ -94,47 +88,41 @@ def slot_row(path: Path, number: int, cargo_root: Path, data: DisksData | None, 
     known = [size for size in sizes if size is not None]
     text = {key: value for key in ("purpose", "unit", "showrunner") if isinstance(value := record.get(key), str)}
     return {"name": path.name, "number": number, "size": sum(known) if known else None,
-            "last_used": now if held else used,
+            "last_used": now if held else used.timestamp() if used else None,
             "used_by": {"purpose": text.get("purpose", ""), "unit": text.get("unit", ""),
                         "showrunner": text.get("showrunner", "")} if held else None,
-            # The nightly sweep deletes a free slot whose last use is older than slots.unused_days.
-            "deleted_tonight": not held and used is not None and now - used > unused_days * DAY_SECONDS}
+            "deleted_tonight": (not held and used is not None
+                                and build_slots.unused(used, settings, datetime.fromtimestamp(now, timezone.utc)))}
 
 
-def read_slots(root: Path, cargo_root: Path, values: Mapping[str, str], machine: str, data: DisksData | None,
+def read_slots(root: Path, cargo_root: Path, settings: conf.ConfigRead, machine: str, data: DisksData | None,
                now: float, state: State = build_folders.build_folder_state) -> SlotReport:
     """Each slot under root, grouped by repository, as the nightly sweep finds them."""
-    unused_days = int(values["slots.unused_days"])
-    names: set[str] = {entry.name.removesuffix(LEASE_SUFFIX) for entry in root.iterdir()} if root.is_dir() else set()
     groups: dict[str, list[SlotRow]] = {}
-    for name in names:
-        if (match := SLOT_NAME.fullmatch(name)) is not None:
-            groups.setdefault(match[1], []).append(
-                slot_row(root / name, int(match[2]), cargo_root, data, now, unused_days, state))
+    for path, repository, number in build_slots.slot_paths(root) if root.is_dir() else []:
+        groups.setdefault(repository, []).append(slot_row(path, number, cargo_root, settings, data, now, state))
 
     def maximum(repository: str) -> int | None:
-        value = values.get(f"slots.{machine}.{repository}.max", values.get(f"slots.{machine}.default_max"))
-        return int(value) if value else None
+        try:
+            return build_slots.configured_maximum(settings, machine, repository)
+        except conf.Unusable:
+            return None
 
     return {"root": str(root), "groups": [{"repository": repository, "maximum": maximum(repository),
                                            "slots": sorted(rows, key=lambda row: row["number"])}
                                           for repository, rows in sorted(groups.items())]}
 
 
-def config_path(value: str) -> Path:
-    return Path(os.path.expandvars(value)).expanduser().resolve()
-
-
 def slot_report(now: float) -> SlotReport | None:
     """The slots on this machine, or None when build_folders.conf names no slot root for it."""
-    values = conf.read("build_folders").values()
+    settings = conf.read_or_repository("build_folders")
     machine = host_name()
-    root = values.get(f"roots.slots.{machine}", values.get("roots.slots"))
-    cargo_root = values.get(f"roots.slot_cargo.{machine}", values.get("roots.slot_cargo"))
-    if not root or not cargo_root:
+    try:
+        root = build_slots.slot_folder_root(settings, machine)
+    except build_slots.SlotsNotConfigured:
         return None
     try:
         data = cast(DisksData, json.loads((disks_page.output_folder() / disks_page.DATA_FILE).read_text(encoding="utf-8")))
     except (OSError, ValueError):
         data = None
-    return read_slots(config_path(root), config_path(cargo_root), values, machine, data, now)
+    return read_slots(root, build_slots.slot_cargo_root(settings), settings, machine, data, now)

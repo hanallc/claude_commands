@@ -1772,11 +1772,12 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 ##### Phase 98 as-built
 
 - `scripts/disks/slots.py`:
-  - `slot_report` reads `roots.slots.<machine>` (else `roots.slots`) and `roots.slot_cargo` from `build_folders.conf`. With no slot root it returns nothing, and the page shows no card.
-  - `read_slots` finds each `<repository>-slotN` folder or lease record under the root, as the nightly sweep does. It groups the slots by repository, with the maximum from `slots.<machine>.<repository>.max`, else `slots.<machine>.default_max`.
+  - `slot_report` reads the slot root and the cargo root through `build_slots` (`slot_folder_root`, `slot_cargo_root`). With no slot root it returns nothing, and the page shows no card.
+  - `read_slots` finds the slots with `build_slots.slot_paths`, as the nightly sweep does. It groups the slots by repository, with the maximum from `build_slots.configured_maximum`.
   - Size: the checkout plus `<slot_cargo>/<name>`, from the last measure's trees (`tree_size`). A folder that the measure does not list is below `measure.keep_bytes`. A path on no measured drive has no size.
   - Used by: `build_folders.build_folder_state` gives held or free. A held slot shows the lease's purpose, unit and showrunner, and "now" as its last use.
-  - "deleted tonight": a free slot whose lease `last_use` is older than `slots.unused_days`, as the sweep in the nightly merge gate removes it.
+  - "deleted tonight": a free slot that `build_slots.unused` names, the same rule the sweep in the nightly merge gate uses.
+- `scripts/lib/build_slots.py` (queue's file, by builds' finding): the public readers `slot_folder_root`, `slot_cargo_root`, `lease_path`, `slot_paths`, `unused` and `configured_maximum`. The pool and the sweep use them.
 - `scripts/review_links/serve.py`: the measure answer adds `slots`, read at each POST, so the holders are current. `json_response` takes any JSON mapping.
 - `scripts/disks/disks.html`:
   - The page now posts on each open; the server starts a measure only when the sizes are old.

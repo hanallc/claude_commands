@@ -10,10 +10,10 @@ from unittest import mock
 
 from scripts.disks import slots
 from scripts.disks.measure import DisksData, Folder
-from scripts.lib import conf
+from scripts.lib import build_slots, conf
 
 GIB = 1 << 30
-DAY = slots.DAY_SECONDS
+DAY = 86400
 NOW = 100 * DAY
 
 
@@ -42,8 +42,10 @@ class TreeSizeTests(unittest.TestCase):
 
 class ReadSlotsTests(unittest.TestCase):
     def test_slots_group_by_repository_with_size_use_and_the_nightly_delete(self) -> None:
-        values = {"slots.unused_days": "7", "slots.host.default_max": "2", "slots.host.hana.max": "8"}
         with tempfile.TemporaryDirectory() as directory:
+            settings_file = Path(directory) / "build_folders.conf"
+            lines = ("slots.unused_days=7", "slots.host.default_max=2", "slots.host.hana.max=8")
+            _ = settings_file.write_text("".join(f"# whole: 1..\n{line}\n" for line in lines))
             root = Path(directory) / "slot"
             root.mkdir()
             for name, purpose, days in (("hana-slot1", "fps", 0), ("hana-slot2", "verify", 9), ("hana-slot10", "", 2),
@@ -51,13 +53,13 @@ class ReadSlotsTests(unittest.TestCase):
                 (root / name).mkdir()
                 lease = {"showrunner": "builds", "unit": "report", "purpose": purpose,
                          "last_use": datetime.fromtimestamp(NOW - days * DAY, timezone.utc).isoformat()}
-                _ = (root / (name + slots.LEASE_SUFFIX)).write_text(json.dumps(lease))
+                _ = build_slots.lease_path(root / name).write_text(json.dumps(lease))
             (root / "notes").mkdir()
 
             def state(path: Path) -> Literal["held", "free"]:
                 return "held" if path.name in {"hana-slot1", "organon-slot1"} else "free"
 
-            report = slots.read_slots(root, Path("/build/cargo"), values, "host", DATA, NOW, state)
+            report = slots.read_slots(root, Path("/build/cargo"), conf.read(settings_file), "host", DATA, NOW, state)
         self.assertEqual(report["root"], str(root))
         self.assertEqual([(group["repository"], group["maximum"], [row["name"] for row in group["slots"]])
                           for group in report["groups"]],
@@ -74,7 +76,7 @@ class ReadSlotsTests(unittest.TestCase):
             def values(self) -> dict[str, str]:
                 return {"roots.slot_cargo": "/build/cargo", "slots.unused_days": "7"}
 
-        with mock.patch.object(conf, "read", return_value=Settings()):
+        with mock.patch.object(conf, "read_or_repository", return_value=Settings()):
             self.assertIsNone(slots.slot_report(NOW))
 
 
