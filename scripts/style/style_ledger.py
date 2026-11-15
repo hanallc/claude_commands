@@ -2263,7 +2263,8 @@ def _judgment_version_triggers() -> str:
     """Version each source mutation and mark its existing cell subscribers.
 
     `+consumer_table` keeps SQLite off the primary key, whose `consumer_table` prefix scans every subscriber of the
-    table; each source term then reads `refill_dependency_sources`.
+    table; each source term then reads `refill_dependency_sources`. A cell's own rule and path name its judgment cell
+    and its rule generation, so those subscribers are read from `refill_cell_paths`, not from dependency rows.
     """
     sources = (
         ("judgments", "id", "judgments"),
@@ -2285,11 +2286,15 @@ def _judgment_version_triggers() -> str:
                     "INSERT INTO refill_rows "
                     + f"SELECT '{table}',{key},version,{present} FROM refill_tables WHERE source_table='{table}' "
                     + "ON CONFLICT(source_table,source_key) DO UPDATE SET version=excluded.version,present=excluded.present;")
-                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "rule_generations":
+                    body.append("UPDATE refill_cells SET dirty_version=dirty_version+1 "
+                                + f"WHERE rule IN ({reference}.rule,{reference}.rule||'{UNCOVERED_SUFFIX}');")
+                    continue
                 if table == "judgments":
-                    match += (f" OR (source_kind='judgment_cell' AND "
-                              + f"source_key=json_array({reference}.rule,{reference}.path))")
-                elif table == "lint_runs":
+                    body.append("UPDATE refill_cells SET dirty_version=dirty_version+1 "
+                                + f"WHERE rule={reference}.rule AND path={reference}.path;")
+                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "lint_runs":
                     match += f" OR (source_kind='lint_tool' AND source_key={reference}.tool)"
                 body.append(
                     "UPDATE refill_cells SET dirty_version=dirty_version+1 WHERE consumer_key IN "
@@ -2697,6 +2702,13 @@ MIGRATIONS = {
     44: "CREATE TABLE IF NOT EXISTS fold_withdrawals (finding_id TEXT PRIMARY KEY, unfolded_at TEXT NOT NULL);",
     # No trigger reads a git_object edge, and each consumer row keeps its objects, so the edges go.
     45: "DELETE FROM refill_dependencies WHERE source_kind='git_object';",
+    # A cell's rule and path columns name its judgment cell and rule generation; no trigger reads its history, scope
+    # membership or removal barrier rows, and its identity holds the tip, so those rows go.
+    46: """
+        CREATE INDEX IF NOT EXISTS refill_cell_paths ON refill_cells(rule,path);
+        DELETE FROM refill_dependencies WHERE consumer_table='refill_cells'
+            AND source_kind IN ('judgment_cell','rule_generations','scope_membership','history','removal_barriers');
+    """ + _replaced_triggers(_judgment_version_triggers()),
 }
 
 
@@ -8921,16 +8933,11 @@ class Ledger:
             return "awaiting merge", pending
         return ("stale" if judged else "open"), ""
 
-    def _cell_dependencies(self, rule: Rule, path: str, tip: RepositoryTip) -> CellDependencies:
+    def _cell_dependencies(self, rule: Rule, path: str) -> CellDependencies:
         rows = cast(list[tuple[int]], self._connection.execute(
             "SELECT id FROM judgments WHERE rule=? AND path=?", (rule.rule_id, path)).fetchall())
-        scope = _cell_scope(rule, path, tip)
+        # The cell row's rule and path name its judgment cell and rule generation, and its identity holds the tip.
         return CellDependencies((
-            ("judgment_cell", json.dumps((rule.rule_id, path), separators=(",", ":"), ensure_ascii=False), ""),
-            ("rule_generations", base_rule(rule.rule_id), ""),
-            ("scope_membership", json.dumps(_input_key(tip, scope, path)[1:]), tip.tree),
-            ("history", tip.commit, tip.commit),
-            ("removal_barriers", json.dumps((rule.rule_id, path)), tip.commit),
             *(("judgments", str(id), "") for (id,) in rows),
             *(("git_object", object_id, object_id) for object_id in sorted(self._judgment_reads)),
         ))
@@ -8945,7 +8952,7 @@ class Ledger:
                 return self._judgment_state(rule, path, tip)
         return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
                             calculate,
-                            lambda: self._cell_dependencies(rule, path, tip),
+                            lambda: self._cell_dependencies(rule, path),
                             crate=crate, family=rule.family, tier=rule.tier)
 
     @contextmanager

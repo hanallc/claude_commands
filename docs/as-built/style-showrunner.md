@@ -805,7 +805,10 @@ On the natedev ledger (3.6 million dependency rows), one `held_findings` lookup 
 Migration 43 drops and creates the cell triggers of migration 42 again with this lookup.
 Python and SQLite use the same unescaped Unicode JSON keys for judgment membership.
 A key change records the old key as deleted and the new key as present.
-Cell dependencies include judgment membership, source rows, generations, scope membership, history, and removal barriers.
+A cell stores dependency rows only for its judgment membership and its lint tools.
+The `judgments` and `rule_generations` triggers find the cells of a changed rule and path through `refill_cell_paths`.
+The cell identity holds the tip, so the cell needs no history, scope membership or removal barrier row.
+Migration 46 adds `refill_cell_paths`, deletes the five per-cell kinds, and replaces the cell triggers.
 The existing coverage code supplies each cell universe and its order.
 Changed rules, paths, ignores, manifests, and generator sites update that universe.
 Each catalog and execution checkout has a separate projection.
