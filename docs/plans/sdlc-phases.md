@@ -291,6 +291,22 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Gotchas:** `agent_exec.sh` runs under `set -u`, so an `agents_resolve` stub must set every variable the launcher reads.
 
+### Phase 36 — The simplify-follow items still in the tree  · status: done
+**Depends on:** none
+
+#### Work Order
+
+Survey (2026-11-15): items 1, 2, 4, 8, 9, 11, 13, 14 and 15 are gone, and item 3's old block is gone. sdlc gave this unit items 5, 6 and 7 (devtools changes `accounts.py status --json`, so item 7 stays at its two sites).
+
+1. Item 10: in `scripts/agents/agent_exec.sh`, delete `agents_claude_extract_result`. Call `"$PY" "$script_dir/claude_result.py" "$log_file" "$output_file"` at its one call site. Move its three comment lines above the `command=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 ...)` line.
+2. Item 12: `scripts/direct/simplify_result.py` joins `SIMPLIFY_AGENTS` with `", "`. Update the expected prompt in `scripts/direct/test_simplify_result.py`.
+3. Item 5: `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py` (two sites) and `scripts/production/add_showrunner_test_support.py` call `create_claude_account`. The showrunner fixture keeps its `projects` write.
+4. Item 3: `docs/as-built/agent-registry.md` says every readonly Claude run disables the edit tools. The `direct.simplify` line goes; it is stale since phase 31.
+5. Item 6: `account_for_launch` in `scripts/production/add_unit.py` calls `accounts.prepare_claude_launch`; its `try` already turns `AccountsError` into `Refusal`.
+6. Item 7: `account_test_support.store_usage(tool, login, usage)` holds the lock, load, key and write steps. `stored_room` and `test_accounts.py` `reading` call it.
+
+**Tests:** `scripts/agents/test_agent_exec.sh`, `test_simplify_result`, `test_nix_env_launches`, `test_add_unit`, and every suite that imports `account_test_support` or `add_showrunner_test_support`.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

@@ -261,8 +261,7 @@ It sends prompt contents through stdin, avoiding the command-line argument size 
 | Claude | Uses print mode with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and retains stream-json events in the log. |
 
 Write mode uses unrestricted write permissions.
-Readonly mode selects the read-only Codex sandbox or Claude plan permissions.
-`direct.simplify` also disables Claude editing tools.
+Readonly mode selects the read-only Codex sandbox, or Claude plan permissions with the editing tools disabled.
 `claude_result.py` writes the final answer to the output file.
 An `is_error` result or nonempty errors array produces `ERROR: <reason>` and exit 1.
 Otherwise the launcher preserves the agent's exit status.

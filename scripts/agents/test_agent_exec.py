@@ -21,7 +21,7 @@ from scripts.message import sessions
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id, source_environment
 from scripts.accounts import accounts
 from scripts.lib.nix_env_test_support import NixFixture
-from scripts.whoami.account_test_support import write_codex_auth
+from scripts.whoami.account_test_support import create_claude_account, write_codex_auth
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -175,10 +175,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         shim.symlink_to(SCRIPTS / "lib/py")
         _ = (self.home / ".claude.json").write_text("{}")
         for label in ("claude1", "claude3"):
-            _ = (notes / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
-            self.assertEqual(accounts.setup(label), [])
-            _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
-                "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+            create_claude_account(label, f"{label}@example.invalid")
         groups = accounts.groups_file()
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
