@@ -4325,20 +4325,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 297
 **Owner:** natest (production change; the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** a verify run records each wait and its activity window through `verify_helper`, so no recorder call starts a new Python process.
-
-**Spec:**
-- Cause: each `progress_history.py` call from verify.sh is a new Python start, about 150 ms, of which main is about 19 ms. direct/test_verify_wait_holder (49.4 AWS CPU s) makes 60 such starts.
-- `verify_helper` already runs a program with a top-level `main` inside its process, for about 7 ms a call. `progress_history.py` has a top-level `main`.
-- The 5 `PHASE_WAIT_RECORDER` calls (start-wait, wait-holder, 3 finish-wait) and the `start-activity` and `finish-activity` calls use `verify_helper`. Before the helper starts, or if it stops, `verify_helper` falls back to `"$PY"`.
-- The memory-event test in test_verify_wait_holder extracts `verify_helper` with the wait functions. With no helper started, it takes the fallback, so its recorder observer sees each call.
-
-**Files:** `scripts/direct/verify.sh`, `scripts/direct/test_verify_wait_holder.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is 7 call sites and one test list.
-
-**Constraints from prior phases:** Phase 297 made the helper read each request in large reads.
-
-**Acceptance gate:** the 150 verify modules, test_progress_history and test_phase_waits pass on natedev; an AWS pair on the verify modules shows less CPU; every behavior check stays.
+- Each progress_history recorder call from verify.sh was a new Python start, about 150 ms, for about 19 ms of work.
+- verify.sh sends its 7 recorder calls (start-wait, wait-holder, 3 finish-wait, start-activity, finish-activity) through `verify_helper`, which runs progress_history main in its process. With no helper, `verify_helper` falls back to `"$PY"`.
+- The test_verify_wait_holder drivers that extract the wait functions also extract `verify_helper`; they start no helper, so their recorder observers see each call.
+- AWS pair, 9 wait-recording modules: about 9.7 CPU s less (wait_holder 6.65).
+- Commit 966a0f225. Production change; the diff went to sdlc.
