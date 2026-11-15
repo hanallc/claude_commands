@@ -419,7 +419,7 @@ print(child.pid, flush=True)
 
     @unittest.skipUnless(sys.platform == "linux", "the Mac path runs with Linux orphan reaping")
     def test_mac_run_stops_its_background_group_before_it_releases_the_slot(self) -> None:
-        wrapper = """import os, pathlib, signal, sys
+        wrapper = """import os, pathlib, sys
 from unittest import mock
 from scripts.lib import build_folders, build_slots
 from scripts.lib.descendants import adopt_descendants
@@ -427,14 +427,17 @@ adopt_descendants()
 with build_slots.take_slot(pathlib.Path(sys.argv[1]), sys.argv[2], showrunner='builds',
                            unit='queue', work='proof', purpose='test') as slot:
     descriptor = build_folders.build_folder_lock_fd(slot.path)
-    # Linux must reap the simulated Mac group's orphans without launchd.
-    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-    try:
+    middle = os.fork()
+    if middle == 0:
         with mock.patch.object(sys, 'platform', 'darwin'):
             status = build_folders.run_build_command(sys.argv[3:], path=slot.path,
                 environment={**os.environ, **slot.env}, pass_fds=(descriptor,))
-    finally:
-        signal.signal(signal.SIGCHLD, previous)
+        os._exit(status)
+    while True:
+        reaped, status = os.wait()
+        if reaped == middle:
+            status = os.waitstatus_to_exitcode(status)
+            break
 raise SystemExit(status)
 """
         probe = """import fcntl, json, os, pathlib, subprocess, sys
