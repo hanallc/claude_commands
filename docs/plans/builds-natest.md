@@ -4035,3 +4035,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals in place of the `runpy.run_path` stub.
 - AWS pair (c7a.4xlarge, 3 rounds): 7 modules 166.71 -> 159.43 CPU s; `test_verify_mac_only` 37.85 -> 34.79.
 - Commit 1e8b2f6fd. Test-only change.
+
+### Phase 277 — The stopped-worker startup stub imports staff only where a child stops a worker  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `stopped_worker_module` in `staff_test_support.py` writes a `sitecustomize.py` with a `sys.meta_path` finder. When a child imports `scripts.agents.stop_resume`, the finder loads the real module and replaces `stop`. The stub `stop` imports `staff` when it runs.
+- In `test_assign_claude_follow`, the delivery retry test runs its three launches in process. The catalog retry part is the `@process_boundary` test `test_failed_catalog_switch_retries_on_the_first_model`.
+- AWS pair (3 rounds, median CPU s): `test_assign_claude_follow` 30.98 -> 20.51; `test_assign_claude_workers` 10.76 -> 8.33; `test_claude_worker` 9.08 -> 6.93.
+- Commit dd647b551. Test-only change.
