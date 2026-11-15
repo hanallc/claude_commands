@@ -4490,11 +4490,15 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
              "Delete /private/Trash (recommended): this frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
             ("/private/scratch/work", "Deleting it removes temporary work; check for work you still need.",
              "Review /private/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
+            ("/private/run/scratch/work", "Deleting it removes its contents; their use is unknown.",
+             "Review /private/run/scratch/work first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 0),
             ("/private/daily", "Deleting it removes its contents; their use is unknown.",
              "Review /private/daily first (recommended): deleting it frees 26.0 GiB, which covers the 10.0 GiB shortfall.", 26 * 3600),
             ("/private/missed", "Deleting it removes its contents; their use is unknown.", "", 100801),
         ):
-            with self.subTest(folder=folder, age=age), self.crossing_delivery({}) as delivery:
+            # Only the configured scratch root names temporary work, not any "scratch" path part.
+            with (self.subTest(folder=folder, age=age), self.crossing_delivery({}) as delivery,
+                  mock.patch.dict(os.environ, {copy_record.ROOT_ENV: "/private/scratch"})):
                 _ = write_config_fixture(conf.path("lint"), "sweep_snapshot_max_age_seconds=100800\n")
                 now = time.time()
                 measurement = sweep.AvailableDiskMeasurement(datetime.fromtimestamp(now - age, UTC), sweep.NoEarlierDiskMeasurement(), [
