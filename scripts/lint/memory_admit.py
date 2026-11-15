@@ -878,14 +878,17 @@ def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestP
 
 
 def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
+    # The service reads this table on each pass. Plain strings and bytes cost half the CPU of Path objects.
     processes: dict[int, ProcessIdentity] = {}
-    for entry in proc.iterdir():
-        if not entry.name.isdecimal():
+    root = os.fspath(proc)
+    for name in os.listdir(root):
+        if not name.isdecimal():
             continue
         try:
-            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            if fields[0] not in ("Z", "X"):
-                processes[int(entry.name)] = ProcessIdentity(int(fields[1]), fields[19])
+            with open(f"{root}/{name}/stat", "rb", buffering=0) as handle:
+                fields = handle.read().rsplit(b") ", 1)[1].split()
+            if fields[0] not in (b"Z", b"X"):
+                processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode())
         except (OSError, ValueError, IndexError):
             continue
     return processes

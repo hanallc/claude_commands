@@ -33,7 +33,7 @@ from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 
-from scripts.lib import build_folders, cancellation, conf, copy_record, file_lock, git_index, scratch
+from scripts.lib import build_folders, cancellation, cargo_target_config, conf, copy_record, file_lock, git_index, scratch
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -680,14 +680,37 @@ else:
     GateDirectoryBase = tempfile.TemporaryDirectory
 
 
+def cargo_output_outside(checkout: Path) -> bool:
+    """Resolve Cargo's folder settings from its config files, so a tree with no outside output starts no Cargo.
+    An unreadable setting counts as outside output, and the guard reads it from Cargo."""
+    if not (checkout / "Cargo.toml").is_file():
+        return False
+    environment = dict(os.environ)
+    cwd = str(checkout)
+    cargo_home = cargo_target_config.cargo_home_folder(cwd, environment)
+    inside = checkout.resolve()
+    try:
+        settings = cargo_target_config.cargo_folder_settings([], cwd, environment)
+        folders = [Path(cargo_target_config.cargo_build_folder(setting, [], cwd, cargo_home) if key == "build-dir"
+                        else os.path.realpath(setting.base / setting.value)) for key, setting in settings.items()]
+    except (OSError, ValueError):
+        return True
+    return any(not folder.is_relative_to(inside) and os.path.lexists(folder) for folder in folders)
+
+
 class GateCheckoutDirectory(GateDirectoryBase):
-    """Remove a private gate folder and report a removal failure separately."""
+    """Remove a private gate folder and its Cargo build folder; report a removal failure separately."""
 
     @override
     def cleanup(self) -> None:
         caller_error = sys.exception()
+        remove_tree = super().cleanup
+        tree = Path(self.name)
         try:
-            super().cleanup()
+            if cargo_output_outside(tree / "checkout"):
+                scratch.remove_with_cargo_output(tree, lambda _path: remove_tree())
+            else:
+                remove_tree()
         except OSError as error:
             raise PostUseError(f"{self.name}: fresh copy removal failed: {error}",
                                caller_error=caller_error) from error
@@ -1202,6 +1225,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 mark_target(cache)
                 shutil.rmtree(tree / "target")
                 (tree / "target").symlink_to(cache / "target", target_is_directory=True)
+                write_cache_build_dir(tree, cache / "target")
                 path_files = manifest_path_files(tree)
                 for path, current in tracked_file_times(tree).items():
                     saved = previous.get(path)
@@ -1214,6 +1238,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 if isinstance(cache_lease, GateLease):
                     caller_error = sys.exception()
                     try:
+                        cache_build_dir_config(tree).unlink(missing_ok=True)
                         refresh_remotes(tree, source)
                         mark_target(cache_lease.tree)
                         commit = commit_at(tree, "HEAD")
@@ -1225,6 +1250,20 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         finally:
             ACTIVE_GATES.reset(active)
             COMMAND_LOCKS.reset(token)
+
+
+def cache_build_dir_config(tree: Path) -> Path:
+    """Cargo reads this file in the gate folder above the checkout, outside the repository."""
+    return tree.parent / ".cargo" / "config.toml"
+
+
+def write_cache_build_dir(tree: Path, build_dir: Path) -> None:
+    """Put the gate's Cargo intermediates in the leased cache, so each gate builds warm.
+    The lease holds the cache for one gate at a time, so two gates never share one build-dir.
+    The file overrides the user's global build-dir; a repository's own Cargo config still wins."""
+    config = cache_build_dir_config(tree)
+    config.parent.mkdir(exist_ok=True)
+    write_text_atomic(config, f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
 
 
 def manifest_path_files(tree: Path) -> set[str]:
