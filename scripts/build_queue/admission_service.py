@@ -693,6 +693,14 @@ class HostEvidenceWorker:
             self.subscriptions[key] = object()
         self.requested.set()
 
+    def expedite(self, key: placement.HostEvidenceKey) -> None:
+        """Probe this key before every other due key."""
+        with self.lock:
+            if key not in self.due:
+                return
+            self.due[key] = float("-inf")
+        self.requested.set()
+
     def remove(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
             _ = self.due.pop(key, None)
@@ -700,48 +708,75 @@ class HostEvidenceWorker:
             _ = self.observations.pop(key, None)
         self.requested.set()
 
+    def _next_ready(self, now: float) -> tuple[placement.HostEvidenceKey, object] | float | None:
+        """Return the earliest due key and its subscription, or the delay until a key is due.
+
+        Each turn probes one key, so an expedited key waits for one probe at most.
+        """
+        ready = min(((due, order, key) for order, (key, due) in enumerate(self.due.items()) if due <= now),
+                    default=None)
+        if ready is not None:
+            return ready[2], self.subscriptions[ready[2]]
+        return max(0.0, min(self.due.values()) - now) if self.due else None
+
     def _read(self) -> None:
         while not self.stopped.is_set():
             self.requested.clear()
             with self.lock:
                 if self.stopped.is_set():
                     return
-                ready = tuple((key, self.subscriptions[key]) for key, due in self.due.items() if due <= time.monotonic())
-            for key, subscription in ready:
-                if self.stopped.is_set():
-                    return
-                with self.lock:
-                    if self.subscriptions.get(key) is not subscription:
-                        continue
-                observed_at = self.clock.now()
-                try:
-                    evidence = self.probe(key)
-                    if evidence.key != key:
-                        raise ValueError("provider evidence has a different policy key")
-                    if isinstance(evidence, placement.FreshHostEvidence):
-                        evidence = replace(evidence, observed_at=min(evidence.observed_at, observed_at))
-                except Exception as error:
-                    evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
-                with self.lock:
-                    if self.subscriptions.get(key) is not subscription:
-                        continue
-                    self.observations[key] = evidence
-                    self.due[key] = time.monotonic() + self.interval
-                with self.lock:
-                    if self.stopped.is_set():
-                        return
-                    try:
-                        os.eventfd_write(self.wake, 1)
-                    except OSError:
-                        return
-            with self.lock:
-                delay = max(0.0, min(self.due.values()) - time.monotonic()) if self.due else None
-            _ = self.requested.wait(delay)
+                ready = self._next_ready(time.monotonic())
+            if not isinstance(ready, tuple):
+                _ = self.requested.wait(ready)
+            elif not self._probe(*ready):
+                return
+
+    def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+        """Probe one key and publish its evidence. Return False when the worker stops."""
+        observed_at = self.clock.now()
+        try:
+            evidence = self.probe(key)
+            if evidence.key != key:
+                raise ValueError("provider evidence has a different policy key")
+            if isinstance(evidence, placement.FreshHostEvidence):
+                evidence = replace(evidence, observed_at=min(evidence.observed_at, observed_at))
+        except Exception as error:
+            evidence = placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
+        with self.lock:
+            if self.subscriptions.get(key) is not subscription:
+                return True
+            self.observations[key] = evidence
+            self.due[key] = time.monotonic() + self.interval
+            if self.stopped.is_set():
+                return False
+            try:
+                os.eventfd_write(self.wake, 1)
+            except OSError:
+                return False
+        return True
 
     def close(self) -> None:
         with self.lock:
             self.stopped.set()
         self.requested.set()
+
+
+def same_remote_resource(first: placement.PlacementDestination, second: placement.PlacementDestination) -> bool:
+    """Return whether two remote destinations share one target and an overlapping scope."""
+    from scripts.mac_test.mac_test import scopes_overlap
+
+    return (first.provider == second.provider and first.target == second.target
+            and scopes_overlap(first.scope, second.scope))
+
+
+@dataclass(frozen=True)
+class PlacementHold:
+    """An older waiting request that permits a remote destination but has no current free reading for it."""
+
+    episode: str
+    destination: placement.PlacementDestination
+    key: placement.HostEvidenceKey
+    observed_at: float
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1115,8 @@ class AdmissionServer:
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
+        # Start time of each hold that keeps a remote destination for an older waiting request.
+        self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
         self.override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride = records.NoHeadAdmissionOverride()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
@@ -2300,14 +2337,18 @@ class AdmissionServer:
         reader = self.host_readers.get(key)
         evidence = (reader.latest if reader is not None else self.host_observations.get(key,
                     placement.HostEvidenceUnavailable(key, self.clock.now(), "not read")))
-        if isinstance(evidence, placement.FreshHostEvidence):
-            interval = (self.last_usable_configuration.waiting_pass_seconds
-                        if isinstance(self.last_usable_configuration, records.MemoryConfig) else 0.0)
-            timeout = (0.0 if key.destination.provider == "local" else
-                       reader.timeout if reader is not None else self._host_probe_timeout(key))
-            if self.clock.now() - evidence.observed_at > interval + timeout:
-                return placement.StaleHostEvidence(key, evidence.observed_at, "provider evidence expired")
+        if isinstance(evidence, placement.FreshHostEvidence) and self.clock.now() - evidence.observed_at > self._evidence_lifetime(key):
+            return placement.StaleHostEvidence(key, evidence.observed_at, "provider evidence expired")
         return evidence
+
+    def _evidence_lifetime(self, key: placement.HostEvidenceKey) -> float:
+        """Return how long one probe can take: a waiting pass plus the probe time limit."""
+        reader = self.host_readers.get(key)
+        interval = (self.last_usable_configuration.waiting_pass_seconds
+                    if isinstance(self.last_usable_configuration, records.MemoryConfig) else 0.0)
+        timeout = (0.0 if key.destination.provider == "local" else
+                   reader.timeout if reader is not None else self._host_probe_timeout(key))
+        return interval + timeout
 
     def _request_host_evidence(self, request: wire.PlacementRequest,
                                destination: placement.PlacementDestination) -> placement.HostEvidence:
@@ -2859,6 +2900,7 @@ done
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy) -> records.QueueInputs:
         """Remove remote selections before the local planner commits any effects."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
+            self.placement_holds = {}
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
@@ -2886,6 +2928,9 @@ done
             and (submitted := self.placement_requests.get(episode)) is not None
             and isinstance(submitted.purpose, placement.SpeculativeCopy)]
         removed: set[str] = set()
+        held: list[PlacementHold] = []
+        taken: list[placement.PlacementDestination] = []
+        holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
@@ -2894,11 +2939,15 @@ done
             prerequisite = self.prerequisites.get(request.episode)
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
+            waiting_for: list[PlacementHold] = []
             for candidate in self.placement_eligibility.get(request.episode, ()):
                 if (initial_readiness_unchecked and candidate.destination.provider == "local"
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
+                    hold = self._placement_hold(request, candidate)
+                    if hold is not None:
+                        waiting_for.append(hold)
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
@@ -2916,7 +2965,11 @@ done
                     continue
                 if candidate.destination.provider == "scaler":
                     continue
+                if (any(same_remote_resource(destination, candidate.destination) for destination in taken)
+                        or self._held_for_older(request, candidate.destination, held, holds)):
+                    continue
                 _ = self._new_assignment(request, candidate.destination)
+                taken.append(candidate.destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
                 _ = self.waiters.pop(request.episode, None)
@@ -2929,8 +2982,52 @@ done
                             del self.slots[key]
                 removed.add(owner)
                 break
+            else:
+                for hold in waiting_for:
+                    held.append(hold)
+                    start = self.placement_holds.get((hold.episode, hold.destination))
+                    # A hold lasts until the next probe of the older request; it never starts again on the same reading.
+                    if start is not None and hold.observed_at < start:
+                        holds[(hold.episode, hold.destination)] = start
+        self.placement_holds = holds
         return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
             if records.waiter_owner(row) not in removed], slots=tuple(self.slots.values()))
+
+    def _placement_hold(self, request: wire.PlacementRequest,
+                        candidate: placement.CandidateEligibility) -> PlacementHold | None:
+        """Return the hold that keeps a remote destination for a waiting request whose evidence is not current."""
+        destination = candidate.destination
+        eligibility = candidate.eligibility
+        key = self.placement_host_keys.get((request.episode, destination))
+        if (key is None or not isinstance(request.purpose, placement.NormalStep)
+                or destination.provider in ("local", "scaler")
+                or not (isinstance(eligibility, placement.EvidenceNeeded)
+                        or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
+            return None
+        return PlacementHold(request.episode, destination, key, self.host_evidence(key).observed_at)
+
+    def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
+                        held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
+        """Keep a destination for an older request whose last reading predates this request's reading.
+
+        The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
+        """
+        key = self.placement_host_keys.get((request.episode, destination))
+        observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()
+        now = self.clock.now()
+        for hold in held:
+            if not same_remote_resource(hold.destination, destination) or hold.observed_at >= observed_at:
+                continue
+            start = holds.get((hold.episode, hold.destination))
+            if start is None:
+                start = now
+                holds[(hold.episode, hold.destination)] = start
+                reader = self.host_readers.get(hold.key)
+                if reader is not None:
+                    reader.worker.expedite(hold.key)
+            if now - start <= self._evidence_lifetime(hold.key):
+                return True
+        return False
 
     def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
         assignment = request.assignment
