@@ -1671,7 +1671,7 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
 
-### Phases 95–99 — The Disks page · status: in progress (95 and 96 done)
+### Phases 95–99 — The Disks page · status: in progress (95, 96 and 97 done)
 
 From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
 1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
@@ -1742,6 +1742,24 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 3. `config/console.conf` gets `page.disks.*` (label Disks). These are new keys.
 4. `serve.py` and `console.conf` are not report's files. The owner reviews the change, or makes it.
 5. Proof: one dark desktop shot of the live page.
+
+##### Phase 97 as-built
+
+- `scripts/disks/disks.html`:
+  - The page shows the old data at once. It posts to `measure` beside it when `disks.json` is missing or older than `cache_seconds`.
+  - The answer `current` reads the data again. Any other answer shows "Measuring…" and reads the data again every `page.poll_seconds` until `measured_at` changes.
+  - After the wait limit (`measure.timeout_seconds` for each drive), the line adds "The measure did not finish."
+  - With no data, the line reads "Measuring the drives. The first measure takes some minutes."
+  - With current data, the line adds "The page measures again when you open it and the sizes are more than N minutes old."
+- `scripts/disks/disks_page.py`:
+  - `start_measure` returns `current` when the data is newer than `cache_seconds`, and `running` when `disks.lock` is held.
+  - Otherwise it starts `measure.py` in its own session and returns `started`. A thread reaps the process. The server never waits.
+  - `page_url` publishes the page with the current config, then gives its link. `main` prints the link.
+  - `measure.py` no longer publishes the page.
+- `scripts/review_links/serve.py`: a POST to the `measure` path beside the page calls `start_measure` and answers `{"state": ...}` at once. A start failure answers 503.
+- `config/console.conf`: `page.disks.*` with label Disks, the `hard-drive` icon and `disks_page:page_url`. `console.py` adds `hard-drive` to `ICON_NAMES`; the Lucide icon is in `scripts/review_links/lucide`.
+- `config/disks.conf`: `page.poll_seconds=5`.
+- Tests: `start_measure` (missing, current, running, old), the status line, the serve route, the console page list. Chrome check: one POST on open, "Measuring…", then the new time after the data changes.
 
 #### Phase 98 — Slots card
 

@@ -169,6 +169,19 @@ function measuredText(measuredAt, now) {
   return `Sizes from ${clock(measuredAt)}, ${age(Math.max(0, now - measuredAt))}.`;
 }
 
+function minutes(seconds) {
+  const count = Math.round(seconds / 60);
+  return `${count} minute${count === 1 ? "" : "s"}`;
+}
+
+// The status line: the age of the sizes, then a running measure or when the next measure starts, then a problem.
+function statusText(measuredAt, now, measuring, problem, cacheSeconds) {
+  if (measuredAt == null) return measuring ? "Measuring the drives. The first measure takes some minutes." : problem || "No sizes yet.";
+  const next = measuring ? "Measuring…"
+    : `The page measures again when you open it and the sizes are more than ${minutes(cacheSeconds)} old.`;
+  return [measuredText(measuredAt, now), next, problem].filter(Boolean).join(" ");
+}
+
 function floorNote(drive) {
   if (drive.floor == null || !drive.total) return "The cleanup floor is unknown.";
   return `Cleanup starts below ${size(drive.floor)} free (${Math.round(100 * drive.floor / drive.total)}%).`;
@@ -179,8 +192,12 @@ function esc(text) {
 }
 
 const settings = JSON.parse(document.getElementById("disks-settings").textContent);
+const DATA_FILE = "disks.json";
+const MEASURE = "measure";
 const states = new Map();
 let data = null;
+let measuring = null;
+let problem = "";
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
@@ -256,11 +273,11 @@ function renderDrive(card, drive) {
 }
 
 function renderStatus() {
-  if (!data) return;
-  const now = Date.now() / 1000;
-  document.getElementById("dot").hidden = false;
-  document.getElementById("dot").classList.toggle("old", now - data.measured_at > settings.cache_seconds);
-  document.getElementById("status").textContent = measuredText(data.measured_at, now);
+  const now = Date.now() / 1000, dot = document.getElementById("dot");
+  dot.hidden = !data;
+  if (data) dot.classList.toggle("old", now - data.measured_at > settings.cache_seconds);
+  document.getElementById("status").textContent =
+    statusText(data ? data.measured_at : null, now, Boolean(measuring), problem, settings.cache_seconds);
 }
 
 function render() {
@@ -275,19 +292,62 @@ function render() {
   renderStatus();
 }
 
-async function load() {
+async function readData() {
+  const response = await fetch(DATA_FILE + "?" + Date.now(), {cache: "no-store"});
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`the server answered ${response.status}`);
+  return response.json();
+}
+
+function show(next) {
+  data = next;
+  if (data) render(); else renderStatus();
+}
+
+// Ask the server for a measure. The page keeps the old sizes and reads the data file again until it changes.
+async function askMeasure() {
   try {
-    const response = await fetch("disks.json?" + Date.now(), {cache: "no-store"});
-    if (!response.ok) throw new Error(response.status === 404 ? "no measure yet" : `the server answered ${response.status}`);
-    data = await response.json();
+    const response = await fetch(MEASURE, {method: "POST", body: "",
+                                           headers: {"Content-Type": "application/x-www-form-urlencoded"}});
+    const answer = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(answer.reason || `the server answered ${response.status}`);
+    if (answer.state === "current") { show(await readData()); return; }
+    measuring = {since: Date.now() / 1000, before: data ? data.measured_at : null};
+    setTimeout(poll, settings.poll_seconds * 1000);
+  } catch (error) {
+    problem = `The page could not start a measure: ${error.message}.`;
+  }
+  renderStatus();
+}
+
+async function poll() {
+  try {
+    const next = await readData();
+    if (next && next.measured_at !== measuring.before) { measuring = null; show(next); return; }
+  } catch (error) {
+    // A failed read leaves the measure running; the next read tries again.
+  }
+  if (Date.now() / 1000 - measuring.since > settings.wait_seconds) {
+    measuring = null;
+    problem = "The measure did not finish.";
+    renderStatus();
+    return;
+  }
+  setTimeout(poll, settings.poll_seconds * 1000);
+}
+
+async function start() {
+  try {
+    data = await readData();
   } catch (error) {
     document.getElementById("status").textContent = `No sizes: ${error.message}.`;
     return;
   }
-  render();
+  show(data);
+  if (!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds) await askMeasure();
 }
 
-load();
+start();
 setInterval(renderStatus, 30000);
 </script>
 </body>
