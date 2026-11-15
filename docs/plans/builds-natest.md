@@ -4417,24 +4417,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 309
 **Owner:** natest (builds gave a go on 11-15 after it held the `_process_class` wrap; base a7cdf31b5; queue owns the build_queue files and has no open edits in them).
 
-#### Work Order
+#### As-built
 
-**Goal:** each dataclass in the import closure of `mac_test.py`, `admission_protocol.py`, `offload.py`, `eligibility.py` and `buildlog/sync.py` has its own one-line docstring. `dataclasses` then skips the default `__doc__` it builds with `inspect.signature` (about 25 us per class per process start).
-
-**Measure:** copied-tree A/B with placeholder docstrings, 30 paired rounds: the mac_test + admission_protocol import fell from 100.1 to 86.3 ms CPU (13.8% less).
-
-**Spec:**
-1. Add a one-line docstring as the first statement of each dataclass with none in the 26 files below: 371 classes at a7cdf31b5. Cover nested dataclasses in these files too.
-2. Each docstring says what the record holds or means, in Simplified Technical English. One line, a full sentence with a period, 100 characters or fewer with its indent. No placeholder text such as "The X record."
-3. A subclass needs its own docstring; an inherited docstring does not stop the default `__doc__`.
-4. Change nothing else: no code, no field, no comment, no blank-line change outside the new lines.
-5. Self-check: `cd <worktree> && scripts/lib/py /tmp/claude/scratch/natest-probe/p310/undoc.py scripts.mac_test.mac_test scripts.build_queue.admission_protocol scripts.mac_test.offload scripts.mac_test.eligibility scripts.buildlog.sync` prints `0 with no docstring`.
-
-**Files (count at a7cdf31b5):** build_queue/admission_records.py 116, build_queue/placement.py 65, build_queue/admission_wire.py 49, build_queue/progress_profile.py 26, mac_test/offload.py 25, buildlog/record.py 13, build_queue/scope_activity.py 10, buildlog/sync.py 9, lib/test_phase.py 8, lib/build_folders.py 6, build_hold/owning_session.py 5, lib/conf.py 5, build_targets/target_config.py 5, build_queue/admission_protocol.py 5, buildlog/health.py 4, lib/copy_record.py 3, buildlog/step_context.py 3, build_hold/override_guard.py 2, build_queue/cloud_progress.py 2, direct/step_selection.py 2, lib/cargo_output.py 2, mac_test/eligibility.py 2, mac_test/claim_state.py 1, buildlog/mac_idle_alert.py 1, mac_test/mac_test.py 1, lib/git_files.py 1. All under `scripts/`.
-
-**Workers:** 1 writer; docstrings only, no test lane.
-- impl: all files.
-
-**Constraints from prior phases:** Phase 278 caches the generated dataclass method code in `scripts/lib/python_startup/sitecustomize.py`; do not change it. No signal handlers, masks or dispositions.
-
-**Acceptance gate:** the self-check prints 0; pyright adds no finding on the 26 files; these modules pass on natedev: build_hold/test_override_guard, buildlog/test_mac_idle_alert, buildlog/test_record, buildlog/test_sync, build_queue/test_admission_protocol, build_queue/test_admission_client, build_queue/test_admission_service, build_queue/test_cloud_progress, build_queue/test_placement, build_queue/test_progress_profile, build_queue/test_scope_activity, lib/test_build_folders, lib/test_cargo_output, lib/test_conf, lib/test_git_files, mac_test/test_mac_test, mac_test/test_offload; the director repeats the import A/B; trial merges with origin/main and queue's newest hash are clean.
+- Each of the 371 dataclasses with no docstring in the 26 files of the `mac_test`, `admission_protocol`, `offload`, `eligibility` and `buildlog.sync` import closure has a one-line docstring, so `dataclasses` builds no default `__doc__` with `inspect.signature`. A class whose body was only `pass` holds only its docstring. No code changed.
+- Import A/B, 30 paired rounds on natedev: `mac_test` + `admission_protocol` import CPU 93.2 -> 78.3 ms (16% less).
+- Commit 304e400f5. The fieldless shared base stays in the backlog.
