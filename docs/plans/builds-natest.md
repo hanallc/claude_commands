@@ -4242,3 +4242,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `VerifyTokenWaitFixture.write_wait_sleep` in `scripts/direct/verify_token_wait_test_support.py` makes the `sleep 3` stub pause a real 0.1 seconds; the memory poll sleep stays faked. A faked `sleep 3` let a `board.sh acquire --wait` loop spin at full CPU while a peer held the token.
 - AWS pair (3 rounds, 9 modules): token_reservation 15.55 -> 9.27 CPU s, about 9.2 CPU s less in total, all pass.
 - Commit 99927dcf3. Test-only change.
+### Phase 295 — The style ledger reads each repository tip once a process  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc gave no objection on 11-15).
+
+#### Work Order
+
+**Goal:** in-process style test runs build each repository tip and check each ref name once, with the same checks of behavior.
+
+**Spec:**
+- `scripts/style/style_ledger.py`: `_read_tip(repo, commit)` is an `lru_cache(maxsize=16)` over `_tip`. `Ledger._tip` and `GitReadCache.tip` call it. A tip depends only on its full commit name, and no code writes into a tip.
+- `_check_ref_format(repo, name)` keeps each valid ref name in a set; `check-ref-format` depends only on the name. `set_tip` and the ticket `assigned` move call it.
+- A production command is one process, so its git reads do not change.
+- `scripts/style/ledger_test_support.py`: `LedgerTestCase.forget_tips()` clears the cache; `tip_builds()` clears it and spies on `_tip`. The three `_tip` spies and the hidden-object test in `test_refill_cells.py` use them.
+
+**Files:** `scripts/style/style_ledger.py`, `scripts/style/ledger_test_support.py`, `scripts/style/test_refill_cells.py`, `scripts/style/test_style_ledger.py`, `scripts/style/test_style_ledger_sites.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module family.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the 48 modules that use style_ledger pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
