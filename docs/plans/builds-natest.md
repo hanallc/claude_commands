@@ -4177,3 +4177,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_saved_reservation_survives_a_lost_reserve_response` keeps the 0-read and 3-read cases. The 3-read case covers the recovery retry loop and its poll spacing.
 - AWS pair (3 rounds): 25.67 -> 22.61 CPU s, all pass.
 - Commit 78f9a3130. Test-only change.
+
+### Phase 289 — The lint key test checks each lint script by a direct call  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_a_lint_script_edit_invalidates_a_previously_reused_pass` in `scripts/direct/test_verify_token_renew.py` keeps one complete lint run after a `verify.sh` edit. It was `test_each_lint_script_edit_invalidates_a_previously_reused_pass`.
+- `LintKeyInputTests.test_the_lint_tree_key_reads_verify_invoke_and_the_lint_config` runs `tree_key` with a `verify_helper` that prints its words. It checks that the key call names `verify.sh`, `invoke.sh` and the lint config.
+- A `tree_key` mutation that drops each path fails the new test.
+- AWS pair (3 rounds): 19.27 -> 16.76 CPU s, all pass.
+- Commit 85116f891. Test-only change.
