@@ -95,6 +95,9 @@ class ScopeActivityReader:
         self.proc: Path = proc
         self.environments: dict[int, dict[str, str]] = {}
         self.commands: dict[int, tuple[str, ...]] = {}
+        # Each scope walks the same ancestors again. Keep each pid's command facts for the whole pass.
+        self.run_commands: dict[int, bool] = {}
+        self.fixtures: dict[int, bool] = {}
         self.runs: dict[int, LiveBuildRun] = {run.pid: run for run in runs}
         self.resolved_runs: dict[int, LiveBuildRun | NoLiveBuildRun] = {}
         self.boot: float = 0.0
@@ -122,6 +125,18 @@ class ScopeActivityReader:
             except OSError:
                 self.commands[pid] = ()
         return self.commands[pid]
+
+    def starts_run(self, pid: int) -> bool:
+        if pid not in self.run_commands:
+            command = self.command(pid)
+            self.run_commands[pid] = "verify.sh" in {Path(arg).name for arg in command} or runs_suite_runner(command)
+        return self.run_commands[pid]
+
+    def fixture(self, pid: int) -> bool:
+        if pid not in self.fixtures:
+            self.fixtures[pid] = bool(self.environment(pid).get("PYTEST_CURRENT_TEST")) or any(
+                arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in self.command(pid))
+        return self.fixtures[pid]
 
     def started_at(self, pid: int) -> float:
         identity = self.processes.get(pid)
@@ -178,9 +193,7 @@ class ScopeActivityReader:
                     return LiveBuildRun(int(owner), start, self.started_at(int(owner)))
             # An inherited run identity cannot name a different process lifetime.
             return NoLiveBuildRun()
-        command = self.command(pid)
-        names = {Path(arg).name for arg in command}
-        if "verify.sh" in names or runs_suite_runner(command):
+        if self.starts_run(pid):
             return LiveBuildRun(pid, self.processes[pid].start, self.started_at(pid))
         return inherited
 
@@ -208,9 +221,7 @@ class ScopeActivityReader:
                 env = self.environment(ancestor)
                 session = session or env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
                 name = name or env.get("CLAUDE_SESSION_NAME", "")
-                command = self.command(ancestor)
-                fixture = fixture or bool(env.get("PYTEST_CURRENT_TEST")) or any(
-                    arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in command)
+                fixture = fixture or self.fixture(ancestor)
                 ancestor = self.processes[ancestor].parent
             inherited = ancestor_runs.get(ancestor, NoLiveBuildRun())
             for ancestor in reversed(chain):
