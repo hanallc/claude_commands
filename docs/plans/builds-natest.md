@@ -4252,3 +4252,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
 - AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
 - Commit 232d9f01e. Production change.
+
+### Phase 296 — A paired trial box keeps its full lifetime after a queue wait  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the crate_run trial timeout; builds gave the go on 11-15; sdlc has no objection).
+
+#### Work Order
+
+**Goal:** a paired trial box gets `lifetime_minutes` from its launch, so a slot queue wait does not shorten its run budgets.
+
+**Spec:**
+- Cause: `gate_trial.py` set each request `expires` when it wrote request.json, before the slot queue wait. `gate_box.py` gives each run `(expires - now - delivery_s) / (2 x runs left)`. A 7 minute wait gave `style/test_crate_run.py` about 67 s a run; it needs about 70 s, so all 6 runs exited 124.
+- `coordinate_trial`: after every module holds its slot, set each pending request `expires` to `worker.clock() + lifetime_minutes * 60`, save its request.json, then reserve the cost.
+- `paired_module`: read request.json after the coordinator sends `launch`.
+- Trial branch names keep their start stamp. A box clones its branch within about one minute of launch.
+
+**Files:** `scripts/aws_target/gate_trial.py`, `scripts/aws_target/test_cloud_gate.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the new test (a queue wait does not shorten the box lifetime) fails without the fix and passes with it; test_cloud_gate, test_gate_trial and test_gate_box pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count.

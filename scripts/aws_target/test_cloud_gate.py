@@ -1876,6 +1876,34 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertTrue(rows[-1]['cleanup_complete'])
 
 
+    def test_paired_queue_wait_does_not_shorten_the_box_lifetime(self) -> None:
+        cohort = self.root / 'waited'
+        folder = cohort / 'waited'
+        folder.mkdir(parents=True)
+        # The request was written before a long wait for a cloud slot, so its first expiry is almost spent.
+        request = {**self.request, 'attempt': 'waited', 'task': 'paired', 'rounds': 1, 'module': 'waited/test_ok.py',
+                   'expires': int(self.now) + 60, 'base': {'commit': 'base', 'tree': 'base-tree'},
+                   'changed': {'commit': 'commit', 'tree': 'tree'}}
+        cloud_gate.save(folder / 'request.json', request)
+        cloud_gate.save(folder / 'deployment.json', self.deployment)
+        @contextmanager
+        def slot(_repo: Path, sidecar: Path, _mode: gate.SuiteMode) -> Generator[cloud_gate.CloudReservation]:
+            yield cloud_gate.CloudReservation(sidecar)
+        def execute(worker: cloud_gate.GateWorker, folder: Path, request: dict[str, object],
+                    _deployment: dict[str, object]) -> dict[str, object]:
+            cloud_gate.save(folder / 'launched-request.json', request)
+            worker.book.resolve_gate('waited', ledger.GateAbsent(int(self.now)))
+            return {'status': 'fallback', 'reason': 'fixture'}
+        with (mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=slot),
+              mock.patch.object(cloud_gate.GateWorker, 'execute', new=execute),
+              mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
+              mock.patch.object(time, 'time', return_value=self.now), redirect_stdout(StringIO())):
+            _ = gate_trial.coordinate_trial(cohort, self.state, self.settings)
+        expires = int(self.now) + cloud_gate.settings().whole('lifetime_minutes') * 60
+        self.assertEqual(cloud_gate.read(folder / 'launched-request.json')['expires'], expires)
+        self.assertEqual(cloud_gate.read(folder / 'request.json')['expires'], expires)
+        self.assertEqual([row.expires for row in self.book.read_snapshot().gate_reservations], [expires])
+
     def test_paired_uncertain_cost_keeps_full_reservation_and_absent_cost_is_zero(self) -> None:
         reservation = ledger.GateReservation('uncertain', int(self.now), int(self.now) + 1200,
             Decimal('0.8'), Decimal('0.02'))
