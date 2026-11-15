@@ -1779,6 +1779,10 @@ def escape_rsync_filter_path(path: str) -> str:
     return escaped
 
 
+# No trailing slash: a gate checkout's target is a symlink to the gate cache, not a folder.
+MIRROR_EXCLUDES = "/.git\n/target\n"
+
+
 def copy_tree(
     controller: ProcessController,
     config: OffloadConfig,
@@ -1798,7 +1802,7 @@ def copy_tree(
         ) as exclude_file:
             exclude_path = Path(exclude_file.name)
             try:
-                _ = exclude_file.write("/.git\n/target/\n")
+                _ = exclude_file.write(MIRROR_EXCLUDES)
                 for path in ignored:
                     _ = exclude_file.write(f"/{escape_rsync_filter_path(path)}\n")
                 exclude_file.flush()
