@@ -149,9 +149,13 @@ def request_token(token: str, identity: str) -> str:
     return hmac.new(token.encode(), ("image:" + identity).encode(), hashlib.sha256).hexdigest()
 
 
-def owner_name(record: staff.StaffSnapshot, identity: str) -> str:
+def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
+    """Return the card's owner text, name and kind, and the group panel's owner text, the name alone."""
     member = record.by_id(staff.StaffId(identity))
-    return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
+    if member is None:
+        unknown = f"Unknown session: {identity}"
+        return unknown, unknown
+    return f"{member.name} ({member.kind})", member.name
 
 
 def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
@@ -159,11 +163,11 @@ def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback
     path = html.escape(image_path(record), quote=True)
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
-    owner = html.escape(owner_name(members, record["owner"]))
+    owner, name = owner_names(members, record["owner"])
     return (f'<article id="image-{record["id"]}" data-image="{record["id"]}" data-registered="{int(added.timestamp())}" '
-            + f'data-owner="{html.escape(record["owner"], quote=True)}">'
+            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + f'<h2 class="caption">{html.escape(caption)}</h2><dl class="image-details">'
-            + f'<dt>Owner:</dt><dd>{owner}</dd>'
+            + f'<dt>Owner:</dt><dd>{html.escape(owner)}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
             + f'{shown_time(added)}</time></dd></dl>'
@@ -269,10 +273,12 @@ STYLE = """<style>[hidden]{display:none!important}
 main{max-width:1060px}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
-grid-template-columns:minmax(0,max-content) max-content max-content;column-gap:12px;font-size:14px}
-[data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;padding:6px 8px;border-radius:6px;
+grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}
+[data-image-groups] a{grid-column:1/-1;display:grid;grid-template-columns:subgrid;cursor:pointer;
 color:inherit;text-decoration:none;overflow-wrap:anywhere}
-[data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8882}
+[data-image-groups] a+a{border-top:1px solid #8884}
+[data-image-groups] span{padding:6px 10px}[data-image-groups] span+span{border-left:1px solid #8884}
+[data-image-groups] a:hover,[data-image-groups] a:focus-visible{background:#8883;outline:none}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
 [data-image-groups]{position:static;max-height:none;margin-bottom:16px}}
@@ -314,7 +320,7 @@ function showGroups() {
       event.preventDefault();
       row.card.scrollIntoView({block: 'start'});
     });
-    const name = row.card.querySelector('.image-details dd').textContent;
+    const name = row.card.dataset.ownerName;
     [name, String(row.count), row.card.querySelector('time').textContent].forEach((text, index) => {
       const cell = document.createElement('span');
       cell.textContent = text;
