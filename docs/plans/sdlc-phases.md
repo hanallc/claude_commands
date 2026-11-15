@@ -311,6 +311,24 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
 
+### Phase 37 — An Images card can show a before and after pair  · status: done
+**Depends on:** none
+
+#### Work Order
+
+User request 11-15 10:24: "if you're going to do a before and after scenario on the image page we need the functionality of having them show side byy side - with a single metadata and delete button - tghis will make comparisons much simpler in the future". Moved from admin-console by sdlc [595a5918]. Base: sdlc-fix-rounds at 304c80d16, merged into this branch.
+
+1. `images.py register --before <path> --after <path>` files one pair: one folder, one record, one caption, one id and one image link. `--image` still files one image.
+2. The record keeps the after image in `file` and adds `before` for a pair. A record without `before` reads as before.
+3. A pair card shows the two images side by side, each under a "Before" or "After" label and linked to its full size. The card has one caption, one details block, one Feedback field, one Send feedback and one Delete. Delete removes both images.
+4. The feedback message names both images.
+5. On a wide page a pair card uses more width than a single card, which keeps its 680px width and place. When the card is narrow, the two images stack, before on top.
+6. `commands/show_image.md` tells a proof to file its before and after shots as one pair.
+7. admin-console keeps `change_page.py` and `change_browser.py`; this phase does not edit them.
+
+**Tests:** `scripts/review_links/test_images.py` (pair register, refusals, card, delete, feedback, old record), `test_serve.py`, `test_console.py`.
+**Proof:** Images page shots before and after, at wide and narrow width.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

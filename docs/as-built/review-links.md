@@ -269,18 +269,20 @@ Answers to questions and changes both post to `changes.html`.
 `/console/images.html` shows registered images with their instructions, oldest first.
 A new image goes to the end, so the cards above it keep their places.
 The console lists it as **Images**, with the Lucide `image` icon.
-A showrunner or unit registers each image with one command:
+A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register --image PATH --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
 ```
 
 - The caption says what changed and what to look at.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
+  The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
-- It prints the image file link and the image's own console link:
+- It prints the image file links (before, then after, for a pair) and the image's own console link:
   `http://<host>:<server_port>/console/?page=images&at.images=%2Fconsole%2Fimages.html%23image%3D<id>`.
   `console.place_query` builds the query from the console's place key.
 - The server serves the copy, so the user never needs the source path.
@@ -289,7 +291,7 @@ Each card shows, in this order:
 
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image, as a link to the full size.
+3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
 5. The **Delete** and **Send feedback** buttons.
 
@@ -297,6 +299,9 @@ Each card shows, in this order:
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+A pair has one caption, one details block, one Feedback field and one **Delete** that removes both images.
+On a page 1104px or wider, a single card is 680px wide and a pair card is up to 1376px wide; both are centered in the images pane.
+When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
 
 A group is a run of shown cards in a row with the same owner.
@@ -322,7 +327,7 @@ The page refuses empty feedback with **Enter feedback first.** and keeps the car
 Otherwise the card leaves the page at once, and the request runs in the background.
 The server sends one message to the owner's staff id, resolved to its current session at each try.
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
-The message holds the feedback, the image link, the caption, the For line and the delete command for the owner to run after it acts.
+The message holds the feedback, the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 When no try reaches the owner, the server answers 503 and writes nothing.
 The card goes back in its place with one line: **Not sent: <reason>**.
