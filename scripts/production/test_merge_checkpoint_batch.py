@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shlex
 import shutil
@@ -214,7 +215,8 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertIn(f"send alpha: resolve alpha phase 2 ({first[:12]}), then resend this checkpoint", result.stdout)
         self.assertNotIn("into the merge branch", result.stdout)
         self.assertEqual(result.stdout.count("batch: retry"), 1)
-        self.assertEqual(self.events("checkpoint-test"), [[], [], []])
+        # The base check adds one run of the red command.
+        self.assertEqual(self.events("checkpoint-test"), [[], [], [], []])
         tip = self.git("rev-parse", "HEAD")
         for branch in ("production", "main"):
             self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), tip)
@@ -334,6 +336,24 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                                             timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(absent.returncode, 1, absent.stdout + absent.stderr)
 
+    def test_a_red_already_on_main_holds_every_item_without_a_bisect(self) -> None:
+        _ = (self.state / "tree-fail-rows").write_text(json.dumps({"src/main-red.txt": "main_red"}), encoding="utf-8")
+        self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")
+        start = self.git("rev-parse", "HEAD")
+        _ = self.push_main_change("src/main-red.txt", "red on main\n")
+        first = self.checkpoint(content="alpha batch side\n")
+        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        result = self.land_batch([self.batch_line("alpha", "2", first), self.batch_line("beta", "2", second)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("merge director: merge test 1 (main_red) red on base "), 1, result.stdout)
+        for unit in ("alpha", "beta"):
+            self.assertIn(f"send {unit}: your checkpoint adds no red", result.stdout)
+        self.assertNotIn("repair merge test", result.stdout)
+        self.assertNotIn("bisect:", result.stdout)
+        self.assertEqual(result.stdout.count("batch: retry"), 0)
+        self.assertEqual(self.git("rev-parse", "HEAD"), start)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
     def test_red_package_drops_only_the_item_that_selects_its_command(self) -> None:
         for interrupted, shrink, shared_red, probe_case in ((False, False, False, ""), (True, False, False, ""),
                                                            (True, True, False, ""), (False, False, True, ""),
@@ -437,7 +457,7 @@ raise SystemExit(1 if red else 0)
                     self.assertEqual(result.stdout.count("batch: retry"), 1)
                     self.assertEqual(self.git("ls-tree", "HEAD", "--", "src/main-sensitive.txt"), "")
                     tested = (self.state / "main-probe-tips").read_text().splitlines()
-                    self.assertEqual(len(tested), 7)
+                    self.assertEqual(len(tested), 8)
                     for tested_tip in set(tested):
                         self.assertEqual(self.git("merge-base", "--is-ancestor", main_commit, tested_tip), "")
                 elif probe_case == "rename":
@@ -500,7 +520,9 @@ raise SystemExit(1 if red else 0)
                     self.assertIn("send alpha: phase 2 merged", result.stdout)
                     self.assertIn("send alpha: phase 3 merged", result.stdout)
                     tips = (self.state / "checkpoint-tips").read_text().splitlines()
-                    self.assertEqual(self.events("checkpoint-test"), [[]] * 6)
+                    self.assertEqual(self.events("checkpoint-test"), [[]] * 7)
+                    # The base check runs the red command once on the start tip, before the bisect.
+                    self.assertEqual(tips.pop(2), start)
                     self.assertEqual([self.git("rev-parse", tip + "^2") for tip in tips[2:-1]], [second, second, first])
                     probes = [line for line in result.stdout.splitlines() if line.startswith("bisect:")]
                     self.assertEqual([line.split(" — ", 1)[0] for line in probes], ["bisect: red", "bisect: green"])

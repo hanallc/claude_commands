@@ -136,11 +136,25 @@ class StylePlanTests(StylePlanFixture):
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_decision_refill_holds_a_file_rename_whose_busy_file_declares_it_by_a_raw_name(self) -> None:
-        issue = self.file_rename_decision(self.rule("read"), (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),),
+        # The gauge.rs rename comes after other words, so file_rename does not approve it; it still edits its parent mod file.
+        rule = self.rule("read")
+        gauge_after = "After the moves, rename crates/alpha/src/gauge.rs to crates/alpha/src/meter.rs. Sweep the mod line."
+        issue = self.file_rename_decision(rule, (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),
+                                                 ("crates/alpha/src/gauge.rs", gauge_after)),
                                           (("crates/alpha/src/lib.rs", "mod gauge;\nmod r#probe;\nmod render;\n"),))
-        finding = self.ledger().proposal_findings(issue)[0]
+        findings = self.ledger().proposal_findings(issue)
         output = self.refill_with_busy("crates/alpha/src/lib.rs")
-        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
+        for finding in findings:
+            with self.subTest(path=finding.path):
+                self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
+        # Another unit's open ticket of the gauge.rs rename makes the parent mod file busy.
+        ledger = self.ledger()
+        gauge = next(finding for finding in findings if finding.path == "crates/alpha/src/gauge.rs")
+        ticket = ledger.next_ticket_id()
+        ledger.ticket_add(ticket, ticket_owner_id("names"), "proposal", "names", "crates/alpha", [gauge.path], [rule],
+                          proposal=str(issue), finding_ids=(gauge.finding_id,))
+        self.assertIn("crates/alpha/src/lib.rs",
+                      ledger.pipeline_footprint(ledger.ticket_get(ticket), frozenset({ledger.synced_commit()})))
 
     def test_decision_refill_holds_a_file_rename_declared_by_a_path_attribute_in_an_inline_module(self) -> None:
         self.assert_rename_waits_for_an_uncertain_path(

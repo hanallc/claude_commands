@@ -92,7 +92,7 @@ The server applies the same root, traversal, private-file, and symlink rules to 
 The console adds a same-origin content policy and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Changes and Builds.
+The left navigation has icons and labels for Changes, Builds and AWS prices.
 The desktop top bar shows only the selected page title.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
@@ -128,9 +128,11 @@ The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for
 `change_page.page_url` reuses the existing Changes publisher.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
+The AWS prices entry calls `aws_page.page_url`.
+That function returns the AWS prices page URL without publishing the page.
 
-The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+The console vendors six SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `hammer`, `cloud`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 

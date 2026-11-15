@@ -303,6 +303,11 @@ This record changes no selection and refuses no run.
 
 **Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
+This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
+A red module runs once more alone, as in the gate.
+The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
+`--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.

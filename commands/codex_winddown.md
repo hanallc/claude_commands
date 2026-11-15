@@ -1,7 +1,9 @@
 ---
-description: Stop Codex work or report active agents.
+description: Stop Codex work or report active agents; it does not stop paid credits.
 argument-hint: "[start|triage|clear|help]"
 ---
+
+A wind-down does not stop paid credits. When the user's reason is credits (for example, "workers are using credits"), the fix is the credits setting: send the user `/tune accounts codex_credit_accounts none` for their go. Never change that value without the user's go. Start a wind-down too only if the user also asks to stop the agents.
 
 `$ARGUMENTS` is `start`, `triage`, `clear`, `help`, or empty. Run the line and show its output unchanged. Run `start`, `triage` or `clear` only on the user's word. With `help` or any other argument, show this block word for word and stop:
 
@@ -14,9 +16,9 @@ argument-hint: "[start|triage|clear|help]"
 ```
 
 1. Empty: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py status`. It prints whether a wind-down is on and every session's running Codex agents on this machine, and changes nothing.
-2. `start`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py start --from <your session name>`. Every showrunner and unit director on this machine is told directly, each in its own version, to let running Codex agents finish and launch no new one. Each showrunner prints `<session> - <count> - <projected finish>` for its unit directors, in alphabetical order, every 2 minutes. The count asks each unit director with a running agent for the finish; until it answers the line reads `asked, answer owed`. When no Codex agent is left on the machine, the user gets one phone notification.
+2. `start`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py start --from <your session name>`. While `codex_credit_accounts` names an account, its first line says that paid credits stay on for those accounts, and names the `/tune` command that stops them; `triage` prints the same line. The wind-down never changes the setting. Every showrunner and unit director on this machine is told directly, each in its own version, to let running Codex agents finish and launch no new one. Each showrunner prints `<session> - <count> - <projected finish>` for its unit directors, in alphabetical order, every 2 minutes. The count asks each unit director with a running agent for the finish; until it answers the line reads `asked, answer owed`. When no Codex agent is left on the machine, the user gets one phone notification.
 3. `triage`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py triage --from <your session name>`. Every showrunner and unit director is told directly to stop each running Codex agent that can stop, onto a resume list, and let the rest finish.
-4. `clear`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py clear --from <your session name>`. The user's all clear: the counts stop, and every showrunner and unit director is told to use Codex again; a running Claude agent may finish.
+4. `clear`: `~/.claude/scripts/lib/py ~/.claude/scripts/production/codex_winddown.py clear --from <your session name>`. The user's all clear: the counts stop, and every showrunner and unit director is told to use Codex again; a running Claude agent may finish. While no-worker mode is on, the message says the wind-down is over and Codex stays off until the workers-back notice; it never tells a director to start Codex.
 
 Counts use the shared worker observation and show open panes with their status.
 Stopped panes count as stopped; closed panes count as closed.
