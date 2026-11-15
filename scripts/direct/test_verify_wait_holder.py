@@ -910,8 +910,8 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
             "TEST_TAPLO_EVENTS": str(self.fixture.root / "taplo-events.jsonl"), "TEST_TAPLO_STATUS": "0",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})
         process = self.start("lint", "sample")
-        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 2, "both Mac judgments", (process,),
-                                directory=self.fixture.runner_state)
+        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 3, "the Mac judgments and fix pass",
+                                (process,), directory=self.fixture.runner_state)
         self.fixture.wait_until(lambda: sum(row["event_type"] == "wait_started" for row in wait_rows(session)) == 2,
                                 "the local repair interval", (process,), directory=session)
         self.assertFalse(any(row["args"][:1] == ["mend"] and "--fix" in row["args"]
@@ -925,7 +925,7 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
                             for row in self.fixture.cargo_events()))
         arguments = [row["args"] for row in self.fixture.runner_events()]
         self.assertEqual([words[words.index("--verb") + 1] for words in arguments],
-                         ["mend-check", "clippy", "clippy"])
+                         ["mend-check", "mend-fix", "clippy", "clippy"])
 
 
 if __name__ == "__main__":
