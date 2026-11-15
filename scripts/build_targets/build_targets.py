@@ -19,7 +19,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from contextvars import ContextVar
@@ -29,6 +28,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
@@ -804,9 +804,8 @@ def reserve_assigned(args: CliArguments) -> int:
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-                    placement.attempt_key(assignment.episode, assignment.attempt)).hex,
-                    assignment.episode, assignment.attempt)
+                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                                     assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78
@@ -1139,7 +1138,7 @@ def caller_waits_on_hold(holds: build_hold.NatedevHolds, directory: Path) -> boo
     """Check whether a hold makes the calling session wait."""
     from scripts.build_hold import build_hold
 
-    return isinstance(hold_waited_on(holds, build_hold.owning_session(), directory,
+    return isinstance(hold_waited_on(holds, session_owner.owning_session(), directory,
                                     current_caller_lineage()), build_hold.Holder)
 
 
@@ -1242,8 +1241,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 print(f"{name}: natedev is held by {display_field(blocking.name)} for "
                       + f"{display_field(blocking.purpose)}{waiting}",
                       file=sys.stderr, flush=True)
-                resolution = build_hold.run_resolution()
-                if isinstance(resolution, build_hold.RunNotInStaff):
+                resolution = session_owner.run_resolution()
+                if isinstance(resolution, session_owner.RunNotInStaff):
                     line = (f"{name}: build has no run pointer ({display_field(str(resolution.run))}); "
                             + f"waits on {display_field(blocking.name)} hold for {display_field(blocking.purpose)}.")
                 elif isinstance(session, NoOwningSession):

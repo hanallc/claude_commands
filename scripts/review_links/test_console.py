@@ -11,6 +11,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.review_links import change_page, console
 
@@ -47,7 +48,8 @@ class ConsoleTests(unittest.TestCase):
             "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json")})))
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
-        with patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True):
+        with (patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True),
+              patch.object(aws_page, "page_url", return_value="/aws/aws_prices.html")):
             url = console.publish()
         parsed = urlsplit(url)
         self.assertEqual(parsed.query, "page=changes")
@@ -57,10 +59,12 @@ class ConsoleTests(unittest.TestCase):
         markup = ConsoleMarkup()
         source = (folder / console.PAGE_NAME).read_text()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["changes", "builds"])
+        self.assertEqual(markup.pages, ["changes", "builds", "aws"])
         self.assertEqual(markup.sources, [])
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 5)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 6)
         self.assertIn("/builds/memory_live.html", source)
+        self.assertIn("/aws/aws_prices.html", source)
+        self.assertIn('class="lucide lucide-cloud"', source)
         self.assertNotIn("Workspace", source)
         self.assertNotIn("sidebar-footer", source)
         self.assertEqual(source.count("<h1>Hana console</h1>"), 2)
@@ -91,13 +95,13 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["builds", "changes"])
-        self.assertIsInstance(pages[0].destination, console.UnavailablePage)
-        self.assertIsInstance(pages[1].destination, console.AvailablePage)
+        self.assertEqual([page.identity for page in pages], ["aws", "builds", "changes"])
+        self.assertIsInstance(pages[1].destination, console.UnavailablePage)
+        self.assertIsInstance(pages[2].destination, console.AvailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages).decode()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["builds", "changes"])
+        self.assertEqual(markup.pages, ["aws", "builds", "changes"])
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
 
@@ -108,7 +112,7 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["changes", "builds"])
+        self.assertEqual([page.identity for page in pages], ["changes", "builds", "aws"])
         self.assertIsInstance(pages[0].destination, console.AvailablePage)
         self.assertIsInstance(pages[1].destination, console.UnavailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages).decode())

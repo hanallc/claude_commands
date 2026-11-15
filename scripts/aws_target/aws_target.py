@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import fcntl
 import json
@@ -21,7 +21,7 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement
+from scripts.aws_target import ledger, measurement, run_cost
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
@@ -132,6 +132,54 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
+def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
+    """Every type a cloud gate can launch or compare."""
+    return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
+                                *values.words('gpu_instance_types'))))
+
+
+def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:
+    gap = f'{check.hours_gap_ratio:.0%}' if check.hours_gap_ratio is not None else 'all billed hours'
+    return push_texts.render('aws.hours_gap', day=day, size=size, region=region, billed=f'{check.billed_hours or 0:.2f}',
+                             box=f'{check.box_hours:.2f}', gap=gap, limit=f'{limit:.0%}')
+
+
+def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time,
+                      notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
+    """Send one user notice for each gate type, region and UTC day whose billed hours differ from its box hours."""
+    configuration = conf.read(settings_path)
+    limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
+    end = datetime.fromtimestamp(clock(), UTC)
+    start = end - timedelta(days=configuration.whole('run_cost_days'))
+    try:
+        checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
+                                           gate_sizes(conf.read_or_repository('cloud_gate')), limit)
+    except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+        print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
+        return 1
+    path = directory / 'hours-gap-notices.json'
+    saved = ledger.mapping(cast(object, json.loads(path.read_text()))).get('claimed') if path.exists() else None
+    # A day before the window is never checked again, so its key is dropped.
+    claimed = {key for key in (cast(list[object], saved) if isinstance(saved, list) else [])
+               if isinstance(key, str) and key.rpartition(':')[2] >= start.date().isoformat()}
+    def save() -> None:
+        write_text_atomic(path, json.dumps({'claimed': sorted(claimed)}) + '\n')
+    status = 0
+    for (size, region, day), check in sorted(checks.items()):
+        key = f'aws-hours-gap:{size}:{region}:{day}'
+        if not check.hours_gap_over or key in claimed:
+            continue
+        # Save the claim before delivery so a slow send never repeats.
+        claimed.add(key)
+        save()
+        if not notify(key, hours_gap_push(day, size, region, check, limit), configuration.number('snapshot_notification_timeout_s')):
+            claimed.discard(key)
+            print(f'aws_target: hours gap notice for {size} in {region} on {day} remains pending', file=sys.stderr)
+            status = 1
+    save()
+    return status
+
+
 def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
              clock: Callable[[], float] = time.time,
              notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice,
@@ -145,8 +193,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
     configuration = conf.read(settings_path)
     values = conf.read_or_repository('cloud_gate')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    sizes = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
-                                 *values.words('gpu_instance_types'))))
+    sizes = gate_sizes(values)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / 'spot-prices.lock').open('a+') as lock:
         try:
@@ -361,7 +408,7 @@ def main() -> int:
         from scripts.aws_target.open_gates import report
         return report(args.directory, int(time.time()))
     if args.command == 'snapshot':
-        return snapshot(args.settings, args.directory)
+        return max(snapshot(args.settings, args.directory), hours_gap_notices(args.settings, args.directory))
     if args.command == 'serve':
         return serve(args.settings, args.directory, args.hana_settings)
     return controller_tick(args.settings, args.directory, args.hana_settings)

@@ -128,10 +128,13 @@ class RefillFacts:
         self.publish(publish)
 
     def dependencies(self, table: str, key: str, edges: tuple[tuple[str, str, str], ...]) -> None:
+        """Replace the stored edges of one consumer row. A Git object never changes, so no trigger reads its edge: the
+        consumer row keeps its objects in its own `objects` column, and this stores no `git_object` edge."""
         _ = self.connection.execute(
             "DELETE FROM refill_dependencies WHERE consumer_table=? AND consumer_key=?", (table, key))
         _ = self.connection.executemany("INSERT OR REPLACE INTO refill_dependencies VALUES (?,?,?,?,?)",
-                                      ((table, key, kind, source, identity) for kind, source, identity in edges))
+                                      ((table, key, kind, source, identity) for kind, source, identity in edges
+                                       if kind != "git_object"))
 
     def input_fact(self, kind: str, identities: object, version: int) -> str | UnstoredFact:
         key = (self.object_store, kind, input_identity(identities), version)

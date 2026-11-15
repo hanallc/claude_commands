@@ -96,12 +96,9 @@ FINDING_REPLACEMENT_GUIDANCE = (
 )
 
 
-# The git objects that the catalog's synced cells read. CROSS JOIN keeps the cells as the outer loop;
-# the planner otherwise walks every stored git-object dependency of every table.
+# The git objects that the catalog's synced cells read, from each cell's own `objects` list.
 SYNCED_CELL_OBJECTS = (
-    "SELECT DISTINCT d.source_key FROM refill_cells c CROSS JOIN refill_dependencies d "
-    + "ON d.consumer_table='refill_cells' AND d.consumer_key=c.consumer_key AND d.source_kind='git_object' "
-    + "WHERE c.catalog=? AND c.view='synced'"
+    "SELECT DISTINCT o.value FROM refill_cells c, json_each(c.objects) o WHERE c.catalog=? AND c.view='synced'"
 )
 
 UNCOVERED_SUFFIX = "#uncovered"
@@ -375,7 +372,14 @@ class RuleBodyChanged:
     rule_blob: str
 
 
-WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone | RuleBodyChanged
+@dataclass(frozen=True)
+class FoldUndone:
+    """A whole test file move kept none of its item findings; `held unfold-test-files` returned them at this time."""
+
+    at: str
+
+
+WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone | RuleBodyChanged | FoldUndone
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
@@ -390,6 +394,8 @@ def withdrawn_line(by: WithdrawnBy) -> str:
             return f"declaration gone at {by.commit[:7]}"
         case RuleBodyChanged():
             return f"rule body changed to {by.rule_blob[:8]}"
+        case FoldUndone():
+            return f"fold undone at {by.at}; its item findings returned"
 
 
 @dataclass(frozen=True)
@@ -803,6 +809,62 @@ class FoldedTestFile:
     finding_id: str
     before: int
     declaring_file: str
+
+
+@dataclass(frozen=True)
+class UnfoldedRule:
+    """What `held unfold-test-files` did for one rule's whole test file moves."""
+
+    rule: str
+    restored_unfiled: int
+    restored_filed: int
+    folds_kept: int
+    folds_withdrawn: int
+
+
+def unfolded_line(item: UnfoldedRule) -> str:
+    return (f"{item.rule}: restored unfiled {item.restored_unfiled}, restored filed {item.restored_filed}, "
+            + f"folds kept {item.folds_kept}, folds withdrawn {item.folds_withdrawn}")
+
+
+# The text `_fold_test_file_group` writes; group 1 is the declaring file.
+WHOLE_TEST_FILE_MOVE = re.compile(r"Move the whole file \S+ into the inline \S+ module in (\S+)\.")
+RUST_FILE_NAME = re.compile(r"[A-Za-z0-9_./-]*[A-Za-z0-9_]\.rs\b")
+
+
+def _names_file(name: str, path: str) -> bool:
+    """Whether a Rust file name from finding text is the repository path's trailing parts."""
+    parts, path_parts = name.split("/"), path.split("/")
+    return len(parts) <= len(path_parts) and path_parts[-len(parts):] == parts
+
+
+def moves_into_test_file_destination(finding: HeldFinding, destination: str) -> bool:
+    """Whether the finding names the declaring file and no Rust file other than it and the test file."""
+    names = tuple(match.group() for match in RUST_FILE_NAME.finditer(finding.text + "\n" + finding.after))
+    return any(_names_file(name, destination) for name in names) and all(
+        _names_file(name, destination) or _names_file(name, finding.path) for name in names)
+
+
+@dataclass(frozen=True)
+class UnfoldPlan:
+    """The item findings to return, the whole test file moves to withdraw, and the counts for each rule."""
+
+    restored: tuple[HeldFinding, ...]
+    withdrawn: tuple[str, ...]
+    rules: tuple[UnfoldedRule, ...]
+
+
+@dataclass(frozen=True)
+class NoUnfoldBackup:
+    """No fold needed a change, so the command wrote nothing and copied nothing."""
+
+
+@dataclass(frozen=True)
+class UnfoldedTestFiles:
+    """The per-rule counts, and the ledger copy made before the writes; it was deleted after verification."""
+
+    rules: tuple[UnfoldedRule, ...]
+    backup: Path | NoUnfoldBackup
 
 
 @dataclass(frozen=True)
@@ -2201,7 +2263,8 @@ def _judgment_version_triggers() -> str:
     """Version each source mutation and mark its existing cell subscribers.
 
     `+consumer_table` keeps SQLite off the primary key, whose `consumer_table` prefix scans every subscriber of the
-    table; each source term then reads `refill_dependency_sources`.
+    table; each source term then reads `refill_dependency_sources`. A cell's own rule and path name its judgment cell
+    and its rule generation, so those subscribers are read from `refill_cell_paths`, not from dependency rows.
     """
     sources = (
         ("judgments", "id", "judgments"),
@@ -2223,11 +2286,15 @@ def _judgment_version_triggers() -> str:
                     "INSERT INTO refill_rows "
                     + f"SELECT '{table}',{key},version,{present} FROM refill_tables WHERE source_table='{table}' "
                     + "ON CONFLICT(source_table,source_key) DO UPDATE SET version=excluded.version,present=excluded.present;")
-                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "rule_generations":
+                    body.append("UPDATE refill_cells SET dirty_version=dirty_version+1 "
+                                + f"WHERE rule IN ({reference}.rule,{reference}.rule||'{UNCOVERED_SUFFIX}');")
+                    continue
                 if table == "judgments":
-                    match += (f" OR (source_kind='judgment_cell' AND "
-                              + f"source_key=json_array({reference}.rule,{reference}.path))")
-                elif table == "lint_runs":
+                    body.append("UPDATE refill_cells SET dirty_version=dirty_version+1 "
+                                + f"WHERE rule={reference}.rule AND path={reference}.path;")
+                match = f"(source_kind='{dependency}' AND source_key={key})"
+                if table == "lint_runs":
                     match += f" OR (source_kind='lint_tool' AND source_key={reference}.tool)"
                 body.append(
                     "UPDATE refill_cells SET dirty_version=dirty_version+1 WHERE consumer_key IN "
@@ -2630,6 +2697,18 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS judgments_holder ON judgments(rule,ticket,recorded_at DESC,id DESC);
         CREATE INDEX IF NOT EXISTS finding_judging_ticket ON held_findings(ticket,finding_id);
     """ + _replaced_triggers(_judgment_version_triggers()) + _finding_version_triggers(),
+    # When `held unfold-test-files` withdrew a whole test file move that kept none of its item findings. Each row is
+    # written with its held_findings state change, so the held_findings triggers version it.
+    44: "CREATE TABLE IF NOT EXISTS fold_withdrawals (finding_id TEXT PRIMARY KEY, unfolded_at TEXT NOT NULL);",
+    # No trigger reads a git_object edge, and each consumer row keeps its objects, so the edges go.
+    45: "DELETE FROM refill_dependencies WHERE source_kind='git_object';",
+    # A cell's rule and path columns name its judgment cell and rule generation; no trigger reads its history, scope
+    # membership or removal barrier rows, and its identity holds the tip, so those rows go.
+    46: """
+        CREATE INDEX IF NOT EXISTS refill_cell_paths ON refill_cells(rule,path);
+        DELETE FROM refill_dependencies WHERE consumer_table='refill_cells'
+            AND source_kind IN ('judgment_cell','rule_generations','scope_membership','history','removal_barriers');
+    """ + _replaced_triggers(_judgment_version_triggers()),
 }
 
 
@@ -2751,7 +2830,7 @@ def command_ticket_holder(reference: str, ledger: Ledger) -> staff.StaffRow:
 type HeldFindingRow = tuple[
     str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName,
     str, str, int, str, str, str, str, int, str, str, str, str,
-    str, str, int, str, str, str, str, int,
+    str, str, int, str, str, str, str, int, str,
 ]
 
 
@@ -2846,6 +2925,7 @@ class Ledger:
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
+        self._name_sites: dict[tuple[str, str, DeclaredItem], declarations.NameSites | declarations.UnreadableBody] = {}
         if access == LedgerAccess.READ_WRITE:
             database.parent.mkdir(parents=True, exist_ok=True)
         self._staff_resolver: session_staff.RowResolver | None = resolver
@@ -4021,26 +4101,31 @@ class Ledger:
         A kept finding in a crate with no freed finding cannot. In a crate that holds both, each finding of the crate
         must be a plain file rename (`file_rename`), and: no freed file names a kept module, by its old or new name;
         no freed rename and kept rename share a new name, and neither takes the other's old name; and no file of the
-        crate reaches a renamed module by a path that holds none of its names (_hidden_module_paths).
+        crate, or file that the crate mounts from outside its folder, reaches a renamed module by a path that holds
+        none of its names (_hidden_module_paths).
         """
         tip = self._tip(commit)
-        reasons = self._crossing_mounts(tip, frozenset(tip.crate(finding.path) for finding in (*freed, *kept)))
-        for crate in sorted({tip.crate(finding.path) for finding in freed}):
-            shared = tuple(finding for finding in kept if tip.crate(finding.path) == crate)
-            if shared:
-                yielded = tuple(finding for finding in freed if tip.crate(finding.path) == crate)
-                reasons += self._crate_couplings(commit, crate, yielded, shared)
+        shared = frozenset(tip.crate(finding.path) for finding in freed) & frozenset(tip.crate(finding.path) for finding in kept)
+        reasons, mounted = self._crossing_mounts(tip, frozenset(finding.path for finding in (*freed, *kept)), shared)
+        for crate in sorted(shared):
+            yielded = tuple(finding for finding in freed if tip.crate(finding.path) == crate)
+            still = tuple(finding for finding in kept if tip.crate(finding.path) == crate)
+            reasons += self._crate_couplings(commit, crate, yielded, still, tuple(dict.fromkeys(mounted.get(crate, ()))))
         return tuple(dict.fromkeys(reasons))
 
-    def _crossing_mounts(self, tip: RepositoryTip, crates: frozenset[str]) -> list[str]:
-        """Why a `path` attribute in any Rust file of the repository can join a crate of crates to another crate.
+    def _crossing_mounts(self, tip: RepositoryTip, paths: frozenset[str],
+                         shared: frozenset[str]) -> tuple[list[str], dict[str, list[str]]]:
+        """Why a `path` attribute in any Rust file of the repository can join a finding at paths to another crate, and
+        the Rust files that each crate of shared mounts from outside its folder.
 
-        A reading outside the declaring crate's folder mounts a file of one crate into another, so a finding's crate
-        is not all the code that compiles its file. It refuses when the declaring crate or the mounted file's crate
-        is in crates; a folder that an inline module's attribute names is read the same way. An unread attribute, and one
-        that mounts a file not named `.rs`, refuse wherever they are. One `git cat-file --batch` reads every file.
+        A reading outside the declaring crate's folder compiles a file of one crate into another. It refuses only when
+        a finding is in the declaring file, the mounted file or a file under the mounted folder. A crate of shared
+        (one that holds a freed and a kept finding) scans each file it mounts with its own files, so a mount refuses
+        there only when it leaves the repository, where no scan reads. An unread attribute, and one that mounts a file
+        not named `.rs`, refuse wherever they are. One `git cat-file --batch` reads every file.
         """
         reasons: list[str] = []
+        mounted: dict[str, list[str]] = {}
         blobs = {path: blob for path, blob in tip.blobs.items() if path.endswith(".rs")}
         for path, content in blob_contents(self.repo, blobs):
             for attribute in _path_attributes(path, content):
@@ -4054,13 +4139,20 @@ class Ledger:
                                 if not reading.endswith(".rs")]
                 kind = "file" if isinstance(attribute, MountedFile) else "folder"
                 for reading in attribute.readings:
-                    outside = reading.startswith("..") or tip.crate(reading) != home
-                    if outside and (home in crates or (not reading.startswith("..") and tip.crate(reading) in crates)):
-                        reasons.append(f"{path} mounts {reading}, a {kind} outside {home}")
-        return reasons
+                    if not reading.startswith("..") and tip.crate(reading) == home:
+                        continue
+                    reason = f"{path} mounts {reading}, a {kind} outside {home}"
+                    if path in paths or any(found == reading or found.startswith(reading + "/") for found in paths):
+                        reasons.append(reason)
+                    elif home in shared and reading.startswith(".."):
+                        reasons.append(reason)
+                    elif home in shared:
+                        mounted.setdefault(home, []).extend(
+                            file for file in tip.rust_files if file == reading or file.startswith(reading + "/"))
+        return reasons, mounted
 
     def _crate_couplings(self, commit: str, crate: str, freed: tuple[HeldFinding, ...],
-                         kept: tuple[HeldFinding, ...]) -> list[str]:
+                         kept: tuple[HeldFinding, ...], mounted: tuple[str, ...]) -> list[str]:
         moves = {finding.finding_id: file_rename(finding.kind, finding.path, finding.after) for finding in (*freed, *kept)}
         renames = {finding_id: moved for finding_id, moved in moves.items() if isinstance(moved, FileRename)}
         if len(renames) < len(moves):
@@ -4080,10 +4172,12 @@ class Ledger:
                                 for name in sorted(names & set(words))]
                 shared = ({yielded.new_stem} & names) | ({moved.new_stem} & {yielded.old_stem})
                 reasons += [f"{finding.finding_id} and {other.finding_id} both rename to or from {name}" for name in sorted(shared)]
-        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()))
+        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()), mounted)
 
-    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...]) -> list[str]:
-        """Why a file of the crate can reach a renamed module by a path that holds none of its names.
+    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...],
+                             mounted: tuple[str, ...]) -> list[str]:
+        """Why a file of the crate, or a file in mounted that the crate mounts from outside its folder, can reach a
+        renamed module by a path that holds none of its names.
 
         A public use of a module name re-exports it, a glob use of a renamed module's parent imports its name, and an
         `include`, `macro_rules` or `macro` word can build a path that no scan reads. Modules come from the folder
@@ -4100,7 +4194,7 @@ class Ledger:
                 parents.add(module[:-1])
         names = {name for moved in renames for name in (moved.old_stem, moved.new_stem)}
         tip = self._tip(commit)
-        for path in (path for path in tip.rust_files if tip.crate(path) == crate):
+        for path in (*(path for path in tip.rust_files if tip.crate(path) == crate), *mounted):
             words = _code_words(self._commit_file(commit, path))
             if isinstance(words, UnreadableCode):
                 reasons.append(f"{path} does not tokenize")
@@ -4114,6 +4208,10 @@ class Ledger:
                 reasons.append(f"{path} holds a glob use that the scan cannot read")
             globs = [index for index in trees.prefixes if words[index] == "*"]
             if not globs:
+                continue
+            if path in mounted:
+                # The scan does not read the module that the crate mounts the file as, so no glob of the file resolves.
+                reasons.append(f"{path} holds a glob use that the scan cannot resolve")
                 continue
             home = style_footprint.crate_module(path, root)
             scopes = style_footprint.import_context(words).scopes
@@ -4203,10 +4301,11 @@ class Ledger:
                 files.update(self.finding_needs(finding.finding_id))
                 moved = file_rename(finding.kind, finding.path, finding.after)
                 pair = approved_rename(finding.kind, finding.before, finding.after)
+                owners = approved_renames.edits_module_owners(finding.kind, finding.path, finding.after)
                 if isinstance(moved, FileRename):
                     files.add(moved.new)
                     name = moved.old_stem
-                elif finding.kind == "restructure" and finding.path.endswith(".rs"):
+                elif owners:
                     path = PurePosixPath(finding.path)
                     name = path.parent.name if path.name == "mod.rs" else path.stem
                 elif isinstance(pair, ApprovedRename):
@@ -4215,7 +4314,7 @@ class Ledger:
                     continue
                 for commit in commits:
                     files.update(self.files_naming(commit, name, ("*.rs", "*.md")))
-                    if isinstance(moved, FileRename) or finding.kind == "restructure":
+                    if isinstance(moved, FileRename) or finding.kind == "restructure" or owners:
                         files.update(self.files_naming(commit, "path"))
         if not files:
             raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
@@ -5231,8 +5330,9 @@ class Ledger:
         query = ("SELECT " + ",".join("h." + name for name in columns.split(","))
                  + ",COALESCE(w.rule_blob,''),COALESCE(r.name,''),COALESCE(r.line,0),"
                  + "COALESCE(r.text,''),COALESCE(r.kind,''),COALESCE(r.reason,''),COALESCE(t.state,''),"
-                 + "CASE WHEN w.finding_id IS NULL THEN 0 ELSE 1 END "
+                 + "CASE WHEN w.finding_id IS NULL THEN 0 ELSE 1 END,COALESCE(u.unfolded_at,'') "
                  + "FROM held_findings h LEFT JOIN rule_body_withdrawals w ON w.finding_id=h.finding_id "
+                 + "LEFT JOIN fold_withdrawals u ON u.finding_id=h.finding_id "
                  + "LEFT JOIN rename_dispositions r ON r.finding_id=h.finding_id "
                  + "LEFT JOIN tickets t ON t.id=h.ticket " + where + " ORDER BY h.created_at,h.finding_id")
         return tuple(cast(list[HeldFindingRow], self._connection.execute(query, parameters).fetchall()))
@@ -5255,7 +5355,7 @@ class Ledger:
                 state = Built(Path(row[11]))
             case "withdrawn":
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                                  RuleBodyChanged(row[23]) if row[30] else
+                                  RuleBodyChanged(row[23]) if row[30] else FoldUndone(row[31]) if row[31] else
                                   DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
                                   else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
@@ -5699,13 +5799,18 @@ class Ledger:
         return self._test_file_destinations[tip.commit].get(finding.path, SeparateItemMove())
 
     def _fold_test_file_group(self, findings: tuple[HeldFinding, ...]) -> tuple[FoldedTestFile, ...]:
-        """Fold one rule's unclaimed findings into the repository's whole sibling test file move."""
+        """Fold one rule's unclaimed findings that move into the declaring file into its whole sibling test file move."""
+        if not findings:
+            return ()
+        lead = next((finding for finding in findings if isinstance(finding.state, Filed)), findings[0])
+        destination = self._test_file_destination(lead)
+        if not isinstance(destination, TestFileDestination):
+            return ()
+        # A finding that names another file, or no file, proposes a different change; it keeps its own row.
+        findings = tuple(finding for finding in findings if moves_into_test_file_destination(finding, destination.path))
         if not findings:
             return ()
         first = next((finding for finding in findings if isinstance(finding.state, Filed)), findings[0])
-        destination = self._test_file_destination(first)
-        if not isinstance(destination, TestFileDestination):
-            return ()
         text = (f"Move the whole file {first.path} into the inline {destination.module} module "
                 + f"in {destination.path}.")
         before = f"The whole test file {first.path} is a separate sibling module."
@@ -5737,6 +5842,70 @@ class Ledger:
             [(identity, now, finding.finding_id) for finding in findings if finding.finding_id != identity],
         )
         return (FoldedTestFile(first.rule, first.path, identity, len(findings), destination.path),)
+
+    def _unfold_plan(self) -> UnfoldPlan:
+        """Find the item findings that a whole test file move holds although they do not move into its destination."""
+        members: dict[str, list[HeldFinding]] = {}
+        folds: dict[str, tuple[str, HeldStateName, str]] = {}
+        for member_id, fold_id, rule, state, text in cast(list[tuple[str, str, str, HeldStateName, str]], self._connection.execute(
+                "SELECT m.finding_id,f.finding_id,f.rule,f.state,f.text FROM held_findings m "
+                + "JOIN held_findings f ON f.finding_id=m.duplicate_of WHERE m.state='withdrawn' "
+                + "AND f.text LIKE 'Move the whole file %' AND f.state!='built' ORDER BY m.created_at,m.finding_id").fetchall()):
+            move = WHOLE_TEST_FILE_MOVE.fullmatch(text)
+            member = self._held(member_id)
+            if move is not None and isinstance(member.state, Withdrawn) and member.state.by == DuplicateOf(fold_id):
+                folds[fold_id] = (rule, state, move.group(1))
+                members.setdefault(fold_id, []).append(member)
+        restored: list[HeldFinding] = []
+        withdrawn: list[str] = []
+        counts: dict[str, list[int]] = {}
+        for fold_id, (rule, state, destination) in folds.items():
+            failing = [member for member in members[fold_id] if not moves_into_test_file_destination(member, destination)]
+            count = counts.setdefault(rule, [0, 0, 0, 0])
+            for member in failing:
+                restored.append(member)
+                count[1 if isinstance(member.state, Withdrawn) and isinstance(member.state.proposal, Path) else 0] += 1
+            if len(failing) < len(members[fold_id]):
+                count[2] += 1
+            elif state in ("unfiled", "filed"):
+                withdrawn.append(fold_id)
+                count[3] += 1
+        return UnfoldPlan(tuple(restored), tuple(withdrawn),
+                          tuple(UnfoldedRule(rule, *count) for rule, count in sorted(counts.items())))
+
+    def unfold_test_files(self) -> UnfoldedTestFiles:
+        """Return wrongly folded item findings to their decisions; copy the ledger first and verify after the writes."""
+        backup = self.database.with_name(self.database.stem + ".before-unfold-test-files" + self.database.suffix)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            plan = self._unfold_plan()
+            if not plan.restored and not plan.withdrawn:
+                return UnfoldedTestFiles(plan.rules, NoUnfoldBackup())
+            # A second reader copies the committed ledger; this connection holds the write lock and has not written.
+            with (closing(sqlite3.connect(self.database.resolve().as_uri() + "?mode=ro", uri=True,
+                                          timeout=BUSY_TIMEOUT_SECONDS)) as source,
+                  closing(sqlite3.connect(backup, timeout=BUSY_TIMEOUT_SECONDS)) as copy):
+                source.backup(copy)
+            now = _now()
+            # The row keeps its proposal, so a finding filed before the fold returns to the same decision.
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET state=CASE WHEN proposal='' THEN 'unfiled' ELSE 'filed' END,"
+                + "duplicate_of='',updated_at=? WHERE finding_id=?",
+                [(now, finding.finding_id) for finding in plan.restored])
+            _ = self._connection.executemany("UPDATE held_findings SET state='withdrawn',updated_at=? WHERE finding_id=?",
+                                             [(now, fold_id) for fold_id in plan.withdrawn])
+            _ = self._connection.executemany("INSERT OR REPLACE INTO fold_withdrawals VALUES (?,?)",
+                                             [(fold_id, now) for fold_id in plan.withdrawn])
+        after = self._unfold_plan()
+        returned = tuple(self._held(finding.finding_id) for finding in plan.restored)
+        if (after.restored or after.withdrawn
+                or any(not isinstance(finding.state, Filed if isinstance(original.state, Withdrawn)
+                                      and isinstance(original.state.proposal, Path) else Unfiled)
+                       for finding, original in zip(returned, plan.restored, strict=True))
+                or any(not isinstance(self._held(fold_id).state, Withdrawn) for fold_id in plan.withdrawn)):
+            raise LedgerError(f"held unfold-test-files did not verify; the ledger before it is {backup}")
+        backup.unlink()
+        return UnfoldedTestFiles(plan.rules, backup)
 
     def fold_test_files(self) -> tuple[FoldedTestFile, ...]:
         """Fold pending sibling test file moves in one transaction and retain their item rows as duplicates."""
@@ -6110,6 +6279,7 @@ class Ledger:
                 self._site_sources[blob].release_parsed()
             self._used_site_sources.clear()
             self._item_bodies.clear()
+            self._name_sites.clear()
             self._outside_diffs.clear()
             style_footprint.tokenized_text.cache_clear()
 
@@ -6468,11 +6638,20 @@ class Ledger:
             if not count or not isinstance(body, declarations.ReadableBody) or not body.lines:
                 failures = (OutsideFailure.BODY_UNREADABLE,)
             elif isinstance(old_body, declarations.ReadableBody):
-                unchanged = declarations.preserved_body(old_body, body, old.declaration.name, item.declaration.name)
+                unchanged = declarations.preserved_body(self._old_name_sites(read, old_path, old, old_body), body,
+                                                        item.declaration.name)
                 if 2 * unchanged < count:
                     failures = (OutsideFailure.BODY_FAILED,)
             self._outside_bodies[key] = (unchanged, count, failures)
         return self._outside_bodies[key]
+
+    def _old_name_sites(self, commit: str, path: str, item: DeclaredItem,
+                        body: declarations.ReadableBody) -> declarations.NameSites | declarations.UnreadableBody:
+        """An old body is tokenized once for every candidate it is compared with."""
+        key = (commit, path, item)
+        if key not in self._name_sites:
+            self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
+        return self._name_sites[key]
 
     def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
         """An immutable item's body is shared by every candidate comparison."""
@@ -7622,6 +7801,7 @@ class Ledger:
         """Release historical bytes and comparison data after their findings finish."""
         self._commit_files = {key: value for key, value in self._commit_files.items() if key[0] != commit}
         self._item_bodies = {key: value for key, value in self._item_bodies.items() if key[0] != commit}
+        self._name_sites = {key: value for key, value in self._name_sites.items() if key[0] != commit}
         self._outside_bodies = {key: value for key, value in self._outside_bodies.items() if key[0] != commit and key[2] != commit}
         self._outside_diffs = {key: value for key, value in self._outside_diffs.items() if commit not in key[:2]}
         self._file_modules = {key: value for key, value in self._file_modules.items() if key[0] != commit}
@@ -7644,6 +7824,7 @@ class Ledger:
             self._active_declarations.clear()
             self._commit_files.clear()
             self._item_bodies.clear()
+            self._name_sites.clear()
             self._outside_diffs.clear()
             self._tips.clear()
             self._inputs.clear()
@@ -8771,16 +8952,11 @@ class Ledger:
             return "awaiting merge", pending
         return ("stale" if judged else "open"), ""
 
-    def _cell_dependencies(self, rule: Rule, path: str, tip: RepositoryTip) -> CellDependencies:
+    def _cell_dependencies(self, rule: Rule, path: str) -> CellDependencies:
         rows = cast(list[tuple[int]], self._connection.execute(
             "SELECT id FROM judgments WHERE rule=? AND path=?", (rule.rule_id, path)).fetchall())
-        scope = _cell_scope(rule, path, tip)
+        # The cell row's rule and path name its judgment cell and rule generation, and its identity holds the tip.
         return CellDependencies((
-            ("judgment_cell", json.dumps((rule.rule_id, path), separators=(",", ":"), ensure_ascii=False), ""),
-            ("rule_generations", base_rule(rule.rule_id), ""),
-            ("scope_membership", json.dumps(_input_key(tip, scope, path)[1:]), tip.tree),
-            ("history", tip.commit, tip.commit),
-            ("removal_barriers", json.dumps((rule.rule_id, path)), tip.commit),
             *(("judgments", str(id), "") for (id,) in rows),
             *(("git_object", object_id, object_id) for object_id in sorted(self._judgment_reads)),
         ))
@@ -8795,7 +8971,7 @@ class Ledger:
                 return self._judgment_state(rule, path, tip)
         return cells.result(rule.rule_id, path, identity, self._judgment_objects_available,
                             calculate,
-                            lambda: self._cell_dependencies(rule, path, tip),
+                            lambda: self._cell_dependencies(rule, path),
                             crate=crate, family=rule.family, tier=rule.tier)
 
     @contextmanager
@@ -9253,6 +9429,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         result["withdrawn_by"] = by.judgment_id if isinstance(by, (ExceptionVerdict, JudgedAgain)) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
         result["rule_changed_to"] = by.rule_blob if isinstance(by, RuleBodyChanged) else ""
+        result["unfolded_at"] = by.at if isinstance(by, FoldUndone) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
     follow = finding.follow
@@ -9325,7 +9502,8 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files")),
+        ("held", ("add", "need", "replace", "file", "waive", "built", "unbuilt", "list", "recheck-merged", "fold-test-files",
+                  "unfold-test-files")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -9386,7 +9564,7 @@ def main() -> None:
                 if action == "built":
                     _ = command.add_argument("--commit", dest="merge", default=None)
                 _ = command.add_argument("--by", required=action == "unbuilt", default=None)
-            elif action not in ("recheck-merged", "fold-test-files"):
+            elif action not in ("recheck-merged", "fold-test-files", "unfold-test-files"):
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
                     _ = command.add_argument("--proposal", required=True)
@@ -9553,6 +9731,12 @@ def main() -> None:
                     for group in folded:
                         print(f"folded {group.rule} {group.path}: {group.before} -> 1 ({group.finding_id}) in {group.declaring_file}")
                     print(f"folded {len(folded)} files: {sum(group.before for group in folded)} -> {len(folded)} findings")
+                elif args.action == "unfold-test-files":
+                    unfolded = ledger.unfold_test_files()
+                    for item in unfolded.rules:
+                        print(unfolded_line(item))
+                    print("unchanged" if isinstance(unfolded.backup, NoUnfoldBackup)
+                          else f"verified; deleted the backup {unfolded.backup}")
                 elif args.action == "recheck-merged":
                     for item in ledger.recheck_merged_findings():
                         print(not_built_line(ledger.repo, item))

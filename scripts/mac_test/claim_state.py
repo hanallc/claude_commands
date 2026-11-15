@@ -185,9 +185,9 @@ CALLING_SESSION = CallingSession()
 
 
 def submitting_session(session: SubmittingSession | CallingSession) -> SubmittingSession:
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    return build_hold.owning_session() if isinstance(session, CallingSession) else session
+    return owning_session.owning_session() if isinstance(session, CallingSession) else session
 
 
 def session_id(session: SubmittingSession) -> str:
