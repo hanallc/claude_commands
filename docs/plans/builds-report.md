@@ -1491,28 +1491,20 @@ From builds (not the user), 2026-11-14 15:10: the user could not understand the 
 - Calls sent to builds, each a one-line revert: the idle states send no push; the new unreachable push; the unreadable state unchanged.
 - `mac_idle.unreachable` waits for the user's approval (`review.py texts --id mac_idle.unreachable --approve`). Until then `test_every_catalog_example_has_current_approval` fails for it. The other 117 tests in `test_mac_idle` and `test_push_texts` pass.
 
-### Phase 81 — The AWS prices page takes the user's second review · status: todo
+### Phase 81 — The AWS prices page takes the user's second review · status: done
 
-From the user (via builds, 2026-11-14 20:2x): "the AWS prices page in the console works - it could stand some enhancements." Seven items; builds' calls (not the user) in brackets:
+From the user (via builds, 2026-11-14 20:2x): seven changes to the AWS prices page. Builds' calls (not the user): the row lowest gets a fill, the box-type lowest an outline; GPU and standard types get separate tables; refused and launched become sections; decimal minutes under a "merge gate" header with "(minutes)" below it.
 
-1. Each row in Spot prices colors its lowest price [background color].
-2. Each box type's lowest price is also marked [an outline; a cell that is both shows both].
-3. GPU and non-GPU types are separate tables in Spot prices and in Spot quotas.
-4. The quotas section shows no snapshot age.
-5. The cost per run puts its run count in its own column.
-6. Refused and launched become their own sections.
-7. Durations are decimal minutes (7.5); the header says "merge gate" with "(minutes)" under it in smaller text.
+#### As-built
 
-From aws (not the user), 2026-11-14 20:2x: the billed-hours check is on main (fc74d6355). `run_cost.hours_checks(book, start, end, home, sizes, max_ratio)` over the spot_bills window; `sizes` from `aws_target.gate_sizes`; `max_ratio` from config `billed_hours_gap_max_ratio`. Cell `<billed>/<box> (<gap %>)`, plus `over` when `hours_gap_over`, or `not billed` without a bill.
-
-Director calls sent to builds, each a one-line revert: a box type is the boxes with the same vCPU count; the run counts get the columns `runs` and `paid runs`; Refused and Launched are two type x region tables for the selected filter; the billed hours are one more section, `Billed hours / box hours`, the same for every filter; `/aws_prices` shows the same tables without colors.
-
-Answer for the user (4): one snapshot read per region reads its prices and both quotas together, and a failed read keeps both, so their ages are always the same. The age shows once, in the prices section.
-
-Work (the director writes it; no Codex workers):
-
-1. `scripts/aws_target/spot_table.py`: split tables, marks for the lowest cells, the new columns and sections, decimal minutes.
-2. `scripts/aws_target/aws_page.py` and `aws_prices.html`: the new data shape, the marks, the small header line, the sections.
-3. `scripts/aws_target/test_control.py`: the new tables, marks and the hours section.
-4. `commands/aws_prices.md` states the new layout.
-5. Proof: before and after shots of each changed section; the terminal output before and after.
+- `spot_table.SpotTables` holds `prices` and `quotas` as (standard, GPU) table pairs, `runs`, `hours` and `hours_note`. The standard rows are `instance_types` then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
+- `Table.row_lowest` and `Table.group_lowest` hold the (row, column) cells with the lowest price of the row, and of the types with the same vCPU count (`largest_gate_vcpus`). Equal prices are all lowest.
+- Quota cells show no age: one region read writes the prices and both quotas together. The snapshot lines follow the prices. Answer sent to the user via builds.
+- Run tables: `region`, `Spot USD/h`, `<noun> (minutes)` (median seconds / 60, one decimal, `run_minutes`), `runs` (`N`, or `N elsewhere` when the time comes from other regions), `estimate`, `paid USD/h`, `paid USD/run`, `paid runs`. `unbilled()` writes `bill due`, `no <noun> runs` or `no runs`.
+- `RunCosts.refused` and `RunCosts.launched` are type x region tables per scope: "Refused <noun> requests (capacity and quota)" and "Launched <noun> boxes".
+- `billed_hours()` builds "Billed hours / box hours" from aws's `run_cost.hours_checks` over the last `run_cost_days`, with `max_ratio` from `billed_hours_gap_max_ratio`. Cells `9.2/8.8 (4%)`, `over`, `not billed`, or `—`. Only types with hours have a row. A region with hours that is not a candidate gets a column. An unreadable cost ledger gives a note and no rows.
+- `aws_page.PageData`: `prices` and `quotas` are lists, plus `hours` and `hours_note`. `TableData` adds `row_lowest` and `group_lowest`. `RunCostData` adds `refused` and `launched`.
+- `aws_prices.html`: one card per price and quota table; a legend under the standard prices; `.mark.low` (fill, `--low`) and `.mark.group-low` (inset 1.5 px accent outline) on a span in the cell. A header or title `name (unit)` shows the unit smaller. The filter also fills the Refused and Launched cards; the billed hours card is fixed. Cells have a 6 px right gutter so a mark in the last column does not overflow.
+- `/aws_prices` prints the same tables without marks, the cheapest line after the run tables, then Refused, Launched and the billed hours.
+- Proof: `phases/81/proof/before-*` and `after-*` (four shots each, plus the terminal text). Live: the one over cell is m7a.4xlarge us-east-2, `21.1/13.5 (56%) over`, as aws said.
+- Tests: 43 in `test_control` pass, with new tests for the marks and the hours table; basedpyright 0/0/0.
