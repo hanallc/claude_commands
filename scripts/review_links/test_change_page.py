@@ -313,7 +313,11 @@ class ChangePageTests(unittest.TestCase):
         manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
         token = manifest.read_bytes()
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.request("/console/changes.html", {}).status, 200)
+        changes = self.request("/console/changes.html", {})
+        self.assertEqual(changes.status, 200)
+        self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
+        self.assertIn("const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
+        self.assertIn("event.data==='console-shown') refreshPage(true);", changes.body)
         self.assertEqual(self.request("/console/rebuilds.html", {}).status, 200)
         self.assertEqual(change_page.page_url(), "/console/changes.html")
         self.assertEqual(manifest.read_bytes(), token)
