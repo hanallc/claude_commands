@@ -211,6 +211,14 @@ A question without a staff owner appears under **Owner unavailable**.
 The reader also scans question folders under the showrunner state root when their owners leave staff.
 Owned cards show the title before the filed text, choices, and **Asked by <session>**.
 They have no separate Question label.
+A question filed with parts (`ask --ask`) shows each part as its own section:
+- the one-line ask in bold, when it differs from the title in more than case and a final `?` or `.`;
+- **Context**;
+- **Items** as a numbered list, with each line of an item on its own line;
+- **Recommended**;
+- **Choices** as buttons above the Answer box. A choice fills the Answer box and marks itself; the user can add words, then saves.
+A question without parts shows its full text by lines, and `- ` or `1. ` lines show as lists.
+In all question text, each `http` or `https` address is a link that opens in a new tab.
 The field label stays **Answer**, and its action stays **Save answer**.
 An **Owner unavailable** card shows the question and `No showrunner owns this question.`
 It has no answer form, and the server refuses an answer.

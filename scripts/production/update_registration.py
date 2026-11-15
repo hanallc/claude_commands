@@ -125,6 +125,32 @@ def check_keys(fields: dict[str, object], allowed: set[str], where: str) -> None
         raise InputError(f"{where}: unknown field(s) {', '.join(unknown)}; allowed: {', '.join(sorted(allowed))}")
 
 
+def read_parts(value: object, where: str) -> QuestionParts:
+    """Read stored question parts; the full question text stays in `question` for every other reader."""
+    if not isinstance(value, dict):
+        raise InputError(f"{where}.parts: expected an object")
+    fields = cast(dict[str, object], value)
+    check_keys(fields, {"ask", "context", "items", "recommend", "choices"}, where + ".parts")
+    texts = {key: fields.get(key) for key in ("ask", "context", "recommend")}
+    lists = {key: fields.get(key) for key in ("items", "choices")}
+    if not all(isinstance(text, str) for text in texts.values()) or not all(
+            isinstance(entries, list) and all(isinstance(entry, str) for entry in cast(list[object], entries))
+            for entries in lists.values()):
+        raise InputError(f"{where}.parts: expected text ask, context and recommend, and lists of text items and choices")
+    return QuestionParts(ask=cast(str, texts["ask"]), context=cast(str, texts["context"]),
+                         items=cast(list[str], lists["items"]), recommend=cast(str, texts["recommend"]),
+                         choices=cast(list[str], lists["choices"]))
+
+
+def question_text(parts: QuestionParts) -> str:
+    """Write the parts as one full question for /next, messages, the review and older readers."""
+    blocks = [parts["ask"], parts["context"],
+              "\n".join(f"{number}. {item}" for number, item in enumerate(parts["items"], 1)),
+              f"Recommended: {parts['recommend']}" if parts["recommend"] else "",
+              "Choices:\n" + "\n".join(f"- {choice}" for choice in parts["choices"]) if parts["choices"] else ""]
+    return "\n\n".join(block for block in blocks if block.strip())
+
+
 def plumbing(line: str) -> str | None:
     """Why the line fails the plumbing check, or None when it passes."""
     found = PLUMBING.search(line)
@@ -155,8 +181,10 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
-                            "marked", "follows", "asked_by"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
+                            "due", "marked", "follows", "asked_by"}, where)
+        if "parts" in fields:
+            _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
@@ -213,11 +241,21 @@ class InstanceAbsent(NamedTuple):
     pass
 
 
+class QuestionParts(TypedDict):
+    """The parts of a question that the Questions page shows as separate sections."""
+    ask: str
+    context: str
+    items: list[str]
+    recommend: str
+    choices: list[str]
+
+
 class OutstandingItem(TypedDict):
     since: str
     text: str
     after: NotRequired[str]
     question: NotRequired[str]
+    parts: NotRequired[QuestionParts]
     reviewed: NotRequired[str]
     review_unavailable: NotRequired[str]
     urgency: NotRequired[str]
@@ -1232,9 +1270,11 @@ def mark_important(production: Production, words: str) -> None:
 SHOWRUNNER_ASKER = "showrunner"
 
 
-def ask(production: Production, text: str, question: str, unit: str, rank: Ranking, *,
+def ask(production: Production, text: str, question: str | QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None) -> None:
-    """Review and file a question with its asker's fixed staff id."""
+    """Review and file a question with its asker's fixed staff id; parts keep their layout on the Questions page."""
+    parts = question if not isinstance(question, str) else None
+    question = question_text(question) if not isinstance(question, str) else question
     identities = identities if identities is not None else QuestionStaff.read()
     asker = identities.asker(production, unit)
     if not text.strip() or "\n" in text:
@@ -1254,6 +1294,8 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
     now = datetime.now(production.zone)
     entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
                             asked_by=asker.id)
+    if parts is not None:
+        entry["parts"] = parts
     if isinstance(accepted, ReviewedQuestion):
         entry["reviewed"] = accepted.reviewed
     else:
@@ -1502,6 +1544,7 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
     """Write the showrunner's new list; a question someone filed with `ask` leaves only through `answer`."""
     identities = identities if identities is not None else QuestionStaff.read()
     previous = {item.text: item for item in read_open_items(outstanding, production=production, identities=identities)}
+    stored_parts = {entry["text"]: entry["parts"] for entry in open_entries(production, identities) if "parts" in entry}
     now = datetime.now(production.zone)
     since = now.strftime("%Y-%m-%dT%H:%M")
     entries: list[OutstandingItem] = []
@@ -1535,6 +1578,8 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
                                      item.rank.follows))
         if item.text in previous:
             keep_question_fields(entry, previous[item.text])
+            if item.text in stored_parts:
+                entry["parts"] = stored_parts[item.text]
         elif isinstance(item, QuestionForReview):
             accepted = review_open_question(production.name, item)
             if isinstance(accepted, ReviewedQuestion):
@@ -1584,9 +1629,17 @@ def main() -> int:
         elif action in ("mark-important", "answer", "withdraw"):
             _ = subcommand.add_argument("--item", required=True)
         elif action == "ask":
-            _ = subcommand.add_argument("--text", required=True, help="the one-line item the count and lists name")
-            _ = subcommand.add_argument("--question", required=True,
-                                        help="what is asked, why, each choice and what it does, the recommended choice")
+            _ = subcommand.add_argument("--text", default="",
+                                        help="the one-line item the count and lists name; the default is --ask")
+            asked = subcommand.add_mutually_exclusive_group(required=True)
+            _ = asked.add_argument("--ask", help="the question in one line; the parts below give the page its layout")
+            _ = asked.add_argument("--question", help="the full question in one text, for older callers")
+            _ = subcommand.add_argument("--context", default="", help="why it is asked now and what waits on it, short")
+            _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
+                                        help="one entry to look at, such as a before and after or a link; repeat it")
+            _ = subcommand.add_argument("--recommend", default="", help="the recommended choice and why")
+            _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],
+                                        help="one answer the user can pick; repeat it")
             _ = subcommand.add_argument("--unit", default="", help="the asking unit's staff id; without --production, select its parent")
             _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
             _ = subcommand.add_argument("--due", default="")
@@ -1637,8 +1690,15 @@ def main() -> int:
                 level = urgency.read(cast(str, args.urgency), cast(str, args.due))
             except urgency.UrgencyError:
                 raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
-            ask(production, cast(str, args.text), cast(str, args.question), cast(str, args.unit), Ranking(level),
-                identities=identities)
+            asked = cast(str | None, args.ask)
+            context, items = cast(str, args.context), cast(list[str], args.items)
+            recommend, choices = cast(str, args.recommend), cast(list[str], args.choices)
+            if asked is None and (context or items or recommend or choices):
+                raise RegistrationFailure("ask", "--context, --item, --recommend and --choice go with --ask")
+            parts = (QuestionParts(ask=asked, context=context, items=items, recommend=recommend, choices=choices)
+                     if asked is not None else None)
+            ask(production, cast(str, args.text) or (asked or ""), parts if parts is not None else cast(str, args.question),
+                cast(str, args.unit), Ranking(level), identities=identities)
         elif action == "questions-table":
             questions_table(production, identities=identities)
         elif action == "migrate-questions":

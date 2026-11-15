@@ -496,7 +496,11 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
   A missing `open_for_user` key preserves the existing items.
   A new question requires its full text and a review result before storage.
 
-- `ask --text "<one line>" --question "<full>" [--unit <unit>]` files a reviewed question without a reply to the user.
+- `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
+  The record keeps the parts in `parts` and the joined full text in `question`, so `/next`, messages and the review read one text.
+  The Questions page shows the parts as sections: the items as a numbered list, links as links, and each choice as a button that fills the Answer box.
+  `--text` defaults to `--ask`. `--question "<full>"` with `--text` still files one text; the page shows its lines, and `- ` or `1. ` lines as lists.
+  A showrunner `questions` write keeps the stored parts of an item that it lists again.
   The unit must belong to the production in staff.
   The writer stores the asker's fixed staff id in `asked_by`.
   A held review refuses before any write.

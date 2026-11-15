@@ -213,16 +213,40 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 {change_page.change_details(row, shown)}</section>'''
 
 
+def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]:
+    """Return the question body and its choice buttons; a question without parts shows its text by lines."""
+    if "parts" not in item:
+        return change_page.review_text_html(item.get("question", ""), links=True), ""
+    parts = item["parts"]
+    same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
+    body = "" if same else f'<p class="question-ask">{change_page.linked(parts["ask"])}</p>'
+    if parts["context"].strip():
+        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], links=True)
+    if parts["items"]:
+        body += '<h2>Items</h2><ol class="question-items">' + "".join(
+            "<li>" + "<br>".join(change_page.linked(line) for line in entry.splitlines()) + "</li>"
+            for entry in parts["items"]) + "</ol>"
+    if parts["recommend"].strip():
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(parts["recommend"], links=True)
+    choices = "".join(f'<button type="button" data-choice="{html.escape(choice, quote=True)}" aria-pressed="false">'
+                      + f'{html.escape(choice)}</button>' for choice in parts["choices"])
+    return body, (f'<fieldset class="question-choices"><legend>Choices</legend>{choices}</fieldset>' if choices else "")
+
+
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
-    form = '<p>No showrunner owns this question.</p>' if question.tab == "unrouted" else f'''<form method="post" action="{change_page.PAGE_NAME}">
+    body, choices = question_parts(question.record.item)
+    owned = question.tab != "unrouted"
+    # Without an owner there is no form, so the choices show as text the user cannot pick.
+    shown_choices = "" if owned else choices.replace('<button type="button"', '<button type="button" disabled')
+    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}">
 <input type="hidden" name="row" value="{key}">
-<input type="hidden" name="token" value="{row_token(browser, question.key)}">
+<input type="hidden" name="token" value="{row_token(browser, question.key)}">{choices}
 <label for="answer-{key}">Answer</label><textarea id="answer-{key}" name="feedback" rows="{feedback_rows}"></textarea>
 <button name="outcome" value="answer">Save answer</button></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(question.record.item["text"])}</h1>
-{change_page.review_text_html(question.record.item.get("question", ""))}
+{body}{shown_choices}
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
@@ -307,6 +331,10 @@ PAGE_STYLE = """<style>[hidden]{display:none!important}
 [data-showrunner-filter] label{white-space:nowrap}
 [data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
 section+section{border:0;margin:0;padding:0}
+.question-ask{font-weight:600}.question-items li{margin:8px 0}
+.question-choices{display:flex;flex-wrap:wrap;gap:8px;border:0;margin:16px 0;padding:0}
+.question-choices legend{padding:0;margin-bottom:8px;font-weight:600}
+.question-choices button[aria-pressed="true"]{outline:2px solid Highlight;outline-offset:2px}
 .navigation{padding:12px 0;background:Canvas}.navigation:empty{display:none}button{min-height:44px}
 </style>"""
 
@@ -417,6 +445,12 @@ function bindPage(){
  rows.forEach(row=>{
   const form=row.querySelector('form');
   if(form) form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
+  // A choice fills the Answer box; the user can add words, then saves.
+  form?.querySelectorAll('[data-choice]').forEach(choice=>choice.addEventListener('click',()=>{
+   const box=form.querySelector('textarea');box.value=choice.dataset.choice;
+   form.querySelectorAll('[data-choice]').forEach(other=>other.setAttribute('aria-pressed',String(other===choice)));
+   box.dispatchEvent(new Event('input',{bubbles:true}));box.focus();
+  }));
  });
 }
 function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}

@@ -493,11 +493,22 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
-    """Render review text as escaped text blocks and consecutive list runs."""
+LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+
+
+def linked(text: str) -> str:
+    """Escape text and make each http or https address a link that opens in a new tab."""
+    pieces = LINK.split(text)
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_blank" rel="noopener">{html.escape(piece)}</a>'
+                   if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, links: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `links` makes addresses links."""
+    escape = linked if links else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{html.escape(text)}</{block}>"
+        return f"<{block}>{escape(text)}</{block}>"
     content: list[str] = []
     current = ""
     for line in lines:
@@ -515,9 +526,9 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
-            content.append(f"<li>{html.escape(item)}</li>")
+            content.append(f"<li>{escape(item)}</li>")
         elif tag:
-            content.append(html.escape(line))
+            content.append(escape(line))
         current = tag
     if current:
         content.append(f"</{current}>")
