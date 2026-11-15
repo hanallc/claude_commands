@@ -214,7 +214,8 @@ class MemoryHoverTests(unittest.TestCase):
         ):
             row: dict[str, object] = {"name": "hana nextest", "queued": True, "used": 1, "reserved": 0, "counted": 1,
                                       "progress": {"kind": "NoProgress"}, **owner, "runner": runner, **extra}
-            waiter: dict[str, object] = {"name": "hana nextest", "need": 2, "since": 100, "reason": "start spacing",
+            waiter: dict[str, object] = {"name": "hana nextest", "need": 2, "since": 100,
+                                         "reason": "another step just started; the queue waits a few seconds between starts",
                                          **owner, "runner": runner, **extra}
             mac: dict[str, object] = {**row, "kind": "mac-build", "machine": "mac", "started_at": 100, "read_at": 190}
             data = {"read_at": 200, "walk": [row, mac], "waiters": [waiter]}
@@ -223,7 +224,8 @@ class MemoryHoverTests(unittest.TestCase):
                     rendered = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
                     root = ElementTree.fromstring(f"<root>{rendered}</root>")
                     self.assertEqual(root[0].tag, "b")
-                    fields = expected + ([("waiting", "2 min"), ("reason", "start spacing")] if key == "wait:0" else [])
+                    fields = expected + ([("waiting", "2 min"),
+                        ("reason", "another step just started; the queue waits a few seconds between starts")] if key == "wait:0" else [])
                     if not fields:
                         self.assertIsNone(root.find("dl[@class='identity']"), rendered)
                         self.assertNotIn("not recorded", rendered)
@@ -550,7 +552,7 @@ function fitLabels() {}
     def test_each_wait_state_has_a_page_hover_reason(self) -> None:
         for reason, expected in (
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (admission_records.StartSpacingWait(110), "start spacing"),
+            (admission_records.StartSpacingWait(110), "another step just started; the queue waits a few seconds between starts"),
             (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         ):
             with self.subTest(reason=reason):
