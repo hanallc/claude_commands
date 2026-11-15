@@ -95,7 +95,8 @@ Small text under the line shows the module count and failed modules.
 The page omits the state `running` and shows any other state first.
 A waiting row shows `cloud` in the # column and its slot wait text.
 Its machine and vCPU cells stay blank.
-The Head line shows `cloud N of M slots`.
+The queue pane's Head line shows `cloud N of M slots`.
+When no step waits, the build page's queue summary hover shows `AWS: N of M slots in use`.
 The selected cloud step card keeps its `Cloud` lines.
 Missing progress and module counts have explicit display states.
 `cloud_gate_stale_pushes=3` sets the update age threshold in `config/build_admission.conf`.
@@ -356,6 +357,29 @@ The page and the queue pane show the same saved Mac idle alert first, in red.
 The feed reads it through `mac_idle_alert.alert_line()` and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
 The feed uses `head_facts.priority_text()` for the page's `priority_text` line.
+A waiting step's hover puts each field on its own line: the wait time, the reason, and `can run on`.
+`can run on` is one line that names the targets that can take the step now.
+A local step shows `natedev or Mac`, `natedev only`, or `natedev only (Mac state unknown)`.
+`MacRoutes.fit()` in `target_availability.py` gives the Mac answer, and `memory_feed.local_runs_on()` makes the line.
+AWS runs only the ~/.claude test gate. A cloud gate shows `AWS (natedev only when AWS cannot start the gate)`.
+When memory holds the first step in line, its hover adds a `First in line` table.
+The table starts at free RAM and subtracts each term that is not zero: the safety net, swap coming back, build reserved, and RAM held for other waiting steps.
+It ends with free and the need.
+`queue_evidence.room_terms()` gives the terms to the table and to the queue pane's Head line.
+The memory bar divides the machine's RAM into three groups, in this order:
+1. Builds: build tools, queued builds, and hana CI.
+2. Free RAM: build reserved, free, and system reserved. System reserved is the safety net and swap coming back.
+3. Everything else: the desktop, agents, other programs, the kernel, the cache, and RAM that is not attributed.
+Brackets above the bar name each group and the three parts of free RAM.
+A bracket under the bar shows the queue cap, from 0 to the end of free.
+`RamBlocks.cap_bytes` is that cap: builds, build reserved, and free. The page's taken amount is the cap less free.
+The legend shows each group under its own heading, and the queue cap rows sit under Builds.
+The status line under the free amount names one cause, in this order:
+1. An unavailable reading.
+2. Memory pressure.
+3. Nothing free: a shortfall, or reserves that use all free RAM.
+4. The GPU test slot. When free does not cover the step's need, the line also names the need and free.
+5. One running build that leaves too little free.
 The unit-board queue pane keeps `build_queue.py --json` and its selected cards.
 A position, session, folder, or `mine` selects cards in the pane.
 The pane resolves labels once and reads optional history once through `head_facts.read_head_facts()`.
