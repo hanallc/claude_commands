@@ -117,7 +117,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
     def price_cell(size: str, region: str) -> str:
         price = minimum.get((region, size))
         note = notes[region]
-        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or 'no offer'
+        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or 'not sold here'
 
     prices = Table('Spot prices (USD/h; lowest zone)', ('type', *regions), frozenset(range(1, len(regions) + 1)),
                    tuple((size, *(price_cell(size, region) for region in regions)) for size in sizes))

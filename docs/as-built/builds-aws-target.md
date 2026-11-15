@@ -579,7 +579,7 @@ The snapshot does not change `controller.json`.
 `python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
 It prints machine types as rows and candidate regions as columns.
 Each cell shows the lowest zone price in USD/h.
-An empty cell says `no snapshot`, `read failed`, or `no offer`.
+An empty cell says `no snapshot`, `read failed`, or `not sold here`.
 Cached prices and quotas remain visible after a read failure.
 Their cells include `read failed`, and the regional detail gives the last good age.
 Old values include `old <age>s` in their cells.

@@ -107,7 +107,11 @@
       "Type": "String",
       "Default": ""
     },
-    "GateSubnets": {
+    "GateRegionImages": {
+      "Type": "CommaDelimitedList",
+      "Default": ""
+    },
+    "GateVpcs": {
       "Type": "CommaDelimitedList",
       "Default": ""
     },
@@ -224,6 +228,30 @@
           "Ref": "GateExpiryMinutes"
         },
         1
+      ]
+    },
+    "GateHasRegionImages": {
+      "Fn::And": [
+        {
+          "Condition": "Gates"
+        },
+        {
+          "Fn::Not": [
+            {
+              "Fn::Equals": [
+                {
+                  "Fn::Join": [
+                    "",
+                    {
+                      "Ref": "GateRegionImages"
+                    }
+                  ]
+                },
+                ""
+              ]
+            }
+          ]
+        }
       ]
     }
   },
@@ -1275,15 +1303,24 @@
               "Action": [
                 "ec2:RunInstances"
               ],
-              "Resource": [
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}"
+              }
+            },
+            {
+              "Fn::If": [
+                "GateHasRegionImages",
                 {
-                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}::image/${GateImage}"
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:RunInstances"
+                  ],
+                  "Resource": {
+                    "Ref": "GateRegionImages"
+                  }
                 },
                 {
-                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${GateSecurityGroup}"
-                },
-                {
-                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
+                  "Ref": "AWS::NoValue"
                 }
               ]
             },
@@ -1292,8 +1329,21 @@
               "Action": [
                 "ec2:RunInstances"
               ],
-              "Resource": {
-                "Ref": "GateSubnets"
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:security-group/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*"
+                }
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/GateDeployment": {
+                    "Ref": "DeploymentId"
+                  },
+                  "aws:ResourceTag/Workload": "cloud-claude-gate"
+                }
               }
             },
             {
@@ -1302,7 +1352,23 @@
                 "ec2:RunInstances"
               ],
               "Resource": {
-                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:subnet/*"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "ec2:Vpc": {
+                    "Ref": "GateVpcs"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
               },
               "Condition": {
                 "StringEquals": {
@@ -1320,14 +1386,16 @@
                   "aws:RequestTag/ExpiresAt": "false"
                 },
                 "ArnEquals": {
-                  "ec2:LaunchTemplate": {
-                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
-                  },
                   "ec2:InstanceProfile": {
                     "Fn::GetAtt": [
                       "GateProfile",
                       "Arn"
                     ]
+                  }
+                },
+                "ArnLike": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*"
                   }
                 }
               }
@@ -1338,7 +1406,7 @@
                 "ec2:RunInstances"
               ],
               "Resource": {
-                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:volume/*"
               },
               "Condition": {
                 "StringEquals": {
@@ -1359,15 +1427,12 @@
                 "ec2:RunInstances"
               ],
               "Resource": {
-                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:network-interface/*"
               },
               "Condition": {
-                "ArnEquals": {
+                "ArnLike": {
                   "ec2:LaunchTemplate": {
-                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
-                  },
-                  "ec2:Subnet": {
-                    "Ref": "GateSubnets"
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*"
                   }
                 }
               }
@@ -1379,10 +1444,10 @@
               ],
               "Resource": [
                 {
-                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
                 },
                 {
-                  "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:volume/*"
                 }
               ],
               "Condition": {
@@ -1418,7 +1483,7 @@
                 "ec2:TerminateInstances"
               ],
               "Resource": {
-                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
               },
               "Condition": {
                 "StringEquals": {
@@ -1709,7 +1774,7 @@
                 "ec2:RunInstances"
               ],
               "Resource": {
-                "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
               },
               "Condition": {
                 "StringEquals": {
@@ -1728,14 +1793,16 @@
                   "aws:RequestTag/GpuSizeTrial": "false"
                 },
                 "ArnEquals": {
-                  "ec2:LaunchTemplate": {
-                    "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${GateLaunchTemplate}"
-                  },
                   "ec2:InstanceProfile": {
                     "Fn::GetAtt": [
                       "GateProfile",
                       "Arn"
                     ]
+                  }
+                },
+                "ArnLike": {
+                  "ec2:LaunchTemplate": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*"
                   }
                 }
               }
