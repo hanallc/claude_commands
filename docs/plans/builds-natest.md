@@ -4027,30 +4027,11 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** the `TARGETS_WRAPPER` and `RECORD_WRAPPER` fixtures in `verify_mac_offload_test_support.py` run inside verify_helper, so about 52 verify modules use less AWS CPU.
-
-**Decision:** verify_helper runs a program inside its process only when the program has a top-level `main`. The two wrappers had none, so each call started a new Python process that ran the real program with runpy.
-
-**Spec:**
-1. `TARGETS_WRAPPER` puts its work in a top-level `main`. `real_targets()` loads the real `build_targets.py` once for each process and returns its `main` status.
-2. `RECORD_WRAPPER` puts its work in a top-level `main`. `real_record()` loads the real `record.py` once for each process and returns `main(sys.argv[1:])`.
-3. `verify_hold_wait_test_support` puts its observation code before `return real_record()`.
-4. `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals, in place of the old `runpy.run_path` stub.
-5. Each answer, exit status and observation stays the same.
-
-**Files:**
-- `scripts/direct/verify_mac_offload_test_support.py`
-- `scripts/direct/verify_hold_wait_test_support.py`
-- `scripts/direct/test_verify_mac_fixture.py`
-
-**Workers:** director; no-worker mode.
-- impl: all files.
-
-**Constraints from prior phases:**
-- Phases 273 and 275: the same pattern for the step-routes and ssh-targets fixtures.
-
-**Acceptance gate:**
-- All 52 modules that use the two support files pass with the same tests; basedpyright 0 errors and 0 warnings.
-- aws pair (3 rounds) shows a gain.
+- `TARGETS_WRAPPER` and `RECORD_WRAPPER` in `verify_mac_offload_test_support.py` have a top-level `main`, so verify_helper runs them inside its process.
+- `real_targets()` and `real_record()` load the real `build_targets.py` and `record.py` once for each process and return the `main` status. They replace the runpy calls.
+- `verify_hold_wait_test_support` puts its observation code before `return real_record()`.
+- `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals in place of the `runpy.run_path` stub.
+- AWS pair (c7a.4xlarge, 3 rounds): 7 modules 166.71 -> 159.43 CPU s; `test_verify_mac_only` 37.85 -> 34.79.
+- Commit 1e8b2f6fd. Test-only change.
