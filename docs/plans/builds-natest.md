@@ -4141,3 +4141,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Cause: the test built the index of the full rows two times.
 - AWS pair (3 rounds): 24.09 -> 19.98 CPU s, wall 29.5 -> 25.3 s; all pass, same tests.
 - Commit f36c878c1. Test-only change.
+
+### Phase 286 — A test run keeps its build log in its run folder  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc land go 11-15).
+
+#### As-built
+
+- `test_run_folder` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+- Every direct test run of every module keeps its build log in its run folder. The gate already sets `BUILDLOG_DIR` for each module (`merge_gate.py:1129`).
+- `scripts/buildlog/test_log_isolation.py` is removed: it re-ran 5 modules under a new HOME and guarded only those 5. `test_testing_folders` checks the two cases and the restore.
+- `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
+- AWS pair (3 rounds): the changed and guarded modules do not change; the removed module cost 16.0 CPU s.
+- Commit 8e5756b00. Production change (sdlc trial go and land go 11-15).
