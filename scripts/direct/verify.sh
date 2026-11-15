@@ -4084,7 +4084,7 @@ run_lint_sequence() {
                     rm -f "$MEND_LOG"
                     exit 0
                 fi
-                if [[ "$force_mac" == 1 && "$LINT_HELD_CLIPPY_FAILED" == 1 ]]; then
+                if [[ "$LINT_HELD_CLIPPY_FAILED" == 1 ]]; then
                     rm -f "$MEND_LOG" "$HOLD_WAIT_DIR/lint-held"
                     exit "$lint_status"
                 fi

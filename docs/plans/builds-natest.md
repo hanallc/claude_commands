@@ -4403,3 +4403,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `run_lint_held_sequence` sets `LINT_HELD_CLIPPY_FAILED` when Mac mend passed (or is off) and Mac clippy failed. `run_lint_sequence` then removes `MEND_LOG` and the `lint-held` mark and exits with the clippy failure, only on the Mac path (`force_mac=1`). A failed Mac mend and the memory-judgment path keep their behavior; `step_writes_tree` is unchanged.
 - Tests: `test_verify_lint_judgment` checks the Mac clippy exit (held calls, exit 1, no second mend). `test_verify_helper`'s bash program checks the compgen fallback and that the next call reads its own reply. `test_verify_lint_local_writes` holds natedev before the clippy fix in its clippy cases.
 - Commit ffd2432f2. verify-unit reviews the diff.
+
+### Phase 309 — A clippy failure on the lint memory-judgment path starts no local mend fix  · status: done
+**Depends on:** Phase 308
+**Owner:** natest (builds gave a go on 11-15 from verify-unit's phase 308 review note; verify-unit reviews the diff).
+
+#### Work Order
+
+**Goal:** on the memory-judgment path of `verify.sh lint` (`LINT_MEMORY_JUDGMENT=1`, so `force_mac=0`), a clippy failure after a passed mend exits with the clippy failure. It starts no local `cargo mend --fix`, so the run does not wait for natedev.
+
+**Spec:**
+1. In `run_lint_sequence`, the phase 308 exit (`LINT_HELD_CLIPPY_FAILED == 1`) applies for `force_mac` 0 and 1. Remove the `"$force_mac" == 1` condition. Keep the removal of `MEND_LOG` and the `lint-held` mark.
+2. The memory-judgment early return in `run_lint_held_sequence` (mend left the queue again) keeps its behavior: `LINT_HELD_CLIPPY_FAILED` stays 0 there, and the loop continues.
+3. A failed mend keeps today's path. Do not change `step_writes_tree` or the `--check` path. Do not change any trap.
+4. Test: extend `test_mac_clippy_failure_stops_without_another_local_mend` in `scripts/direct/test_verify_lint_judgment.py` with a `subTest` for the memory-judgment path (`LINT_MEMORY_JUDGMENT=1` when the first mend leaves the queue). No new test method. Every behavior check stays.
+
+**Files:** `scripts/direct/verify.sh` (`run_lint_sequence`), `scripts/direct/test_verify_lint_judgment.py`; `scripts/direct/test_verify_lint_local_writes.py` only if a fixture there depends on the old path.
+
+**Workers:** 1 writer; one condition and one test case.
+- impl: all files.
+
+**Constraints from prior phases:** Phase 308 added `LINT_HELD_CLIPPY_FAILED` and the Mac-path exit, and `verify_helper` runs compgen before the lock with a subshell write and no trap. No signal handlers, masks or dispositions; EXIT traps stay as they are. Shellcheck baseline on verify.sh: 23 findings; add none.
+
+**Acceptance gate:** test_verify_lint_judgment, test_verify_lint_local_writes, test_verify_step_state, test_verify_token_self_hold and buildlog/test_mac_idle pass on natedev; `bash -n` and shellcheck add no finding; trial merges with 9f8fc1c39 and origin/main are clean; verify-unit reviews the diff.
