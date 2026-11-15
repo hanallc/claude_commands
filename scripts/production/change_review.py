@@ -1425,20 +1425,37 @@ def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
     return columns, index
 
 
-def edit_row(path: Path, row: str, item: Visible, day: date, production: Path) -> str:
-    """Rewrite the Change and How to check cells of `row` in To review; return the row written.
+@dataclass(frozen=True)
+class KeepRowText:
+    """Keep the current Change and How to check cells."""
 
-    The row keeps its id, its Merged cell, every other cell and its place in the table.
-    """
+
+def edit_row(path: Path, row: str, item: Visible | KeepRowText, day: date, production: Path,
+             *, image: str = "") -> str:
+    """Edit the selected text and image cells without changing the row's identity or position."""
+    removed_image = ""
 
     def write(lines: list[str]) -> str:
+        nonlocal removed_image
+        _ = _to_review(path, lines, row)
+        if image:
+            _add_column(path, lines, SECTION, IMAGE)
         columns, index = _to_review(path, lines, row)
         cells = dict(zip(columns, _cells(lines[index])))
-        written = _row(path, columns, {**cells, "Change": _cell(item.change), CHECK: _cell(item.how())})
+        if isinstance(item, Visible):
+            cells.update({"Change": _cell(item.change), CHECK: _cell(item.how())})
+        if image:
+            previous = _plain(cells.get(IMAGE, ""))
+            removed_image = previous if previous != image else ""
+            cells[IMAGE] = _cell(image)
+        written = _row(path, columns, cells)
         lines[index] = written + "\n"
         return written
 
-    return _edit(path, production, day, write, lambda _: f"edit {row}")
+    written = _edit(path, production, day, write, lambda _: f"edit {row}")
+    if removed_image:
+        image_store.remove_change(change_routing.review_root(), removed_image)
+    return written
 
 
 def mark_row(path: Path, row: str, now: datetime, production: Path) -> str:
@@ -1934,6 +1951,14 @@ def _visible(options: CommandLine) -> Visible:
     return Visible(change, options.check.strip(), options.see.strip())
 
 
+def _register_image(image: str) -> str:
+    """Register a file and report store failures as command errors."""
+    try:
+        return image_store.register_change(Path(image).expanduser())
+    except (ValueError, subprocess.SubprocessError) as error:
+        raise ChangeReviewError(str(error)) from error
+
+
 @dataclass(frozen=True)
 class ReviewRowTarget:
     path: Path
@@ -2036,10 +2061,7 @@ def _run(options: CommandLine) -> int:
             path = _list(options)
             item, rank = _visible(options), _rank_option(options, path)
             if options.image:
-                try:
-                    item = replace(item, image=image_store.register_change(Path(options.image).expanduser()))
-                except (ValueError, subprocess.SubprocessError) as error:
-                    raise ChangeReviewError(str(error)) from error
+                item = replace(item, image=_register_image(options.image))
             record = staff.snapshot()
             stamp = now()
             rows = append_rows(path, [item], stamp.date(), merged, production_doc(options.production), rank,
@@ -2049,8 +2071,11 @@ def _run(options: CommandLine) -> int:
             for line in hold_for_row(path, row, options.hold or []):
                 print(line)
         case "edit":
-            target, item = _row_option(options), _visible(options)
-            print(edit_row(target.path, target.row, item, today(), production_doc(options.production)))
+            target = _row_option(options)
+            edited_item = (KeepRowText() if options.image and not any((options.change, options.check, options.see))
+                           else _visible(options))
+            image = _register_image(options.image) if options.image else ""
+            print(edit_row(target.path, target.row, edited_item, today(), production_doc(options.production), image=image))
         case "show":
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             if options.list and not options.production:

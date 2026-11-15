@@ -34,7 +34,7 @@ from scripts.production import change_routing, change_review, footer_counts, nex
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve, image_store, review_link
+from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -1204,6 +1204,9 @@ class ChangePageTests(unittest.TestCase):
         _, _, browser = self.browser()
         page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
         for body in (browser, page):
+            self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
+            self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
+            self.assertIn('data-image-zoom class="change-image"', body)
             self.assertIn(f'href="/change-images/{identity}/image.png" target="_blank" rel="noopener"', body)
             self.assertIn('alt="Screenshot: Numbered moves"', body)
             self.assertIn('class="change-text"', body)
