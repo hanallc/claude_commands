@@ -86,6 +86,10 @@ State:
 
 @~/.claude/docs/decision_criteria.md
 
+The question form for every question to the user is defined by this import:
+
+@~/.claude/docs/question_template.md
+
 ---
 
 <Throughout>
@@ -266,7 +270,7 @@ State:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up: what is asked, why, and the answer choices. Set it
+  where it first comes up, in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
   restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this

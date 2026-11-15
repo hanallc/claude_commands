@@ -142,6 +142,7 @@ The shared pane launch builder uses `set_home`.
 | File | Access | `staff` calls |
 |---|---|---|
 | `commands/plan/shrink.md` | read | runtime_id; unit_runs.open_run reads the run pointer |
+| `commands/show_image.md` | read | staff.py get (shell) |
 | `commands/showrunner/promote_unit.md` | read | staff.py get (shell) |
 | `commands/showrunner/units.md` | write | agents pause, exit, resume (shell; staff writes through shutdown.py) |
 | `docs/producer/morty-operations.md` | read | staff.json (shell) |

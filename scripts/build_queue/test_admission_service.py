@@ -3735,6 +3735,8 @@ class CiSliceAdmissionTests(unittest.TestCase):
                        and step.measured.cgroup == str(fixture.root / "ci.slice"))
                 assert isinstance(ci.measured, records.UnownedSliceMemory)
                 self.assertEqual(ci.measured.bytes, ci_bytes * GIB)
+                # The swap-backed use takes out the same queued scope as the working set.
+                self.assertEqual(ci.measured.anonymous, records.AnonymousRunUse(ci_bytes * GIB))
                 room = reply.reading.explanation.room
                 assert isinstance(room, records.MemoryRoom)
                 self.assertEqual(room.available, 60 * GIB)
