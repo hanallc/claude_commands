@@ -456,7 +456,7 @@ class MacRunTests(unittest.TestCase):
         placed_arguments = shlex.split(placed_commands[0])
         queue_events = [cast(list[str], json.loads(line))
                         for line in (self.stub_state / "queue-events").read_text().splitlines()]
-        self.assertEqual([event[0] for event in queue_events], ["place-step", "finish-step"])
+        self.assertEqual([event[0] for event in queue_events], ["place-step", "cancel-placement"])
         placed = queue_events[0]
         assigned = cast(dict[str, str], json.loads((self.stub_state / "assigned").read_text()))
         self.assertEqual(placed_arguments[0], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1]

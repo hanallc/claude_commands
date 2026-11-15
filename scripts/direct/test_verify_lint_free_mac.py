@@ -5,10 +5,9 @@ import subprocess
 import unittest
 from pathlib import Path
 from typing import override
-from unittest import mock
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
-from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -109,30 +108,15 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
                              for row in self.cargo_events()), 1)
         self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
 
-    def test_linux_only_workspace_never_leaves_the_local_memory_queue(self) -> None:
+    def test_linux_only_workspace_lint_leaves_memory_for_the_mac(self) -> None:
+        # Only the Mac compiles macOS code, so a lint ignores linux_only and the Mac judges the whole workspace.
         settings = Path(self.environment["MAC_TEST_CONFIG"])
         _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", template="mac_test")
-        memory_hook = self.root / "memory-hook"
-        admission = caller_admission(self, self.root, self.environment)
-        handle_request = admission.server.handle_request
-
-        def observe(request: wire.Request,
-                    connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
-            if isinstance(request, wire.PlacementRequest):
-                _ = memory_hook.write_text(wire.encode_request(request))
-            return handle_request(request, connection)
-
-        _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=observe))
         process = self.queued_lint()
-        self.wait_for_memory_wait(process)
-        self.assertNotIn("free-now", memory_hook.read_text())
-        self.assertEqual(self.runner_events(), [])
+        output = self.finish_lint(process)
+        self.assertIn("another machine is free after", output)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "clippy"])
         self.assertEqual(self.local_mend(), [])
-        self.release_memory()
-        _ = self.finish_lint(process)
-        self.assertEqual(self.runner_events(), [])
-        self.assertEqual(self.local_mend(), [["mend", "--all-targets", "--workspace", "--fix"]])
-        self.assertEqual(self.free_now_settings(), [])
 
 
 if __name__ == "__main__":
