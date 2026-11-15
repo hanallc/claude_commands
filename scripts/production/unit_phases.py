@@ -41,7 +41,7 @@ from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
 
 from scripts.production import display_cells, land_queue, land_runs
-from scripts.production import unit_queue
+from scripts.production import unit_queue, waits_on
 from scripts.lib import unit_runs
 from scripts.whoami import quota_state
 
@@ -408,22 +408,13 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     return single_spaced(task)
 
 
+# The repository whose local origin/main a queued item's wait is checked against; no fetch.
+REPOSITORY = Path(__file__).resolve().parents[2]
+
 # Notes for a sent checkpoint that has not landed (user, 2026-11-15).
 CHECKPOINT_WAITS = {"running": "waiting on running checkpoint", "queued": "waiting on queued checkpoint"}
 NOT_IN_LINE = "checkpoint sent, not in the land line"
 WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
-
-
-class LandView(NamedTuple):
-    """The lands that run now, the land line, and the newest result of each land."""
-
-    running: frozenset[str]
-    line: dict[str, land_queue.Place] | land_queue.NoLine
-    results: dict[str, land_runs.LandResult]
-
-
-def land_view() -> LandView:
-    return LandView(land_runs.running_commits(), land_queue.places(), land_runs.last_results())
 
 
 def ordinal(number: int) -> str:
@@ -443,7 +434,8 @@ def land_result_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo
     return single_spaced(f"land {result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
 
 
-def checkpoint_wait(events: list[dict[str, object]], land: LandView, *, now: float, zone: ZoneInfo) -> str | None:
+def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
+                    now: float, zone: ZoneInfo) -> str | None:
     """Name the state of a checkpoint sent after the phase instance's last start of work.
 
     A land that holds its commit runs now, or it waits at a place in the land line, or its last land ended.
@@ -455,25 +447,25 @@ def checkpoint_wait(events: list[dict[str, object]], land: LandView, *, now: flo
             commit = event.get("checkpoint_commit")
             if not isinstance(commit, str) or not commit:
                 return CHECKPOINT_WAITS["queued"]
-            if land_runs.holds(land.running, commit):
-                return CHECKPOINT_WAITS["running"]
-            result = land_runs.result_for(land.results, commit)
-            place = None if isinstance(land.line, land_queue.NoLine) else land_queue.place_of(land.line, commit)
-            if place is None and result is not None:
-                return land_result_text(result, now=now, zone=zone)
-            if place is None:
-                return CHECKPOINT_WAITS["queued"] if isinstance(land.line, land_queue.NoLine) else NOT_IN_LINE
-            queued = f"{CHECKPOINT_WAITS['queued']}, {ordinal(place.number)} in line"
-            if result is None or result["landed"]:
-                return queued
-            return f"{queued}; last try: {land_result_text(result, now=now, zone=zone)}"
+            match land_queue.land_state(land, commit):
+                case land_queue.LandRunning():
+                    return CHECKPOINT_WAITS["running"]
+                case land_queue.InLine(place, failed):
+                    queued = f"{CHECKPOINT_WAITS['queued']}, {ordinal(place.number)} in line"
+                    return f"{queued}; last try: {land_result_text(failed, now=now, zone=zone)}" if failed else queued
+                case land_queue.LandEnded(result):
+                    return land_result_text(result, now=now, zone=zone)
+                case land_queue.NotInLine():
+                    return NOT_IN_LINE
+                case land_queue.LineUnused():
+                    return CHECKPOINT_WAITS["queued"]
         if kind in WORK_STARTS:
             return None
     return None
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
-                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: LandView) -> str:
+                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: land_queue.LandView) -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
@@ -624,17 +616,53 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_re
     return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
 
 
+def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
+    """Say the state of the work a queued item waits on; the owner is the unit and phase that sent its commit."""
+    commit = found.commit if isinstance(found, waits_on.NotOnMain | waits_on.PhaseSent) else ""
+    if commit:
+        prefix = "checkpoint " if isinstance(found, waits_on.PhaseSent) else ""
+        match land_queue.land_state(land, commit):
+            case land_queue.LandRunning():
+                return f"{prefix}in gate now"
+            case land_queue.InLine(place, failed):
+                text = f"{prefix}{ordinal(place.number)} in land line ({place.owner})"
+                return f"{text}; last try: {land_result_text(failed, now=now, zone=zone)}" if failed else text
+            case land_queue.LandEnded(result) if not result["landed"]:
+                return land_result_text(result, now=now, zone=zone)
+            case _:
+                return f"{prefix}not on main"
+    match found:
+        case waits_on.PhaseOpen(eta_at):
+            when = short_time(datetime.fromtimestamp(eta_at, UTC), now=now, zone=zone) if eta_at is not None else ""
+            return f"open, ETA {when}" if when else "open, no ETA"
+        case waits_on.PhaseNotStarted():
+            return "not started"
+        case _:
+            return "not found"
+
+
+def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
+                land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
+    """An item with no wait is its text; a met wait says ready; else the item names its wait and that wait's state."""
+    if not item.after or found is None:
+        return item.text
+    if isinstance(found, waits_on.OnMain):
+        return f"ready: {item.text} ({item.after} on main)"
+    return f"{item.text} · waits on {item.after}: {wait_text(found, land, now=now, zone=zone)}"
+
+
 def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE,
-                open_phase_ids: tuple[str, ...] = ()) -> str:
-    """Show queued work, excluding queue items equal to Notes."""
+                open_phase_ids: tuple[str, ...] = (),
+                describe: Callable[[unit_queue.QueuedItem], str] = unit_queue.shown) -> str:
+    """Show queued work, excluding queue items equal to Notes; describe says the first item and its wait."""
     try:
-        items = unit_queue.read(staff_id)
+        items = unit_queue.read_items(staff_id)
     except (OSError, ValueError) as error:
         print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
         queue = "queue unreadable"
     else:
-        items = [item for item in items if item != notes]
-        queue = (single_spaced(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
+        items = [item for item in items if item.text != notes]
+        queue = (single_spaced(describe(items[0])) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
     rows = [row for row in plan_phase_rows(record_fields(record))
             if row.get("status") not in ("done", "running", "open") and row.get("phase") not in open_phase_ids]
     plan = ""
@@ -686,7 +714,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = plan_history.now_epoch() if now is None else now
     view = census_view(census_read)
     reason = no_worker_reason()
-    land = land_view()
+    land = land_queue.land_view()
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
@@ -703,6 +731,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if path not in events:
             events[path] = plan_history.read_run_events(path)
         return events[path]
+
+    def describe(item: unit_queue.QueuedItem) -> str:
+        found = waits_on.state(item.after, repo=REPOSITORY, snapshot=snapshot, read_run=read_run) if item.after else None
+        return queued_text(item, found, land, now=now, zone=zone)
 
     unit_snapshot = staff.StaffSnapshot(tuple(
         current for unit in units if isinstance(unit.member, staff.StaffRow)
@@ -773,7 +805,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
                 notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land)
-                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
+                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids, describe=describe)
                           if first else display_cells.NONE)
                 if first:
                     notes = with_waits(notes, waits)
@@ -788,7 +820,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                   notes, display_cells.NONE, queued))
         else:
             notes = notes_cell(notes_record, read_run=read_run)
-            queued = (queued_cell(member.id, queued_record, notes=notes)
+            queued = (queued_cell(member.id, queued_record, notes=notes, describe=describe)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
             notes = with_waits(notes, waits)
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),

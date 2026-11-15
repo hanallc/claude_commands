@@ -136,6 +136,10 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A row without a recorded phase instance keeps the existing summary for work outside the plan.
 8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
    It excludes each queue item whose text equals Notes in the same row.
+   An item added with `--after <work>` names its wait: `<text> · waits on <work>: <state>`.
+   The state comes from the local `origin/main` (no fetch), the land line, the land results, and the owner unit's run.
+   Example states: `checkpoint 3rd in land line (builds 589)`, `in gate now`, `open, ETA 16:00`, `not started`, `not on main`, `not found`.
+   When the work is on main, the item shows `ready: <text> (<work> on main)`.
    Each part adds ` +<n> more` for later items.
    The queue count includes only remaining items.
    With no remaining queue item, it shows the plan part or `—`.

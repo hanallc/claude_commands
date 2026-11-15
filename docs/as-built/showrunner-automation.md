@@ -178,7 +178,14 @@ It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratc
 
 `/unit:queue add <text>`, `done`, `clear`, and `show` call `scripts/production/unit_queue.py`.
 The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`.
-`add` appends one normalized text item.
+`add` appends one normalized text item. `add --after <work>` stores `{"text", "after"}`; an item without a wait stays a string.
+`read_items` returns `QueuedItem(text, after)`; `read` returns the texts.
+`waits_on.state` finds the state of the work, and does not fetch:
+a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
+else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
+Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
+`unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> · waits on <work>: <state>`.
+A commit's state is `in gate now`, `<Nth> in land line (<unit> <phase>)`, its failed land result, or `not on main` (`land_queue.land_state`).
 `done` removes the first item.
 `clear` writes an empty list without reading a damaged old file.
 Writes use the list lock and atomic publication.
@@ -800,7 +807,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
     `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
-    `table` reads one `LandView` (`land_view()`): the running land commits, the land line places, and the newest land results.
+    `table` reads one `land_queue.LandView` (`land_queue.land_view()`): the running land commits, the land line places, and the newest land results.
+    `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
     The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
     Else, at a place in the line, it is `waiting on queued checkpoint, <Nth> in line`; a failed newest result adds `; last try: <result>`.
     Else the newest result shows: `checkpoint landed <time>`, or `land <state> at <step> <time>: <first detail line>`.

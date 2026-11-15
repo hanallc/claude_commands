@@ -454,6 +454,18 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(cells[3], "outside-c: Verification: check " + "x" * 150 + " +3 more")
         queue = cells[4].split(" · ", 1)[0]
         self.assertEqual(queue, long_text + " +1 more")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(unit_queue.main(["clear"]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", "acctland", "--after", "no-such-branch-for-test"]), 0)
+        work = table_of([selected], records).split("\n\n")[-1]
+        cells = [cell.strip() for cell in work.splitlines()[2].split("|")[1:-1]]
+        self.assertEqual(cells[4].split(" · plan:", 1)[0], "acctland · waits on no-such-branch-for-test: not found")
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": member.current_session, "CODEX_THREAD_ID": ""}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(unit_queue.main(["clear"]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", long_text]), 0)
+                self.assertEqual(unit_queue.main(["add", "--text", "Later"]), 0)
         _ = config.write_text(configured)
         wide_records: dict[str, object] = {"messaging": typed_record(self.root / "plan.md", *(["todo"] * 20))}
         fitted = table_of([selected], wide_records)
@@ -840,12 +852,12 @@ class UnitPhasesTests(unittest.TestCase):
                                         "landed": False, "step": "red", "state": "failed", "detail": "test_cards red\nmore",
                                         "time": datetime.fromtimestamp(now - 600, UTC).isoformat()}
         landed: land_runs.LandResult = {**failed, "landed": True, "step": "", "state": "", "detail": ""}
-        second = {"d" * 40: land_queue.Place(1, "sdlc other"), "c" * 9: land_queue.Place(2, "sdlc images")}
+        second = {"d" * 40: land_queue.Place(1, "sdlc other", "sdlc other"), "c" * 9: land_queue.Place(2, "sdlc images", "sdlc images")}
 
         def wait(found: list[dict[str, object]], running: frozenset[str] | None = None,
                  line: dict[str, land_queue.Place] | None = None,
                  results: dict[str, land_runs.LandResult] | None = None) -> str | None:
-            view = unit_phases.LandView(running or frozenset(), land_queue.NoLine() if line is None else line, results or {})
+            view = land_queue.LandView(running or frozenset(), land_queue.NoLine() if line is None else line, results or {})
             return unit_phases.checkpoint_wait(found, view, now=now, zone=utc)
 
         self.assertEqual(wait(events[:4]), "waiting on queued checkpoint")
@@ -868,7 +880,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         def notes() -> str:
             return unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, zone=utc,
-                                                land=unit_phases.land_view())
+                                                land=land_queue.land_view())
 
         self.assertEqual(notes(), "phase images-card — Images card · waiting on queued checkpoint")
         self.assertEqual(land_queue.main(["add", "sdlc images", "--commit", "c" * 40]), 0)
