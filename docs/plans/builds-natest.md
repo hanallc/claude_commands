@@ -4084,3 +4084,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - One `ast.walk` for each file; the `Name` nodes match the `killpg` import names after the walk. The shell and `killpg` checks run only on a string constant or shell line that has "kill".
 - AWS pair (3 rounds, median CPU s): `lib/test_process_group_sources` 16.41 -> 5.21.
 - Commit f7d26d4c5. Test-only change.
+
+### Phase 281 — Six repository scans parse only files that name their finding words  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- Six repository scans skip a file whose text lacks the words that every finding needs (the phase 280 pattern): `message/test_session_send_sources`, `notify/test_push_texts_sources`, `accounts/test_launch_accounts_sources` (`EXCEPTIONS` files always scanned), `astra/test_design_roles_sources`, `unguarded_launches` in `lib/test_claude_launch_scan.py` (Python files only), and `forbidden_launches` in `direct/test_one_launch_path.py`.
+- `lib/test_py_floor_sources` keeps its full parse: it must parse each file at the floor version.
+- AWS pair (3 rounds, median CPU s): 46.0 -> 15.5 in total; `session_send_sources` 7.23 -> 0.33, `launch_accounts_sources` 9.86 -> 3.23, `push_texts_sources` 8.64 -> 2.77.
+- Commit bddca5e1e. Test-only change.
