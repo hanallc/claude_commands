@@ -1,4 +1,5 @@
-"""The scratch guard refuses a command that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude or ~/rust."""
+"""The scratch guard refuses a command that makes a new loose folder in ~, /tmp, $TMPDIR, /tmp/claude, ~/rust or the
+session root."""
 
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ class ScratchGuardTests(unittest.TestCase):
     home: Path = Path()
     temp: Path = Path()
     session_root: Path = Path()
+    new_root: Path = Path()
     name: str = ""
 
     @override
@@ -44,9 +46,13 @@ class ScratchGuardTests(unittest.TestCase):
             prefix="scratch-guard-test-", dir="/tmp",
         ))))
         self.home, self.temp = base / "home", base / "temp"
-        self.session_root = base / "sessions"
-        self.enterContext(mock.patch.dict(os.environ, {"SESSION_TEMP_ROOT": str(self.session_root)}))
+        # session_root is the former root; new_root is the session root, absent until a test makes it.
+        self.session_root, self.new_root = base / "sessions", base / "session"
+        self.enterContext(mock.patch.dict(os.environ, {"SESSION_FORMER_ROOT": str(self.session_root),
+                                                       "SESSION_TEMP_ROOT": str(self.new_root)}))
+        # The home folders a real home holds; a new folder directly in home is refused.
         (self.home / "rust" / "hana").mkdir(parents=True)
+        (self.home / "worktrees").mkdir()
         self.temp.mkdir()
         # A name no real folder in /tmp holds, so the real /tmp root judges it as new.
         self.name = f"scratch-guard-{secrets.token_hex(6)}"
@@ -117,14 +123,31 @@ class ScratchGuardTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(own.stat().st_mode), 0o700)
                 self.assertEqual(list(self.session_root.iterdir()), [own])
 
-    def test_existing_session_temp_folder_needs_only_one_stat(self) -> None:
+    def test_existing_session_temp_folder_is_left_as_it_is(self) -> None:
         own = self.session_root / "scratch-session"
         own.mkdir(parents=True, mode=0o750)
-        with mock.patch.object(os, "stat", wraps=os.stat) as read_stat, mock.patch.object(Path, "mkdir") as mkdir:
+        with mock.patch.object(Path, "mkdir") as mkdir:
             remake_session_temp(json.dumps({"session_id": "scratch-session"}))
-            read_stat.assert_called_once_with(own)
             mkdir.assert_not_called()
         self.assertEqual(stat.S_IMODE(own.stat().st_mode), 0o750)
+
+    def test_a_deleted_session_folder_in_the_session_root_is_made_again(self) -> None:
+        own = self.new_root / "verify"
+        (self.new_root / ".id").mkdir(parents=True)
+        (self.new_root / ".id" / "scratch-session").symlink_to("verify")
+        self.assertEqual(self.run_hook("pwd"), "")
+        self.assertTrue(own.is_dir())
+        self.assertEqual(os.readlink(self.new_root / ".id" / "scratch-session"), "verify")
+        self.assertFalse(self.session_root.exists())
+
+    def test_a_new_folder_in_home_or_the_session_root_is_refused(self) -> None:
+        (self.new_root / "verify").mkdir(parents=True)
+        self.assert_refused("mkdir ~/port-gate-tree-test", str(self.home / "port-gate-tree-test"))
+        self.assert_refused("git clone a ~/port-gate-tree-test2", str(self.home / "port-gate-tree-test2"))
+        self.assert_refused(f"mkdir {self.new_root}/loose", str(self.new_root / "loose"))
+        self.assert_allowed("mkdir ~/rust/hana/notes")
+        self.assert_allowed(f"mkdir -p {self.new_root}/verify/fast-track")
+        self.assertEqual(self.run_hook("mktemp -d", temp=self.new_root / "verify"), "")
 
     def test_missing_or_bad_session_id_does_not_read_or_create_a_folder(self) -> None:
         bad_ids: tuple[object, ...] = ("", "../other", "/absolute", "a/b", ".", "..", "id\n", None, 1, [])

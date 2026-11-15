@@ -178,7 +178,15 @@ It returns `TimerConfigurationUnreadable`, `TimerTargetUnresolved`, `TimerScratc
 
 `/unit:queue add <text>`, `done`, `clear`, and `show` call `scripts/production/unit_queue.py`.
 The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/unit-queue/`.
-`add` appends one normalized text item.
+`add` appends one normalized text item. `add --after <work>` stores `{"text", "after"}`; an item without a wait stays a string.
+`read_items` returns `QueuedItem(text, after)`; `read` returns the texts.
+`waits_on.state` finds the state of the work, and does not fetch:
+a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
+else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
+Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
+`unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> — after <work>: <state>`.
+A phase checkpoint's state is `done, <land text>`, with `, not on main yet` after a land; a commit's state is its land text, or `not on main` when it is not in the line.
+An open phase is `in work, ETA <time>` or `in work, no ETA`.
 `done` removes the first item.
 `clear` writes an empty list without reading a damaged old file.
 Writes use the list lock and atomic publication.
@@ -750,6 +758,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
+    The first line shows `in work N · waiting to merge N · waiting on other work N · merged today N`.
+    One empty line separates this summary from the first table.
+    Counts include only units in these phase tables and always show zeros.
+    `in work` counts open phases without a `checkpoint_wait` result.
+    `waiting to merge` counts distinct unit and phase owners from active merges and the merge line.
+    Open rows with a `checkpoint_wait` result add their owner unless the count already includes it.
+    `waiting on other work` counts every queue item with an `after` state other than `waits_on.OnMain`.
+    `merged today` counts distinct unit and phase pairs with successful merge results dated today in the production zone.
+    Queue reads and wait states are reused for the summary, Notes, and Queued.
     Each open phase of the selected run gets one row in both tables.
     The staff current run selects the run when present; otherwise, the newest run supplies the rows.
     Notes, ETA cells, and Workers use that same selected run.
@@ -760,8 +777,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Every row repeats Unit.
     Only the first row carries Status, Machine, Progress, ETA Plan, and Queued.
     Later rows use `—` for those unit-wide cells.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
-    The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
+    The work table prints `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
     Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
@@ -799,12 +816,37 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching phase label at the start of the title appears once, regardless of case or dash.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-    `unit_phases.checkpoint_sent` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows ` · checkpoint sent, waits to land` in place of the step.
+    `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
+    `table` reads one `land_queue.LandView` (`land_queue.land_view()`): the running land commits, the land line places, and the newest land results.
+    `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
+    A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
+    So a checkpoint that a later checkpoint carries shows that later item's place. The order is: running, its own place, a landed result, carried running, carried place, a failed result.
+    `unit_phases.land_text` says the land state in plain words, and the wait is `done, <land text>` (user, 2026-11-15: a human must understand it).
+    The land text is `merging now` when `land_runs.running_lands()` holds the event's `checkpoint_commit`.
+    Else, at a place in the line, it is `waits to merge, <Nth> in line`, or `waits to merge with <unit> <phase>, <Nth> in line` for a carried commit; a failed newest result adds `; last try <state> at <step> <time>: <first detail line>`.
+    Else the newest result shows: `merged <time>`, or `did not merge: <state> at <step> <time>: <first detail line>`.
+    Else it is `not sent to merge yet`. With no line file, it stays `waits to merge`.
+    `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits, and the `unit phase` owner of each) while it holds the merge lock, and removes it at exit.
+    `unit_phases.unit_lands` adds to the unit's first Notes row each sent checkpoint that has no open phase row: `merging now: <phases>`,
+    `done, waits to merge: <phase> (1st in line), <phase> + <phase> (2nd in line)` with one entry for each line item,
+    and `<phase> did not merge: <result>` for a newest failed result whose commit is not on `origin/main` (sdlc C1701).
+    A merge conflict result says `merge conflict in <files> <time>`.
+    A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
+    `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).
+    The row has the commit, production, unit, phase, landed, step, state, detail and UTC time. The file keeps the newest 300 rows.
+    `scripts/production/land_queue.py` keeps the land line in `$MERGE_GATE_STATE_DIR/land_queue.json` under a file lock.
+    `add LABEL --batch FILE | --commit HASH [--first | --before LABEL]`, `move`, `remove`, `list`, and `next`; `next` removes the first item and prints its label, or prints nothing when the line is empty.
+    An item's commits are its `--commit` values and the third field of each batch file line, read when the board reads the line.
     `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
     Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.
     Text equal to the title adds nothing; this comparison ignores case and whitespace.
-    Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+    Units without open work show `nothing open: <plan reason>, <queue reason>`.
+    The plan reason is `plan done`, `no plan`, or `next plan phase <id> not started`, in plan order.
+    A missing record, an unavailable record, or an empty phase list uses `no plan`.
+    The queue reason is `queue empty`, `queued work waits on <after>`, or `queued work not started`.
+    The first queue item's wait selects the queue reason; a ready item uses `queued work not started`.
+    Sent work and shell waits still append through `with_waits`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
     Each open worker or director wait appends `waiting on <reason> <elapsed>` to Notes.
     A named holder adds `(held by <holder>)` before the elapsed time.
@@ -851,10 +893,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Duration predictions still use the plan's recorded history.
     The first row also names the latest promises for unfinished targets without open rows.
     Those promises use `phase <id>: <time>[ · late <elapsed>]`.
-    The latest `phase_finished` event for each target decides whether that target is done.
-    Only status `completed` marks a target as done.
-    A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
-    That target's promise remains visible.
+    A later promise for the same target replaces the earlier promise.
+    Any later `phase_finished` event removes that promise, regardless of status.
+    A later `checkpoint` event for the target also removes the promise.
+    A merge result for the same unit and phase removes the promise when its time follows the promise event.
+    A later `phase_started` event opens the phase again; its promise belongs in ETA Next.
     Without an unfinished plan or such a promise, the cell shows `—`.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
@@ -863,16 +906,22 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
     A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
     `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
-    Its cell keeps the existing 80-character limit.
+    Its cell keeps every word and wraps in the work table like Notes (user, 2026-11-15).
+    With no running worker, `workers_cell` shows the reason from `NO_WORKER_REASONS`, plus `+<n> idle`.
+    `no_worker_reason` reads `quota_state.no_worker_mode()` once for each table: `no-worker mode`, else `none running`.
+    Only a unit's first row carries the reason. A failed census or an unscanned machine gives `—` (user, 2026-11-15).
+    `display_cells.wrapped(keep=...)` keeps the Workers column when every cell is `—`.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
-    Rows without a recorded phase instance keep the existing summary for work outside the plan.
-    Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    Rows without a recorded phase instance name every open phase outside the plan, with its step text, in run order.
+    Non-Phase Work joins entries with ` · `.
+    Queued names every queue item with its wait text, joined with ` · `.
+    The plan part names every phase that is neither done nor open.
+    It shows `plan: phase 30: <title>, then 31, 32`, with the title only for the first phase.
     It excludes every open phase of the selected run, including phases absent from the configured plan.
     It excludes each queue item whose text equals Notes in the same row.
-    Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
-    Each displayed item or title keeps its full text and count suffix.
+    Each displayed item or title keeps its full text.
     A configured plan with phases takes priority over the selected run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.
@@ -926,7 +975,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.
   - **The plan backlog**: each line ending `proposed` or `deferred` of the ledger the `- **Improvement queue:**` line names (`proposals_folder.ledger`), for the doc only (user 2026-10-27); a production with no such line has no backlog rows. A file a line names is beside its ledger. The proposer is the `Proposed <date> by <who>` words of the file the line names, else `plan backlog`. Proposed lines join the issues waiting for review in `/next proposal` and the For-you proposals count; accepted and deferred lines do not count.
-  - **Add-ons**: each top-level entry of `next_items_pending.md` in `/tmp/claude/unit/<run id>/` or `/tmp/claude/delegate/<run id>/`, for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
+  - **Add-ons**: each top-level entry of `next_items_pending.md` in `<run root>/<run id>/` for each run root `unit_runs.run_roots()` reads at use (`/session/<name>/run`, `/tmp/claude/unit`, `/tmp/claude/delegate`), for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
 
   **State** says what the user can do, never a bare `next` (user 2026-10-12: "next after what?"). An issue that `proposal_issue.proposal_progress` reads as `InProgress` (its approval is recorded, or it has no answer and its `stage` is `active`) reads `in progress by <unit>` (`in progress` with no `unit`); else `waiting for your review`, as does a backlog line marked proposed. The waiting rows (issues and proposed backlog lines) come first in `scripts/lib/urgency.py` order (level from `review_urgency`, value the score of the proposed stars, prerequisite the first `depends_on`), then the in-progress ones, oldest first. A deferred backlog line reads `deferred until you ask for it`. An add-on is the showrunner's to settle (user 2026-10-12, below), so it reads `the showrunner decides: build, save for later, or drop`: the unit sends its add-ons to the showrunner, which answers `current`, `next` or `drop` for each.
 

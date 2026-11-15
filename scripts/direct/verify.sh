@@ -2000,7 +2000,7 @@ cancel_tree_run() {
 
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
-    TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
+    TREE_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-tree --owner-pid "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
@@ -2942,14 +2942,14 @@ route_test() {
 # Starts copy_watch.py beside the natedev step run() is about to start: while
 # the step compiles, it may run a copy of the same test on the Mac, and the
 # first result wins (see docs/as-built/mac-test-offload.md). Its folder sits in
-# the run's hold folder, so the EXIT trap removes both, and both names carry
-# the run's pid for tmp_sweep.py when a kill skips the trap.
+# the run's hold folder, so the EXIT trap removes both. Both lease records name
+# the run's pid, so the next run takes back a folder that a kill left.
 start_copy_watch() {
     # BASHPID identifies this shell inside a subshell. Bash 3.2 needs the child shell's PPID.
     local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
     local copy_parent=()
     [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
-    COPY_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
+    COPY_WATCH_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify-copy --owner-pid "$$" "${copy_parent[@]}")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -3214,7 +3214,7 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     set_gate_metadata 2>/dev/null || true
 fi
 
-HOLD_WAIT_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
+HOLD_WAIT_DIR="$(verify_helper "$BUILD_FOLDERS_SCRIPT" tool --tool verify --owner-pid "$$")"
 if [[ "$CMD" == lint ]]; then
     # The call owns these files. Cleanup removes them with the wait directory.
     export VERIFY_LINT_VERSIONS_FILE="$HOLD_WAIT_DIR/lint-versions"

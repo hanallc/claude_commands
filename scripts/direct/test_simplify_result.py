@@ -120,7 +120,7 @@ class SimplifyResultTests(unittest.TestCase):
         with patch.dict(os.environ, {"CONF_DIR": str(config)}):
             simplify_result.prepare(diff, source, prompt, self.directory / "report.txt", conf.read("direct"))
         self.assertEqual((self.directory / "prompt.md").read_text(),
-                         f"/simplify {diff}\n\nKeep these agents: reuse,altitude.\n\n\nUser instructions\n")
+                         f"/simplify {diff}\n\nKeep these agents: reuse, altitude.\n\n\nUser instructions\n")
         self.assertEqual(source.read_text(), "User instructions")
 
     def test_empty_reports_preserve_account_failure_reasons_from_the_log(self) -> None:

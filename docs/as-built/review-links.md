@@ -96,7 +96,8 @@ Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
-Every page uses `page_frame.STYLE`: the content column starts 32px from the top and left edges of the frame, and the title uses bold 26px text.
+Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
 AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
@@ -177,8 +178,12 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
-The function takes the review root and returns the keys of the items that wait on the page.
-Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes`.
+Questions uses `change_browser.waiting_questions`.
+Images uses `images.waiting_images` for registered images without `feedback_at`.
+The Images page and its items function share the same waiting-record filter.
+Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
 The console posts `open=<id>` for the page it shows to `/console/news`.
 While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
@@ -193,7 +198,8 @@ An items function that fails writes one line to the server log, and its page sho
 In the open sidebar the icon's center lines up with the status dots of unavailable pages.
 In the collapsed rail the icon sits at the top right of the page icon.
 At phone width the menu button shows the icon while any page holds new items.
-Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+Each poll reads the change lists once, about 0.1 seconds of server time.
+The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
 The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
@@ -231,6 +237,30 @@ All with no card keeps the URL without a fragment.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
+
+Each change can hold one image id in its optional `Image` cell.
+`change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py image --image <png>` registers a screenshot for a checkpoint line.
+`image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
+The parser accepts twelve lowercase hexadecimal characters.
+`list-ready` and `live` leave the cell empty and print one line when the image is missing.
+
+Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
+The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
+It has a 420px height limit and crops from the top left.
+It opens the full image in a new tab.
+Below 1000px, it moves under the text.
+A row without an image retains its text width and position.
+
+`image_store.register_file` shares draft creation, image suffix checks, and atomic publication between the two image stores.
+It stores a single image or a before and after pair with one record.
+`image_store.read_record` checks the optional `before` and `feedback_at` fields.
+Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
+The snapshot sweep skips both image stores during normal snapshot deletion.
+It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
+The setting starts at 14 days and is read at each sweep.
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.
@@ -295,18 +325,24 @@ Answers to questions and changes both post to `changes.html`.
 `/console/images.html` shows registered images with their instructions, oldest first.
 A new image goes to the end, so the cards above it keep their places.
 The console lists it as **Images**, with the Lucide `image` icon.
-A showrunner or unit registers each image with one command:
+A showrunner or unit registers each image, or a before and after pair, with one command:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register --image PATH --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
 ```
 
 - The caption says what changed and what to look at.
+- `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
+  It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
+  It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
+  `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
+  The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
-- It prints the image file link and the image's own console link:
+- It prints the image file links (before, then after, for a pair) and the image's own console link:
   `http://<host>:<server_port>/console/?page=images&at.images=%2Fconsole%2Fimages.html%23image%3D<id>`.
   `console.place_query` builds the query from the console's place key.
 - The server serves the copy, so the user never needs the source path.
@@ -315,7 +351,7 @@ Each card shows, in this order:
 
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image, as a link to the full size.
+3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
 5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
 
@@ -323,6 +359,9 @@ Each card shows, in this order:
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
+On a page 1108px or wider, a single card is 680px wide and a pair card is up to 1376px wide; both are centered in the images pane.
+When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
 
 A group is a run of shown cards in a row with the same owner.
@@ -348,7 +387,7 @@ The server sends one message to the owner's staff id, resolved to its current se
 It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.`, `your image is not approved.` or `feedback on your image.`
 A `Feedback:` line follows when the user wrote text.
-Then come the image link, the caption, the For line and the delete command for the owner to run after it acts.
+Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
 After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
 A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
 When no try reaches the owner, the server answers 503 and writes nothing.

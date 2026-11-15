@@ -1170,7 +1170,11 @@ class AdmissionServer:
         self.closed: bool = False
         self.next_pass: float = float("inf")
         self.next_source_check: float = float("inf")
-        self.sources: dict[Path, tuple[int, int] | SourceMissing] = self._source_stamps()
+        # The service watches each loaded module under this folder and stops when one changes.
+        self.source_root: Path = Path(__file__).resolve().parents[1]
+        self.source_module_count: int = len(sys.modules)
+        self.sources: dict[Path, tuple[int, int] | SourceMissing] = {
+            path: self._stamp(path) for path in self._source_paths()}
         self.source_change_at: float | SourcesUnchanged = SourcesUnchanged()
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3790,16 +3794,15 @@ done
         except (BrokenPipeError, ConnectionResetError):
             self._disconnect(connection)
 
-    def _source_stamps(self) -> dict[Path, tuple[int, int] | SourceMissing]:
-        scripts = Path(__file__).resolve().parents[1]
+    def _source_paths(self) -> set[Path]:
         paths: set[Path] = set()
         for module in list(sys.modules.values()):
             filename = cast(object, getattr(module, "__file__", None))
             if isinstance(filename, str):
                 path = Path(filename).resolve()
-                if path.is_relative_to(scripts):
+                if path.is_relative_to(self.source_root):
                     paths.add(path)
-        return {path: self._stamp(path) for path in paths}
+        return paths
 
     @staticmethod
     def _stamp(path: Path) -> tuple[int, int] | SourceMissing:
@@ -3811,6 +3814,11 @@ done
 
     def _check_sources(self) -> None:
         configuration = self.last_usable_configuration
+        if len(sys.modules) != self.source_module_count:
+            # A function-level import loads its module after start. Watch it from the first check after it loads.
+            self.source_module_count = len(sys.modules)
+            for path in self._source_paths() - self.sources.keys():
+                self.sources[path] = self._stamp(path)
         current = {path: self._stamp(path) for path in self.sources}
         now = self.clock.monotonic()
         if current != self.sources:

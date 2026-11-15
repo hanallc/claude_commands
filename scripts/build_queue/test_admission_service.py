@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import subprocess
 import unittest
 from typing import cast, override
@@ -5146,6 +5147,32 @@ class ServiceTests(unittest.TestCase):
                 fixture.server.run_once(0)
                 self.assertTrue(fixture.server.stopped)
                 self.assertTrue((fixture.state_dir / "state.json").exists())
+
+    def test_a_module_loaded_after_start_stops_the_service_when_it_changes(self) -> None:
+        from scripts.mac_test import eligibility
+
+        with AdmissionFixture() as fixture:
+            # eligibility.py loads inside a function on the first Mac read, after the service starts.
+            fixture.server.source_root = fixture.root
+            source = fixture.root / "mac_test" / "eligibility.py"
+            source.parent.mkdir()
+            _ = source.write_text(Path(eligibility.__file__).read_text())
+            module = types.ModuleType("loaded_after_start")
+            module.__file__ = str(source)
+            with mock.patch.dict(sys.modules, {module.__name__: module}):
+                fixture.clock.advance(1)
+                fixture.server.run_once(0)
+                self.assertIn(source, fixture.server.sources)
+                self.assertIsInstance(fixture.server.source_change_at, service.SourcesUnchanged)
+                _ = source.write_text(source.read_text() + "\n# changed\n")
+                fixture.clock.advance(1)
+                fixture.server.run_once(0)
+                fixture.clock.advance(1)
+                fixture.server.run_once(0)
+                self.assertFalse(fixture.server.stopped)
+                fixture.clock.advance(1)
+                fixture.server.run_once(0)
+                self.assertTrue(fixture.server.stopped)
 
     def test_serve_defaults_to_the_private_admission_directory(self) -> None:
         with AdmissionFixture() as fixture:

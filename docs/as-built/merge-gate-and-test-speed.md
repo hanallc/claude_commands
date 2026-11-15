@@ -692,6 +692,12 @@ Checkpoint integration modules separate inputs, receipts, validation, promotion,
 Ordinary CLI cases use the real parser and handlers in-process.
 Git, executable stand-ins, and selected unit and child-handoff cases retain real subprocesses.
 
+### Land line
+
+`land_queue.py` keeps the order in which the land runner takes items: `add`, `move`, `remove`, `list`, `next`.
+The runner takes each item with `next` under the line lock, so an item lands once and an edit never loses an item.
+The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
+
 ### Queued checkpoint batches
 
 `merge_checkpoint.py --production <name> --batch <file>` lands queued checkpoints in file order.
@@ -701,7 +707,8 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once.
+1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
+   Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
 2. Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
 4. Check each remaining item and make its own merge commit.
@@ -953,7 +960,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
+| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.

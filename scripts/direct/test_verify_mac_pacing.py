@@ -6,6 +6,7 @@ from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 import signal
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 @final
@@ -30,7 +31,7 @@ class VerifyMacPacingTests(VerifyMacOffloadFixture):
         self.assertGreater(self.routing_record()["hold_wait_s"], 0)
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["outcome"], "interrupted")
-        self.assertEqual(list((self.root / "tmp").glob("verify-hold.*")), [])
+        self.assertEqual(tool_folders(self.root / "tmp", "verify"), [])
 
 
 if __name__ == "__main__":
