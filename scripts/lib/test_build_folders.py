@@ -1436,6 +1436,16 @@ os._exit(0)
                         process.kill()
                     _ = process.communicate(timeout=10)
 
+    def test_a_sweep_without_wait_tries_a_held_lock_once(self) -> None:
+        held = folders.create_build_folder(folders.UniqueBuildFolder("sweep-held-"))
+        self.addCleanup(_release_folder, held)
+        free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
+        _release_folder(free)
+        with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(held.is_dir())
+        self.assertFalse(free.exists())
+
     def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
         for stage in ("folder", "lease", "temporary-lease", "lock"):
             for held in (False, True):

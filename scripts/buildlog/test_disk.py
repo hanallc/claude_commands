@@ -25,7 +25,7 @@ from scripts.lint import sweep
 from scripts.buildlog import test_index
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import copy_record
-from scripts.lib.cargo_output import CargoOutputRoots
+from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import linux_runner
@@ -68,6 +68,26 @@ class DiskTests(unittest.TestCase):
         expected = sorted(path for row in rows.values() for path in (row.target_directory, row.build_directory))
         self.assertEqual((outputs, again), (expected, expected))
         self.assertIn(rows["new"], sweep.saved_cargo_output_roots().workspaces)
+
+    def test_an_unreadable_checkout_is_read_again_only_after_its_manifest_changes(self) -> None:
+        base = self.base()
+        checkout = base / "broken"
+        checkout.mkdir()
+        manifest = checkout / "Cargo.toml"
+        _ = manifest.write_text("[package\n")
+        failed = CargoOutputUnavailable("failed to parse manifest")
+        with mock.patch.object(disk, "read_cargo_output_roots", return_value=failed) as read:
+            first = disk.mapped_output_paths([("base", str(base))])
+            second = disk.mapped_output_paths([("base", str(base))])
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(first, second)
+            self.assertEqual(first[1], [f"{checkout}: failed to parse manifest"])
+            _ = manifest.write_text("[package]\nname = 'broken'\n")
+            _ = disk.mapped_output_paths([("base", str(base))])
+            self.assertEqual(read.call_count, 2)
+        checkout_rows = disk.saved_unreadable()
+        self.assertEqual(list(checkout_rows), [checkout])
+        self.assertEqual(checkout_rows[checkout].manifest_size, manifest.stat().st_size)
 
     def test_scanned_folders_add_the_scratch_root_only_outside_the_folders(self) -> None:
         base = self.base()
