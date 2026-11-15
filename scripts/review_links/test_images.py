@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, image_store, images, serve
+from scripts.review_links import change_page, console, image_store, images, serve
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
                     + "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
@@ -64,6 +64,44 @@ class ImagesFixture(unittest.TestCase):
 
     def register(self, caption: str = "The nav shows Images. Look at the left column.") -> image_store.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
+
+
+class ImagesNewsTests(ImagesFixture):
+    def pages(self) -> tuple[console.ConsolePage, ...]:
+        return tuple(page for page in console.read_pages() if page.identity == "images")
+
+    def test_the_first_visit_records_waiting_images_without_a_new_mark(self) -> None:
+        record = self.register()
+        self.assertEqual(console.news(self.root, self.pages(), "changes"), ())
+        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((record["id"],)))
+        seen = cast(dict[str, list[str]], json.loads((self.root / change_page.CONSOLE_FOLDER / console.SEEN_NAME).read_text()))
+        self.assertEqual(seen["images"], [record["id"]])
+
+    def test_a_new_image_marks_images_until_the_user_opens_the_page(self) -> None:
+        pages = self.pages()
+        self.assertEqual(console.news(self.root, pages, "changes"), ())
+        _ = self.register()
+        self.assertEqual(console.news(self.root, pages, "changes"), ("images",))
+        self.assertEqual(console.news(self.root, pages, "images"), ())
+        self.assertEqual(console.news(self.root, pages, "changes"), ())
+
+    def test_feedback_and_temporary_change_images_give_no_new_mark(self) -> None:
+        pages = self.pages()
+        self.assertEqual(console.news(self.root, pages, "changes"), ())
+        answered = self.register("Answered image")
+        answered["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        image_store.write_record(images.images_root(self.root) / answered["id"], answered)
+        change = image_store.register_change(self.shot)
+        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset())
+        self.assertEqual(console.news(self.root, pages, "changes"), ())
+        body = images.render(self.root).decode()
+        self.assertNotIn(answered["id"], body)
+        self.assertNotIn(change, body)
+        waiting = self.register("Waiting image")
+        self.assertEqual(images.waiting_images(console.NewsRequest(self.root)), frozenset((waiting["id"],)))
+        self.assertIn(waiting["id"], images.render(self.root).decode())
+        self.assertEqual(console.news(self.root, pages, "changes"), ("images",))
+
 
 class ChangeImageTests(ImagesFixture):
     def test_change_images_do_not_appear_on_the_images_page(self) -> None:
