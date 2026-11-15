@@ -586,6 +586,13 @@ Both commands change nothing.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
+The record holds only rows that a restart starts:
+- `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
+- `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
+- `restart` removes a saved id with no staff row, or a saved worker that `worker.not_restored` names, with one anomaly line: `<name>: restart anomaly: <reason>; removed from the restart record`.
+- `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
+- `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
+- An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
 `shutdown_record.update` holds the record lock for each change.
 Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.
 It checks current liveness again under each row lock.
