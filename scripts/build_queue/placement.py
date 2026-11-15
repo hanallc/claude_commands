@@ -233,6 +233,18 @@ class SourceKeyUnavailable:
 SourceIdentity = SourceKeyKnown | SourceKeyUnavailable
 
 
+StepCommandKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
+MacRunKind = Literal["shot", "install", "probe", "run"]
+CommandKind = StepCommandKind | MacRunKind
+STEP_COMMAND_KINDS: tuple[StepCommandKind, ...] = ("check", "lint", "doc", "test", "build", "example", "final")
+MAC_RUN_KINDS: tuple[MacRunKind, ...] = ("shot", "install", "probe", "run")
+
+
+@dataclass(frozen=True)
+class CommandKindNotSent:
+    """An older client sends no command kind, so the service reads it from the recorded step."""
+
+
 @dataclass(frozen=True)
 class PlacementConstraints:
     source_key: SourceIdentity
@@ -242,6 +254,7 @@ class PlacementConstraints:
     session: SubmittingSession
     candidates: tuple[PlacementCandidate, ...]
     selection: HostSelection = ConfiguredOrder()
+    command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
 
 
 @dataclass(frozen=True)
@@ -371,6 +384,7 @@ class HostEvidenceKey:
     step: str = ""
     settings: ProviderSettings = ConfiguredProviderSettings()
     local_hold_owner: SubmittingOwner | NoLocalHoldOwner = NoLocalHoldOwner()
+    command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
 
 
 @dataclass(frozen=True)

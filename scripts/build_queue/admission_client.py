@@ -20,7 +20,7 @@ import socket
 import shlex
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
 from scripts.build_queue import admission_code, placement, snapshot_codec
@@ -51,7 +51,7 @@ class PlacementConstraintBuilder(Protocol):
     """Read fixed caller policy without importing the provider command cycle."""
 
     def __call__(self, repo_root: Path, package: str,
-                 kind: Literal["check", "lint", "doc", "test", "build", "example", "final"],
+                 kind: placement.CommandKind,
                  command: tuple[str, ...], session: placement.SubmittingSession,
                  source_key: placement.SourceIdentity, routing: target_config.Routing,
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
@@ -1237,7 +1237,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         builder = cast(PlacementConstraintBuilder, getattr(
             import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
-            cast(Literal["check", "lint", "doc", "test", "build", "example", "final"], kind), tuple(step_argv), session,
+            cast(placement.CommandKind, kind), tuple(step_argv), session,
             placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)

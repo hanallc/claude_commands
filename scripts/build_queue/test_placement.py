@@ -735,6 +735,75 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 else:
                     self.assertEqual(assignment_for(fixture, request).destination, destination)
 
+    def test_each_mac_run_kind_is_admitted_on_the_mac_and_refused_on_a_linux_target(self) -> None:
+        cases: tuple[tuple[str, placement.CommandKind | placement.CommandKindNotSent, str], ...] = (
+            *((kind, kind, "macos") for kind in placement.MAC_RUN_KINDS),
+            *((kind, kind, "linux") for kind in placement.MAC_RUN_KINDS),
+            ("zsh", placement.CommandKindNotSent(), "macos"),
+            ("nextest", placement.CommandKindNotSent(), "linux"))
+        for step, sent, platform in cases:
+            with self.subTest(kind=sent, platform=platform), PlacementFixture() as fixture:
+                repository = fixture.root / "hana"
+                (repository / ".git").mkdir(parents=True)
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
+                _ = write_config_fixture(fixture.root / "box.conf",
+                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                request = placement_request(fixture)
+                assert isinstance(request.profile, records.StepProfile)
+                destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
+                request = replace(request, profile=replace(request.profile, step=step), constraints=replace(
+                    request.constraints, repository=str(repository), command_kind=sent,
+                    candidates=(placement.PlacementCandidate(destination),)))
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+                reachable = offload.CommandOutput(0, "", "")
+                with (mock.patch.object(offload.ProcessController, "capture", return_value=reachable),
+                      mock.patch.object(mac_test, "free_now", return_value="free")):
+                    evidence = fixture.read_host_evidence(key)
+                fixture.server.publish_host_evidence(evidence)
+                admitted = isinstance(sent, placement.CommandKindNotSent) and step == "nextest" or (
+                    sent in placement.MAC_RUN_KINDS and platform == "macos")
+                if admitted:
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.AllowedHost())
+                    self.assertEqual(assignment_for(fixture, request).destination, destination)
+                else:
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.FixedExclusion("command"))
+                    reply, = fixture.server.handle_request(request)
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertEqual(reply.retry, placement.DoNotRetry("command"))
+
+    def test_each_command_kind_reads_its_own_host_evidence(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            kinds: tuple[placement.CommandKind | placement.CommandKindNotSent, ...] = (
+                *placement.MAC_RUN_KINDS, "test", placement.CommandKindNotSent())
+            keys = {fixture.server.host_evidence_key(replace(request, constraints=replace(
+                request.constraints, command_kind=kind)), destination) for kind in kinds}
+            self.assertEqual(len(keys), len(kinds))
+
+    def test_a_busy_mac_holds_a_mac_run_kind(self) -> None:
+        with PlacementFixture() as fixture:
+            repository = fixture.root / "hana"
+            (repository / ".git").mkdir(parents=True)
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=box\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n")
+            _ = write_config_fixture(fixture.root / "box.conf",
+                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+            request = placement_request(fixture)
+            destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
+            request = replace(request, constraints=replace(request.constraints, repository=str(repository),
+                command_kind="install", candidates=(placement.PlacementCandidate(destination),)))
+            key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[key] = request
+            with mock.patch.object(mac_test, "free_now", return_value="busy"):
+                evidence = fixture.read_host_evidence(key)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("busy"))
+
     def test_a_lost_or_delivered_authorization_never_replays_before_or_after_restart(self) -> None:
         for response in ("lost", "delivered", "delivered_before_next_pass"):
             for restart in (False, True):

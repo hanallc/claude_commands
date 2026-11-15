@@ -13,9 +13,9 @@ from unittest import mock
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import snapshot_with_head_cause, wait_reply
+from scripts.build_queue.admission_test_support import GIB, snapshot_with_head_cause, wait_reply
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.mac_test.claim_state import WholeMacScope
+from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
 
 
@@ -61,6 +61,8 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
             for dependency in ("admission_wire", "placement"):
                 source = source.replace("from scripts.build_queue." + dependency + " import (",
                                         "from _pinned_" + dependency + " import (")
+            # The older codec shapes its records by module name, so it must know the pinned module names.
+            source = source.replace('__module__ == "scripts.build_queue.', '__module__ == "_pinned_')
             exec(compile(source, revision + ":" + path, "exec"), module.__dict__)
         setattr(modules["_pinned_admission_records"], "placement", modules["_pinned_placement"])
         setattr(modules["_pinned_admission_wire"], "records", modules["_pinned_admission_records"])
@@ -268,6 +270,26 @@ class SnapshotCodecTests(unittest.TestCase):
                 older_snapshot = cast(object, getattr(parsed, "snapshot"))
                 gpu = cast(object, getattr(cast(object, getattr(older_snapshot, "decision")), "gpu", None))
                 self.assertEqual(type(gpu).__name__, "NoneType" if revision == "7fdfd9a6a" else "GpuSlotWait")
+
+    def test_each_older_service_reads_a_command_kind_request_and_the_new_service_reads_each_older_request(self) -> None:
+        destination = placement.PlacementDestination("ssh", "mac", "fixture-mac", RepositoryScope("hana"))
+        profile = records.StepProfile("hana", "zsh", "tree", records.ExpectedPeak(GIB, "measured", 5), estimated_at=1000.0)
+        for kind in (*placement.MAC_RUN_KINDS, "test", placement.CommandKindNotSent()):
+            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("source-a"), ("/bin/zsh", "-c", "true"),
+                "/repo/hana", "hana", NoOwningSession(), (placement.PlacementCandidate(destination),), command_kind=kind)
+            request = wire.PlacementRequest("episode-a", placement.SubmittingOwner("natedev", 42, "100"), 1000.0,
+                                            profile, constraints)
+            line = wire.encode_request(request)
+            self.assertEqual(wire.parse_request(line), request)
+            for revision in (*OLDER_CLIENTS, "429f57a6c"):
+                with self.subTest(kind=kind, revision=revision), pinned_snapshot_reader(revision):
+                    # The older service parses the new request, and its client writes the request again in its own shape.
+                    older_wire = sys.modules["_pinned_admission_wire"]
+                    older = cast(Callable[[str], object], getattr(older_wire, "parse_request"))(line)
+                    older_line = cast(Callable[[object], str], getattr(older_wire, "encode_request"))(older)
+                    self.assertNotIn("command_kind", older_line)
+                    self.assertEqual(wire.parse_request(older_line),
+                                     replace(request, constraints=replace(constraints, command_kind=placement.CommandKindNotSent())))
 
     def test_acquisition_defaults_unused_variants_and_restores_strict_reads(self) -> None:
         for field in ("job_state", "service_job_state"):
