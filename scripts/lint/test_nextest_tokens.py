@@ -32,6 +32,13 @@ FAKE_CARGO = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$CARGO_CALLS"
 [[ -z "${FAKE_QUIET:-}" ]] || exec >/dev/null
 if [[ " $* " == *" --no-run "* ]]; then
+    # nextest 0.9.143 refuses these with --no-run.
+    for flag in --fail-fast --no-fail-fast --max-fail --debugger --tracer; do
+        if [[ " $* " == *" $flag "* ]]; then
+            echo "error: the argument '--no-run' cannot be used with '$flag'"
+            exit 2
+        fi
+    done
     echo built
     exit "${FAKE_BUILD_STATUS:-0}"
 fi
@@ -123,6 +130,38 @@ def read_line(child: subprocess.Popen[str]) -> str:
     return output_of(child).readline()
 
 
+# The shape verify.sh passes for a hana test step.
+HANA_RUN = ("cargo", "nextest", "run", "--test-threads", "32", "--no-fail-fast", "--workspace", "--bin", "hana",
+            "-E", "package(hana) & test(camera_output_cable_ink_reaches_brightness_source_from_the_face)",
+            "--features", "hana/dynamic_linking")
+
+
+class BuildOnlyTests(unittest.TestCase):
+    def test_the_build_keeps_the_selection_and_drops_every_run_only_option(self) -> None:
+        run = tokens.test_run(HANA_RUN)
+        assert isinstance(run, tokens.SizedTestRun)
+        self.assertEqual(run.build_only(), ["cargo", "nextest", "run", "--no-run", "--workspace", "--bin", "hana",
+            "-E", "package(hana) & test(camera_output_cable_ink_reaches_brightness_source_from_the_face)",
+            "--features", "hana/dynamic_linking"])
+        self.assertEqual(run.with_threads(8)[3:6], ["--test-threads", "8", "--no-fail-fast"])
+
+    def test_each_run_only_form_is_dropped_with_its_value(self) -> None:
+        for given in (["--fail-fast"], ["--no-fail-fast"], ["--max-fail", "3"], ["--max-fail=3"],
+                      ["--retries", "2"], ["--retries=2"], ["-j", "4"], ["-j4"], ["--test-threads", "4"],
+                      ["--status-level", "all"], ["--final-status-level=fail"], ["--success-output", "never"],
+                      ["--failure-output", "final"], ["--no-capture"], ["--nocapture"], ["--debugger", "gdb"],
+                      ["--tracer", "strace"], ["--no-tests", "pass"], ["--stress-count", "2"],
+                      ["--message-format", "libtest-json"], ["--show-progress", "none"], ["--hide-progress-bar"]):
+            with self.subTest(given=given):
+                self.assertEqual(tokens.build_selection([*given, "--workspace", "-E", "all()"]),
+                                 ["--workspace", "-E", "all()"])
+
+    def test_build_options_and_filters_stay(self) -> None:
+        kept = ["-p", "hana", "--lib", "--features=x", "--build-jobs", "4", "-P", "ci", "--release",
+                "--cargo-profile", "test", "--partition", "count:1/2", "--run-ignored", "all", "-E", "all()"]
+        self.assertEqual(tokens.build_selection(kept), kept)
+
+
 class HolderTests(PoolCase):
     def test_run_waits_for_its_floor_while_a_compile_holds_the_pool(self) -> None:
         self.fill(4)
@@ -154,6 +193,16 @@ class HolderTests(PoolCase):
         self.assertEqual(child.wait(timeout=30), 101)
         self.assertEqual(self.cargo_calls(), ["nextest run --no-run"])
         self.assertFalse((self.root / "width").exists())
+        self.assertEqual(self.free_tokens(), 4)
+
+    def test_a_hana_run_builds_without_its_run_only_flags_then_runs_with_them(self) -> None:
+        self.fill(4)
+        child = self.holder(*HANA_RUN)
+        output = output_of(child).read()
+        self.assertEqual(child.wait(timeout=30), 0, output)
+        selection = " ".join(HANA_RUN[6:])
+        self.assertEqual(self.cargo_calls(), [f"nextest run --no-run {selection}",
+                                              f"nextest run --test-threads 4 --no-fail-fast {selection}"])
         self.assertEqual(self.free_tokens(), 4)
 
     def test_killed_child_gives_every_token_back(self) -> None:
