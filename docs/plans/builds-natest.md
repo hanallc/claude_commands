@@ -4159,11 +4159,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-- **Goal:** `direct/test_verify_mac_arguments.py` uses less AWS CPU and keeps every behavior check.
-- **Spec:** `test_decline_runs_same_nextest_words_locally_after_runner` keeps 2 complete `verify.sh` runs: a filter run with a package and an ignored-only run with no package and no filter. A new `NextestArgumentTests` test runs `parse_command_arguments` and `compose_nextest_args` for all 5 argument shapes and checks the `--run-ignored`, `--no-tests=warn`, `--workspace` and `package(sample)` assertions. The flow assertions of the 3 removed runs repeat the kept runs with the same setup.
-- **Files:** `scripts/direct/test_verify_mac_arguments.py`.
-- **Workers:** 1 writer: one test module; the director writes it (no-worker mode).
-- **Constraints from prior phases:** none.
-- **Acceptance gate:** the module passes; basedpyright 0 errors; a `verify.sh` mutation for each moved assertion fails the new test; AWS pair shows a gain.
+- `test_decline_runs_same_nextest_words_locally_after_runner` in `scripts/direct/test_verify_mac_arguments.py` keeps 2 complete `verify.sh` runs: a filter run with a package, and an ignored-only run with no package and no filter. They cover `FILTER_RUN` from `--filter` and from `--run-ignored`.
+- `NextestArgumentTests.test_each_argument_shape_gives_its_ignored_and_package_words` runs `parse_command_arguments` and `compose_nextest_args` for all 5 argument shapes. It checks the `--run-ignored`, `--no-tests=warn`, `--workspace` and `package(sample)` assertions. `compose_script` shares the function and metadata setup with the existing direct test.
+- A `verify.sh` mutation for each moved assertion fails the new test.
+- AWS pair (3 rounds): 14.19 -> 8.33 CPU s, all pass.
+- Commit fef7152f0. Test-only change.
