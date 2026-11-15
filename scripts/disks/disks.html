@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disks</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4; --hover: #efede8;
+  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f; --accent: #2a78d6; --room: #1baf7a;
+  --track: #e8e6e0; --band: #dcdad4; --floor: #c98a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
+    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70;
+    --track: #232321; --band: #33322e; --floor: #e0a530;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --card: #1a1a19; --line: #34332f; --hover: #242422;
+  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f; --accent: #3987e5; --room: #199e70;
+  --track: #232321; --band: #33322e; --floor: #e0a530;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+__PAGE_FRAME_STYLE__
+h2 { font-size: 1.05rem; margin: 0; }
+h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
+.dot.old { background: var(--ink-3); }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; align-items: start; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; min-width: 0; }
+.head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
+.free { font-size: 1.05rem; font-weight: 600; }
+.free small { font-weight: 400; color: var(--ink-2); font-size: 0.86rem; }
+.bar { position: relative; height: 12px; border-radius: 6px; background: var(--track); margin: 12px 0 6px; }
+.bar .used { position: absolute; inset: 0 auto 0 0; border-radius: 6px; background: var(--accent); }
+.bar .floor { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--floor); border-radius: 1px; }
+.note { color: var(--ink-2); font-size: 0.84rem; margin: 0 0 12px; }
+.note .mark { display: inline-block; width: 2px; height: 11px; background: var(--floor); margin: 0 6px -1px 0; }
+.limit { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 0.86rem; color: var(--ink-2); margin: 0 0 6px; }
+.limit .range { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 220px; }
+.limit input { flex: 1; min-width: 60px; accent-color: var(--accent); }
+.limit output { min-width: 64px; text-align: right; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.limit .end { color: var(--ink-3); font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+table { border-collapse: collapse; width: 100%; font-size: 0.86rem; table-layout: fixed; }
+th, td { text-align: left; padding: 5px 0 5px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+th:first-child, td:first-child { padding-left: 0; }
+th { color: var(--ink-2); font-weight: 600; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+td.path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.82rem; }
+/* A long folder name wraps, so no name is cut. */
+.tree td:first-child { white-space: normal; overflow-wrap: anywhere; }
+td.dim, .dim { color: var(--ink-3); }
+tbody tr:hover td { background: var(--hover); }
+.tree col.place { width: 50%; } .tree col.size { width: 78px; } .tree col.pct { width: 84px; }
+.tree tr[aria-expanded] > td { cursor: pointer; }
+.tree tr[aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tree .twist { display: inline-block; width: 14px; text-indent: 0; color: var(--ink-3); font-family: system-ui, sans-serif; }
+.walk { position: relative; height: 10px; }
+.walk .span { position: absolute; top: 0; bottom: 0; background: var(--track); border-radius: 3px; }
+.walk .span.inner { background: var(--band); }
+.walk .seg { position: absolute; top: 1px; bottom: 1px; min-width: 2px; border-radius: 3px; background: var(--accent); opacity: 0.7; }
+.walk .seg.other { background: var(--ink-3); opacity: 0.45; }
+.problem { color: var(--ink-2); font-size: 0.86rem; margin: 12px 0 0; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 560px) {
+  .card { padding: 14px 12px 10px; }
+  .tree col.place { width: auto; } .tree col.size { width: 64px; } .tree col.pct { width: 0; } .tree col.walk { width: 64px; }
+  .tree .pct { display: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1 class="page-title">Disks</h1>
+  <div class="status"><span class="dot" id="dot" hidden></span><span id="status">Reading the sizes…</span></div>
+  <div class="grid" id="drives"></div>
+</main>
+<script id="disks-settings" type="application/json">__DISKS_SETTINGS__</script>
+<script>
+const GIB = 1024 ** 3;
+const SLIDER_STEPS = 1000;
+
+function size(bytes) {
+  const gib = bytes / GIB;
+  if (gib >= 1024) return (gib / 1024).toFixed(1) + " TiB";
+  if (gib >= 10) return Math.round(gib) + " GiB";
+  if (gib >= 1) return gib.toFixed(1) + " GiB";
+  return Math.round(bytes / 1024 ** 2) + " MiB";
+}
+
+function share(part, whole) {
+  return !whole || part / whole < 0.005 ? "<1%" : Math.round(100 * part / whole) + "%";
+}
+
+// The slider runs on a log scale from the configured least value to the largest top folder.
+function sliderRange(tree, settings) {
+  const min = settings.slider_min_gib * GIB;
+  const largest = Math.max(0, ...tree.children.map(child => child.size));
+  return {min, max: Math.max(largest, min)};
+}
+
+function toSlider(limit, range) {
+  if (range.max <= range.min) return 0;
+  return Math.round(SLIDER_STEPS * Math.log(limit / range.min) / Math.log(range.max / range.min));
+}
+
+function fromSlider(position, range) {
+  return range.min * (range.max / range.min) ** (position / SLIDER_STEPS);
+}
+
+function startLimit(range, settings) {
+  return Math.min(range.max, Math.max(range.min, settings.slider_default_gib * GIB));
+}
+
+function topPath(mount, name) {
+  return (mount.endsWith("/") ? mount : mount + "/") + name;
+}
+
+// The rows of a folder's children at a limit. Children below the limit join one Other row with the
+// folder's own files, which hold its files and its folders below the measure's limit.
+// One small child shows by its name. Own files below the measure's limit alone get no row.
+function treeRows(node, mount, state, keepBytes, path = "", depth = 0, start = 0, out = []) {
+  const children = [...node.children].sort((a, b) => b.size - a.size);
+  let shown = children.filter(child => child.size >= state.limit);
+  let rest = children.filter(child => child.size < state.limit);
+  if (rest.length === 1) { shown = [...shown, rest[0]]; rest = []; }
+  let at = start;
+  for (const child of shown) {
+    const childPath = depth === 0 ? topPath(mount, child.name) : path + "/" + child.name;
+    const folds = child.children.length > 0;
+    const open = folds && state.opened.has(childPath);
+    out.push({kind: folds ? (open ? "open" : "shut") : "leaf", path: childPath, name: depth === 0 ? childPath : child.name,
+              depth, size: child.size, parentSize: node.size, parentStart: start, start: at});
+    if (open) treeRows(child, mount, state, keepBytes, childPath, depth + 1, at, out);
+    at += child.size;
+  }
+  const files = node.other >= keepBytes;
+  if (rest.length || files) {
+    const restSize = rest.reduce((total, child) => total + child.size, 0) + node.other;
+    const name = rest.length ? `Other · ${rest.length} folders${files ? " and files" : ""}` : "Files and small folders";
+    out.push({kind: "other", path: "", name, depth, size: restSize, parentSize: node.size, parentStart: start, start: at});
+  }
+  return out;
+}
+
+function clock(seconds) {
+  const when = new Date(seconds * 1000), today = new Date();
+  const time = when.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  return when.toDateString() === today.toDateString() ? time
+    : when.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + time;
+}
+
+function age(seconds) {
+  const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"} ago`;
+  if (seconds < 60) return "less than a minute ago";
+  if (seconds < 3600) return plural(Math.floor(seconds / 60), "minute");
+  if (seconds < 86400) return plural(Math.floor(seconds / 3600), "hour");
+  return plural(Math.floor(seconds / 86400), "day");
+}
+
+function measuredText(measuredAt, now) {
+  return `Sizes from ${clock(measuredAt)}, ${age(Math.max(0, now - measuredAt))}.`;
+}
+
+function floorNote(drive) {
+  if (drive.floor == null || !drive.total) return "The cleanup floor is unknown.";
+  return `Cleanup starts below ${size(drive.floor)} free (${Math.round(100 * drive.floor / drive.total)}%).`;
+}
+
+function esc(text) {
+  return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
+}
+
+const settings = JSON.parse(document.getElementById("disks-settings").textContent);
+const states = new Map();
+let data = null;
+
+// A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
+function walk(row, scale) {
+  const pct = bytes => (100 * bytes / scale).toFixed(3) + "%";
+  return `<div class="walk"><div class="span${row.depth ? " inner" : ""}" style="left:${pct(row.parentStart)};width:${pct(row.parentSize)}"></div>`
+    + `<div class="seg${row.kind === "other" ? " other" : ""}" style="left:${pct(row.start)};width:${pct(row.size)}"></div></div>`;
+}
+
+function rowHtml(row, scale) {
+  // The twist hangs to the left, so a wrapped name lines up with its first line.
+  const indent = `style="padding-left:${row.depth * 16 + 14}px;text-indent:-14px"`;
+  const twist = row.kind === "open" ? "▾" : row.kind === "shut" ? "▸" : "";
+  const toggle = row.kind === "open" || row.kind === "shut"
+    ? ` tabindex="0" aria-expanded="${row.kind === "open"}" data-path="${esc(row.path)}"` : "";
+  const place = row.kind === "other" ? `<td class="dim" ${indent}>` : `<td class="path" ${indent} title="${esc(row.path)}">`;
+  return `<tr${toggle}>${place}<span class="twist">${twist}</span>${esc(row.name)}</td>`
+    + `<td class="n${row.kind === "other" ? " dim" : ""}">${size(row.size)}</td><td class="n dim pct">${share(row.size, row.parentSize)}</td>`
+    + `<td>${walk(row, scale)}</td></tr>`;
+}
+
+function stateFor(drive, range) {
+  if (!states.has(drive.mount)) {
+    const largest = [...drive.tree.children].sort((a, b) => b.size - a.size)[0];
+    states.set(drive.mount, {limit: startLimit(range, settings), opened: new Set(largest ? [topPath(drive.mount, largest.name)] : [])});
+  }
+  return states.get(drive.mount);
+}
+
+function headHtml(drive) {
+  const name = settings.names[drive.mount];
+  const title = name ? `${esc(name)}<span class="path">${esc(drive.mount)}</span>` : esc(drive.mount);
+  const free = drive.total ? `<span class="free">${size(drive.free)} free <small>of ${size(drive.total)}</small></span>` : "";
+  let html = `<div class="head"><h2>${title}</h2>${free}</div>`;
+  if (drive.total) {
+    const mark = drive.floor == null ? "" : `<div class="floor" style="left:${(100 * (drive.total - drive.floor) / drive.total).toFixed(2)}%"></div>`;
+    html += `<div class="bar"><div class="used" style="width:${(100 * drive.used / drive.total).toFixed(2)}%"></div>${mark}</div>`
+      + `<p class="note">${drive.floor == null ? "" : '<span class="mark"></span>'}${floorNote(drive)}</p>`;
+  }
+  return html;
+}
+
+function renderDrive(card, drive) {
+  if (!drive.tree) {
+    card.innerHTML = headHtml(drive) + `<p class="problem">No folder sizes: ${esc(drive.error || "the measure gave no folders")}.</p>`;
+    return;
+  }
+  const range = sliderRange(drive.tree, settings), state = stateFor(drive, range);
+  const rows = treeRows(drive.tree, drive.mount, state, data.keep_bytes);
+  card.innerHTML = headHtml(drive)
+    + `<label class="limit">Name folders of at least<span class="range"><span class="end">${size(range.min)}</span>`
+    + `<input type="range" min="0" max="${SLIDER_STEPS}" value="${toSlider(state.limit, range)}"${range.max > range.min ? "" : " disabled"}>`
+    + `<span class="end">${size(range.max)}</span><output>${size(state.limit)}</output></span></label>`
+    + `<table class="tree"><colgroup><col class="place"><col class="size"><col class="pct"><col class="walk"></colgroup>`
+    + `<thead><tr><th>Place</th><th class="n">Size</th><th class="n pct">Of parent</th><th aria-label="Place in the drive"></th></tr></thead>`
+    + `<tbody>${rows.map(row => rowHtml(row, drive.tree.size)).join("")}</tbody></table>`;
+  const slider = card.querySelector("input");
+  slider.addEventListener("input", () => {
+    state.limit = fromSlider(Number(slider.value), range);
+    renderDrive(card, drive);
+    card.querySelector("input").focus();
+  });
+  const toggle = path => {
+    if (!state.opened.delete(path)) state.opened.add(path);
+    renderDrive(card, drive);
+    card.querySelector(`tr[data-path="${CSS.escape(path)}"]`)?.focus();
+  };
+  card.querySelectorAll("tr[data-path]").forEach(row => {
+    row.addEventListener("click", () => toggle(row.dataset.path));
+    row.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(row.dataset.path); }
+    });
+  });
+}
+
+function renderStatus() {
+  if (!data) return;
+  const now = Date.now() / 1000;
+  document.getElementById("dot").hidden = false;
+  document.getElementById("dot").classList.toggle("old", now - data.measured_at > settings.cache_seconds);
+  document.getElementById("status").textContent = measuredText(data.measured_at, now);
+}
+
+function render() {
+  const grid = document.getElementById("drives");
+  grid.replaceChildren();
+  for (const drive of data.drives) {
+    const card = document.createElement("section");
+    card.className = "card";
+    grid.append(card);
+    renderDrive(card, drive);
+  }
+  renderStatus();
+}
+
+async function load() {
+  try {
+    const response = await fetch("disks.json?" + Date.now(), {cache: "no-store"});
+    if (!response.ok) throw new Error(response.status === 404 ? "no measure yet" : `the server answered ${response.status}`);
+    data = await response.json();
+  } catch (error) {
+    document.getElementById("status").textContent = `No sizes: ${error.message}.`;
+    return;
+  }
+  render();
+}
+
+load();
+setInterval(renderStatus, 30000);
+</script>
+</body>
+</html>

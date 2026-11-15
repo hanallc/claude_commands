@@ -1,4 +1,4 @@
-"""Measure each configured drive into the Disks page data file.
+"""Measure each configured drive into the Disks page data file, then publish the page.
 
 One measure at a time: a second call while a measure runs exits at once.
 Each drive's `du` runs at the lowest CPU and disk priority under a memory cap.
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 from scripts.buildlog import disk, filesystem
+from scripts.disks import disks_page
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -188,7 +189,11 @@ def measure(settings: MeasureSettings, runner: Runner = run_command,
 
 def main(argv: Sequence[str] | None = None) -> int:
     _ = argparse.ArgumentParser(description=__doc__).parse_args(argv)
-    return measure(read_settings())
+    settings = read_settings()
+    status = measure(settings)
+    if status == 0:
+        _ = disks_page.publish(settings.output_folder, disks_page.page_settings())
+    return status
 
 
 if __name__ == "__main__":
