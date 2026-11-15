@@ -23,7 +23,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import cloud_gate, gate_box, gate_trial, ledger
-from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
+from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable, largest_gate_vcpus
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile
@@ -477,6 +477,34 @@ class CloudGateTests(CostFixture):
         self.gate_history([(first, 'us-east-2', cap), (third, 'us-east-2', cap)])
         with redirect_stdout(StringIO()):
             self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+
+    def test_a_region_whose_spot_quota_is_below_one_box_is_not_tried(self) -> None:
+        worker, variants = self.steering_fixture()
+        types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
+        self.variant_prices(variants, {})
+        boxes = {size: largest_gate_vcpus((size,)) for size in types}
+        largest = max(boxes.values())
+        path = self.state / 'spot-prices.json'
+        def quotas(west: int, *, age: int = 0) -> None:
+            document = ledger.mapping(cast(object, json.loads(path.read_text())))
+            document['regions'] = [{'region': region, 'read_at': int(self.now) - age, 'standard_vcpus': str(vcpus),
+                                    'gpu_vcpus': '0'} for region, vcpus in (('us-east-2', largest), ('us-west-2', west))]
+            _ = path.write_text(json.dumps(document))
+        # us-west-2 fits only the smaller boxes, so only the largest type there is skipped.
+        quotas(largest - 1)
+        with redirect_stdout(StringIO()) as output:
+            ranked = worker.rank_variants(variants, 'merge-gate')
+        skipped = {size for size, vcpus in boxes.items() if vcpus == largest}
+        self.assertEqual({(row.region, row.instance_type) for row in variants} - {(row.region, row.instance_type) for row in ranked},
+                         {('us-west-2', size) for size in skipped})
+        self.assertEqual(output.getvalue().count('Cloud gate skips '), len(skipped))
+        self.assertIn(f'its Spot quota {largest - 1} vCPUs is below one box ({largest} vCPUs)', output.getvalue())
+        # A quota of exactly one box is tried, and a stale quota never causes a skip.
+        for west, age in ((largest, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
+            with self.subTest(west=west, age=age):
+                quotas(west, age=age)
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
 
     def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
         cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
