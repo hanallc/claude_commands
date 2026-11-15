@@ -199,6 +199,36 @@ class ReviewTextTests(unittest.TestCase):
             '<ol start="3"><li>Third</li><li>Fourth</li></ol><ol><li>First</li></ol>'
             + '<ul><li>Bullet</li></ul><ol start="8"><li>Eighth</li></ol>')
 
+    def test_question_text_links_addresses_and_leaves_punctuation_outside(self) -> None:
+        link = '<a href="http://h:1/x?a=b&amp;c=d" target="_blank" rel="noopener">http://h:1/x?a=b&amp;c=d</a>'
+        self.assertEqual(change_page.review_text_html("See http://h:1/x?a=b&c=d.\n- <b> https://e.invalid/p)", links=True),
+                         f'<p>See {link}.</p><ul><li>&lt;b&gt; <a href="https://e.invalid/p" target="_blank" '
+                         + 'rel="noopener">https://e.invalid/p</a>)</li></ul>')
+        self.assertEqual(change_page.review_text_html("See http://h:1/x"), "<p>See http://h:1/x</p>")
+
+    def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
+        parts = update_registration.QuestionParts(
+            ask="Approve both page changes to land?", context="Two changes wait.",
+            items=["AWS filter\nAfter: http://h:1/i", "Memory <bar>"], recommend="go for both",
+            choices=["go for both", 'no "yet"'])
+        item = update_registration.OutstandingItem(
+            since="2026-11-15T08:00", text="Approve both?", question="joined", parts=parts)
+        body, choices = change_browser.question_parts(item)
+        self.assertEqual(body, '<p class="question-ask">Approve both page changes to land?</p>'
+                         + '<h2>Context</h2><p>Two changes wait.</p><h2>Items</h2><ol class="question-items">'
+                         + '<li>AWS filter<br>After: <a href="http://h:1/i" target="_blank" rel="noopener">http://h:1/i</a></li>'
+                         + '<li>Memory &lt;bar&gt;</li></ol><h2>Recommended</h2><p>go for both</p>')
+        self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
+                         + '<button type="button" data-choice="go for both" aria-pressed="false">go for both</button>'
+                         + '<button type="button" data-choice="no &quot;yet&quot;" aria-pressed="false">no &quot;yet&quot;</button>'
+                         + '</fieldset>')
+        parts["ask"] = "approve both"
+        parts["context"] = parts["recommend"] = ""
+        parts["items"] = parts["choices"] = []
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+        del item["parts"]
+        self.assertEqual(change_browser.question_parts(item), ("<p>joined</p>", ""))
+
 
 class ChangePageTests(unittest.TestCase):
     temporary: Path = Path()

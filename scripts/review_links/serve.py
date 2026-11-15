@@ -462,7 +462,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 raise ValueError("empty delete request")
-            request = images.submit(root, self.rfile.read(length).decode("utf-8"))
+            images.submit(root, self.rfile.read(length).decode("utf-8"))
         except change_page.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
@@ -470,17 +470,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(400, "Use the delete form on this page.", error)
             return
         except OSError as error:
-            self.browser_failure(503, "The delete request could not be saved. Try again.", error)
+            self.browser_failure(503, "The image could not be deleted. Try again.", error)
             return
-        try:
-            self.json_response(200, {"state": "requested"})
-        finally:
-            # The request thread sends the message after it flushes the response.
-            if not isinstance(request, images.DeleteAlreadyRequested):
-                try:
-                    images.deliver(root, request)
-                except (OSError, ValueError) as error:
-                    print(f"review-links image delivery: {error}", file=sys.stderr)
+        self.json_response(200, {"state": "deleted"})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
@@ -522,7 +514,6 @@ class ReviewLinksServer(ThreadingHTTPServer):
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
         threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
-        threading.Thread(target=images.recover_pending, args=(self.root,), daemon=True).start()
 
     @override
     def server_bind(self) -> None:

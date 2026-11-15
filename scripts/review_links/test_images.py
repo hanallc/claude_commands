@@ -1,9 +1,8 @@
-"""Test image registration, the Images page, and delete requests in private folders."""
+"""Test image registration, the Images page, and deletes in private folders."""
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import tempfile
 import threading
@@ -32,7 +31,6 @@ class ImagesFixture(unittest.TestCase):
     shot: Path = Path()
     owner: staff.StaffRow | None = None
     sent: list[tuple[str, str, str]] = []
-    delivered: threading.Event = threading.Event()
 
     @override
     def setUp(self) -> None:
@@ -42,23 +40,16 @@ class ImagesFixture(unittest.TestCase):
         for stem in ("console", "review_links", "change_review"):
             _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
                                 configuration / f"{stem}.conf")
-        self.write_delivery_config(3)
         self.root = self.temporary / "snapshots"
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
-            "STAFF_FILE": str(self.temporary / "staff.json")})))
+            "STAFF_FILE": str(self.temporary / "staff.json"), "USER_ZONE": "America/New_York"})))
         runner = fixture_member("showrunner", name="shot-runner")
         self.owner = fixture_member("unit", name="shot-owner", parent=runner.id)
         self.shot = self.temporary / "before.png"
         _ = self.shot.write_bytes(PNG)
         self.sent = []
-        self.delivered = threading.Event()
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture))
-
-    def write_delivery_config(self, tries: int) -> None:
-        path = self.temporary / "config/review_links.conf"
-        content = re.sub(r"(?m)^delivery_tries=.*$", f"delivery_tries={tries}", path.read_text())
-        _ = path.write_text(re.sub(r"(?m)^delivery_pause_seconds=.*$", "delivery_pause_seconds=0", content))
 
     def capture(self, recipient: str, sender: str, message: str) -> None:
         self.sent.append((recipient, sender, message))
@@ -69,12 +60,6 @@ class ImagesFixture(unittest.TestCase):
 
     def register(self, caption: str = "The nav shows Images. Look at the left column.") -> images.ImageRecord:
         return images.register(self.shot, caption, self.owner_id(), "Phase console-images")
-
-    def delete_request(self, identity: str) -> images.DeleteRequest:
-        request = images.read_record(self.root / images.FOLDER / identity).get("delete_request")
-        assert request is not None
-        return request
-
 
 class ImagesTests(ImagesFixture):
     def test_register_copies_the_image_into_a_folder_that_the_record_owns(self) -> None:
@@ -131,29 +116,46 @@ class ImagesTests(ImagesFixture):
         self.assertIn("Newer shot", source)
         self.assertIn("shot-owner (unit)", source)
         self.assertIn("Phase console-images", source)
-        self.assertIn(f'src="/images/{newer["id"]}/image.png"', source)
+        self.assertIn(f'src="/images/{newer['id']}/image.png"', source)
         token = images.request_token(images.console_token(self.root), newer["id"])
         self.assertIn(f'name="token" value="{token}"', source)
         self.assertIn('<option value="week" selected>', source)
+        self.assertIn("card.remove();", source)
+        self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
+        self.assertIn("'Not deleted: ' + error.message", source)
 
-    def test_delete_request_sends_once_to_the_owner(self) -> None:
+    def test_card_shows_the_caption_then_aligned_details_then_the_image_and_delete(self) -> None:
+        record = self.register("Look at <the> cards")
+        record["registered_at"] = "2026-11-15T03:09:00+00:00"
+        images.write_record(self.root / images.FOLDER / record["id"], record)
+        card = images.card(record, "token", staff.snapshot())
+        path = f"/images/{record['id']}/image.png"
+        token = images.request_token("token", record["id"])
+        self.assertEqual(card, (
+            f'<article data-image="{record['id']}" data-registered="1794712140">'
+            + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
+            + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
+            + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
+            + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
+            + f'<form method="post" data-delete><input type="hidden" name="image" value="{record['id']}">'
+            + f'<input type="hidden" name="token" value="{token}">'
+            + '<button type="submit">Delete</button><span role="status" data-delete-status></span></form></article>'))
+        with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
+            self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot()))
+
+    def test_delete_removes_the_image_at_once_and_sends_no_message(self) -> None:
         record = self.register()
+        kept = self.register("Kept shot")
         body = urlencode({"image": record["id"],
                           "token": images.request_token(images.console_token(self.root), record["id"])})
-        pending = images.submit(self.root, body)
-        assert not isinstance(pending, images.DeleteAlreadyRequested)
-        images.deliver(self.root, pending)
-        self.assertEqual(len(self.sent), 1)
-        recipient, sender, message = self.sent[0]
-        assert self.owner is not None
-        self.assertEqual((recipient, sender), (f"session:{self.owner.current_session}", "images"))
-        self.assertTrue(message.startswith("From the user (via the Images page): delete this image."))
-        self.assertIn(f"images.py delete --id {record['id']}", message)
-        self.assertEqual(self.delete_request(record["id"])["state"], "sent")
-        self.assertIsInstance(images.submit(self.root, body), images.DeleteAlreadyRequested)
-        self.assertIn("Delete requested.", images.render(self.root).decode())
+        images.submit(self.root, body)
+        self.assertFalse((self.root / images.FOLDER / record["id"]).exists())
+        self.assertEqual(images.records(self.root), [kept])
+        self.assertEqual(self.sent, [])
+        with self.assertRaisesRegex(change_page.AnswerRefused, f"no image {record['id']}"):
+            images.submit(self.root, body)
 
-    def test_delete_request_refuses_a_wrong_token_or_unknown_image(self) -> None:
+    def test_delete_refuses_a_wrong_token_or_unknown_image(self) -> None:
         record = self.register()
         token = images.console_token(self.root)
         for body in (urlencode({"image": record["id"], "token": "wrong"}),
@@ -161,38 +163,17 @@ class ImagesTests(ImagesFixture):
                      urlencode({"image": record["id"]}),
                      urlencode({"image": "../x", "token": "t"})):
             with self.subTest(body=body), self.assertRaises(change_page.AnswerRefused):
-                _ = images.submit(self.root, body)
-        self.assertNotIn("delete_request", images.read_record(self.root / images.FOLDER / record["id"]))
+                images.submit(self.root, body)
+        self.assertEqual(images.records(self.root), [record])
 
-    def test_failed_delivery_retries_then_records_the_error_and_allows_a_new_request(self) -> None:
-        record = self.register()
-        body = urlencode({"image": record["id"],
-                          "token": images.request_token(images.console_token(self.root), record["id"])})
-
-        def refuse(recipient: str, sender: str, message: str) -> None:
-            self.capture(recipient, sender, message)
-            raise RuntimeError("socket unavailable")
-
-        pending = images.submit(self.root, body)
-        assert not isinstance(pending, images.DeleteAlreadyRequested)
-        with patch.object(change_page, "send_message", side_effect=refuse), redirect_stderr(StringIO()):
-            images.deliver(self.root, pending)
-        self.assertEqual(len(self.sent), 3)
-        request = self.delete_request(record["id"])
-        self.assertEqual((request["state"], request["error"]), ("failed", "socket unavailable"))
-        self.assertIn("Not sent: socket unavailable", images.render(self.root).decode())
-        self.assertNotIsInstance(images.submit(self.root, body), images.DeleteAlreadyRequested)
-
-    def test_recovery_sends_a_pending_request_and_skips_a_deleted_image(self) -> None:
+    def test_an_old_record_with_a_delete_request_reads_and_shows_delete(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
-        record["delete_request"] = {"state": "pending", "requested_at": record["registered_at"], "error": ""}
-        images.write_record(folder, record)
-        images.recover_pending(self.root)
-        self.assertEqual(len(self.sent), 1)
-        images.delete(self.root, record["id"])
-        images.deliver(self.root, record)
-        self.assertFalse(folder.exists())
+        stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
+        stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
+        _ = (folder / images.RECORD).write_text(json.dumps(stored))
+        self.assertEqual(images.read_record(folder), record)
+        self.assertIn('<button type="submit">Delete</button>', images.render(self.root).decode())
 
 
 class ImagesServerTests(ImagesFixture):
@@ -202,15 +183,6 @@ class ImagesServerTests(ImagesFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
-        deliver = images.deliver
-
-        def finish(root: Path, record: images.ImageRecord) -> None:
-            try:
-                deliver(root, record)
-            finally:
-                self.delivered.set()
-
-        _ = self.enterContext(patch.object(images, "deliver", side_effect=finish))
         with patch.object(change_page, "recover_pending"):
             server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
         self.port = server.server_port
@@ -242,16 +214,18 @@ class ImagesServerTests(ImagesFixture):
         status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{images.RECORD}")
         self.assertEqual(status, 404)
 
-    def test_server_accepts_a_delete_request_and_refuses_a_bad_token(self) -> None:
+    def test_server_deletes_the_image_and_refuses_a_bad_token(self) -> None:
         record = self.register()
         status, _, body = self.http("POST", images.PAGE_PATH, urlencode({"image": record["id"], "token": "wrong"}))
         self.assertEqual(status, 400)
         self.assertEqual(cast(dict[str, str], json.loads(body)), {"reason": "the image token does not match this page"})
         token = images.request_token(images.console_token(self.root), record["id"])
         status, _, body = self.http("POST", images.PAGE_PATH, urlencode({"image": record["id"], "token": token}))
-        self.assertEqual((status, cast(dict[str, str], json.loads(body))), (200, {"state": "requested"}))
-        self.assertTrue(self.delivered.wait(TEST_HANG_GUARD_SECS), "delete delivery did not finish")
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual((status, cast(dict[str, str], json.loads(body))), (200, {"state": "deleted"}))
+        self.assertEqual(images.records(self.root), [])
+        self.assertEqual(self.sent, [])
+        status, _, _ = self.http("GET", images.image_path(record))
+        self.assertEqual(status, 404)
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()
