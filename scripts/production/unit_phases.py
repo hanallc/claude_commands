@@ -215,19 +215,38 @@ def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
     return display_cells.NONE
 
 
-def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], done_phase_ids: set[str], *,
-                     now: float, zone: ZoneInfo) -> str:
-    """Name promises for unfinished targets that have no open row."""
-    targets: dict[str, datetime] = {}
+def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], land: land_queue.LandView, *,
+                     unit: str, now: float, zone: ZoneInfo, completed_phase_ids: tuple[str, ...] = ()) -> str:
+    """Name promises with no later finish, sent work, or open row."""
+    targets: dict[str, tuple[datetime, float]] = {}
+    instances: dict[str, str] = {}
     for event in events:
-        if event.get("event_type") != "eta_stated":
+        kind = event.get("event_type")
+        instance = str(event.get("phase_instance_id", ""))
+        phase_id = str(event.get("phase_id") or instances.get(instance, ""))
+        if kind == "phase_started":
+            instances[instance] = phase_id
+        elif kind in ("phase_finished", "checkpoint"):
+            _ = targets.pop(phase_id, None)
+        elif kind == "eta_stated":
+            target = str(event.get("eta_phase_id", phase_id))
+            at, stated = event.get("eta_at"), event.get("timestamp_epoch")
+            if (target and target not in open_phase_ids and target not in completed_phase_ids
+                    and isinstance(at, int | float)):
+                targets[target] = (datetime.fromtimestamp(at, UTC), float(stated) if isinstance(stated, int | float) else 0.0)
+    results: dict[str, float] = {}
+    for result in land.results.values():
+        if result["unit"] != unit:
             continue
-        phase_id = str(event.get("eta_phase_id", event.get("phase_id", "")))
-        at = event.get("eta_at")
-        if phase_id and phase_id not in open_phase_ids and phase_id not in done_phase_ids and isinstance(at, int | float):
-            targets[phase_id] = datetime.fromtimestamp(at, UTC)
+        try:
+            at = datetime.fromisoformat(result["time"]).timestamp()
+        except ValueError:
+            continue
+        results[result["phase"]] = max(results.get(result["phase"], at), at)
     parts: list[str] = []
-    for phase_id, promise in targets.items():
+    for phase_id, (promise, stated) in targets.items():
+        if results.get(phase_id, stated) > stated:
+            continue
         text = f"phase {phase_id}: {short_time(promise, now=now, zone=zone)}"
         if now > promise.timestamp():
             text += " · late " + elapsed_text(now - promise.timestamp())
@@ -362,24 +381,20 @@ def phase_note_label(phase_id: str, title: str) -> str:
     return f"phase {phase_id} — {title}"
 
 
-def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
+def notes_cell(record: object, *, queue_note: str = "queue empty", read_run: RunEventsReader = read_work_events) -> str:
     """Show the current phase, task, and repair rounds."""
     fields = record_fields(record)
-    if not fields:
-        return display_cells.NONE
-    unavailable = fields.get("unavailable")
-    if isinstance(unavailable, str):
-        return "no plan"
     current = fields.get("current")
     phases = plan_phase_rows(fields)
-    if (not isinstance(current, dict)
+    if (isinstance(fields.get("unavailable"), str) or not isinstance(current, dict)
             or current.get("phase") not in {row.get("phase") for row in phases}):
-        done = sum(row.get("status") == "done" for row in phases)
-        if not phases:
-            return "no phases"
-        if done == len(phases):
-            return "plan done"
-        return "between phases" if done else "not started"
+        if not phases or isinstance(fields.get("unavailable"), str):
+            plan_note = "no plan"
+        elif next_phase := next((row for row in phases if row.get("status") != "done"), None):
+            plan_note = f"next plan phase {next_phase.get('phase', '')} not started"
+        else:
+            plan_note = "plan done"
+        return f"nothing open: {plan_note}, {queue_note}"
     phase = current
     task = task_cell(fields, read_run=read_run)
     if task == display_cells.NONE:
@@ -657,7 +672,7 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_re
             text = (f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text
                     ) if isinstance(step, display_cells.OpenStep) else display_cells.NONE
             work.append(single_spaced(f"{identifier}: {text}"))
-    return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
+    return " · ".join(work) or display_cells.NONE
 
 
 def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
@@ -692,25 +707,42 @@ def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
     return f"{item.text} — after {item.after}: {wait_text(found, land, now=now, zone=zone)}"
 
 
-def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE,
-                open_phase_ids: tuple[str, ...] = (),
-                describe: Callable[[unit_queue.QueuedItem], str] = unit_queue.shown) -> str:
-    """Show queued work, excluding queue items equal to Notes; describe says the first item and its wait."""
+class UnitWorkQueue(NamedTuple):
+    """The work items that a unit has not started."""
+
+    items: tuple[unit_queue.QueuedItem, ...]
+
+
+class UnreadableWorkQueue(NamedTuple):
+    """The unit's work queue could not be read."""
+
+
+def read_work_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
+    """Read the unit's work queue and report a read failure."""
     try:
-        items = unit_queue.read_items(staff_id)
+        return UnitWorkQueue(tuple(unit_queue.read_items(staff_id)))
     except (OSError, ValueError) as error:
         print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
+        return UnreadableWorkQueue()
+
+
+def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE,
+                open_phase_ids: tuple[str, ...] = (),
+                describe: Callable[[unit_queue.QueuedItem], str] = unit_queue.shown,
+                read_queue: Callable[[staff.StaffId], UnitWorkQueue | UnreadableWorkQueue] = read_work_queue) -> str:
+    """Show every work item and pending plan phase, excluding items equal to Notes."""
+    work_queue = read_queue(staff_id)
+    if isinstance(work_queue, UnreadableWorkQueue):
         queue = "queue unreadable"
     else:
-        items = [item for item in items if item.text != notes]
-        queue = (single_spaced(describe(items[0])) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
+        queue = " · ".join(single_spaced(describe(item)) for item in work_queue.items if item.text != notes)
     rows = [row for row in plan_phase_rows(record_fields(record))
             if row.get("status") not in ("done", "running", "open") and row.get("phase") not in open_phase_ids]
     plan = ""
     if rows:
         title = single_spaced(rows[0].get("title", ""))
         plan = (f"plan: phase {rows[0].get('phase')}: {title}"
-                + (f" +{len(rows) - 1} more" if len(rows) > 1 else ""))
+                + (", then " + ", ".join(row.get("phase", "") for row in rows[1:]) if len(rows) > 1 else ""))
     return " · ".join(part for part in (queue, plan) if part) or display_cells.NONE
 
 
@@ -759,6 +791,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
+    queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
+    wait_states: dict[str, waits_on.WaitState] = {}
+
+    def read_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
+        if staff_id not in queues:
+            queues[staff_id] = read_work_queue(staff_id)
+        return queues[staff_id]
 
     def read_plan(path: Path) -> list[plan_history.PlanPhase]:
         if path not in plans:
@@ -773,10 +812,32 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             events[path] = plan_history.read_run_events(path)
         return events[path]
 
+    def wait_state(after: str) -> waits_on.WaitState:
+        if after not in wait_states:
+            wait_states[after] = waits_on.state(after, repo=REPOSITORY, snapshot=snapshot, read_run=read_run)
+        return wait_states[after]
+
     def describe(item: unit_queue.QueuedItem) -> str:
-        found = waits_on.state(item.after, repo=REPOSITORY, snapshot=snapshot, read_run=read_run) if item.after else None
+        found = wait_state(item.after) if item.after else None
         return queued_text(item, found, land, now=now, zone=zone)
 
+    unit_names = {unit.unit for unit in units}
+    merge_owners = {owner for owner in land.running.values() if owner.partition(" ")[0] in unit_names}
+    if not isinstance(land.line, land_queue.NoLine):
+        merge_owners.update(place.owner for place in land.line.values() if place.owner.partition(" ")[0] in unit_names)
+    today = datetime.fromtimestamp(now, zone).date()
+    merged: set[tuple[str, str]] = set()
+    for result in land.results.values():
+        if not result["landed"] or result["unit"] not in unit_names:
+            continue
+        try:
+            merged_date = datetime.fromisoformat(result["time"]).astimezone(zone).date()
+        except ValueError:
+            continue
+        if merged_date == today:
+            merged.add((result["unit"], result["phase"]))
+    in_work = 0
+    waiting = 0
     unit_snapshot = staff.StaffSnapshot(tuple(
         current for unit in units if isinstance(unit.member, staff.StaffRow)
         if (current := snapshot.by_id(unit.member.id)) is not None))
@@ -800,7 +861,19 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         workers = unit_reason
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         run_events: list[dict[str, object]] = []
+        queue_note = "queue empty"
         if isinstance(member, staff.StaffRow):
+            work_queue = read_queue(member.id)
+            if isinstance(work_queue, UnreadableWorkQueue):
+                queue_note = "queue unreadable"
+            else:
+                waiting += sum(bool(item.after) and not isinstance(wait_state(item.after), waits_on.OnMain)
+                               for item in work_queue.items)
+                if work_queue.items:
+                    first_item = work_queue.items[0]
+                    queue_note = (f"queued work waits on {first_item.after}"
+                                  if first_item.after and not isinstance(wait_state(first_item.after), waits_on.OnMain)
+                                  else "queued work not started")
             if run is not None:
                 run_events = read_run(run.path)
             opened = runs.get(member.id, NoOpenUnitRun())
@@ -838,7 +911,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             else:
                 done_ids.discard(phase_id)
         if run_events and not run_is_finished(run_events):
-            pending_eta = pending_eta_cell(run_events, open_ids, done_ids, now=now, zone=zone)
+            pending_eta = pending_eta_cell(run_events, open_ids, land, unit=unit.unit, now=now, zone=zone,
+                                           completed_phase_ids=tuple(done_ids))
             if pending_eta != display_cells.NONE:
                 plan_eta = " · ".join(cell for cell in (plan_eta, pending_eta) if cell != display_cells.NONE)
                 show_plan_eta = True
@@ -850,7 +924,13 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 first = phase_index == 0
                 notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land,
                                          unit=member.name)
-                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids, describe=describe)
+                instance = [event for event in run_events if event.get("phase_instance_id") == phase.instance_id]
+                if checkpoint_wait(instance, land, now=now, zone=zone, unit=member.name) is None:
+                    in_work += 1
+                else:
+                    merge_owners.add(f"{unit.unit} {phase.phase}")
+                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids,
+                                      describe=describe, read_queue=read_queue)
                           if first else display_cells.NONE)
                 if first:
                     notes = with_waits(notes, (*sent, *waits))
@@ -864,8 +944,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                   workers_cell(phase_workers, now=now, reason=unit_reason if first else display_cells.NONE),
                                   notes, display_cells.NONE, queued))
         else:
-            notes = notes_cell(notes_record, read_run=read_run)
-            queued = (queued_cell(member.id, queued_record, notes=notes, describe=describe)
+            in_work += sum(phase.get("status") in ("running", "open")
+                           for phase in plan_phase_rows(record_fields(notes_record)))
+            notes = notes_cell(notes_record, queue_note=queue_note, read_run=read_run)
+            queued = (queued_cell(member.id, queued_record, notes=notes, describe=describe, read_queue=read_queue)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
             notes = with_waits(notes, (*sent, *waits))
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
@@ -891,7 +973,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
                       "| " + " | ".join(("---",) * len(headers)) + " |"))
         lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
-    return "\n".join(lines)
+    summary = (f"in work {in_work} · waiting to merge {len(merge_owners)}"
+               f" · waiting on other work {waiting} · merged today {len(merged)}")
+    return summary + "\n\n" + "\n".join(lines)
 
 
 def production_records(doc: Path) -> dict[str, object]:
