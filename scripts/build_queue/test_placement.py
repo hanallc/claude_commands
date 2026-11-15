@@ -700,8 +700,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                         if coordinator.poll() is None:
                             _ = coordinator.communicate("", timeout=TEST_HANG_GUARD_SECS)
 
-    def test_reader_assigns_supported_profile_steps_and_keeps_unknown_steps_waiting(self) -> None:
-        for step in ("nextest", "clippy", "mend-check", "check", "doc", "build", "unknown"):
+    def test_reader_assigns_supported_profile_steps_and_refuses_unknown_steps_for_good(self) -> None:
+        for step in ("nextest", "clippy", "mend-check", "mend", "check", "doc", "build", "unknown"):
             with self.subTest(step=step), PlacementFixture() as fixture:
                 repository = fixture.root / "hana"
                 (repository / ".git").mkdir(parents=True)
@@ -727,9 +727,11 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     evidence = fixture.read_host_evidence(key)
                 fixture.server.publish_host_evidence(evidence)
                 if step == "unknown":
-                    self.assertIsInstance(evidence, placement.HostEvidenceUnavailable)
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.FixedExclusion("command"))
                     reply, = fixture.server.handle_request(request)
-                    self.assertIsInstance(reply, wire.PlacementWait)
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertEqual(reply.retry, placement.DoNotRetry("command"))
                 else:
                     self.assertEqual(assignment_for(fixture, request).destination, destination)
 
