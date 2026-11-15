@@ -1034,6 +1034,18 @@ def process_uid(pid: int, proc: Path) -> int | OwnerProcessGone:
     return OwnerProcessGone()
 
 
+
+def episode_constraints(first: placement.PlacementConstraints,
+                        later: placement.PlacementConstraints) -> placement.PlacementConstraints:
+    """Keep the constraints of an episode's first request, so a later land or a busy target cannot change them.
+
+    A request from an older client has no command kind. A newer client of the same episode adds it.
+    """
+    if isinstance(first.command_kind, placement.CommandKindNotSent):
+        return replace(first, command_kind=later.command_kind)
+    return first
+
+
 class AdmissionServer:
     def __init__(self, state_dir: Path, clock: Clock, readings: Readings, proc: Proc, *,
                  fault: Callable[[str], None] = _no_fault, socket_path: Path | None = None,
@@ -3063,9 +3075,11 @@ done
             if request.owner in self.pending_coordinators:
                 del self.pending_coordinators[request.owner]
             previous = self.placement_requests.get(request.episode)
-            if previous is not None and (previous.constraints != request.constraints or previous.owner != request.owner
-                    or previous.since != request.since or previous.run != request.run or previous.purpose != request.purpose):
-                return [wire.Refused("placement constraints changed within an episode")]
+            if previous is not None and (previous.owner != request.owner or previous.since != request.since
+                    or previous.run != request.run or previous.purpose != request.purpose):
+                return [wire.Refused("placement episode changed its owner, start, run or purpose")]
+            if previous is not None:
+                request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite
