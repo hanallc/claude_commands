@@ -4118,3 +4118,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Cause: the fixture queue waited 5 s of start spacing between starts, and `cleanup_program_starts` waited a 5 s stop grace on a TERM-resistant program.
 - AWS pair (3 rounds): CPU 15.65 -> 15.21 s, wall 127.7 -> 24.8 s; all pass, same tests.
 - Commit ce8c5dc7c. Test-only change.
+
+### Phase 284 — The branch page reads the history of main in one git call  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 11-15).
+
+#### As-built
+
+- `main_history` in `scripts/review_links/branch_page.py` reads `git log --format=%H %cI %P main` once. `list_branches` takes the merged check, the commit date, the merge commit and the merge date from it.
+- The walk starts at the oldest mainline commit, so each commit gets the oldest mainline commit that holds it. `is_ancestor` and `mainline_merge` are gone.
+- Live ~/.claude repo: 104 heads, 42 merged; old and new rows agree; 0.11 s against 0.93 s.
+- AWS pair (3 rounds): `review_links/test_branch_page` 16.67 -> 9.29 CPU s, wall 16.9 -> 9.7 s; all pass, same tests.
+- Commit b4b5396bb. Production change (sdlc go 11-15).
