@@ -18,7 +18,7 @@ from urllib.parse import parse_qs
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
-from scripts.review_links import change_browser, change_page, review_link
+from scripts.review_links import change_browser, change_page, console, review_link
 
 FOLDER = "images"
 PAGE_NAME = "images.html"
@@ -377,8 +377,10 @@ async function refresh() {
     scrollTo({top, behavior: 'instant'});
   } catch (_) {}
 }
-const start = new URLSearchParams(location.hash.slice(1)).get('show');
-if (start in spans) menu.value = start;
+const start = new URLSearchParams(location.hash.slice(1));
+if (start.get('show') in spans) menu.value = start.get('show');
+// An image link (#image=<id>) opens the page at that image, with a longer period when the image is older.
+const target = document.getElementById('image-' + start.get('image'));
 menu.addEventListener('change', apply);
 addEventListener('message', event => {
   if (event.source === parent && event.origin === location.origin && event.data === 'console-shown') refresh();
@@ -386,6 +388,13 @@ addEventListener('message', event => {
 document.addEventListener('visibilitychange', refresh);
 bind(list);
 apply();
+if (target) {
+  if (target.hidden) {
+    menu.value = 'all';
+    apply();
+  }
+  target.scrollIntoView({block: 'start'});
+}
 })();"""
 
 
@@ -409,7 +418,8 @@ def main(arguments: list[str]) -> int:
                               f"Change {change}" if change is not None else f"Phase {phase}")
             origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
             print(f"registered {record['id']}: {origin}{image_path(record)}")
-            print(f"Images page: {origin}/{change_page.CONSOLE_FOLDER}/?page=images")
+            place = console.place_query("images", f"{PAGE_PATH}#image={record['id']}")
+            print(f"Image link: {origin}/{change_page.CONSOLE_FOLDER}/{place}")
         else:
             delete(review_link.review_root().resolve(), cast(str, args.id))
             print(f"deleted {cast(str, args.id)}")

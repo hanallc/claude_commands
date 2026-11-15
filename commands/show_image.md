@@ -6,7 +6,7 @@ argument-hint: "<image path> <caption>"
 # Show image
 
 Use this when the user must look at an image: before and after shots of a page change, a screen defect, or a chart.
-Register the image on the console Images page and give the user that page's link.
+Register the image on the console Images page and give the user the image's own link.
 A file path alone is not something the user can view.
 
 ## Steps
@@ -21,8 +21,9 @@ A file path alone is not something the user can view.
    - Use `--change` for a change review row, such as `sdlc/C12`. Use `--phase` for phase work.
    - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
    - It copies the image, so you can delete the source file after it prints `registered`.
-4. Give the user the `Images page:` link that the command prints.
-   In a notice to a showrunner, give the same link and the image ids.
+4. Give the user the `Image link:` that the command prints for each image.
+   It opens the Images page at that image.
+   In a notice to a showrunner, give the same links and the image ids.
 
 The page shows the oldest image first, and a new image goes to the end.
 The user removes an image with its **Delete** button.

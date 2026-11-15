@@ -8,12 +8,14 @@ import importlib
 from pathlib import Path
 import re
 from typing import cast
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 
 from scripts.lib import conf
 from scripts.review_links import review_link
 
 PAGE_NAME = "console.html"
+# The console script's placeKey uses the same prefix for the place it keeps for each page.
+PLACE_PREFIX = "at."
 ICONS = Path(__file__).with_name("lucide")
 ICON_NAMES = frozenset(("list-checks", "hammer", "cloud", "image", "message-circle-question", "panel-left-close",
                         "panel-left-open", "menu", "refresh-cw", "x"))
@@ -55,6 +57,11 @@ def read_pages() -> tuple[ConsolePage, ...]:
     if not pages:
         raise ValueError("console.conf has no page entries")
     return tuple(pages)
+
+
+def place_query(identity: str, place: str) -> str:
+    """Return the console query that opens a page at a place in it, such as one image."""
+    return "?" + urlencode({"page": identity, PLACE_PREFIX + identity: place})
 
 
 def read_rebuilds() -> AvailablePage | UnavailablePage:

@@ -99,7 +99,8 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(record["subject"], "Change sdlc/C9")
         self.assertEqual(output.getvalue().splitlines(), [
             f"registered {record['id']}: http://127.0.0.1:8765/images/{record['id']}/image.png",
-            "Images page: http://127.0.0.1:8765/console/?page=images"])
+            "Image link: http://127.0.0.1:8765/console/?page=images&at.images="
+            + f"%2Fconsole%2Fimages.html%23image%3D{record['id']}"])
         errors = StringIO()
         with redirect_stderr(errors):
             self.assertEqual(images.main(["delete", "--id", "000000000000"]), 1)
@@ -118,6 +119,8 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
         self.assertIn("last.owner === card.dataset.owner", source)
         self.assertIn("link.href = '#' + row.card.id;", source)
+        self.assertIn("document.getElementById('image-' + start.get('image'))", source)
+        self.assertIn("if (target.hidden) {", source)
         self.assertIn("Newer shot", source)
         self.assertIn("shot-owner (unit)", source)
         self.assertIn("Phase console-images", source)

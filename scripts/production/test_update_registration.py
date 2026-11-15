@@ -188,7 +188,7 @@ class QuestionIdentityTests(RegistrationFixture):
 
     def file_question(self, title: str = "Choose the layout", question: str = "Keep the layout?") -> None:
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
-            result = self.run_command("ask", "--text", title, "--question", question,
+            result = self.run_command("ask", "--text", title, "--ask", question,
                                       "--unit", "alpha")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = self.question_rows()
@@ -463,7 +463,7 @@ class QuestionIdentityTests(RegistrationFixture):
             self.assertIn("questions: unavailable", errors.getvalue())
             self.assertEqual(registration.read_open_items(self.outstanding()), [])
             self.assertIn(self.doc, footer_counts.sources(self.doc))
-        refused = self.run_command("ask", "--text", "Choose the compiler", "--question", "Use it?")
+        refused = self.run_command("ask", "--text", "Choose the compiler", "--ask", "Use it?")
         self.assertEqual(refused.returncode, 2)
         self.assertIn("no showrunner staff row", refused.stdout + refused.stderr)
 
@@ -544,7 +544,7 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn("Keep the layout?", first.stdout)
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Ship the release?")):
-            filed = self.run_command("ask", "--text", "Choose the release", "--question", "Ship the release?",
+            filed = self.run_command("ask", "--text", "Choose the release", "--ask", "Ship the release?",
                                      "--unit", "alpha", "--urgency", "user")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         repeated = self.run_command("next")
@@ -610,14 +610,14 @@ class QuestionIdentityTests(RegistrationFixture):
     def test_question_review_and_defer_keep_the_fixed_asker(self) -> None:
         held = review.QuestionAwaitingFacts("Keep the layout?", ("Which layout?",))
         with mock.patch.object(review, "review_question", return_value=held):
-            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+            result = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep the layout?",
                                       "--unit", "alpha")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("Which layout?", result.stdout + result.stderr)
         self.assertEqual(list(self.issues.glob("*.md")), [])
         with mock.patch.object(review, "review_question",
                                return_value=review.QuestionReviewUnavailable("Keep the layout?", "fixture timeout")):
-            filed = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep the layout?",
+            filed = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep the layout?",
                                      "--unit", "alpha")
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         state = self.question_state([{"text": "Choose the layout", "after": "2099-01-02T08:00"}])

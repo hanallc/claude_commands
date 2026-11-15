@@ -11,8 +11,10 @@ Use this command for a unit's question or your own question. Do not file questio
    - `--ask`: the question in one line. The lists use it as the title unless you pass `--text`.
    - `--context`: why it is asked now and what waits on it, in one or two sentences.
    - `--item`: one entry for each thing to look at, such as a before and after or a link. Repeat it.
+     For an image, give the image's own link that `/show_image` prints, not the Images page link.
    - `--recommend`: the recommended choice and why.
    - `--choice`: one answer the user can pick, such as `go for both`. Repeat it. Each choice is a button that fills the Answer box.
+   - A question with choices needs at least two `--choice` and one `--recommend`. An open question has no `--choice`.
 2. Resolve the asker through the staff record.
 3. Run the command below.
 4. Tell the asking unit that you filed its question.
@@ -22,7 +24,7 @@ Use this command for a unit's question or your own question. Do not file questio
 ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --production <showrunner name> [--unit <unit staff id>] --ask "<question in one line>" --context "<why now>" --item "<entry>" [--item "<entry>" ...] --recommend "<choice and why>" --choice "<answer>" [--choice "<answer>" ...] [--urgency blocks]
 ```
 
-`--question "<full question>"` with `--text "<title>"` still files a question as one text. The page shows its lines, and lines that start with `- ` or `1. ` show as lists.
+`--ask` is the only form for a new question. A question stored as one text before this form still shows on the page.
 
 Omit `--unit` for your own question. A current unit label is also accepted. The stored `asked_by` always holds the fixed staff id.
 

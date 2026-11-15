@@ -37,7 +37,7 @@ class RegistrationTests(RegistrationFixture):
         ]))
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
             for title, asker in (("Choose the layout", str(unit_id)), ("Choose the colors", "")):
-                filed = self.run_command("ask", "--text", title, "--question", "Keep this layout?",
+                filed = self.run_command("ask", "--text", title, "--ask", "Keep this layout?",
                                          "--unit", asker)
                 self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         questions = list((self.root / "issues").glob("question-*.md"))
@@ -116,7 +116,7 @@ class RegistrationTests(RegistrationFixture):
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-            filed = self.run_command("ask", "--text", "Choose the shared layout", "--question", "Keep this layout?",
+            filed = self.run_command("ask", "--text", "Choose the shared layout", "--ask", "Keep this layout?",
                                      "--unit", str(asker_id))
         self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
         records = list((owner / "questions").glob("question-*.md"))
@@ -148,7 +148,7 @@ class RegistrationTests(RegistrationFixture):
         self.checkout = document.parents[2]
         self.doc = document
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-            result = self.run_command("ask", "--text", "Choose the layout", "--question", "Keep this layout?",
+            result = self.run_command("ask", "--text", "Choose the layout", "--ask", "Keep this layout?",
                                       "--unit", str(asker_id))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         question, = (self.root / "issues").glob("question-*.md")
@@ -199,7 +199,7 @@ class RegistrationTests(RegistrationFixture):
                 self.checkout: Path = checkout
                 self.doc: Path = relative
                 with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
-                    arguments = ["ask", "--text", title, "--question", "Keep this layout?", "--unit", str(asker_id)]
+                    arguments = ["ask", "--text", title, "--ask", "Keep this layout?", "--unit", str(asker_id)]
                     if select_production:
                         filed = self.run_command(*arguments)
                     else:
@@ -238,9 +238,17 @@ class RegistrationTests(RegistrationFixture):
         listed = self.run_command("questions", "--state", str(state))
         self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
         self.assertEqual(cast(list[dict[str, object]], cast(object, self.open_rows()))[0]["parts"], row["parts"])
-        mixed = self.run_command("ask", "--text", "Other", "--question", "Keep it?", "--choice", "yes")
-        self.assertEqual(mixed.returncode, 2, mixed.stdout + mixed.stderr)
-        self.assertIn("go with --ask", mixed.stdout)
+        for refused, reason in (
+                (("--choice", "yes", "--recommend", "yes"), "at least two --choice and one --recommend"),
+                (("--choice", "yes", "--choice", "no"), "at least two --choice and one --recommend")):
+            with self.subTest(refused=refused):
+                result = self.run_command("ask", "--text", "Other", "--ask", "Keep it?", *refused)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(reason, result.stdout)
+        old_form = self.run_command("ask", "--text", "Other", "--question", "Keep it?")
+        self.assertEqual(old_form.returncode, 2, old_form.stdout + old_form.stderr)
+        self.assertIn("--ask", old_form.stderr)
+        self.assertEqual(len(self.open_rows()), 1)
 
     def test_question_without_a_proposals_line_can_be_filed_listed_and_answered(self) -> None:
         _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
@@ -305,7 +313,7 @@ class RegistrationTests(RegistrationFixture):
                 path = self.outstanding()
                 history = path.with_suffix(".history.jsonl")
                 before = path.read_bytes()
-                command = (("ask", "--text", "new question?", "--question", "Try the new layout?", "--unit", "alpha")
+                command = (("ask", "--text", "new question?", "--ask", "Try the new layout?", "--unit", "alpha")
                            if action == "ask" else ("mark-important", "--item", "Reminder")
                            if action == "mark-important" else
                            ("questions", "--state", str(self.question_state(["Reminder", "New reminder"]))))

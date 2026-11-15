@@ -1270,17 +1270,19 @@ def mark_important(production: Production, words: str) -> None:
 SHOWRUNNER_ASKER = "showrunner"
 
 
-def ask(production: Production, text: str, question: str | QuestionParts, unit: str, rank: Ranking, *,
+def ask(production: Production, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None) -> None:
-    """Review and file a question with its asker's fixed staff id; parts keep their layout on the Questions page."""
-    parts = question if not isinstance(question, str) else None
-    question = question_text(question) if not isinstance(question, str) else question
+    """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
     asker = identities.asker(production, unit)
     if not text.strip() or "\n" in text:
         raise RegistrationFailure("ask", "--text must be one nonempty line")
-    if not question.strip():
-        raise RegistrationFailure("ask", "--question must hold the full question")
+    if not parts["ask"].strip() or "\n" in parts["ask"]:
+        raise RegistrationFailure("ask", "--ask must be one nonempty line")
+    # A question with choices names at least two and the one to take; an open question has none.
+    if parts["choices"] and (len(parts["choices"]) < 2 or not parts["recommend"].strip()):
+        raise RegistrationFailure("ask", "a question with choices needs at least two --choice and one --recommend")
+    question = question_text(parts)
     problem = plumbing(text)
     if problem is not None:
         raise RegistrationFailure("ask", f"{text}: {problem}")
@@ -1293,9 +1295,7 @@ def ask(production: Production, text: str, question: str | QuestionParts, unit: 
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
     entry = OutstandingItem(since=now.strftime("%Y-%m-%dT%H:%M"), text=text, question=question,
-                            asked_by=asker.id)
-    if parts is not None:
-        entry["parts"] = parts
+                            asked_by=asker.id, parts=parts)
     if isinstance(accepted, ReviewedQuestion):
         entry["reviewed"] = accepted.reviewed
     else:
@@ -1631,15 +1631,15 @@ def main() -> int:
         elif action == "ask":
             _ = subcommand.add_argument("--text", default="",
                                         help="the one-line item the count and lists name; the default is --ask")
-            asked = subcommand.add_mutually_exclusive_group(required=True)
-            _ = asked.add_argument("--ask", help="the question in one line; the parts below give the page its layout")
-            _ = asked.add_argument("--question", help="the full question in one text, for older callers")
+            _ = subcommand.add_argument("--ask", required=True,
+                                        help="the question in one line; the parts below give the page its layout")
             _ = subcommand.add_argument("--context", default="", help="why it is asked now and what waits on it, short")
             _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
                                         help="one entry to look at, such as a before and after or a link; repeat it")
-            _ = subcommand.add_argument("--recommend", default="", help="the recommended choice and why")
+            _ = subcommand.add_argument("--recommend", default="",
+                                        help="the recommended choice and why; required with --choice")
             _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],
-                                        help="one answer the user can pick; repeat it")
+                                        help="one answer the user can pick; give two or more")
             _ = subcommand.add_argument("--unit", default="", help="the asking unit's staff id; without --production, select its parent")
             _ = subcommand.add_argument("--urgency", default="", help="user, blocks, soon (with --due), normal or later")
             _ = subcommand.add_argument("--due", default="")
@@ -1690,15 +1690,11 @@ def main() -> int:
                 level = urgency.read(cast(str, args.urgency), cast(str, args.due))
             except urgency.UrgencyError:
                 raise RegistrationFailure("ask", "--urgency is user, blocks, soon with --due, normal or later") from None
-            asked = cast(str | None, args.ask)
-            context, items = cast(str, args.context), cast(list[str], args.items)
-            recommend, choices = cast(str, args.recommend), cast(list[str], args.choices)
-            if asked is None and (context or items or recommend or choices):
-                raise RegistrationFailure("ask", "--context, --item, --recommend and --choice go with --ask")
-            parts = (QuestionParts(ask=asked, context=context, items=items, recommend=recommend, choices=choices)
-                     if asked is not None else None)
-            ask(production, cast(str, args.text) or (asked or ""), parts if parts is not None else cast(str, args.question),
-                cast(str, args.unit), Ranking(level), identities=identities)
+            asked = cast(str, args.ask)
+            parts = QuestionParts(ask=asked, context=cast(str, args.context), items=cast(list[str], args.items),
+                                  recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
+            ask(production, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
+                identities=identities)
         elif action == "questions-table":
             questions_table(production, identities=identities)
         elif action == "migrate-questions":
