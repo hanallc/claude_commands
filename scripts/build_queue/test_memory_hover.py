@@ -563,10 +563,10 @@ function fitLabels() {}
 
     def test_a_mac_only_wait_hover_names_what_holds_the_mac_below_can_run_on(self) -> None:
         waiter = {"name":"tile nextest", "unit":"", "showrunner":"", "need":1, "since":200_000 - 240,
-                  "reason":"start spacing", "runs_on":"Mac only", "mac_state":"blocked by research until released"}
+                  "reason":"start spacing", "runs_on":"Mac only", "mac_state":"build hold by research (hana) until released — Mac CI restore"}
         hover = cast(list[str], self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[waiter]}))
         lines = hover[1].split("\n")
-        self.assertEqual(lines[lines.index("can run on: Mac only") + 1], "Mac: blocked by research until released")
+        self.assertEqual(lines[lines.index("can run on: Mac only") + 1], "Mac: build hold by research (hana) until released — Mac CI restore")
         del waiter["mac_state"]
         hover = cast(list[str], self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[waiter]}))
         self.assertNotIn("Mac:", hover[1])

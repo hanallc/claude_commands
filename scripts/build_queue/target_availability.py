@@ -193,6 +193,10 @@ class MacRoutes:
             return "busy with " + "; ".join(job.what for job in jobs) if jobs else ""
         if isinstance(state, targets.StateUnreadable):
             return "state unreadable, " + state.reason
+        if isinstance(state, targets.Held):
+            # The user, 2026-11-15: a block is a build hold that a unit put on the Mac, so say so.
+            text = f"build hold by {self.owner(state)} {targets.end_text(state.end, self.zone)}"
+            return text + (f" — {state.reason}" if state.reason else "")
         fit = self.state_fit(state)
         return fit.note if isinstance(fit, Allowed) and not isinstance(state, targets.Free) else ""
 
@@ -208,13 +212,15 @@ class MacRoutes:
         return tuple(targets.running_job(claim) for claim in mac.claims
                      if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
 
+    def owner(self, state: targets.Held) -> str:
+        """The unit that holds a target, else its session, with the showrunner when known."""
+        identity = holder_labels(state, self.labels)
+        owner = identity.unit if identity.unit != "—" else identity.session
+        return owner + (f" ({identity.showrunner})" if identity.showrunner != "—" else "")
+
     def state_fit(self, state: targets.TargetState) -> TargetFit:
         if isinstance(state, targets.Held):
-            identity = holder_labels(state, self.labels)
-            owner = identity.unit if identity.unit != "—" else identity.session
-            if identity.showrunner != "—":
-                owner += f" ({identity.showrunner})"
-            return Allowed(f"blocked by {owner} {targets.end_text(state.end, self.zone)}")
+            return Allowed(f"blocked by {self.owner(state)} {targets.end_text(state.end, self.zone)}")
         if isinstance(state, targets.Running):
             return Allowed("busy with " + "; ".join(job.what for job in state.jobs))
         if isinstance(state, targets.Unreachable):
