@@ -806,6 +806,12 @@ Contract route decisions remain with the current owners.
    is needed to classify that sample.
    Total: 2–4 work hours plus the trial's recording. Undo: restore the single
    `direct.md` from git; retain the trial records.
+   Phase 5 result (2026-11-15): inconclusive. The pooled median rose 3.06%
+   (n=9 before, n=24 after), but every after row has no recorded worker model,
+   and no-worker mode moved implementation into director tokens from
+   2026-11-13. The context size after a recorded reload fell about 19% in
+   cargo-liner-handler. A worker-mode re-measure, after the worker model is
+   recorded, settles this step (Step log, After sample).
 
 2. **B — Reuse closeout facts. Needs the user.** Keep both commits, notice,
    plan review and completion in their current order. Add B's recording calls
@@ -1617,3 +1623,403 @@ Ambiguous display label `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z`: 7 starts fall
 | `7831cad1-29c6-4c9c-adae-243994b25685` | `2026-11-07T20:46:44.300+00:00` |
 | `fd1efb5d-fd26-4783-8501-3c6e755fe9d7` | `2026-11-07T22:09:01.592+00:00` |
 
+
+### After sample (Phase 5)
+
+The after sample uses phase starts in `[2026-11-07T23:32:53Z, 2026-11-15T14:00:00Z)`.
+The bounds are `[2026-11-07 18:32:53 EST, 2026-11-15 09:00:00 EST)`.
+The start is the main time of the route revision `7733bee4cdb9d75cd9680482809eff05c1a788e3`.
+The end is the collection time.
+The measurement version is the before sample's version: blob `98bef1370ee83586a43f1b0e12cd16b92b30876e` at worktree HEAD `96c882a1e44102e44e24fd1a9a13d41d3490fd91`.
+The worktree file changed after that version.
+`git archive 96c882a1e scripts config` supplied a copy; its `phase_process.py` hash matches the blob, and its imports resolve inside the copy.
+
+Each unit ran once as a summary and once with `--detail trial`:
+
+```sh
+/home/natepiano/.claude/scripts/lib/py <copy of 96c882a1e>/scripts/direct/phase_process.py baseline --exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units <unit> --since 2026-11-07T23:32:53Z --until 2026-11-15T14:00:00Z
+/home/natepiano/.claude/scripts/lib/py <copy of 96c882a1e>/scripts/direct/phase_process.py baseline --exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units <unit> --since 2026-11-07T23:32:53Z --until 2026-11-15T14:00:00Z --detail trial
+```
+
+The units are the nine before-sample units.
+All 18 invocations exited 0 on 2026-11-15, and each reported zero source-record read problems.
+The full output is `/tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/phases/5/after_measure.log`.
+A second run of all 18 invocations gave the same output, line for line: `after_measure_check.log` in the same folder.
+In the after window no selector picks another unit's phase, so each unit's rows come from its own selector.
+
+#### Exposure and exclusions
+
+| Unit | AfterChange | ExposureNotRecorded | NoFollowingPhase | SharedDirector | Open unmixed | Eligible | Weighted known |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cargo-liner-handler | 17 | 3 | 1 | 4 | 0 | 12 | 12 |
+| claude-natedev-builds-natest | 195 | 12 | 0 | 207 | 0 | 0 | 0 |
+| claude-natedev-builds-resources | 1 | 0 | 0 | 1 | 0 | 0 | 0 |
+| claude-natedev-efficiency | 6 | 1, plus 2 where the next phase starts with a different hash | 1 | 0 | 0 | 3 | 2 (1 `Unweighted`) |
+| claude-natedev-unit-board | 8 | 1 | 6 | 0 | 0 | 3 | 3 |
+| devtools | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| hana_catalyst-build-speed-tests | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| remove-running-section-handler | 12 | 5 | 1 | 14 | 0 | 1 | 1 |
+| sdlc-devtools | 70 | 8, plus 1 where the next phase starts with a different hash | 10 | 60 | 2 | 6 | 6 |
+
+Mixed is n=0 for every unit.
+The exclusion states can overlap.
+The after sample has 25 eligible phases and 24 with known weighted tokens.
+Five units have eligible phases in both windows: cargo-liner-handler, claude-natedev-efficiency, claude-natedev-unit-board, remove-running-section-handler and sdlc-devtools.
+builds-natest has no eligible phase because every after phase shares its director.
+builds-resources, devtools and hana have no eligible after phase.
+
+#### Weighted director tokens, phase plus gap (primary measure)
+
+The values come from the exact `--detail trial` rows of both windows.
+The median is the usual median; p90 is nearest-rank at `ceil(0.9 × n)`.
+
+| Unit | Before n | Before median | Before p90 | After n | After median | After p90 | Median change |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cargo-liner-handler | 2 | 4768147.750000002 | 5387968.200000003 | 12 | 5224967.1 | 7392259.100000001 | +9.58% |
+| claude-natedev-efficiency | 2 | 3243792.5 | 3811565.300000001 | 2 | 1966533.4000000004 | 2758278.200000001 | −39.38% |
+| claude-natedev-unit-board | 1 | 1078853.7000000002 | 1078853.7000000002 | 3 | 2266444.2999999993 | 3327915.7999999984 | +110.08% |
+| remove-running-section-handler | 1 | 4277661.099999998 | 4277661.099999998 | 1 | 2240040.3999999994 | 2240040.3999999994 | −47.63% |
+| sdlc-devtools | 3 | 1184759.9 | 2952753.1000000006 | 6 | 1833327.0500000007 | 4530650.999999998 | +54.74% |
+| Five units pooled | 9 | 2952753.1000000006 | 5387968.200000003 | 24 | 3043097.0 | 6547595.899999994 | +3.06% |
+
+The pooled median rose 3.06%; it did not fall by 1.5% or more.
+The pooled p90 rose 21.52%.
+Two units fell and three rose.
+The median of the five unit medians fell 30.94%, so the pooled sign depends on the unit mix.
+cargo-liner-handler supplies 12 of 24 after rows and 2 of 9 before rows.
+
+#### Compactions and context size after reload (reported, no target)
+
+| Unit | Before compactions n / median / total | After compactions n / median / total | Before reload requests n / median | After reload requests n / median / p90 | After states |
+| --- | --- | --- | --- | --- | --- |
+| cargo-liner-handler | 2 / 1.5 / 3 | 12 / 3 / 29 | 3 / 126,885 | 7 / 102,725 / 202,074 | NoReload n=22 compactions |
+| claude-natedev-efficiency | 2 / 0.5 / 1 | 3 / 1 / 3 | 1 / 101,428 | 3 / 113,931 / 119,429 | NoCompaction n=1 phase |
+| claude-natedev-unit-board | 1 / 0 / 0 | 3 / 1 / 4 | 0 | 3 / 87,356 / 91,262 | NoReload n=1 compaction |
+| remove-running-section-handler | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 129,756 | 1 / 108,489 / 108,489 | none |
+| sdlc-devtools | NotRecorded n=4 | NotRecorded n=6 | NotRecorded | NotRecorded n=6 phases | transcript invalid JSON at line 13452 |
+
+`NoReload` means no contract Read after `compact_boundary`.
+In cargo-liner-handler, 22 of 29 after compactions have no contract Read after them.
+
+#### Phase time (quality held)
+
+| Unit | Before n / median / p90 | After n / median / p90 | Result |
+| --- | --- | --- | --- |
+| cargo-liner-handler | 2 / 101.9 min / 114.9 min | 12 / 107.8 min / 14.1 h | median and p90 rose |
+| claude-natedev-efficiency | 2 / 41.5 min / 49.2 min | 3 / 62.2 min / 88.8 min | median and p90 rose |
+| claude-natedev-unit-board | 1 / 16.8 min / 16.8 min | 3 / 32.1 min / 41.4 min | median and p90 rose |
+| remove-running-section-handler | 1 / 98.9 min / 98.9 min | 1 / 945.0 s / 945.0 s | median and p90 fell |
+| sdlc-devtools | 4 / 45.6 min / 71.8 min | 6 / 40.5 min / 2.8 h | median fell; p90 rose |
+
+Phase time rose in four of five units.
+The quality-held condition does not hold for those four units.
+
+#### After phase instances and exact costs
+
+Source records are `/home/natepiano/.local/state/plan-delegate/runs/<run>.jsonl` for each run below.
+
+| Unit | Run / display phase | Instance | Start UTC | Weighted tokens | Raw input including caches | Raw output | Compactions | Display match |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/2` | `6283f087-7936-44e0-be6a-3c3a5e72a9b6` | `2026-11-11T23:59:15.708+00:00` | `6280172.500000001` | 39312649 | 141961 | 3 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/4` | `17ed5612-5f8a-4364-bb8c-2599a03c06d0` | `2026-11-13T08:34:04.354+00:00` | `5004751.9` | 33948223 | 106804 | 3 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/5` | `1667bee7-34cd-42e7-9546-65051af7870b` | `2026-11-13T14:49:11.034+00:00` | `4918001.200000003` | 33899547 | 122207 | 2 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/8` | `eb6ea901-b26c-46af-a008-ca515d2ae24b` | `2026-11-13T22:24:38.710+00:00` | `6547595.899999994` | 41668715 | 174223 | 4 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/9` | `dc0a2635-a01d-4b0c-8fd4-279bce17951b` | `2026-11-13T23:46:27.288+00:00` | `2604777.4` | 18497053 | 56743 | 1 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/13` | `d8230617-03ef-4f06-882d-66e966644ee8` | `2026-11-14T04:07:48.354+00:00` | `7950049.400000007` | 53241729 | 182947 | 3 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/14` | `f66f9090-b84a-4898-9052-6c54ce5f4d3c` | `2026-11-14T14:13:26.125+00:00` | `2277439.7` | 16517115 | 49320 | 1 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/15` | `9eaff024-7d55-4503-ba65-d44c3d48becf` | `2026-11-14T14:43:58.302+00:00` | `5445182.299999998` | 39955786 | 116951 | 2 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/16` | `5c1491b3-e337-4576-b8bc-f76c1698b4f3` | `2026-11-14T16:25:01.381+00:00` | `6392315.799999994` | 43057661 | 164086 | 3 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/17` | `f993acd1-3223-49b2-93f2-e2ec92a1126e` | `2026-11-14T17:48:48.882+00:00` | `7392259.100000001` | 41576861 | 146185 | 3 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/19` | `ba848bbe-da77-4884-b36c-6623ab27678b` | `2026-11-15T07:54:06.986+00:00` | `3509194.1999999993` | 26533210 | 80148 | 1 | Unique |
+| cargo-liner-handler | `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/20` | `28c92f95-5235-43ed-b331-66b46a985e1e` | `2026-11-15T10:55:17.639+00:00` | `4991841.800000001` | 33109500 | 131258 | 3 | Unique |
+| claude-natedev-efficiency | `1ce2e169-3129-4f89-b65d-25ead85f2048/20` | `91ef4999-661a-4c5e-857b-da2df424c887` | `2026-11-09T15:02:22.049+00:00` | `Unweighted(reasons=("unweighted model '<synthetic>' at 2026-11-09T15:39:18.567000+00:00",))` | 23169080 | 99658 | 2 | Unique |
+| claude-natedev-efficiency | `1ce2e169-3129-4f89-b65d-25ead85f2048/21` | `0cb18e08-5a9d-4f87-8d2e-7094107182cf` | `2026-11-09T16:07:20.317+00:00` | `1174788.5999999999` | 8815638 | 30080 | 0 | Unique |
+| claude-natedev-efficiency | `1ce2e169-3129-4f89-b65d-25ead85f2048/23` | `9b4766b7-d41f-482d-b2b0-7ded62c37ae5` | `2026-11-09T17:10:10.070+00:00` | `2758278.200000001` | 15874848 | 85387 | 1 | Unique |
+| claude-natedev-unit-board | `e6fe66d2-6674-4a1f-b9ec-6b6c3152b158/1` | `151463c0-731e-43b6-9b6b-ec24c79b8036` | `2026-11-12T22:15:31.532+00:00` | `2266444.2999999993` | 16736451 | 41596 | 1 | Unique |
+| claude-natedev-unit-board | `e7c0912e-f757-4711-81ff-578259d1d73f/1` | `51847367-fa5c-4b46-afac-96151d7cfcb2` | `2026-11-13T03:03:57.198+00:00` | `1905966.0000000005` | 13326762 | 37918 | 1 | Unique |
+| claude-natedev-unit-board | `60608201-0621-435b-87a7-62f0d3c82a39/1` | `9e9b044e-aaef-438d-92b5-b9a8de0a4895` | `2026-11-14T00:53:31.255+00:00` | `3327915.7999999984` | 21575357 | 82768 | 2 | Unique |
+| remove-running-section-handler | `21496649-0876-4315-8701-05f8943b788f/75` | `e6bc7faa-0c8e-496a-ac9f-f9d721bdb726` | `2026-11-09T05:13:10.503+00:00` | `2240040.3999999994` | 16601192 | 38407 | 1 | Unique |
+| sdlc-devtools | `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | one of the candidates below | see candidates | `1423465.6000000003` | 7148076 | 17876 | NotRecorded | Ambiguous |
+| sdlc-devtools | `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/8s` | `36c12bae-c281-4ca9-b855-bc8c06fc2756` | `2026-11-08T15:12:01.657+00:00` | `2243188.500000001` | 15946162 | 45173 | NotRecorded | Unique |
+| sdlc-devtools | `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/8t` | `7052a40e-167f-471b-8e76-09fa4391e6e4` | `2026-11-08T16:47:08.095+00:00` | `4530650.999999998` | 29885059 | 79977 | NotRecorded | Unique |
+| sdlc-devtools | `eacd0bed-652c-4588-8132-a49dc07b67bb/1` | `d18c45f0-28e5-472a-81e0-c141368f0dd1` | `2026-11-09T09:15:58.127+00:00` | `2255618.6999999997` | 15673022 | 45035 | NotRecorded | Unique |
+| sdlc-devtools | `39d78181-cfe5-4106-9a9d-544a8be4fdd3/1` | `bfbe1fda-3969-48bd-9bdd-d9d46db7342b` | `2026-11-09T15:37:06.390+00:00` | `1164626.5` | 6710737 | 29156 | NotRecorded | Unique |
+| sdlc-devtools | `95037808-045b-425b-a548-dd00c41e185a/1` | `929286f8-555a-4a7f-9794-98ef2a596b79` | `2026-11-10T18:58:04.169+00:00` | `658326.9000000001` | 5523849 | 12307 | NotRecorded | Unique |
+
+Matching metadata:
+
+| Run / display phase | Mode | Scope class | Worker model and pass kinds | Source for scope and gates | Gates |
+| --- | --- | --- | --- | --- | --- |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/2` | NotRecorded | medium (11 paths) | NotRecorded: `unknown / unknown / unset` (fix, impl, review, test) | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/2/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/4` | NotRecorded | small (4 paths) | NotRecorded: `unknown / unknown / unset` (fix, impl, review, test) | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/4/implementation_prompt.md` | verify.sh test; verify.sh lint (cargo-handler, tui_pane, cargo-tile) |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/5` | NotRecorded | medium (7 paths) | NotRecorded: `unknown / unknown / unset` (fix, impl, review, test) | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/5/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/8` | NotRecorded | medium (7 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/8/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/9` | NotRecorded | medium (7 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/9/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/13` | NotRecorded | small (4 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/13/implementation_prompt.md` | verify.sh test; verify.sh lint (cargo-handler, tui_pane, cargo-tile) |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/14` | NotRecorded | medium (8 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/14/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh test cargo-tile; verify.sh test tui_pane; verify.sh lint (cargo-handler, tui_pane, cargo-tile) |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/15` | NotRecorded | medium (12 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/15/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/16` | NotRecorded | medium (8 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/16/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/17` | NotRecorded | medium (7 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/17/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/19` | NotRecorded | small (3 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/19/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/20` | NotRecorded | small (4 paths) | NotRecorded: no worker pass | `/tmp/claude/unit/54fb1c7e-28f5-4eed-b9ef-08c60ce15bf6/phases/20/implementation_prompt.md` | verify.sh test cargo-handler; verify.sh lint cargo-handler |
+| `1ce2e169-3129-4f89-b65d-25ead85f2048/20` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (fix, impl, review) | `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/20/implementation_prompt.md` | NotRecorded |
+| `1ce2e169-3129-4f89-b65d-25ead85f2048/21` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review) | `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/21/implementation_prompt.md` | NotRecorded |
+| `1ce2e169-3129-4f89-b65d-25ead85f2048/23` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review) | `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/phases/23/implementation_prompt.md` | NotRecorded |
+| `e6fe66d2-6674-4a1f-b9ec-6b6c3152b158/1` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (fix, impl, review, test) | NotRecorded | NotRecorded |
+| `e7c0912e-f757-4711-81ff-578259d1d73f/1` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review, test) | NotRecorded | NotRecorded |
+| `60608201-0621-435b-87a7-62f0d3c82a39/1` | NotRecorded | NotRecorded | NotRecorded: no worker pass | NotRecorded | NotRecorded |
+| `21496649-0876-4315-8701-05f8943b788f/75` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review) | NotRecorded | NotRecorded |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review, test) | NotRecorded | NotRecorded |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/8s` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (fix, impl, review) | NotRecorded | NotRecorded |
+| `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/8t` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (fix, impl, review) | NotRecorded | NotRecorded |
+| `eacd0bed-652c-4588-8132-a49dc07b67bb/1` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review, test) | NotRecorded | NotRecorded |
+| `39d78181-cfe5-4106-9a9d-544a8be4fdd3/1` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review) | NotRecorded | NotRecorded |
+| `95037808-045b-425b-a548-dd00c41e185a/1` | NotRecorded | NotRecorded | NotRecorded: `unknown / unknown / unset` (impl, review) | NotRecorded | NotRecorded |
+
+The efficiency prompts exist but have no `Files` list and no acceptance gate, so scope and gates stay `NotRecorded`.
+The unit-board, remove-running and sdlc-devtools runs retain no phase prompt.
+
+Ambiguous display label `c96e80d9-b13e-4c13-aa6e-acfee5cbf068/3z`: 3 starts fall inside the after window.
+
+| Candidate instance | Start UTC |
+| --- | --- |
+| `0c744ee6-021e-415f-bbd9-f045fad5126e` | `2026-11-08T03:14:42.908+00:00` |
+| `43667e97-b180-4e60-b911-d75789467613` | `2026-11-08T12:28:56.397+00:00` |
+| `8d9f7b2e-70cb-40a5-9ddb-2c043fc01617` | `2026-11-09T04:13:56.788+00:00` |
+
+#### Matching result
+
+| Control | Before | After | Match |
+| --- | --- | --- | --- |
+| Mode | NotRecorded | NotRecorded | Not a control; a limit in both windows (showrunner, 2026-11-08) |
+| Worker model | cargo-liner-handler and efficiency: `codex / gpt-6.1-sol / high`; others NotRecorded | 15 rows `unknown / unknown / unset`; 10 rows have no worker pass | No: NotRecorded after; the workload also changed |
+| Scope class | known for cargo-liner-handler, efficiency and remove-running-section-handler; others NotRecorded | known for cargo-liner-handler only; others NotRecorded | Only cargo-liner-handler has a value in both windows |
+| Gates | known for cargo-liner-handler, efficiency, unit-board and remove-running-section-handler; sdlc-devtools NotRecorded | known for cargo-liner-handler only (`verify.sh` test and lint); others NotRecorded | Only cargo-liner-handler has a value in both windows |
+
+The result is **inconclusive**.
+It is not a pass and not a failure.
+Worker model is `NotRecorded` in every after row.
+`progress_history.begin_dispatch` records `called_family="unknown"`, `called_model="unknown"` and `called_effort="unset"` for every pane dispatch.
+Its caller is `scripts/production/worker.py`.
+This began with `a453a2ca4` (herdr-worker-panes phase 8, 2026-11-05).
+The last known `called_agent` in the run records is at `2026-11-07T16:10:39Z`.
+The workload also changed.
+No-worker mode started on 2026-11-13: cargo-liner-handler phases 8 to 20 and unit-board `60608201/1` have no worker pass, so the director wrote the code.
+Director tokens in those phases include implementation work that workers did in the before window.
+
+The likely reasons the measure did not fall:
+
+1. No-worker mode moved implementation into the director's tokens and phase time.
+2. Compactions per phase rose (cargo-liner-handler median 1.5 to 3), and phases ran longer.
+3. After most compactions the transcript shows no contract Read (`NoReload` 22 of 29 in cargo-liner-handler).
+   The measure does not count skill text that Claude Code restores after a compaction, so the cause is not known.
+   Where a read is recorded, the context size after reload fell (cargo-liner-handler 126,885 to 102,725, −19%).
+
+#### Changes inside the windows
+
+`trial_exposure` reads only the `direct.md` hash.
+The changes below can change director work without changing that hash.
+Each line is a first-parent main commit, its UTC main time and the watched files it changed.
+
+Recorder, launcher, hook, wait publisher and `phase_process.py` changes inside the after window (95).
+The watched files are `progress_history.py`, `phase_process.py`, `codex_mesh.py`, `mesh_runs.py`, `implement.sh`, `review.sh`, `verify.sh`, `merge_checkpoint.py`, `stop-direct-continue.py`, `user-prompt-submit-conversation-pause.py` and `conversation_pause.py`.
+`aac335c11` (hierarchies Phase 30) deletes `codex_mesh.py`.
+
+```text
+270935b38 2026-11-08T01:21:02Z codex_mesh.py,conversation_pause.py,merge_checkpoint.py,mesh_runs.py
+e036315ca 2026-11-08T06:11:52Z verify.sh
+7f940ee02 2026-11-08T06:13:08Z conversation_pause.py,stop-direct-continue.py,user-prompt-submit-conversation-pause.py
+be9a2e260 2026-11-08T11:35:19Z codex_mesh.py,mesh_runs.py,progress_history.py,review.sh,verify.sh
+1824aa902 2026-11-08T12:09:30Z mesh_runs.py
+fe79b47d4 2026-11-08T14:51:01Z progress_history.py
+f4131e77b 2026-11-08T15:31:21Z verify.sh
+5a82f5ee5 2026-11-08T19:10:29Z verify.sh
+3753da7e6 2026-11-08T19:58:54Z merge_checkpoint.py
+1c2398051 2026-11-08T20:27:12Z mesh_runs.py
+5f4c1669d 2026-11-09T03:16:06Z progress_history.py
+0fd3716d1 2026-11-09T03:56:07Z progress_history.py
+ebb2b6cdf 2026-11-09T04:39:07Z merge_checkpoint.py
+ce1655f97 2026-11-09T04:45:44Z merge_checkpoint.py,user-prompt-submit-conversation-pause.py
+aac335c11 2026-11-09T04:57:18Z codex_mesh.py,mesh_runs.py,verify.sh
+21badbab2 2026-11-09T08:22:50Z verify.sh
+73b8acacd 2026-11-09T08:26:59Z progress_history.py
+782118892 2026-11-09T08:53:30Z merge_checkpoint.py
+0620a2fe4 2026-11-09T08:59:02Z verify.sh
+419210fea 2026-11-09T08:59:29Z progress_history.py
+efd51778e 2026-11-09T10:14:59Z progress_history.py
+bc4823759 2026-11-09T11:50:20Z merge_checkpoint.py
+ce04fc652 2026-11-09T13:56:49Z merge_checkpoint.py,progress_history.py
+4b7ee03d3 2026-11-09T14:25:41Z progress_history.py
+1e6353ead 2026-11-09T14:39:57Z merge_checkpoint.py
+c5b250e4a 2026-11-09T15:39:58Z merge_checkpoint.py
+9215c98e8 2026-11-09T16:30:04Z merge_checkpoint.py
+989b483a4 2026-11-09T16:50:31Z merge_checkpoint.py
+414da9318 2026-11-09T18:40:01Z verify.sh
+648f6f5ef 2026-11-09T19:32:40Z merge_checkpoint.py
+3ed8a0515 2026-11-09T21:45:40Z progress_history.py
+50f7fef6a 2026-11-09T23:08:58Z review.sh
+baa3b664c 2026-11-09T23:40:22Z merge_checkpoint.py,progress_history.py
+c2b7550c3 2026-11-10T00:24:29Z verify.sh
+f9346625d 2026-11-10T14:15:50Z verify.sh
+fbfb2d84e 2026-11-10T14:59:07Z conversation_pause.py,progress_history.py,user-prompt-submit-conversation-pause.py
+b345301bf 2026-11-10T16:00:25Z progress_history.py
+3a26b7778 2026-11-10T20:12:30Z progress_history.py
+18f2d7895 2026-11-10T20:26:43Z progress_history.py
+c72083931 2026-11-11T01:45:57Z verify.sh
+fb602d0d5 2026-11-11T05:14:41Z progress_history.py
+8d347063c 2026-11-11T08:04:57Z progress_history.py,verify.sh
+6ea2ca254 2026-11-11T08:22:05Z progress_history.py
+fb130b1da 2026-11-11T14:52:15Z progress_history.py
+6b2deacbe 2026-11-11T20:10:14Z merge_checkpoint.py
+f2b5d7a9c 2026-11-11T20:41:01Z merge_checkpoint.py
+428a6fe5e 2026-11-11T21:19:22Z progress_history.py,verify.sh
+d6c43303c 2026-11-11T21:32:22Z merge_checkpoint.py
+95746504a 2026-11-11T21:46:05Z merge_checkpoint.py
+1042dc697 2026-11-11T22:12:34Z review.sh
+7271ef1a0 2026-11-11T22:45:45Z merge_checkpoint.py
+f4e6ee9f2 2026-11-11T23:34:51Z phase_process.py
+669977426 2026-11-12T00:51:25Z conversation_pause.py
+a7e497867 2026-11-12T06:14:03Z merge_checkpoint.py
+3b7275d0a 2026-11-12T06:49:41Z verify.sh
+600e89650 2026-11-12T09:19:33Z progress_history.py
+5dd579ca9 2026-11-12T14:17:57Z verify.sh
+a416e7732 2026-11-12T16:16:22Z review.sh,verify.sh
+677c7e007 2026-11-12T19:05:56Z progress_history.py
+9063235fd 2026-11-12T19:30:45Z phase_process.py
+ca7d7e3f1 2026-11-12T22:50:07Z progress_history.py,stop-direct-continue.py
+82f0164c5 2026-11-12T23:20:16Z progress_history.py
+9e3cb0cc4 2026-11-13T01:03:08Z progress_history.py
+d22063fc6 2026-11-13T01:24:31Z merge_checkpoint.py
+2491d3999 2026-11-13T01:34:30Z merge_checkpoint.py
+6f866b024 2026-11-13T02:11:03Z merge_checkpoint.py
+be33ee59f 2026-11-13T11:11:24Z verify.sh
+9aa7fa219 2026-11-13T11:57:56Z verify.sh
+6b0997ba6 2026-11-13T12:56:09Z merge_checkpoint.py
+712b81c6f 2026-11-13T15:13:42Z conversation_pause.py,merge_checkpoint.py,user-prompt-submit-conversation-pause.py
+8d22359f0 2026-11-13T16:15:12Z verify.sh
+92b2403f8 2026-11-13T17:47:37Z progress_history.py
+8b656e8ec 2026-11-13T18:07:00Z merge_checkpoint.py
+f3e703de9 2026-11-13T18:51:56Z verify.sh
+c097234d1 2026-11-14T01:49:15Z merge_checkpoint.py,progress_history.py
+34c549e52 2026-11-14T02:28:30Z progress_history.py
+d9e701950 2026-11-14T03:31:58Z progress_history.py,stop-direct-continue.py
+6eb083384 2026-11-14T04:01:55Z verify.sh
+a2799cecd 2026-11-14T04:08:22Z verify.sh
+84e097a9d 2026-11-14T05:35:36Z verify.sh
+c1c251585 2026-11-14T14:11:02Z verify.sh
+44599e211 2026-11-14T16:40:49Z stop-direct-continue.py
+7fd52eaa9 2026-11-14T17:01:15Z merge_checkpoint.py
+81792c494 2026-11-14T17:51:04Z merge_checkpoint.py
+553195712 2026-11-14T19:12:36Z progress_history.py
+42e3aa6d1 2026-11-14T19:12:38Z merge_checkpoint.py
+fb0042672 2026-11-14T19:41:02Z verify.sh
+44909a1da 2026-11-14T19:41:04Z merge_checkpoint.py
+fc74d6355 2026-11-15T01:13:11Z merge_checkpoint.py
+aa981e3a0 2026-11-15T01:29:57Z verify.sh
+13e29cac4 2026-11-15T06:06:49Z verify.sh
+4dcb0a6c3 2026-11-15T06:15:09Z verify.sh
+5d60575fc 2026-11-15T07:11:15Z merge_checkpoint.py
+be9adce60 2026-11-15T08:18:39Z verify.sh
+14d97916b 2026-11-15T13:14:57Z verify.sh
+```
+
+Changes to `docs/direct/*.md` and `scripts/direct/phase_reservation.py` inside either window (40).
+`ba32f25a0` is Phase 21.
+`1fc8ae186` adds `no_worker_mode.md`.
+
+```text
+before 3fa44fde1 2026-11-03T18:17:52Z compose_work_order.md,write_prompt_contract.md
+before 3df974c46 2026-11-04T00:36:15Z phase_reservation.py
+before b686f8b6c 2026-11-04T06:29:55Z compose_work_order.md
+before c03bf71d2 2026-11-04T09:31:17Z dual_review.md,phase_checks.md,write_prompt_contract.md
+before 673d5ebaf 2026-11-04T12:22:52Z write_prompt_contract.md
+before 36d6e99ef 2026-11-05T20:07:50Z dual_review.md,launch_implementation.md,phase_reservation.py,run_phase_review.md,write_prompt_contract.md
+before 9ba842c60 2026-11-06T02:21:32Z write_prompt_contract.md
+before 1531ded7b 2026-11-06T07:29:37Z dual_review.md,phase_end.md
+before c7754c2d6 2026-11-06T09:03:00Z run_phase_review.md
+before 18322ec3c 2026-11-06T18:40:31Z dual_review.md,launch_implementation.md,phase_end.md,run_phase_review.md,write_prompt_contract.md
+before 6b967b587 2026-11-07T00:31:17Z compose_work_order.md,dual_review.md,launch_implementation.md,write_prompt_contract.md
+before c2852a093 2026-11-07T05:18:11Z compose_work_order.md,dual_review.md,launch_implementation.md,write_prompt_contract.md
+before 1ebfac980 2026-11-07T06:57:55Z compose_work_order.md,dual_review.md,launch_implementation.md,phase_reservation.py,write_prompt_contract.md
+before 10ab1f294 2026-11-07T10:15:52Z phase_reservation.py
+before 7100fd016 2026-11-07T13:04:40Z write_prompt_contract.md
+before 189c7444b 2026-11-07T20:20:53Z write_prompt_contract.md
+after 7733bee4c 2026-11-07T23:32:53Z authorization.md,berth_decisions.md,codex_dispatch_wait.md,early_review.md,final_gate_commit.md,held_astra_roles.md,launch_failure.md,phase_end.md,phase_reservation.md,phase_reservation.py,repair_rounds.md,standing_plan_refill.md,ux_review.md,verification.md
+after 2660b3729 2026-11-08T00:24:09Z dual_review.md,repair_rounds.md,write_prompt_contract.md
+after be9a2e260 2026-11-08T11:35:19Z phase_reservation.py
+after 1824aa902 2026-11-08T12:09:30Z phase_reservation.py
+after ba32f25a0 2026-11-08T18:08:55Z phase_reservation.md,phase_reservation.py
+after aac335c11 2026-11-09T04:57:18Z dual_review.md,launch_failure.md,launch_implementation.md,phase_end.md,repair_rounds.md,run_phase_review.md,write_prompt_contract.md
+after 21badbab2 2026-11-09T08:22:50Z final_gate_commit.md
+after 73b8acacd 2026-11-09T08:26:59Z dual_review.md,early_review.md,launch_implementation.md
+after 3ed8a0515 2026-11-09T21:45:40Z final_gate_commit.md,launch_implementation.md,write_prompt_contract.md
+after 1fc8ae186 2026-11-09T23:31:13Z launch_failure.md,no_worker_mode.md
+after 5277677db 2026-11-10T00:18:18Z standing_plan_refill.md
+after f9346625d 2026-11-10T14:15:50Z verification.md
+after fbfb2d84e 2026-11-10T14:59:07Z repair_rounds.md
+after 1a6593cd8 2026-11-11T14:46:04Z launch_failure.md,launch_implementation.md,run_phase_review.md,write_prompt_contract.md
+after 5aac5284d 2026-11-11T21:19:33Z write_prompt_contract.md
+after d6c43303c 2026-11-11T21:32:22Z phase_end.md
+after a7aca35f2 2026-11-12T19:47:17Z held_astra_roles.md
+after ca7d7e3f1 2026-11-12T22:50:07Z phase_end.md,restart_takeover.md,run_phase_review.md,standing_plan_refill.md,style_unit.md
+after f3e703de9 2026-11-13T18:51:56Z write_prompt_contract.md
+after c097234d1 2026-11-14T01:49:15Z no_worker_mode.md,phase_reservation.py
+after d9e701950 2026-11-14T03:31:58Z write_prompt_contract.md
+after d0f58125d 2026-11-14T03:37:53Z phase_reservation.py
+after c1c251585 2026-11-14T14:11:02Z verification.md
+after 42e3aa6d1 2026-11-14T19:12:38Z no_worker_mode.md
+```
+
+#### Proposal
+
+The proposal goes to the user as one question.
+
+1. Keep cheap A.
+   The route did not fall by 1.5%, but the no-worker workload and the missing worker model explain the result better than the route does.
+   An undo now would also remove the one measured gain: a smaller context after each recorded reload.
+2. Record each worker's model at dispatch.
+   `begin_dispatch` takes the model, family and effort of the worker the pane launched.
+3. Measure cheap A again on at least 20 eligible worker-mode phases from at least two units after that fix.
+   Use the same frozen protocol.
+4. Start no new step (B, full A, G or I) until that result.
+5. In the same phase, find why 22 of 29 cargo-liner-handler compactions show no contract Read, and report the cause.
+   A change to the measure is a separate proposal, because the trial keeps its frozen measurement version.
+
+### Worker model and NoReload cause (Phase 29)
+
+The showrunner settled the Proposal on 2026-11-15 without a user question: keep cheap A, fix the worker-model recording now, and measure again after the workers-back notice.
+
+#### Worker model at dispatch
+
+1. `progress_history.begin_dispatch` takes a `CalledAgent` (family, model, effort).
+   The default is `CALLED_AGENT_NOT_RECORDED` (`unknown / unknown / unset`).
+2. `worker.launched_agent(row)` reads the worker's newest pane launch record.
+   It returns the launch kind as the family, the kept `--model`, and the kept effort.
+   A Codex launch keeps its effort in `model_reasoning_effort`; a Claude launch keeps no effort, so it records `unset`.
+3. A launch with no record or no kept model records `unknown / unknown / unset`.
+   The recorder never infers a model.
+4. A live check on 607 worker rows: 30 have a launch record and resolve (for example `codex / gpt-6.1-sol / high` and `claude / opus / unset`).
+   The other 577 have no launch record and stay `unknown`.
+
+#### NoReload cause
+
+The probe read the cargo-liner-handler director transcript (`fc0ab8f8`) for each `compact_boundary` from 2026-11-07T23:32:53Z to 2026-11-15T14:00:00Z.
+It counted every tool call whose input names `commands/unit/direct.md`, inside and outside phase windows.
+
+| After the boundary | Restored skill text present | Restored skill text absent | Total |
+| --- | --- | --- | --- |
+| `Read` of `direct.md` | 20 | 7 | 27 |
+| Bash read only (`cat`, `sed -n`, `head`) | 16 | 5 | 21 |
+| No read of `direct.md` | 35 | 3 | 38 |
+| Total | 71 | 15 | 86 |
+
+There are two causes:
+
+1. Claude Code puts the text of each invoked skill back after compaction, cut short.
+   With that text present, the director often continues without a reload: 35 of 71 boundaries.
+2. The director reloads with Bash in 21 of 86 boundaries.
+   The measure counts only the `Read` tool, so a Bash reload is a NoReload.
+
+So NoReload does not mean that the director worked with no contract text.
+It means that the measure did not see a `Read` of the contract.
+The trial keeps its frozen measurement version, so Phase 30 reports NoReload with this cause and does not change the measure.

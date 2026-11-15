@@ -760,8 +760,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Every row repeats Unit.
     Only the first row carries Status, Machine, Progress, ETA Plan, and Queued.
     Later rows use `—` for those unit-wide cells.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
-    The work table prints `| Unit | Notes | Non-Phase Work | Queued |`.
+    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
+    The work table prints `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
     Workers uses the configured display name.
     ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
     Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
@@ -799,7 +799,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching phase label at the start of the title appears once, regardless of case or dash.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-    `unit_phases.checkpoint_sent` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows ` · checkpoint sent, waits to land` in place of the step.
+    `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
+    `table` reads one `LandView` (`land_view()`): the running land commits, the land line places, and the newest land results.
+    The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
+    Else, at a place in the line, it is `waiting on queued checkpoint, <Nth> in line`; a failed newest result adds `; last try: <result>`.
+    Else the newest result shows: `checkpoint landed <time>`, or `land <state> at <step> <time>: <first detail line>`.
+    Else it is `checkpoint sent, not in the land line`. With no line file, it stays `waiting on queued checkpoint`.
+    `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits) while it holds the merge lock, and removes it at exit.
+    A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
+    `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).
+    The row has the commit, production, unit, phase, landed, step, state, detail and UTC time. The file keeps the newest 300 rows.
+    `scripts/production/land_queue.py` keeps the land line in `$MERGE_GATE_STATE_DIR/land_queue.json` under a file lock.
+    `add LABEL --batch FILE | --commit HASH [--first | --before LABEL]`, `move`, `remove`, `list`, and `next`; `next` removes the first item and prints its label, or prints nothing when the line is empty.
+    An item's commits are its `--commit` values and the third field of each batch file line, read when the board reads the line.
     `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
     Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.
@@ -863,7 +875,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
     A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
     `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
-    Its cell keeps the existing 80-character limit.
+    Its cell keeps every word and wraps in the work table like Notes (user, 2026-11-15).
+    With no running worker, `workers_cell` shows the reason from `NO_WORKER_REASONS`, plus `+<n> idle`.
+    `no_worker_reason` reads `quota_state.no_worker_mode()` once for each table: `no-worker mode`, else `none running`.
+    Only a unit's first row carries the reason. A failed census or an unscanned machine gives `—` (user, 2026-11-15).
+    `display_cells.wrapped(keep=...)` keeps the Workers column when every cell is `—`.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
     Rows without a recorded phase instance keep the existing summary for work outside the plan.

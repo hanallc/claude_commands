@@ -159,37 +159,177 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Ruled out:** mode recording (showrunner, 2026-11-08); `--before-at` for this sample (`--route-revision` reads the before hashes from the route's parent).
 
-### Phase 5 — Measure the first step and propose the next  · status: todo
+### Phase 5 — Measure the first step and propose the next  · status: done
 **Depends on:** Phase 4
 
-**Waits for:** at least twenty eligible `AfterChange` phases from the same units as the before sample, after the route's main time (2026-11-07 23:32:53Z).
+#### As-built
 
-#### Work Order
-
-**Goal:** the design doc says whether Step 1 moved its measure, and the next step goes to the user.
-
-**Spec:**
-- Fix both bounds before the run: `--since` is the time the route reached main, and `--until` is the collection time, written as UTC stamps in the Step log. Never use the script's moving fourteen-day default. Run one invocation per unit, because `render_trial` pools the primary measures across all selected units: `phase_process.py baseline --exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3 --units <one unit of the before sample> --since <the route main time> --until <the collection time>`, at the Step log's measurement version. Record the after phase instances and their matching metadata the same way Phase 4's freeze did (`--detail trial` per unit, then each row's phase start event). Add the after numbers to the Step log with n for each: weighted director tokens over the phase plus its following gap (the primary measure), compactions per phase and context size after each reload (reported, no target). Show each unit's results apart, and each excluded state (`ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed) with n.
-- Matching: the same units in both windows, with matched scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure. Two `NotRecorded` values never match: a control that is `NotRecorded` in either window makes the result `inconclusive`.
-- Mode is not a matching control: no record holds the director's mode. The result names Mode as a `NotRecorded` limit in both windows (showrunner, 2026-11-08). Add no mode recording.
-- Counts: the n a step names counts usable primary observations (weighted tokens known). `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload` are reported with n; they are never 0 and never a failed saving.
-- Quality held: median and p90 phase time per unit, over the trial's eligible phases (the trial section's phase-time line), do not rise against the Step log's before sample. A rise is reported with the step's result.
-- If the window holds no eligible observation (n 0, or below the n the step names), the result is `not yet measurable`: the Step log names the missing evidence and the condition for the next collection, and the phase waits on it; this is never read as a failed step.
-- Compute the saving from the exact per-phase weighted tokens the Step log holds (the `--detail trial` rows), never from the short-form table cells (`2.7M`), which hide differences near 1.5%.
-- If the primary measure did not fall by at least 1.5% (half the low end of the 3–7% target), the Step log says so, names the likely reason, and proposes undoing it or changing it; that proposal is the question.
-- Otherwise update Steps with what the measure taught, and pick the next step.
-- At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one. Write that step's own implementation Work Order: its Spec, its Files, its Workers, and its measurement requirements (the measure it must move, the target, the n it names and the excluded states it reports). Keep the frozen comparison protocol: fixed `--since` and `--until` bounds, one invocation per unit, recorded phase instances and matching metadata, and the before sample frozen in the Step log before any contract edit.
+- The Step log's "After sample (Phase 5)" section holds the cheap A after measure: window `[2026-11-07T23:32:53Z, 2026-11-15T14:00:00Z)`, run at the before sample's measurement version (archived from `96c882a1e`), one summary and one `--detail trial` run per unit. A second run matched line for line.
+- 25 eligible after phases, 24 with known weighted tokens, from five units present in both windows. The pooled median rose 3.06% (n=9 before, n=24 after). Phase time rose in four of five units.
+- Result: `inconclusive`. Every after worker pass records model `unknown`: `progress_history.begin_dispatch` writes `unknown` for each pane dispatch (since `a453a2ca4`, 2026-11-05). No-worker mode from 2026-11-13 moved implementation into director tokens.
+- The Step log lists each main change to the recorder, launchers, hooks, wait publishers and `phase_process.py` inside the after window (95), and to `docs/direct/*.md` and `phase_reservation.py` inside either window (40).
+- Steps item 1 notes the result. sdlc decided (2026-11-15): keep cheap A, fix the worker-model recording now (Phase 29), and measure again after the workers-back notice (Phase 30).
 
 **Files:**
 - `docs/plans/sdlc-phases-design.md` — Step log, Steps
 
-**Workers:** `1 writer + 1 tester` — one doc. `impl` runs the measure and writes the Step log.
-- `impl` — `docs/plans/sdlc-phases-design.md`
-- `test` — opens as test — independently re-runs the frozen measure, recomputes the percentage from the exact observations (values near 1.5% included), and checks the Step log; it writes no doc text
+### Phase 29 — Each worker pass records its model  · status: done
+**Depends on:** Phase 5
 
-**Constraints from prior phases:** Deployed revisions: Phase 4's **Constraints from prior phases** lists the main commit and time for Phases 3, 6 to 16, 18 and 19, the staff-lifecycle cut and postmaster-unit's records. The route is on main at 7733bee4c (2026-11-07 23:32:53Z). The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the route revision and its main time, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample from recorded hashes after the route shipped. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. The after window ends at the collection time. A change to the recorder, a launcher, a hook (the Stop and prompt hooks included), a wait publisher or `phase_process.py` does not end it: these files change on main almost daily (the first, `d6ed85d3e` at 2026-11-08T00:50:40Z, changed `codex_mesh.py` and `mesh_runs.py` 78 minutes after the route), so a cutoff would leave no sample. Exposure already guards the measure: a phase counts as `AfterChange` only when it starts and finishes with the route's recorded `direct.md` hash. The Step log lists each such change inside the after window with hash and main time, and the result names them. hierarchies Phase 30, which deletes `codex_mesh.py`, is one. Run the measure at the Step log's measurement version of `phase_process.py`. The Step log also lists each main change to `docs/direct/*.md` and to `scripts/direct/phase_reservation.py` inside either window, with hash and time; Phase 21 is one. `trial_exposure` reads only the `direct.md` hash, so the result names these changes. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green. The before sample (Phase 4, checkpoint 271be2de5) holds 31 instances from 9 units: cargo-liner-handler, claude-natedev-builds-natest, claude-natedev-builds-resources, claude-natedev-efficiency, claude-natedev-unit-board, devtools, hana_catalyst-build-speed-tests, remove-running-section-handler and sdlc-devtools. `--units` matches the run-start unit, worktree, branch and working-directory name, so the `remove-running-section-handler` selector also picks `cargo-liner-handler` phases and `sdlc-devtools` also picks `devtools` phases. Compute each unit's after numbers from its own `--detail trial` rows, as the Step log does; never add selector totals. The detail rows omit the phase instance id: keep the Step log's `Ambiguous` mark on a display id with several starts in a window. Scope class and gates use the Step log's sources: for builds-resources, the Work Order at the phase's checkpoint commit; a field with no retained source stays `NotRecorded`. The two devtools selectors have unavailable compaction counts (invalid JSON in their transcript).
+#### As-built
 
-**Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
+- `progress_history.begin_dispatch` takes `called: CalledAgent` (family, model, effort). The default `CALLED_AGENT_NOT_RECORDED` is `unknown / unknown / unset`, so test calls in other modules keep their form.
+- `worker.launched_agent(row)` reads the worker's newest pane launch record (`pane_record.launch_for_session`). The family is the launch kind; the model and effort come from `worker_panes.kept_settings` over `pane_record.resume_arguments`. A Claude launch keeps no effort and records `unset`. No record or no kept model records `unknown / unknown / unset`. The herdr dispatch passes `called=launched_agent(started.row)`.
+- Tests: `test_dispatch_records_the_called_worker_model` (test_progress_history.py) and `test_launched_agent_reads_the_kept_launch_settings` (test_worker.py).
+- A live read of 607 worker rows resolves the 30 that have launch records. A live dispatch proof waits for the workers-back notice.
+- The Step log's "Worker model and NoReload cause (Phase 29)" section gives the NoReload cause. In 86 cargo-liner-handler boundaries of the after window, 27 reload with `Read`, 21 reload with Bash only, and 38 do not reload. 71 of 86 show the skill text that Claude Code restores after compaction. The measure counts only `Read`.
+
+**Files:**
+- `scripts/direct/progress_history.py` — `CalledAgent`, `begin_dispatch`
+- `scripts/production/worker.py` — `launched_agent`, the `begin_dispatch` call
+- `scripts/direct/test_progress_history.py`, `scripts/production/test_worker.py`
+- `docs/plans/sdlc-phases-design.md` — Step log
+
+**Gotchas:** `pane_launch.CurrentLaunch["kind"]` is not a required key; read it through `pane_launch.saved_kind`.
+
+### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
+**Depends on:** Phase 29
+
+**Waits for:** the workers-back notice (showrunner, 2026-11-15), then at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
+
+#### Work Order
+
+**Goal:** the design doc says whether cheap A moved director tokens on worker-mode phases, and the next step goes to the showrunner.
+
+**Spec:**
+- Run the frozen protocol of Phase 5. Fixed `--since` (Phase 29's main time) and `--until` (the collection time) as UTC stamps; one invocation per unit, summary and `--detail trial`; the measurement version is blob `98bef1370ee83586a43f1b0e12cd16b92b30876e` from `git archive 96c882a1e`; `--exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3`. Record each after instance and its matching metadata (scope class, worker model, gates) as Phase 5 did.
+- Measure: weighted director tokens over the phase plus its following gap. Target: the pooled median and the median of each matched unit 3–7% lower than the Step log's before sample; a fall below 1.5% is a proposal to undo or change cheap A. n counts phases with known weighted tokens. Report compactions per phase and context size after reload with no target, and median and p90 phase time per unit.
+- Report each excluded state with n: `ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed, open unmixed, `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload`.
+- Matching: a phase with no worker pass, or with a worker model `NotRecorded`, does not match a before row with a recorded worker model. A control `NotRecorded` in either window makes the result `inconclusive`. Mode stays a named `NotRecorded` limit.
+- Start no new step (B, full A, G or I) before this result (showrunner, 2026-11-15). Send the showrunner the result and the next step.
+
+**Files:**
+- `docs/plans/sdlc-phases-design.md` — Step log, Steps
+
+**Workers:** director only — the director runs the measure and writes the Step log.
+
+**Acceptance gate:** the Step log has the after numbers with n and window, the matching result and the phase-time check; `test_phase_process.py` passes; the result is sent.
+
+### Phase 31 — Every read-only Claude run has no file-edit tools  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/agents/agent_exec.sh` readonly Claude mode passes `--permission-mode plan --disallowedTools Edit,Write,NotebookEdit`. Write mode keeps every tool.
+- The `direct.simplify`-only tool branch and its readonly-only guard are deleted. The one caller, `simplify_daily.py`, runs readonly.
+- `test_agent_exec.sh` checks the exact readonly argv for a plain task and a tier task, and the removed tools for simplify.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`
+- `scripts/agents/test_agent_exec.sh`
+
+**Gotchas:** the dry run prints each argument with `%q`, so the expected argv has `Edit\,Write\,NotebookEdit`.
+
+### Phase 32 — One place decides a Claude run failed, and one helper reads the review minutes  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/direct/simplify_result.py` `validate` reads only `stats` from `claude_result`. A failed Claude run reaches it as the `ERROR: <reason>` report that `agent_exec.sh` writes through `claude_result.py`; that is the one failure check.
+- `scripts/production/review_regime.py` `optional_float` reads `review_minutes`, `ux_check_minutes` and `ux_repair_minutes`. Values and missing values are the same as before.
+- Tests: `test_a_failed_run_records_the_error_from_the_launcher_report` (test_simplify_result.py) and `test_each_review_minute_field_reads_numbers_and_skips_other_values` (test_review_regime.py).
+
+**Files:**
+- `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
+- `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
+
+### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.phase_lock(phase_dir)` holds `phase_baseline.lock`, the lock file the baseline writer already used. `committed`, the repair record (`_repair_record`), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` hold it across their read and write.
+- `release_held` takes no lock itself; its final `clear` takes the lock and checks the pending record again.
+- The repair holds the lock during its board check, so a checkpoint can wait up to that check's timeout.
+- Test: `test_a_checkpoint_during_a_repair_keeps_its_pending_release_record` fails with the lock removed and passes with it.
+
+**Files:**
+- `scripts/direct/phase_reservation.py`
+- `scripts/direct/test_phase_reservation.py`
+
+**Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
+
+### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `note_file.ahead(resets, *, now)` and `note_file.remaining(note)` hold the two note helpers. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`. It keeps no copy and no re-export, so a caller of the helpers does not load `quota_alert`.
+- `test_agent_notes.py` reads `note_file.ahead`; no other caller was found.
+
+**Files:**
+- `scripts/whoami/note_file.py` — `ahead`, `remaining`
+- `scripts/whoami/quota_alert.py` — the call sites
+- `scripts/whoami/test_agent_notes.py` — the `ahead` tests
+
+### Phase 35 — The launch account for a Claude task lives in models.conf  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agents_resolve` sets `AGENT_CLAUDE_ACCOUNT` for a claude task from `[<function>.options]`: `claude_account.<subtask>`, then `claude_account`. The value is `workers` (the default) or `caller`; another value stops with `ERROR:` and the allowed values. A codex task gets an empty value.
+- `agent_exec.sh` runs a `caller` task on the caller's own account and every other Claude task on the workers pool. No task-name test is left.
+- `config/models.conf` has `[direct.options] claude_account.simplify=caller`.
+
+**Files:**
+- `scripts/agents/models_config.sh` — `_agents_resolve_claude_account`
+- `scripts/agents/agent_exec.sh` — the account branch
+- `config/models.conf`, `docs/as-built/agent-registry.md` — the key and its description
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh` — each value, and `account_case` on the caller account
+- `scripts/lib/test_nix_env_launches.py` — the `agents_resolve` stub sets `AGENT_CLAUDE_ACCOUNT`
+
+**Gotchas:** `agent_exec.sh` runs under `set -u`, so an `agents_resolve` stub must set every variable the launcher reads.
+
+### Phase 36 — The simplify-follow items still in the tree  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agent_exec.sh` calls `claude_result.py` at its one call site. The wrapper function is gone; its comment sits above the Claude command line.
+- `simplify_result.py` lists `SIMPLIFY_AGENTS` with `", "`.
+- `account_for_launch` in `add_unit.py` calls `accounts.prepare_claude_launch`; its `try` turns `AccountsError` into `Refusal`.
+- `account_test_support.store_usage(tool, login, usage)` writes one login's readings under the store lock. `stored_room` and `test_accounts.py` `reading` call it.
+- `test_agent_exec.py`, `test_review.py` (two sites) and `add_showrunner_test_support.py` call `create_claude_account`.
+- `agent-registry.md` says every readonly Claude run disables the editing tools.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`, `scripts/direct/simplify_result.py`, `scripts/production/add_unit.py`
+- `scripts/whoami/account_test_support.py` — `store_usage`
+- `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/accounts/test_accounts.py`, `scripts/direct/test_simplify_result.py`
+- `docs/as-built/agent-registry.md`
+
+**Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
+
+### Phase 37 — An Images card can show a before and after pair  · status: done
+**Depends on:** none
+
+#### As-built
+
+User request 11-15 10:24: before and after shots side by side, with one metadata block and one Delete. The user accepted the mockup.
+
+- `images.py register (--image PATH | --before PATH --after PATH)`: a pair is one folder with `before<suffix>` and `after<suffix>`, one record, one id and one image link. The record keeps the after image in `file` and the before image in `before`.
+- A pair card (`article.pair`) shows Before and After side by side in `.image-pair`, each linked to its full size. It has one caption, one details block, one Feedback field, one Send feedback and one Delete, which removes the folder.
+- The feedback message has a `Before:` and an `After:` link for a pair.
+- On a page 1104px or wider, a single card is 680px and a pair card is up to 1376px, both centered. A pair card under 600px stacks its images, before on top (container query).
+- `/show_image`, `docs/as-built/review-links.md` and the proof rule in `docs/production_format.md` say: file before and after shots as one pair.
+
+**Files:**
+- `scripts/review_links/images.py` — `register(before=)`, `shown_files`, `picture`, the pair card, the CSS and the `register` options
+- `scripts/review_links/test_images.py` — `ImagePairTests` and the pair server test
+- `commands/show_image.md`, `docs/as-built/review-links.md`, `docs/production_format.md`
+
+**Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
