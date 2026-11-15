@@ -428,7 +428,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(result[1].count("unavailable"), 4)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
-        head = "Head: free 8.5 GiB; reserve 3.0 GiB; need 1.9 GiB · cloud 2 of 9 slots"
+        head = "Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − kept aside 6.0 GiB) · cloud 2 of 9 slots"
         priority = "queue priority: port (the user's bump)"
         data = {"read_at": 200, "waiters": [
             {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
@@ -441,7 +441,8 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(index=index):
                 hover = str(self.page_expression(f"tipText('wait:{index}', data)", data))
                 self.assertEqual(hover.count(reason), 1)
-                self.assertEqual(hover.count(head), int(index == 0))
+                # The page names kept-aside memory "reserved".
+                self.assertEqual(hover.count(head.replace("kept aside", "reserved")), int(index == 0))
                 self.assertEqual(hover.count(priority), int(index == 0))
                 if index == 0:
                     self.assertNotIn("Needs 1.9 GiB", hover)
