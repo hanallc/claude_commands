@@ -33,8 +33,8 @@ The summary uses the first matching rule:
 1. `working`: a matched worker, command, director activity, or busy director with an unsent open phase executes.
 2. `idle`: the unit has a pause or stop, or readable records show no remaining work and no busy director.
 3. `waiting on other work`: an open phase or director command has a recorded wait.
-4. `waiting to merge`: sent work waits in the merge line, merges, failed, or has no recorded position.
-5. `waiting on other work`: the first next item has an unmet dependency or recorded plan wait.
+4. `waiting to merge`: sent work waits, merges, or failed; a unit wait can also keep done work from the merge.
+5. `waiting on other work`: the first next item has a recorded wait, or a unit wait has no matching target.
 6. `unknown`: the available facts explain no earlier state.
 
 `Now` names each open phase as `<title> (<phase id>)`.
@@ -82,6 +82,25 @@ A line that has no record says `merge position not recorded`.
 Sent open phases appear only under `Merge`.
 The board has no daily merge count.
 
+Directors record a unit wait with `progress_history.py start-wait --target WORK --by WHO --reason CONDITION --kind KIND`.
+The target can name a phase or a queue item's exact leading ID.
+The command requires `--by` and `--reason` with `--target`.
+The record belongs to the run, with no phase or pass attribution.
+`finish-wait --wait-id ID`, target phase start, or run finish closes the wait.
+The newest open reason for a target replaces its earlier reason.
+
+Done work outside the merge line uses `<id> is done; <by> keeps it from the merge until <reason>; since <time>.`
+This text replaces the missing-reason sentence under `Merge`.
+A merge line entry, running merge, result, or presence on local main suppresses the hold text.
+Queue targets append `<By> keeps it waiting until <reason>; since <time>.`
+Pending plan targets append the same text after `Plan next`.
+An unmatched target appears under `Now`, or under `Also` when another task runs.
+Its text is `<By> keeps <target> waiting until <reason>; since <time>.`
+With no open phase, the first next item's unit wait supplies `Now`:
+`No task runs. <By> keeps <target> waiting until <reason>.`
+An open unit wait prevents an otherwise empty unit from counting as idle.
+Stored actor text remains unchanged; sentence starts use a capital letter.
+
 `Next` preserves every queue item in stored order.
 An exact leading open or sent phase ID followed by `:` identifies started work.
 `Next` leaves out that item, because `Now` or `Merge` already shows the work.
@@ -89,6 +108,8 @@ The first unstarted queue item determines the queue wait.
 A satisfied dependency appends `Ready: <after> is on the local copy of main.`
 An unmet dependency appends `After <after>: <state>.`
 States distinguish absent local work, started work, submitted work, unstarted phases, and dependencies not found locally.
+A sent dependency outside the merge line can use its unit wait: `After <after>: done; <by> keeps it from the merge until <reason>.`
+The dependency reader returns that wait from the run it already reads.
 The board checks local `origin/main` without a fetch.
 Pending plan work follows the queue: `Plan next: <title> (<id>); then <remaining ids>.`
 The first pending phase preserves its `Waits for:` text and names unmet `Depends on:` phases.

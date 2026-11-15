@@ -11,7 +11,7 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.direct import plan_history
+from scripts.direct import phase_waits, plan_history
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.production import land_queue, land_runs, staff, unit_phases, unit_queue, waits_on
 
@@ -79,6 +79,27 @@ class WaitsOnTests(unittest.TestCase):
         self.assertEqual(waits_on.carried(self.repo, main), [])
         self.assertEqual(waits_on.carried(self.repo, "f" * 40), [])
 
+        path = plan_history.run_events_path(run)
+        runs[path].extend([
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "22", "wait_id": "hold",
+             "wait_by": "sdlc", "wait_reason": "the user approves board-reasons", "wait_kind": "WaitingForUser",
+             "wait_started_epoch": 1_794_749_000, "wait_attribution": {"state": "UnitTarget"}},
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "23", "wait_id": "other",
+             "wait_by": "builds", "wait_reason": "the build finishes", "wait_kind": "WaitingForSupplier",
+             "wait_started_epoch": 1_794_749_100, "wait_attribution": {"state": "UnitTarget"}}])
+        reads: list[Path] = []
+
+        def read_run(path: Path) -> list[dict[str, object]]:
+            reads.append(path)
+            return runs.get(path, [])
+
+        held = waits_on.state("handler/22", repo=self.repo, snapshot=snapshot, read_run=read_run)
+        self.assertEqual(held, waits_on.PhaseSent(sent, phase_waits.UnitWait(
+            "22", "sdlc", "the user approves board-reasons", "WaitingForUser", 1_794_749_000, "hold")))
+        self.assertEqual(reads, [path])
+        runs[path].append({"event_type": "wait_finished", "wait_id": "hold"})
+        self.assertEqual(state("handler/22"), waits_on.PhaseSent(sent))
+
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
         failed: land_runs.LandResult = {"commit": "c" * 40, "production": "builds", "unit": "report", "phase": "89",
@@ -121,6 +142,17 @@ class WaitsOnTests(unittest.TestCase):
                          "acctland. After builds/589: merged 13:30.")
         self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: landed}),
                          "acctland. After builds/589: absent from the local copy of main; merged 13:30.")
+
+        held = waits_on.PhaseSent("d" * 40, phase_waits.UnitWait(
+            "589", "sdlc", "the user approves board-reasons", "WaitingForUser", now - 600, "hold"))
+        self.assertEqual(text(held),
+                         "acctland. After builds/589: done; sdlc keeps it from the merge until the user approves board-reasons.")
+        self.assertEqual(text(held, frozenset({"d" * 40})), "acctland. After builds/589: merging now.")
+        self.assertEqual(text(held, results={"d" * 40: landed}), "acctland. After builds/589: merged 13:30.")
+        self.assertEqual(text(held, results={"d" * 40: {**failed, "commit": "d" * 40}}),
+                         "acctland. After builds/589: did not merge: failed at red: test_x red; 13:30.")
+        held_in_line = waits_on.PhaseSent("c" * 40, held.wait)
+        self.assertEqual(text(held_in_line), "acctland. After builds/589: waiting to merge, 10th in line.")
 
     def test_the_first_row_names_each_sent_checkpoint_of_the_unit(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")

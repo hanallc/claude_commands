@@ -680,6 +680,26 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn("- **Next:** Nothing queued after the current work.", rendered)
         self.assertNotIn("Continue current work", rendered)
 
+        dependency_path = self.write_run(dependency, "dependency", [("22", "Submitted delivery")], [
+            self.phase_event("checkpoint", "22", checkpoint_commit=sent),
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "22", "wait_id": "hold",
+             "wait_by": "sdlc", "wait_reason": "the user approves board-reasons", "wait_kind": "WaitingForUser",
+             "wait_started_epoch": datetime(2026, 11, 15, 17, 50, tzinfo=UTC).timestamp(),
+             "wait_attribution": {"state": "UnitTarget"}}])
+        member_path = self.write_run(member, "next", [])
+        _ = self.queue(member, unit_queue.QueuedItem("Merge delivery", "dependency/22"),
+                       unit_queue.QueuedItem("Read delivery", "dependency/22"))
+        with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+              patch.object(waits_on, "state", wraps=waits_on.state) as dependencies):
+            rendered = self.blocks([dependency, member], {})
+        self.assertIn("**next** — waiting on other work", rendered)
+        self.assertIn("  1. Merge delivery. After dependency/22: done; sdlc keeps it from the merge "
+                      + "until the user approves board-reasons.", rendered)
+        self.assertIn("  2. Read delivery. After dependency/22: done; sdlc keeps it from the merge "
+                      + "until the user approves board-reasons.", rendered)
+        self.assertCountEqual([call.args[0] for call in reads.call_args_list], [dependency_path, member_path])
+        self.assertEqual(dependencies.call_count, 1)
+
     def test_plan_waits_control_the_unit_with_no_current_task(self) -> None:
         member = self.member("waiting")
         plan = self.root / "plan.md"
@@ -696,6 +716,112 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn("**waiting** — waiting on other work", rendered)
                 self.assertIn("- **Now:** No task runs.", rendered)
                 self.assertIn(explanation, rendered)
+
+    def test_unit_waits_name_the_reason_at_each_target_and_set_the_bucket(self) -> None:
+        member = self.member("reasons")
+        base = self.repository()
+        sent = commit_repository(self.root, "Delivery", allow_empty=True)
+        plan = self.root / "plan.md"
+        _ = plan.write_text("# Plan\n### Phase 30 — Later delivery · status: todo\n"
+                            + "### Phase 31 — Last delivery · status: todo\n")
+        started = datetime(2026, 11, 15, 17, 50, tzinfo=UTC).timestamp()
+        hold: dict[str, object] = {"event_type": "wait_started", "wait_scope": "unit", "wait_id": "hold",
+            "wait_by": "the user", "wait_reason": "the user approves the release", "wait_kind": "WaitingForUser",
+            "wait_started_epoch": started, "wait_attribution": {"state": "UnitTarget"}}
+        cases = (
+            ("sent", "delivery", "Merge", "waiting to merge",
+             "delivery is done; the user keeps it from the merge until the user approves the release; since 17:50."),
+            ("done", "delivery", "Merge", "waiting to merge",
+             "delivery is done; the user keeps it from the merge until the user approves the release; since 17:50."),
+            ("queue", "acctcolor", "Next", "waiting on other work",
+             "The user keeps it waiting until the user approves the release; since 17:50."),
+            ("queue later", "acctcolor", "Next", "unknown",
+             "The user keeps it waiting until the user approves the release; since 17:50."),
+            ("queue text", "acctcolor", "Now", "waiting on other work",
+             "The user keeps acctcolor waiting until the user approves the release; since 17:50."),
+            ("plan", "30", "Next", "waiting on other work",
+             "The user keeps it waiting until the user approves the release; since 17:50."),
+            ("free", "The release", "Now", "waiting on other work",
+             "The user keeps the release waiting until the user approves the release; since 17:50."),
+            ("working", "The release", "Also", "working",
+             "The user keeps the release waiting until the user approves the release; since 17:50."))
+        for target_state, target, label, bucket, expected in cases:
+            with self.subTest(target_state=target_state):
+                phases: list[tuple[str, str]] = []
+                tail: list[dict[str, object]] = []
+                if target_state in ("sent", "done"):
+                    phases.append(("delivery", "Completed delivery"))
+                    tail.append(self.phase_event("checkpoint", "delivery", checkpoint_commit=sent)
+                                if target_state == "sent" else self.phase_event("phase_finished", "delivery",
+                                    status="completed", timestamp_epoch=started - 60, phase_elapsed_seconds=60))
+                if target_state == "working":
+                    phases.append(("work", "Current delivery"))
+                    tail.append(self.phase_event("pass_started", "work", pass_instance_id="writer-pass",
+                                                 pass_kind="impl", worker_id="writer-id"))
+                tail.append({**hold, "target_work": target})
+                path = self.write_run(member, "reasons", phases, tail, plan=plan.name if target_state == "plan" else "")
+                queued_items: list[unit_queue.QueuedItem] = []
+                if target_state == "queue later":
+                    queued_items.append(unit_queue.QueuedItem("Ready delivery"))
+                if target_state in ("queue", "queue later"):
+                    queued_items.extend((unit_queue.QueuedItem("acctcolor: Add account colors"),
+                                  unit_queue.QueuedItem("Read the report")))
+                if target_state == "queue text":
+                    queued_items.append(unit_queue.QueuedItem("Review acctcolor: Add account colors"))
+                _ = self.queue(member, *queued_items)
+                workers = [census_worker("writer", member.id)] if target_state == "working" else []
+                with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                      patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
+                    rendered = self.blocks([member], {}, workers=workers)
+                self.assertIn(f"**reasons** — {bucket}", rendered)
+                field = rendered.split(f"- **{label}:**", 1)[1].split("\n- **", 1)[0]
+                self.assertIn(expected, field)
+                self.assertEqual(rendered.count(expected), 1)
+                self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+                self.assertEqual(queues.call_count, 1)
+                if target_state in ("queue", "plan"):
+                    self.assertIn(f"- **Now:** No task runs. The user keeps {target} waiting until the user approves the release.",
+                                  rendered)
+                    self.assertNotIn("has not started; reason not recorded", rendered)
+                if target_state in ("queue", "queue later"):
+                    self.assertIn("acctcolor: Add account colors. " + expected, field)
+                    self.assertIn("Read the report", field)
+                if target_state == "queue later":
+                    self.assertIn("- **Now:** No task runs. Ready delivery has not started; reason not recorded.", rendered)
+                if target_state == "queue text":
+                    self.assertIn("  1. Review acctcolor: Add account colors", rendered)
+                if target_state == "plan":
+                    self.assertIn("Plan next: Later delivery (30); then 31.", field)
+                if target_state == "working":
+                    self.assertIn("- **Now:** The implementation worker writes Current delivery (work).", rendered)
+                if label == "Merge":
+                    self.assertNotIn("absent from the merge line; reason not recorded", rendered)
+
+        for merge_state, expected in (
+                ("in line", "delivery is done; waiting to merge, 1st in line."),
+                ("running", "delivery is done; merging now."),
+                ("failed", "delivery did not merge: failed at tests: release test failed;"),
+                ("merged", ""), ("on main", "")):
+            with self.subTest(merge_state=merge_state):
+                with land_queue.edited() as items:
+                    items.clear()
+                land_runs.results_path().unlink(missing_ok=True)
+                commit = base if merge_state == "on main" else sent
+                _ = self.write_run(member, "reasons", [("delivery", "Completed delivery")], [
+                    self.phase_event("checkpoint", "delivery", checkpoint_commit=commit),
+                    {**hold, "target_work": "delivery"}])
+                _ = self.queue(member)
+                if merge_state == "in line":
+                    land_queue.add("reasons delivery", batch="", commits=[commit], first=False, before=None)
+                if merge_state in ("failed", "merged"):
+                    land_runs.record_result(commit=commit, production="sdlc", unit="reasons", phase="delivery",
+                        landed=merge_state == "merged", step="tests", state="failed", detail="release test failed")
+                with land_runs.landing([commit] if merge_state == "running" else [], ["reasons delivery"]):
+                    rendered = self.blocks([member], {})
+                self.assertNotIn("the user approves the release", rendered)
+                self.assertNotIn("keeps it from the merge", rendered)
+                if expected:
+                    self.assertIn(expected, rendered)
 
     def test_merge_groups_appear_once_and_sent_phases_leave_now(self) -> None:
         member = self.member("merge")
