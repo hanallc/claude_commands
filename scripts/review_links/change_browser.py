@@ -422,7 +422,7 @@ def owner_groups(items: list[Rebuild]) -> str:
 
 
 # Machines sit side by side when the frame is wide; under each owner, a time is a column beside its reasons.
-REBUILD_STYLE = """<style>main{max-width:1060px}
+REBUILD_STYLE = """<style>main{max-width:1124px}
 [data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
 [data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
 [data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
@@ -435,7 +435,7 @@ def render_rebuilds() -> bytes:
     """Render the status line's rebuild answer for the console's rebuild link and Rebuilds page."""
     config = conf.path("statusline")
     rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
-    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
+    return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -455,7 +455,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
     content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
-               + f'<h1>{change_page.TITLES[kind]}</h1>'
+               + f'<h1 class="page-title">{change_page.TITLES[kind]}</h1>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'

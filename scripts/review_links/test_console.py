@@ -105,7 +105,8 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('id="mobile-nav-toggle"', source)
         self.assertIn('aria-label="Open navigation"', source)
         self.assertIn('class="lucide lucide-menu"', source)
-        self.assertIn('.sidebar .brand,.collapsed .sidebar,.page-header{display:none}', source)
+        self.assertIn('.sidebar .brand,.collapsed .sidebar{display:none}', source)
+        self.assertNotIn('page-header', source)
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
