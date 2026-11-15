@@ -3987,3 +3987,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_verify_step_state` and the nine fixture imports read it from there.
 - AWS pair (c7a.4xlarge, 3 rounds): sum of 7 verify modules 182.56 -> 171.38 CPU s.
 - Commit a9fed9fdd. Test-only change.
+
+### Phase 273 — The step-routes targets fixture runs inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- The step-routes `targets.py` fixture has a top-level `main`, so verify_helper runs it inside the helper process.
+- It loads the real `build_targets.py` once for each helper and calls its `main`. Each answer and route event stays the same.
+- The four tests that edit the fixture text use the indented layout.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 9 verify modules 175.06 -> 116.08 CPU s; `test_verify_lint_local_writes` 59.44 -> 31.14.
+- Commit a8e5d997f. Test-only change.
+
+### Phase 274 — The status line reads staff.json with one jq start  · status: done
+**Depends on:** none
+**Owner:** natest (production change; needs the sdlc go).
+
+#### As-built
+
+- One jq call in `statusline.sh` reads staff.json. It prints `unit <id> <session>` for the payload session's unit row, or else the showrunner ids.
+- The payload goes in with `--arg` and `fromjson` in a `try`. A bad payload matches no unit row; `/dev/null` staff gives no owners.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_statusline` 45.11 -> 44.66 CPU s.
+- Commit 9d9e95bab. Production change; sdlc go 2026-11-14.

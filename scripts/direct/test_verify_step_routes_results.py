@@ -25,16 +25,16 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
                                       + '\n(Path(os.environ["PACKAGE_ROOT"]) / "mac-returned").touch()\n')
                 targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
                 _ = targets.write_text(TARGETS.replace(
-                    'raise SystemExit(10 if any(holders.iterdir()) else 0)', '''
-    marker = Path(os.environ["PACKAGE_ROOT"]) / "mac-returned"
-    if marker.exists():
-        with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-        from scripts.direct.step_row_test_support import read_step_row
-        record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
-        (Path(os.environ["PACKAGE_ROOT"]) / "pending-state").write_text(record["state"])
-        for path in holders.iterdir():
-            path.unlink()
-    raise SystemExit(10 if any(holders.iterdir()) else 0)'''))
+                    '        return 10 if any(holders.iterdir()) else 0', '''
+        marker = Path(os.environ["PACKAGE_ROOT"]) / "mac-returned"
+        if marker.exists():
+            with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+            from scripts.direct.step_row_test_support import read_step_row
+            record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
+            (Path(os.environ["PACKAGE_ROOT"]) / "pending-state").write_text(record["state"])
+            for path in holders.iterdir():
+                path.unlink()
+        return 10 if any(holders.iterdir()) else 0'''))
                 result = self.run_verify("test", "sample")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(observed.read_text(), "waiting_mac")

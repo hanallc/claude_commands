@@ -766,7 +766,8 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                        epoch=EPOCH + 60, checkout=str(gate))
         self.write_run([module_run("test_alpha.py", 900.0)], host="ip-10-0-0-3.us-east-2.compute.internal",
                        epoch=EPOCH + 120)
-        self.write_run([module_run("test_alpha.py", 700.0)], epoch=EPOCH + 180, checkout=str(gate))
+        # A gate host runs this test, so the run off the AWS hosts names its host.
+        self.write_run([module_run("test_alpha.py", 700.0)], host="natedev", epoch=EPOCH + 180, checkout=str(gate))
         output = self.report("top", "--host", "aws", "--repo", str(self.repo))
         alpha = self.line(output, "tools/test_alpha.py")
         self.assertEqual(self.cell(output, alpha, "median s"), "6.000", output)
