@@ -52,15 +52,15 @@ The JSON output contains the newest record fields with the joined `reason`.
 
 ## Typed reader
 
-`read_needs() -> list[MachineNeeds]` gives the page the same summaries as the list command.
+`read_needs() -> list[MachineNeeds]` gives the rebuilds page the same summaries as the list command.
 Each `MachineNeeds` contains `newest: NeedRecord` and `reasons: tuple[str, ...]`.
 Its `records: tuple[NeedRecord, ...]` retains each open record, from oldest to newest.
-The review page lists these records newest first under `After the rebuild` for each machine.
-It shows the rebuild instruction before the reasons.
-A closed Details disclosure shows full commits, current staff names and kinds, and different requesters.
-The page counts machines with open needs and has no combined total across review types.
-It shows natedev before the Mac and tells the user to refresh after the rebuild.
-An empty view shows `No rebuilds needed.`
+The Hana console's bottom-left rebuild link reads `/console/rebuilds.html` and shows only while a need is open.
+Its label names each machine and the count of open needs.
+A click opens an overlay that lists the records newest first for each machine, after the rebuild instruction.
+Each record shows its reason, source agent, affected session when different, and full commit, with current staff names and kinds.
+The page shows natedev before the Mac.
+An empty view shows `No rebuilds needed.` and hides the link.
 Its `record()` method returns the newest fields with the joined reason.
 The reader reads only the open JSON files in the needs folder.
 It does not read completed files or run subprocesses.

@@ -119,6 +119,10 @@ class CostFixture(unittest.TestCase):
             "AWS_TARGET_CONFIG": str(self.settings),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })))
+        # Login shells set AWS_SHARED_CREDENTIALS_FILE to the real home; the fixture home must decide every AWS path.
+        # The patch above restores the removed names when the test ends.
+        for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
+            del os.environ[name]
         install_cost_settings(self.settings)
 
     def configure(self, overrides: str) -> None:

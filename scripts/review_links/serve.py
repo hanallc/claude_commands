@@ -83,7 +83,8 @@ def sweep_snapshots(root: Path, now: float) -> int:
         return removed
     for entry in entries:
         try:
-            if entry.is_symlink() or not entry.is_dir():
+            # The fixed console folder holds the console's browser token for every later request.
+            if entry.name == change_page.CONSOLE_FOLDER or entry.is_symlink() or not entry.is_dir():
                 continue
             children = list(entry.iterdir())
             # New snapshots contain regular files. Check symlinks before their
@@ -108,12 +109,51 @@ def sweep_snapshots(root: Path, now: float) -> int:
     return removed
 
 
+def old_console_link(root: Path, path: str) -> str:
+    """Give the fixed console address for an older console, browser or rebuild link."""
+    parts = urlsplit(path)
+    match = re.fullmatch(r"/([a-z0-9]{6})/(" + "|".join(map(re.escape, (
+        console.PAGE_NAME, change_page.PAGE_NAME, change_page.REBUILDS_NAME))) + ")", parts.path)
+    # A selected-row page keeps its own signed link.
+    if match is None or (match[2] == change_page.PAGE_NAME and (root / match[1] / change_page.MANIFEST).exists()):
+        raise FileNotFoundError("not an older console link")
+    page = "" if match[2] == console.PAGE_NAME else match[2]
+    return f"/{change_page.CONSOLE_FOLDER}/{page}" + (f"?{parts.query}" if parts.query else "")
+
+
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
     """Serve regular files within the snapshot root, without directory indexes."""
 
     @override
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
+        route = urlsplit(self.path)
+        if route.path == f"/{change_page.CONSOLE_FOLDER}":
+            self.redirect(f"/{change_page.CONSOLE_FOLDER}/" + (f"?{route.query}" if route.query else ""))
+            return None
+        if route.path == f"/{change_page.CONSOLE_FOLDER}/":
+            try:
+                content = console.render(console.read_pages(), console.read_rebuilds())
+            except (OSError, ValueError, ImportError) as error:
+                print(f"review-links console: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The console is not available.</p>"))
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
+                             + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
+            self.end_headers()
+            return BytesIO(content)
+        try:
+            location = old_console_link(root, self.path)
+        except FileNotFoundError:
+            pass
+        else:
+            self.redirect(location)
+            return None
         try:
             branches = branch_page.page_at(root, self.path)
         except FileNotFoundError:
@@ -132,6 +172,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
                     return None
             self.html_response(200, branch_page.render(branches))
+            return None
+        try:
+            change_browser.rebuilds_at(root, self.path)
+            content = change_browser.render_rebuilds()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links rebuilds: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The rebuild list is not available.</p>"))
+            return None
+        else:
+            self.html_response(200, content)
             return None
         try:
             browser = change_browser.page_at(root, self.path)
@@ -194,10 +246,6 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(stat.st_size))
             self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
             self.send_header("X-Content-Type-Options", "nosniff")
-            if file.name == console.PAGE_NAME:
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; "
-                                 + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
         except BaseException:
             stream.close()

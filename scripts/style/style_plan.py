@@ -22,7 +22,7 @@ import tempfile
 import time
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -258,15 +258,16 @@ def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[st
 
 def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges,
                      kind: str, crate: str, rule: str, files: tuple[str, ...],
-                     findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForSync | SyncNotNeeded:
+                     findings: tuple[style_ledger.HeldFinding, ...] = (),
+                     main_edits: EditedFiles | None = None) -> WaitingForSync | SyncNotNeeded:
     # Structure tickets read source and never edit it, even when main has moved.
     if kind == "structure":
         return SyncNotNeeded()
     # Only the selected proposal needs a footprint at main, where new callers may have appeared.
     if isinstance(changes, MainChanges) and changes.paths and findings:
         try:
-            main_edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
-            files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in main_edits.of(finding)))))
+            edits = main_edits or EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
+            files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in edits.of(finding)))))
         except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
             changes = UnknownMainChanges(f"cannot read selected footprint at main: {error}")
     check = ticket_sync_check(changes, files)
@@ -964,19 +965,22 @@ class _ModuleRenames:
     module_sites: bool
 
 
-def _module_renames(repo: Path, path: str, before: str,
-                    moves: tuple[FileRename, ...]) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
-    """Rename each module site of an approved file rename in the HEAD text of the Rust file at path.
-
-    The scan reads the file's `plain_words`, and a raw site keeps its `r#`, so `mod r#lock;` takes
-    `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
-    """
+def _head_spans(before: str) -> tuple[style_footprint.TokenSpan, ...] | NoRenamedText:
+    """The token spans of a HEAD text, or `NoRenamedText` when the text has a token the gate cannot read."""
     try:
         old = style_footprint.token_spans(before)
     except style_footprint.UnreadableTokenSpans:
         return NoRenamedText()
-    if len(old) != len(style_footprint.tokens(before)):
-        return NoRenamedText()
+    return old if len(old) == len(style_footprint.tokens(before)) else NoRenamedText()
+
+
+def _module_renames(repo: Path, path: str, before: str, old: tuple[style_footprint.TokenSpan, ...],
+                    moves: tuple[FileRename, ...]) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
+    """Rename each module site of an approved file rename in the HEAD text of the Rust file at path, from its spans old.
+
+    The scan reads the file's `plain_words`, and a raw site keeps its `r#`, so `mod r#lock;` takes
+    `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
+    """
     words, plain = tuple(span.token.value for span in old), plain_words(old)
     renamed = list(words)
     scans: list[RenamedModuleScan] = []
@@ -999,11 +1003,20 @@ def _module_renames(repo: Path, path: str, before: str,
     return _ModuleRenames(words, tuple(renamed), comments, module_sites)
 
 
-def module_site_reading(repo: Path, path: str, before: str,
-                        moved: FileRename) -> ModuleSiteReading | NoRenamedText | UncertainModulePath:
-    """Whether the Rust file at path names a module of moved, without the renamed code that `renamed_text` builds."""
-    renames = _module_renames(repo, path, before, (moved,))
-    return ModuleSiteReading(renames.module_sites) if isinstance(renames, _ModuleRenames) else renames
+def module_site_readings(repo: Path, path: str, before: str, moves: tuple[FileRename, ...]
+                         ) -> tuple[ModuleSiteReading | NoRenamedText | UncertainModulePath, ...]:
+    """Whether the Rust file at path names a module of each move, without the renamed code that `renamed_text` builds.
+
+    One token read of the file serves every move.
+    """
+    old = _head_spans(before)
+    if isinstance(old, NoRenamedText):
+        return tuple(old for _ in moves)
+    readings: list[ModuleSiteReading | NoRenamedText | UncertainModulePath] = []
+    for moved in moves:
+        renames = _module_renames(repo, path, before, old, (moved,))
+        readings.append(ModuleSiteReading(renames.module_sites) if isinstance(renames, _ModuleRenames) else renames)
+    return tuple(readings)
 
 
 def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ...],
@@ -1013,7 +1026,10 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     Each module site of an approved file rename takes its new word (`_module_renames`), then each qualified reference
     of an approved rename, which reads its parent from the HEAD words.
     """
-    renames = _module_renames(repo, path, before, moves)
+    old = _head_spans(before)
+    if isinstance(old, NoRenamedText):
+        return old
+    renames = _module_renames(repo, path, before, old, moves)
     if not isinstance(renames, _ModuleRenames):
         return renames
     words, renamed = renames.words, list(renames.renamed)
@@ -2742,6 +2758,8 @@ class EditedFiles:
         self.texts: dict[str, str] = {}
         # The renamed_text of each file rename in each file that names its old module.
         self.readings: dict[FileRename, tuple[tuple[str, ModuleSiteReading | NoRenamedText | UncertainModulePath], ...]] = {}
+        # The file moves of prepared findings with no saved footprint; the first module reading reads them all.
+        self.pending: dict[FileRename, None] = {}
         self.declarations: dict[str, ModuleDeclarationText | UnreadableDeclarationText] = {}
         self.edited: dict[str, tuple[str, ...]] = {}
         self.named: dict[str, tuple[tuple[str, str], ...]] = {}
@@ -2755,14 +2773,38 @@ class EditedFiles:
                       (self.repo / folder / "main.rs").is_file(), encode_proof(crate_library(self.repo, PurePosixPath(folder))))
                      for folder in self.ledger.footprint_roots(self.commits()))
 
+    def prepare(self, findings: Iterable[style_ledger.HeldFinding]) -> None:
+        """Load the saved footprint of each finding. Keep the file moves of the others, so that `module_readings` reads
+        each declaring file once for all of them."""
+        self.ledger.prepare_finding_footprints()
+        for finding in findings:
+            if finding.finding_id in self.footprints:
+                continue
+            stored = self.ledger.stored_finding_footprint(finding, *self._footprint_view(finding))
+            moved = file_rename(finding.kind, finding.path, finding.after)
+            if isinstance(stored, FindingFootprint):
+                self.footprints[finding.finding_id] = stored
+            elif isinstance(moved, FileRename) and moved not in self.readings:
+                self.pending[moved] = None
+
+    def _source_reads(self, finding: style_ledger.HeldFinding) -> bool:
+        return (isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)
+                or isinstance(approved_rename(finding.kind, finding.before, finding.after), ApprovedRename)
+                or approved_renames.edits_module_owners(finding.kind, finding.path, finding.after))
+
+    def _footprint_view(self, finding: style_ledger.HeldFinding) -> tuple[str, object]:
+        """The stored footprint view of finding and the inputs its identity holds."""
+        if not self._source_reads(finding):
+            return "recorded", ()
+        view = f"synced-and-{self.role.value}" if isinstance(self.base, UnitBranchTip) else "synced"
+        return view, (self.commits(), self.root_inputs)
+
     def footprint(self, finding: style_ledger.HeldFinding) -> FindingFootprint:
         if finding.finding_id not in self.footprints:
             if not self.footprints:
                 self.ledger.prepare_finding_footprints()
             moved = file_rename(finding.kind, finding.path, finding.after)
-            source_reads = (isinstance(moved, FileRename)
-                            or isinstance(approved_rename(finding.kind, finding.before, finding.after), ApprovedRename)
-                            or finding.kind == "restructure" and finding.path.endswith(".rs"))
+            source_reads = self._source_reads(finding)
             def calculate() -> FindingFootprint:
                 self.required_blobs = set()
                 files = self._computed_files(finding)
@@ -2772,10 +2814,8 @@ class EditedFiles:
                 if source_reads:
                     self.ledger.record_finding_sources(self.commits(), tuple(self.required_blobs))
                 return FindingFootprint(files, uncertain)
-            view = (f"synced-and-{self.role.value}" if isinstance(self.base, UnitBranchTip) else "synced") if source_reads else "recorded"
-            inputs = (self.commits(), self.root_inputs) if source_reads else ()
             self.footprints[finding.finding_id] = self.ledger.finding_footprint(
-                finding, view, inputs, calculate)
+                finding, *self._footprint_view(finding), calculate)
         return self.footprints[finding.finding_id]
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
@@ -2795,7 +2835,7 @@ class EditedFiles:
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             computed = (finding.path, *named_files)
-        elif finding.kind == "restructure" and finding.path.endswith(".rs"):
+        elif approved_renames.edits_module_owners(finding.kind, finding.path, finding.after):
             owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
                       if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
             computed = (finding.path, *owners)
@@ -2906,26 +2946,44 @@ class EditedFiles:
             self.texts[unread[label]] = content.decode(errors="replace")
 
     def module_readings(self, moved: FileRename) -> tuple[tuple[str, ModuleSiteReading | NoRenamedText | UncertainModulePath], ...]:
-        """`module_site_reading` of moved in each Rust file at either commit that `declaring` gives for its old stem, the renamed
-        file included, scanned once for each file version and kept for the refill.
+        """`module_site_readings` of moved in each Rust file at either commit that `declaring` gives for its old stem, the
+        renamed file included, kept for the refill. The first reading also reads the `pending` moves, so each file version
+        is tokenized once for all of them.
 
         A file outside the crate's root folder names the module only through the library's name or a `path` attribute
         that names the old file, so a text that holds neither name, and no `path` string the scan cannot read, is not
         scanned.
         """
-        if moved in self.readings:
-            _ = self.declaring_versions(moved.old_stem)
-        else:
-            root = crate_root(self.repo, moved.old)
-            library = crate_library(self.repo, root) if isinstance(root, PurePosixPath) else NoLibrary()
-            self.readings[moved] = tuple(
-                (path, module_site_reading(self.repo, path, text, moved)) for path, text in self.declaring(moved.old_stem)
-                if not (isinstance(root, PurePosixPath)
-                        and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
-                        and PurePosixPath(moved.old).name not in text
-                        and not (isinstance(library, Library) and library.name in text)
-                        and not UNREAD_PATH_STRING.search(text)))
+        if moved not in self.readings:
+            # The other moves' reads are not this finding's sources.
+            required = set(self.required_blobs)
+            self._read_module_sites((moved, *(other for other in self.pending if other not in self.readings)))
+            self.pending.clear()
+            self.required_blobs = required
+        _ = self.declaring_versions(moved.old_stem)
         return self.readings[moved]
+
+    def _read_module_sites(self, moves: tuple[FileRename, ...]) -> None:
+        """Read the tokens of each declaring file once, for every move whose old stem the file may declare."""
+        declaring = {moved: self._declaring_files(moved) for moved in moves}
+        movers: dict[tuple[str, str], list[FileRename]] = defaultdict(list)
+        for moved, files in declaring.items():
+            for file in files:
+                movers[file].append(moved)
+        readings = {(path, text): dict(zip(file_moves, module_site_readings(self.repo, path, text, tuple(file_moves)), strict=True))
+                    for (path, text), file_moves in movers.items()}
+        for moved, files in declaring.items():
+            self.readings[moved] = tuple((file[0], readings[file][moved]) for file in files)
+
+    def _declaring_files(self, moved: FileRename) -> tuple[tuple[str, str], ...]:
+        root = crate_root(self.repo, moved.old)
+        library = crate_library(self.repo, root) if isinstance(root, PurePosixPath) else NoLibrary()
+        return tuple((path, text) for path, text in self.declaring(moved.old_stem)
+                     if not (isinstance(root, PurePosixPath)
+                             and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
+                             and PurePosixPath(moved.old).name not in text
+                             and not (isinstance(library, Library) and library.name in text)
+                             and not UNREAD_PATH_STRING.search(text)))
 
 
 def _unbuilt_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
@@ -3023,13 +3081,23 @@ def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketR
     return work
 
 
+def edits_at_main(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges) -> EditedFiles | None:
+    """The footprint reader at main's pushed tip when main changed paths. A selection passes one reader to each
+    `checkpoint_selection` and `ticket_sync_wait`, so each declaring file is tokenized once."""
+    if isinstance(changes, MainChanges) and changes.paths:
+        return EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
+    return None
+
+
 def checkpoint_selection(work: WaitingCheckpoint | NoCheckpointBlock, ledger: style_ledger.Ledger,
                          changes: MainChanges | UnknownMainChanges, files: tuple[str, ...],
-                         findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForMerge | NoCheckpointBlock:
+                         findings: tuple[style_ledger.HeldFinding, ...] = (),
+                         main_edits: EditedFiles | None = None) -> WaitingForMerge | NoCheckpointBlock:
+    """A merge wait for the files, and for the files at main of the findings; a call without main_edits reads its own."""
     if isinstance(work, NoCheckpointBlock):
         return work
     if isinstance(changes, MainChanges) and changes.paths and findings:
-        edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
+        edits = main_edits or EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
         if any(edits.uncertain(finding) for finding in findings):
             raise style_ledger.LedgerError("selected footprint at main is uncertain")
         files = (*files, *(path for finding in findings for path in edits.of(finding)))
@@ -3497,6 +3565,7 @@ def _select_observed_phase(
         # A finding whose change edits another busy file waits, and so does a file rename whose edit the gate cannot
         # prove; the other findings of its file stay available.
         footprint_waits: Counter[tuple[str, str]] = Counter()
+        edits.prepare(finding for path in set(by_file) - outside - held - set(changed) for finding in by_file[path])
         for path in sorted(set(by_file) - outside - held - set(changed)):
             free: list[style_ledger.HeldFinding] = []
             for finding in by_file[path]:
@@ -3514,14 +3583,17 @@ def _select_observed_phase(
         refusals["outside pilot scope"] += sum(len(by_file[path]) for path in outside)
         refusals["busy or rank held"] += sum(len(by_file[path]) for path in held)
         refusals["waiting for sync"] += sum(len(by_file[path]) for path in changed)
+        main_edits = edits_at_main(ledger, changes)
+        if main_edits is not None:
+            main_edits.prepare(finding for path in set(by_file) - outside - held - set(changed) for finding in by_file[path])
         for path in sorted(set(by_file) - outside - held - set(changed)):
             members = tuple(by_file[path])
             if not members:
                 continue
             footprint = tuple(dict.fromkeys(edited for finding in members for edited in edits.of(finding)))
-            checkpoint = checkpoint_selection(predecessor, ledger, changes, footprint, members)
+            checkpoint = checkpoint_selection(predecessor, ledger, changes, footprint, members, main_edits)
             sync = ticket_sync_wait(ledger, changes, "proposal", style_proposals.crate_for(directories, path), rule,
-                                    footprint, members)
+                                    footprint, members, main_edits)
             if isinstance(checkpoint, WaitingForMerge) or isinstance(sync, WaitingForSync):
                 refusals["waiting for merge" if isinstance(checkpoint, WaitingForMerge) else "waiting for sync"] += len(members)
                 by_file[path] = []

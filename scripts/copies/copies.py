@@ -863,31 +863,32 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         **(record.fields if isinstance(record, copy_record.Registered) else {}),
         "test_hana_clone": True, "source_path": str(source.resolve()),
     }, scratch_settings=scratch_settings)
-    checkout = path / "checkout"
     try:
-        # The task folder keeps one lock path while its checkout gains Git metadata.
+        # The task folder is the checkout, so its cargo build folder has the task folder's name.
         with claim_tree(path, create=False) as state:
             if state is not ClaimState.ACQUIRED:
                 raise CopyError(f"{path}: task folder is busy")
-            checkout.mkdir()
-            initialize_git(checkout, source.resolve())
-            _ = git(checkout, "reset", "--hard", "--quiet")
+            initialize_git(path, source.resolve())
+            scratch.exclude_copy_metadata(path)
+            _ = git(path, "reset", "--hard", "--quiet")
             from scripts.accounts import accounts
 
             if accounts.source_has_claude_trust(source):
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
-                    "claude_trust_folder": str(checkout.resolve()),
+                    "claude_trust_folder": str(path.resolve()),
                 }, scratch_settings=scratch_settings)
-                accounts.set_claude_folder_trust(checkout, trusted=True)
-            source_commit = git(checkout, "rev-parse", "HEAD").decode().strip()
+                accounts.set_claude_folder_trust(path, trusted=True)
+            source_commit = git(path, "rev-parse", "HEAD").decode().strip()
             _ = scratch.update_record(path, lambda record: {
                 **(record.fields if isinstance(record, copy_record.Registered) else {}),
                 "source_commit": source_commit,
             }, scratch_settings=scratch_settings)
+        # The claim began before .git existed; later claims lock .git/.claude-busy.
+        (path / scratch.BUSY).unlink(missing_ok=True)
     except (OSError, CopyError) as error:
         raise CopyError(f"clone failed; its task still owns the partial folder {path}: {error}") from error
-    return checkout
+    return path
 
 
 def apply_changes(tree: Path, worktree: Path, base: str) -> None:
@@ -1942,7 +1943,8 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
             yield
         finally:
             COMMAND_LOCKS.reset(token)
-            if not tree.parent.exists():
+            # The parent lease guards the sibling lock; with both gone it guards nothing.
+            if not tree.exists() and not floor_claims.mirror_lock_path(tree).exists():
                 parent_lock.unlink(missing_ok=True)
             # Closing releases only our descriptor. Live children retain the flock.
 
@@ -2076,8 +2078,13 @@ def mirror_remove(args: CopyArguments) -> int:
             if tree.exists():
                 write_text_atomic(authority, json.dumps(raw) + "\n")
                 task_record = copy_record.record_path(tree)
-                if task_record is not None and task_record.parent != tree:
+                # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
+                if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
                     scratch.remove_marked(task_record.parent, scratch.remove)
+                    # A task clone is its task folder, so its lock files sit in the scratch root.
+                    if task_record.parent == tree.resolve():
+                        for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
+                            lock.unlink(missing_ok=True)
                 else:
                     clear_mirror_content(tree)
                     tree.rmdir()

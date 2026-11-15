@@ -19,7 +19,6 @@ import signal
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from contextvars import ContextVar
@@ -805,9 +804,8 @@ def reserve_assigned(args: CliArguments) -> int:
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-                    placement.attempt_key(assignment.episode, assignment.attempt)).hex,
-                    assignment.episode, assignment.attempt)
+                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                                     assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
                     return 78

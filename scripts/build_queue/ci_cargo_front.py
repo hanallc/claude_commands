@@ -27,15 +27,11 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
+from scripts.buildlog import parse
 from scripts.lib import cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
-BUILDING = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
-                      "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "miri", "mend"})
-GLOBAL_VALUES = frozenset({"-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path",
-                          "--target-dir", "--target", "-j", "--jobs", "-p", "--package", "--exclude",
-                          "-F", "--features", "--profile", "--message-format", "--artifact-dir", "--out-dir"})
 PR_SET_PDEATHSIG = 1
 LIBC = ctypes.CDLL(None, use_errno=True)
 
@@ -46,18 +42,16 @@ class JobTemporaryFolder:
 
 
 def building_call(arguments: Sequence[str]) -> bool:
-    values = iter(arguments)
-    for value in values:
-        if value in GLOBAL_VALUES:
-            _ = next(values, "")
-        elif not value.startswith(("-", "+")):
-            for argument in values:
-                if argument == "--":
-                    break
-                if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
-                    return False
-            return value in BUILDING
-    return False
+    index = parse.cargo_subcommand_index(arguments)
+    if index is None:
+        return False
+    value = arguments[index]
+    for argument in arguments[index + 1:]:
+        if argument == "--":
+            break
+        if argument in ("-h", "--help") or (value != "install" and argument in ("-V", "--version")):
+            return False
+    return value in parse.CARGO_BUILD_VERBS
 
 
 def cargo_path(explicit: str, front: Path) -> tuple[str, str]:
@@ -152,49 +146,52 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
             client.CLOCK.now(), str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width)
-        output = client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
-        grant = client.service_admit(request, output)
-        if not isinstance(grant, wire.RunnerAdmitted):
-            if isinstance(grant, wire.Refused):
-                print(grant.reason, file=sys.stderr)
-            return 1
-        output.finished()
-        place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
-            purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
-        environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
-        status = 1
-        cleanup = ExitStack()
-        try:
-            _ = adopt_descendants()
-            # The main thread forks because the death signal follows the thread that forks.
-            process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
-                                  preexec_fn=partial(end_with_front, pid))
-            stream = process.stderr
-            if stream is None:
-                raise RuntimeError("cargo progress pipe is unavailable")
-            reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
-            reader.start()
-            _ = cleanup.callback(stream.close)
-            _ = cleanup.callback(reader.join)
-            status = process.wait()
-        except SystemExit as error:
-            status = error.code if isinstance(error.code, int) else 1
-            raise
-        finally:
-            with cancellation.defer_cleanup_signals():
-                try:
-                    place.finish(failed=status != 0)
-                finally:
+        with ExitStack() as reservation:
+            try:
+                held = reservation.enter_context(queue_place.held_reservation(request))
+            except queue_place.QueuePlaceRefused as error:
+                print(error, file=sys.stderr)
+                return 1
+            grant = held.grant
+            if not isinstance(grant, wire.RunnerAdmitted):
+                print("the service estimate grant has no runner timing", file=sys.stderr)
+                return 1
+            place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
+                purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
+            environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
+            status = 1
+            cleanup = ExitStack()
+            try:
+                _ = adopt_descendants()
+                # The main thread forks because the death signal follows the thread that forks.
+                process = place.popen(argv, env=environment, stderr=subprocess.PIPE,
+                                      preexec_fn=partial(end_with_front, pid))
+                stream = process.stderr
+                if stream is None:
+                    raise RuntimeError("cargo progress pipe is unavailable")
+                reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
+                reader.start()
+                _ = cleanup.callback(stream.close)
+                _ = cleanup.callback(reader.join)
+                status = process.wait()
+            except SystemExit as error:
+                status = error.code if isinstance(error.code, int) else 1
+                raise
+            finally:
+                with cancellation.defer_cleanup_signals():
                     try:
-                        cleanup.close()
+                        place.finish(failed=status != 0)
                     finally:
                         try:
-                            while os.waitpid(-1, os.WNOHANG)[0]:
-                                pass
-                        except ChildProcessError:
-                            pass
+                            cleanup.close()
                         finally:
-                            _ = client.release(grant.reservation, status, grant.cleanup_timing)
+                            try:
+                                while os.waitpid(-1, os.WNOHANG)[0]:
+                                    pass
+                            except ChildProcessError:
+                                pass
+                            finally:
+                                held.status = status
         return status if status >= 0 else 128 - status
 
 
