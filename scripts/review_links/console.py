@@ -222,7 +222,7 @@ DOCUMENT = """<!doctype html>
 <title>Hana console</title>
 <style>
 :root{color-scheme:light dark;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
---nav:#f8f9fc;--page:#fff;--text:#192339;--muted:#626c7e;--border:#e1e5ed;--active:#e8edfd;--accent:#2849a3;--hover:#edf0f6;
+--nav:#f8f9fc;--page:#fff;--text:#192339;--muted:#525c6e;--border:#e1e5ed;--active:#e8edfd;--accent:#2849a3;--hover:#edf0f6;
 --notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3}
 @media(prefers-color-scheme:dark){:root{--nav:#141b28;--page:#10151e;--text:#e4eaf4;--muted:#a4afc2;
 --border:#2d3748;--active:#253758;--accent:#c2d4ff;--hover:#202b3c;--notice:#3a2b12;--notice-text:#ffd28f;--notice-hover:#4a3718}}
@@ -244,7 +244,7 @@ color:var(--muted);text-decoration:none;font-weight:550;white-space:nowrap}
 .nav-entry[aria-current=page]{background:var(--active);color:var(--accent)}
 .nav-entry[aria-current=page]:before{content:"";position:absolute;left:-12px;top:13px;bottom:13px;width:3px;background:var(--accent);border-radius:0 3px 3px 0}
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-.unavailable-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);margin-left:auto}
+.unavailable-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);margin:0 4px 0 auto}
 .new-mark{display:grid;place-items:center;margin-left:auto;color:var(--accent)}.new-mark svg{width:14px;height:14px;fill:currentColor}
 .collapsed .new-mark{position:absolute;top:7px;left:33px;margin:0}.collapsed .new-mark svg{width:11px;height:11px}
 .toggle{position:relative}#menu-new{position:absolute;top:4px;right:4px;left:auto;margin:0}#menu-new svg{width:11px;height:11px}
@@ -280,8 +280,9 @@ background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .sidebar .brand,.collapsed .sidebar,.page-header{display:none}
 .workspace{flex:1;width:100%}
 .shell:not(.collapsed) .dismiss{display:block;position:fixed;inset:56px 0 0;border:0;background:#0003;z-index:2}
-.rebuild-slot,.collapsed .rebuild-slot{left:12px;bottom:12px;width:auto;padding:0}
-.rebuild-link,.collapsed .rebuild-link{width:auto;max-width:220px;box-shadow:0 6px 20px #0003}
+.rebuild-slot,.collapsed .rebuild-slot{position:static;order:1;width:auto;padding:0;border-top:1px solid var(--border);background:var(--nav)}
+.rebuild-slot:has(>[hidden]){display:none}
+.rebuild-link,.collapsed .rebuild-link{width:auto;max-width:none;margin:12px}
 .collapsed .rebuild-link .entry-label{display:inline}.collapsed .rebuild-count,.collapsed .rebuild-link .tooltip{display:none!important}}
 </style></head><body>
 <div class="shell" id="console-shell" <!-- SHELL -->>

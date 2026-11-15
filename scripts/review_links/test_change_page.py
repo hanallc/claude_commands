@@ -1322,7 +1322,7 @@ class ChangePageTests(unittest.TestCase):
 
             with self.subTest(rebuilds="time column"):
                 self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr)', body)
-                self.assertIn('[data-rebuilds] dt{grid-column:1;color:GrayText}[data-rebuilds] dd{grid-column:2;', body)
+                self.assertIn('[data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;', body)
 
             with self.subTest(rebuilds="requester absent"):
                 natedev_needs = next(item for item in need.read_needs() if item.newest["machine"] == "natedev")
