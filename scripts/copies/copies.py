@@ -681,13 +681,14 @@ else:
 
 
 class GateCheckoutDirectory(GateDirectoryBase):
-    """Remove a private gate folder and report a removal failure separately."""
+    """Remove a private gate folder and its Cargo build folder; report a removal failure separately."""
 
     @override
     def cleanup(self) -> None:
         caller_error = sys.exception()
+        remove_tree = super().cleanup
         try:
-            super().cleanup()
+            scratch.remove_with_cargo_output(Path(self.name), lambda _path: remove_tree())
         except OSError as error:
             raise PostUseError(f"{self.name}: fresh copy removal failed: {error}",
                                caller_error=caller_error) from error

@@ -645,6 +645,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.restore_repository()
         _ = self.limits()
         atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        _ = write_config_fixture(self.root / "scratch.conf")
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
         self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         write_machine_config(self.root)

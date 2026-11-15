@@ -10,7 +10,7 @@ import sys
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from scripts.lib import cargo_output
+from scripts.lib import cargo_output, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 
 
@@ -47,6 +47,9 @@ def fake_cargo_output_roots(
                         return output
 
                     return CargoOutputRoots(resolved, relocated(roots.target_directory), relocated(roots.build_directory))
+        if (resolved.parent / copy_record.TEMPORARY_GATE_RECORD).is_file():
+            # Cargo's default layout keeps a fresh gate checkout's output inside the checkout.
+            return CargoOutputRoots(resolved, resolved / "target", resolved / "target")
         return CargoOutputUnavailable("the fixture has no Cargo output mapping")
 
     with ExitStack() as stack:
