@@ -585,41 +585,81 @@ It normalizes that line's whitespace and redacts it again.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
-`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot and configuration.
-It prints machine types as rows and candidate regions as columns.
+`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot, cost ledger and configuration.
+It prints two price tables: the standard types, then the GPU types.
+Each has candidate regions as rows and machine types as columns.
+The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
 Each cell shows the lowest zone price in USD/h.
-An empty cell says `no snapshot`, `read failed`, or `not sold here`.
+A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
+One line `— not sold here` under the price tables names it.
+Another empty cell says `no snapshot` or `read failed`.
 Cached prices and quotas remain visible after a read failure.
-Their cells include `read failed`, and the regional detail gives the last good age.
-Old values include `old <age>s` in their cells.
+Their price cells include `read failed`, and the regional detail gives the last good age.
+Old prices include `old <minutes> min` in their cells.
 Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
 Each region without evidence says `no snapshot was ever taken`.
 The table never uses a bare `-` for an unavailable value.
-It splits wide tables into groups of region columns to fit the terminal.
-Each region shows its snapshot age and a stale mark after `price_max_age_seconds`.
+It splits wide tables into groups of columns to fit the terminal.
+Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
 The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
-Below the prices, it shows both quotas in vCPUs and the number of boxes each type fits.
-Standard types use the Standard quota; GPU types use the G and VT quota.
+Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
+Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
+One region read writes the prices and both quotas together, so the quota cells show no age.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
 An absent snapshot explains missing quotas and box counts without creating files.
-The rows are `instance_types`, then `price_compare_instance_types`, then `gpu_instance_types`.
+The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
 The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, `/aws_prices` shows one block for each type, with one line for each candidate region.
+Below the quotas, `/aws_prices` shows one block for each standard type, with one line for each candidate region.
 The user asked for this layout on 2026-11-14 through builds. Each line shows:
 1. The lowest zone Spot price in USD/h.
-2. The median merge gate box time and the run count, from launch to finish, boot included.
+2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
-3. The estimate: Spot price times that box time, plus the refusal wait cost.
-4. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
-5. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
-6. Refused/launched: capacity and quota refusals, and launches, of the type in the region.
+3. Runs: the run count of that time.
+   A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
+4. The estimate: Spot price times that box time, plus the refusal wait cost.
+5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
+6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
+   Runs on days without a bill show `bill due`.
+7. Paid runs: the count of runs that paid USD/run covers.
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
-A region without its own runs uses the type's runs in other regions, and the cell says so.
-Runs on days without a bill show `not billed`.
-The last line names the cheapest merge gate by estimate.
+The next line names the cheapest merge gate by estimate.
 These blocks do not split for a narrow terminal.
+Below them, two tables show the refused requests and the launched boxes of each type and region.
+Refused requests are capacity and quota refusals.
+The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
+A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `hours_gap_over` is set.
+A type and region without a bill read shows `not billed`. Only types with hours have a row.
+An unreadable cost ledger shows a note in place of the billed hours.
+
+The AWS prices page shows the same tables, published by `aws_page.publish`.
+The user asked for these page changes on 2026-11-14 through builds:
+1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
+   `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
+   The cost cells are the estimate in USD for one run (`RunCosts.prices`), the estimate that gate placement uses.
+   A type and region with no estimate shows a dash. GPU types have no runs, so their cost cells are dashes.
+   The run kind switch also sets the run tables below. The URL keeps both choices, as `?prices=cost&runs=merge-gate`.
+2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
+   In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
+   A strong outline marks the cheapest cell of each table. Equal cheapest cells all have the outline.
+   One legend line explains the colors and the outline. Builds removed the vCPU group mark on 2026-11-15.
+3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
+   The user asked for the side by side cards on 2026-11-15 through builds.
+4. A header of the form `name (unit)` shows the unit on a smaller second line.
+5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
+   The page run tables have no Spot or estimate column, because the cost view shows those numbers.
+6. A `Table.not_sold` cell shows the lucide `ban` icon, with the title `Not sold here` on hover, and no legend.
+   The user asked for it on 2026-11-15 through builds.
+
+A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
+1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
+2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
+3. The colors and the outline use only the chosen regions. `Table.values` holds the number of each cell.
+   One region shows no color and no outline.
+4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
+5. A snapshot line for one region shows only when that region is chosen.
+6. The page keeps the region choice in browser storage. The URL keeps the price view and the run kind.
 
 ### Billed hours check
 
@@ -638,7 +678,7 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Billed hours with no box hours are also over.
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
-`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` row.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` table.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.

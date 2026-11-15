@@ -87,6 +87,7 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .seg-unattributed { background: radial-gradient(circle, var(--ink-3) 1px, transparent 1.4px) 0 0 / 5px 5px, var(--unattributed); }
 .seg-floor { background: var(--floor); }
 .seg-agents { background: var(--agents); }
+.seg-desktop { background: var(--desktop); }
 .hatch-swap { background: repeating-linear-gradient(135deg, var(--agents) 0 3px, var(--free) 3px 6px); }
 .bar > div { cursor: help; }
 .bar > div:hover { filter: brightness(1.12); }
@@ -142,6 +143,7 @@ summary .v { margin-left: auto; padding-left: 12px; font-variant-numeric: tabula
 .sw.free { background: var(--free); border: 1px solid var(--ink-2); }
 .sw.floor { background: var(--floor); }
 .sw.agents { background: var(--agents); }
+.sw.desktop { background: var(--desktop); }
 .sw.swap { background: repeating-linear-gradient(135deg, var(--agents) 0 2px, var(--free) 2px 4px); }
 .sw.cap { background: var(--cap); }
 .section-head { font-weight: 600; font-size: 1rem; }
@@ -353,6 +355,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
         <div class="hatch" id="s-reserved" data-tip="reserved"><span class="lbl" id="l-reserved"></span></div>
         <div class="seg-room" id="s-room" data-tip="room"><span class="lbl" id="l-room"></span></div>
         <div class="seg-floor" id="s-safety" data-tip="safety"><span class="lbl" id="l-safety"></span></div>
+        <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="hatch-swap" id="s-swap" data-tip="swap"><span class="lbl" id="l-swap"></span></div>
         <div class="seg-agents" id="s-agents" data-tip="agents"><span class="lbl" id="l-agents"></span></div>
         <div class="seg-programs" id="s-programs" data-tip="programs"><span class="lbl" id="l-programs"></span></div>
@@ -370,7 +373,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="ci"><span class="sw ci"></span><span class="name">hana CI</span><span class="v num" id="v-ci">–</span></div>
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Reserved RAM</span><span class="v num" id="v-reserved">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Next step room</span><span class="v num" id="v-room">–</span></div>
-      <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety and desktop</span><span class="v num" id="v-safety">–</span></div>
+      <div class="row" data-tip="safety"><span class="sw floor"></span><span class="name">Safety</span><span class="v num" id="v-safety">–</span></div>
+      <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="swap"><span class="sw swap"></span><span class="name">RAM for swap</span><span class="v num" id="v-swap">–</span></div>
       <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
       <div class="row" data-tip="programs"><span class="sw programs"></span><span class="name">Other programs</span><span class="v num" id="v-programs">–</span></div>
@@ -433,31 +437,35 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <script>
 let latest = null;
 const TIPS = {
-  builds: (d) => [`Builds and tools · ${ramAmount(d.ram.builds_bytes)}`, amountLines([
-    ["Queued builds", d.ram.queued_builds_bytes], ["rust-analyzer", d.ram.rust_analyzer_bytes],
-    ["sccache", d.ram.sccache_bytes], ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build program RAM is recorded."],
+  builds: (d) => [`Builds and tools · ${ramAmount(d.ram.builds_bytes)}`, lines("RAM that builds and build tools use now.",
+    amountLines([["Queued builds", d.ram.queued_builds_bytes], ["rust-analyzer", d.ram.rust_analyzer_bytes],
+      ["sccache", d.ram.sccache_bytes], ["Other build tools", d.ram.other_build_tools_bytes]]) || "No build program RAM is recorded.")],
   ci: (d) => [`hana CI · ${ramAmount(d.ram.ci_bytes)}`, "RAM used by hana CI programs.\nFile cache and kernel memory appear separately."],
   reserved: (d) => [`Reserved RAM · ${ramAmount(d.ram.build_covered_bytes)}`, lines(
-    "RAM held for running builds and accepted work.", `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
+    "RAM the queue holds for running builds until they reach their expected peak.",
+    `Reservation target: ${ramAmount(d.ram.build_target_bytes)}.`,
     optional(d.ram.build_missing_bytes, `Missing RAM: ${ramAmount(d.ram.build_missing_bytes)}.`))],
   room: (d) => [`Next step room · ${ramAmount(d.ram.room_bytes)}`, lines(
-    `Available RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety target: ${ramAmount(d.ram.safety_target_bytes)}.`,
+    "RAM that the next waiting step can start in.", `Available RAM: ${ramAmount(d.ram.available_bytes)}.`, `− Safety target: ${ramAmount(d.ram.safety_target_bytes)}.`,
     optional(d.ram.swap_target_bytes, `− Swap reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`),
     optional(d.ram.build_target_bytes, `− Build reservation target: ${ramAmount(d.ram.build_target_bytes)}.`))],
-  safety: (d) => [`Safety and desktop · ${ramAmount(safetyBytes(d.ram))}`, lines(
-    `Safety reserve: ${ramAmount(d.ram.safety_covered_bytes)}; target ${ramAmount(d.ram.safety_target_bytes)}.`,
-    `Desktop programs: ${ramAmount(d.ram.desktop_bytes)}.`,
-    optional(d.ram.desktop_protection_bytes, `Desktop protection setting: ${ramAmount(d.ram.desktop_protection_bytes)}.`),
-    optional(d.ram.desktop_protection_bytes, "Protection does not add RAM to this block."))],
+  safety: (d) => [`Safety · ${ramAmount(d.ram.safety_covered_bytes)}`, lines(
+    "RAM the queue always leaves free, so the machine does not run out of memory.",
+    `Target: ${ramAmount(d.ram.safety_target_bytes)}.`)],
+  desktop: (d) => measuredTip("Desktop", d.ram.desktop_bytes, lines(
+    "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
+    optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`RAM for swap · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "RAM held against swap outside builds and CI.", `Reserve target: ${ramAmount(d.ram.swap_target_bytes)}.`,
+    "RAM the queue leaves free for memory in swap, mostly agents' memory.",
+    "That memory can come back into RAM at any time.", `Target: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Missing RAM: ${ramAmount(d.ram.swap_missing_bytes)}.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
     "RAM used by agent sessions and their tools.\nFile cache and kernel memory appear separately."),
   programs: (d) => [`Other programs · ${ramAmount(d.ram.other_programs_bytes)}`, lines(
+    "RAM that programs other than builds, agents and the desktop use.",
     ...d.ram.programs.map(program => `${program.name}: ${ramAmount(program.bytes)}`),
     d.ram.smaller_program_count ? `and ${d.ram.smaller_program_count} smaller programs: ${ramAmount(d.ram.smaller_programs_bytes)}` : "")],
-  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines(amountLines([
+  kernel: (d) => measuredTip("Kernel, measured", d.ram.kernel_bytes, lines("RAM that the kernel uses for itself.", amountLines([
     ["Compressed swap (zram)", d.ram.compressed_swap_bytes], ["Slab, stacks and page tables", d.ram.kernel_structures_bytes],
     ["Other kernel counters", d.ram.kernel_counters_bytes]]),
     "Reclaimable kernel cache appears in the cache block.")),
@@ -485,7 +493,8 @@ const GIB = 1024 ** 3;
 const RAM_BLOCKS = [
   ["builds", "Builds and tools", r => r.builds_bytes], ["ci", "hana CI", r => r.ci_bytes],
   ["reserved", "Reserved RAM", r => r.build_covered_bytes], ["room", "Next step room", r => r.room_bytes],
-  ["safety", "Safety and desktop", r => safetyBytes(r)], ["swap", "RAM for swap", r => r.swap_covered_bytes],
+  ["safety", "Safety", r => r.safety_covered_bytes], ["desktop", "Desktop", r => r.desktop_bytes],
+  ["swap", "RAM for swap", r => r.swap_covered_bytes],
   ["agents", "Agents", r => r.agents_bytes], ["programs", "Other programs", r => r.other_programs_bytes],
   ["kernel", "Kernel, measured", r => r.kernel_bytes], ["cache", "File and kernel cache", r => r.cache_bytes],
   ["unattributed", "Not attributed", r => r.unattributed_bytes],
@@ -503,7 +512,6 @@ function measuredTip(name, bytes, body) {
   return recorded(bytes) ? [`${name} · ${ramAmount(bytes)}`, body]
     : [`${name} · unavailable`, "The latest reading is unavailable.\nThis amount is unknown."];
 }
-function safetyBytes(r) { return r.safety_covered_bytes + (recorded(r.desktop_bytes) ? r.desktop_bytes : 0); }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
   return ({
@@ -1370,7 +1378,10 @@ function recordReadFailure(message) {
   else showQueueError(message.replace(/\.$/, ""));
 }
 
+const consoleHidden = () => window.frameElement?.hidden === true;
+
 async function tick() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1385,6 +1396,7 @@ async function tick() {
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
@@ -1396,6 +1408,12 @@ tick();
 setInterval(tick, SECONDS * 1000);
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+addEventListener("message", event => {
+  if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
+    tick();
+    reloadWhenPageChanges();
+  }
+});
 </script>
 </body>
 </html>

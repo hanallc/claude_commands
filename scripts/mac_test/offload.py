@@ -2530,14 +2530,6 @@ def run_offload(
             write_version_decline(request.target, repository.name)
             return DeclinedMacRun("state", elapsed_seconds(started), detail)
         decline_path.unlink(missing_ok=True)
-    if not linux and isinstance(request.source, StagedDocSnapshot):
-        try:
-            scoped_package = eligibility.step_package(request.kind or eligibility.verb_kind(request.verb), request.package)
-            if eligibility.has_linux_only(request.source.root, scoped_package,
-                              eligibility.comma_values(config.values[f"linux_only.{repository.name}"])):
-                return declined("linux_only", started)
-        except (OSError, UnicodeError, ValueError):
-            return declined("repo", started)
 
     try:
         with ExitStack() as admission_leases:
