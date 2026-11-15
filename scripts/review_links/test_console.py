@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import urlsplit
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
+from scripts.lib import conf
 from scripts.review_links import change_page, console
 
 
@@ -50,24 +50,27 @@ class ConsoleTests(unittest.TestCase):
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         with (patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True),
               patch.object(aws_page, "page_url", return_value="/aws/aws_prices.html")):
-            url = console.publish()
-        parsed = urlsplit(url)
-        self.assertEqual(parsed.query, "page=changes")
-        folder = self.root / "snapshots" / parsed.path.split("/")[1]
+            source = console.render(console.read_pages(), console.read_rebuilds()).decode()
+        self.assertEqual(change_page.console_url(), f"http://127.0.0.1:{conf.read('review_links').whole('server_port')}/console/")
+        folder = self.root / "snapshots" / change_page.CONSOLE_FOLDER
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
-        self.assertTrue((folder / change_page.PAGE_NAME).is_file())
         markup = ConsoleMarkup()
-        source = (folder / console.PAGE_NAME).read_text()
         markup.feed(source)
         self.assertEqual(markup.pages, ["aws", "builds", "changes", "questions"])
         self.assertEqual(markup.sources, [])
         self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 9)
-        base = parsed.path.rsplit("/", 1)[0]
+        base = f"/{change_page.CONSOLE_FOLDER}"
         changes = f"{base}/{change_page.PAGE_NAME}"
         self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
         self.assertIn(f'data-url="{changes}?type=questions" data-title="Questions"', source)
         self.assertIn(f'data-rebuilds="{base}/{change_page.REBUILDS_NAME}"', source)
         self.assertIn('aria-controls="rebuild-dialog" hidden>', source)
+        self.assertNotIn("<iframe", source)
+        self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+        self.assertIn("const placeKey = identity => 'at.' + identity;", source)
+        self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
+        self.assertIn("event.data !== 'console-place'", source)
+        self.assertIn("if (opened) frame.contentWindow.postMessage('console-shown', location.origin);", source)
         self.assertIn('<dialog id="rebuild-dialog" aria-labelledby="rebuild-title">', source)
         self.assertIn('class="lucide lucide-refresh-cw"', source)
         self.assertIn('aria-label="Close"', source)

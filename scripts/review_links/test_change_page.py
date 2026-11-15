@@ -273,7 +273,6 @@ class ChangePageTests(unittest.TestCase):
         original = settings.read_text()
         real_write = atomic_file.write_bytes_atomic
         publications: list[tuple[Callable[[], str], str]] = [
-            (change_page.publish_browser, change_page.BROWSER_MANIFEST),
             (lambda: change_page.publish(self.production, self.review_list, ["C1"]), change_page.MANIFEST),
         ]
         for index, (publish, manifest) in enumerate(publications):
@@ -305,12 +304,24 @@ class ChangePageTests(unittest.TestCase):
         result = self.command(change_page, change_page.main, [])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         url = urlsplit(result.stdout.strip())
-        self.assertEqual(url.query, "page=changes")
-        self.assertTrue(url.path.endswith("/console.html"), result.stdout)
-        folder = self.root / url.path.split("/")[1]
-        self.assertTrue((folder / change_page.PAGE_NAME).is_file())
-        self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
-        self.assertTrue((folder / "console.html").is_file())
+        self.assertEqual((url.scheme, url.path, url.query), ("http", "/console/", ""))
+        self.assertEqual(self.command(change_page, change_page.main, []).stdout, result.stdout)
+        console = self.request(url.path, {})
+        self.assertEqual(console.status, 200)
+        self.assertIn('data-url="/console/changes.html" data-title="Changes"', console.body)
+        self.assertIn('data-rebuilds="/console/rebuilds.html"', console.body)
+        manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
+        token = manifest.read_bytes()
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+        changes = self.request("/console/changes.html", {})
+        self.assertEqual(changes.status, 200)
+        self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
+        self.assertIn("const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
+        self.assertIn("event.data==='console-shown') refreshPage(true);", changes.body)
+        self.assertEqual(self.request("/console/rebuilds.html", {}).status, 200)
+        self.assertEqual(change_page.page_url(), "/console/changes.html")
+        self.assertEqual(manifest.read_bytes(), token)
+        self.assertEqual(sorted(path.name for path in manifest.parent.iterdir()), [change_page.BROWSER_MANIFEST])
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
@@ -761,7 +772,7 @@ class ChangePageTests(unittest.TestCase):
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         config = self.temporary / "config/review_links.conf"
         _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
-        path = urlsplit(change_page.publish_browser()).path
+        path = change_page.page_url()
         with redirect_stderr(StringIO()) as errors:
             reply = self.request(path, {})
         forms = BrowserForms()
@@ -1109,7 +1120,7 @@ class ChangePageTests(unittest.TestCase):
         return {"row": row, "outcome": outcome, "feedback": feedback, "token": self.page.token}
 
     def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
-        path = urlsplit(change_browser.publish()).path
+        path = change_page.page_url()
         reply = self.request(path + ("?type=questions" if kind == "questions" else ""), {})
         self.assertEqual(reply.status, 200)
         forms = BrowserForms()
@@ -1149,7 +1160,7 @@ class ChangePageTests(unittest.TestCase):
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
                                       date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
-        path = urlsplit(change_browser.publish()).path
+        path = change_page.page_url()
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
             reply = self.request(path, {})
         self.assertEqual(reply.status, 200)
@@ -1200,7 +1211,8 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('<div data-rebuilds data-count="0" data-label=""><p>No rebuilds needed.</p></div>', body)
             self.assertFalse(Path(os.environ["REBUILD_NEEDS_DIR"]).exists())
             self.assertEqual(self.request(rebuilds, {}).status, 200)
-            self.assertEqual(self.request("/zzzzzz/" + change_page.REBUILDS_NAME, {}).status, 404)
+            forwarded = self.http_request("/zzzzzz/" + change_page.REBUILDS_NAME, {})
+            self.assertEqual((forwarded.status, forwarded.location), (303, "/console/rebuilds.html"))
 
         with self.subTest(rebuilds="machine reasons and current names"):
             owner = next(row for row in staff.snapshot().rows if row.name == "page-owner")

@@ -1,4 +1,4 @@
-"""Publish one navigation shell for the administrative pages."""
+"""Render one navigation shell for the administrative pages."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,11 +7,10 @@ import html
 import importlib
 from pathlib import Path
 import re
-import tempfile
 from typing import cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-from scripts.lib import atomic_file, conf
+from scripts.lib import conf
 from scripts.review_links import review_link
 
 PAGE_NAME = "console.html"
@@ -126,25 +125,6 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     return content.encode("utf-8")
 
 
-def publish() -> str:
-    """Publish the console beside Changes, or in its own snapshot when Changes is unavailable."""
-    root = review_link.review_root().resolve()
-    pages = read_pages()
-    content = render(pages, read_rebuilds())
-    for page in pages:
-        if page.identity == "changes" and isinstance(page.destination, AvailablePage):
-            path = unquote(urlsplit(page.destination.path).path)
-            target = (root / path.lstrip("/")).with_name(PAGE_NAME)
-            if not target.resolve().is_relative_to(root) or not target.parent.is_dir():
-                raise ValueError("the Changes page is outside the review root or is not available")
-            atomic_file.write_bytes_atomic(target, content, mode=0o600)
-            return review_link.snapshot_url(root, target) + "?page=changes"
-    with tempfile.TemporaryDirectory(prefix="admin-console-") as temporary:
-        source = Path(temporary) / PAGE_NAME
-        _ = source.write_bytes(content)
-        return review_link.snapshot_at(root, [source], new=True)[0] + "?page=" + pages[0].identity
-
-
 DOCUMENT = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -184,7 +164,9 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .workspace{grid-column:2;display:flex;flex-direction:column;min-width:0;min-height:0}
 .page-header{height:80px;flex:none;display:flex;align-items:center;padding:0 30px;border-bottom:1px solid var(--border);gap:12px}
 .page-header h2{font-size:17px;line-height:1.3;letter-spacing:-.3px;margin:0;font-weight:600}
-.frame-area{flex:1;min-height:0;position:relative}iframe{display:block;border:0;width:100%;height:100%;background:var(--page)}
+.frame-area{flex:1;min-height:0;position:relative}
+.frame-area iframe{position:absolute;inset:0;display:block;border:0;width:100%;height:100%;background:var(--page)}
+.frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}
 .empty{height:100%;display:grid;place-content:center;text-align:center;padding:24px;color:var(--muted)}
 .empty h3{font-size:20px;color:var(--text);margin:0 0 8px}.empty p{max-width:30ch;margin:0}
 .rebuild-slot{position:fixed;left:0;bottom:0;width:244px;padding:12px;z-index:4}.collapsed .rebuild-slot{width:72px}
@@ -234,7 +216,7 @@ aria-controls="rebuild-dialog" hidden><!-- REBUILD --><span class="entry-label" 
 <span class="rebuild-count" id="rebuild-count" aria-hidden="true"></span><span class="tooltip" id="rebuild-tooltip" aria-hidden="true"></span></button></div>
 <button class="dismiss" id="nav-dismiss" type="button" aria-label="Collapse navigation" tabindex="-1"></button>
 <main class="workspace"><header class="page-header"><h2 id="page-title"></h2></header>
-<div class="frame-area"><iframe id="page-frame" title="Selected console page" hidden></iframe>
+<div class="frame-area">
 <section class="empty" id="page-unavailable" hidden><h3>Not available</h3><p>This page is not available. Try another page or open a new console link.</p></section></div></main>
 </div>
 <dialog id="rebuild-dialog" aria-labelledby="rebuild-title"><div class="dialog-head"><h2 id="rebuild-title">Rebuilds needed</h2>
@@ -247,7 +229,10 @@ aria-controls="rebuild-dialog" hidden><!-- REBUILD --><span class="entry-label" 
   const mobileToggle = document.getElementById('mobile-nav-toggle');
   const phone = matchMedia('(max-width:680px)');
   const entries = [...document.querySelectorAll('.nav-entry')];
-  const frame = document.getElementById('page-frame');
+  const frameArea = document.querySelector('.frame-area');
+  // Each opened page keeps a live frame, so a page keeps its filter, card, scroll and typed text.
+  const frames = new Map();
+  const placeKey = identity => 'at.' + identity;
   const storageKey = 'admin-console.navigation-collapsed';
   let desktopCollapsed = false;
   try { desktopCollapsed = localStorage.getItem(storageKey) === 'true'; } catch (_) {}
@@ -266,6 +251,48 @@ aria-controls="rebuild-dialog" hidden><!-- REBUILD --><span class="entry-label" 
       try { localStorage.setItem(storageKey, String(value)); } catch (_) {}
     }
   }
+  function placeOf(entry, stored) {
+    const base = entry.dataset.url;
+    if (!base || !stored) return base;
+    try {
+      const target = new URL(stored, location.href);
+      // A recorded place stays on the page's own path, so a link cannot frame another page.
+      if (target.origin === location.origin && target.pathname === new URL(base, location.href).pathname) {
+        return target.pathname + target.search + target.hash;
+      }
+    } catch (_) {}
+    return base;
+  }
+  function record(entry) {
+    let place;
+    try {
+      const at = frames.get(entry.dataset.page).contentWindow.location;
+      place = placeOf(entry, at.pathname + at.search + at.hash);
+    } catch (_) { return; }
+    const url = new URL(location.href);
+    if (place === entry.dataset.url) url.searchParams.delete(placeKey(entry.dataset.page));
+    else url.searchParams.set(placeKey(entry.dataset.page), place);
+    history.replaceState(null, '', url);
+  }
+  function frameFor(entry) {
+    let frame = frames.get(entry.dataset.page);
+    if (frame) return frame;
+    frame = document.createElement('iframe');
+    frame.hidden = true;
+    frame.src = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    frame.addEventListener('load', () => {
+      record(entry);
+      try { frame.contentWindow.addEventListener('hashchange', () => record(entry)); } catch (_) {}
+    });
+    frames.set(entry.dataset.page, frame);
+    frameArea.prepend(frame);
+    return frame;
+  }
+  addEventListener('message', event => {
+    if (event.origin !== location.origin || event.data !== 'console-place') return;
+    const entry = entries.find(item => frames.get(item.dataset.page)?.contentWindow === event.source);
+    if (entry) record(entry);
+  });
   function select(identity, navigate = false) {
     const selected = entries.find(entry => entry.dataset.page === identity) || entries[0];
     if (!selected) return;
@@ -280,11 +307,18 @@ aria-controls="rebuild-dialog" hidden><!-- REBUILD --><span class="entry-label" 
     url.searchParams.set('page', selected.dataset.page);
     history.replaceState(null, '', url);
     const path = selected.dataset.url;
-    frame.hidden = !path;
+    frames.forEach((frame, page) => { if (page !== selected.dataset.page) frame.hidden = true; });
     document.getElementById('page-unavailable').hidden = Boolean(path);
-    frame.title = title;
-    if (path) { if (frame.getAttribute('src') !== path) frame.src = path; }
-    else frame.removeAttribute('src');
+    if (path) {
+      const opened = frames.has(selected.dataset.page);
+      const frame = frameFor(selected);
+      frame.title = title;
+      if (frame.hidden) {
+        frame.hidden = false;
+        // A page that paused its refresh while hidden loads an update at once; a new page loads anyway.
+        if (opened) frame.contentWindow.postMessage('console-shown', location.origin);
+      }
+    }
     if (navigate && phone.matches) collapse(true);
   }
   collapse(collapsed);

@@ -3202,6 +3202,21 @@ class Ledger:
                 if self._finding_reads:
                     self._finding_reads[0].footprints_prepared = True
 
+    def stored_finding_footprint(self, finding: HeldFinding, view: str, inputs: object) -> FindingFootprint | UnstoredFact:
+        """The saved footprint that `finding_footprint` returns without a calculation."""
+        with self._finding_observation(refresh_objects=False):
+            if not self._maintaining_findings:
+                return UnstoredFact()
+            stored = self._finding_results().load(finding.finding_id, "footprint:" + view,
+                                                  self._footprint_identity(finding, inputs),
+                                                  self._judgment_objects_available, lambda _: False)
+            return (cast(FindingFootprint, self._decode_finding_proof(stored.result))
+                    if isinstance(stored, StoredFindingProof) else UnstoredFact())
+
+    def _footprint_identity(self, finding: HeldFinding, inputs: object) -> object:
+        return (finding.path, finding.kind, finding.before, finding.after,
+                self.finding_needs(finding.finding_id), encode_proof(inputs), self._search_locale())
+
     def finding_footprint(self, finding: HeldFinding, view: str, inputs: object,
                           calculate: Callable[[], FindingFootprint]) -> FindingFootprint:
         """Maintain source paths independently of live availability."""
@@ -3209,8 +3224,7 @@ class Ledger:
             if not self._maintaining_findings:
                 return calculate()
             results = self._finding_results()
-            identity = (finding.path, finding.kind, finding.before, finding.after,
-                        self.finding_needs(finding.finding_id), encode_proof(inputs), self._search_locale())
+            identity = self._footprint_identity(finding, inputs)
             stored = results.load(finding.finding_id, "footprint:" + view, identity,
                                   self._judgment_objects_available, lambda _: False)
             if isinstance(stored, StoredFindingProof):
