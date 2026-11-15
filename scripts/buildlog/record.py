@@ -169,6 +169,7 @@ def local_targets() -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class LocalStepIdentity:
+    """The identity holds target and host names for local step classification."""
     targets: tuple[str, ...]
     hosts: tuple[str, ...]
 
@@ -249,23 +250,24 @@ class LaunchStep(GitFacts):
 
 @dataclass(frozen=True)
 class InvalidLaunchState:
-    pass
+    """The saved launch state is invalid."""
 
 
 @dataclass(frozen=True)
 class PublishedLaunch:
+    """The publication result reports a new launch row and an unknown worktree."""
     added: bool
     unknown_worktree: bool
 
 
 @dataclass(frozen=True)
 class NoHeldLog:
-    pass
+    """The step has no retained log."""
 
 
 @dataclass(frozen=True)
 class NoPeakFile:
-    pass
+    """The step has no peak memory file."""
 
 
 @dataclass(frozen=True)
@@ -283,6 +285,7 @@ class PendingStep:
 
 @dataclass(frozen=True)
 class PublishedStep:
+    """The publication result reports whether a step row was added."""
     added: bool
 
 
@@ -565,12 +568,13 @@ def tree_facts(start: str | None, end: str | None) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class SentTreeKey:
+    """The value identifies the source tree sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentTreeKey:
-    pass
+    """The remote step has no recorded source tree key."""
 
 
 def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
@@ -581,12 +585,13 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
 
 @dataclass(frozen=True)
 class SentRepositoryIdentity:
+    """The value identifies the repository sent to the remote host."""
     value: str
 
 
 @dataclass(frozen=True)
 class NoSentRepositoryIdentity:
-    pass
+    """The remote step has no recorded source repository identity."""
 
 
 def sent_repository_identity() -> SentRepositoryIdentity | NoSentRepositoryIdentity:
@@ -636,11 +641,13 @@ def pending_steps_root() -> Path:
 
 @dataclass(frozen=True)
 class ReservedTestPhaseRecord(TestPhaseRecord):
+    """The test phase evidence includes its admission reservation identifier."""
     reservation_id: str
 
 
 @dataclass(frozen=True)
 class ChargedTestPhaseRecord(ReservedTestPhaseRecord):
+    """The reserved test phase evidence includes its completed memory charge."""
     charge: TestPhaseChargeUse
 
 
@@ -1197,6 +1204,7 @@ def ssh_attempt(attempt: SshAttempt) -> None:
 
 @dataclass(frozen=True)
 class AttemptResult:
+    """The attempt result holds repository, slot, outcome, completion, and cleanup evidence."""
     repo_identity: str
     slot: int
     outcome: str

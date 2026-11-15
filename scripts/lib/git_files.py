@@ -40,6 +40,7 @@ class Checkout:
 
 @dataclass(frozen=True)
 class OnBranch:
+    """The name identifies the checked out Git branch."""
     name: str
 
 
