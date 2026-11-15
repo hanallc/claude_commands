@@ -4314,20 +4314,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (builds assigned the gate copy leak on 11-15; test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** No test leaves a `verify-unit-gate-*` or `sample-style-gate-*` folder outside its test folder.
-
-**Spec:**
-- Cause: two tests SIGKILL a gate owner by design, and a dead owner cannot remove its fresh copy. `test_command_keeps_busy_lock_after_wrapper_is_killed` (`test_copies.py`) kills a `copies.py run` child; `test_after_a_sigkill_of_the_owner_the_sweep_keeps_the_dir_until_its_verifier_ends` (`test_style_sync.py`) kills a style lint driver. Each fixture puts in-process temporary folders in the test folder, but the children inherit the outer TMPDIR. 278 copies remained under session TMPDIRs and /tmp, the oldest from 2026-11-09.
-- Each fixture sets TMPDIR for its children inside the test folder: `self.base / "temporary"` in `StandingTests`, `self.root` in `StyleSyncTests`.
-- Each of the two tests asserts that the killed owner's checkout is inside the test folder. Each assertion fails without the fixture change.
-- A per-test probe of test_style_sync finds no other writer.
-
-**Files:** `scripts/copies/test_copies.py`, `scripts/style/test_style_sync.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is two fixture lines and two assertions.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** test_copies and test_style_sync pass on natedev with no gate copy left in TMPDIR; each new assertion fails without its fixture line; basedpyright reports zero errors and zero warnings.
+- Cause of the gate copy leak (builds, 11-15; 278 folders, oldest 11-09): two tests SIGKILL a gate owner by design, and their children used the outer TMPDIR, so the dead owner's fresh copy survived the test folder.
+- The `StandingTests` fixture (`test_copies.py`) and the `StyleSyncTests` fixture (`test_style_sync.py`) give their children a TMPDIR inside the test folder. The two kill tests assert that the killed owner's checkout is inside the test folder.
+- The free leftovers are deleted.
+- Commit 0a92e8ed5. Test-only change.
