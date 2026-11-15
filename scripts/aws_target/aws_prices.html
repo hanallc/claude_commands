@@ -399,7 +399,7 @@ for (const group of scopeFilters) {
   for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
 }
 
-// The region filter: all regions by default, any combination. None clears every region, so one click then shows only that one.
+// The region filter: all regions by default, any combination. "none" clears every region, so one click then shows only that one.
 // The area row above it groups the regions by the first word of their names, in the order of the region list.
 function chipRow(id, labels) {
   const row = document.getElementById(id);
@@ -409,9 +409,9 @@ function chipRow(id, labels) {
     row.appendChild(button);
     return button;
   };
-  const all = chip("All", "all");
+  const all = chip("all", "all");
   const each = labels.map(label => chip(label));
-  const none = chip("None", "all");
+  const none = chip("none", "all");
   return {all, each, none};
 }
 const areaOf = region => region.split("-", 1)[0];
