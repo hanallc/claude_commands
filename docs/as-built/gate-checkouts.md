@@ -191,7 +191,7 @@ The command's exit status is returned, and its output passes through.
 `--publish PATH` copies a built file out of the checkout after the command returns.
 The option can repeat. Each PATH is relative to the checkout.
 The copy occurs while `standing()` still holds the lease, so it follows the `target` symlink into the cache root.
-`publish_files(tree, paths, command_exit)` makes one `scratch.new(word="gate-binary", throwaway=True)` folder under `/tmp/claude/scratch`.
+`publish_files(tree, paths, command_exit)` makes one `scratch.new(word="gate-binary", throwaway=True)` folder under the scratch root (`build_folders.conf` `roots.scratch`).
 Each file keeps its base name and mode. It is written to `.<name>.tmp` first and then renamed.
 `manifest.json` in the folder holds `repository`, the full checkout `commit`, `command_exit` and the file names.
 Stdout prints `published: <absolute path> <full commit>` for each file.

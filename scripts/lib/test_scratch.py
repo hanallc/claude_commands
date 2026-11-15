@@ -160,7 +160,7 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual((checkout / "asset").read_text(), "saved source")
         self.assertTrue((checkout / ".git").is_dir())
         self.assertFalse((checkout / scratch.BUSY).exists())
-        record = scratch.task_of(checkout.parent)
+        record = scratch.task_of(checkout)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, "gate:hana-view")
         self.assertEqual(record.fields["source_path"], str(source.resolve()))
@@ -168,8 +168,8 @@ class ScratchTests(unittest.TestCase):
         target = checkout / "target"
         target.mkdir()
         _ = (target / "build").write_text("disposable build output")
-        self.assertEqual(scratch.end("gate:hana-view"), [checkout.parent])
-        self.assertFalse(checkout.parent.exists())
+        self.assertEqual(scratch.end("gate:hana-view"), [checkout])
+        self.assertFalse(checkout.exists())
         self.assertEqual((source / "asset").read_text(), "saved source")
         self.assertEqual(scratch.end("gate:hana-view"), [])
 
@@ -179,7 +179,7 @@ class ScratchTests(unittest.TestCase):
             with scratch.judgment_lock(checkout) as available:
                 self.assertFalse(available)
             _ = (checkout / "partial").write_text("partial clone")
-            record = scratch.task_of(checkout.parent)
+            record = scratch.task_of(checkout)
             assert isinstance(record, copy_record.Registered)
             self.assertEqual(record.task, "gate:clone-failure")
             raise copies.CopyError("interrupted clone")
@@ -189,7 +189,7 @@ class ScratchTests(unittest.TestCase):
                 _ = copies.clone(self.base / "source", "gate:clone-failure")
         paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
         self.assertEqual(len(paths), 1)
-        self.assertTrue((paths[0] / "checkout" / "partial").exists())
+        self.assertTrue((paths[0] / "partial").exists())
         self.assertEqual(scratch.end("gate:clone-failure"), paths)
         self.assertFalse(paths[0].exists())
 
@@ -1005,9 +1005,9 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertEqual(ended.at, bare_end.at)
         self.assertIsInstance(scratch.task_end("until:bad/private-task"), scratch.Unknown)
 
-    def test_until_folder_name_contains_the_stamp_without_the_task_id(self) -> None:
+    def test_until_folder_name_holds_only_the_word(self) -> None:
         path = scratch.new("until:2099-01-01T0930Z/private-task", word="proof")
-        self.assertRegex(path.name, r"^until-2099-01-01T0930Z-proof-[a-z0-9]+$")
+        self.assertRegex(path.name, r"^proof-[a-z0-9]+$")
 
     def test_no_task_lasts_a_day_and_until_ends_at_its_time(self) -> None:
         path = scratch.new(now=1_000_000.0)

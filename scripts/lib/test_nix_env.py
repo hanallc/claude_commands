@@ -492,13 +492,14 @@ class RegisteredCloneTests(GitNixFixture):
         os.environ.update(locations)
 
     def clone(self, repository: Path, task_folder: Path | None = None) -> Path:
-        folder = task_folder if task_folder is not None else copy_record.root() / "task"
-        folder.mkdir(parents=True)
-        checkout = folder / "checkout"
+        # The task folder is the checkout, as copies.clone makes it.
+        checkout = task_folder if task_folder is not None else copy_record.root() / "task"
+        checkout.parent.mkdir(parents=True, exist_ok=True)
         _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
         fields = {"task": "gate:nix-env", "test_hana_clone": True,
                   "source_path": str(repository), "source_commit": self.git(checkout, "rev-parse", "HEAD")}
-        _ = (folder / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")
+        _ = (checkout / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")
+        scratch.exclude_copy_metadata(checkout)
         return checkout
 
     def assert_clone_refused(self, checkout: Path) -> None:
@@ -509,7 +510,7 @@ class RegisteredCloneTests(GitNixFixture):
     def test_registered_clone_with_unchanged_envrc_is_approved_and_loads(self) -> None:
         repository = self.repository(self.home / "rust/repo")
         checkout = self.clone(repository)
-        self.assertEqual(copy_record.record_path(checkout), checkout.parent / copy_record.RECORD)
+        self.assertEqual(copy_record.record_path(checkout), checkout / copy_record.RECORD)
         self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
         self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
         _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
@@ -535,7 +536,7 @@ class RegisteredCloneTests(GitNixFixture):
 
     def test_clone_without_source_commit_requires_explicit_approval(self) -> None:
         checkout = self.clone(self.repository(self.home / "rust/repo"))
-        path = checkout.parent / copy_record.RECORD
+        path = checkout / copy_record.RECORD
         fields = cast(dict[str, object], json.loads(path.read_text()))
         del fields["source_commit"]
         _ = path.write_text(json.dumps(fields), encoding="utf-8")
@@ -548,7 +549,7 @@ class RegisteredCloneTests(GitNixFixture):
 
     def test_clone_without_test_hana_clone_requires_explicit_approval(self) -> None:
         checkout = self.clone(self.repository(self.home / "rust/repo"))
-        path = checkout.parent / copy_record.RECORD
+        path = checkout / copy_record.RECORD
         fields = cast(dict[str, object], json.loads(path.read_text()))
         del fields["test_hana_clone"]
         _ = path.write_text(json.dumps(fields), encoding="utf-8")
@@ -564,7 +565,7 @@ class RegisteredCloneTests(GitNixFixture):
         physical.mkdir()
         copy_record.root().symlink_to(physical, target_is_directory=True)
         checkout = self.clone(self.repository(self.home / "rust/repo"))
-        self.assertEqual(copy_record.record_path(checkout), checkout.parent.resolve() / copy_record.RECORD)
+        self.assertEqual(copy_record.record_path(checkout), checkout.resolve() / copy_record.RECORD)
         self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
         self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
 

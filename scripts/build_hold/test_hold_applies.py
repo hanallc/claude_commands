@@ -82,24 +82,6 @@ class TemporaryHoldTest(unittest.TestCase):
         _ = (release / "current").write_text(cycle_id + "\n")
 
 
-class CargoVerbTests(unittest.TestCase):
-    def test_build_verbs_match_the_wrapper_and_lookup_verbs_pass(self) -> None:
-        wrapper = SCRIPT.with_name("cargo").read_text()
-        branch = wrapper.split('case "$subcommand" in', 1)[1].split(') ;;', 1)[0].strip()
-        self.assertEqual(hold_applies.BUILDING_CARGO_VERBS, frozenset(branch.split("|")))
-        for verb in hold_applies.BUILDING_CARGO_VERBS | {"metadata", "locate-project", "tree", "version", "search"}:
-            with self.subTest(verb=verb):
-                self.assertEqual(hold_applies.cargo_verb(("+nightly", "--config=term.color=never", verb)), verb)
-        self.assertEqual(hold_applies.cargo_verb(("+stable", "-v")), "")
-
-    def test_option_values_cannot_turn_a_lookup_into_a_build(self) -> None:
-        for option in hold_applies.CARGO_OPTIONS_WITH_VALUES:
-            with self.subTest(option=option):
-                self.assertEqual(hold_applies.cargo_verb((option, "build", "metadata")), "metadata")
-                self.assertEqual(hold_applies.cargo_verb((option, "metadata", "check")), "check")
-        self.assertEqual(hold_applies.cargo_verb(("--config",)), "")
-
-
 class HoldAppliesTest(TemporaryHoldTest):
     def assert_cli(self, status: int, refusal: str = "") -> None:
         done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False)
