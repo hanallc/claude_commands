@@ -381,8 +381,7 @@ def fixed_placement_constraints(
                 host_eligibility = placement.FixedExclusion("repo")
             else:
                 excluded = eligibility.comma_values(config.values[key])
-                if (package in excluded if package
-                        else eligibility.workspace_has_linux_only(repo_root, excluded)):
+                if eligibility.has_linux_only(repo_root, eligibility.step_package(kind, package), excluded):
                     host_eligibility = placement.FixedExclusion("linux_only")
         elif not eligibility.linux_kind_permitted(config.values, kind):
             host_eligibility = placement.FixedExclusion("target does not permit this command")

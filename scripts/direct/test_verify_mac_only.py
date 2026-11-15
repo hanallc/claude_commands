@@ -340,7 +340,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
             "unreachable": "the Mac cannot be reached (/build:status --probe)",
             "backoff": "the Mac was unreachable a short time ago (retry backoff)",
             "disk": "the Mac is below its free-space floor", "off": "Mac offload is off",
-            "repo": "this repository has no Mac setting", "linux_only": "sample is Linux only on the Mac",
+            "repo": "this repository has no Mac setting", "linux_only": "the step covers a package that is Linux only on the Mac",
             "state": "the Mac claim state cannot be read", "copy": "the tree copy to the Mac failed",
             "no_tests": "no test matched on the Mac", "lost": "the link to the Mac dropped during the run",
             "runner": "the Mac runner gave no usable result",

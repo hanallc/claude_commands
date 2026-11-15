@@ -11,9 +11,12 @@ Tree-writing steps remain local.
 Unpinned build and final steps retain their local rules.
 A pinned final keeps its clean-tree check and saves no local pass.
 A remote build prints its target and binary path.
-A step with a named package checks only that package against `linux_only.<repo>`, for every kind.
+A step with a named package checks only that package against `linux_only.<repo>`.
 `linux_only` keeps a package's own steps off the Mac; a package that depends on one still runs there.
 A step with no package refuses Mac offload when any workspace member is `linux_only`.
+`lint` and `doc` steps cover the whole workspace for every package, so they always use the workspace check.
+`eligibility.step_package` holds this rule.
+Without it, a `lint hana_diegetic --check` on the Mac judged the macOS code of `hana_video`, which CI never judges.
 
 `fixed_placement_constraints` retains every configured candidate that a fixed rule permits.
 Disk, busy, spending, reachability, and hold results remain refreshed evidence.
