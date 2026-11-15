@@ -4046,3 +4046,18 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - In `test_assign_claude_follow`, the delivery retry test runs its three launches in process. The catalog retry part is the `@process_boundary` test `test_failed_catalog_switch_retries_on_the_first_model`.
 - AWS pair (3 rounds, median CPU s): `test_assign_claude_follow` 30.98 -> 20.51; `test_assign_claude_workers` 10.76 -> 8.33; `test_claude_worker` 9.08 -> 6.93.
 - Commit dd647b551. Test-only change.
+
+### Phase 278 — Python starts reuse the compiled dataclass method code  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 2026-11-14 with six conditions).
+
+#### As-built
+
+- `sitecustomize.start_process` inserts a `DataclassCodeFinder`. When a process imports `dataclasses`, the finder sets its global `exec` to `dataclass_exec`.
+- `dataclass_code(source, folder)` reads the marshal code of each generated source from `/var/tmp/dataclass-code-<uid>/<cache tag>`, keyed by the sha1 of the compile flags, the optimize level and the source. A miss, or a truncated or corrupt entry, compiles with `<string>`, flags 0 and `dont_inherit=True`, and replaces the file.
+- A root that is not a 0700 folder of the user turns the cache off with no error.
+- A read refreshes an entry once a day. `tmp_sweep.prune_dataclass_code` removes the entries that no process read in lint.conf `dataclass_code_days` days, and each emptied cache tag folder. Only the live `/tmp` roots add the cache root.
+- `lib/test_dataclass_code.py` fails when the startup hook does not give `dataclasses` the cached exec on the current Python.
+- AWS pair (3 rounds, median CPU s): 8 modules 290.41 -> 255.76; `test_statusline` 45.05 -> 34.42; `test_offload` 46.90 -> 40.08.
+- Live CLI start CPU on natedev: `direct.assign` 335 -> 199 ms; `admission_protocol` 144 -> 85 ms; `progress_history` 118 -> 83 ms.
+- Commit 3f52df2c3. Production change (sdlc go 2026-11-14).
