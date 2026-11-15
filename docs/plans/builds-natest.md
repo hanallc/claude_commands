@@ -4089,23 +4089,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** six source-scan modules find the same results with less CPU.
-
-**Spec:**
-- Each scan reads the file text and skips a file without the words that every finding needs. The phase 280 pattern.
-- `message/test_session_send_sources`: one of the four sender target names.
-- `notify/test_push_texts_sources`: "pushover", or "user" with "--to" or "broadcast".
-- `accounts/test_launch_accounts_sources`: a quoted "claude", or "command claude" or "exec claude"; an `EXCEPTIONS` file is always scanned.
-- `astra/test_design_roles_sources`: "GUILD_" or "guilds".
-- `unguarded_launches` in `lib/test_claude_launch_scan.py`: for Python, a literal that ends in claude or codex, or the words "agent" and "start". Shell files keep the full scan.
-- `forbidden_launches` in `direct/test_one_launch_path.py`: "review".
-
-**Files:** `scripts/message/test_session_send_sources.py`, `scripts/notify/test_push_texts_sources.py`, `scripts/accounts/test_launch_accounts_sources.py`, `scripts/astra/test_design_roles_sources.py`, `scripts/lib/test_claude_launch_scan.py`, `scripts/direct/test_one_launch_path.py`.
-
-**Workers:** 1 writer; no split (six small gates). impl: all six files. test opens as impl.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the eight changed modules pass; AWS pair shows a CPU saving.
+- Six repository scans skip a file whose text lacks the words that every finding needs (the phase 280 pattern): `message/test_session_send_sources`, `notify/test_push_texts_sources`, `accounts/test_launch_accounts_sources` (`EXCEPTIONS` files always scanned), `astra/test_design_roles_sources`, `unguarded_launches` in `lib/test_claude_launch_scan.py` (Python files only), and `forbidden_launches` in `direct/test_one_launch_path.py`.
+- `lib/test_py_floor_sources` keeps its full parse: it must parse each file at the floor version.
+- AWS pair (3 rounds, median CPU s): 46.0 -> 15.5 in total; `session_send_sources` 7.23 -> 0.33, `launch_accounts_sources` 9.86 -> 3.23, `push_texts_sources` 8.64 -> 2.77.
+- Commit bddca5e1e. Test-only change.
