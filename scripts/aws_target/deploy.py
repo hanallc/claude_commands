@@ -28,7 +28,7 @@ from typing import cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, spot_end, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
@@ -537,9 +537,11 @@ class Deployment:
                            *, keep: str) -> None:
         """Change the Hana stack through a change set that refuses a box or disk replacement.
 
-        The Hana box and disk are retained, so CloudFormation never ends them. A failed change can leave a
-        retained box with its persistent request, so a failure ends every Hana box except the kept one."""
+        The Hana box, disks and bucket are retained, so CloudFormation never deletes them. A failed change
+        ends every Hana box except the kept one, then deletes what the rollback kept.
+        A failed create also deletes the failed stack and every unattached Hana disk."""
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        started = self.clock()
         try:
             kind = 'UPDATE' if ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name,
                                                     service='cloudformation'), 'Stacks') else 'CREATE'
@@ -583,16 +585,25 @@ class Deployment:
             _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
                          '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
         except (AwsUnavailable, subprocess.SubprocessError) as error:
+            tag = ('HanaDeployment', parameters['DeploymentId'])
             try:
-                ended = spot_end.end_boxes(api, ('HanaDeployment', parameters['DeploymentId']), keep=keep)
+                ended = spot_end.end_boxes(api, tag, keep=keep)
+                # Read the rollback events before a stack delete makes them unreadable by name.
+                kept = retained.skipped_since(api, settings.stack_name, started)
+                if kind == 'CREATE':
+                    _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
+                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                                 service='cloudformation', timeout_s=timeout)
+                retained.delete(api, kept, wait_s=timeout)
             except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
-                raise AwsUnavailable(f'{error}\nthe Hana Spot boxes did not end: {end_error}') from None
-            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests') from None
+                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
+            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
+                                 + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
 
     def hana_down(self, *, approve_destroy: bool = False) -> bool:
-        """Cancel every Hana Spot request, terminate its boxes, then delete the Hana stack."""
+        """Cancel every Hana Spot request, terminate its boxes, delete the Hana stack, then its data disk and bucket."""
         print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
-        print('down --workload hana keeps the retained data disk and control bucket.')
+        print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
         if not approve_destroy:
             print('Run deploy.py down --workload hana --approve-destroy to remove the Hana box.')
             return True
@@ -605,9 +616,14 @@ class Deployment:
         settings, _, _ = self._hana_inputs()
         api = self._api(settings)
         timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
         with control_lock(self.directory):
+            # Read the stack's disk and bucket before the stack delete removes the record of them.
+            kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
+                frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
+                frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
             with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
-                ended = spot_end.end_boxes(api, ('HanaDeployment', ledger.text(saved, 'deployment')))
+                ended = spot_end.end_boxes(api, tag)
             if 'generation' in saved:
                 hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
                     hana_spend.read_settings(conf.read_or_repository('hana_aws'))).reconcile(
@@ -616,9 +632,12 @@ class Deployment:
                 _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
                 _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
                              service='cloudformation', timeout_s=timeout)
+            with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
+                retained.delete(api, kept, wait_s=timeout)
             for name in ('lifecycle.json', 'setup.json'):
                 (self.directory / 'hana' / name).unlink(missing_ok=True)
-        print(f'down --workload hana: done; {ended} Spot boxes ended; data disk and control bucket kept')
+        print(f'down --workload hana: done; {ended} Spot boxes ended; '
+              + f'{len(kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
         return True
 
     def _hana_inputs(self) -> tuple[DeploymentSettings, dict[str, str], bytes]:

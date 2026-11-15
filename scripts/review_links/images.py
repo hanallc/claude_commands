@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
-from scripts.review_links import change_browser, change_page, console, image_store, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, page_frame, review_link
 
 FOLDER = "images"
 PAGE_NAME = "images.html"
@@ -122,10 +122,10 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 
 
 def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
-    """Link one image to its full size; a pair image shows its label above it."""
+    """Link one image to the shared zoom; show its pair label above it."""
     path = html.escape(image_path(record, file), quote=True)
     alt = record["caption"].splitlines()[0]
-    linked = (f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
+    linked = (f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" '
               + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
@@ -389,7 +389,7 @@ if (target) {
   target.scrollIntoView({block: 'start'});
 }
 })();"""
-SCRIPT_VERSION = change_page.script_version(SCRIPT)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
 
 
 def main(arguments: list[str]) -> int:

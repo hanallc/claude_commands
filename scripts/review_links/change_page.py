@@ -428,7 +428,7 @@ def change_content(row: dict[str, str], content: str) -> str:
     if not path:
         return content
     alt = html.escape("Screenshot: " + row.get("Change", "Change preview"), quote=True)
-    thumbnail = (f'<a class="change-image" href="{path}" target="_blank" rel="noopener">'
+    thumbnail = (f'<a data-image-zoom class="change-image" href="{path}" target="_blank" rel="noopener">'
                  + f'<img src="{path}" alt="{alt}"></a>')
     return '<div class="change-text">' + content + '</div>' + thumbnail
 
@@ -438,7 +438,7 @@ def document(content: str, title: str = TITLES["changes"]) -> bytes:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}''' + page_frame.STYLE + '''main{max-width:744px}
+body{margin:0}''' + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
 ''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
@@ -452,7 +452,7 @@ section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
 button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-</style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
+</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:

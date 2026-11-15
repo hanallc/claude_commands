@@ -240,6 +240,8 @@ An empty page shows **No questions to answer.** or **No changes to review.**
 
 Each change can hold one image id in its optional `Image` cell.
 `change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py edit --row <id> --image <png>` attaches or replaces an image without changing the other cells.
+It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
@@ -249,7 +251,10 @@ The parser accepts twelve lowercase hexadecimal characters.
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
 The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
 It has a 420px height limit and crops from the top left.
-It opens the full image in a new tab.
+A plain click opens the shared image zoom over the page.
+Escape or a click on the zoom closes it and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
 Below 1000px, it moves under the text.
 A row without an image retains its text width and position.
 
@@ -351,9 +356,20 @@ Each card shows, in this order:
 
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
+3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
 5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
+
+A plain click on a single image or either pair image opens the shared image zoom.
+The zoom centers the full image over a dark backdrop within the page view.
+It fits the view with a 16px margin and never exceeds the image's natural size.
+Escape or a click on the backdrop or image closes it.
+The page keeps its scroll position and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
+`page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.
+One document click listener handles `data-image-zoom` links, including links from later page updates.
+The modal dialog takes focus and uses the image's alt text as its accessible name.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).

@@ -95,6 +95,8 @@ user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new 
 
 Attach one image wherever possible. A line without an image stays valid.
 Use `add --image <png>` to attach an existing screenshot to a manual row.
+Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
+An image replacement deletes the old image after the row is written.
 For a checkpoint, register the image first:
 
 ```sh
@@ -111,7 +113,9 @@ A missing image prints one line and leaves the cell empty.
 
 The console card and the one-row page show a 280px thumbnail beside the change text.
 The thumbnail moves below the text on narrow screens.
-Select it to open the full image in a new tab.
+Click the thumbnail to zoom over the page.
+Press Escape or click the zoom to return.
+Shift-click or use the right-click menu to open the full image in a new tab.
 A landing or return verdict deletes the image and clears its cell.
 Change images use `change-images/` and never appear on the Images page.
 The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
@@ -152,6 +156,7 @@ what the person sees:
 
 ```sh
 … edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --image <png>
 ```
 
 Pass the displayed ID, such as `sdlc/C9`.
@@ -159,6 +164,9 @@ The prefix names the responsible showrunner, even when another showrunner's list
 Commands also accept the list-based ID and a bare row number with the selected list.
 Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
+Add `--image <png>` to the text edit to attach or replace the image.
+With only `--image`, the row keeps all other cells.
+With any text option, pass all three text options.
 
 ## show
 
