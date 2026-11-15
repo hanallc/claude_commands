@@ -1185,6 +1185,46 @@ class MacOrderTests(unittest.TestCase):
             self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.younger.episode])
             self.assertEqual(fixture.server.placement_holds, {})
 
+    def test_older_requests_that_cannot_use_the_mac_never_keep_it_from_a_younger_one(self) -> None:
+        """11-15 10:44-11:04: two older cargo-liner steps waited on natedev memory and could not use the Mac.
+
+        The tile nextest read the cargo-liner scope free. Each new tile reading started new holds for the older
+        steps, and the tile reading expired before both older probes answered. The tile nextest never got the Mac.
+        """
+        for refusal in ("busy", "disk"):
+            with (self.subTest(refusal=refusal), PlacementFixture() as fixture,
+                  mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
+                fixture.configure(waiting_pass_seconds=1)
+                _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+                fixture.free(0)
+                fixture.hold_starts()
+                _ = fixture.run_pass()
+                readings: dict[placement.HostEvidenceKey, placement.HostEligibility] = {}
+                older: list[wire.PlacementRequest] = []
+                for name, age in (("handler-mend", 1500), ("handler-clippy", 1400)):
+                    request = placement_request(fixture, session=OwningSession(name), since=fixture.clock.now() - age)
+                    request = replace(request, constraints=replace(request.constraints,
+                        candidates=(*request.constraints.candidates, local_candidate(fixture))))
+                    readings[self.provide(fixture, request, placement.TemporaryExclusion(refusal))] = (
+                        placement.TemporaryExclusion(refusal))
+                    self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
+                    older.append(request)
+                tile = placement_request(fixture, session=OwningSession("tile-nextest"),
+                                         since=fixture.clock.now() - 1300)
+                readings[self.provide(fixture, tile, ALLOWED_HOST)] = ALLOWED_HOST
+                self.assertIsInstance(fixture.connect(tile).replies()[-1], wire.PlacementWait)
+                worker = fixture.server.host_targets[("mac", "mac")]
+                assert isinstance(worker, ManualEvidenceWorker)
+                for _probe in range(15):
+                    # Each Mac probe takes four seconds, so three probes outlast one reading.
+                    fixture.clock.advance(4)
+                    for key, eligibility in readings.items():
+                        fixture.provider_evidence[key] = placement.FreshHostEvidence(
+                            key, fixture.clock.now(), "host-generation-a", eligibility)
+                    _ = worker.probe_next()
+                    _ = fixture.run_pass()
+                self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])
+
 
 class PassGapTests(unittest.TestCase):
     """Socket requests in one pass gap share the next pass and get their replies from it."""
