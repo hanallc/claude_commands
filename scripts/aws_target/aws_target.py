@@ -21,7 +21,7 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, run_cost
+from scripts.aws_target import ledger, measurement, price_days, run_cost
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
@@ -229,6 +229,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
         reason_limit = configuration.whole('snapshot_error_reason_max_chars')
         failures = {row.region: row for row in snapshot_failures(document)}
         status = 0
+        read_prices: list[ledger.RegionalSpotPrice] = []
         for region in regions:
             read_name = 'price'
             try:
@@ -243,6 +244,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     usd_per_hour=str(row.usd_per_hour), read_at=row.read_at) for row in regional)
                 readings = [row for row in readings if row.get('region') != region]
                 readings.append(dict(region=region, read_at=now, standard_vcpus=str(standard), gpu_vcpus=str(gpu)))
+                read_prices.extend(regional)
                 _ = failures.pop(region, None)
             except (AwsUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError, subprocess.SubprocessError) as error:
                 raw_lines: list[str] = []
@@ -271,6 +273,11 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             streak = SnapshotFailureStreak(since, notice_claimed)
             output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
         write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+        try:
+            price_days.record(directory, read_prices, now, configuration.whole('spot_price_days_keep'))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
+            status = 1
         access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
         if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
             # Save the claim before delivery because note keys alone do not suppress repeats.

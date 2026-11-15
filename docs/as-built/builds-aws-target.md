@@ -532,6 +532,12 @@ The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
 The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
 The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
+After that write, the snapshot adds each read to `spot-price-days.json`.
+For each type and region, it adds the lowest zone price of the read to that UTC day.
+Each `days` row keeps `instance_type`, `region`, `day`, `usd_sum`, and `reads`; the mean is `usd_sum / reads`.
+The file keeps the last `spot_price_days_keep` days from `config/aws_target.conf`.
+A run estimate can then use the Spot price of each billed day.
+A failed history write leaves `spot-prices.json` written and returns a failure status.
 A regional failure preserves that region's previous prices, quotas, and read time.
 Other regions still refresh, and the command returns a failure status.
 The `failures` array saves the latest failed attempt for each region.
