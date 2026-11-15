@@ -95,7 +95,8 @@ user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new 
 
 ## Change images
 
-Attach one image wherever possible. A line without an image stays valid.
+Every change review carries one image: a dark mode shot at desktop width, or `image --output <text file>` for terminal output.
+The parser still accepts a line without an image.
 Use `add --image <png>` to attach an existing screenshot to a manual row.
 Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
 Use `add --output <text file>` or `edit --row <id> --output <text file>` to attach rendered text.
