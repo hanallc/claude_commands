@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_showrunner, recorded_unit
 from scripts.production import showrunner_tree
 from scripts.production.change_review import Invisible, Malformed, Visible
+from scripts.review_links import image_store
 
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
@@ -207,6 +208,99 @@ class ProducerFixture(unittest.TestCase):
         return self.git("rev-parse", "HEAD")
 
 class ProducerWriterTests(ProducerFixture):
+    def test_image_commands_report_store_errors(self) -> None:
+        commands = (("image", "--image", "invalid.txt"),
+            ("add", "--repo", str(self.repo), "--production", "top", "--change", "Preview",
+             "--check", "Read", "--see", "The image", "--image", "invalid.txt"),
+            ("edit", "--production", "top", "--row", "C1", "--image", "invalid.txt"))
+        for arguments in commands:
+            for error in (ValueError("invalid image"), subprocess.SubprocessError("image capture failed")):
+                with self.subTest(arguments=arguments, error=error), mock.patch.object(
+                        image_store, "register_change", side_effect=error):
+                    code, _, errors = run(*arguments)
+                    self.assertEqual(code, 1)
+                    self.assertIn(str(error), errors)
+
+    def test_edit_image_adds_the_image_column_without_changing_other_cells(self) -> None:
+        _ = self.listing.write_text(LIST, encoding="utf-8")
+        before = change_review.pending(self.listing)
+        self.assertNotIn(change_review.IMAGE, before[0])
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        code, _, errors = run("edit", "--production", "top", "--list", str(self.listing),
+                              "--row", "C76", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        after = change_review.pending(self.listing)
+        self.assertEqual([{key: value for key, value in row.items() if key != change_review.IMAGE}
+                          for row in after], before)
+        self.assertTrue(image_store.change_image(self.root / "links", after[0][change_review.IMAGE]))
+        self.assertEqual(after[1][change_review.IMAGE], "")
+
+    def test_edit_image_replaces_the_old_folder_after_the_cell_is_written(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        code, _, errors = run("add", "--repo", str(self.repo), "--production", "top", "--change", "Preview",
+                              "--check", "Read", "--see", "The image", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        before = change_review.pending(self.listing)[0]
+        old = before[change_review.IMAGE]
+        remove = image_store.remove_change
+
+        def remove_written(root: Path, identity: str) -> None:
+            self.assertNotEqual(change_review.pending(self.listing)[0][change_review.IMAGE], identity)
+            remove(root, identity)
+
+        with mock.patch.object(image_store, "remove_change", side_effect=remove_written) as removed:
+            code, _, errors = run("edit", "--production", "top", "--row", "C1", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        removed.assert_called_once_with(self.root / "links", old)
+        after = change_review.pending(self.listing)[0]
+        self.assertEqual({**after, change_review.IMAGE: old}, before)
+        self.assertFalse((self.root / "links" / image_store.CHANGE_FOLDER / old).exists())
+        self.assertTrue(image_store.change_image(self.root / "links", after[change_review.IMAGE]))
+
+    def test_edit_image_keeps_text_validation_and_accepts_a_complete_text_edit(self) -> None:
+        _ = self.listing.write_text(LIST, encoding="utf-8")
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        arguments = ("edit", "--production", "top", "--list", str(self.listing),
+                     "--row", "C76", "--image", str(shot), "--change", "New preview")
+        code, _, errors = run(*arguments)
+        self.assertEqual(code, 1)
+        self.assertIn("--check needs one line of words", errors)
+        self.assertEqual(self.listing.read_text(encoding="utf-8"), LIST)
+        code, _, errors = run(*arguments, "--check", "Open", "--see", "The result")
+        self.assertEqual((code, errors), (0, ""))
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual((row["Change"], row[change_review.CHECK]), ("New preview", "Open. You see: The result"))
+        self.assertTrue(image_store.change_image(self.root / "links", row[change_review.IMAGE]))
+
+    def test_a_missing_image_does_not_add_an_empty_image_column(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _ = change_review.append_rows(self.listing, [Visible("Preview", "Read", "Proof", image="abcdef012345")],
+                date(2026, 11, 15), "", self.doc, producers=[self.unit.id], record=staff.snapshot())
+        self.assertEqual(output.getvalue(), "change review: no image abcdef012345; row C1 has no image\n")
+        self.assertNotIn(change_review.IMAGE, change_review.pending(self.listing)[0])
+
+    def test_add_image_and_both_verdicts_remove_only_the_change_image(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        for verdict in ("works", "return"):
+            with self.subTest(verdict=verdict):
+                code, output, errors = run("add", "--repo", str(self.repo), "--production", "top",
+                    "--change", "Preview", "--check", "Read", "--see", "The image", "--image", str(shot))
+                self.assertEqual((code, errors), (0, ""))
+                row = output.strip().splitlines()[-1]
+                pending = next(item for item in change_review.pending(self.listing) if item["#"] == row)
+                identity = pending[change_review.IMAGE]
+                folder = self.root / "links" / image_store.CHANGE_FOLDER / identity
+                self.assertTrue(folder.is_dir())
+                _ = change_review.record_verdict(self.listing, row, verdict, date(2026, 11, 15), self.doc)
+                self.assertFalse(folder.exists())
+                reviewed = next(item for item in change_review.review_rows(self.listing) if item["#"] == row)
+                self.assertEqual(reviewed.get(change_review.IMAGE, ""), "")
+
     def test_open_cells_follow_staff_changes_without_rewriting_review_history(self) -> None:
         _ = change_review.append_rows(self.listing, [Visible("Unit", "Read", "Proof"),
             Visible("Production", "Read", "Proof"), Visible("Reviewed", "Read", "Proof")],
@@ -527,6 +621,16 @@ class ReviewKindTest(unittest.TestCase):
 
 
 class ParseTest(unittest.TestCase):
+    def test_image_is_the_last_optional_field(self) -> None:
+        identity = "012345abcdef"
+        self.assertEqual(change_review.parse(f"Change | Try | See | image {identity}"),
+                         Visible("Change", "Try", "See", image=identity))
+        self.assertEqual(change_review.parse(f"Change | Try | See | after restart | image {identity}"),
+                         Visible("Change", "Try", "See", change_review.AfterStep("restart"), identity))
+        for suffix in ("image bad", "image ../outside", f"image {identity} | after restart", "image "):
+            with self.subTest(suffix=suffix):
+                self.assertIsInstance(change_review.parse("Change | Try | See | " + suffix), Malformed)
+
     def test_a_visible_line_a_none_line_and_a_malformed_line(self) -> None:
         self.assertEqual(change_review.entries(f"checkpoint(x): y\n\n{SEE}\nChange-Review: none — scripts only\n"
                                                + "Change-Review: something\n"),
@@ -986,6 +1090,21 @@ class ReadyListTests(ProducerFixture):
 
     def live(self, merged: str, step: str = "restart") -> tuple[int, str, str]:
         return run("live", "--repo", str(self.repo), "--production", "top", "--merged", merged, "--step", step)
+
+    def test_list_ready_and_live_keep_images_and_report_a_missing_image(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        merged = self.merge_change(f"Change-Review: First | Read | First result | image {identity}\n"
+            + f"Change-Review: Held | Read | Later result | after restart | image {identity}\n"
+            + "Change-Review: Missing | Read | Missing result | image abcdef012345")
+        self.promote()
+        code, output, errors = self.ready()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("change review: no image abcdef012345; row C2 has no image", output)
+        self.assertEqual([row.get(change_review.IMAGE, "") for row in change_review.pending(self.listing)], [identity, ""])
+        self.assertEqual(self.live(merged)[0], 0)
+        self.assertEqual(change_review.pending(self.listing)[-1][change_review.IMAGE], identity)
 
     def test_a_separate_promotion_makes_the_source_clone_add_each_row_once(self) -> None:
         merged = self.merge_change("Change-Review: First | Read | First result\n"

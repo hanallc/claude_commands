@@ -602,6 +602,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
     peak_history_share_percent: int
+    progress_profile_sweep_seconds: float
 
 
 @dataclass(frozen=True)
@@ -618,10 +619,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
             peak_history_share_percent = settings.whole("peak_history_share_percent")
+            progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
+            progress_profile_sweep_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 

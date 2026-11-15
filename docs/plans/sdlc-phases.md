@@ -243,6 +243,94 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
 - `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
 
+### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.phase_lock(phase_dir)` holds `phase_baseline.lock`, the lock file the baseline writer already used. `committed`, the repair record (`_repair_record`), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` hold it across their read and write.
+- `release_held` takes no lock itself; its final `clear` takes the lock and checks the pending record again.
+- The repair holds the lock during its board check, so a checkpoint can wait up to that check's timeout.
+- Test: `test_a_checkpoint_during_a_repair_keeps_its_pending_release_record` fails with the lock removed and passes with it.
+
+**Files:**
+- `scripts/direct/phase_reservation.py`
+- `scripts/direct/test_phase_reservation.py`
+
+**Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
+
+### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `note_file.ahead(resets, *, now)` and `note_file.remaining(note)` hold the two note helpers. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`. It keeps no copy and no re-export, so a caller of the helpers does not load `quota_alert`.
+- `test_agent_notes.py` reads `note_file.ahead`; no other caller was found.
+
+**Files:**
+- `scripts/whoami/note_file.py` — `ahead`, `remaining`
+- `scripts/whoami/quota_alert.py` — the call sites
+- `scripts/whoami/test_agent_notes.py` — the `ahead` tests
+
+### Phase 35 — The launch account for a Claude task lives in models.conf  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agents_resolve` sets `AGENT_CLAUDE_ACCOUNT` for a claude task from `[<function>.options]`: `claude_account.<subtask>`, then `claude_account`. The value is `workers` (the default) or `caller`; another value stops with `ERROR:` and the allowed values. A codex task gets an empty value.
+- `agent_exec.sh` runs a `caller` task on the caller's own account and every other Claude task on the workers pool. No task-name test is left.
+- `config/models.conf` has `[direct.options] claude_account.simplify=caller`.
+
+**Files:**
+- `scripts/agents/models_config.sh` — `_agents_resolve_claude_account`
+- `scripts/agents/agent_exec.sh` — the account branch
+- `config/models.conf`, `docs/as-built/agent-registry.md` — the key and its description
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh` — each value, and `account_case` on the caller account
+- `scripts/lib/test_nix_env_launches.py` — the `agents_resolve` stub sets `AGENT_CLAUDE_ACCOUNT`
+
+**Gotchas:** `agent_exec.sh` runs under `set -u`, so an `agents_resolve` stub must set every variable the launcher reads.
+
+### Phase 36 — The simplify-follow items still in the tree  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agent_exec.sh` calls `claude_result.py` at its one call site. The wrapper function is gone; its comment sits above the Claude command line.
+- `simplify_result.py` lists `SIMPLIFY_AGENTS` with `", "`.
+- `account_for_launch` in `add_unit.py` calls `accounts.prepare_claude_launch`; its `try` turns `AccountsError` into `Refusal`.
+- `account_test_support.store_usage(tool, login, usage)` writes one login's readings under the store lock. `stored_room` and `test_accounts.py` `reading` call it.
+- `test_agent_exec.py`, `test_review.py` (two sites) and `add_showrunner_test_support.py` call `create_claude_account`.
+- `agent-registry.md` says every readonly Claude run disables the editing tools.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`, `scripts/direct/simplify_result.py`, `scripts/production/add_unit.py`
+- `scripts/whoami/account_test_support.py` — `store_usage`
+- `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/accounts/test_accounts.py`, `scripts/direct/test_simplify_result.py`
+- `docs/as-built/agent-registry.md`
+
+**Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
+
+### Phase 37 — An Images card can show a before and after pair  · status: done
+**Depends on:** none
+
+#### As-built
+
+User request 11-15 10:24: before and after shots side by side, with one metadata block and one Delete. The user accepted the mockup.
+
+- `images.py register (--image PATH | --before PATH --after PATH)`: a pair is one folder with `before<suffix>` and `after<suffix>`, one record, one id and one image link. The record keeps the after image in `file` and the before image in `before`.
+- A pair card (`article.pair`) shows Before and After side by side in `.image-pair`, each linked to its full size. It has one caption, one details block, one Feedback field, one Send feedback and one Delete, which removes the folder.
+- The feedback message has a `Before:` and an `After:` link for a pair.
+- On a page 1104px or wider, a single card is 680px and a pair card is up to 1376px, both centered. A pair card under 600px stacks its images, before on top (container query).
+- `/show_image`, `docs/as-built/review-links.md` and the proof rule in `docs/production_format.md` say: file before and after shots as one pair.
+
+**Files:**
+- `scripts/review_links/images.py` — `register(before=)`, `shown_files`, `picture`, the pair card, the CSS and the `register` options
+- `scripts/review_links/test_images.py` — `ImagePairTests` and the pair server test
+- `commands/show_image.md`, `docs/as-built/review-links.md`, `docs/production_format.md`
+
+**Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

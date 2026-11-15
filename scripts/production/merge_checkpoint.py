@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
-from scripts.production import change_review, checkpoint_gate
+from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
 from scripts.lib import mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -1347,11 +1347,22 @@ def finish_checkpoint(request: MergeRequest, merge_head: str, tests_green: str) 
     promotion_done.touch()
     record(request, merge_head, tests_green)
     end_phase_scratch(request)
+    record_land(request, landed=True)
     print(f"send {request.unit.name}: phase {request.phase} merged and pushed as {merge_head}; continue with the next step")
+
+
+def record_land(request: MergeRequest, *, landed: bool, step: str = "", state: str = "", detail: str = "") -> None:
+    """Add the land result for the units board; a failed write does not change the land."""
+    try:
+        land_runs.record_result(commit=request.commit, production=request.production.name, unit=request.unit.name,
+                                phase=request.phase, landed=landed, step=step, state=state, detail=detail)
+    except OSError as error:
+        print(f"land result: not recorded — {error}", flush=True)
 
 
 def report_checkpoint_stop(request: MergeRequest, error: checkpoint_gate.Stop) -> int:
     checkpoint_gate.report(error.step, error.state, error.detail.replace("\n", "; "))
+    record_land(request, landed=False, step=error.step, state=error.state, detail=error.detail)
     print(f"send {request.unit.name}: {error.message}")
     return checkpoint_gate.TREE_CHANGED_STATUS if error.state == "cancelled" else 1
 
@@ -1458,6 +1469,7 @@ def run(request: MergeRequest) -> int:
         return report_checkpoint_stop(request, error)
     except (OSError, ValueError) as error:
         checkpoint_gate.report("run", "failed", str(error).replace("\n", "; "))
+        record_land(request, landed=False, step="run", state="failed", detail=str(error))
         print(f"send {request.unit.name}: the showrunner will inspect the failed command")
         return 1
 
@@ -2068,7 +2080,8 @@ def main() -> int:
         try:
             requests = batch_requests(batch, cast(str, args.production))
             production = requests[0].production
-            with merge_lock(production.checkout, production.name):
+            owners = [f"{item.unit.name} {item.phase}" for item in requests]
+            with merge_lock(production.checkout, production.name), land_runs.landing([item.commit for item in requests], owners):
                 return run_batch(requests)
         except (Refusal, staff.StaffRefused, OSError, ValueError, checkpoint_gate.Stop) as error:
             checkpoint_gate.report("input", "failed", str(error))
@@ -2103,7 +2116,8 @@ def main() -> int:
     require_unit_arguments(parser, args)
     try:
         request = request_from(args)
-        with merge_lock(request.production.checkout, request.production.name):
+        owners = [f"{request.unit.name} {request.phase}"]
+        with merge_lock(request.production.checkout, request.production.name), land_runs.landing([request.commit], owners):
             return run(request)
     except staff.StaffUnreadable as error:
         checkpoint_gate.report("change review", "failed", f"{error}: the staff record is read before the push")

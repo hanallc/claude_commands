@@ -70,7 +70,7 @@ from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, main_push_lock, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
-from scripts.production import affected_modules, change_review  # noqa: E402
+from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -644,7 +644,7 @@ def slower_than_recorded(seconds: float, recorded: float) -> bool:
 
 
 def gate_state_dir() -> Path:
-    return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
+    return land_runs.state_dir()
 
 
 @dataclass(frozen=True)

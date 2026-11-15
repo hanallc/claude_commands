@@ -25,20 +25,11 @@ down refuses while an AWS job still runs. Kept claims do not delay down.
 down would delete the aws-build Tailscale device and keep tag:build-aws policy rules.
 down would delete all scaler access keys and remove only the scaler credential profile.
 down would remove regional gate stacks and copied images before the home foundation stack.
-down would remove compute resources, then the foundation stack and retained Budget.
+down would remove the foundation stack and retained Budget.
 down would delete the data volume and the gate image with its snapshot. The /home build cache is lost.
 down would remove deployment.json, up.json, setup proofs, and the prepared bundle.
 down keeps the spend ledger, charge history, disabled routing.json, admin.gpg, and the box image.
 Run deploy.py down --approve-destroy to remove the target.'''
-
-BUILDER_DRY_RUN = '''remove-builder would disable builder routing and aws-target.service.
-remove-builder refuses while an AWS job still runs.
-remove-builder would delete the builder Tailscale device and builder compute resources.
-remove-builder would delete the retained data volume. The /home build cache is lost.
-remove-builder keeps the stack, Budget, scaler credentials, gate resources, and gate-deployment.json.
-remove-builder keeps admin.gpg, and the box image.
-remove-builder resolves builder accounting and keeps the spending history.
-Run deploy.py remove-builder --approve-destroy to remove only the builder.'''
 
 IMAGES_DRY_RUN = '''remove-images would switch the gate stack to the official NixOS image.
 remove-images would keep the old image launchable until gate-deployment.json names the official image.
@@ -73,10 +64,8 @@ class NeverJoined:
 class TargetRemoval:
     def __init__(self, settings: Path, directory: Path, output: Path, admin: admin_secrets.AdminSecretSession,
                  api: AwsCli, execute: AwsExecutor, *, tailnet: box.TailnetTransport = box.tailnet_request,
-                 pause: Callable[[float], object] = time.sleep, clock: Callable[[], float] = time.time,
-                 builder_only: bool = False) -> None:
+                 pause: Callable[[float], object] = time.sleep, clock: Callable[[], float] = time.time) -> None:
         self.settings = settings
-        self.builder_only = builder_only
         self.directory = directory
         self.output = output
         self.admin = admin
@@ -217,8 +206,7 @@ class TargetRemoval:
         self.saved = deployment_record(self.directory)
         receipt = self.directory / 'down-complete.json'
         builder_receipt = self.directory / 'builder-removal.json'
-        if builder_receipt.exists() and (self.builder_only
-                or ledger.mapping(self.saved.get('outputs', {})).get('ComputeEnabled') == 'false'):
+        if builder_receipt.exists() and ledger.mapping(self.saved.get('outputs', {})).get('ComputeEnabled', 'false') == 'false':
             previous = remote.read_record(builder_receipt)
             outputs = ledger.mapping(self.saved.get('outputs', {})).copy()
             previous_outputs = ledger.mapping(previous.get('outputs', {}))
@@ -252,7 +240,7 @@ class TargetRemoval:
                                         str(outputs.get('InstanceId', '')), str(saved.get('data_volume_id', '')),
                                         str(saved.get('budget_name', '')))
         path = self.directory / 'down.json'
-        if path.exists() and not self.builder_only:
+        if path.exists():
             journal = remote.read_record(path)
             for key in ('account_id', 'region', 'stack_id', 'deployment_id'):
                 if journal.get(key) != getattr(self.identity, key):
@@ -272,7 +260,8 @@ class TargetRemoval:
                 raise ValueError('a completed removal record cannot authorize another stack deletion')
             return True
         # Refusals must leave up available to record missing deletion identities.
-        foundation_without_volume = (outputs.get('ComputeEnabled') == 'false'
+        # The foundation template has no ComputeEnabled output now; a record without it has no builder.
+        foundation_without_volume = (outputs.get('ComputeEnabled', 'false') == 'false'
                                      and not outputs.get('InstanceId') and not outputs.get('DataVolumeId')
                                      and saved.get('data_volume_id', '') == '')
         for key in ('data_volume_id', 'budget_name'):
@@ -289,7 +278,7 @@ class TargetRemoval:
         _ = self._device_identity()
         if stack:
             outputs = self._outputs(stack)
-            if foundation_without_volume and (outputs.get('ComputeEnabled') != 'false'
+            if foundation_without_volume and (outputs.get('ComputeEnabled', 'false') != 'false'
                     or outputs.get('InstanceId') or outputs.get('DataVolumeId')):
                 raise ValueError('the live foundation has compute resources absent from the deployment record')
             for key, value in (('InstanceId', self.identity.instance), ('DataVolumeId', self.identity.volume),
@@ -299,36 +288,9 @@ class TargetRemoval:
         return False
 
     def remember(self) -> None:
-        path = self.directory / ('builder-removal.json' if self.builder_only else 'down.json')
-        if self.builder_only or not path.exists():
-            write_text_atomic(path, json.dumps(self.saved if self.builder_only else asdict(self.identity)) + '\n')
-
-    def compute(self) -> bool:
-        stack = self._stack()
-        if not stack or stack.get('StackStatus') in ('REVIEW_IN_PROGRESS', 'DELETE_IN_PROGRESS'):
-            return False
-        if ledger.text(stack, 'StackStatus').endswith('_IN_PROGRESS'):
-            self._wait(lambda: not ledger.text(self._stack(), 'StackStatus').endswith('_IN_PROGRESS'),
-                       'the stack update did not finish')
-            stack = self._stack()
-        if self._outputs(stack).get('ComputeEnabled') != 'true':
-            return False
-        if stack.get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'):
-            raise ValueError('down cannot remove compute from stack state ' + ledger.text(stack, 'StackStatus'))
-        parameters = [{'ParameterKey': ledger.text(row, 'ParameterKey'), 'UsePreviousValue': True}
-                      for row in ledger.rows(stack, 'Parameters') if row.get('ParameterKey') != 'EnableCompute']
-        parameters.append({'ParameterKey': 'EnableCompute', 'ParameterValue': 'false'})
-        _ = self.api.call('update-stack', '--stack-name', self.identity.stack_id, '--use-previous-template',
-                          '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(parameters), service='cloudformation')
-        def removed() -> bool:
-            current = self._stack()
-            status = str(current.get('StackStatus', ''))
-            if status in ('UPDATE_FAILED', 'UPDATE_ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_FAILED'):
-                raise ValueError('compute removal failed: ' + status)
-            return not current or status == 'UPDATE_COMPLETE' and self._outputs(current).get('ComputeEnabled') == 'false'
-        self._wait(removed, 'compute removal did not finish')
-        print('removed: instance, root volume, launch template, security group, instance profile, compute roles, and volume attachment')
-        return True
+        path = self.directory / 'down.json'
+        if not path.exists():
+            write_text_atomic(path, json.dumps(asdict(self.identity)) + '\n')
 
     def foundation(self) -> bool:
         stack = self._stack()
@@ -429,7 +391,7 @@ class TargetRemoval:
 
     def run(self) -> bool:
         stages = (('routing-off', self.routing), ('tailscale-device', self.devices), ('regional-gates', self.regional_gates), ('scaler-keys', self.scaler),
-                  ('compute', self.compute), ('foundation', self.foundation), ('retained-resources', self.retained),
+                  ('foundation', self.foundation), ('retained-resources', self.retained),
                   ('gate-image', self.gate_image), ('local-state', self.local_state))
         with control_lock(self.directory / 'up'), ExitStack() as locks:
             try:

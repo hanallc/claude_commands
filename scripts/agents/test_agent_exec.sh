@@ -64,7 +64,11 @@ write_test_registry "$MODELS_CONFIG_FILE" \
     assignments/codex_case=codex \
     assignments/direct.simplify=claude \
     direct.claude/simplify=opus:max \
+    direct.options/claude_account.simplify=caller \
     assignments/claude_case=claude \
+    assignments/account_case=claude \
+    account_case.claude/task=opus:max \
+    account_case.options/claude_account=caller \
     assignments/bare_case=codex \
     assignments/tier_case=codex \
     assignments/tier_case.claude_task=claude \
@@ -287,6 +291,8 @@ export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 run_exec_fixture direct.simplify readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "simplify replaced the caller account with the workers account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "simplify used the worker catalog" "claude-opus-claude2-fixture" "$(recorded_claude_model)"
+run_exec_fixture account_case.task readonly "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
+assert_equal "a claude_account=caller row did not keep the caller account" "$HOME/.claude2" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"

@@ -914,6 +914,10 @@ The main loop clears the outage claim once after `silence_seconds` of continuous
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
+Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
+It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+A failed start of the new code exits, and `Restart=always` starts the service again.
+A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 A restored head override receives reconnect grace only after the listener is ready.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
 It sends the outage message to the `builds` session first.
@@ -1998,6 +2002,10 @@ Scope evidence includes all recorded scope members, including helpers outside th
 The service reads process commands and `RssAnon` only for a new highest run value.
 Lower samples, equal samples, and lower bin peaks retain the previous process evidence.
 Active records retain this evidence across service restarts and completion.
+The history merge reads only each record's profile and time; it does not keep the process evidence in memory.
+Each pass reads stale histories for at most `progress_profile_sweep_seconds` (initially 0.05), and always reads at least one key.
+After a restart, the service reads the history of each running step's key at once, and the other keys over the next passes.
+The sweep also deletes expired records, so an expired record can stay on disk until the sweep reaches its key.
 Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
 Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.

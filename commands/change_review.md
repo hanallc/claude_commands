@@ -73,7 +73,7 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
+… add [--production <name>] --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>] [--image <png>]
 ```
 
 `--urgency` is `blocks` (work stops until the user checks it), `soon` (with
@@ -90,6 +90,35 @@ shows each unit's phase" --check "In a showrunner session on natedev, type
 check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
 commit holds the change. The Merged cell holds the date and time of the add, in the
 user's zone, then the commit: `2026-11-13 16:20 · 31770c75`. It prints the new row's id, such as `C12`.
+
+## Change images
+
+Attach one image wherever possible. A line without an image stays valid.
+Use `add --image <png>` to attach an existing screenshot to a manual row.
+Use `edit --row <id> --image <png>` to attach or replace an image on an existing row.
+An image replacement deletes the old image after the row is written.
+For a checkpoint, register the image first:
+
+```sh
+… image --image <png>
+… image --output <text file>
+```
+
+Use one option. `--output` renders the text as a dark terminal screenshot with headless Chrome.
+The action prints an image id and a hint.
+Add ` | image <id>` as the last Change-Review field, after ` | after <step>` when present.
+The id contains twelve lowercase hexadecimal characters.
+`list-ready` and `live` copy it into the row's `Image` cell.
+A missing image prints one line and leaves the cell empty.
+
+The console card and the one-row page show a 280px thumbnail beside the change text.
+The thumbnail moves below the text on narrow screens.
+Click the thumbnail to zoom over the page.
+Press Escape or click the zoom to return.
+Shift-click or use the right-click menu to open the full image in a new tab.
+A landing or return verdict deletes the image and clears its cell.
+Change images use `change-images/` and never appear on the Images page.
+The server deletes unclaimed images after `change_image_unclaimed_days`, which starts at 14 days.
 
 ## list-ready and live
 
@@ -127,6 +156,7 @@ what the person sees:
 
 ```sh
 … edit [--production <name>] --row <id> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+… edit [--production <name>] --row <id> --image <png>
 ```
 
 Pass the displayed ID, such as `sdlc/C9`.
@@ -134,6 +164,9 @@ The prefix names the responsible showrunner, even when another showrunner's list
 Commands also accept the list-based ID and a bare row number with the selected list.
 Pass `--list <path>` when the displayed ID matches several lists.
 The row keeps its id, its Merged cell and its place. It prints the new row.
+Add `--image <png>` to the text edit to attach or replace the image.
+With only `--image`, the row keeps all other cells.
+With any text option, pass all three text options.
 
 ## show
 
