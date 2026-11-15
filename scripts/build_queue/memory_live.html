@@ -1375,7 +1375,10 @@ function recordReadFailure(message) {
   else showQueueError(message.replace(/\.$/, ""));
 }
 
+const consoleHidden = () => window.frameElement?.hidden === true;
+
 async function tick() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1390,6 +1393,7 @@ async function tick() {
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
+  if (consoleHidden()) return;
   try {
     const r = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
     const stamp = r.headers.get("Last-Modified");
@@ -1401,6 +1405,12 @@ tick();
 setInterval(tick, SECONDS * 1000);
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
+addEventListener("message", event => {
+  if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
+    tick();
+    reloadWhenPageChanges();
+  }
+});
 </script>
 </body>
 </html>

@@ -454,6 +454,38 @@ class MemoryHoverTests(unittest.TestCase):
                     **data, "unmatched_priority_text": unmatched}))
                 self.assertEqual(heading.count(priority), int(bool(unmatched)))
 
+    def test_a_hidden_console_frame_reads_nothing_until_the_console_shows_it(self) -> None:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        javascript = """
+const calls = [];
+let listener = null;
+const parent = {name: "console"};
+const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
+const window = {frameElement: JSON.parse(process.argv[1])};
+const SECONDS = 5;
+const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
+const setInterval = () => 0;
+const addEventListener = (kind, handler) => { listener = handler; };
+""" + loop + """
+const loaded = calls.length;
+listener({source: {}, origin: location.origin, data: "console-shown"});
+listener({source: parent, origin: "http://other", data: "console-shown"});
+const foreign = calls.length;
+if (window.frameElement) window.frameElement.hidden = false;
+listener({source: parent, origin: location.origin, data: "console-shown"});
+process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(0, 2)]));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        reads = ["memory.json", "/memory_live.html"]
+        for frame, expected in (("null", [2, 2, 4, reads]), ('{"hidden": false}', [2, 2, 4, reads]),
+                                ('{"hidden": true}', [0, 0, 2, reads])):
+            with self.subTest(frame=frame):
+                result = subprocess.run([executable, "-e", javascript, frame], text=True, capture_output=True,
+                    timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("const TIPS ="):html.index("const tip =")]
