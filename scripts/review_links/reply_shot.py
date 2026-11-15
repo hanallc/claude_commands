@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
-from scripts.lib import conf
+from scripts.lib import conf, nix_env
 
 # Claude Code resumes the transcript with this placeholder key and makes no model call.
 PLACEHOLDER_KEY = "sk-ant-shot-only-0000000000000000000000"
@@ -99,6 +99,10 @@ def shot(markdown: Path, columns: int, png: Path) -> None:
                    "ANTHROPIC_API_KEY": PLACEHOLDER_KEY}
             for name in [name for name in env if name.startswith("CLAUDE_CODE") or name in ("CLAUDECODE", "WAYLAND_DISPLAY")]:
                 del env[name]
+            loaded = nix_env.ensure(cwd, env)
+            if isinstance(loaded, nix_env.Refused):
+                raise RuntimeError(loaded.reason)
+            env = loaded.env
             rows = settings.whole("reply_shot_terminal_rows")
             term = subprocess.Popen(["xterm", "-geometry", f"{columns}x{rows}+0+0", *FONT, "-bg", "black", "-fg", "white",
                                      "-e", claude, "--bare", "--resume", session], cwd=cwd, env=env)
