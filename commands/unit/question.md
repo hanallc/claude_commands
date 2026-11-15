@@ -21,18 +21,10 @@ Send design choices and proposed additions to the showrunner.
    The command reads the production document from the parent showrunner's `doc.path`.
    Do not pass a production document path or resolve one against your current directory.
    Without a parent showrunner, end the turn with `— decision:` as `/unit:direct` requires.
-2. Write the question in parts, so the user can read it days later.
-   The Questions page shows each part as its own section.
-   - `--ask`: the question in one line, such as `alpha: keep the old key binding?`. The lists use it as the title.
-   - `--context`: the unit, phase, file or screen, why you ask now, and which work waits. Keep it short.
-   - `--item`: one entry for each thing to look at, such as a before and after or a link. Repeat it.
-     For an image, give the image's own link that `/show_image` prints, not the Images page link.
-   - `--recommend`: the recommended choice and the reason.
-   - `--choice`: one answer the user can pick, with its result. Repeat it. Each choice is a button that fills the Answer box.
-   - A question with choices needs at least two `--choice` and one `--recommend`. An open question has no `--choice`.
+2. Write the question in parts, as **Question form** below says.
 3. Run the command:
    ```sh
-   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --unit <your unit staff id> --ask "<one line>" --context "<why now>" --item "<entry>" [--item "<entry>" ...] --recommend "<choice and reason>" --choice "<answer>" [--choice "<answer>" ...] [--urgency blocks]
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --unit <your unit staff id> --ask "<one line>" --context "<why now>" --item "<fact>" [--item ...] --recommend "<choice and reason>" --choice "<answer>" [--choice ...] [--urgency blocks]
    ```
    Pass `--urgency blocks` when the phase needs the answer to continue.
    The command reviews the question before it adds the question to the list.
@@ -45,3 +37,7 @@ Send design choices and proposed additions to the showrunner.
    When no work can continue, end the turn with `— decision: filed for the user: <one line>`.
 5. Apply the answer that the showrunner sends with `From the user (via the showrunner):`.
    Treat the answer as the user's instruction.
+
+## Question form
+
+@~/.claude/docs/question_template.md

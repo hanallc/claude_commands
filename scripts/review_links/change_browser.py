@@ -252,9 +252,16 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
     return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
 
 
+def item_html(entry: str) -> str:
+    """Show an item that is one backtick span, such as a command, as a code block."""
+    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    if whole is not None:
+        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+    return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
+
+
 def item_list(items: list[str]) -> str:
-    return '<h2>Items</h2><ol class="question-items">' + "".join(
-        "<li>" + "<br>".join(change_page.linked(line) for line in entry.splitlines()) + "</li>" for entry in items) + "</ol>"
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
 
 
 def choice_buttons(choices: list[str]) -> str:
@@ -274,18 +281,18 @@ def text_sections(text: str) -> tuple[str, str]:
         items[-1], trailing = last[0], last[1] if len(last) > 1 else ""
     choice_lead, choices, choice_trailing = numbered_run(choice_text)
     if not items and not choice_text and not recommend:
-        return change_page.review_text_html(text, links=True), ""
-    body = change_page.review_text_html(lead, links=True) if lead else ""
-    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, links=True) if trailing else "")
+        return change_page.review_text_html(text, inline=True), ""
+    body = change_page.review_text_html(lead, inline=True) if lead else ""
+    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, inline=True) if trailing else "")
     # Only numbered choices become buttons; other choice text shows as text.
     if choice_text and not choices:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, links=True)
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, inline=True)
     elif choice_lead:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, links=True)
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, inline=True)
     if choice_trailing:
-        body += change_page.review_text_html(choice_trailing, links=True)
+        body += change_page.review_text_html(choice_trailing, inline=True)
     if recommend:
-        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, links=True)
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, inline=True)
     return body, choice_buttons(choices)
 
 
@@ -295,13 +302,13 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
         return text_sections(item.get("question", ""))
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
-    body = "" if same else f'<p class="question-ask">{change_page.linked(parts["ask"])}</p>'
+    body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
     if parts["context"].strip():
-        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], links=True)
+        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], inline=True)
     if parts["items"]:
         body += item_list(parts["items"])
     if parts["recommend"].strip():
-        body += '<h2>Recommended</h2>' + change_page.review_text_html(parts["recommend"], links=True)
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(parts["recommend"], inline=True)
     return body, choice_buttons(parts["choices"])
 
 
@@ -400,6 +407,8 @@ PAGE_STYLE = """<style>[hidden]{display:none!important}
 [data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
 section+section{border:0;margin:0;padding:0}
 .question-ask{font-weight:600}.question-items li{margin:8px 0}
+[data-type="questions"] code{font:.9em ui-monospace,monospace;background:#8882;padding:1px 4px;border-radius:4px}
+[data-type="questions"] pre{margin:8px 0}[data-type="questions"] pre code{font:inherit;background:none;padding:0}
 .question-choices{display:flex;flex-wrap:wrap;gap:8px;border:0;margin:16px 0;padding:0}
 .question-choices legend{padding:0;margin-bottom:8px;font-weight:600}
 .question-choices button{text-align:left}.question-choices button[aria-pressed="true"]{outline:2px solid Highlight;outline-offset:2px}
