@@ -31,10 +31,16 @@ class Table:
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
     region_axis: RegionAxis
-    # One ranking for each row, and one for all the types with the same vCPU count.
+    # One ranking for each type, and one for all the types with the same vCPU count.
     # The page marks the first set of each ranking that has a cell in the chosen regions.
-    row_ranks: tuple[Ranking, ...] = ()
+    type_ranks: tuple[Ranking, ...] = ()
     group_ranks: tuple[Ranking, ...] = ()
+    # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
+    not_sold: frozenset[tuple[int, int]] = frozenset()
+
+
+NOT_SOLD = '—'
+NOT_SOLD_LEGEND = f'{NOT_SOLD} not sold here'
 
 
 def minutes_ago(seconds: int) -> str:
@@ -163,7 +169,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
     days = configuration.whole('run_cost_days')
     home = configuration.text('region')
     hours, hours_note = billed_hours(directory, now, regions, gate_sizes(values), days, home,
-                                     conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
+                                     configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
         (price_table('Standard Spot prices (USD/h; lowest zone)', standard, regions, minimum, notes),
@@ -177,18 +183,19 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
 
 def price_table(title: str, sizes: tuple[str, ...], regions: tuple[str, ...], minimum: dict[tuple[str, str], Decimal],
                 notes: Mapping[str, str]) -> Table:
-    """One row per type and one column per region, with the lowest price of each row and of each vCPU count marked."""
+    """One row per region and one column per type, with the lowest price of each type and of each vCPU count marked."""
     def cell(size: str, region: str) -> str:
         price = minimum.get((region, size))
         note = notes[region]
-        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or 'not sold here'
+        return f'{price:.4f}' + (f' [{note}]' if note else '') if price is not None else note or NOT_SOLD
 
-    prices = {(row, column): minimum[region, size] for row, size in enumerate(sizes)
-              for column, region in enumerate(regions, 1) if (region, size) in minimum}
-    groups = {row: largest_gate_vcpus((size,)) for row, size in enumerate(sizes)}
-    return Table(title, ('type', *regions), frozenset(range(1, len(regions) + 1)),
-                 tuple((size, *(cell(size, region) for region in regions)) for size in sizes), 'columns',
-                 ranks(prices, lambda place: place[0]), ranks(prices, lambda place: groups[place[0]]))
+    places = {(row, column): (region, size) for row, region in enumerate(regions) for column, size in enumerate(sizes, 1)}
+    prices = {place: minimum[key] for place, key in places.items() if key in minimum}
+    not_sold = frozenset(place for place, key in places.items() if key not in minimum and not notes[key[0]])
+    groups = {column: largest_gate_vcpus((size,)) for column, size in enumerate(sizes, 1)}
+    return Table(title, ('region', *sizes), frozenset(range(1, len(sizes) + 1)),
+                 tuple((region, *(cell(size, region) for size in sizes)) for region in regions), 'rows',
+                 ranks(prices, lambda place: place[1]), ranks(prices, lambda place: groups[place[1]]), not_sold)
 
 
 def ranks(prices: dict[tuple[int, int], Decimal], group: Callable[[tuple[int, int]], int]) -> tuple[Ranking, ...]:
@@ -288,12 +295,13 @@ def unbilled(runs: int) -> str:
 
 
 def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tuple[str, ...], days: int, home: str,
-                 max_ratio: Decimal) -> tuple[Table, str]:
+                 builder: str, max_ratio: Decimal) -> tuple[Table, str]:
     """The billed Spot hours against the recorded box hours of each type and region, and the note under them."""
     title = 'Billed hours / box hours'
     end = datetime.fromtimestamp(now, UTC)
     try:
-        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, sizes, max_ratio)
+        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, sizes,
+                                       max_ratio)
     except ledger.LedgerUnavailable:
         return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
     # A region that is no longer a candidate keeps its column while it has hours in the window.
@@ -338,6 +346,8 @@ def render(directory: Path, now: int, *, width: int | None = None, settings_path
     tables = spot_tables(directory, now, settings_path=settings_path)
     terminal_width = width if width is not None else shutil.get_terminal_size().columns
     lines = [line for table in tables.prices for line in split_table(table, terminal_width)]
+    if any(table.not_sold for table in tables.prices):
+        lines.extend((NOT_SOLD_LEGEND, ''))
     lines.extend((*tables.snapshot_lines, ''))
     lines.extend(line for table in tables.quotas for line in split_table(table, terminal_width))
     merge_gates = tables.runs[0]

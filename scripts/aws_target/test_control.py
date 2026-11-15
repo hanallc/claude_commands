@@ -326,9 +326,12 @@ class ControlTests(CostFixture):
             # The quotas come from the same read as the prices, so only the prices show the age.
             for row in quotas.rows:
                 self.assertEqual(row[column], f'{quota // vcpus} boxes')
-        missing = next(line for line in table.splitlines() if line.startswith(self.omitted))
-        self.assertIn('old', missing)
-        self.assertNotIn(' -', missing)
+        # A stale region names its note in an empty cell, not the sign of a type it does not sell.
+        prices = spot_table.spot_tables(self.state, int(self.clock.now)).prices[1]
+        column = prices.headers.index(self.omitted)
+        self.assertTrue(all('old' in row[column] for row in prices.rows))
+        self.assertEqual(prices.not_sold, frozenset())
+        self.assertNotIn(spot_table.NOT_SOLD_LEGEND, table)
         self.assertEqual(before, {path: path.read_bytes() for path in self.state.iterdir()})
 
     def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
@@ -429,16 +432,18 @@ class ControlTests(CostFixture):
         self.assertEqual(data, aws_page.page_data(tables, int(self.clock.now)))
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
-        self.assertEqual([table['right'] for table in data['prices']], [list(range(1, len(self.regions) + 1))] * 2)
-        # Every fixture price is equal, so each ranking is one set: the row, or every row with the same vCPU count.
+        self.assertEqual([table['right'] for table in data['prices']],
+                         [list(range(1, len(types) + 1)) for types in ((*self.standard, *self.compare), self.gpu)])
+        # Every fixture price is equal, so each ranking is one set: the type, or every type with the same vCPU count.
         prices = data['prices'][0]
-        columns = range(1, len(self.regions) + 1)
-        self.assertEqual(prices['row_ranks'], [[[[row, column] for column in columns]] for row in range(len(prices['rows']))])
+        columns = range(1, len(prices['headers']))
+        self.assertEqual([row[0] for row in prices['rows']], list(self.regions))
+        self.assertEqual(prices['type_ranks'], [[[[row, column] for row in range(len(self.regions))]] for column in columns])
         self.assertEqual(sorted(cell for ranking in prices['group_ranks'] for ties in ranking for cell in ties),
-                         [[row, column] for row in range(len(prices['rows'])) for column in columns])
+                         sorted([row, column] for row in range(len(self.regions)) for column in columns))
         self.assertEqual([len(ranking) for ranking in prices['group_ranks']], [1] * len(prices['group_ranks']))
-        self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])],
-                         ['columns', 'columns', 'rows', 'rows'])
+        self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
+        self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], list(self.regions))
         self.assertEqual([line['text'] for line in data['snapshot']], list(tables.snapshot_lines))
         summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
@@ -473,7 +478,7 @@ class ControlTests(CostFixture):
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],
                          [self.standard[0], None, self.standard[0]])
 
-    def test_prices_split_gpu_types_and_mark_the_lowest_of_each_row_and_vcpu_count(self) -> None:
+    def test_prices_split_gpu_types_and_mark_the_lowest_of_each_type_and_vcpu_count(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         path = self.state / 'spot-prices.json'
         document = ledger.mapping(cast(object, json.loads(path.read_text())))
@@ -483,18 +488,18 @@ class ControlTests(CostFixture):
                 row['usd_per_hour'] = '0.2000'
         _ = path.write_text(json.dumps(document))
         standard, gpu = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).prices
-        self.assertEqual(([row[0] for row in standard.rows], [row[0] for row in gpu.rows]),
-                         ([*self.standard, *self.compare], list(self.gpu)))
-        column = len(self.regions)
-        columns = range(1, column + 1)
-        # The lower price ranks first in its row, then the equal prices; a row of equal prices is one set.
-        self.assertEqual(standard.row_ranks[0], (frozenset({(0, column)}), frozenset((0, index) for index in columns[:-1])))
-        self.assertEqual(standard.row_ranks[1], (frozenset((1, index) for index in columns),))
-        vcpus = [deploy.largest_gate_vcpus((row[0],)) for row in standard.rows]
-        peers = {index for index, count in enumerate(vcpus) if count == vcpus[0]}
-        others = {(row, index) for row in range(len(vcpus)) if row not in peers for index in columns}
+        self.assertEqual((standard.headers[1:], gpu.headers[1:]), ((*self.standard, *self.compare), self.gpu))
+        self.assertEqual([row[0] for row in standard.rows], list(self.regions))
+        row = len(self.regions) - 1
+        rows = range(len(self.regions))
+        # The lower price ranks first in its type, then the equal prices; a type of equal prices is one set.
+        self.assertEqual(standard.type_ranks[0], (frozenset({(row, 1)}), frozenset((index, 1) for index in rows[:-1])))
+        self.assertEqual(standard.type_ranks[1], (frozenset((index, 2) for index in rows),))
+        vcpus = {column: deploy.largest_gate_vcpus((size,)) for column, size in enumerate(standard.headers[1:], 1)}
+        peers = {column for column, count in vcpus.items() if count == vcpus[1]}
+        others = {(index, column) for column in vcpus if column not in peers for index in rows}
         lowest = {cell for ranking in standard.group_ranks for cell in ranking[0]}
-        self.assertEqual(lowest, {(0, column)} | others)
+        self.assertEqual(lowest, {(row, 1)} | others)
 
     def test_snapshot_line_is_one_line_only_when_every_region_agrees(self) -> None:
         reads = tuple(spot_table.RegionRead(region, 3364, False, None, 0) for region in ('a', 'b'))
@@ -759,10 +764,12 @@ class ControlTests(CostFixture):
     def test_fresh_reply_without_an_offer_names_the_missing_price(self) -> None:
         self.omitted = self.gpu[-1]
         self.assertEqual(self.snapshot(), 0)
-        table = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings)
-        missing = next(line for line in table.splitlines() if line.startswith(self.omitted))
-        self.assertIn('not sold here', missing)
-        self.assertNotIn(' -', missing)
+        gpu = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).prices[1]
+        column = gpu.headers.index(self.omitted)
+        self.assertEqual({row[column] for row in gpu.rows}, {spot_table.NOT_SOLD})
+        self.assertEqual(gpu.not_sold, frozenset((row, column) for row in range(len(gpu.rows))))
+        lines = spot_table.render(self.state, int(self.clock.now), settings_path=self.settings).splitlines()
+        self.assertEqual(lines.count(spot_table.NOT_SOLD_LEGEND), 1)
 
 
 

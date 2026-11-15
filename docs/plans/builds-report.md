@@ -1534,3 +1534,15 @@ From the user (via builds, 2026-11-14): "please add a filter at the top that all
 - `/aws_prices` in the terminal does not change.
 - Proof: `phases/83/proof/before-*` (four shots) and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width).
 - Tests: 43 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 84 — The Spot price tables have one row per region · status: done
+
+From the user (via builds, 2026-11-15): "instead of saying 'not sold here' i think you should just do a dash and have a legend underneath that says dash = not sold here - if you can use an appropriate lucide icon that would be even better ... we should transpose the table because there are now so many more regions than machine types. and split the table into two side by side - one for standard and one for gpu based". From builds (not the user): the page uses the lucide `ban` icon with no legend; the terminal uses `—` with one legend line.
+
+#### As-built
+
+- `spot_table.price_table`: one row per region and one column per type, with `region_axis` `rows`. `Table.row_ranks` became `type_ranks`, one ranking per type column; `group_ranks` groups the type columns by vCPU count.
+- `Table.not_sold` holds the (row, column) cells of a type that the region does not sell. The terminal cell reads `—` (`NOT_SOLD`), and `render` adds one line `— not sold here` (`NOT_SOLD_LEGEND`) under the price tables. A region with a note (`no snapshot`, `read failed`, old age) keeps its note.
+- `aws_prices.html`: a not sold cell shows the lucide `ban` icon with the title `Not sold here`. The Standard and GPU price cards sit side by side and stack below 760 px. `lowestShown` uses only cells in the chosen rows and columns.
+- Proof: `phases/84/proof/before-*` and `after-*` (all regions dark, two regions dark, one region light, two regions at phone width, all regions at phone width).
+- Tests: 44 in `test_control` pass; basedpyright 0/0/0.

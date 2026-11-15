@@ -6,6 +6,8 @@ Run `python3 ~/.claude/scripts/aws_target/deploy.py spot-table` and show its lin
 
 The command reads only the local hourly snapshot and cost ledger. It makes no AWS call.
 Two tables show the lowest zone Spot price in USD/h for each type and region: standard types, then GPU types.
+Each has one row per region and one column per type.
+A `—` cell is a type that the region does not sell, and one line `— not sold here` under the tables names it.
 The snapshot age of each region follows the prices.
 Two quota tables follow: the Standard quota with the standard box counts, and the G and VT quota with the GPU box counts.
 Under the quotas, each standard type has one block with one line for each region.
@@ -17,7 +19,7 @@ The next line names the cheapest merge gate.
 Then two tables show the refused requests and the launched boxes of each type and region.
 The last table shows billed hours / box hours with the gap, and `over` above `billed_hours_gap_max_ratio`.
 `buildlog hourly` refreshes the snapshot with `aws_target.hourly`.
-Empty cells say `no snapshot`, `read failed`, or `not sold here`.
+Other empty cells say `no snapshot` or `read failed`.
 Each failed region shows its saved AWS error and the failure time.
 Cached values remain visible with a failure label or an old age.
 A failed hourly snapshot sends one user notice for each failure streak.

@@ -587,16 +587,19 @@ The snapshot does not change `controller.json`.
 
 `python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot, cost ledger and configuration.
 It prints two price tables: the standard types, then the GPU types.
-Each has machine types as rows and candidate regions as columns.
+Each has candidate regions as rows and machine types as columns.
+The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
 Each cell shows the lowest zone price in USD/h.
-An empty cell says `no snapshot`, `read failed`, or `not sold here`.
+A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
+One line `— not sold here` under the price tables names it.
+Another empty cell says `no snapshot` or `read failed`.
 Cached prices and quotas remain visible after a read failure.
 Their price cells include `read failed`, and the regional detail gives the last good age.
 Old prices include `old <minutes> min` in their cells.
 Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
 Each region without evidence says `no snapshot was ever taken`.
 The table never uses a bare `-` for an unavailable value.
-It splits wide tables into groups of region columns to fit the terminal.
+It splits wide tables into groups of columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
 The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
@@ -632,19 +635,22 @@ An unreadable cost ledger shows a note in place of the billed hours.
 
 The AWS prices page shows the same tables, published by `aws_page.publish`.
 The user asked for these page changes on 2026-11-14 through builds:
-1. A price with the lowest value of its row has a fill.
+1. A price with the lowest value of its type has a fill.
 2. A price with the lowest value of all the types with the same vCPU count has an outline.
    A cell can have both. Equal prices are all lowest. A legend under the standard prices names both marks.
-3. Each standard and GPU table is its own card.
+3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
+   The user asked for the side by side cards on 2026-11-15 through builds.
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
 5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
+6. A `Table.not_sold` cell shows the lucide `ban` icon, with the title `Not sold here` on hover, and no legend.
+   The user asked for it on 2026-11-15 through builds.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The fill and the outline mark the lowest price in the chosen regions. `Table.row_ranks` and `Table.group_ranks`
-   hold each row and each vCPU count from the lowest price up, so the page marks the first set that has a chosen region.
-   A row or vCPU count with fewer than two prices in the chosen regions has no mark: one region shows no fill.
+3. The fill and the outline mark the lowest price in the chosen regions. `Table.type_ranks` and `Table.group_ranks`
+   hold each type and each vCPU count from the lowest price up, so the page marks the first set that has a chosen region.
+   A type or vCPU count with fewer than two prices in the chosen regions has no mark: one region shows no fill.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
 6. The page keeps the choice in browser storage, with the run kind.
