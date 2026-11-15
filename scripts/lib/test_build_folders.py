@@ -50,6 +50,23 @@ class BuildFolderTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
 
+    def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        lines = [line for line in settings.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("roots.scratch")]
+
+        def configure(root: Path) -> None:
+            text = "\n".join(f"{line}\nroots.scratch={root}" if line == "[roots]" else line for line in lines)
+            _ = settings.write_text(text + "\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ):
+            del os.environ[copy_record.ROOT_ENV]
+            configure(self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            configure(self.root / "second-root")
+            self.assertEqual(copy_record.root(), self.root / "second-root")
+
     def test_cli_remove_cleans_free_records_and_keeps_a_held_folder(self) -> None:
         allocated = self.command("unique", "--prefix", "remove-cli-")
         self.assertEqual(allocated.returncode, 0, allocated.stderr)
