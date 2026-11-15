@@ -488,10 +488,10 @@ try {
               detailLayouts[name]=detailProof;
               if(name==='cloud_region_disagree') {
                 const agree=detailLayouts.cloud_region;
-                assert.ok(detailProof.barHidden && !agree.barHidden,'The disagree reading does not hide the memory bar.');
+                assert.ok(!detailProof.barHidden && !agree.barHidden,'The disagree reading hides the memory bar.');
                 for(const key of ['beside','tableLeft','detailWidth','chartHeight'])
-                  assert.equal(detailProof[key],agree[key],'The hidden memory bar changes the Running chart '+key+'.');
-                assert.deepEqual(detailProof.bars,agree.bars,'The hidden memory bar changes the Running chart bars.');
+                  assert.equal(detailProof[key],agree[key],'The disagree note changes the Running chart '+key+'.');
+                assert.deepEqual(detailProof.bars,agree.bars,'The disagree note changes the Running chart bars.');
               }
               if(name.startsWith('cloud_region') && process.env.MEMORY_PAGE_SHOT) {
                 const clip=await evaluate(`(() => {
@@ -606,6 +606,16 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
+            await show({...base, ram:{...base.ram, agreement:'disagree'}});
+            const disagree=await evaluate(`(() => {
+              const note=document.querySelector('#ram-disagree');
+              return {note:note.hidden?'':note.textContent,bar:document.querySelector('#barwrap').getBoundingClientRect().height,
+                scale:document.querySelector('#scale').hidden};
+            })()`);
+            assert.equal(disagree.note,'RAM readings do not agree: the named parts exceed the total.');
+            assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
+            assert.equal(disagree.scale,false,'A disagreement hides the scale.');
+            proof.disagree=disagree;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
