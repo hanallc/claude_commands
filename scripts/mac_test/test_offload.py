@@ -1433,7 +1433,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         )
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
+        self.assertIn("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH", remote_words)
         self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)

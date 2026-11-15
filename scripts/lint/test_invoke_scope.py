@@ -717,7 +717,6 @@ buildlog_release_memory() {
     echo release >> "$events"
     rm -rf "$TMPDIR/scope"
 }
-nextest_share_end() { :; }
 buildlog_end() { echo "record $1" >> "$events"; }
 sweep_after_step() { :; }
 run_once fixture-step
