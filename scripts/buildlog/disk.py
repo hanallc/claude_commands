@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from scripts.lib import conf
+from scripts.lib import conf, copy_record
 from scripts.lib.cargo_output import CargoOutputUnavailable, read_cargo_output_roots
 from scripts.lib.user_zone import user_zone
 
@@ -88,6 +88,14 @@ FOLDERS: list[tuple[str, str]] = [
     ("CI runner 1", "/var/lib/hana-ci/hana-linux-1"),
     ("CI runner 2", "/var/lib/hana-ci/hana-linux-2"),
 ]
+
+
+def scanned_folders() -> list[tuple[str, str]]:
+    """FOLDERS plus the scratch root when no folder holds it; task checkouts build there."""
+    scratch = copy_record.root()
+    if any(scratch.is_relative_to(Path(path).expanduser()) for _, path in FOLDERS):
+        return list(FOLDERS)
+    return [*FOLDERS, ("scratch", str(scratch))]
 
 
 @dataclass(frozen=True)
@@ -317,7 +325,7 @@ def snapshot() -> MeasuredDiskSnapshot:
                 "previous_measured_at": previous_snapshot["previous_measured_at"],
             }
     previous = previous_outside_measurement(previous_snapshot)
-    folders = list(FOLDERS)
+    folders = scanned_folders()
     outputs, unavailable = mapped_output_paths(folders)
     for output in outputs:
         if not any(output.is_relative_to(Path(path).expanduser().resolve()) for _, path in folders):
