@@ -616,10 +616,10 @@ try {
             assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
             assert.equal(disagree.scale,false,'A disagreement hides the scale.');
             proof.disagree=disagree;
-            // Build tools and the CI file cache sit outside the memory bar's room block; the cap line still marks the cap.
+            // Build tools sit outside the cap; the cap terms (queued builds, CI, reservations, room) add to the cap.
             const gib=1024**3, capReading=structuredClone(base);
-            Object.assign(capReading.ram,{builds_bytes:capReading.ram.queued_builds_bytes+2*gib,sccache_bytes:2*gib,
-              ci_bytes:gib/2,ci_counted_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
+            Object.assign(capReading.ram,{build_tools_bytes:2*gib,sccache_bytes:2*gib,
+              ci_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
             capReading.room-=1.5;
             await show(capReading);
             const capLine=await evaluate(`(() => {
@@ -666,6 +666,37 @@ try {
               'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
             proof.barMark=barMark;
+            // The cap terms end at the mark and the build tools start there: the mark splits no block.
+            const blockEdges=`(() => {
+              const edge=id=>{const b=document.getElementById(id);if(!b||b.hidden)return null;
+                const r=b.getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect();
+              const mark=document.querySelector('#barwrap #mark').getBoundingClientRect().left+7;
+              const terms=['s-queued','s-ci','s-reserved','s-room'].map(edge).filter(Boolean);
+              const blocks=[...document.querySelectorAll('#barwrap .bar > div')].filter(b=>!b.hidden).map(b=>b.getBoundingClientRect());
+              return {mark,termsRight:terms.length?terms[terms.length-1].right:bar.left,over:edge('s-over'),tools:edge('s-tools'),
+                unit:bar.width*${gib}/latest.ram.total_bytes,split:blocks.filter(b=>b.left<mark-1.5&&b.right>mark+1.5).length};
+            })()`;
+            const terms=await evaluate(blockEdges);
+            assert.ok(Math.abs(terms.termsRight-terms.mark)<=1.5,'The cap terms do not end at the cap mark. '+JSON.stringify(terms));
+            assert.ok(terms.tools&&Math.abs(terms.tools.left-terms.mark)<=1.5,'The build tools do not start at the cap mark. '+JSON.stringify(terms));
+            assert.equal(terms.over,null,'An over-cap block shows when use is under the cap.');
+            assert.equal(terms.split,0,'The cap mark splits a block. '+JSON.stringify(terms));
+            // Available RAM below the safety and swap reserves puts the cap below queued and CI use.
+            const overReading=structuredClone(capReading);
+            const overUse=overReading.ram.queued_builds_bytes+overReading.ram.ci_bytes;
+            Object.assign(overReading.ram,{build_covered_bytes:0,room_bytes:0});
+            overReading.cap=(overUse-2*gib)/gib;
+            overReading.room=0;
+            await show(overReading);
+            const over=await evaluate(blockEdges);
+            assert.ok(Math.abs(over.termsRight-over.mark)<=1.5,'Queued and CI use do not stop at the cap mark. '+JSON.stringify(over));
+            assert.ok(over.over&&Math.abs(over.over.left-over.mark)<=1.5&&Math.abs(over.over.width-2*over.unit)<=1.5,
+              'The use above the cap is not its own block at the mark. '+JSON.stringify(over));
+            assert.ok(over.tools&&Math.abs(over.tools.left-over.over.right)<=1.5,'The build tools do not follow the over-cap block. '+JSON.stringify(over));
+            assert.equal(over.split,0,'The cap mark splits a block. '+JSON.stringify(over));
+            assert.match(await evaluate("tipText('shortfall',latest).join(' ')"),/Queued and CI use above the cap: 2\.0 GiB\./);
+            proof.overCap=over;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
