@@ -24,7 +24,7 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, claude_table_layout, display_cells, live_units, unit_queue
+from scripts.production import census, claude_table_layout, display_cells, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib import names as display_names
@@ -138,7 +138,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(sessions),
                                                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                                                     "UNIT_QUEUE_STATE_DIR": str(self.root / "queue"),
-                                                    "XDG_STATE_HOME": str(self.root / "state")}))
+                                                    "XDG_STATE_HOME": str(self.root / "state"),
+                                                    "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
 
@@ -831,16 +832,22 @@ class UnitPhasesTests(unittest.TestCase):
         events: list[dict[str, object]] = [
             {"event_type": "phase_started", "phase_id": "images-card", "phase_instance_id": "one"},
             {"event_type": "activity_started", "phase_instance_id": "one", "activity": "write the card"},
-            {"event_type": "checkpoint", "phase_instance_id": "one"},
+            {"event_type": "checkpoint", "phase_instance_id": "one", "checkpoint_commit": "c" * 40},
             {"event_type": "eta_stated", "phase_instance_id": "one", "eta_phase_id": "images-card"},
             {"event_type": "activity_started", "phase_instance_id": "two"}]
-        self.assertTrue(unit_phases.checkpoint_sent(events[:4]))
-        self.assertFalse(unit_phases.checkpoint_sent([*events[:4], events[1]]))
-        self.assertFalse(unit_phases.checkpoint_sent(events[:2]))
+        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset()), "waiting on queued checkpoint")
+        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset({"ccccccccc"})), "waiting on running checkpoint")
+        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset({"d" * 40})), "waiting on queued checkpoint")
+        self.assertIsNone(unit_phases.checkpoint_wait([*events[:4], events[1]], frozenset({"c" * 40})))
+        self.assertIsNone(unit_phases.checkpoint_wait(events[:2], frozenset()))
         phase = phase_table.OpenPhase("images-card", "Images card", datetime(2026, 11, 15, 14, tzinfo=UTC),
             phase_table.PhaseProgressNotReported(), phase_table.EtaUnavailable(), phase_table.EtaNeverStated(), "one")
-        self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now),
-                         "phase images-card — Images card · checkpoint sent, waits to land")
+        self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, lands=frozenset()),
+                         "phase images-card — Images card · waiting on queued checkpoint")
+        with land_runs.landing(["c" * 9]):
+            self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now,
+                                                          lands=land_runs.running_commits()),
+                             "phase images-card — Images card · waiting on running checkpoint")
 
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")

@@ -788,7 +788,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A matching phase label at the start of the title appears once, regardless of case or dash.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-    `unit_phases.checkpoint_sent` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows ` · checkpoint sent, waits to land` in place of the step.
+    `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
+    The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`, else `waiting on queued checkpoint`.
+    `table` reads the land records once. `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits) while it holds the merge lock, and removes it at exit.
+    A record whose process ended is not running; the next read removes it. A short hash in a record matches its full commit.
     `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
     Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.

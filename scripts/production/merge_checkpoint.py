@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
-from scripts.production import change_review, checkpoint_gate
+from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
 from scripts.lib import mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -2065,7 +2065,7 @@ def main() -> int:
         try:
             requests = batch_requests(batch, cast(str, args.production))
             production = requests[0].production
-            with merge_lock(production.checkout, production.name):
+            with merge_lock(production.checkout, production.name), land_runs.landing([item.commit for item in requests]):
                 return run_batch(requests)
         except (Refusal, staff.StaffRefused, OSError, ValueError, checkpoint_gate.Stop) as error:
             checkpoint_gate.report("input", "failed", str(error))
@@ -2100,7 +2100,7 @@ def main() -> int:
     require_unit_arguments(parser, args)
     try:
         request = request_from(args)
-        with merge_lock(request.production.checkout, request.production.name):
+        with merge_lock(request.production.checkout, request.production.name), land_runs.landing([request.commit]):
             return run(request)
     except staff.StaffUnreadable as error:
         checkpoint_gate.report("change review", "failed", f"{error}: the staff record is read before the push")

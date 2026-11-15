@@ -40,7 +40,7 @@ from scripts.style import style_config
 from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
 
-from scripts.production import display_cells
+from scripts.production import display_cells, land_runs
 from scripts.production import unit_queue
 from scripts.lib import unit_runs
 from scripts.whoami import quota_state
@@ -408,29 +408,35 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     return single_spaced(task)
 
 
-CHECKPOINT_SENT = "checkpoint sent, waits to land"
+# Notes for a sent checkpoint that has not landed (user, 2026-11-15).
+CHECKPOINT_WAITS = {"running": "waiting on running checkpoint", "queued": "waiting on queued checkpoint"}
 WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
 
 
-def checkpoint_sent(events: list[dict[str, object]]) -> bool:
-    """A checkpoint after the phase instance's last start of work waits to land."""
+def checkpoint_wait(events: list[dict[str, object]], running: frozenset[str]) -> str | None:
+    """Name the wait for a checkpoint after the phase instance's last start of work.
+
+    The checkpoint is running when a land run that holds its commit runs now; otherwise it is queued.
+    """
     for event in reversed(events):
         kind = event.get("event_type")
         if kind == "checkpoint":
-            return True
+            commit = event.get("checkpoint_commit")
+            held = isinstance(commit, str) and land_runs.holds(running, commit)
+            return CHECKPOINT_WAITS["running" if held else "queued"]
         if kind in WORK_STARTS:
-            return False
-    return False
+            return None
+    return None
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
-                     snapshot: staff.StaffSnapshot, now: float) -> str:
+                     snapshot: staff.StaffSnapshot, now: float, lands: frozenset[str]) -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
-    if checkpoint_sent(instance):
-        parts.append(CHECKPOINT_SENT)
+    if (wait := checkpoint_wait(instance, lands)) is not None:
+        parts.append(wait)
     elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
         if text and text.casefold() not in (single_spaced(phase.title).casefold(), label.casefold(),
@@ -637,6 +643,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = plan_history.now_epoch() if now is None else now
     view = census_view(census_read)
     reason = no_worker_reason()
+    lands = land_runs.running_commits()
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
@@ -722,7 +729,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
-                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now)
+                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, lands=lands)
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
                           if first else display_cells.NONE)
                 if first:

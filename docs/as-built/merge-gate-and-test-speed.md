@@ -692,7 +692,7 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once.
+1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
 2. Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
 4. Check each remaining item and make its own merge commit.

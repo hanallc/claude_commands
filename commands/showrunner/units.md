@@ -85,7 +85,9 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A matching phase label at the start of the title appears once, regardless of case or dash.
    The phase instance in the selected run supplies the open step.
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-   A checkpoint after the instance's last phase, pass or activity start appends ` · checkpoint sent, waits to land` in place of the step.
+   A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
+   It is ` · waiting on running checkpoint` while a land run that holds the checkpoint commit runs now.
+   Otherwise it is ` · waiting on queued checkpoint`.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
