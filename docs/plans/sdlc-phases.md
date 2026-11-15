@@ -294,18 +294,22 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 36 — The simplify-follow items still in the tree  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-Survey (2026-11-15): items 1, 2, 4, 8, 9, 11, 13, 14 and 15 are gone, and item 3's old block is gone. sdlc gave this unit items 5, 6 and 7 (devtools changes `accounts.py status --json`, so item 7 stays at its two sites).
+- `agent_exec.sh` calls `claude_result.py` at its one call site. The wrapper function is gone; its comment sits above the Claude command line.
+- `simplify_result.py` lists `SIMPLIFY_AGENTS` with `", "`.
+- `account_for_launch` in `add_unit.py` calls `accounts.prepare_claude_launch`; its `try` turns `AccountsError` into `Refusal`.
+- `account_test_support.store_usage(tool, login, usage)` writes one login's readings under the store lock. `stored_room` and `test_accounts.py` `reading` call it.
+- `test_agent_exec.py`, `test_review.py` (two sites) and `add_showrunner_test_support.py` call `create_claude_account`.
+- `agent-registry.md` says every readonly Claude run disables the editing tools.
 
-1. Item 10: in `scripts/agents/agent_exec.sh`, delete `agents_claude_extract_result`. Call `"$PY" "$script_dir/claude_result.py" "$log_file" "$output_file"` at its one call site. Move its three comment lines above the `command=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 ...)` line.
-2. Item 12: `scripts/direct/simplify_result.py` joins `SIMPLIFY_AGENTS` with `", "`. Update the expected prompt in `scripts/direct/test_simplify_result.py`.
-3. Item 5: `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py` (two sites) and `scripts/production/add_showrunner_test_support.py` call `create_claude_account`. The showrunner fixture keeps its `projects` write.
-4. Item 3: `docs/as-built/agent-registry.md` says every readonly Claude run disables the edit tools. The `direct.simplify` line goes; it is stale since phase 31.
-5. Item 6: `account_for_launch` in `scripts/production/add_unit.py` calls `accounts.prepare_claude_launch`; its `try` already turns `AccountsError` into `Refusal`.
-6. Item 7: `account_test_support.store_usage(tool, login, usage)` holds the lock, load, key and write steps. `stored_room` and `test_accounts.py` `reading` call it.
+**Files:**
+- `scripts/agents/agent_exec.sh`, `scripts/direct/simplify_result.py`, `scripts/production/add_unit.py`
+- `scripts/whoami/account_test_support.py` — `store_usage`
+- `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/accounts/test_accounts.py`, `scripts/direct/test_simplify_result.py`
+- `docs/as-built/agent-registry.md`
 
-**Tests:** `scripts/agents/test_agent_exec.sh`, `test_simplify_result`, `test_nix_env_launches`, `test_add_unit`, and every suite that imports `account_test_support` or `add_showrunner_test_support`.
+**Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
