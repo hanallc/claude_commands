@@ -36,7 +36,7 @@ from scripts.production.delivery_state import (
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import review_link
+from scripts.review_links import page_frame, review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
@@ -418,7 +418,7 @@ def document(content: str, title: str = TITLES["changes"]) -> bytes:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
+body{margin:0}''' + page_frame.STYLE + '''main{max-width:744px}
 h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
 section h2{font-size:17px}section details{margin:16px 0}
