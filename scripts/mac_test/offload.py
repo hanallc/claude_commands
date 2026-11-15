@@ -77,6 +77,8 @@ from scripts.lib import build_folders
 
 # Version the mirrored repository's development shell exports on the Mac.
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+# The Mac cargo gate's links (scripts/mac_test/cargo_gate/bin) in the installed copy.
+MAC_CARGO_GATE_BIN = "$HOME/.claude/scripts/mac_test/cargo_gate/bin"
 
 
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
@@ -1924,10 +1926,16 @@ def remote_test_command(
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     clear_environment = clear_environment + " && " if clear_environment else ""
+    # The Mac cargo gate passes a placed run; its folder stays ahead of the real cargo.
+    mac_placement = (
+        "MAC_PLACEMENT=" + shlex.quote(request.placement.assignment.episode + "/" + request.placement.assignment.attempt) + " "
+        if isinstance(request.placement, AssignedOffloadRequest) else ""
+    )
     return (
         f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{environment}"
-        'PATH="$HOME/.cargo/bin:$PATH" '
+        f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
+        f"{mac_placement}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
         f"{repo_identity}"
