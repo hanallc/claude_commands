@@ -233,22 +233,15 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 32 — One place decides a Claude run failed, and one helper reads the review minutes  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** remove two copies from the approved next items (sdlc, 2026-11-02: removing duplication needs no question).
-
-**Spec:**
-- `scripts/direct/simplify_result.py` `validate` deletes the `result.reason` branch and reads only `stats` from `claude_result`. `agent_exec.sh` already writes `ERROR: <reason>` for a failed Claude run.
-- `scripts/production/review_regime.py` adds `optional_float` beside `optional_int`; it reads `review_minutes`, `ux_check_minutes` and `ux_repair_minutes`. Values and missing values stay the same.
-- Tests: a failed run still records its error; each minute field reads a number and skips other values.
+- `scripts/direct/simplify_result.py` `validate` reads only `stats` from `claude_result`. A failed Claude run reaches it as the `ERROR: <reason>` report that `agent_exec.sh` writes through `claude_result.py`; that is the one failure check.
+- `scripts/production/review_regime.py` `optional_float` reads `review_minutes`, `ux_check_minutes` and `ux_repair_minutes`. Values and missing values are the same as before.
+- Tests: `test_a_failed_run_records_the_error_from_the_launcher_report` (test_simplify_result.py) and `test_each_review_minute_field_reads_numbers_and_skips_other_values` (test_review_regime.py).
 
 **Files:**
 - `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
 - `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
-
-**Workers:** `director only (no Codex workers until the workers-back notice)`.
-
-**Acceptance gate:** `test_simplify_result.py`, `test_simplify_lens.py`, `test_claude_result.py` and `test_review_regime.py` pass; basedpyright reports zero errors and zero warnings on the changed files.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
