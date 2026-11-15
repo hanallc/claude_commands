@@ -454,7 +454,7 @@ class ControlTests(CostFixture):
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
         paid = {costs.scope.name: next(table for table in costs.tables if table.title == size).rows[0][5:] for costs in tables.runs}
-        self.assertEqual(paid, {'merge-gate': ('bill due', 'no merge gate runs', '0'),
+        self.assertEqual(paid, {'merge-gate': ('bill due', 'no runs', '0'),
                                 'targeted-test': ('bill due', 'bill due', '0'),
                                 'both': ('bill due', 'bill due', '0')})
         self.assertEqual([(costs.cheapest.size if costs.cheapest else None) for costs in tables.runs],

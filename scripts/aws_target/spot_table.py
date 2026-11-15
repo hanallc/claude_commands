@@ -248,9 +248,9 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', run_minutes(seconds),
                               f'{len(seconds)}' + ('' if own or not seconds else ' elsewhere'),
                               f'{estimate:.4f}' if estimate is not None else '—',
-                              f'{paid:.4f}' if paid is not None else unbilled(len(here), len(here)),
+                              f'{paid:.4f}' if paid is not None else unbilled(len(here)),
                               f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' if billed
-                              else unbilled(len(scoped), len(here), scope), str(len(billed))))
+                              else unbilled(len(scoped)), str(len(billed))))
             tables.append(Table(size, headers, frozenset(range(1, len(headers))), tuple(table)))
             refused_rows.append((size, *refused_cells))
             launched_rows.append((size, *launched_cells))
@@ -261,11 +261,9 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
     return tuple(scopes)
 
 
-def unbilled(scoped: int, here: int, scope: run_cost.RunScope | None = None) -> str:
-    """The paid cell without a bill: runs wait for their day's bill, only other kinds ran, or nothing ran."""
-    if scoped:
-        return 'bill due'
-    return f'no {scope.noun} runs' if here and scope else 'no runs'
+def unbilled(runs: int) -> str:
+    """The paid cell without a bill: runs wait for their day's bill, or no run counts here."""
+    return 'bill due' if runs else 'no runs'
 
 
 def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tuple[str, ...], days: int, home: str,
