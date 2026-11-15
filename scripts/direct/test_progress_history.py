@@ -4135,6 +4135,26 @@ with patch.object(fcntl, "flock", admission):
             self.assertEqual(current.to_json().get("role"), role)
             self.finish_slot_pass(session, "TEST-worker", "completed", 41_030 + index * 20)
 
+    def test_dispatch_records_the_called_worker_model(self) -> None:
+        session = self.start_run("called-model", 41_000)
+        self.start_phase(session, 41_010)
+        parent = fixture_member("showrunner", name="called-parent")
+        prompt = self.root / "called-prompt.txt"
+        atomic_file.write_text_atomic(prompt, "Read the requested files.\n")
+        cases = (("impl", progress_history.CalledAgent("codex", "gpt-called", "high"),
+                  {"family": "codex", "model": "gpt-called", "effort": "high"}),
+                 ("test", progress_history.CALLED_AGENT_NOT_RECORDED,
+                  {"family": "unknown", "model": "unknown", "effort": "unset"}))
+        for index, (slot, called, expected) in enumerate(cases):
+            member = fixture_worker(slot, parent.id, runtime_id=fixture_runtime_id(f"called-{slot}"))
+            with self.subTest(slot=slot), patch.dict(os.environ, {"UNIT_NOW_EPOCH": str(41_020 + index * 20)}):
+                _ = progress_history.begin_dispatch(session, slot=slot, phase="3", role=cast(staff.WorkerRole, slot),
+                    worker_name=member.name, worker_id=member.id, launcher_command=["assign.sh"],
+                    prompt=prompt, kind="broad", lens="contract", called=called)
+                started = self.pass_events("called-model", "pass_started")[-1]
+                agent = cast(dict[str, object], started["called_agent"])
+                self.assertEqual({key: agent[key] for key in expected}, expected)
+
     def test_dispatch_api_reuses_active_and_completed_passes_after_launcher_loss(self) -> None:
         session = self.start_run("dispatch-api", 41_000)
         self.start_phase(session, 41_010)
