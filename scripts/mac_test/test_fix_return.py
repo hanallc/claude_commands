@@ -10,9 +10,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.lib import berth_board
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
@@ -42,12 +43,30 @@ def git(root: Path, *words: str) -> None:
     _ = subprocess.run(["git", "-C", str(root), *words], check=True, capture_output=True)
 
 
+def commit_all(root: Path) -> None:
+    git(root, "add", "-A")
+    git(root, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "-q", "-m", "fixture")
+
+
+def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
+                status: Literal["blocking", "clear"] = "blocking") -> berth_board.Reservation:
+    return berth_board.Reservation(reservation_id, "lint", root, branch, scopes, "active", status)
+
+
+UNCONFIGURED = berth_board.Board((), configured=False)
+
+
+def unconfigured(_: Path) -> berth_board.Board:
+    return UNCONFIGURED
+
+
 class ReturnFixTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
         self.worktree: Path = Path()
         self.mirror: Path = Path()
+        self.board: berth_board.Board = UNCONFIGURED
 
     @override
     def setUp(self) -> None:
@@ -64,6 +83,8 @@ class ReturnFixTests(unittest.TestCase):
             "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
             "FIX_TEST_DIR": str(self.root), "FIX_TEST_REMOTE": str(remote), "FIX_TEST_RSYNC": real_rsync,
         })))
+        self.board = UNCONFIGURED
+        _ = cast(object, self.enterContext(patch.object(fix_return, "read_board", self.read_board)))
         self.worktree = self.root / "worktree"
         self.worktree.mkdir()
         git(self.worktree, "init", "-q")
@@ -71,15 +92,16 @@ class ReturnFixTests(unittest.TestCase):
         _ = (self.worktree / "a.rs").write_text("fn a() {}\n")
         _ = (self.worktree / "b.rs").write_text("fn b() {}\n")
         _ = (self.worktree / "d.rs").write_text("fn d() {}\n")
-        git(self.worktree, "add", "-A")
-        git(self.worktree, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com",
-            "commit", "-q", "-m", "fixture")
+        commit_all(self.worktree)
         (self.worktree / "target").mkdir()
         _ = (self.worktree / "target/build.txt").write_text("natedev build\n")
         mirror_text = offload.remote_mirror(REPOSITORY, "mac", 1)
         self.mirror = remote / mirror_text.lstrip("/") if mirror_text.startswith("/") else remote / mirror_text
         self.mirror.parent.mkdir(parents=True)
         _ = shutil.copytree(self.worktree, self.mirror, ignore=shutil.ignore_patterns(".git", "target"))
+
+    def read_board(self, _: Path) -> berth_board.Board:
+        return self.board
 
     def fix_the_mirror(self) -> None:
         """Make the edits a Mac fix pass and a Mac build make in the mirror."""
@@ -124,7 +146,7 @@ class ReturnFixTests(unittest.TestCase):
         self.fix_the_mirror()
         _ = (self.worktree / "a.rs").write_text("fn a() { edited }\n")
         result = self.return_fix(sent)
-        self.assertEqual(result, fix_return.FixRefused("the worktree changed after the copy to the Mac"))
+        self.assertEqual(result, fix_return.FixRefused("the worktree changed after the copy"))
         self.assertEqual((self.worktree / "a.rs").read_text(), "fn a() { edited }\n")
         self.assertFalse((self.worktree / "c.rs").exists())
         self.assertTrue((self.worktree / "b.rs").exists())
@@ -134,6 +156,21 @@ class ReturnFixTests(unittest.TestCase):
         result = self.return_fix(offload.UNAVAILABLE_TREE_KEY)
         self.assertEqual(result, fix_return.FixRefused("the copy sent no tree key"))
         self.assertEqual((self.worktree / "a.rs").read_text(), "fn a() {}\n")
+
+    def test_mac_fix_writes_held_paths_only(self) -> None:
+        self.board = berth_board.Board((
+            reservation("own-1", self.worktree, "mine", "file:a.rs"),
+            reservation("other-2", self.root / "other", "theirs", "file:c.rs"),
+        ))
+        sent = offload.read_tree_key(self.worktree)
+        self.fix_the_mirror()
+        result = self.return_fix(sent)
+        self.assertEqual(result, fix_return.FixApplied(("a.rs",), (), (
+            fix_return.Withheld("c.rs", "other-2 (theirs)"), fix_return.Withheld("b.rs", ""))))
+        self.assertEqual(fix_return.fix_word(result), "withheld")
+        self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
+        self.assertFalse((self.worktree / "c.rs").exists())
+        self.assertEqual((self.worktree / "b.rs").read_text(), "fn b() {}\n")
 
     def test_unchanged_mirror_writes_nothing(self) -> None:
         result = self.return_fix(offload.read_tree_key(self.worktree))
@@ -170,7 +207,8 @@ def rename_then_stop(source, destination):
 fix_return.stage_file = stage_then_stop
 fix_return.os.replace = rename_then_stop
 changes = fix_return.MirrorChanges(("a.rs", "src/b.rs", "c.rs"), ("gone.rs",))
-print(fix_return.apply_fix(worktree, staging, changes, lambda: True))
+unconfigured = fix_return.berth_board.Board((), configured=False)
+print(fix_return.apply_fix(worktree, staging, changes, lambda: True, lambda _: unconfigured))
 '''
 
 # The start of verify.sh: finish_mac_fix with verify_helper running the program in a process.
@@ -282,6 +320,185 @@ class ParseItemizedTests(unittest.TestCase):
         self.assertIsInstance(result, fix_return.FixFailed)
 
 
+class HoldFilterTests(unittest.TestCase):
+    ROOT: Path = Path("/fixture/worktree")
+    CHANGES: fix_return.MirrorChanges = fix_return.MirrorChanges(
+        ("src/held.rs", "src/foreign.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",))
+
+    def hold(self, *entries: berth_board.Reservation) -> tuple[fix_return.MirrorChanges, tuple[fix_return.Withheld, ...]]:
+        return fix_return.hold_filter(self.ROOT, self.CHANGES, berth_board.Board(entries))
+
+    def test_own_reservation_keeps_and_others_are_withheld(self) -> None:
+        kept, withheld = self.hold(
+            reservation("own-1", self.ROOT, "mine", "tree:src/held.rs", "file:src/gone.rs"),
+            reservation("other-2", Path("/fixture/other"), "theirs", "file:src/foreign.rs"),
+            reservation("other-3", Path("/fixture/other"), "theirs", "file:src/clear.rs", status="clear"),
+        )
+        self.assertEqual(kept, fix_return.MirrorChanges(("src/held.rs",), ("src/gone.rs",)))
+        self.assertEqual(withheld, (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),
+                                    fix_return.Withheld("src/free.rs", ""), fix_return.Withheld("src/clear.rs", "")))
+
+    def test_foreign_reservation_wins_over_an_own_tree(self) -> None:
+        kept, withheld = self.hold(
+            reservation("own-1", self.ROOT, "mine", "tree:src"),
+            reservation("other-2", Path("/fixture/other"), "theirs", "file:src/foreign.rs"),
+        )
+        self.assertEqual(kept, fix_return.MirrorChanges(
+            ("src/held.rs", "src/free.rs", "src/clear.rs"), ("src/gone.rs",)))
+        self.assertEqual(withheld, (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
+
+    def test_unconfigured_board_keeps_every_path(self) -> None:
+        self.assertEqual(fix_return.hold_filter(self.ROOT, self.CHANGES, UNCONFIGURED), (self.CHANGES, ()))
+
+    def test_withheld_lines_name_the_holder_and_the_check(self) -> None:
+        result = fix_return.FixApplied(("src/held.rs",), (), (
+            fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),
+            fix_return.Withheld("src/free.rs", ""), fix_return.Withheld("src/also.rs", "")))
+        self.assertEqual(fix_return.withheld_lines(result), [
+            "not written: src/foreign.rs is held by reservation other-2 (theirs)",
+            "not written: no reservation holds src/free.rs, src/also.rs; "
+            + "run `cargo-berth check src/free.rs src/also.rs`, then run lint again",
+        ])
+        self.assertFalse(fix_return.fix_passed(result))
+        self.assertEqual(fix_return.fix_word(result), "withheld")
+
+    def test_foreign_only_withheld_passes(self) -> None:
+        result = fix_return.FixApplied((), (), (fix_return.Withheld("src/foreign.rs", "other-2 (theirs)"),))
+        self.assertTrue(fix_return.fix_passed(result))
+        self.assertEqual(fix_return.fix_word(result), "applied")
+
+
+class LocalCopyTests(unittest.TestCase):
+    """The local fix pass edits a private copy, and only held paths come back."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root: Path = Path()
+        self.worktree: Path = Path()
+        self.target: Path = Path()
+        self.metadata: fix_return.CargoMetadata = fix_return.CargoMetadata(workspace_root="", target_directory="")
+        self.board: berth_board.Board | berth_board.BoardUnavailable = UNCONFIGURED
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.worktree = self.root / "worktree"
+        source = self.worktree / "ws/src"
+        source.mkdir(parents=True)
+        git(self.worktree, "init", "-q")
+        _ = (self.worktree / ".gitignore").write_text("target/\nout.log\n")
+        _ = (self.worktree / "ws/Cargo.toml").write_text("[workspace]\n")
+        for name in ("held", "foreign", "free", "gone"):
+            _ = (source / f"{name}.rs").write_text(f"fn {name}() {{}}\n")
+        commit_all(self.worktree)
+        self.target = self.worktree / "target"
+        self.metadata = fix_return.CargoMetadata(
+            workspace_root=str(self.worktree / "ws"), target_directory=str(self.target))
+        self.board = berth_board.Board((
+            reservation("own-1", self.worktree, "mine", "file:ws/src/held.rs", "file:ws/src/gone.rs",
+                        "file:ws/src/new.rs"),
+            reservation("other-2", self.root / "other", "theirs", "file:ws/src/foreign.rs"),
+        ))
+
+    def read(self, _: Path) -> berth_board.Board | berth_board.BoardUnavailable:
+        return self.board
+
+    def copy(self) -> fix_return.CopyMade:
+        made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)
+        assert isinstance(made, fix_return.CopyMade), made
+        return made
+
+    def text(self, relative: str) -> str:
+        return (self.worktree / relative).read_text()
+
+    def test_held_fixes_are_written_and_others_withheld(self) -> None:
+        made = self.copy()
+        self.assertEqual(made.folder, self.target / fix_return.COPY_NAME)
+        self.assertEqual(made.manifest, made.tree / "ws/Cargo.toml")
+        self.assertEqual(made.target, self.target)
+        for name in ("held", "foreign", "free"):
+            _ = (made.tree / f"ws/src/{name}.rs").write_text(f"pub(crate) fn {name}() {{}}\n")
+        (made.tree / "ws/src/gone.rs").unlink()
+        _ = (made.tree / "ws/src/new.rs").write_text("fn new() {}\n")
+        _ = (made.tree / "out.log").write_text("log\n")
+        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        self.assertEqual(result, fix_return.FixApplied(("ws/src/held.rs", "ws/src/new.rs"), ("ws/src/gone.rs",), (
+            fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"), fix_return.Withheld("ws/src/free.rs", ""))))
+        self.assertFalse(fix_return.fix_passed(result))
+        self.assertEqual(self.text("ws/src/held.rs"), "pub(crate) fn held() {}\n")
+        self.assertEqual(self.text("ws/src/new.rs"), "fn new() {}\n")
+        self.assertFalse((self.worktree / "ws/src/gone.rs").exists())
+        self.assertEqual(self.text("ws/src/foreign.rs"), "fn foreign() {}\n")
+        self.assertEqual(self.text("ws/src/free.rs"), "fn free() {}\n")
+        self.assertFalse((self.worktree / "out.log").exists())
+        self.assertFalse(made.folder.exists())
+
+    def test_foreign_only_fix_passes_and_writes_nothing(self) -> None:
+        made = self.copy()
+        _ = (made.tree / "ws/src/foreign.rs").write_text("pub(crate) fn foreign() {}\n")
+        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        self.assertEqual(result, fix_return.FixApplied((), (), (
+            fix_return.Withheld("ws/src/foreign.rs", "other-2 (theirs)"),)))
+        self.assertTrue(fix_return.fix_passed(result))
+        self.assertEqual(self.text("ws/src/foreign.rs"), "fn foreign() {}\n")
+
+    def test_unchanged_copy_is_none(self) -> None:
+        made = self.copy()
+        self.assertEqual(fix_return.return_copy(self.worktree, made.folder, self.read), fix_return.FixNone())
+        self.assertFalse(made.folder.exists())
+
+    def test_changed_worktree_refuses_and_deletes_the_copy(self) -> None:
+        made = self.copy()
+        _ = (made.tree / "ws/src/held.rs").write_text("pub(crate) fn held() {}\n")
+        _ = (self.worktree / "ws/src/held.rs").write_text("fn held() { edited }\n")
+        result = fix_return.return_copy(self.worktree, made.folder, self.read)
+        self.assertEqual(result, fix_return.FixRefused("the worktree changed during the lint fix pass"))
+        self.assertEqual(self.text("ws/src/held.rs"), "fn held() { edited }\n")
+        self.assertFalse(made.folder.exists())
+
+    def test_unconfigured_repository_fixes_in_place(self) -> None:
+        self.board = UNCONFIGURED
+        made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)
+        self.assertEqual(made, fix_return.InPlace())
+        self.assertFalse(self.target.exists())
+
+    def test_unavailable_board_fails(self) -> None:
+        self.board = berth_board.BoardUnavailable("ledger unreadable")
+        made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)
+        self.assertEqual(made, fix_return.FixFailed("cargo-berth board: ledger unreadable"))
+
+    def test_workspace_outside_the_repository_fails(self) -> None:
+        self.metadata = fix_return.CargoMetadata(workspace_root=str(self.root), target_directory=str(self.target))
+        made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)
+        self.assertIsInstance(made, fix_return.FixFailed)
+
+    def stale_copy(self, owner: int) -> Path:
+        folder = self.target / fix_return.COPY_NAME
+        folder.mkdir(parents=True)
+        _ = (folder / fix_return.OWNER_NAME).write_text(str(owner))
+        _ = (folder / "stale").write_text("left\n")
+        return folder
+
+    def test_live_owner_keeps_its_copy(self) -> None:
+        live = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        folder = self.stale_copy(live.pid)
+        made = self.copy()
+        self.assertEqual(made.folder, self.target / f"{fix_return.COPY_NAME}-{os.getpid()}")
+        self.assertTrue((folder / "stale").exists())
+        _ = fix_return.return_copy(self.worktree, made.folder, self.read)
+        self.assertFalse(made.folder.exists())
+
+    def test_stopped_owner_copy_is_replaced(self) -> None:
+        stopped = subprocess.Popen(["true"])
+        _ = stopped.wait()
+        folder = self.stale_copy(stopped.pid)
+        made = self.copy()
+        self.assertEqual(made.folder, folder)
+        self.assertFalse((folder / "stale").exists())
+
+
 class ApplyFixTests(unittest.TestCase):
     def test_path_outside_the_worktree_fails(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -289,7 +506,8 @@ class ApplyFixTests(unittest.TestCase):
         staging.mkdir()
         worktree = root / "worktree"
         worktree.mkdir()
-        result = fix_return.apply_fix(worktree, staging, fix_return.MirrorChanges(("../escape.rs",), ()), lambda: True)
+        result = fix_return.apply_fix(worktree, staging, fix_return.MirrorChanges(("../escape.rs",), ()),
+                                      lambda: True, unconfigured)
         self.assertIsInstance(result, fix_return.FixFailed)
         self.assertFalse((root / "escape.rs").exists())
 

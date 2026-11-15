@@ -1,9 +1,20 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Bring the files of a Mac fix pass back into the worktree that the Mac copied.
+"""Bring the files of a lint fix pass back into the worktree that was copied.
 
-offload.py lists the mirror files that differ from the worktree, fetches them
-to a staging folder, and calls apply_fix. apply_fix writes them only when the
-worktree still has the tree key that the copy sent.
+Two fix passes run on a copy of the worktree:
+
+1. The Mac fix pass. offload.py lists the mirror files that differ from the
+   worktree, fetches them to a staging folder, and calls apply_fix.
+2. The local fix pass in a repository that cargo-berth configures. verify.sh
+   runs mend, clippy --fix, fmt and taplo on a private copy (`copy`), then
+   brings the changes back (`return-copy`). A rewrite in place can write a path
+   that another reservation holds, and berth records that as an incursion.
+
+apply_fix writes the files only when the worktree is unchanged since the copy.
+It reads `cargo-berth board --json` and writes only the paths that this
+worktree's reservations hold. It reports each other fixed path and does not
+write it. A path that another reservation holds is not a failure. A path that
+no reservation holds fails the pass, with the cargo-berth check command.
 
 A roll-forward record in the git folder makes the return all or nothing:
 
@@ -16,7 +27,10 @@ A stop leaves the record. The next verify.sh run calls `fix_return.py finish`
 before its first step. A staging record removes its siblings, so the tree is
 unchanged. A commit record finishes the renames, so the tree has every fix.
 
-Usage: fix_return.py finish --repo-root DIR
+Usage:
+  fix_return.py finish --repo-root DIR
+  fix_return.py copy --repo-root DIR --owner PID < cargo-metadata.json
+  fix_return.py return-copy --repo-root DIR --folder DIR
 """
 
 from __future__ import annotations
@@ -30,22 +44,44 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import filecmp
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import stat
 import subprocess
 import sys
 from typing import Literal, TypedDict, cast
 
+from scripts.lib import berth_board
+
+
+@dataclass(frozen=True)
+class Withheld:
+    """A fixed path that this worktree does not hold, so the fix is not written.
+
+    holder names the reservation that holds the path. It is empty when no
+    reservation holds the path.
+    """
+
+    path: str
+    holder: str
+
 
 @dataclass(frozen=True)
 class FixApplied:
-    """The worktree received the changed files and lost the removed files."""
+    """The worktree received the held changed files and lost the held removed files."""
 
     changed: tuple[str, ...]
     removed: tuple[str, ...]
+    withheld: tuple[Withheld, ...] = ()
+
+    def unheld(self) -> tuple[Withheld, ...]:
+        """The withheld paths that no reservation holds; each one fails the pass."""
+        return tuple(item for item in self.withheld if not item.holder)
 
 
 @dataclass(frozen=True)
@@ -91,7 +127,7 @@ DELETED_LINE = re.compile(r"\*deleting +(.+)")
 
 def fix_word(result: FixResult) -> str:
     if isinstance(result, FixApplied):
-        return "applied"
+        return "withheld" if result.unheld() else "applied"
     if isinstance(result, FixNone):
         return "none"
     if isinstance(result, FixRefused):
@@ -102,8 +138,21 @@ def fix_word(result: FixResult) -> str:
 
 
 def fix_passed(result: FixResult) -> bool:
-    """A fix pass passes only when the worktree now holds its files."""
-    return isinstance(result, (FixApplied, FixNone))
+    """A fix pass passes only when the worktree now has every fix that no other reservation holds."""
+    return isinstance(result, FixNone) or (isinstance(result, FixApplied) and not result.unheld())
+
+
+def withheld_lines(result: FixResult) -> list[str]:
+    """One line for each fixed path that was not written."""
+    if not isinstance(result, FixApplied):
+        return []
+    lines = [f"not written: {item.path} is held by reservation {item.holder}"
+             for item in result.withheld if item.holder]
+    unheld = [item.path for item in result.unheld()]
+    if unheld:
+        lines.append("not written: no reservation holds " + ", ".join(unheld)
+                     + "; run `cargo-berth check " + " ".join(unheld) + "`, then run lint again")
+    return lines
 
 
 def parse_itemized(output: str) -> MirrorChanges | FixFailed:
@@ -251,11 +300,61 @@ def finish(repo_root: Path) -> str:
         return finish_record(repo_root, path)
 
 
+BoardReader = Callable[[Path], berth_board.Board | berth_board.BoardUnavailable]
+
+
+def read_board(repo_root: Path) -> berth_board.Board | berth_board.BoardUnavailable:
+    """Read the reservations. A host without cargo-berth has an unconfigured board."""
+    if shutil.which("cargo-berth") is None:
+        return berth_board.Board((), configured=False)
+    return berth_board.read_board(repo_root)
+
+
+def hold_filter(repo_root: Path, changes: MirrorChanges,
+                board: berth_board.Board) -> tuple[MirrorChanges, tuple[Withheld, ...]]:
+    """Keep the paths that this worktree holds; withhold every other path.
+
+    A path that another worktree's blocking reservation holds is withheld with
+    that reservation. A path that no blocking reservation holds is withheld
+    with no holder. An unconfigured board keeps every path.
+    """
+    if not board.configured:
+        return changes, ()
+    root = repo_root.resolve()
+    reservations = [(reservation, reservation.holder_worktree_root.resolve() == root)
+                    for reservation in board.reservations()]
+    withheld: list[Withheld] = []
+
+    def kept(paths: tuple[str, ...]) -> tuple[str, ...]:
+        result: list[str] = []
+        for path in paths:
+            holders = [(reservation, own) for reservation, own in reservations if reservation.blocks(path)]
+            foreign = [reservation for reservation, own in holders if not own]
+            if foreign:
+                withheld.append(Withheld(path, f"{foreign[0].reservation_id} ({foreign[0].holder_branch})"))
+            elif holders:
+                result.append(path)
+            else:
+                withheld.append(Withheld(path, ""))
+        return tuple(result)
+
+    return MirrorChanges(kept(changes.changed), kept(changes.removed)), tuple(withheld)
+
+
 def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
-              worktree_unchanged: Callable[[], bool]) -> FixResult:
-    """Write the staged files when the worktree still has the sent tree key."""
+              worktree_unchanged: Callable[[], bool], board_reader: BoardReader | None = None) -> FixResult:
+    """Write the held staged files when the worktree is unchanged since the copy.
+
+    board_reader defaults to read_board, looked up at each call.
+    """
     if not worktree_unchanged():
-        return FixRefused("the worktree changed after the copy to the Mac")
+        return FixRefused("the worktree changed after the copy")
+    board = (board_reader or read_board)(repo_root)
+    if isinstance(board, berth_board.BoardUnavailable):
+        return FixFailed(f"cargo-berth board: {board.reason}")
+    changes, withheld = hold_filter(repo_root, changes, board)
+    if not changes.changed and not changes.removed:
+        return FixApplied((), (), withheld) if withheld else FixNone()
     try:
         token = secrets.token_hex(4)
         renames = [(str(Path(relative).with_name(f".{Path(relative).name}{TEMPORARY_MARK}{token}")), relative)
@@ -281,7 +380,205 @@ def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
             _ = finish_record(repo_root, path)
     except OSError as error:
         return FixFailed(str(error))
-    return FixApplied(changes.changed, changes.removed)
+    return FixApplied(changes.changed, changes.removed, withheld)
+
+
+COPY_NAME = "verify-lint-copy"
+OWNER_NAME = "owner"
+SENT_NAME = "sent.json"
+TREE_NAME = "tree"
+FileStat = tuple[int, int, int, int]
+
+
+class CargoMetadata(TypedDict):
+    workspace_root: str
+    target_directory: str
+
+
+@dataclass(frozen=True)
+class CopyMade:
+    """The private copy: the fix pass runs cargo with manifest and target."""
+
+    folder: Path
+    tree: Path
+    manifest: Path
+    target: Path
+
+
+@dataclass(frozen=True)
+class InPlace:
+    """cargo-berth does not configure the repository, so the fix pass writes the worktree."""
+
+
+def listed_files(repo_root: Path) -> list[str]:
+    """The tracked and untracked files that git does not ignore, as the Mac mirror copies them."""
+    listed = subprocess.run(["git", "-C", str(repo_root), "ls-files", "-z", "-co", "--exclude-standard"],
+                            capture_output=True, check=False)
+    if listed.returncode != 0:
+        raise OSError("git ls-files failed: " + listed.stderr.decode(errors="replace").strip())
+    return sorted({os.fsdecode(name) for name in listed.stdout.split(b"\0") if name})
+
+
+def file_stat(path: Path) -> FileStat | None:
+    """Size, modification time, inode and mode; None for a missing path or a folder."""
+    try:
+        status = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISDIR(status.st_mode):
+        return None
+    return (status.st_size, status.st_mtime_ns, status.st_ino, status.st_mode)
+
+
+def worktree_snapshot(repo_root: Path) -> dict[str, FileStat]:
+    snapshot: dict[str, FileStat] = {}
+    for relative in listed_files(repo_root):
+        status = file_stat(repo_root / relative)
+        if status is not None:
+            snapshot[relative] = status
+    return snapshot
+
+
+def owner_alive(folder: Path, owner: int) -> bool:
+    """True when another live process owns the copy folder."""
+    try:
+        pid = int((folder / OWNER_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if pid == owner:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def claim_folder(target: Path, owner: int) -> Path:
+    """Take the copy folder in the cargo target folder.
+
+    The name is the same in each run, so cargo finds the copy's earlier build
+    of the workspace members fresh. A folder that a stopped run left is
+    deleted. A folder that a live run owns gives a name with this owner.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    staged = target / f".{COPY_NAME}-{owner}.new"
+    shutil.rmtree(staged, ignore_errors=True)
+    for name in (COPY_NAME, f"{COPY_NAME}-{owner}"):
+        folder = target / name
+        if folder.exists() and not owner_alive(folder, owner):
+            shutil.rmtree(folder)
+        staged.mkdir()
+        _ = (staged / OWNER_NAME).write_text(str(owner), encoding="utf-8")
+        try:
+            os.rename(staged, folder)
+        except OSError:
+            shutil.rmtree(staged, ignore_errors=True)
+            continue
+        return folder
+    raise OSError(f"{target / COPY_NAME} is in use by another lint run")
+
+
+def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
+              board_reader: BoardReader | None = None) -> CopyMade | InPlace | FixFailed:
+    """Copy the worktree for the fix pass in a repository that cargo-berth configures."""
+    board = (board_reader or read_board)(repo_root)
+    if isinstance(board, berth_board.BoardUnavailable):
+        return FixFailed(f"cargo-berth board: {board.reason}")
+    if not board.configured:
+        return InPlace()
+    root = repo_root.resolve()
+    workspace = Path(metadata["workspace_root"]).resolve()
+    if not workspace.is_relative_to(root):
+        return FixFailed(f"the cargo workspace {workspace} is not inside {root}")
+    try:
+        folder = claim_folder(Path(metadata["target_directory"]), owner)
+    except OSError as error:
+        return FixFailed(str(error))
+    tree = folder / TREE_NAME
+    try:
+        sent: dict[str, FileStat] = {}
+        for relative in listed_files(root):
+            source = root / relative
+            before = file_stat(source)
+            if before is None:
+                continue
+            destination = tree / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(before[3]):
+                os.symlink(os.readlink(source), destination)
+            else:
+                # copy2 keeps the modification time, so cargo finds unchanged files fresh.
+                _ = shutil.copy2(source, destination)
+            if file_stat(source) != before:
+                raise OSError(f"{relative} changed while the copy was made")
+            sent[relative] = before
+        _ = (folder / SENT_NAME).write_text(json.dumps(sent), encoding="utf-8")
+    except OSError as error:
+        shutil.rmtree(folder, ignore_errors=True)
+        return FixFailed(str(error))
+    return CopyMade(folder, tree, tree / workspace.relative_to(root) / "Cargo.toml",
+                    Path(metadata["target_directory"]))
+
+
+def read_sent(folder: Path) -> dict[str, FileStat]:
+    values = cast(dict[str, list[int]], json.loads((folder / SENT_NAME).read_text(encoding="utf-8")))
+    return {relative: (status[0], status[1], status[2], status[3]) for relative, status in values.items()}
+
+
+def copy_changes(repo_root: Path, tree: Path, sent: dict[str, FileStat]) -> MirrorChanges:
+    """The regular files that the fix pass changed, added or removed in the copy."""
+    changed: list[str] = []
+    removed: list[str] = []
+    for relative, status in sent.items():
+        copied = tree / relative
+        if not copied.is_symlink() and not copied.exists():
+            removed.append(relative)
+        elif not stat.S_ISLNK(status[3]) and not copied.is_symlink() and not filecmp.cmp(
+                copied, repo_root / relative, shallow=False):
+            changed.append(relative)
+    for directory, _, names in os.walk(tree):
+        for name in names:
+            path = Path(directory) / name
+            relative = path.relative_to(tree).as_posix()
+            if relative not in sent and path.is_file() and not path.is_symlink():
+                changed.append(relative)
+    return MirrorChanges(tuple(sorted(changed)), tuple(sorted(removed)))
+
+
+def return_copy(repo_root: Path, folder: Path, board_reader: BoardReader | None = None) -> FixResult:
+    """Bring the held changes of the copy back, then delete the copy."""
+    root = repo_root.resolve()
+    try:
+        sent = read_sent(folder)
+
+        def unchanged() -> bool:
+            return worktree_snapshot(root) == sent
+
+        if not unchanged():
+            return FixRefused("the worktree changed during the lint fix pass")
+        changes = without_ignored(root, copy_changes(root, folder / TREE_NAME, sent))
+        if isinstance(changes, FixFailed):
+            return changes
+        if not changes.changed and not changes.removed:
+            return FixNone()
+        return apply_fix(root, folder / TREE_NAME, changes, unchanged, board_reader)
+    except (OSError, ValueError, KeyError, IndexError) as error:
+        return FixFailed(str(error))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def report_copy(result: FixResult) -> None:
+    if isinstance(result, FixApplied):
+        count = len(result.changed) + len(result.removed)
+        print(f"verify.sh: the lint fix pass wrote {count} file{'s' if count != 1 else ''} into the worktree.")
+    elif isinstance(result, (FixRefused, FixFailed)):
+        print(f"verify.sh: the lint fix pass wrote no file: {result.reason}.", file=sys.stderr)
+    for line in withheld_lines(result):
+        print(f"verify.sh: {line}.", file=sys.stderr)
 
 
 def main(arguments: Sequence[str]) -> int:
@@ -289,7 +586,32 @@ def main(arguments: Sequence[str]) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     finishing = commands.add_parser("finish", help="complete a stopped Mac fix return")
     _ = finishing.add_argument("--repo-root", required=True)
+    copying = commands.add_parser("copy", help="copy the worktree for the lint fix pass")
+    _ = copying.add_argument("--repo-root", required=True)
+    _ = copying.add_argument("--owner", required=True, type=int)
+    returning = commands.add_parser("return-copy", help="bring the held changes of the copy back")
+    _ = returning.add_argument("--repo-root", required=True)
+    _ = returning.add_argument("--folder", required=True)
     parsed = parser.parse_args(arguments)
+    command = cast(str, parsed.command)
+    if command == "copy":
+        try:
+            metadata = cast(CargoMetadata, json.loads(sys.stdin.read()))
+            made = make_copy(Path(cast(str, parsed.repo_root)), metadata, cast(int, parsed.owner))
+        except (ValueError, KeyError, TypeError) as error:
+            made = FixFailed(f"cargo metadata: {error}")
+        if isinstance(made, FixFailed):
+            print(f"verify.sh: the lint fix pass could not copy the worktree: {made.reason}", file=sys.stderr)
+            return 2
+        if isinstance(made, InPlace):
+            print("in-place")
+        else:
+            print(f"copy\n{made.folder}\n{made.tree}\n{made.manifest}\n{made.target}")
+        return 0
+    if command == "return-copy":
+        result = return_copy(Path(cast(str, parsed.repo_root)), Path(cast(str, parsed.folder)))
+        report_copy(result)
+        return 0 if fix_passed(result) else 1
     try:
         done = finish(Path(cast(str, parsed.repo_root)))
     except (OSError, ValueError, KeyError) as error:
