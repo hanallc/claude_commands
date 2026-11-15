@@ -582,8 +582,12 @@ function fitLabels() {}
         self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], [*builds, *free, *other])
         # The user, 11-15: each legend group sits under its own heading, so the legend ties to the bar.
         self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]], [
-            "g-builds", *builds, "cap", "g-builds", "reserved", "room", "cap", "waiting", "progress",
+            "g-builds", *builds, "cap", "g-builds", "reserved", "room", "cap",
             "g-free", "reserved", "room", "system", "safety", "swap", "shortfall", "g-else", *other])
+        # The user, 11-15: the waiting and progress key sits under the Running and Queued chart.
+        walk_card = page[page.index('<div class="walk" id="walk">'):page.index('<section class="card" id="leftovers"')]
+        key = walk_card[walk_card.index('<div class="walk-key">'):]
+        self.assertEqual([part.split('"')[0] for part in key.split('data-tip="')[1:]], ["waiting", "progress"])
         self.assertIn('<details class="legend-box" open>', page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],

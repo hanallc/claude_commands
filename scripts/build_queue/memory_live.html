@@ -115,7 +115,6 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .legend .row:hover { background: var(--free); }
 .legend .row .name { font-weight: 600; }
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
-.legend .row[data-tip="progress"] { display: flex; flex-wrap: wrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
 #tip { white-space: pre-line; position: fixed; z-index: 10; max-width: 300px; padding: 8px 10px; border-radius: 8px; background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.4; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; box-shadow: 0 4px 14px rgb(0 0 0 / 0.2); }
 #tip.on { opacity: 1; }
@@ -352,6 +351,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
+.walk-key { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 0.85rem; }
+.walk-key .key { display: inline-flex; align-items: center; gap: 6px; cursor: help; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -430,8 +431,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="row" data-tip="reserved"><span class="sw res"></span><span class="name">Build reserved</span><span class="v num" id="v-cap-reserved">–</span></div>
       <div class="row" data-tip="room"><span class="sw room"></span><span class="name">Free</span><span class="v num" id="v-cap-room">–</span></div>
       <div class="row total" data-tip="cap"><span class="sw cap"></span><span class="name">Queue cap</span><span class="v num" id="v-cap">–</span></div>
-      <div class="row" data-tip="waiting"><span class="sw waiting"></span><span class="name">Waiting step, memory it needs</span></div>
-      <div class="row" data-tip="progress"><span class="name">Progress: </span><span class="sw progress building"></span><span>building, </span><span class="sw progress testing"></span><span>testing</span></div>
      </div>
      </div>
      <div class="legend-group">
@@ -470,6 +469,10 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
     <div class="walk" id="walk"></div>
     <p class="pressure-reason" id="cap-reason"></p>
+    <div class="walk-key">
+      <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
+      <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
+    </div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -565,7 +568,7 @@ const TIPS = {
   budget: (d) => [`RAM · ${ramAmount(d.ram.total_bytes)}`,
     "The bar divides this machine's RAM into builds, free RAM and everything else.\nFree RAM includes cache that Linux can take back."],
   waiting: () => ["Waiting step", "The dashed bar shows the memory the step needs.\nIt ends at the queue cap."],
-  progress: () => ["Build progress", "The line shows completed work.\nThe legend gives the building and testing colors."],
+  progress: () => ["Build progress", "The line shows completed work.\nThe key under the chart gives the building and testing colors."],
 };
 const GIB = 1024 ** 3;
 const RAM_BLOCKS = [

@@ -374,7 +374,7 @@ Brackets above the bar name each group and the three parts of free RAM.
 A bracket under the bar shows the queue cap, from 0 to the end of free.
 `RamBlocks.cap_bytes` is that cap: builds, build reserved, and free. The page's taken amount is the cap less free.
 The hana CI amount is its swap-backed use from `ci_cap_use`, the same amount that admission counts.
-The legend shows each group under its own heading, and the queue cap rows sit under Builds.
+The legend shows each group under its own heading, and the queue cap rows sit under Builds. The key for waiting steps and build progress sits at the bottom of the Running and Queued card, under the chart it explains.
 The status line under the free amount names one cause, in this order:
 1. An unavailable reading.
 2. Memory pressure.
