@@ -4194,18 +4194,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/direct/test_verify_result_environment.py` runs 4 fewer complete `verify.sh` runs, with the same checks of behavior.
-
-**Spec:**
-- `test_mac_routes_carry_result_values_and_fixed_terminal_values` keeps the auto route and drops the `--mac` and `--target mac` runs. `verify.sh` sets the forwarded values before it picks a route, and each Mac route starts the runner in `try_mac_test`. `test_changed_forwarded_value_reaches_the_mac_and_runs_again` keeps a value check on the `--mac` route.
-- `test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` checks the empty and unset values for `NO_COLOR` only. `NO_COLOR` and `CLICOLOR` reach the key through the same policy list.
-
-**Files:** `scripts/direct/test_verify_result_environment.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
-
-**Constraints from prior phases:** Phases 287-289 cut repeated complete runs in the same way.
-
-**Acceptance gate:** the module passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
+- `test_mac_routes_carry_result_values_and_fixed_terminal_values` in `scripts/direct/test_verify_result_environment.py` keeps the auto route. `verify.sh` sets the forwarded values before it picks a route, and each Mac route starts the runner in `try_mac_test`. `test_changed_forwarded_value_reaches_the_mac_and_runs_again` keeps a value check on the `--mac` route.
+- `test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` checks the empty and unset values for `NO_COLOR` only.
+- AWS pair (3 rounds): 17.60 -> 13.12 CPU s, all pass.
+- Commit feb588554. Test-only change.
