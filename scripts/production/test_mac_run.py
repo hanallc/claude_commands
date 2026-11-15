@@ -29,7 +29,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 SCRIPT = Path(__file__).with_name("mac_run.sh")
 MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
-# build_hold.owning_session() reads these; a Mac block admits the session they name.
+# owning_session.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
     "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",

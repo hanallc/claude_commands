@@ -27,23 +27,28 @@ class VerifySshRoutingTests(VerifySshTargetsFixture):
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_protocol as wire
+''' + support.BUILD_TARGETS_STATUS + r'''
 
-if sys.argv[1] == "reserve":
-    assigned = wire.parse_reply(Path(sys.argv[sys.argv.index("--assignment-file") + 1]).read_text())
-    assert isinstance(assigned, wire.Assignment)
-    assignment = assigned.assignment
-    with (Path(os.environ["TEST_RUNNER_STATE"]) / "refused-assignments.jsonl").open("a") as output:
-        output.write(json.dumps({"episode": assignment.episode, "since": assignment.since}) + "\n")
-    Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 67108864 kB\n")
-    raise SystemExit(1)
-''' + support.RUN_BUILD_TARGETS + "\nraise SystemExit(status)\n")
+def main() -> object:
+    if sys.argv[1] == "reserve":
+        assigned = wire.parse_reply(Path(sys.argv[sys.argv.index("--assignment-file") + 1]).read_text())
+        assert isinstance(assigned, wire.Assignment)
+        assignment = assigned.assignment
+        with (Path(os.environ["TEST_RUNNER_STATE"]) / "refused-assignments.jsonl").open("a") as output:
+            output.write(json.dumps({"episode": assignment.episode, "since": assignment.since}) + "\n")
+        Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 67108864 kB\n")
+        return 1
+    return build_targets_status()
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''')
         result = self.verify("test", "sample", "--no-cache", extra={"BUILD_TARGETS_SCRIPT": str(wrapper)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         snapshots = [cast(dict[str, object], json.loads(line))
@@ -77,7 +82,6 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 import time
 from unittest import mock
@@ -85,32 +89,38 @@ source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib import process_start
-root = Path(os.environ["TEST_RUNNER_STATE"])
-recovering = sys.argv[1] == "recover-reservation"
-observations = root / "recovery-observations.jsonl"
-with ExitStack() as patches:
-    observations_seen = len(observations.read_text().splitlines()) if observations.exists() else 0
-    if recovering and observations_seen < int(os.environ.get("TEST_RECOVERY_UNKNOWN_READS", "0")):
-        owner = int(sys.argv[sys.argv.index("--pid") + 1])
-        original_start = process_start.process_start
-        def owner_start(pid):
-            return process_start.Unreadable("the private owner reading is unavailable") if pid == owner else original_start(pid)
-        patches.enter_context(mock.patch.object(process_start, "process_start", side_effect=owner_start))
-''' + "\n".join("    " + line if line else line for line in support.RUN_BUILD_TARGETS.splitlines()) + r'''
-if recovering:
-    identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
-    with observations.open("a") as output:
-        output.write(json.dumps({"status": status, "identity": identity_file.read_text(),
-                                 "at": time.monotonic()}) + "\n")
-if sys.argv[1] == "reserve" and status == 0:
-    marker = root / "saved-reserve.json"
-    if not marker.exists():
-        assignment_file = Path(sys.argv[sys.argv.index("--assignment-file") + 1])
+''' + support.BUILD_TARGETS_STATUS + r'''
+
+def main() -> object:
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+    recovering = sys.argv[1] == "recover-reservation"
+    observations = root / "recovery-observations.jsonl"
+    with ExitStack() as patches:
+        observations_seen = len(observations.read_text().splitlines()) if observations.exists() else 0
+        if recovering and observations_seen < int(os.environ.get("TEST_RECOVERY_UNKNOWN_READS", "0")):
+            owner = int(sys.argv[sys.argv.index("--pid") + 1])
+            original_start = process_start.process_start
+            def owner_start(pid):
+                return process_start.Unreadable("the private owner reading is unavailable") if pid == owner else original_start(pid)
+            patches.enter_context(mock.patch.object(process_start, "process_start", side_effect=owner_start))
+        status = build_targets_status()
+    if recovering:
         identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
-        marker.write_text(json.dumps({"assignment": assignment_file.read_text(),
-                                     "identity": identity_file.read_text()}))
-        raise SystemExit(1)
-raise SystemExit(status)
+        with observations.open("a") as output:
+            output.write(json.dumps({"status": status, "identity": identity_file.read_text(),
+                                     "at": time.monotonic()}) + "\n")
+    if sys.argv[1] == "reserve" and status == 0:
+        marker = root / "saved-reserve.json"
+        if not marker.exists():
+            assignment_file = Path(sys.argv[sys.argv.index("--assignment-file") + 1])
+            identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
+            marker.write_text(json.dumps({"assignment": assignment_file.read_text(),
+                                         "identity": identity_file.read_text()}))
+            return 1
+    return status
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ''')
         for unknown_reads, poll_seconds in ((0, "0.05"), (1, "0.05"), (3, "0.25")):
             with self.subTest(unknown_reads=unknown_reads, poll_seconds=poll_seconds):
@@ -349,7 +359,7 @@ from pathlib import Path
 import runpy
 
 with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.direct.test_verify_step_state import read_step_row
+from scripts.direct.step_row_test_support import read_step_row
 snapshot = Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json")
 if not snapshot.exists():
     records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))

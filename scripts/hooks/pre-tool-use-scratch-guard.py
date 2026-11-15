@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Refuse a Bash command or file write that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude,
-~/rust or ~/rust/scratch.
+~/rust, ~/rust/scratch or the folder that holds the scratch and copies roots (/build/claude on natedev).
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
@@ -10,8 +10,8 @@ The commands judged are mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/
 cargo new/init, and tar extraction (-C or the working folder); a Write or NotebookEdit judges its
 file's path. A command is refused when it makes a folder directly in one of the roots that does not
 exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
-/tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session) and the two
-scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session or run root still permits ordinary temporary files.
+/tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session), the scratch roots
+(build_folders.conf roots.scratch, /tmp/claude/scratch, ~/rust/repro) and the copies roots (roots.copies, /tmp/claude/copies). A TMPDIR inside a session or run root still permits ordinary temporary files.
 Repository copies under those roots require `build_folders.py run`.
 The hook restores the session temp folder from the hook input's session id.
 ~/worktrees is no root, and a make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
@@ -28,6 +28,7 @@ try:
 except FileNotFoundError:
     pass
 
+import functools
 import io
 import json
 import os
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Protocol, TypedDict, cast, override
 
 
+from scripts.lib import copy_record
 from scripts.lib.file_module import load_file_module
 
 
@@ -111,9 +113,16 @@ def own_temp(temp: str) -> bool:
             or any(SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts))
 
 
+@functools.cache
+def configured_roots() -> tuple[Path, Path]:
+    """The configured scratch and copies roots, as real paths."""
+    return real(str(copy_record.root())), real(str(copy_record.copies_root()))
+
+
 def roots() -> list[Path]:
     """The folders in which a new loose folder is refused, as real paths, nested ones included."""
-    found = [real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch")]
+    found = [real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"),
+             *(root.parent for root in configured_roots())]
     temp = os.environ.get("TMPDIR")
     if temp and not own_temp(temp):
         found.append(real(temp))
@@ -125,6 +134,8 @@ def allowed(top: Path) -> bool:
     if top.parent == real("/tmp") and (top.name == "claude" or SESSION_SCRATCHPAD.fullmatch(top.name)):
         return True
     if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session", "copies"):
+        return True
+    if top in configured_roots():
         return True
     return top == real("~/rust/repro")
 

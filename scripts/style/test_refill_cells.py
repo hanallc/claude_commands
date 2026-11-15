@@ -68,6 +68,12 @@ class JudgmentCellsTests(LedgerTestCase):
         with self.subTest(change="lint judgment"):
             self.lint(self.git("rev-parse", "HEAD"), "clippy", True, {})
             self.assert_full_recomputation()
+        with (self.subTest(change="cell dependency kinds"), self.ledger() as ledger,
+              closing(sqlite3.connect(ledger.database)) as connection):
+            rows = cast(list[tuple[str]], connection.execute(
+                "SELECT DISTINCT source_kind FROM refill_dependencies WHERE consumer_table='refill_cells'").fetchall())
+            kinds = {kind for (kind,) in rows}
+            self.assertLessEqual(kinds, {"judgments", "lint_tool"})
 
     def test_unchanged_reopen_reads_no_historical_judgment_source(self) -> None:
         rule = self.rule("modules", "tier: C\nfamily: modules\ninput_scope: crate\n")

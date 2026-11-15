@@ -13,8 +13,8 @@ It also shows the paid USD/h and paid USD per merge gate from the AWS bill for t
 Gate placement uses the same estimate.
 A region without its own runs uses the type's time from other regions, and the cell says so.
 The last line names the cheapest merge gate.
-`buildlog hourly` refreshes the snapshot with `aws_target.py snapshot`.
-Empty cells say `no snapshot`, `read failed`, or `no offer`.
+`buildlog hourly` refreshes the snapshot with `aws_target.hourly`.
+Empty cells say `no snapshot`, `read failed`, or `not sold here`.
 Each failed region shows its saved AWS error and the failure time.
 Cached values remain visible with a failure label or an old age.
 A failed hourly snapshot sends one user notice for each failure streak.

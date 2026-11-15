@@ -40,7 +40,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, mac_idle_alert
+from scripts.buildlog import charts, mac_idle_alert, parse
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -591,16 +591,13 @@ def cargo_job(command: tuple[str, ...]) -> str:
     for index, argument in enumerate(command):
         if Path(argument).name not in ("cargo", "cargo-tile-real", "cargo-nextest"):
             continue
-        arguments = iter(command[index + 1:])
-        for argument in arguments:
-            if argument in ("--color", "--config", "--manifest-path", "--lockfile-path", "-C", "-Z"):
-                _ = next(arguments, "")
-            elif not argument.startswith(("-", "+")):
-                if argument in ("test", "nextest"):
-                    return "tests"
-                if argument == "build" and any(flag in command for flag in ("--release", "-r")):
-                    return "release build"
-                return argument
+        subcommand = parse.cargo_subcommand(command[index + 1:])
+        if subcommand in ("test", "nextest"):
+            return "tests"
+        if subcommand == "build" and any(flag in command for flag in ("--release", "-r")):
+            return "release build"
+        if subcommand:
+            return subcommand
     return ""
 
 

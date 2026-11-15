@@ -133,7 +133,7 @@ class HoldEnforcerTests(unittest.TestCase):
             step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
 
-    def test_drain_command_keeps_existing_runs_and_waits_without_stopping(self) -> None:
+    def test_drain_command_keeps_working_runs_and_waits_without_stopping(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.build_hold.owning_session import NoOwningSession
 
@@ -148,6 +148,8 @@ class HoldEnforcerTests(unittest.TestCase):
         _ = self.process(40, "custom-build")
         _ = self.process(60, "cargo", argv=("cargo", "build"), session="existing-agent")
         _ = self.process(61, "rustc", parent=60)
+        _ = self.process(80, "bash", argv=("bash", "verify.sh", "check"))
+        _ = self.process(81, "cargo", parent=80, argv=("cargo", "clippy"))
         statuses: list[str] = []
         original_wait = hold_enforcer.wait_for_kept_runs
 
@@ -172,23 +174,25 @@ class HoldEnforcerTests(unittest.TestCase):
                 for pid in (20, 21, 30, 60, 61):
                     shutil.rmtree(self.proc / str(pid))
             else:
-                _ = self.process(10, "bash", start=12_001, argv=("bash", "verify.sh", "check"))
-                shutil.rmtree(self.proc / "40")
+                for pid in (40, 80, 81):
+                    shutil.rmtree(self.proc / str(pid))
             status()
 
         def wait(holder: build_hold.Holder, proc_root: Path) -> int:
-            self.assertEqual(set(holder.keep), {build_hold.ProcessIdentity(pid, "11000") for pid in (10, 20, 30, 40, 60)})
+            self.assertEqual(set(holder.keep), {build_hold.ProcessIdentity(pid, "11000") for pid in (20, 30, 40, 60, 80)})
             self.assertIsInstance(holder.release, build_hold.KnownReleaseEta)
             record = cast(dict[str, object], json.loads((self.holders / member.id).read_text()))
             self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep"})
-            for pid in (10, 11, 20, 21, 30, 60, 61):
+            for pid, expected in ((10, build_hold.Holder), (11, build_hold.Holder),
+                                  *((pid, build_targets.NoBlockingHold) for pid in (20, 21, 30, 60, 61, 80, 81))):
                 lineage = build_targets.read_caller_lineage(self.proc, pid, "11000")
                 self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
-                    NoOwningSession(), self.holders, lineage), build_targets.NoBlockingHold)
+                    NoOwningSession(), self.holders, lineage), expected)
             status()
             return original_wait(holder, proc_root, sleep=advance, clock=lambda: self.now)
 
         with mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
+             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
              mock.patch.object(hold_enforcer, "start"), \
              mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, \
              mock.patch.object(os, "kill") as kill, \
@@ -207,6 +211,10 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(output.getvalue().splitlines()[-1], "drained; natedev stays held until release")
         self.assertTrue((self.holders / member.id).is_file())
         self.assertTrue((self.proc / "50/stat").is_file())
+        self.assertNotIn("pid 10,", statuses[0])
+        self.assertIn(": pid 80, start 11000", statuses[0])
+        self.assertIn(": pid 80, start 11000", statuses[1])
+        self.assertNotIn("kept by", statuses[2])
 
     def test_drain_keeps_a_gate_started_before_the_hold_is_published(self) -> None:
         from scripts.build_targets import build_targets
@@ -231,6 +239,7 @@ class HoldEnforcerTests(unittest.TestCase):
             self.assertEqual(discoveries, [()])
             self.assertFalse(build_hold.has_holder_file(directory))
             _ = self.process(55, "bash", argv=("bash", "verify.sh", "check"))
+            _ = self.process(57, "cargo", parent=55, argv=("cargo", "build"))
             return original_start(directory, identity, purpose, request, now, keep, before_publish=before_publish)
 
         def start_enforcer() -> None:
@@ -243,7 +252,11 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
                     NoOwningSession(), self.holders, lineage), expected)
 
+        # The fake gate starts at tick 11000; fix the boot clock after it so a fresh host keeps it.
         with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000), \
+             mock.patch.object(os, "sysconf", return_value=100), \
              mock.patch.object(build_hold, "start_hold", side_effect=publish), \
              mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
              mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
@@ -467,7 +480,8 @@ class HoldEnforcerTests(unittest.TestCase):
                                        return_value=build_hold.ClaimsUnreadable("private claims are damaged")), \
                      mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
                      redirect_stderr(errors):
-                    self.assertEqual(hold_enforcer.working_drain_identities(self.proc), (identity,))
+                    self.assertEqual(hold_enforcer.working_gates(table, hold_enforcer.claimed_processes(self.proc)),
+                                     (identity,))
                 self.assertEqual(errors.getvalue().splitlines(), ["claims unreadable: private claims are damaged"])
                 for admitted, claimed, expected in (
                     (frozenset[build_hold.ProcessIdentity](), frozenset[build_hold.ProcessIdentity](),

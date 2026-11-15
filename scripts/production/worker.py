@@ -1623,6 +1623,9 @@ def main(arguments: list[str] | None = None) -> int:
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
+    if args.command in ("add", "assign") and quota_state.no_worker_mode():
+        print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         if args.command == "finish-dispatch":
             return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir), args.dispatch_id)

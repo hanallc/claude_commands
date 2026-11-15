@@ -1339,8 +1339,8 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
     if isinstance(request.placement, AssignedOffloadRequest):
         assignment = request.placement.assignment
         if isinstance(request.admission, UnclaimedMacRun):
-            identity = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-                placement.attempt_key(assignment.episode, assignment.attempt)).hex, assignment.episode, assignment.attempt)
+            identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                                 assignment.episode, assignment.attempt)
         leased_slots = (assignment.destination.slot,) if assignment.destination.slot else ()
     session = (request.holder_session if isinstance(request.admission, UnclaimedMacRun)
                else claim_state.session_id(request.admission.submitting_session))
@@ -2253,8 +2253,8 @@ def claim_for_run(
         controller.expected_claim = request.admission.identity
     elif isinstance(request.placement, AssignedOffloadRequest):
         assigned = request.placement.assignment
-        controller.expected_claim = claim_state.ClaimIdentity(uuid.uuid5(uuid.NAMESPACE_URL,
-            placement.attempt_key(assigned.episode, assigned.attempt)).hex, assigned.episode, assigned.attempt)
+        controller.expected_claim = claim_state.ClaimIdentity(placement.assigned_claim_id(assigned.episode, assigned.attempt),
+                                                              assigned.episode, assigned.attempt)
     if isinstance(request.placement, AssignedOffloadRequest) and isinstance(controller.expected_claim, claim_state.ClaimIdentity):
         assigned = request.placement.assignment
         identity = controller.expected_claim
@@ -2676,9 +2676,9 @@ def parser() -> argparse.ArgumentParser:
 
 def holder_session() -> str:
     """Use the unit owner session before the shell session."""
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     if isinstance(owner, OwningSession):
         return owner.session_id
     return os.environ.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}"

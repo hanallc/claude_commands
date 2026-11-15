@@ -36,6 +36,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 self.assertEqual(self.broadcasts, [])
                 calls: list[list[str]] = []
                 stops: list[list[str]] = []
+                copies: list[list[str]] = []
 
                 def record_broadcast(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
                     del options
@@ -44,7 +45,9 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     saved = cast(quota_alert.StoredState, json.loads(quota_alert.STATE.read_text()))
                     self.assertTrue(saved.get("no_worker_mode", False))
                     self.assertIn("--no-block", arguments)
-                    if "--from" in arguments:
+                    if os.path.basename(arguments[arguments.index("--") + 2]) == "send.py":
+                        copies.append(arguments[arguments.index("--to"):])
+                    elif "--from" in arguments:
                         calls.append(arguments[arguments.index("--from"):])
                     else:
                         stops.append(arguments[arguments.index("--") + 2:])
@@ -59,6 +62,8 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     self.assertEqual(calls[0][2::2], ["--showrunners", "--units"])
                     self.assertIn("Send no assign.", calls[0][3])
                     self.assertEqual(calls[0][3], calls[0][5])
+                    self.assertEqual(copies, [["--to", producer, "--from", "quota-alert", "--text", f"FYI, no action: {calls[0][3]}"]
+                                              for producer in ("morty", "dwight")])
                     with quota_alert.state_file() as state:
                         self.assertTrue(state.get("no_worker_mode", False))
                     self.assertEqual(len(calls), 1)
@@ -66,6 +71,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 else:
                     self.assertEqual(calls, [])
                     self.assertEqual(stops, [])
+                    self.assertEqual(copies, [])
                     with quota_alert.state_file() as state:
                         self.assertFalse(state.get("no_worker_mode", False))
 
@@ -87,8 +93,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                     log = self.block(notes, self.now)
                     _ = self.block(notes, self.now + timedelta(minutes=1))
                 self.assertEqual(output.getvalue().splitlines(), [f"quota-alert: no-worker mode broadcast failed: {detail}",
+                                                                  f"quota-alert: no-worker mode FYI to morty failed: {detail}",
+                                                                  f"quota-alert: no-worker mode FYI to dwight failed: {detail}",
                                                                   f"quota-alert: Codex worker stop failed: {detail}"])
-                self.assertEqual(start.call_count, 2)
+                self.assertEqual(start.call_count, 4)
                 self.assertIn("quota status codex1: Codex refused work on codex1. No credit balance is reported for codex1. "
                               + "New work moved to Claude, the other coding assistant.", log)
                 self.assertEqual(self.assignments()["direct"], "claude")

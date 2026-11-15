@@ -159,6 +159,7 @@ class GateArguments(argparse.Namespace):
     promote_only: bool = False
     full: bool = False
     nightly: bool = False
+    modules: list[str] = field(default_factory=list)
 
 
 class SuiteMode(Enum):
@@ -2571,6 +2572,8 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
+    _ = parser.add_argument("--module", action="append", default=[], dest="modules",
+                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
 
 
 class CloudGateRoute(Protocol):
@@ -2642,13 +2645,24 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
+def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
+    """Run only the named modules, as a merge red's check on its base.
+
+    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
+    """
+    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
+                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+                      time_limit=gate_record.NoGateTimeLimit("named modules"))
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = run_gate_suites(repo, args.type_dirs,
-                                      module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode)
+                run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
+                       run_gate_suites(repo, args.type_dirs,
+                                       module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
@@ -2697,6 +2711,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --merge-branch")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
+    if args.modules and not args.tests_only:
+        parser.error("--module needs --tests-only")
     if args.nightly:
         args.type_dirs = list(NIGHTLY_TYPE_DIRS)
     if not args.tests_only and not args.promote_only and not args.nightly:

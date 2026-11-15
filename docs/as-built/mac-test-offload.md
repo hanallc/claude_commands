@@ -59,7 +59,7 @@ A PID alone cannot release another attempt.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
   `verify.sh` passes its repository root with `--repo-root`.
-- `block --holder KEY --for TEXT [--hours N] [--showrunner NAME]` stores the holder key and the native session from `build_hold.owning_session()`. The build-hold command supplies the fixed staff ID. A block admits its recorded session’s claims; a block without a session refuses every caller. The block uses `block_hours`, with a limit of `block_max_hours`. It warns the holder `block_warn_minutes` before expiry. A repeat block keeps `since`. `unblock --holder KEY` matches only the stored key. Status lines show the current staff name when the key resolves.
+- `block --holder KEY --for TEXT [--hours N] [--showrunner NAME]` stores the holder key and the native session from `owning_session.owning_session()`. The build-hold command supplies the fixed staff ID. A block admits its recorded session’s claims; a block without a session refuses every caller. The block uses `block_hours`, with a limit of `block_max_hours`. It warns the holder `block_warn_minutes` before expiry. A repeat block keeps `since`. `unblock --holder KEY` matches only the stored key. Status lines show the current staff name when the key resolves.
 - **CI switch.** `block` turns the repository variable `ci_variable` (hana's `MACOS_CI`) off through `gh` and records a `ci` word: `off_by_this_block`, `off_before`, `not_configured`, `still_on`, `off_unconfirmed`. Unblock and expiry turn it back on only for `off_by_this_block` and `off_unconfirmed`, and list per branch the CI runs that skipped macOS meanwhile, with the `gh workflow run` line to rerun them. The report uses one paged REST list and one GraphQL request for the newest 200 runs; missing or partial job data produces a report error. A lift that cannot turn the switch back on keeps the block, messages the holder hourly and keeps trying. Expiry records that failure as `ExpiredBlockLiftFailed(gh_error_line)` on `SettleOutcome.expired_block_lift_failure` (otherwise `NO_EXPIRED_BLOCK_LIFT_FAILURE`), apart from `ci_problem`; while it lasts `status` prints `The block is past its time limit but could not lift: CI's Mac switch could not be turned back on (<gh line>). Run github-warmup, then unblock.`, and `block` names the same `gh` line. A new `ci` word goes into `CiSwitch`, `decoded_ci`, `ci_needs_restore` and `ci_may_still_be_on`.
 - **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
 - **The message.** The block sends one free message with key `mac-free-<since>`. A staff holder receives it through the fixed staff ID. A holder outside staff uses the recorded session socket or given key. The message states which work ended and that the block remains active. A send.py exit status of 0 or 1 counts as delivery.
@@ -133,18 +133,22 @@ Malformed numeric protocol values become `AdmissionUnavailable` at the admission
 
 The watch sends the builds showrunner one message after `alert_seconds` while eligible steps wait.
 It resolves the address with `showrunners.py address builds`.
-The message names the block, idle claim, or free Mac.
+The message names the block, idle claim, free Mac, disk exclusion, or unreachable Mac.
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
 `MAC UNREACHABLE` identifies a future connection backoff.
 `MAC IDLE WATCH` identifies unreadable or stale state.
-Neither condition sends an idle notification.
+The unreachable state sends the message after `alert_seconds` while eligible steps wait.
+The unreadable state sends no message or phone push.
 
-After `push_seconds`, a block uses `mac_idle.blocked` with `need=blocked`.
-An idle claim or free Mac uses `mac_idle.stuck` with `need=decision`.
-A free Mac has no reservation sentence.
-The block push names `/build:mac unblock` as its action.
-The other push asks the builds showrunner to resume Mac work.
+A free Mac, idle claim, block, or disk exclusion sends no phone push.
+These states keep the message to builds.
+The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `push_seconds` while eligible steps wait.
+The title is "Mac tests stopped".
+The action is "Wake the Mac or check its network."
+The body gives the elapsed minutes and the number of waiting tests.
+It states that builds cannot reach the Mac.
+The unreachable state runs no repairs.
 
 Both sends use outage keys and `--repeat-minutes`.
 The repeat window covers at least `repeat_minutes` and the current outage age.
@@ -166,9 +170,9 @@ This policy covers process stops, including SIGTERM, SIGKILL, and session stops.
 It does not cover power loss or promise filesystem synchronization.
 
 The watch saves `messaged` and `pushed` only after accepted delivery.
-The block push uses `mac_idle.py cleared --since <since>`.
+The unreachable push uses `mac_idle.py cleared --since <since>`.
 That check reads only the saved result.
-It clears when the outage changes, ends, or has no waiting steps.
+It clears when the saved state is no longer unreachable, the outage changes, or no steps wait.
 Missing and stale readings never clear a push.
 A later outage gets new marks and keys.
 
@@ -515,7 +519,7 @@ The footer reads the block file directly, without a lock, GitHub request, or mes
 
 `OffloadRequest` requires the copy owner and holder session.
 It also carries the repository scope.
-`request_from_arguments` selects the holder through `build_hold.owning_session()` before the shell session fallback.
+`request_from_arguments` selects the holder through `owning_session.owning_session()` before the shell session fallback.
 `request_mirror` uses this supplied session without another lookup.
 Busy refusals can name the unit director's session.
 

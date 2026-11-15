@@ -31,6 +31,7 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_member,
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import models_registry, process_start, unit_runs
 from scripts.message import sessions
+from scripts.whoami import quota_state
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
 from scripts.accounts import accounts
@@ -2724,6 +2725,14 @@ class WorkerPaneTests(StaffTestCase):
             code, _, errors = self.command("start-or-resume", "new", "--role", "impl")
         self.assertEqual(code, worker_panes.ExitCode.REFUSED)
         self.assertIn("caller", errors)
+        self.assertEqual(self.world.launches, [])
+
+    def test_no_worker_mode_cli_starts_no_worker(self) -> None:
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}),
+              patch.object(quota_state, "no_worker_mode", return_value=True)):
+            code, output, errors = self.command("start-or-resume", "new", "--role", "impl")
+        self.assertEqual((code, output, errors),
+                         (worker_panes.ExitCode.REFUSED, "", f"worker_panes.py: {quota_state.NO_WORKER_START}\n"))
         self.assertEqual(self.world.launches, [])
 
     def test_showrunner_can_start_a_worker(self) -> None:

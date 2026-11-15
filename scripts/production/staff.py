@@ -448,6 +448,7 @@ class StaffRow:
             elif key in fields:
                 invalid.append(key)
         if invalid:
+            # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
@@ -1023,6 +1024,7 @@ def _rows(value: object) -> list[StaffRow]:
         fields = cast(dict[str, object], item) if isinstance(item, dict) else dict[str, object]()
         if isinstance(fields.get("kind"), str) and fields["kind"] not in _KINDS:
             unknown.append(fields)
+            # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped", file=sys.stderr)
             continue
         rows.append(StaffRow.from_json(cast(object, item)))
@@ -1033,13 +1035,19 @@ def _rows(value: object) -> list[StaffRow]:
     return sorted(rows, key=lambda row: row.id)
 
 
-def _local_fields() -> dict[str, object]:
-    """Read the local record without constructing every staff row."""
+def _local_text() -> str:
     try:
-        value = _decode(_file().read_text(encoding="utf-8"))
+        return _file().read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
+        raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
+
+
+def _record_fields(text: str) -> dict[str, object]:
+    try:
+        value = _decode(text)
+    except StaffUnreadable as error:
         raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
     if not isinstance(value, dict):
         raise StaffUnreadable("staff record must be an object")
@@ -1050,14 +1058,40 @@ def _local_fields() -> dict[str, object]:
     return fields
 
 
+def _local_fields() -> dict[str, object]:
+    """Read the local record without constructing every staff row."""
+    return _record_fields(_local_text())
+
+
+# A process reads the same staff text many times; the last clean parse serves each read of that text.
+_PARSED: dict[str, tuple[str, StaffSnapshot]] = {}
+
+
+def _clean_parse(fields: dict[str, object], loaded: StaffSnapshot) -> bool:
+    """True when the parse printed no anomaly, so a later read of the same text prints none either."""
+    rows = fields.get("rows")
+    return (isinstance(rows, list) and len(cast(list[object], rows)) == len(loaded.rows)
+            and not any("role" in row.unknown_fields or "home" in row.unknown_fields for row in loaded.rows))
+
+
 def _load(*, initial: bool = False) -> StaffSnapshot:
     try:
-        fields = _local_fields()
+        text = _local_text()
     except StaffAbsent:
         if initial:
             return StaffSnapshot(())
         raise
-    return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
+    path = str(_file().absolute())
+    parsed = _PARSED.get(path)
+    if parsed is not None and parsed[0] == text:
+        # A new snapshot finds backends again; they follow session files, not the staff text.
+        return replace(parsed[1])
+    fields = _record_fields(text)
+    loaded = replace(_snapshot_value(fields), inputs=(path,))
+    _PARSED.clear()
+    if _clean_parse(fields, loaded):
+        _PARSED[path] = (text, loaded)
+    return loaded
 
 
 def local_by_current_session(session_id: str) -> StaffRow | None:

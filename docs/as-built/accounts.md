@@ -25,6 +25,7 @@ This document describes the implementation and its constraints.
 | `scripts/accounts/outage_alerts.py` | Durable alert claims for retained record-driven restart paths. |
 | `scripts/whoami/agent_accounts.py` | Account identity, Codex homes, worker selection, and credit policy. |
 | `scripts/whoami/note_file.py` | Numbered account notes and the shared notes-folder resolver. |
+| `scripts/whoami/quota_state.py` | The quota state file, the no-worker mode read, and the `NO_WORKER_START` refusal text. It is a leaf module. |
 | `scripts/settings/settings_local_keys.sh` | Settings classification, local snapshots, and Git filter transformations. |
 | `scripts/settings/local_key_notices.py` | Deferred notices for new machine-local keys. |
 | `scripts/lib/conf.py` | Validated configuration reads and recovery. |
@@ -296,6 +297,8 @@ The refusal handler sets this flag independently of the first `NoRoomMove` entry
 A zero account with credits off enables the same flag when its workers stay on it: no other account has room, or the workers move failed.
 The saved flag triggers one broadcast to showrunners and unit directors on both machines.
 `config/accounts.conf` supplies `no_worker_mode_on` and `no_worker_mode_off`; `quota-alert` identifies the sender.
+Each producer that `no_worker_mode_fyi` names (`morty dwight`) gets one copy of each notice through `send.py`.
+The copy begins `FYI, no action:`; producers direct no workers.
 The ON notice directs directors to write code, run tests, and do reviews without assigning workers.
 Successful Codex recovery clears the flag and broadcasts OFF after the workers account and assignment restoration succeed.
 Recovery also clears the flag when no Claude assignment fallback was saved.

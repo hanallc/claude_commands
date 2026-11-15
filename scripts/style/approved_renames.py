@@ -40,6 +40,8 @@ NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
+# A rename of a Rust file at any place in an after, as in `After the moves, rename <a> to <b>.`
+ANY_FILE_RENAME = re.compile(rf"(?<![\w/.-])rename ({RUST_FILE}) to {RUST_FILE}", re.IGNORECASE)
 # Words after a file rename that name a second file pair: another change.
 SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
 # A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.
@@ -1603,6 +1605,15 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
             or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
+
+
+def edits_module_owners(kind: str, path: str, after: str) -> bool:
+    """Whether a finding changes the module of its Rust file, so it edits each file that declares that module: a
+    restructure, or a rename of its own file in any words, also one that file_rename does not approve."""
+    if kind == "restructure":
+        return path.endswith(".rs")
+    return kind == "rename" and any(path == match[1] or path.endswith("/" + match[1])
+                                    for match in ANY_FILE_RENAME.finditer(after))
 
 
 def names_other_change(rest: str) -> bool:

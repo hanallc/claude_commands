@@ -13,7 +13,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import step_record
-from scripts.direct.step_selection import Pinned
+from scripts.direct.step_row_test_support import read_step_row
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
 from scripts.direct.verify_mac_offload_test_support import VERIFY
 from scripts.lib.shell_test_support import shell_functions
@@ -21,23 +21,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 INVOKE = VERIFY.parent.parent / "lint/invoke.sh"
-
-
-def read_step_row(call_id: str) -> dict[str, object]:
-    """Adapt a decoded record for existing fixture observations."""
-    record = step_record.read(call_id)
-    if not isinstance(record, step_record.StepRecord):
-        raise AssertionError(f"The live record is invalid: {record}")
-    location: dict[str, object]
-    match record.runs_on:
-        case step_record.AnyTarget(_, mac_targets):
-            location = {"kind": "any_target", "mac_targets": list(mac_targets)}
-        case step_record.NatedevOnly(reason):
-            location = {"kind": "natedev_only", "reason": reason}
-    return dict(kind=record.kind, state=record.state.value, selected_target=record.selected_target,
-                updated=record.updated, runs_on=location, eligible_targets=list(record.eligible_targets),
-                pinned_target=record.selection.target if isinstance(record.selection, Pinned) else "",
-                package=step_record.package_name(record.package))
 
 
 OBSERVER = r'''
@@ -252,18 +235,18 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         for damage in ("removed", "foreign", "nul"):
             with self.subTest(damage=damage):
                 targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-                source = TARGETS.replace('raise SystemExit(10 if any(holders.iterdir()) else 0)', '''
-    if command == "register-local":
-        for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
-            if os.environ["TEST_RECORD_DAMAGE"] == "removed":
-                path.unlink()
-            elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
-                path.write_bytes(path.read_bytes() + bytes([0]))
-            else:
-                row = json.loads(path.read_text())
-                row["pid"] = os.getpid()
-                path.write_text(json.dumps(row))
-    raise SystemExit(10 if any(holders.iterdir()) else 0)''')
+                source = TARGETS.replace('        return 10 if any(holders.iterdir()) else 0', '''
+        if command == "register-local":
+            for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+                if os.environ["TEST_RECORD_DAMAGE"] == "removed":
+                    path.unlink()
+                elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
+                    path.write_bytes(path.read_bytes() + bytes([0]))
+                else:
+                    row = json.loads(path.read_text())
+                    row["pid"] = os.getpid()
+                    path.write_text(json.dumps(row))
+        return 10 if any(holders.iterdir()) else 0''')
                 _ = targets.write_text(source)
                 self.fixture.environment["TEST_RECORD_DAMAGE"] = damage
                 result = self.call_step_functions("run cargo check -p sample\n", kind="check")

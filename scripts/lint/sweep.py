@@ -450,7 +450,8 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     from scripts.buildlog import index as build_index
 
     known_trees: dict[str, list[str]] = {}
-    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees)
+    checkouts: list[str] = []
+    discovered = target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees, checkouts=checkouts)
     recorded = recorded_output_roots(build_index.index_path(), store.host_name())
     cached = saved_cargo_output_roots()
     mappings: tuple[CargoOutputRoots, ...] = ()
@@ -462,6 +463,7 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     combined = tuple(dict.fromkeys(CargoOutputRoots(*(resolve(path) for path in (
         item.workspace_root, item.target_directory, item.build_directory)))
         for item in (*mappings, *cached.workspaces, *cached.history)))
+    combined = (*combined, *scratch_checkout_roots(checkouts, combined))
     mapped_paths = {path for item in combined for path in (item.target_directory, item.build_directory)}
     mapped = {str(path) for path in mapped_paths if path.is_dir()}
     added = sorted(mapped - set(discovered))
@@ -470,6 +472,23 @@ def discover_cargo_outputs(roots: Sequence[str], *,
     protected = tuple(NoRecordedEvidence(path) for path in discovered if path not in mapped)
     index = CargoOutputIndex(combined, no_recorded_evidence=protected, known_trees=known_trees)
     return sorted(set(discovered) | mapped), index
+
+
+def scratch_checkout_roots(checkouts: Sequence[str],
+                           known: Sequence[CargoOutputRoots]) -> tuple[CargoOutputRoots, ...]:
+    """Ask Cargo once for each scratch checkout that no row maps; a task build writes no record."""
+    scratch = copy_record.root().resolve()
+    workspaces = [item.workspace_root for item in known]
+    found: list[CargoOutputRoots] = []
+    for checkout in sorted({Path(path).resolve() for path in checkouts}):
+        # A member crate sorts after its workspace, so its workspace row covers it.
+        if not checkout.is_relative_to(scratch) or any(checkout.is_relative_to(root) for root in workspaces):
+            continue
+        roots = read_cargo_output_roots(checkout)
+        if isinstance(roots, CargoOutputRoots):
+            found.append(roots)
+            workspaces.append(roots.workspace_root)
+    return tuple(found)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3553,7 +3572,9 @@ def folder_choice(path: str, size: int) -> FolderChoice:
     label = home_relative(str(folder))
     if name.casefold() in ("trash", ".trash"):
         return FolderChoice(label, size, FolderChoiceKind.TRASH)
-    if any(part.casefold() == "scratch" for part in folder.parts):
+    # Only the configured scratch roots hold temporary work; a "scratch" name elsewhere is no proof.
+    resolved = folder.expanduser().resolve()
+    if any(resolved.is_relative_to(root.expanduser().resolve()) for root in scratch_roots()):
         return FolderChoice(label, size, FolderChoiceKind.SCRATCH)
     return FolderChoice(label, size, FolderChoiceKind.OTHER)
 
@@ -3883,10 +3904,14 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
 
 
 def floor_roots(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[str, ...]:
-    """Include the standing pool wherever copies configuration places it."""
+    """Include the standing pool and the scratch root wherever configuration places them."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    return (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+    roots = (*lint_settings.words("sweep_floor_roots"), str(copies.gates_root()))
+    scratch = copy_record.root()
+    if any(scratch.is_relative_to(Path(root).expanduser()) for root in roots):
+        return roots
+    return (*roots, str(scratch))
 
 
 def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, float],
@@ -4990,17 +5015,22 @@ def read_rebuild_steps(root: Path) -> list[RebuildStep]:
     return read_rebuild_evidence(root).steps
 
 
-def clone_kind(folder: str) -> str:
+def scratch_roots() -> tuple[Path, ...]:
+    return copy_record.root(), copy_record.FORMER_ROOT
+
+
+def clone_kind(folder: str, scratch_roots: tuple[Path, ...]) -> str:
     path = Path(folder)
     parts = path.parts
     # A scratch HOME sits under /tmp, so its ~/rust worktrees are named before the /tmp groups.
     if path.is_relative_to(Path.home() / "rust"):
         return "~/rust worktrees"
-    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp"):
+    in_scratch = any(path.is_relative_to(root) for root in scratch_roots)
+    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp") or in_scratch:
         # Older copies include gate57e, mergeclone and p34-merge-<sha>.
         if any(re.search(r"(?:^|[-_])(gate|merge)", part) for part in parts):
             return "gate and merge copies"
-        if path.is_relative_to("/tmp/claude/scratch"):
+        if in_scratch:
             return "scratch.py folders"
         if "phases" in parts or any(re.search(r"(?:^|[-_])phase(?:\d|[-_])", part) for part in parts):
             return "phase clones"
@@ -5083,8 +5113,9 @@ def rebuilds_main(argv: list[str]) -> int:
         print(f"lint sweep: cannot read rebuild evidence: {error}", file=sys.stderr)
         return 2
     totals: dict[tuple[str, RebuildCause], float] = {}
+    roots = scratch_roots()
     for rebuild in cold:
-        key = (clone_kind(rebuild.step.workspace), rebuild.cause)
+        key = (clone_kind(rebuild.step.workspace, roots), rebuild.cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
     print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")

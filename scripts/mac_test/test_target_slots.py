@@ -30,7 +30,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
-from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -132,7 +132,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "utc_now", return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)))
         _ = self.enterContext(mock.patch.object(time, "monotonic", return_value=100.0))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.git_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected child process")))
