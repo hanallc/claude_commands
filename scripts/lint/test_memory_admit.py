@@ -6233,6 +6233,8 @@ class CiSliceMemoryTests(unittest.TestCase):
         reading = self.reading()
         self.assertEqual(reading.bytes, 2 * GIB)
         self.assertEqual(reading.swap_bytes, GIB)
+        # The active file cache stays in the working set but not in the swap-backed use.
+        self.assertEqual(reading.anonymous, admission_records.AnonymousRunUse(1024))
         _ = (self.ci / "memory.stat").write_text(f"inactive_file {11 * GIB}\n")
         self.assertEqual(self.reading().bytes, 0)
 

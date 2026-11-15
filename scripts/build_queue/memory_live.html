@@ -345,7 +345,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="last-reading" id="last-reading" hidden></div>
     </div>
 
-    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree</p>
+    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree: the named parts exceed the total.</p>
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
       <div class="bar">
         <div class="seg-used" id="s-builds" data-tip="builds"><span class="lbl" id="l-builds"></span></div>
@@ -471,7 +471,7 @@ const TIPS = {
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
     "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
-    optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`), "Reservations count toward this limit.")],
+    optional(d.ram.ci_counted_bytes, `CI use counted, file cache included: ${ramAmount(d.ram.ci_counted_bytes)}.`), "Reservations count toward this limit.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines(
     optional(d.ram.safety_missing_bytes, `Safety reserve missing: ${ramAmount(d.ram.safety_missing_bytes)}.`),
     optional(d.ram.swap_missing_bytes, `Swap reserve missing: ${ramAmount(d.ram.swap_missing_bytes)}.`),
@@ -542,8 +542,9 @@ function swapTip(row) {
 }
 function capEnd(r) {
   const total = recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes : 1;
-  return (r.builds_bytes + r.ci_bytes + r.build_covered_bytes + r.room_bytes) / total;
+  return (r.builds_bytes + ciBytes(r) + r.build_covered_bytes + r.room_bytes) / total;
 }
+function ciBytes(r) { return recorded(r.ci_bytes) ? r.ci_bytes : 0; }
 function poolTip(pool, d) {
   if (pool === "builds_ci") return [`Builds and CI · ${swapAmount(d.swap.builds_ci_bytes)}`,
     "Swap used by builds, build tools, and CI.\nThe queue excludes this from its swap reserve target."];
@@ -816,10 +817,9 @@ function render(d) {
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
   const total = recorded(r.total_bytes) ? r.total_bytes : 0;
-  const disagree = r.agreement === "disagree";
-  $("ram-disagree").hidden = !disagree;
-  $("barwrap").hidden = !total || disagree;
-  $("scale").hidden = !total || disagree;
+  $("ram-disagree").hidden = r.agreement !== "disagree";
+  $("barwrap").hidden = !total;
+  $("scale").hidden = !total;
   const parts = [];
   for (const [key, name, amount] of RAM_BLOCKS) {
     const bytes = amount(r);
@@ -1222,7 +1222,7 @@ function placeMemoryBars(d) {
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
   const used = r.builds_bytes / GIB * unit;
-  const ciWidth = r.ci_bytes / GIB * unit;
+  const ciWidth = ciBytes(r) / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
   const reserveAt = used + ciWidth;

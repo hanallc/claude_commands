@@ -25,7 +25,7 @@ RAM_FIXTURE: dict[str, object] = {
     "room_bytes": 18 * GIB, "shortfall_bytes": 0, "safety_covered_bytes": 4 * GIB, "swap_covered_bytes": 2 * GIB,
     "build_covered_bytes": 6 * GIB, "safety_missing_bytes": 0, "swap_missing_bytes": 0, "build_missing_bytes": 0,
     "builds_bytes": 5 * GIB, "queued_builds_bytes": 3 * GIB, "rust_analyzer_bytes": GIB, "sccache_bytes": 512 * MIB,
-    "other_build_tools_bytes": 512 * MIB, "ci_bytes": 2 * GIB, "agents_bytes": 8 * GIB, "desktop_bytes": 3 * GIB,
+    "other_build_tools_bytes": 512 * MIB, "ci_bytes": 2 * GIB, "ci_counted_bytes": 3 * GIB, "agents_bytes": 8 * GIB, "desktop_bytes": 3 * GIB,
     "desktop_protection_bytes": 2 * GIB, "other_programs_bytes": 4 * GIB, "smaller_programs_bytes": GIB,
     "smaller_program_count": 5,
     "programs": [{"id": "firefox", "name": "firefox", "bytes": 2 * GIB}, {"id": "zed", "name": "zed", "bytes": GIB}],
@@ -556,7 +556,7 @@ function fitLabels() {}
                              "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
                              "Memory with no program name: 0.5 GiB."],
             "cap": ["Queue cap · 40.0 GiB", "Limit for queued builds and hana CI.\nQueued use counted: 3.0 GiB.\n" +
-                    "CI use counted: 2.0 GiB.\nReservations count toward this limit."],
+                    "CI use counted, file cache included: 3.0 GiB.\nReservations count toward this limit."],
             "budget": ["RAM budget · 64.0 GiB", "Blocks divide this machine's usable RAM.\n" +
                        "Available RAM includes cache Linux expects to reclaim.\nReservations use available RAM."],
         })

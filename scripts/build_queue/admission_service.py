@@ -1652,7 +1652,10 @@ class AdmissionServer:
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
                                dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
                 legacy_job = IdleService()
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
+            anonymous = gate.swap_backed_use_less(memory.anonymous,
+                                                  (item.anonymous for item in (*duplicate, *scoped)))
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), anonymous=anonymous,
+                                  job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
