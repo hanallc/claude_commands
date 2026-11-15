@@ -304,6 +304,10 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    reaches, so the design check finds the defects in one batch, not one per
    round.
 
+   Shots the user must look at go on the console Images page: register each
+   with `/show_image` (`~/.claude/commands/show_image.md`) and give the user
+   each image's own link, never a path alone.
+
    Such a notice carries the third line: the verdict of the design check
    (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends
    by the fresh Claude helper, taken from a build of `<hash>`. A verdict on

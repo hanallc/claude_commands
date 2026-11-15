@@ -651,7 +651,7 @@ class ServerCodeHealthTests(unittest.TestCase):
 
 
 class ServerCodeRestartTests(unittest.TestCase):
-    def test_a_changed_module_restarts_the_same_process_and_keeps_serving_http(self) -> None:
+    def test_a_changed_module_restarts_the_same_process_and_answers_a_request_sent_during_the_restart(self) -> None:
         checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
@@ -667,11 +667,16 @@ class ServerCodeRestartTests(unittest.TestCase):
         _ = driver.write_text(python_tool_source('''import importlib.util
 import os
 import sys
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
+if serve.LISTEN_FD in os.environ:
+    # Hold the restart open, so the test sends a request before the new server starts.
+    print(f"restarting {os.getpid()}", file=sys.__stdout__, flush=True)
+    time.sleep(0.5)
 serve.__file__ = str(checkout / "scripts/review_links/serve.py")
 serve.tailscale_ip = lambda: "127.0.0.1"
 spec = importlib.util.spec_from_file_location("review_restart_fixture", checkout / "review_restart_fixture.py")
@@ -724,6 +729,18 @@ with redirect_stdout(sys.stderr):
         self.assertEqual(first[0], child.pid)
         self.assertEqual(first[1], "before")
         _ = module_file.write_text("VALUE = 'after_code_change'\n")
+        assert child.stdout is not None
+        ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
+        self.assertEqual(ready, [child.stdout], errors_path.read_text())
+        self.assertEqual(cast(str, child.stdout.readline()).split(), ["restarting", str(first[0])])
+        during = HTTPConnection("127.0.0.1", first[2], timeout=TEST_HANG_GUARD_SECS)
+        try:
+            during.request("GET", "/answer.txt")
+            response = during.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        finally:
+            during.close()
         second = read_start()
         self.assertEqual(second, (first[0], "after_code_change", first[2]))
         self.assertEqual((checkout / "starts.txt").read_text().splitlines(),

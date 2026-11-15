@@ -21,15 +21,10 @@ Send design choices and proposed additions to the showrunner.
    The command reads the production document from the parent showrunner's `doc.path`.
    Do not pass a production document path or resolve one against your current directory.
    Without a parent showrunner, end the turn with `— decision:` as `/unit:direct` requires.
-2. Write the full question with enough context for the user to read it days later.
-   Include the unit, phase, file or screen, and the reason for the question.
-   State which work needs the answer.
-   Explain each choice and its result.
-   Mark the recommended choice with `(recommended — <reason>)`.
-   Add one line of text for the lists, such as `alpha: keep the old key binding?`.
+2. Write the question in parts, as **Question form** below says.
 3. Run the command:
    ```sh
-   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --unit <your unit staff id> --text "<one line>" --question "<the full question>" [--urgency blocks]
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --unit <your unit staff id> --ask "<one line>" --context "<why now>" --item "<fact>" [--item ...] --recommend "<choice and reason>" --choice "<answer>" [--choice ...] [--urgency blocks]
    ```
    Pass `--urgency blocks` when the phase needs the answer to continue.
    The command reviews the question before it adds the question to the list.
@@ -42,3 +37,15 @@ Send design choices and proposed additions to the showrunner.
    When no work can continue, end the turn with `— decision: filed for the user: <one line>`.
 5. Apply the answer that the showrunner sends with `From the user (via the showrunner):`.
    Treat the answer as the user's instruction.
+6. The user can send a follow-up from the Questions page.
+   The message starts with `From the user (via the review page), a follow-up on your question:`.
+   Answer it with the command that the message gives:
+   ```sh
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production <showrunner name> --item "<question text>" --text "<your reply>"
+   ```
+   The question then returns to the user with the follow-up and your reply.
+   A skip message needs no action; the question stays open.
+
+## Question form
+
+@~/.claude/docs/question_template.md

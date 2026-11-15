@@ -219,7 +219,10 @@ class VaultPullTests(unittest.TestCase):
         return [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
 
     def question(self) -> str:
-        return option(self.questions()[-1], "--question")
+        """Join the filed parts, so a check can look for a phrase in any part."""
+        args = self.questions()[-1]
+        return " ".join(args[index + 1] for index, value in enumerate(args)
+                        if value in ("--ask", "--context", "--choice", "--recommend"))
 
     def conflict(self) -> tuple[str, str]:
         local = self.commit(self.local, {"shared.md": "natedev edit\n"})
@@ -278,7 +281,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(len(self.questions()), 1)
         self.assertIn("shared.md", self.question())
         self.assertIn("In a terminal on the Mac", self.question())
-        self.assertIn("I recommend choice 1", self.question())
+        self.assertIn("Combine the edits: the next hourly sync", self.question())
         self.assertFalse(any("push" in args and "origin" in args for args in self.commands))
         self.assertFalse(any("pushover" in " ".join(args) or "send.py" in " ".join(args) for args in self.commands))
 
@@ -541,9 +544,13 @@ class VaultPullTests(unittest.TestCase):
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
-        self.assertIn("conflict", option(args, "--question"))
-        self.assertIn("Combine the edits and commit the result", option(args, "--question"))
-        self.assertNotIn("Keep the current branch", option(args, "--question"))
+        self.assertIn("conflict", option(args, "--context"))
+        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.")
+        self.assertEqual([args[index + 1] for index, value in enumerate(args) if value == "--choice"], [
+            "Combine the edits and commit the result. This keeps the wanted content from both copies.",
+            "Choose one copy for each file and commit the result. This replaces the other copy's content."])
+        self.assertEqual(option(args, "--recommend"), "Combine the edits: the next hourly sync retries the merge.")
+        self.assertNotIn("--question", args)
         self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
         self.assertEqual(option(args, "--urgency"), "soon")
         self.assertEqual(option(args, "--due"), "2027-01-16")

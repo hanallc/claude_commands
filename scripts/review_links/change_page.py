@@ -136,6 +136,9 @@ class SentCloseoutAlerts(TypedDict):
     messages: list[str]
 
 
+QuestionOutcome = Literal["answer", "followup", "skip"]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -144,6 +147,8 @@ class StoredUserAnswer(TypedDict):
     question: str
     answer: str
     message: str
+    # A record saved before follow-ups and skips has no kind; it is an answer.
+    kind: NotRequired[QuestionOutcome]
 
 
 @dataclass(frozen=True)
@@ -493,11 +498,29 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
-    """Render review text as escaped text blocks and consecutive list runs."""
+LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def linked(text: str) -> str:
+    """Escape text and make each http or https address a link that opens in the same tab, outside the console frame."""
+    pieces = LINK.split(text)
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_top">{html.escape(piece)}</a>'
+                   if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
+
+
+def inline_html(text: str) -> str:
+    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
+    pieces = CODE_SPAN.split(text)
+    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{html.escape(text)}</{block}>"
+        return f"<{block}>{escape(text)}</{block}>"
     content: list[str] = []
     current = ""
     for line in lines:
@@ -515,9 +538,9 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
-            content.append(f"<li>{html.escape(item)}</li>")
+            content.append(f"<li>{escape(item)}</li>")
         elif tag:
-            content.append(html.escape(line))
+            content.append(escape(line))
         current = tag
     if current:
         content.append(f"</{current}>")
@@ -1014,7 +1037,8 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 question = next((item for item in update_registration.question_records_for_document(page.production, identities)
                                  if item.path == page.review_list), None)
-                if question is None or question.status != "closed":
+                # An answer closes its question; a follow-up or a skip leaves it open.
+                if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):
