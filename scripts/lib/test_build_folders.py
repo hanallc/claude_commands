@@ -1446,6 +1446,38 @@ os._exit(0)
         self.assertTrue(held.is_dir())
         self.assertFalse(free.exists())
 
+    def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
+        real_open = os.open
+        for action in ("sweep", "create"):
+            with self.subTest(action=action):
+                removed: list[str] = []
+
+                def open_then_remove(name: str | os.PathLike[str], flags: int, mode: int = 0o777, *,
+                                     dir_fd: int | None = None) -> int:
+                    descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+                    if os.fspath(name).endswith(".lock") and not removed:
+                        # Another process removes the free folder's lock between this open and its check.
+                        removed.append(os.fspath(name))
+                        os.unlink(name, dir_fd=dir_fd)
+                    return descriptor
+
+                if action == "sweep":
+                    free = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    _release_folder(free)
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertEqual(removed, [free.name + ".lock"])
+                    folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertFalse(free.exists())
+                else:
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        made = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    self.addCleanup(_release_folder, made)
+                    self.assertEqual(len(removed), 1)
+                    self.assertNotEqual(removed[0], made.name + ".lock")
+                    self.assertTrue(made.is_dir())
+                    self.assertEqual(folders.build_folder_state(made), "held")
+
     def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
         for stage in ("folder", "lease", "temporary-lease", "lock"):
             for held in (False, True):

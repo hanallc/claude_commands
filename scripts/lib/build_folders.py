@@ -234,7 +234,8 @@ def _open_lock(path: Path, directory: int, *, create: bool) -> int:
     descriptor = os.open(path.name + ".lock", flags, 0o600, dir_fd=directory)
     try:
         inode = os.fstat(descriptor)
-        if not stat.S_ISREG(inode.st_mode) or inode.st_nlink != 1:
+        # Another process can remove the lock after this open; _lock_current refuses a lock with no link.
+        if not stat.S_ISREG(inode.st_mode) or inode.st_nlink > 1:
             raise ValueError("a build folder lock must be a regular file with one link")
         return descriptor
     except BaseException:

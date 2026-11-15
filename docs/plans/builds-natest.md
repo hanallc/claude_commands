@@ -4264,3 +4264,46 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Test `test_paired_queue_wait_does_not_shorten_the_box_lifetime` in `test_cloud_gate.py`.
 - AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
 - Commit abe4afc09. Production change.
+
+### Phase 297 — The verify helper reads each request in large reads  · status: todo
+**Depends on:** none
+**Owner:** natest (production change; the diff goes to sdlc).
+
+#### Work Order
+
+**Goal:** the verify helper reads a request with a few large reads, not one read call for each byte.
+
+**Spec:**
+- Cause: `read_field` in `scripts/direct/verify_helper.py` reads the unbuffered stdin one byte a call. A request carries the caller's whole environment (about 31 KB), so each call makes about 31k read calls. In `direct/test_verify_ssh_targets_routing.py` (natedev 21.5 CPU s) the request reads cost 2.54 CPU s of the helper's 6.2 s (445 calls, 5.7 ms a call).
+- `FieldReader` keeps a byte buffer, reads with `os.read(descriptor, READ_SIZE)` (64 KiB) and splits on NUL. `read_call` takes a `FieldReader`.
+- The main loop calls `select` only when the reader holds no buffered bytes. Buffered bytes belong to the next request, and `select` would wait for nothing.
+- The request format, the reply format and the fallback path do not change.
+
+**Files:** `scripts/direct/verify_helper.py`, `scripts/direct/test_verify_helper.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the new test (two requests in one write each get a reply) passes, and it hangs without the buffered check; test_verify_helper passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) on the verify modules passes with the same test count.
+
+### Phase 298 — A build folder lock removed after its open is not current  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the test_queue_card flake on 11-15; queue owns the queue card; the diff goes to sdlc).
+
+#### Work Order
+
+**Goal:** a sweep or a folder create that opens a lock another process then removes does not raise.
+
+**Spec:**
+- Cause: the devtools full gate on 7b1ecd3fd (AWS) failed `test_cloud_card_reads_progress_from_a_private_service`. `AdmissionFixture` calls `socket_parent`, which sweeps the shared socket parent. `remove_build_folder` opened another module's free folder lock with `O_CREAT`, the owner unlinked the lock, and `_open_lock` saw `st_nlink == 0` and raised `ValueError`.
+- `_open_lock` refuses a non-regular file and `st_nlink > 1` (a hard link). It accepts `st_nlink == 0`.
+- Every `_open_lock` caller checks `_lock_current`, which refuses a removed lock: the sweep leaves that folder, and `create_build_folder` tries a new name.
+
+**Files:** `scripts/lib/build_folders.py`, `scripts/lib/test_build_folders.py`.
+
+**Workers:** 1 writer (the director; no-worker mode). The change is one line and one test.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** the new test (sweep and create subtests) fails without the fix and passes with it; test_build_folders, test_queue_card and test_socket_test_support pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count.
