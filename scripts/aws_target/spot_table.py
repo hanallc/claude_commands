@@ -275,8 +275,7 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
                               f'{len(seconds)}' + ('' if own or not seconds else ' elsewhere'),
                               f'{estimate:.4f}' if estimate is not None else '—',
                               f'{paid:.4f}' if paid is not None else unbilled(len(here)),
-                              f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' if billed
-                              else unbilled(len(scoped)), str(len(billed))))
+                              paid_run_cell(billed, len(scoped) - len(billed), allocations), str(len(billed))))
             tables.append(Table(size, headers, frozenset(range(1, len(headers))), tuple(table), 'rows'))
             refused_rows.append((size, *refused_cells))
             launched_rows.append((size, *launched_cells))
@@ -298,6 +297,13 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
 def unbilled(runs: int) -> str:
     """The paid cell without a bill: runs wait for their day's bill, or no run counts here."""
     return 'bill due' if runs else 'no runs'
+
+
+def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations: dict[run_cost.BilledKey, Decimal]) -> str:
+    """The paid USD per run and the count of runs whose bill is still due; a bill comes up to about a day late."""
+    if not billed:
+        return f'{due} bill due' if due else 'no runs'
+    return f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' + (f' ({due} bill due)' if due else '')
 
 
 def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tuple[str, ...], days: int, home: str,

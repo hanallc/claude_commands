@@ -21,10 +21,9 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, console, image_store, images, serve
+from scripts.review_links import change_page, console, image_store, images, page_frame, serve
 
-PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
-                    + "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
+PNG = bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082')
 
 
 class ImagesFixture(unittest.TestCase):
@@ -183,6 +182,8 @@ class ImagesTests(ImagesFixture):
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
         source = images.render(self.root).decode()
+        self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
+        self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
         self.assertIn("last.owner === card.dataset.owner", source)
@@ -202,7 +203,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
+    def test_updates_keep_zoom_and_feedback_working_after_an_older_script_reloads(self) -> None:
         _ = self.register()
         current = images.render(self.root).decode()
         marker = f'data-script="{images.SCRIPT_VERSION}"'
@@ -224,6 +225,30 @@ class ImagesTests(ImagesFixture):
  for (let step = 0; step < 100 && list() === before; step++) await wait(20);
  check(list() !== before, 'the update puts in a new list');
  const card = list().querySelector('article'), form = card.querySelector('form');
+ const link = card.querySelector('a[data-image-zoom]');
+ const zoom = document.querySelector('[data-image-zoom-dialog]');
+ link.click();
+ check(zoom.open, 'a plain click opens the zoom after the list changes');
+ check(document.activeElement === zoom, 'the zoom takes focus');
+ check(zoom.getAttribute('role') === 'dialog' && zoom.getAttribute('aria-modal') === 'true', 'the zoom is modal');
+ check(zoom.getAttribute('aria-label') === link.querySelector('img').alt, 'the image names the zoom');
+ await zoom.querySelector('img').decode();
+ check(zoom.querySelector('img').getBoundingClientRect().width === 1, 'the zoom keeps the natural size limit');
+ zoom.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', bubbles:true}));
+ check(!zoom.open && document.activeElement === link, 'Escape closes the zoom and returns focus');
+ for (const modified of [{shiftKey:true}, {ctrlKey:true}, {metaKey:true}, {altKey:true}, {button:1}]) {
+  let allowed = false;
+  const stopNavigation = event => {allowed = !event.defaultPrevented; event.preventDefault();};
+  document.addEventListener('click', stopNavigation, {once:true});
+  link.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, ...modified}));
+  check(allowed && !zoom.open, 'modified clicks keep the link action');
+ }
+ link.click();zoom.querySelector('img').click();
+ check(!zoom.open && document.activeElement === link, 'an image click closes the zoom and returns focus');
+ link.click();zoom.click();
+ check(!zoom.open, 'a backdrop click closes the zoom');
+ link.click();zoom.dispatchEvent(new Event('cancel', {cancelable:true}));
+ check(!zoom.open, 'the native cancel event closes the zoom');
  form.elements.feedback.value = 'Too dark.';
  form.requestSubmit(form.querySelector('button[value="feedback"]'));
  for (let step = 0; step < 100 && card.isConnected; step++) await wait(20);
@@ -231,7 +256,7 @@ class ImagesTests(ImagesFixture):
  await wait(200);
  check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
  await report(failures);
-})();
+})().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
 </script>"""
         gets: list[str] = []
         posts: list[dict[str, list[str]]] = []
@@ -255,6 +280,12 @@ class ImagesTests(ImagesFixture):
                     self.end_headers()
                     _ = self.wfile.write(f'<iframe src="{images.PAGE_PATH}" width="1100" height="800"></iframe>'
                                          .encode() + b'<img src="/probe-complete" alt="" hidden>')
+                    return
+                if self.path.endswith("/image.png"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.end_headers()
+                    _ = self.wfile.write(PNG)
                     return
                 if self.path != images.PAGE_PATH:
                     self.send_error(404)
@@ -316,7 +347,7 @@ class ImagesTests(ImagesFixture):
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
             + '<dt>Added:</dt><dd><time datetime="2026-11-15T03:09:00+00:00">Nov 14, 2026, 22:09</time></dd></dl>'
-            + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
+            + f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" alt="Look at &lt;the&gt; cards" loading="lazy"></a>'
             + f'<form method="post" data-image-form><input type="hidden" name="image" value="{record['id']}">'
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
@@ -503,13 +534,16 @@ class ImagePairTests(ImagesFixture):
         self.assertTrue(card.startswith(f'<article id="image-{record['id']}" class="pair" data-image='))
         self.assertIn(
             '<div class="image-pair">'
-            + f'<figure><figcaption>Before</figcaption><a href="{before}" target="_blank" rel="noopener">'
+            + f'<figure><figcaption>Before</figcaption><a data-image-zoom href="{before}" target="_blank" rel="noopener">'
             + f'<img src="{before}" alt="Before: Look at &lt;the&gt; counts" loading="lazy"></a></figure>'
-            + f'<figure><figcaption>After</figcaption><a href="{after}" target="_blank" rel="noopener">'
+            + f'<figure><figcaption>After</figcaption><a data-image-zoom href="{after}" target="_blank" rel="noopener">'
             + f'<img src="{after}" alt="After: Look at &lt;the&gt; counts" loading="lazy"></a></figure></div>'
             + '<form method="post" data-image-form>', card)
         self.assertEqual((card.count("<form"), card.count('value="approved"'), card.count('value="feedback"'),
                           card.count("<h2"), card.count("<dl")), (1, 1, 1, 1, 1))
+        page = images.render(self.root).decode()
+        self.assertEqual(page.count(page_frame.ZOOM_STYLE), 1)
+        self.assertEqual(page.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertNotIn("<figure>", images.card(self.register(), "token", staff.snapshot(), 3))
         # A narrow card stacks the pair, before on top.
         self.assertIn("@container (max-width:599px){.image-pair{grid-template-columns:minmax(0,1fr)}}", images.STYLE)
