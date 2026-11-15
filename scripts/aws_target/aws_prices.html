@@ -83,7 +83,7 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 .filter button + button { border-left: 1px solid var(--line); }
 .filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
 .filter button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-/* The area and region filters stay at the top of the view while the page scrolls. */
+/* The geography and region filters stay at the top of the view while the page scrolls. */
 .regions { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: max-content minmax(0, 1fr);
   align-items: baseline; gap: 6px 8px; background: var(--bg); padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
 .regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
@@ -92,7 +92,7 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
   border-radius: 999px; padding: 3px 6px; cursor: pointer; }
 .chips button:hover { background: var(--hover); }
 .chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-/* An area with some of its regions chosen. */
+/* A geography with some of its regions chosen. */
 .chips button[aria-pressed="mixed"] { background: color-mix(in srgb, var(--accent) 22%, var(--card)); border-color: var(--accent); color: var(--ink); }
 .chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .chips .all { font-weight: 600; }
@@ -103,8 +103,8 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 <h1 class="page-title">AWS prices</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
 <nav class="regions" aria-label="Regions to show">
-  <span class="regions-label" id="areas-label">Areas</span>
-  <div class="chips" role="group" aria-labelledby="areas-label" id="areas"></div>
+  <span class="regions-label" id="geographies-label">Geography</span>
+  <div class="chips" role="group" aria-labelledby="geographies-label" id="geographies"></div>
   <span class="regions-label" id="regions-label">Regions</span>
   <div class="chips" role="group" aria-labelledby="regions-label" id="regions"></div>
 </nav>
@@ -400,7 +400,7 @@ for (const group of scopeFilters) {
 }
 
 // The region filter: all regions by default, any combination. "none" clears every region, so one click then shows only that one.
-// The area row above it groups the regions by the first word of their names, in the order of the region list.
+// The geography row above it groups the regions by the first word of their names, in the order of the region list.
 function chipRow(id, labels) {
   const row = document.getElementById(id);
   const chip = (label, className) => {
@@ -414,39 +414,39 @@ function chipRow(id, labels) {
   const none = chip("none", "all");
   return {all, each, none};
 }
-const areaOf = region => region.split("-", 1)[0];
-const areas = [...new Set(data.regions.map(areaOf))];
-const areaRow = chipRow("areas", areas);
+const geographyOf = region => region.split("-", 1)[0];
+const geographies = [...new Set(data.regions.map(geographyOf))];
+const geographyRow = chipRow("geographies", geographies);
 const regionRow = chipRow("regions", data.regions);
 const regionChips = regionRow.each;
 regionChips.forEach((chip, index) => { chip.dataset.region = data.regions[index]; });
-// An area is pressed when all its regions are chosen, and mixed when some are.
-function areaState(area) {
-  const regions = data.regions.filter(region => areaOf(region) === area);
+// A geography is pressed when all its regions are chosen, and mixed when some are.
+function geographyState(geography) {
+  const regions = data.regions.filter(region => geographyOf(region) === geography);
   const chosen = regions.filter(region => shown.has(region)).length;
   return chosen === regions.length ? "true" : chosen ? "mixed" : "false";
 }
 function showRegions(next) {
   shown = next;
-  for (const row of [areaRow, regionRow]) {
+  for (const row of [geographyRow, regionRow]) {
     row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
     row.none.setAttribute("aria-pressed", String(shown.size === 0));
   }
-  areaRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", areaState(areas[index])));
+  geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
   for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
-for (const row of [areaRow, regionRow]) {
+for (const row of [geographyRow, regionRow]) {
   row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
   row.none.addEventListener("click", () => showRegions(new Set()));
 }
-// An area chip chooses all its regions, or clears them when all are already chosen.
-areaRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
-  const area = areas[index];
+// A geography chip chooses all its regions, or clears them when all are already chosen.
+geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
+  const geography = geographies[index];
   const next = new Set(shown);
-  const choose = areaState(area) !== "true";
-  for (const region of data.regions) if (areaOf(region) === area) { if (choose) next.add(region); else next.delete(region); }
+  const choose = geographyState(geography) !== "true";
+  for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
   showRegions(next);
 }));
 for (const chip of regionChips) {
