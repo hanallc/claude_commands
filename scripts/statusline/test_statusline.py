@@ -1104,7 +1104,8 @@ class CountsRowTests(unittest.TestCase):
         read_text = Path.read_text
         for failure in ("unreadable proposal", "invalid proposal encoding", "unreadable question",
                         "invalid question encoding", "malformed question", "invalid registration",
-                        "late unreadable proposal", "late unreadable question", "late unreadable proposal body",
+                        # A proposal file is read once for its frontmatter; the late read is its body.
+                        "late unreadable proposal", "late unreadable question",
                         "invalid proposal urgency", "invalid proposal date"):
             with self.subTest(failure=failure):
                 for previous in (*folder.glob("*.md"), *question_folder.glob("*.md")):
@@ -1132,8 +1133,7 @@ class CountsRowTests(unittest.TestCase):
                     nonlocal reads
                     if path_to_read == path:
                         reads += 1
-                        readable = 2 if failure == "late unreadable proposal body" else 1
-                        if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > readable):
+                        if failure.startswith("unreadable") or (failure.startswith("late unreadable") and reads > 1):
                             raise PermissionError(f"{path}: unreadable")
                     return read_text(path_to_read, encoding=encoding, errors=errors)
 
@@ -1150,6 +1150,31 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(self.lines()[-1], "For you: 1 question" if is_question else "For you: 1 proposal")
                 self.assertEqual(cache.read_text().splitlines()[1], "")
                 path.unlink()
+
+    def test_a_refresh_reads_each_proposal_file_once(self) -> None:
+        from scripts.production import issues
+
+        folder = self.home / "issues"
+        folder.mkdir()
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text() + f"- **Proposals:** {folder}\n")
+        for name in ("first", "second"):
+            _ = (folder / f"{name}.md").write_text(
+                f"---\nstatus: open\ntags: [proposal]\nproposed_by: {OWNER.id}\n---\n# {name}\n")
+        instance = self.home / f".local/state/notifier/showrunner-{OWNER.id}"
+        environment = {"HOME": str(self.home), "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
+                       "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        frontmatter = issues.frontmatter
+        reads: list[Path] = []
+
+        def read(path: Path, *, sources: list[Path] | None = None) -> dict[str, list[str]]:
+            reads.append(path)
+            return frontmatter(path, sources=sources)
+
+        with patch.dict(os.environ, environment), patch.object(issues, "frontmatter", read):
+            cache = counts_row.write(instance)
+        self.assertEqual(cache.read_text().splitlines()[0], "For you: 2 proposals")
+        self.assertEqual(sorted(reads), [folder / "first.md", folder / "second.md"])
 
     def test_failed_change_lists_retry_and_remain_watched(self) -> None:
         listing = self.home / f"change-review - {OWNER.name}.md"
