@@ -217,6 +217,69 @@ class PlacementStatusTests(unittest.TestCase):
             assert isinstance(reply, wire.Assignment)
             self.assertEqual(reply.assignment.destination, assignment.destination)
 
+    def test_an_unconfirmed_claim_holder_frees_its_assignment_after_its_owner_ends(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,
+            coordinator_holder,
+        )
+        from scripts.mac_test import claim_state, offload
+
+        for case in ("pass", "restart", "owner live", "claim listed", "start pending"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                self.assertEqual(fixture.server.handle_request(consume_permission("consume-unconfirmed", assignment, claim)),
+                    [wire.FirstAuthorization(assignment, claim)])
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                fixture.server.assignments[key] = replace(fixture.server.assignments[key],
+                    holder=placement.ClaimHolderUnconfirmed("not consumed"))
+                fixture.server.persist()
+                if case != "owner live":
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+                if case == "start pending":
+                    pending = offload.pending_start_path(assignment.destination.target,
+                        claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt))
+                    pending.parent.mkdir(parents=True, exist_ok=True)
+                    _ = pending.write_text("")
+                if case == "restart":
+                    fixture.restart()
+                fixture.clock.advance(1)
+                claims = ((placement.AdoptedProviderClaim(claim, coordinator_holder(assignment), assignment.session,
+                                                          assignment.destination.host, "host-generation-a"),)
+                          if case == "claim listed" else ())
+                _ = publish_candidate(fixture, request, claims=claims)
+                _ = fixture.run_pass()
+                if case in ("pass", "restart"):
+                    self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("lost"))
+                    self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                else:
+                    self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+
+    def test_a_local_assignment_closes_after_its_owner_ends_without_a_report(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, placement_request, local_candidate
+
+        for case in ("owner ended", "owner live"):
+            with self.subTest(case=case), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints,
+                    candidates=(local_candidate(fixture),)))
+                granted, = fixture.connect(request).replies()
+                assert isinstance(granted, wire.LocalPlacementGranted)
+                key = placement.attempt_key(granted.assignment.episode, granted.assignment.attempt)
+                fixture.release(granted.grant)
+                if case == "owner ended":
+                    fixture.proc.kill(wire.Owner(request.owner.pid, request.owner.start_time))
+                _ = fixture.run_pass()
+                if case == "owner ended":
+                    self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
+                    self.assertNotIn(request.episode, fixture.server.current_assignments)
+                else:
+                    self.assertEqual(fixture.server.assignments[key].state, placement.CurrentAssignment())
+                    self.assertEqual(fixture.server.current_assignments[request.episode], key)
+
     def test_status_and_replay_keep_pending_terminal_reports_current(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, placement_request, publish_candidate, assignment_for, adopt_assignment, consume_permission,

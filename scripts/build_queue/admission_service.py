@@ -2606,7 +2606,7 @@ done
             return (isinstance(report.path, placement.DispatchPathSettled)
                 and isinstance(report.outcome, placement.AttemptDeclined)
                 and evidence.observed_at >= report.received_at)
-        return (self._ended_claim_holder(saved)
+        return ((self._ended_claim_holder(saved) or self._unconfirmed_holder_owner_ended(saved))
             and isinstance(saved.permission, placement.PermissionConsumed)
             and evidence.observed_at > saved.permission.consumed_at
             and not self._start_pending(saved))
@@ -2629,6 +2629,17 @@ done
                 and isinstance(saved.holder, placement.ClaimHolderIdentity)
                 and saved.holder.host == self.host
                 and not self._live(wire.Owner(saved.holder.pid, saved.holder.start_time)))
+
+    def _unconfirmed_holder_owner_ended(self, saved: records.SavedPlacementAssignment) -> bool:
+        """A claim with no confirmed holder frees its assignment after its submitting owner ends.
+
+        No holder process can be checked, so only fresh evidence without the claim releases it.
+        Without this rule, the assignment stays current with no process behind it.
+        """
+        return (saved.assignment.destination.provider != "local"
+                and isinstance(saved.provider, placement.ProviderClaimReference)
+                and isinstance(saved.holder, placement.ClaimHolderUnconfirmed)
+                and not self._placement_owner_live(saved.assignment.owner))
 
     def _start_pending(self, saved: records.SavedPlacementAssignment) -> bool:
         from scripts.mac_test import claim_state, offload
@@ -3127,6 +3138,10 @@ done
                 self._close_for_report(saved, report)
                 continue
             if assignment.destination.provider == "local":
+                # A coordinator that ends before its execution report leaves the local assignment current.
+                state = self._assignment_state(saved)
+                if isinstance(state, placement.ClosedAssignment) and not self._placement_owner_live(assignment.owner):
+                    self._close_placement(saved, state.reason, placement.DoNotRetry("coordinator ended"))
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:
