@@ -1,5 +1,6 @@
 """Copy locations and record reading, kept as a leaf because nix_env imports it.
-scratch.py reaches herdr, which imports nix_env; only the standard library belongs here.
+scratch.py reaches herdr, which imports nix_env; only the standard library and conf belong here.
+build_folders.conf roots.scratch and roots.copies set the two roots.
 """
 from __future__ import annotations
 
@@ -11,7 +12,9 @@ from pathlib import Path
 from typing import cast
 
 ROOT_ENV = "SCRATCH_ROOT"
-DEFAULT_ROOT = "/tmp/claude/scratch"
+# natedev's roots before /build. The sweeps drain them by the usual task rules.
+FORMER_ROOT = Path("/tmp/claude/scratch")
+FORMER_COPIES_ROOT = Path("/tmp/claude/copies")
 COPIES_ENV = "SCRATCH_COPIES_ROOT"
 RECORD = ".scratch.json"
 TEMPORARY_GATE_RECORD = ".gate-copy.json"
@@ -34,13 +37,21 @@ class UnreadableRecord:
     reason: str
 
 
+def _configured_root(key: str) -> str:
+    from scripts.lib import conf
+
+    return conf.read_or_repository("build_folders").text(key)
+
+
 def root() -> Path:
-    return Path(os.environ.get(ROOT_ENV) or DEFAULT_ROOT).expanduser()
+    return Path(os.environ.get(ROOT_ENV) or _configured_root("roots.scratch")).expanduser()
 
 
 def copies_root() -> Path:
-    configured = Path(os.environ.get(COPIES_ENV) or str(root().parent / "copies")).expanduser()
-    return Path(os.path.realpath(configured))
+    # A SCRATCH_ROOT override keeps its copies beside it.
+    configured = (os.environ.get(COPIES_ENV) or (str(root().parent / "copies") if os.environ.get(ROOT_ENV)
+                                                 else _configured_root("roots.copies")))
+    return Path(os.path.realpath(Path(configured).expanduser()))
 
 
 def copy_folder(path: Path) -> Path | None:
@@ -64,8 +75,8 @@ def record_path(folder: Path) -> Path | None:
         record = read_record(path)
         if isinstance(record, Registered) and record.task.startswith("gate:"):
             return path
-    if folder.name == "checkout" and folder.parent.parent == root().resolve():
-        path = folder.parent / RECORD
+    if folder.parent == root().resolve():
+        path = folder / RECORD
         record = read_record(path)
         if isinstance(record, Registered) and record.fields.get("test_hana_clone") is True:
             return path

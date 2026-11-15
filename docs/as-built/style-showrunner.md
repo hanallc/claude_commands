@@ -1189,8 +1189,9 @@ Each start uses `QueuePlace.popen`; the shared queue controls admission, scope a
 A dry run that starts no program requests no place.
 
 The queue reads `[memory]` from `config/build_admission.conf` at each program start.
-`program_first_peak_gib.rust-analyzer` and `program_first_peak_gib.cargo` supply the first peaks before this host has program history.
-The existing queue uses measured program peaks when history exists.
+`program_first_peak_gib.rust-analyzer` and `program_first_peak_gib.cargo` supply the first peaks before this host has history.
+The queue uses measured rust-analyzer peaks when history exists.
+A Cargo command sizes from its step history for the repository, as a `verify.sh` step does.
 Missing or invalid first peaks refuse the start, even when history exists.
 The error names the config file and key.
 `bulk_rename.style_program_place` converts queue refusals to command exit 2.

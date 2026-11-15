@@ -18,6 +18,7 @@ from unittest import mock
 
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import queue_place as shell_place
 from scripts.build_queue import snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
 
@@ -58,8 +59,8 @@ def wait_client_main() -> int:
         return step_estimator.StepEstimate(admission_records.StepProfile("fixture", "nextest", "tree", peak,
             estimated_at=clock.now()), step_estimator.ReusableEstimate())
     with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
-        with mock.patch.object(sys, "argv", ["admission_client.py", *sys.argv[2:]]):
-            return client.main()
+        with mock.patch.object(sys, "argv", ["queue_place.py", *sys.argv[2:]]):
+            return shell_place.main()
 
 
 class AdmissionClientWaitTests(unittest.TestCase):
@@ -107,7 +108,7 @@ class AdmissionClientWaitTests(unittest.TestCase):
 
     def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
         command = ('set -e; source "$1"; buildlog_memory_python() { '
-            + 'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
+            + 'if [[ "$1" == "$BUILDLOG_QUEUE_PLACE_SCRIPT" ]]; then '
             + 'shift; "$TEST_PY" "$TEST_WAIT_CLIENT" --wait-client "$@"; else "$TEST_PY" "$@"; fi; }; '
             + 'shift; if (( $# == 0 )); then '
             + 'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '

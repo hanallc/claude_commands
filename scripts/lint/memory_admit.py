@@ -2466,7 +2466,7 @@ def main() -> None:
         if len(sys.argv) == 3 and sys.argv[1] == "tripwire":
             check_memory_reading(Path(sys.argv[2]))
         else:
-            raise ValueError("admission actions use admission_client.py")
+            raise ValueError("admission actions use queue_place.py")
     except LiveMemoryReading as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)

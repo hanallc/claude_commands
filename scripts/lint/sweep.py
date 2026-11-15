@@ -4990,17 +4990,22 @@ def read_rebuild_steps(root: Path) -> list[RebuildStep]:
     return read_rebuild_evidence(root).steps
 
 
-def clone_kind(folder: str) -> str:
+def scratch_roots() -> tuple[Path, ...]:
+    return copy_record.root(), copy_record.FORMER_ROOT
+
+
+def clone_kind(folder: str, scratch_roots: tuple[Path, ...]) -> str:
     path = Path(folder)
     parts = path.parts
     # A scratch HOME sits under /tmp, so its ~/rust worktrees are named before the /tmp groups.
     if path.is_relative_to(Path.home() / "rust"):
         return "~/rust worktrees"
-    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp"):
+    in_scratch = any(path.is_relative_to(root) for root in scratch_roots)
+    if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp") or in_scratch:
         # Older copies include gate57e, mergeclone and p34-merge-<sha>.
         if any(re.search(r"(?:^|[-_])(gate|merge)", part) for part in parts):
             return "gate and merge copies"
-        if path.is_relative_to("/tmp/claude/scratch"):
+        if in_scratch:
             return "scratch.py folders"
         if "phases" in parts or any(re.search(r"(?:^|[-_])phase(?:\d|[-_])", part) for part in parts):
             return "phase clones"
@@ -5083,8 +5088,9 @@ def rebuilds_main(argv: list[str]) -> int:
         print(f"lint sweep: cannot read rebuild evidence: {error}", file=sys.stderr)
         return 2
     totals: dict[tuple[str, RebuildCause], float] = {}
+    roots = scratch_roots()
     for rebuild in cold:
-        key = (clone_kind(rebuild.step.workspace), rebuild.cause)
+        key = (clone_kind(rebuild.step.workspace, roots), rebuild.cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
     print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")
