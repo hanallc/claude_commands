@@ -259,6 +259,8 @@ def send_feedback(root: Path, identity: str, feedback: str) -> None:
         write_record(folder, current)
 
 
+# At 1104px and wider, the page starts at the console's 30px header padding, so
+# the groups panel sits under the header title. 1104 = 30 + 300 + 64 + 680 + 30.
 STYLE = """<style>[hidden]{display:none!important}
 [data-image-filter]{display:flex;align-items:center;gap:8px;margin-bottom:16px}
 [data-image-filter] select{font:inherit;min-height:44px;color:CanvasText;background:Canvas}
@@ -282,6 +284,9 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
 [data-image-groups]{position:static;max-height:none;margin-bottom:16px}}
+@media (min-width:1104px){main{max-width:none;margin:0;padding-left:30px;padding-right:30px}
+[data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
+[data-image-layout]>div{width:100%;max-width:680px;justify-self:center}}
 </style>"""
 
 SCRIPT = r"""(() => {
