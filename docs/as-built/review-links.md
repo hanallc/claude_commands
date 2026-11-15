@@ -1015,3 +1015,16 @@ Image links scroll smoothly to their image, then reveal it over 180ms with a 4px
 Other image cards stay visible.
 An image fades before removal, and the cards below close the gap over 180ms.
 Reduced motion disables fades and uses instant scrolling.
+
+Questions and Changes show a Lucide copy button inside the top right of each code block.
+The command item renderer emits the button with the code block.
+Plain proof text keeps its `<pre>` block without a copy button.
+Inline code keeps its current style.
+The button copies the code text without the button or its label.
+The button shows a check and the label “Copied” for two seconds after success.
+A second click starts the two seconds again.
+A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
+The shared script uses the clipboard API when available.
+Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
+The fallback restores focus and the previous selection.
+One document listener also handles code blocks from page updates.
