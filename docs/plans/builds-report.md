@@ -1649,3 +1649,20 @@ From the user (via sdlc and builds), 2026-11-15, for the AWS prices page: "it ne
 - The tables keep their row order; only the filter chips change.
 - `test_control`: the page data regions follow the key, and a mixed list sorts into the group order.
 - Proof: `phases/93/proof/before-1400-dark.png` and `after-1400-dark.png`, from the live AWS state.
+
+### Phase 94 — A cargo-liner step names only what keeps it off the Mac · status: done
+
+From the user (via builds), 2026-11-15: "this said that the mac was busy with a hana run - but the mac can always run one cargo-liner run - so this is a bug - this cargo-liner should be already running on the mac - the only thing that should block cargo liner on the mac is a mac hold, mac unavailable, or mac already has a cargo-liner run".
+
+#### As-built
+
+- `target_config.LOCAL_CALLER`: the `LocalRequired` routing that `verify.sh --local` sends. `admission_client` uses it for `--local-only`.
+- `admission_service._placement_row`: a step with the `LOCAL_CALLER` fixed Mac exclusion writes `local_reason` into its waiter record.
+- `admission_records.waiter_routing`: reads `local_reason` back. `WaitingStep` and `RunningStep` carry `routing`, and `memory_admit` fills it from the waiter record.
+- `target_availability.MacRoutes.line` takes the routing:
+  - A `LocalRequired` step reads "Runs on natedev because the run asks for it (--local)", with no Mac line.
+  - A busy Mac names only the live claims of this step's repository. A whole-Mac claim matches every repository. A repository matches by key, else by name.
+  - With no claim for this repository, the line reads "Mac: no claim for this repository".
+- `memory_feed` passes each step's routing to the line.
+- Tests: `test_target_availability` (repository filter, whole-Mac claim, local step) and `test_placement` (a local step keeps its routing in the waiting and running views).
+- Proof: `phases/94/proof/before.png` ("Mac: busy with nextest hana; check cargo-handler") and `after-local.png` ("Runs on natedev because the run asks for it (--local)").

@@ -14,11 +14,12 @@ from typing import TYPE_CHECKING, TypedDict, final
 
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget
+from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalRequired, Routing, SshTarget
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
     from scripts.mac_test import mac_test
+    from scripts.mac_test.claim_state import ClaimScope
 
 
 class TargetRow(TypedDict):
@@ -107,13 +108,16 @@ class MacRoutes:
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
         self.policies: dict[tuple[str, str | PackageNotRecorded, str], str] = {}
+        self.scopes: dict[str, ClaimScope] = {}
 
-    def line(self, step: str, folder: str, package: str | PackageNotRecorded) -> str:
+    def line(self, step: str, folder: str, package: str | PackageNotRecorded, routing: Routing) -> str:
         mac = self.mac
-        if isinstance(mac, SnapshotsUnreadable):
-            return "Mac: state unreadable, " + mac.reason
         if isinstance(mac, NoMacTarget):
             return ""
+        if isinstance(routing, LocalRequired):
+            return "Runs on natedev because the run asks for it (--local)"
+        if isinstance(mac, SnapshotsUnreadable):
+            return "Mac: state unreadable, " + mac.reason
         kind = build_targets.recorded_step_kind(step)
         if isinstance(kind, build_targets.KindNotOffloaded):
             return "Mac: kind not offloaded"
@@ -123,7 +127,7 @@ class MacRoutes:
         excluded = self.policy(mac, folder, package, kind)
         if excluded:
             return excluded
-        return self.state_line(mac.states[0])
+        return self.state_line(mac, folder)
 
     def policy(self, mac: targets.TargetSnapshot, folder: str, package: str | PackageNotRecorded,
                kind: build_targets.StepKind) -> str:
@@ -150,7 +154,9 @@ class MacRoutes:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
 
-    def state_line(self, state: targets.TargetState) -> str:
+    def state_line(self, mac: targets.TargetSnapshot, folder: str) -> str:
+        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim."""
+        state = mac.states[0]
         if isinstance(state, targets.Held):
             identity = holder_labels(state, self.labels)
             owner = identity.unit if identity.unit != "—" else identity.session
@@ -158,12 +164,36 @@ class MacRoutes:
                 owner += f" ({identity.showrunner})"
             return f"Mac: blocked by {owner} {targets.end_text(state.end, self.zone)}"
         if isinstance(state, targets.Running):
-            return "Mac: busy with " + "; ".join(job.what for job in state.jobs)
+            jobs = self.repository_jobs(mac, folder)
+            if not jobs:
+                return "Mac: no claim for this repository"
+            return "Mac: busy with " + "; ".join(job.what for job in jobs)
         if isinstance(state, targets.Unreachable):
             return "Mac: unreachable, " + state.reason
         if isinstance(state, targets.StateUnreadable):
             return "Mac: state unreadable, " + state.reason
         return "Mac: no recorded block or claim; availability not checked"
+
+    def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
+        """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
+        from scripts.mac_test import mac_test
+
+        if folder not in self.scopes:
+            self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
+        scope = self.scopes[folder]
+        return tuple(targets.running_job(claim) for claim in mac.claims
+                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
+
+
+def same_repository(claim: ClaimScope, step: ClaimScope) -> bool:
+    """A whole Mac scope matches every repository; a repository matches by key, else by name."""
+    from scripts.mac_test import mac_test
+
+    if not isinstance(claim, mac_test.RepositoryScope) or not isinstance(step, mac_test.RepositoryScope):
+        return True
+    if claim.key and step.key:
+        return claim.key == step.key
+    return claim.name == step.name
 
 
 def mac_claims(snapshots: Snapshots) -> Sequence[mac_test.HeldClaim]:

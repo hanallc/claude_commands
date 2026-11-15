@@ -43,6 +43,7 @@ from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
+from scripts.build_targets.target_config import LOCAL_CALLER
 from scripts.lint import memory_admit as gate
 
 from scripts.buildlog import store
@@ -2684,6 +2685,10 @@ done
             if run_place is not None:
                 row["order_since"] = min(run_place.since, row.get("order_since", row["since"]))
             row["build_run"] = _live_run(request.run)
+        if any(isinstance(candidate.eligibility, placement.FixedExclusion)
+               and candidate.eligibility.reason == LOCAL_CALLER.reason
+               for candidate in request.constraints.candidates):
+            row["local_reason"] = LOCAL_CALLER.reason
         prerequisite = self.prerequisites.get(request.episode, placement.TokenRequired())
         if isinstance(prerequisite, placement.TokenRequired):
             row["token_left_at"] = row.get("token_left_at", request.since)

@@ -47,6 +47,8 @@ class LocalRequired:
 
 Routing = AnyEligibleTarget | LocalRequired
 ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
+# verify.sh --local pins a step to natedev. The queue finds this reason on the step's fixed Mac exclusion.
+LOCAL_CALLER = LocalRequired("local caller")
 
 
 @dataclass(frozen=True)
