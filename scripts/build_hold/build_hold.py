@@ -334,48 +334,6 @@ class Busy:
     reasons: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class RunOwner:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class NoRunNamed:
-    pass
-
-
-@dataclass(frozen=True)
-class RunNotInStaff:
-    run: Path
-
-
-def run_resolution(environment: Mapping[str, str] = os.environ) -> RunOwner | NoRunNamed | RunNotInStaff:
-    """Find the staff session that owns the named run."""
-    run = (environment.get("UNIT_RUN_DIR") or environment.get("PLAN_DELEGATE_BOARD_DIR")
-           or environment.get("UNIT_SESSION_DIR") or environment.get("PLAN_DELEGATE_SESSION_DIR"))
-    if run:
-        from scripts.production import staff
-
-        try:
-            rows = staff.local_snapshot().rows
-        except staff.StaffUnreadable:
-            rows = ()
-        for row in rows:
-            if isinstance(row.run, staff.OpenRun) and str(row.run.path) == run and row.current_session:
-                return RunOwner(row.current_session)
-        return RunNotInStaff(Path(run))
-    return NoRunNamed()
-
-
-def owning_session(environment: Mapping[str, str] = os.environ) -> session_owner.OwningSession | session_owner.NoOwningSession:
-    """Find the session that owns this run before using the shell's session id."""
-    resolution = run_resolution(environment)
-    if isinstance(resolution, RunOwner):
-        return session_owner.OwningSession(resolution.session_id)
-    session_id = environment.get("CLAUDE_CODE_SESSION_ID", "")
-    return session_owner.OwningSession(session_id) if session_id else session_owner.NoOwningSession()
-
-
 def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
     if pid <= 0:
         return ""
@@ -549,14 +507,14 @@ def audit_owner(process: AuditProcess, ancestors: Sequence[AuditProcess]) -> ses
         session_id = item.environment.get("CLAUDE_CODE_SESSION_ID", "")
         if session_id:
             return session_owner.OwningSession(session_id)
-        owner = owning_session(item.environment)
+        owner = session_owner.owning_session(item.environment)
         if isinstance(owner, session_owner.OwningSession):
             return owner
         if item.environment.get("CODEX_THREAD_ID"):
             return session_owner.OwningSession(item.environment["CODEX_THREAD_ID"])
     for parent in ancestors:
         if audit_command(parent) in {"claude", "codex"}:
-            owner = owning_session(parent.environment)
+            owner = session_owner.owning_session(parent.environment)
             if isinstance(owner, session_owner.OwningSession):
                 return owner
             return session_owner.OwningSession(parent.environment.get("CODEX_THREAD_ID")

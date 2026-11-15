@@ -1,6 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Find loose folders in ~/rust, ~/rust/scratch, /tmp, /tmp/claude and $TMPDIR once a day, remove the
-idle ones whose removal loses no work, and tell their makers.
+"""Find loose folders in ~/rust, ~/rust/scratch, /tmp, /tmp/claude, $TMPDIR and the folder that holds the
+scratch and copies roots (/build/claude on natedev) once a day, remove the idle ones whose removal loses
+no work, and tell their makers.
 
 The scratch guard refuses most loose folders before they exist, and the hourly tmp sweep removes the
 temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
@@ -9,7 +10,7 @@ the backstop for the rest: folders that can hold work. A folder is loose when it
   * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or a scratch
     root (~/rust/repro, ~/rust/scratch);
   * in ~/rust/scratch: nothing; every folder there is loose, since scratch.py never makes one there;
-  * in /tmp, /tmp/claude and $TMPDIR: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
+  * in /tmp, /tmp/claude, $TMPDIR and the roots' folder: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
     only folders, a verify.sh run folder or a tempfile folder, which the sweep judges.
 
@@ -760,7 +761,8 @@ def main(argv: list[str]) -> int:
     if expected is None:
         print(f"folder audit: {RUST_ROOTS_FILE} cannot be read; ~/rust is not judged")
     temps = list(dict.fromkeys(Path(os.path.realpath(path)) for path in
-                               ("/tmp", "/tmp/claude", os.environ.get("TMPDIR", "")) if path))
+                               ("/tmp", "/tmp/claude", os.environ.get("TMPDIR", ""),
+                                str(copy_record.root().parent), str(copy_record.copies_root().parent)) if path))
     now = time.time()
     removing = armed(lint_settings=lint_settings)
     try:

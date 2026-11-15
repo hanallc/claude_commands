@@ -292,7 +292,20 @@ Each local Promote checkout must exist before the command pushes.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
      Otherwise, restore the tip before the checkpoint merge while origin still has its old tip.
      This removes the checkpoint merge and the main merges from this run, while preserving earlier unpublished work.
-  8. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
+     A red names its failed nextest tests, or the red modules of a merge gate command (`--- <suite>/<module> exit=<rc> ---`).
+     A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
+  8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
+     The run is limited to its red names, with `--filter`, `-E test(=<name>)` or the merge gate's `--module <suite>/<module>`.
+     The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
+     A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
+     The unit gets a repair line only for its own red names.
+     When every red name is also red on the base, the stop is `red: held`, and the unit's line tells it to send nothing.
+     A command with no red names is the base's red only when the whole command is red on the base.
+     A command that the base does not select, such as a package the checkpoint adds or renames, stays the unit's red without a run.
+     A command that cannot start on the base, and a main conflict, also leave the red with the unit.
+     A resumed merge whose restored tip already holds the checkpoint runs no base check.
+     A batch runs the base check before its bisect. A base red holds every item, and the bisect runs only the units' own red names.
+  9. *push and promote*: `tested_main_push` acquires `main_push_lock` and fetches main after tests.
      It publishes only when the tested tip contains main.
      Otherwise, it keeps the lock, merges main, retests the new paths, and tries again.
      The first test run is outside this lock. Retests run inside it, so main cannot move under a tested tip.
@@ -315,12 +328,12 @@ Each local Promote checkout must exist before the command pushes.
      It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
-  9. Record the code checkpoint's review ledger row and production log line.
+  10. Record the code checkpoint's review ledger row and production log line.
      `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
      The ledger key includes unit, plan, and phase.
      The LOG line identifies the checkpoint, merge, tests, push, and promotion.
      An existing matching log line skips the write.
-- **Merge report.** Step 8 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
+- **Merge report.** Step 9 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.
 - **Re-run.** A hash already merged reads `PushedTip | NotYetPushed` from origin, skips the push when pushed, and re-runs every promotion, each a no-op at the tip. A merge not yet pushed is one a killed run left untested, so the re-run runs its merge tests first, and red undoes the merge as on a first run. A failed promote is re-run with the same command.
 - **Change review** (`scripts/production/change_review.py`).
   A visible checkpoint line has three fields: `<what changed> | <how to try> | <what you see>`.

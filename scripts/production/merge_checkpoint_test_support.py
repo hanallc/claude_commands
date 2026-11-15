@@ -117,6 +117,16 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
+    # Each named test fails while its file is in the tested tree; --filter limits the run to the named tests.
+    tree_rows = state / "tree-fail-rows"
+    if tree_rows.exists():
+        filters = {args[index + 1] for index, word in enumerate(args[:-1]) if word == "--filter"}
+        rows = [f"        FAIL [   1.000s] (1/2) fixture::tests {test}\\n"
+                for path, test in json.loads(tree_rows.read_text()).items()
+                if (Path.cwd() / path).exists() and (not filters or test in filters)]
+        if rows:
+            print("".join(rows), end="")
+            raise SystemExit(1)
     fail_rows = state / "fail-rows"
     if fail_rows.exists() and "--filter" not in args:
         print(fail_rows.read_text(), end="")
@@ -422,7 +432,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return sha
 
-    def push_main_change(self, relative: str, content: str) -> str:
+    def push_main_change(self, relative: str, content: str, subject: str = "independent main fix") -> str:
         """Push an independent main fix through the fixture's private origin."""
         writer = self.root / "main-fix-writer"
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
@@ -430,7 +440,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
         self.write(writer, relative, content)
         _ = self.git("add", relative, cwd=writer)
-        _ = self.git("commit", "-m", "independent main fix", cwd=writer)
+        _ = self.git("commit", "-m", subject, cwd=writer)
         _ = self.git("push", "origin", "main", cwd=writer)
         return self.git("rev-parse", "HEAD", cwd=writer)
 

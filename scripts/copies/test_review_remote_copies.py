@@ -105,7 +105,7 @@ class RemoteEntryTests(unittest.TestCase):
         use_results: list[subprocess.CompletedProcess[str]] = []
 
         def use_during_removal(parent: Path) -> None:
-            # Remove the old lock files before checkout, as scratch.remove does.
+            # Remove the lock files first, as mirror_remove does after the task folder goes.
             for path in (floor_claims.mirror_lock_path(checkout), floor_claims.record_lock_path(checkout)):
                 path.unlink()
             result = subprocess.run([sys.executable, str(copies.__file__),
@@ -123,7 +123,9 @@ class RemoteEntryTests(unittest.TestCase):
               mock.patch.object(scratch, "remove", side_effect=use_during_removal)):
             self.assertEqual(copies.mirror_remove(mirror_arguments(task_mirror, "mirror-remove")), 0)
         self.assertEqual(len(use_results), 1)
-        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(checkout.exists())
+        self.assertFalse(floor_claims.mirror_lock_path(checkout).exists())
+        self.assertFalse(floor_claims.record_lock_path(checkout).exists())
         self.assertFalse(floor_claims.mirror_parent_lock_path(checkout).exists())
 
         replacement_tree = self.root / "replacement-parent/checkout"

@@ -66,11 +66,12 @@ REFUSAL_ACTION = "At chatgpt.com/codex/settings/usage, add credits for account c
 
 
 class WorkerModeRequests(list[list[str]]):
-    """Notice requests; `stops` holds the requests that stop the Codex workers."""
+    """Notice requests; `stops` holds the requests that stop the Codex workers, `fyi` each producer copy."""
 
     def __init__(self) -> None:
         super().__init__()
         self.stops: list[list[str]] = []
+        self.fyi: list[tuple[str, str]] = []
 
 
 @contextmanager
@@ -80,10 +81,12 @@ def worker_mode_broadcasts() -> Generator[WorkerModeRequests]:
 
     def record(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
         if "--no-block" in arguments:
-            if "--from" in arguments:
+            script = arguments.index("--") + 2
+            if Path(arguments[script]).name == "send.py":
+                sent.fyi.append((arguments[arguments.index("--to") + 1], arguments[arguments.index("--text") + 1]))
+            elif "--from" in arguments:
                 sent.append(arguments[arguments.index("--from"):])
             else:
-                script = arguments.index("--") + 2
                 sent.stops.append([Path(arguments[script]).name, *arguments[script + 1:]])
             return subprocess.CompletedProcess(arguments, 0, "", "")
         run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)

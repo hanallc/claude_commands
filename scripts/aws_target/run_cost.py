@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -12,6 +12,23 @@ from scripts.aws_target import ledger
 from scripts.aws_target.measurement import number
 
 KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
+
+
+@dataclass(frozen=True)
+class RunScope:
+    """The run kinds that one cost table counts."""
+    name: str
+    # The filter label on the AWS prices page.
+    label: str
+    # One run of this scope, as the table headers and sentences name it.
+    noun: str
+    modes: tuple[str, ...]
+
+
+SCOPES = (RunScope('merge-gate', 'Merge gates', 'merge gate', ('merge-gate',)),
+          RunScope('targeted-test', 'Targeted runs', 'targeted test', ('targeted-test',)),
+          RunScope('both', 'Both', 'run', tuple(mode for mode, _label in KINDS)))
+
 # AWS had no Spot box for this type and zone at this price.
 ZONE_REFUSALS = frozenset({'InsufficientInstanceCapacity', 'InsufficientSpotCapacity', 'SpotMaxPriceTooLow'})
 # The region has no Spot quota room.
@@ -71,12 +88,20 @@ def runs_from_rows(rows: Sequence[dict[str, object]], start: datetime, end: date
 BilledKey = tuple[str, str, str, str]
 
 
+def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime) -> list[ledger.ChargeRead]:
+    """The bill reads of the UTC days in [start, end) that have a bill."""
+    return [reading for reading in book.read_bills()
+            if start.date().isoformat() <= reading.day < end.date().isoformat() and ledger.is_billed_day(reading)]
+
+
 def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     """The billed Spot USD and box hours for each type, region and day in [start, end)."""
+    return bills_from_readings(billed_readings(book, start, end))
+
+
+def bills_from_readings(readings: Sequence[ledger.ChargeRead]) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]] = {}
-    for reading in book.read_bills():
-        if not (start.date().isoformat() <= reading.day < end.date().isoformat() and ledger.is_billed_day(reading)):
-            continue
+    for reading in readings:
         for usage in reading.usage_types:
             size = usage.usage_type.partition('SpotUsage:')[2]
             region = ledger.usage_region(usage.usage_type, 'SpotUsage:')
@@ -118,6 +143,77 @@ def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[BilledKey
     return sum((allocations[key] for key in groups), Decimal(0)) / len(runs)
 
 
+DayKey = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class HoursCheck:
+    """Billed Spot hours against the recorded box hours of one type and region, on the days with a bill."""
+    # None when no day has a bill read; box_hours then counts every day.
+    billed_hours: Decimal | None
+    box_hours: Decimal
+    # abs(billed - box) / box; None without a bill or without box hours.
+    hours_gap_ratio: Decimal | None
+    # The ratio is above the limit, or AWS billed hours with no recorded box.
+    hours_gap_over: bool
+
+
+def hours_check(billed: Decimal | None, box: Decimal, max_ratio: Decimal) -> HoursCheck:
+    ratio = abs(billed - box) / box if billed is not None and box > 0 else None
+    over = billed is not None and (ratio > max_ratio if ratio is not None else billed > 0)
+    return HoursCheck(billed, box, ratio, over)
+
+
+def box_hours(book: ledger.CostLedger, start: datetime, end: datetime, home: str) -> dict[DayKey, Decimal]:
+    """The recorded box hours of each type, region and UTC day in [start, end).
+
+    A gate counts from its reservation to its confirmed end; open and absent gates do not count."""
+    first, last = start.date().isoformat(), end.date().isoformat()
+    hours: dict[DayKey, Decimal] = defaultdict(Decimal)
+    for reservation in book.read_snapshot().gate_reservations:
+        if not isinstance(reservation.state, ledger.GateTerminated) or not reservation.instance_type:
+            continue
+        left, right = reservation.at, reservation.state.at
+        while left < right:
+            day = datetime.fromtimestamp(left, UTC).date()
+            stop = min(right, int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()) + 86400)
+            if first <= day.isoformat() < last:
+                hours[reservation.instance_type, reservation.region or home, day.isoformat()] += Decimal(stop - left) / 3600
+            left = stop
+    return dict(hours)
+
+
+def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str,
+                     sizes: Collection[str], max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
+    """The hours check of each type in sizes, region and UTC day in [start, end).
+
+    A day with a bill read and no Spot hours for the type bills 0 hours; a day without a read has no bill."""
+    readings = billed_readings(book, start, end)
+    read_days = {reading.day for reading in readings}
+    bills = bills_from_readings(readings)
+    boxes = box_hours(book, start, end, home)
+    keys = {key for key in boxes.keys() | bills.keys() if key[0] in sizes}
+    return {key: hours_check(bills[key][1] if key in bills else Decimal(0) if key[2] in read_days else None,
+                             boxes.get(key, Decimal(0)), max_ratio) for key in keys}
+
+
+def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str,
+                 sizes: Collection[str], max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
+    """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
+    billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
+    unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
+    for (size, region, _day), check in day_hours_checks(book, start, end, home, sizes, max_ratio).items():
+        (unbilled if check.billed_hours is None else billed)[size, region].append(check)
+    checks: dict[tuple[str, str], HoursCheck] = {}
+    for key in billed.keys() | unbilled.keys():
+        if key in billed:
+            checks[key] = hours_check(sum((day.billed_hours or Decimal(0) for day in billed[key]), Decimal(0)),
+                                      sum((day.box_hours for day in billed[key]), Decimal(0)), max_ratio)
+        else:
+            checks[key] = HoursCheck(None, sum((day.box_hours for day in unbilled[key]), Decimal(0)), None, False)
+    return checks
+
+
 def median_run_time(seconds: list[Decimal]) -> str:
     if not seconds:
         return '—'
@@ -136,10 +232,10 @@ class RunEvidence:
     # Median seconds from a refused launch request to the next request of the same attempt.
     refusal_wait_s: Decimal
 
-    def box_seconds(self, size: str, region: str, mode: str) -> tuple[list[Decimal], bool]:
+    def box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[list[Decimal], bool]:
         """The region's own box times, else the type's times in all regions (False)."""
-        own = self.by_region.get((size, region, mode))
-        return (own, True) if own else (self.by_type.get((size, mode), []), False)
+        own = [time for mode in modes for time in self.by_region.get((size, region, mode), [])]
+        return (own, True) if own else ([time for mode in modes for time in self.by_type.get((size, mode), [])], False)
 
     def refusals_per_launch(self, size: str, region: str) -> tuple[Decimal | None, int, int]:
         """Refused requests for each launched box, with the counts it comes from."""
@@ -148,11 +244,11 @@ class RunEvidence:
             return None, 0, 0
         return Decimal(refused) / max(launched, 1), refused, launched
 
-    def expected_usd(self, price: Decimal, size: str, region: str, mode: str, wait_usd_per_minute: Decimal,
+    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
                      default_seconds: Decimal) -> Decimal:
         """Spot price for the median box time, plus the wait cost of the expected refusals first."""
-        seconds, _own = self.box_seconds(size, region, mode)
-        seconds = seconds or self.by_mode.get(mode, [])
+        seconds, _own = self.box_seconds(size, region, modes)
+        seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
         box = Decimal(median(seconds)) if seconds else default_seconds
         refusals = self.refusals_per_launch(size, region)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60

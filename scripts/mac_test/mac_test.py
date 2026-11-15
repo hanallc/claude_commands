@@ -93,6 +93,7 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
+    from scripts.buildlog import sync as buildlog_sync
     from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -1745,9 +1746,9 @@ def block_duration(raw: str, config: MacTestConfig) -> BlockDuration:
 
 
 def requested_delivery(holder: str) -> MessageDelivery:
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    owner = build_hold.owning_session()
+    owner = owning_session.owning_session()
     return (
         RecordedSession(owner.session_id, holder)
         if isinstance(owner, OwningSession)
@@ -2028,7 +2029,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
             if not args.claim_id:
-                args.claim_id = uuid.uuid5(uuid.NAMESPACE_URL, placement.attempt_key(assignment.episode, assignment.attempt)).hex
+                args.claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
         session = assignment.session
     else:
         scope = target_claim_scope(paths, args.worktree)
@@ -2073,7 +2074,39 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         time.sleep(min(2.0, remaining))
 
 
-def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
+@dataclass(frozen=True)
+class EndStoppedWork:
+    """The holder has exited: end its mirror's remote work before the start fence settles."""
+
+    repository: eligibility.KnownRepository
+
+
+@dataclass(frozen=True)
+class KeepRemoteWork:
+    """The holder releases its own claim, so no remote work of its own remains."""
+
+
+KEEP_REMOTE_WORK = KeepRemoteWork()
+
+
+@dataclass(frozen=True)
+class ClaimsReleased:
+    """Every claim the holder owned is gone; the transfers are what those claims recorded."""
+
+    count: int
+    transfers: tuple[buildlog_sync.TransferBytes, ...]
+
+
+@dataclass(frozen=True)
+class ClaimReleaseRefused:
+    reason: str
+
+
+def release_exact_claims(
+    paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
+    provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
+) -> ClaimsReleased | ClaimReleaseRefused:
+    """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
 
     with nullcontext() if provider_lock_held else locked(paths.lock):
@@ -2085,36 +2118,44 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
                 record = read_run(path)
             except StateReadError:
                 continue
-            if (isinstance(record, dict) and record["pid"] == args.pid
-                    and claim_state.claim_identity(record) == claim_state.ClaimIdentity(
-                        args.claim_id, args.episode, args.attempt)):
+            if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
                 owned.append((path, record))
+    transfers: list[buildlog_sync.TransferBytes] = []
     for path, record in owned:
-        identity = claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt)
         pending = offload.pending_start_path(paths.target, identity)
         if "remote_host" in record and pending.exists():
-            settings = Path(args.settings) if args.settings else config_path(paths.target)
-            connection = eligibility.read_connection_settings(settings)
-            command = (offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
-                       + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
+            connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
+            fence = offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
+            # Stopped work ends first, so the fence it holds is free to settle.
+            command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
+                       + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
+                       else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
             observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
-            if (not isinstance(observed.result, offload.LeftoversEnded)
-                    or "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines()):
-                print("cannot release: the remote start fence remains unconfirmed", file=sys.stderr)
-                return 12
+            if not isinstance(observed.result, offload.LeftoversEnded):
+                return ClaimReleaseRefused("the remote work of the claim has not ended")
+            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
+                return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
             if read_run(path) != record:
-                print("cannot release: the exact claim changed during cleanup", file=sys.stderr)
-                return 12
-            transfers = record.get("transfers", [])
-            if transfers:
-                print("copy_bytes=" + json.dumps(transfers))
+                return ClaimReleaseRefused("the exact claim changed during cleanup")
+            transfers.extend(record.get("transfers", []))
             pending.unlink(missing_ok=True)
             path.unlink(missing_ok=True)
     with nullcontext() if provider_lock_held else locked(paths.lock):
         block_present = not isinstance(read_block(paths.block), NoMacBlock)
     if block_present:
         start_watcher(paths)
+    return ClaimsReleased(len(owned), tuple(transfers))
+
+
+def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False) -> int:
+    released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
+                                    args.settings, provider_lock_held=provider_lock_held)
+    if isinstance(released, ClaimReleaseRefused):
+        print(f"cannot release: {released.reason}", file=sys.stderr)
+        return 12
+    if released.transfers:
+        print("copy_bytes=" + json.dumps(list(released.transfers)))
     return 0
 
 

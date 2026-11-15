@@ -14,30 +14,6 @@ from scripts.build_hold import build_hold
 from scripts.build_targets.targets import Held, StateUnreadable, target_state
 
 
-BUILDING_CARGO_VERBS = frozenset({
-    "build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r", "bench", "doc", "d",
-    "rustc", "rustdoc", "fix", "install", "miri", "mend",
-})
-CARGO_OPTIONS_WITH_VALUES = frozenset({
-    "-C", "--config", "-Z", "--color", "--manifest-path", "--lockfile-path", "--target-dir", "--target",
-    "-j", "--jobs", "-p", "--package", "--exclude", "-F", "--features", "--profile", "--message-format",
-    "--artifact-dir", "--out-dir",
-})
-
-
-def cargo_verb(arguments: tuple[str, ...]) -> str:
-    """Match the cargo wrapper's first-verb and option-value rules."""
-    skip_value = False
-    for argument in arguments:
-        if skip_value:
-            skip_value = False
-        elif argument in CARGO_OPTIONS_WITH_VALUES:
-            skip_value = True
-        elif not argument.startswith(("+", "-")):
-            return argument
-    return ""
-
-
 class HoldStateReadError(ValueError):
     """The hold decision could not be read; admission must stop."""
 

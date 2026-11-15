@@ -502,7 +502,8 @@ The runbook gives the preparation steps.
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
+`python3 scripts/aws_target/aws_target.py snapshot` runs the same two steps manually.
 No systemd unit change or NixOS rebuild is required.
 The old `aws-target.service` remains disabled.
 `aws_target.py tick` reads account charges only.
@@ -610,6 +611,32 @@ Runs on days without a bill show `not billed`.
 The last line names the cheapest merge gate by estimate.
 These blocks do not split for a narrow terminal.
 
+### Billed hours check
+
+The user asked for this check on 2026-11-14 through builds.
+It compares the billed Spot hours with the recorded box hours for each type, region and UTC day.
+1. Billed hours: the `UsageQuantity` of `<CODE>-SpotUsage:<type>` in the bill read for that day.
+   A day with a bill read and no usage row for the type bills 0 hours.
+2. Box hours: each gate in the cost ledger, from its reservation to its confirmed end, split at UTC midnight.
+   Open and absent gates do not count. A gate without a region ran in the home region.
+3. The gap ratio is `abs(billed - box) / box`.
+   A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
+   Billed hours with no box hours are also over.
+`run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
+Days run from the window start day up to, but not including, the end day, like the bill split.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` row.
+`HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
+Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
+`aws_target.hourly` checks the last `run_cost_days` days after its price read.
+`buildlog hourly` and `aws_target.py snapshot` both call it.
+It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
+Each type, region and day that is over sends one `aws.hours_gap` user notice.
+The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
+A failed delivery removes the claim, so the next hourly run sends it again.
+A claim for a day before the window is dropped.
+Live, 2026-11-14: the days since 2026-11-12 are within 4.5 %.
+Before that day, the box hours were 7 to 13 % above the bill.
+
 `python3 scripts/aws_target/aws_target.py open-gates` reads only the local cost ledger.
 It prints the ledger path, file write time, age, counts by state, and pending compute request count.
 It lists each open attempt, state, reservation time, expiry, instance type, region, and mode.
@@ -638,6 +665,12 @@ The live read never writes `spot-prices.json`.
 `launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
 Resumed launches keep the saved ranking and evidence without another live read.
+Placement does not try a type and region whose median box time, boot included, is above `max_gate_minutes=12`.
+The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
+The median uses the type's runs in that region, or its runs in all regions when the region has none.
+A type without runs is tried; `lifetime_minutes` is not a measurement.
+Each skip prints `Cloud gate skips <type> in <region>`.
+When every variant is skipped, the gate falls back to natedev before a launch.
 Available variants precede variants under a capacity cooldown.
 Within each group, variants with a current price come first, ranked by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".

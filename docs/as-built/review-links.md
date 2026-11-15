@@ -92,7 +92,7 @@ The server applies the same root, traversal, private-file, and symlink rules to 
 The console adds a same-origin content policy and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Changes and Builds.
+The left navigation has icons and labels for AWS prices, Builds, Changes and Questions, in alphabetical order.
 The desktop top bar shows only the selected page title.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
@@ -104,6 +104,7 @@ At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
 The menu button opens the navigation above the frame.
 A page choice, the Escape key, or a click outside closes the navigation.
+When the rebuild overlay is open, the Escape key closes only the overlay.
 The phone navigation starts closed and does not change the stored desktop state.
 
 `?page=<id>` selects a page.
@@ -126,27 +127,39 @@ The page serves itself at that path and permits same-origin framing.
 A link that leaves the page uses `target="_top"`.
 The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for these pages.
 `change_page.page_url` reuses the existing Changes publisher.
+`change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
+The AWS prices entry calls `aws_page.page_url`.
+That function returns the AWS prices page URL without publishing the page.
 
-The console vendors five SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `hammer`, `panel-left-close`, `panel-left-open`, and `menu`.
+The bottom-left rebuild link shows only while a rebuild need is open.
+`rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
+That function returns `/<snapshot>/rebuilds.html` beside the Changes page.
+The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
+Its label names each machine and the need count, for example **Rebuild natedev, the Mac (3)**.
+The collapsed rail shows the icon with a count badge, and hover or focus shows the label.
+At phone width the link is a small fixed button at the bottom left.
+A click opens a modal overlay titled **Rebuilds needed** with the machine, reason, source agent and commit of each need.
+The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
+When the last need clears, the link hides and an open overlay closes.
+
+The console vendors nine SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
-### Questions, Changes, and Rebuilds
+### Questions and Changes
 
-The review page has one tab bar for Questions, Changes, and Rebuilds, with waiting counts.
-The selected tab joins the content panel and has an accent line on its top edge.
-Arrow keys, Home, and End select tabs. Tab moves to the selected tab and then the page controls.
-Each type tab shows its own count. The page has no combined total.
-The heading follows the selected type: Questions to answer, Changes to review, or Rebuilds needed.
-The document title remains Changes to review.
+`changes.html` shows one kind of item: Changes by default, Questions with `?type=questions`.
+Any other `type` value gets a 503 page.
+The page has no tab bar and no combined total.
+The heading and document title follow the kind: **Changes to review** or **Questions to answer**.
 The page updates itself through its existing GET URL without a full reload.
 `page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
 The page loads updates only while its browser tab is visible.
 It loads an update at once when the tab becomes visible again.
-Updates retain the selected type, showrunner, waiting card, open Details sections, and scroll position.
+Updates retain the selected showrunner, waiting card, open Details sections, and scroll position.
 If the card no longer waits, the page selects the next waiting item in the same filter.
 Typed text or an active save holds replacement; the page keeps only the newest loaded update.
 The page applies that update when all unsaved fields are empty or the save ends.
@@ -154,16 +167,15 @@ A successful save requests a fresh update so an older response cannot restore th
 Updates preserve a retained field's focus and cursor.
 A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
-Questions and Changes show one card at a time.
+The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
 All is the default and includes every showrunner in the existing item order.
 The menu keeps the existing showrunner order.
-The tab bar and menu stay on one line at phone and desktop widths.
-Switching types retains each type's selected showrunner and card.
-The URL fragment records the type, showrunner, and card.
+The menu stays on one line at phone and desktop widths.
+The URL fragment records the showrunner and card.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
-An empty type shows **No questions to answer.** or **No changes to review.**
+An empty page shows **No questions to answer.** or **No changes to review.**
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.
@@ -193,23 +205,27 @@ A save error clears that attempt's delivery intent and releases its claim.
 Recovery sends only answers with `saved: true` whose canonical question record is closed.
 Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
-The Changes tab retains its existing cards, controls, and count rules.
+Answers to questions and changes both post to `changes.html`.
 
-Rebuilds shows one block per machine, with natedev first, then the Mac, then other machines in name order.
-It has no showrunner menu, card navigation, Skip for now, or answer form.
-Its count is the number of machines with open rebuild needs.
+### Rebuilds page
+
+`/<snapshot>/rebuilds.html` lists open rebuild needs for the console's rebuild link.
+The server serves it only beside a published Changes browser.
+It is not in the navigation.
+A `data-rebuilds` block carries `data-count`, the number of open needs, and `data-label`, the link label.
+The page shows one block per machine, with natedev first, then the Mac, then other machines in name order.
 Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
 The Mac instruction states that updates can take five minutes while the Mac is reachable.
 A machine with multiple needs shows `One rebuild applies all listed changes.`
-Under `After the rebuild`, bullets show the stored reasons unchanged, newest first by creation time.
-A closed `Details` disclosure shows each full configuration commit in the same order.
-It shows `Affected session: <name> (<kind>)` from the current staff record.
-It shows `Requested by: <name> (<kind>)` only for a different, recorded requester.
+Each need shows its stored reason, newest first by creation time.
+Under the reason, a list shows the source agent, the affected session and the full configuration commit.
+The source agent is the recorded requester, or else the affected session.
+The affected session shows only when it differs from the source agent.
+Names come from the current staff record as `<name> (<kind>)`.
 Unknown staff IDs appear as `Unknown session: <id>`.
-The reader uses the same staff record as the page routing.
 Each render calls `rebuild.need.read_needs()` once.
-The final line states `Completed requests clear automatically. Refresh this page after the rebuild.`
-An empty or missing needs folder shows only `No rebuilds needed.` beneath the tabs, with a count of 0.
+The final line states `Completed requests clear automatically.`
+An empty or missing needs folder shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
 The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
 The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.

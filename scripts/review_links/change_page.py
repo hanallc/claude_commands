@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import functools
 import html
 import json
 import re
@@ -38,6 +39,7 @@ from scripts.review_links import review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
+REBUILDS_NAME = "rebuilds.html"
 BROWSER_MANIFEST = ".review-link-browser.json"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
@@ -49,10 +51,15 @@ class BrowserManifest(TypedDict):
     initial: str
 
 
+type ReviewKind = Literal["changes", "questions"]
+TITLES: dict[ReviewKind, str] = {"changes": "Changes to review", "questions": "Questions to answer"}
+
+
 @dataclass(frozen=True)
 class ReviewBrowser:
     token: str
     initial: str = ""
+    kind: ReviewKind = "changes"
 
 
 class PageManifest(TypedDict):
@@ -394,10 +401,10 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
-def document(content: str) -> bytes:
+def document(content: str, title: str = TITLES["changes"]) -> bytes:
     return ('''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Changes to review</title><style>
+<title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
 body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
 h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
@@ -1036,9 +1043,26 @@ def publish_browser(initial: str = "") -> str:
     return url
 
 
+@functools.cache
+def console_browser(root: Path) -> str:
+    """Publish one browser folder for each process, so the console's pages share it."""
+    del root
+    return urlsplit(publish_browser()).path
+
+
 def page_url() -> str:
     """Publish the Changes page and return its path under the review root."""
-    return urlsplit(publish_browser()).path
+    return console_browser(review_link.review_root().resolve())
+
+
+def questions_url() -> str:
+    """Return the Questions page: the same browser, limited to questions."""
+    return page_url() + "?type=questions"
+
+
+def rebuilds_url() -> str:
+    """Return the open rebuild needs beside the console's browser."""
+    return page_url().rsplit("/", 1)[0] + "/" + REBUILDS_NAME
 
 
 def main(arguments: list[str]) -> int:

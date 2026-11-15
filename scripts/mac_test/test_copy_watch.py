@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from dataclasses import replace
+from contextlib import redirect_stderr
 import io
 import json
 import os
@@ -30,6 +31,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.lib import test_hang_guard
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import placement, admission_protocol as wire
+from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue.test_placement import placement_request
 from scripts.mac_test import claim_state, mac_test
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
@@ -320,12 +322,60 @@ class StopTests(unittest.TestCase):
                     _ = result.write_text(f"mac={mac}\nreason=busy\nseconds=1.0\n")
                     process = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({status})"])
                     _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-                    watch.copy = copy_watch.RunningCopy(process, result, time.monotonic())
+                    watch.copy = copy_watch.RunningCopy(process, result, time.monotonic(), root / "copy.assignment.json")
                     watch.copy_count = 1
                     report = watch.stop()
                     self.assertEqual((report.outcome, report.copy_count), (outcome, 1))
                     self.assertIsInstance(report.win, copy_watch.NoWin)
                     self.assertIsInstance(watch.copy, copy_watch.NoCopy)
+
+
+class StoppedCopyReleaseTests(unittest.TestCase):
+    def test_a_stopped_copy_releases_its_kept_claim_and_settles_its_assignment(self) -> None:
+        from scripts.build_queue import admission_client
+
+        cases = {
+            "kept claim released": (mac_test.ClaimsReleased(1, ()), 1),
+            "claim already released": (mac_test.ClaimsReleased(0, ()), 0),
+            "remote work remains": (mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"), 0),
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": directory}):
+            root = Path(directory)
+            request = copy_watch.WatchRequest(
+                info=root / "info", result=root / "result", runner=root / "runner.py",
+                settings=root / "mac.conf", repo_root=root, package="sample", call_id="v-call",
+                call_started=1.0, filter_run=False, nextest_words=(),
+            )
+            repository = eligibility.KnownRepository("repo")
+            destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
+            assignment = placement.PlacementAssignment("v-call-copy-1", "attempt-1", destination,
+                placement.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+                NoOwningSession(), 1.0)
+            assignment_file = root / "copy.assignment.json"
+            admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
+            for name, (released, reports) in cases.items():
+                with self.subTest(name):
+                    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                    copy = copy_watch.RunningCopy(process, root / "copy.result", time.monotonic(), assignment_file)
+                    with mock.patch.object(mac_test, "release_exact_claims", return_value=released) as release, \
+                         mock.patch.object(admission_client, "report_execution") as report, \
+                         redirect_stderr(io.StringIO()):
+                        copy_watch.stop_copy(copy, request, repository)
+                    self.assertIsNotNone(process.poll())
+                    paths, pid, identity, settings = cast(tuple[claim_state.StatePaths, int, claim_state.ClaimIdentity, str],
+                                                          release.call_args.args)
+                    self.assertEqual((paths.directory, pid, settings), (Path(directory), process.pid, str(request.settings)))
+                    self.assertEqual(identity, claim_state.ClaimIdentity(
+                        placement.assigned_claim_id("v-call-copy-1", "attempt-1"), "v-call-copy-1", "attempt-1"))
+                    self.assertEqual(release.call_args.kwargs, {"remote_work": mac_test.EndStoppedWork(repository)})
+                    self.assertEqual(report.call_count, reports)
+                    if reports:
+                        sent = cast(wire.ExecutionReport, report.call_args.args[0])
+                        self.assertEqual((sent.assignment, sent.outcome, sent.path),
+                                         (assignment, placement.AttemptDeclined("lost"), placement.DispatchPathSettled()))
+                        self.assertEqual(sent.claim, placement.ProviderClaimReference(
+                            "mac", "mac", claim_state.RepositoryScope("repo"), identity.claim_id, "v-call-copy-1", "attempt-1"))
 
 
 @final
