@@ -348,6 +348,16 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         if conclusion in ("cancelled", "failure"):
             contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
     sources = indexed_monthly_sources(connection)
+    # A gate run is a recorded event of the place that holds its file; AWS records nothing else.
+    source_machines = {source.path: source.machine for source in sources}
+    gate_rows = cast(Sequence[tuple[str, int | None, float | None, float]], connection.execute(
+        "SELECT src, status, wall_s, unixepoch(started_at,'subsec') FROM gate_runs WHERE "
+        + moments.window_bounds("started_at"), parameters).fetchall())
+    for src, status, wall, at in gate_rows:
+        machine = source_machines.get(src) or machine_name(None, Path(src).parent.name, legacy_hosts)
+        observations.append(SourceObservation(at, machine))
+        if status:
+            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0)))
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),

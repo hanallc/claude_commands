@@ -79,16 +79,21 @@ class CostTests(unittest.TestCase):
 
     def test_cloud_gate_files_count_as_one_aws_machine(self) -> None:
         started = (fixtures.START + timedelta(seconds=10)).isoformat()
-        for folder in ("box-one.fixture.internal", "box-two.fixture.internal", "aws"):
+        for folder, status in (("box-one.fixture.internal", 1), ("box-two.fixture.internal", 0), ("aws", 1)):
             path = self.fixture.fixture.root/folder/"2026-10.jsonl"
             path.parent.mkdir(parents=True)
             _ = path.write_text(json.dumps({
                 "kind": "gate_run", "v": record.RECORD_VERSION, "id": f"gate-{folder}", "host": folder,
-                "started_at": started, "ended_at": started, "source": store.CLOUD_GATE_SOURCE,
-                "suites": [], "modules": []}) + "\n")
+                "started_at": started, "ended_at": started, "wall_s": 600, "status": status,
+                "source": store.CLOUD_GATE_SOURCE, "suites": [], "modules": []}) + "\n")
         with closing(self.fixture.connection(fixtures.build("local", 10, target="natedev"))) as connection:
             reading = costs.read_costs(connection, fixtures.START, fixtures.END)
         self.assertEqual(set(reading.first_sources) - {"natedev"}, {"aws"})
+        # Gate runs are the AWS place's only events, so they observe it and count its failed runs.
+        self.assertIn("aws", {observation.machine for observation in reading.observations})
+        result = costs.aggregate_costs(reading, fixtures.START, fixtures.END)
+        self.assertEqual([(row.machine, row.cause, row.seconds) for row in result.ranked if row.machine == "aws"],
+                         [("aws", "Failed runs", 1200)])
 
     def test_phase_score_uses_matched_wall_time_and_nearest_rank_p90(self) -> None:
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
