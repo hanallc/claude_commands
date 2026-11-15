@@ -342,6 +342,7 @@ class RowQueueNotes(TypedDict):
     priority_text: NotRequired[str]
     ci_label: NotRequired[str]
     runs_on: NotRequired[str]
+    mac_state: NotRequired[str]
     runner: NotRequired[unit_labels.Runner]
     worker: NotRequired[str]
 
@@ -372,11 +373,17 @@ def step_runs_on(route: target_config.StepRoute, routes: target_availability.Mac
     """Name the targets that can take a natedev queue step: a route that limits the step first, else the Mac routes."""
     if isinstance(route, target_config.LocalRequired):
         return f"natedev only ({RUN_ASKS_TEXT if route == target_config.LOCAL_CALLER else route.reason})"
-    if isinstance(route, target_config.MacOnly):
+    if mac_only_route(route, routes):
         return "Mac only"
     if isinstance(route, target_config.PinnedTarget):
-        return ("Mac" if routes.is_mac(route.target) else route.target) + " only"
+        return route.target + " only"
     return local_runs_on(routes.fit(step, folder, package))
+
+
+def mac_only_route(route: target_config.StepRoute, routes: target_availability.MacRoutes) -> bool:
+    """A Mac-only step, or a step pinned to the Mac target."""
+    return isinstance(route, target_config.MacOnly) or (isinstance(route, target_config.PinnedTarget)
+                                                        and routes.is_mac(route.target))
 
 
 CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
@@ -1706,7 +1713,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         if isinstance(waiter.reason, admission_records.BehindHead):
             reason += ": the first step in line gets memory first"
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
-        waiters.append({"name": names.for_owner(waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
+        wait_row: WaitRow = {"name": names.for_owner(waiter.step, identity.unit if identity.unit != "—" else "", identity.role,
                             ci=bool(ci_label), current_name=step_text(waiter, names, labels=labels)),
                         **page_owner_labels(identity, ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
@@ -1714,7 +1721,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "reason": reason,
                         "fits": need <= captured.signed_room,
                         "runs_on": "" if ci_label else step_runs_on(
-                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)})
+                            waiter.route, routes, waiter.step, waiter.folder, waiter.package)}
+        if not ci_label and mac_only_route(waiter.route, routes) and (holds := routes.holds(waiter.folder)):
+            wait_row["mac_state"] = holds
+        waiters.append(wait_row)
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:

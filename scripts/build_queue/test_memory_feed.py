@@ -1348,6 +1348,7 @@ process.stdout.write(JSON.stringify({
                                 (target_config.PinnedTarget("natedev"), "natedev only")):
             with self.subTest(route=route), mock.patch.object(routes, "fit") as fit:
                 self.assertEqual(memory_feed.step_runs_on(route, routes, "nextest", "/fixture/hana", "hana"), expected)
+                self.assertEqual(memory_feed.mac_only_route(route, routes), expected == "Mac only")
                 fit.assert_not_called()
         with mock.patch.object(routes, "fit", return_value=target_availability.Allowed("no block or claim recorded")):
             self.assertEqual(memory_feed.step_runs_on(target_config.ANY_ELIGIBLE_TARGET, routes, "nextest",
