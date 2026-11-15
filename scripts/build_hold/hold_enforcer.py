@@ -26,7 +26,7 @@ from typing import Literal, cast
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
-from scripts.build_hold.hold_applies import BUILDING_CARGO_VERBS, cargo_verb
+from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 from scripts.direct import step_record
@@ -650,7 +650,7 @@ def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
 def is_build(process: build_hold.AuditProcess) -> bool:
     names = {process.executable, Path(process.argv[0]).name if process.argv else process.command}
     if "cargo" in names:
-        return cargo_verb(process.argv[1:]) in BUILDING_CARGO_VERBS
+        return cargo_subcommand(process.argv[1:]) in CARGO_BUILD_VERBS
     if "rustc" in names:
         arguments = process.argv[1:]
         if arguments and arguments[0].startswith("+"):
