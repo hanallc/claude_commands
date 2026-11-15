@@ -758,6 +758,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
   - **Phase productions:** The command prints two tables in the same unit order.
+    The first line shows `in work N · waiting to merge N · waiting on other work N · merged today N`.
+    One empty line separates this summary from the first table.
+    Counts include only units in these phase tables and always show zeros.
+    `in work` counts open phases without a `checkpoint_wait` result.
+    `waiting to merge` counts distinct unit and phase owners from active merges and the merge line.
+    Open rows with a `checkpoint_wait` result add their owner unless the count already includes it.
+    `waiting on other work` counts every queue item with an `after` state other than `waits_on.OnMain`.
+    `merged today` counts distinct unit and phase pairs with successful merge results dated today in the production zone.
+    Queue reads and wait states are reused for the summary, Notes, and Queued.
     Each open phase of the selected run gets one row in both tables.
     The staff current run selects the run when present; otherwise, the newest run supplies the rows.
     Notes, ETA cells, and Workers use that same selected run.
@@ -832,7 +841,12 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.
     Text equal to the title adds nothing; this comparison ignores case and whitespace.
-    Other notes are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+    Units without open work show `nothing open: <plan reason>, <queue reason>`.
+    The plan reason is `plan done`, `no plan`, or `next plan phase <id> not started`, in plan order.
+    A missing record, an unavailable record, or an empty phase list uses `no plan`.
+    The queue reason is `queue empty`, `queued work waits on <after>`, or `queued work not started`.
+    The first queue item's wait selects the queue reason; a ready item uses `queued work not started`.
+    Sent work and shell waits still append through `with_waits`.
     Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
     Each open worker or director wait appends `waiting on <reason> <elapsed>` to Notes.
     A named holder adds `(held by <holder>)` before the elapsed time.
@@ -879,10 +893,11 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Duration predictions still use the plan's recorded history.
     The first row also names the latest promises for unfinished targets without open rows.
     Those promises use `phase <id>: <time>[ · late <elapsed>]`.
-    The latest `phase_finished` event for each target decides whether that target is done.
-    Only status `completed` marks a target as done.
-    A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
-    That target's promise remains visible.
+    A later promise for the same target replaces the earlier promise.
+    Any later `phase_finished` event removes that promise, regardless of status.
+    A later `checkpoint` event for the target also removes the promise.
+    A merge result for the same unit and phase removes the promise when its time follows the promise event.
+    A later `phase_started` event opens the phase again; its promise belongs in ETA Next.
     Without an unfinished plan or such a promise, the cell shows `—`.
     The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
     Times use the production zone and a short date outside the current day.
@@ -898,13 +913,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `display_cells.wrapped(keep=...)` keeps the Workers column when every cell is `—`.
     The table reads no panes, run records or process table for Workers.
     Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
-    Rows without a recorded phase instance keep the existing summary for work outside the plan.
-    Queued combines the first queue item with the first unfinished plan phase, excluding done and open phases.
+    Rows without a recorded phase instance name every open phase outside the plan, with its step text, in run order.
+    Non-Phase Work joins entries with ` · `.
+    Queued names every queue item with its wait text, joined with ` · `.
+    The plan part names every phase that is neither done nor open.
+    It shows `plan: phase 30: <title>, then 31, 32`, with the title only for the first phase.
     It excludes every open phase of the selected run, including phases absent from the configured plan.
     It excludes each queue item whose text equals Notes in the same row.
-    Its queue count includes only remaining items.
     With no remaining queue item, it shows the plan part or `—`.
-    Each displayed item or title keeps its full text and count suffix.
+    Each displayed item or title keeps its full text.
     A configured plan with phases takes priority over the selected run's plan.
     The fallback plan path resolves against the staff worktree.
     An unreadable queue retains `queue unreadable` and reports its path and cause.
