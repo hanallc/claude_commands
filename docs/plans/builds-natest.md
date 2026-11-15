@@ -4107,3 +4107,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Until a natedev full run with tests passes, a natedev full run has no time limit.
 - The queue_place tests wait on their own fixture queue, not the live queue.
 - Commit a92140f44. Production change (needs the sdlc go).
+
+### Phase 283 — The queue_place fixture waits no start spacing or stop grace  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change; builds asked 11-15).
+
+#### Work Order
+
+**Goal:** `build_queue/test_queue_place` does not wait seconds of real time on fixture start spacing or on the stop grace.
+
+**Spec:**
+- `QueuePlaceFixture` in `scripts/build_queue/test_queue_place.py` opens `AdmissionFixture` with `skip_idle_spacing=True`. No queue_place test checks the start spacing.
+- The fixture config sets `program_stop_seconds=0.2` and `program_sample_seconds=0.1`. A test that rewrites the config keeps its own values.
+- Cause: `cleanup_program_starts` waits `program_stop_seconds` (5 s) on a TERM-resistant program; the start window test runs 6 subtests.
+
+**Files:** `scripts/build_queue/test_queue_place.py`.
+
+**Workers:** 1 writer; no split (one fixture). impl: the file. test opens as impl.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** `build_queue/test_queue_place` passes with the same tests; AWS pair shows no CPU rise.
