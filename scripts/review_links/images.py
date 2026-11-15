@@ -16,7 +16,7 @@ from typing import TypedDict, cast
 from urllib.parse import parse_qs
 
 from scripts.lib import atomic_file, conf, file_lock
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import shown_time
 from scripts.production import staff
 from scripts.review_links import change_browser, change_page, review_link
 
@@ -151,7 +151,7 @@ def card(record: ImageRecord, token: str, members: staff.StaffSnapshot) -> str:
             + f'<dt>Owner:</dt><dd>{html.escape(owner_name(members, record["owner"]))}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
             + f'<dt>Added:</dt><dd><time datetime="{html.escape(record["registered_at"], quote=True)}">'
-            + f'{added.astimezone(user_zone()).strftime("%b %d, %Y, %H:%M")}</time></dd></dl>'
+            + f'{shown_time(added)}</time></dd></dl>'
             + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
             + f'alt="{html.escape(caption.splitlines()[0], quote=True)}" loading="lazy"></a>'
             + '<form method="post" data-delete>'

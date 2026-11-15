@@ -14,13 +14,14 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
+from scripts.lib.user_zone import shown_time
 from scripts.production import change_review, change_routing, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.issues import frontmatter
-from scripts.rebuild import need
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
+from scripts.statusline import rebuild_row
 
 MANIFEST = change_page.BROWSER_MANIFEST
 FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
@@ -250,52 +251,48 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
-def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
-    """Show each machine's rebuild action, then each need's reason, source agent and commit."""
-    def session(identity: str) -> str:
-        member = record.by_id(staff.StaffId(identity))
-        return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
+def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
+                 record: staff.StaffSnapshot) -> str:
+    """Show each machine the status line names, then one entry per change: who made it, when and why."""
+    def who(session: str) -> str:
+        member = record.by_member_reference(session) if session else None
+        return (f"{member.name} ({member.kind})" if member is not None
+                else f"Unknown session: {session}" if session else "Unknown session")
 
-    def field(label: str, value: str) -> str:
-        return f'<dt>{label}</dt><dd>{value}</dd>'
+    def entry(session: str, at: str, reason: str) -> tuple[datetime, str]:
+        moment = datetime.fromisoformat(at)
+        return moment, (f'<li><dl><dt>Who</dt><dd>{html.escape(who(session))}</dd>'
+                        + f'<dt>When</dt><dd><time datetime="{html.escape(at, quote=True)}">{shown_time(moment)}</time></dd>'
+                        + f'<dt>Reason</dt><dd>{html.escape(reason)}</dd></dl></li>')
 
-    ordered = sorted(machines, key=lambda item: (
-        item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"]))
-    names = ["the Mac" if machine.newest["machine"] == "mac" else machine.newest["machine"] for machine in ordered]
+    names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
-    for machine, name in zip(ordered, names):
-        machine_name = machine.newest["machine"]
-        terminal = "Terminal" if machine_name == "mac" else "a terminal"
-        items: list[str] = []
-        for item in sorted(machine.records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
-            source = item["requested_by"] or item["concerns"]
-            affected = (field("Affected session", html.escape(session(item["concerns"])))
-                        if item["concerns"] and item["concerns"] != source else "")
-            items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
-                         + field("Source agent", html.escape(session(source))) + affected
-                         + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
-        blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
-            + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
-            + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
-            + ('<p>One rebuild applies all listed changes.</p>' if len(machine.records) >= 2 else '')
-            + '<ul>' + ''.join(items) + '</ul></article>')
-    count = sum(len(machine.records) for machine in machines)
-    label = f"Rebuild {', '.join(names)} ({count})" if count else ""
-    return (f'<div data-rebuilds data-count="{count}" data-label="{html.escape(label, quote=True)}">'
-            + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
-            + '</div>')
+    for machine_name, name in zip(answer.machines, names):
+        records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
+        filed = {item["nixos_commit"] for item in records}
+        # A filed need and its commit are one change; the need gives the requester and the reason.
+        items = [entry(item["requested_by"] or item["concerns"], item["created_at"], item["reason"]) for item in records]
+        items += [entry(change.session, change.at, change.reason)
+                  for change in changes.get(machine_name, ()) if change.commit not in filed]
+        listed = ('<ul>' + ''.join(shown for _, shown in sorted(items, key=lambda item: item[0], reverse=True)) + '</ul>'
+                  if items else '<p>The change list is not available yet.</p>')
+        blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
+    label = f"Rebuild {' and '.join(names)}" if names else ""
+    return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
+            + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
 REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}[data-rebuilds] li p{margin:0 0 8px}
-[data-rebuilds] dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] h2{margin-top:0}[data-rebuilds] ul{list-style:none;padding:0}[data-rebuilds] li+li{margin-top:16px}
+[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
 [data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
 
 
 def render_rebuilds() -> bytes:
-    """Render the open rebuild needs for the console's rebuild link and overlay."""
-    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuild_list(need.read_needs(), staff.snapshot()),
-                                "Rebuilds needed")
+    """Render the status line's rebuild answer for the console's rebuild link and overlay."""
+    config = conf.path("statusline")
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
+    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:

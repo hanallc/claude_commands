@@ -160,16 +160,17 @@ That function returns the configured Builds page URL without publishing a readin
 The AWS prices entry calls `aws_page.page_url`.
 That function returns the AWS prices page URL without publishing the page.
 
-The bottom-left rebuild link shows only while a rebuild need is open.
+The bottom-left rebuild link shows only while the Rebuilds page names a machine.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
 That function returns `/console/rebuilds.html`.
 The link reads that page when the console loads, then at each `page_refresh_seconds` interval while the browser tab is visible.
-Its label names each machine and the need count, for example **Rebuild natedev, the Mac (3)**.
-The collapsed rail shows the icon with a count badge, and hover or focus shows the label.
-At phone width the link is a small fixed button at the bottom left.
-A click opens a modal overlay titled **Rebuilds needed** with the machine, reason, source agent and commit of each need.
+Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the Mac** or **Rebuild natedev and the Mac**.
+A long label wraps to a second line and stays inside the sidebar.
+The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
+At phone width the link is a small fixed button at the bottom left, never wider than the open sidebar (220px), so it wraps and stays inside the sidebar.
+A click opens a modal overlay titled **Rebuilds needed** with the Rebuilds page content.
 The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
-When the last need clears, the link hides and an open overlay closes.
+When no machine needs a rebuild, the link hides and an open overlay closes.
 
 The console vendors ten SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
@@ -290,23 +291,26 @@ An agent deletes an image with this command:
 
 ### Rebuilds page
 
-`/console/rebuilds.html` lists open rebuild needs for the console's rebuild link.
+`/console/rebuilds.html` lists the machines that the status line names for a rebuild, for the console's rebuild link.
+Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
+That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
 The server serves it only in a folder that holds the browser manifest.
 It is not in the navigation.
-A `data-rebuilds` block carries `data-count`, the number of open needs, and `data-label`, the link label.
-The page shows one block per machine, with natedev first, then the Mac, then other machines in name order.
-Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
-The Mac instruction states that updates can take five minutes while the Mac is reachable.
-A machine with multiple needs shows `One rebuild applies all listed changes.`
-Each need shows its stored reason, newest first by creation time.
-Under the reason, a list shows the source agent, the affected session and the full configuration commit.
-The source agent is the recorded requester, or else the affected session.
-The affected session shows only when it differs from the source agent.
+A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
+The page shows one block per machine, with natedev first, then the Mac.
+Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then one entry per change, newest first.
+Each entry is a list of three rows: Who, When and Reason.
+The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
+A commit's reason is its subject and its time is the author time.
+Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
+A filed need is an entry with its requester (else the affected session), its creation time and its reason.
+A need covers its own commit, so that commit shows once.
 Names come from the current staff record as `<name> (<kind>)`.
-Unknown staff IDs appear as `Unknown session: <id>`.
-Each render calls `rebuild.need.read_needs()` once.
-The final line states `Completed requests clear automatically.`
-An empty or missing needs folder shows only `No rebuilds needed.`, with a count of 0 and an empty label.
+An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
+When shows the time in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+A listed machine without a recorded change list shows `The change list is not available yet.`
+When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
 The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
 The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.

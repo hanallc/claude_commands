@@ -173,7 +173,8 @@ background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-w
 .empty h3{font-size:20px;color:var(--text);margin:0 0 8px}.empty p{max-width:30ch;margin:0}
 .rebuild-slot{position:fixed;left:0;bottom:0;width:244px;padding:12px;z-index:4}.collapsed .rebuild-slot{width:72px}
 .rebuild-link{position:relative;display:flex;gap:12px;align-items:center;width:100%;min-height:46px;padding:11px 14px;border:0;border-radius:9px;
-background:var(--notice);color:var(--notice-text);font-weight:600;text-align:left;cursor:pointer;white-space:nowrap}
+background:var(--notice);color:var(--notice-text);font-weight:600;text-align:left;cursor:pointer}
+.rebuild-link .entry-label{min-width:0;overflow-wrap:anywhere}.rebuild-link .tooltip{white-space:nowrap}
 .rebuild-link:hover{background:var(--notice-hover)}.rebuild-count{display:none}
 .collapsed .rebuild-link .entry-label{display:none}
 .collapsed .rebuild-count{display:grid;place-items:center;position:absolute;top:5px;left:28px;min-width:17px;height:17px;padding:0 4px;
@@ -190,8 +191,7 @@ dialog::backdrop{background:#0b10184d}
 .dialog-body code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .dialog-body ul{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:12px}
 .dialog-body li{border:1px solid var(--border);border-radius:9px;padding:12px 14px}
-.dialog-body li p{color:var(--text);font-weight:550}
-.dialog-body dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:2px;margin:0;font-size:13px}
+.dialog-body dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:2px;margin:0;font-size:13px}
 .dialog-body dt{color:var(--muted)}.dialog-body dd{margin:0;min-width:0}
 .dialog-body>p:last-child{margin:16px 0 0;font-size:13px}
 [hidden]{display:none!important}.dismiss,.mobile-header{display:none}
@@ -203,7 +203,7 @@ background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .workspace{flex:1;width:100%}
 .shell:not(.collapsed) .dismiss{display:block;position:fixed;inset:56px 0 0;border:0;background:#0003;z-index:2}
 .rebuild-slot,.collapsed .rebuild-slot{left:12px;bottom:12px;width:auto;padding:0}
-.rebuild-link,.collapsed .rebuild-link{width:auto;box-shadow:0 6px 20px #0003}
+.rebuild-link,.collapsed .rebuild-link{width:auto;max-width:220px;box-shadow:0 6px 20px #0003}
 .collapsed .rebuild-link .entry-label{display:inline}.collapsed .rebuild-count,.collapsed .rebuild-link .tooltip{display:none!important}}
 </style></head><body>
 <div class="shell" id="console-shell" <!-- SHELL -->>
