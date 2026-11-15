@@ -77,7 +77,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         separate.assert_not_called()
         self.assertTrue(all(file() is None for file in parsed_files))
         for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
-                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
             with self.subTest(completed_cache=cache):
                 self.assertFalse(getattr(ledger, cache))
         items = cast(dict[tuple[str, str], tuple[declarations.DeclaredItem, ...]], getattr(ledger, "_declared_files"))
@@ -991,7 +991,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
         self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
         for cache in ("_site_sources", "_parsed_files", "_declared_blobs", "_active_declarations",
-                      "_tips", "_commit_files", "_item_bodies", "_outside_diffs"):
+                      "_tips", "_commit_files", "_item_bodies", "_name_sites", "_outside_diffs"):
             with self.subTest(completed_cache=cache):
                 self.assertFalse(getattr(ledger, cache))
 
