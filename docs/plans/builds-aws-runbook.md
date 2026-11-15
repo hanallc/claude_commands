@@ -85,7 +85,7 @@ python3 scripts/aws_target/deploy.py spot-table
 
 The rows show configured Standard and GPU machine types.
 The columns show candidate regions and the lowest zone price in USD/h.
-A `-` means the snapshot has no offer for that type and region.
+A `not sold here` cell means AWS sells no Spot of that type in that region.
 Wide tables use separate groups of region columns.
 Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
 GPU types use the G and VT quota; other configured types use the Standard quota.
