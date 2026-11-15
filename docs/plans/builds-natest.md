@@ -4035,3 +4035,32 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals in place of the `runpy.run_path` stub.
 - AWS pair (c7a.4xlarge, 3 rounds): 7 modules 166.71 -> 159.43 CPU s; `test_verify_mac_only` 37.85 -> 34.79.
 - Commit 1e8b2f6fd. Test-only change.
+
+### Phase 277 — The stopped-worker startup stub imports staff only where a child stops a worker  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### Work Order
+
+**Goal:** child Python processes in the three modules that use `stopped_worker_module` skip the `staff` and `stop_resume` imports, so those modules use less AWS CPU.
+
+**Decision:** a command profile on 1a3af57d0 showed each child Python start at 0.55-0.65 s in `test_assign_claude_follow`. The stub `sitecustomize.py` imported `staff` and `stop_resume` (about 0.2 s) in every child, also in children that never stop a worker.
+
+**Spec:**
+1. The stub installs a `sys.meta_path` finder. When a child imports `scripts.agents.stop_resume`, the finder loads the real module and then replaces `stop`. The stub `stop` imports `staff` and `stop_resume` when it runs.
+2. `test_failed_switch_delivery_retries_the_saved_handoff_before_the_assignment` keeps its three launches and runs them in process. Its catalog retry part moves to the new `@process_boundary` test `test_failed_catalog_switch_retries_on_the_first_model`, which needs the startup stub.
+3. Each assertion stays.
+
+**Files:**
+- `scripts/production/staff_test_support.py`
+- `scripts/direct/test_assign_claude_follow.py`
+
+**Workers:** director; no-worker mode.
+- impl: all files.
+
+**Constraints from prior phases:**
+- Phase 221: the follow module runs content calls in process, except cases marked `@process_boundary`.
+
+**Acceptance gate:**
+- `test_assign_claude_follow`, `test_assign_claude_workers` and `test_claude_worker` pass; basedpyright 0 errors and 0 warnings.
+- aws pair (3 rounds) shows a gain.
