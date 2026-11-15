@@ -452,7 +452,7 @@ section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
 button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + "</script></body></html>").encode("utf-8")
+</style><style>''' + page_frame.COPY_STYLE + '''</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + page_frame.COPY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
