@@ -4337,20 +4337,11 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 302
 **Owner:** natest (builds gave the go on 11-15; production change, the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** `phase_wait_holder_flags` runs its holder lookup through `verify_helper`, so a lookup starts no new Python process.
-
-**Spec:**
-- Cause: the lookup is an inline `"$PY" -` heredoc in verify.sh. test_verify_wait_holder makes 59 starts, 2.2 natedev CPU s.
-- Move the heredoc to `scripts/direct/phase_wait_holder.py` with a typed top-level `main()`; it reads the same 6 arguments from `sys.argv` and prints the same lines.
-- `phase_wait_holder_flags` calls `VERIFY_PY_HELPER=PHASE_WAIT_HOLDER verify_helper "$PHASE_WAIT_HOLDER_SCRIPT" ...`. The fallback path still passes `VERIFY_PY_HELPER`, so the identity observer counts in test_verify_wait_holder stay valid.
-- basedpyright reports zero errors and zero warnings on the new file.
-
-**Files:** `scripts/direct/verify.sh`, `scripts/direct/phase_wait_holder.py` (new).
-
-**Workers:** 1 writer (the director; no-worker mode).
-
-**Constraints from prior phases:** Phase 302 sends the recorder calls through `verify_helper`.
-
-**Acceptance gate:** the verify modules pass on natedev; natedev CPU of wait_holder before and after; AWS pair; every behavior check stays.
+- `phase_wait_holder_flags` in verify.sh ran a 115-line python heredoc, a new Python start for each holder lookup.
+- The lookup is `scripts/direct/phase_wait_holder.py` with a typed `main` (5 arguments). `verify_helper` runs it in its process; with no helper, it falls back to `"$PY"`. Output lines are unchanged.
+- The script path comes from the recorder folder, so function extracts in tests keep working. The script finds its package root from its own place.
+- Tests that extract the function without a helper still start a separate Python (26 of 59 lookups in wait_holder).
+- AWS pair, 9 verify and recorder modules: about 1.5 CPU s less (wait_holder 1.04).
+- Commit 6fd02cc51. Production change; the diff went to sdlc.
