@@ -31,6 +31,10 @@ where each task's folder is an entry: it stays while its task is open, goes
 when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
 session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays, as does each run's tmp/ (its TMPDIR).
 Run keep reasons keep the run folder. Its tmp/ entries use the 4 h and process-use rules.
+First, in each session temp root (running or not), each run tmp/ and the test-runs/ folder in each,
+a temporary_build_folder allocation whose caller ended goes at once: its free lease marks it
+temporary, and its maker removes it at its end. A stop with no cleanup leaves it, and a fixture repo
+in it would fail the git check below for ever.
 A director or session worktree guard permits the same checks for closed phases. Open runs and open phases stay.
 Unreadable ownership or phase state keeps the affected entries. Each session temp entry also uses the 4 h rule.
 In a temp folder a folder's ctime is no change, since
@@ -108,7 +112,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, conf, copy_record, scratch, testing_folders, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -212,6 +216,7 @@ TASK_OPEN = "its task is open and it changed in the last 7 days"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
 UNREADABLE = "it cannot be read"
+ENDED_TEMPORARY = "its temporary_build_folder caller ended"
 PHASE_OPEN = "its phase is open"
 WORKER_USES = "a live worker uses it"
 UNSAVED_WORK = "it holds unsaved git work"
@@ -1020,10 +1025,45 @@ def temp_parents(roots: Roots, live: frozenset[str] | None) -> tuple[str, ...]:
     sessions = () if live is None else tuple(
         entry.path for root in roots.sessions for entry in listing(root)
         if entry.name in live and entry.is_dir(follow_symlinks=False))
-    runs = tuple(temp for root in roots.runs for entry in listing(root)
+    return sessions + run_temp_folders(roots)
+
+
+def run_temp_folders(roots: Roots) -> tuple[str, ...]:
+    """Each run folder's temp folder (its TMPDIR)."""
+    return tuple(temp for root in roots.runs for entry in listing(root)
                  if entry.is_dir(follow_symlinks=False) and os.path.isdir(temp := os.path.join(entry.path, RUN_TEMP_NAME))
                  and not os.path.islink(temp))
-    return sessions + runs
+
+
+def remove_ended_temporary_folders(roots: Roots, result: Sweep) -> None:
+    """Remove each temporary_build_folder allocation whose caller ended from each session temp root,
+    running or not, each run temp folder, and the test-run parent in each.
+
+    A stop with no cleanup (SIGKILL, a default SIGTERM) leaves the folder and its free lease. Its maker
+    removes it at its end, so no age, process or git check applies: a test fixture repo holds commits
+    on no remote, and the git check would keep it for ever."""
+    sizes: dict[Path, tuple[float, int]] = {}
+
+    def measure(path: Path) -> None:
+        change = last_change(str(path), Limit(float("inf"), RECENT))
+        sizes[path] = change if isinstance(change, tuple) else (0.0, 0)
+
+    sessions = tuple(entry.path for root in roots.sessions for entry in listing(root) if entry.is_dir(follow_symlinks=False))
+    for parent in sessions + run_temp_folders(roots):
+        # The test-run parent holds only test-run folders, so any free one goes (testing_folders.py).
+        for folder, ended_only in ((Path(parent), True), (Path(parent) / testing_folders.TEST_RUNS_NAME, False)):
+            try:
+                removed = build_folders.sweep_temporary_build_folders(folder, wait=False, ended_only=ended_only,
+                                                                      removing=measure)
+            except (OSError, ValueError) as error:
+                result.failed.append(FailedEntry(path=str(folder), error=str(error)))
+                continue
+            for path in removed:
+                newest, size = sizes.get(path, (0.0, 0))
+                result.freed += size
+                result.deleted.append(DeletedEntry(path=str(path), gib=round(size / GIB, 3),
+                                                   last_change=when(newest) if newest else "unknown",
+                                                   reason=ENDED_TEMPORARY))
 
 
 @dataclass(frozen=True)
@@ -1217,6 +1257,8 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     result = Sweep()
+    if not dry_run:
+        remove_ended_temporary_folders(roots, result)
     pane_use = read_pane_runs()
     resumed: set[str] = set()
     if not dry_run:

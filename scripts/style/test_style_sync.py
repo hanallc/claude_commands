@@ -1373,7 +1373,7 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         lease_path = directory.with_name(directory.name + ".lease.json")
         self.assertTrue(lock.is_file())
         lease = cast(dict[str, object], json.loads(lease_path.read_text()))
-        self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+        self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time", "temporary"})
         self.assertEqual(lease["pid"], process.pid)
         self.assertIsInstance(lease["start_time"], str)
         self.assertEqual(build_folders.build_folder_state(directory), "free")

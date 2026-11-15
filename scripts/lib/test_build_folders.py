@@ -420,8 +420,8 @@ def mkdir_step(name, mode=0o777, *, dir_fd=None):
         interrupt()
         return result
     return mkdir(name, mode, dir_fd=dir_fd)
-def lease_step(*args):
-    lease(*args)
+def lease_step(*args, **kwargs):
+    lease(*args, **kwargs)
     interrupt()
 def fstat_step(fd):
     inode = fstat(fd)
@@ -1427,7 +1427,7 @@ os._exit(0)
                         finally:
                             os.close(descriptor)
                     self.assertIsInstance(process_start.process_start(int(child_pid)), (process_start.Gone, process_start.Zombie))
-                    folders.sweep_temporary_build_folders(folder.parent)
+                    _ = folders.sweep_temporary_build_folders(folder.parent)
                     self.assertFalse(folder.exists())
                     self.assertFalse(folder.with_name(folder.name + ".lease.json").exists())
                     self.assertFalse(folder.with_name(folder.name + ".lock").exists())
@@ -1442,9 +1442,34 @@ os._exit(0)
         free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
         _release_folder(free)
         with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
-            folders.sweep_temporary_build_folders(self.root, wait=False)
+            _ = folders.sweep_temporary_build_folders(self.root, wait=False)
         self.assertTrue(held.is_dir())
         self.assertFalse(free.exists())
+
+    def test_a_shared_parent_sweep_takes_only_ended_temporary_folders(self) -> None:
+        probe = "import pathlib, signal; print(pathlib.Path.cwd(), flush=True); signal.pause()"
+        process = subprocess.Popen([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
+                                    "--name", "proof", "--", sys.executable, "-c", probe],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        assert process.stdout is not None
+        ended = Path(cast(str, process.stdout.readline()).strip())
+        # A stop of the caller and its child leaves a free folder whose lease marks it temporary.
+        process_group.send_process_group(process.pid, signal.SIGKILL)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        parent = ended.parent
+        kept = folders.create_build_folder(folders.UniqueBuildFolder("shared-kept-", folders.ExplicitBuildParent(parent)))
+        _release_folder(kept)
+        seen: list[Path] = []
+        with folders.temporary_build_folder(folders.UniqueBuildFolder("shared-held-", folders.ExplicitBuildParent(parent))) as held:
+            removed = folders.sweep_temporary_build_folders(parent, wait=False, ended_only=True, removing=seen.append)
+            self.assertTrue(held.is_dir())
+        self.assertEqual(removed, [ended])
+        self.assertEqual(seen, [ended])
+        self.assertFalse(ended.exists())
+        self.assertFalse(ended.with_name(ended.name + ".lease.json").exists())
+        # A folder made by create_build_folder outlives its maker, so a free lock is no end for it.
+        self.assertTrue(kept.is_dir())
+        self.assertFalse(held.exists())
 
     def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
         real_open = os.open
@@ -1465,9 +1490,9 @@ os._exit(0)
                     free = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
                     _release_folder(free)
                     with mock.patch.object(os, "open", side_effect=open_then_remove):
-                        folders.sweep_temporary_build_folders(self.root, wait=False)
+                        _ = folders.sweep_temporary_build_folders(self.root, wait=False)
                     self.assertEqual(removed, [free.name + ".lock"])
-                    folders.sweep_temporary_build_folders(self.root, wait=False)
+                    _ = folders.sweep_temporary_build_folders(self.root, wait=False)
                     self.assertFalse(free.exists())
                 else:
                     with mock.patch.object(os, "open", side_effect=open_then_remove):
@@ -1521,14 +1546,14 @@ os._exit(0)
                         temporary.unlink()
                     if not held:
                         _release_folder(path)
-                    folders.sweep_temporary_build_folders(self.root)
+                    _ = folders.sweep_temporary_build_folders(self.root)
                     if held:
                         self.assertTrue(path.with_name(path.name + ".lock").is_file())
                         self.assertEqual(path.exists(), stage == "folder")
                         self.assertEqual(lease.exists(), stage in ("folder", "lease"))
                         self.assertEqual(temporary.exists(), stage != "lock")
                         _release_folder(path)
-                        folders.sweep_temporary_build_folders(self.root)
+                        _ = folders.sweep_temporary_build_folders(self.root)
                     self.assertFalse(path.exists())
                     self.assertFalse(lease.exists())
                     self.assertFalse(temporary.exists())

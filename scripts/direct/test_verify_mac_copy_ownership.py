@@ -31,7 +31,7 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         for folder in [*holds, *folders]:
             self.assertTrue(folder.with_name(folder.name + ".lock").is_file())
             lease = cast(dict[str, object], json.loads(folder.with_name(folder.name + ".lease.json").read_text()))
-            self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+            self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time", "temporary"})
             self.assertIsInstance(lease["pid"], int)
             self.assertIsInstance(lease["start_time"], str)
         process.send_signal(signal.SIGTERM)

@@ -547,6 +547,10 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   Held locks prevent removal.
   SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
   No signal handler runs cleanup.
+  The hourly tmp sweep (`scripts/lint/tmp_sweep.py`) also sweeps each `test-runs` parent, so residue goes when no next run comes.
+  A `temporary_build_folder` lease records `"temporary": true`.
+  In each session temp root and run `tmp/`, the hourly sweep removes a free lease with that mark at once, with no age or git check.
+  A `create_build_folder` folder outlives its maker, so its free lease stays with the 4 h and git rules.
 - Each test module gets a fresh `BUILDLOG_DIR` inside its temp root, so its log rows cannot reach the real build log.
 - Each test module starts with tripwires for `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH: any call, including lookup commands, exits 99 and fails the module with the tool and arguments; a module can put its own stubs first. Each module also gets a private `BUILDLOG_LIVE_MEMORY_TRIPWIRE` record path: a recorded read of `/proc/meminfo` or `/proc/pressure/memory` fails the module with `a test read live memory`, the path and the arguments, even if its tests pass. Neither kind of tripwire failure runs again, including after a signal during a natedev hold. An incomplete or invalid memory record also fails the module and prints `a test read live memory (unreadable record):` with the raw line. The types job gets no live memory tripwire.
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.

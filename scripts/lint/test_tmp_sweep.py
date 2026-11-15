@@ -809,7 +809,44 @@ def created_in_ended_process(requests: list[tuple[str, str]]) -> list[Path]:
     return [Path(line) for line in child.stdout.splitlines()]
 
 
+def temporary_in_stopped_process(prefix: str, parent: Path) -> Path:
+    """Allocate a temporary_build_folder with a fixture repo in a child that exits with no cleanup."""
+    code = ("import os, subprocess, sys\nfrom pathlib import Path\nfrom scripts.lib import build_folders\n"
+            "request = build_folders.UniqueBuildFolder(sys.argv[1], build_folders.ExplicitBuildParent(Path(sys.argv[2])))\n"
+            "with build_folders.temporary_build_folder(request) as path:\n"
+            "    subprocess.run(['git', 'init', '-q', str(path / 'repo')], check=True)\n"
+            "    (path / 'repo/a').write_text('fixture')\n"
+            "    print(path, flush=True)\n"
+            "    os._exit(137)\n")
+    child = subprocess.run([sys.executable, "-c", code, prefix, str(parent)], text=True, capture_output=True,
+                           check=False, cwd=Path(__file__).resolve().parents[2], timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+    assert child.returncode == 137, child.stderr
+    return Path(child.stdout.strip())
+
+
 class TempParentTests(TmpSweepCase):
+    def test_an_ended_temporary_folder_goes_at_once_whatever_its_git_work(self) -> None:
+        live_root = self.tmp / "session" / LIVE_SESSION
+        live_root.mkdir(parents=True)
+        ended = temporary_in_stopped_process("admit-test-", live_root)
+        self.assertTrue((ended / "repo/.git").is_dir())
+        # create_build_folder work outlives its maker, so its free lease is no end.
+        kept, = created_in_ended_process([("queue-place-", str(live_root))])
+        self.recent(write(kept / "output"))
+        # An old test-run folder in an ended session's test-run parent has no mark; that parent holds only runs.
+        runs = self.tmp / "session" / "ended-session" / "test-runs"
+        runs.mkdir(parents=True)
+        old_run, = created_in_ended_process([("test-run-", str(runs))])
+        _ = write(old_run / "fixture/.git/HEAD", "ref: refs/heads/main\n")
+        result = self.sweep()
+        self.assertFalse(ended.exists())
+        self.assertFalse(old_run.exists())
+        self.assertTrue(kept.is_dir())
+        removed = {entry["path"]: entry["reason"] for entry in result.deleted}
+        self.assertEqual(removed[str(ended)], tmp_sweep.ENDED_TEMPORARY)
+        self.assertEqual(removed[str(old_run)], tmp_sweep.ENDED_TEMPORARY)
+        self.assertEqual(self.sweep(dry_run=True).deleted, [])
+
     def test_common_session_owner_keeps_its_root_and_sweeps_only_idle_entries(self) -> None:
         session_parent = self.tmp / "session"
         owner = build_folders.create_build_folder(build_folders.StableOwnerFolder(

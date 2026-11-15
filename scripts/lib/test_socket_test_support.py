@@ -68,7 +68,7 @@ class ShortSocketDirectoryTests(unittest.TestCase):
                 with short_socket_directory() as held:
                     self.assertFalse(left.exists())
                     self.assertFalse(left.with_name(left.name + ".lease.json").exists())
-                    build_folders.sweep_temporary_build_folders(Path(held).parent, wait=False)
+                    _ = build_folders.sweep_temporary_build_folders(Path(held).parent, wait=False)
                     self.assertTrue(Path(held).is_dir())
 
     def test_one_process_sweeps_a_parent_once(self) -> None:

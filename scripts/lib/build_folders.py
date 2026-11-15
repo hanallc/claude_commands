@@ -307,10 +307,12 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         os.close(descriptor)
 
 
-def _write_lease(path: Path, directory: int, spec: BuildFolderSpec) -> None:
+def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, temporary: bool) -> None:
+    """temporary marks a temporary_build_folder allocation: it goes when its caller ends, so a free lock
+    means a stopped caller (sweep_temporary_build_folders with ended_only)."""
     record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": os.getpid(),
-              "start_time": datetime.now(timezone.utc).isoformat()}
+              "start_time": datetime.now(timezone.utc).isoformat(), "temporary": temporary}
     name = path.name + ".lease.json"
     try:
         existing = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -323,16 +325,16 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec) -> None:
         if not stat.S_ISREG(existing.st_mode) or existing.st_nlink > 1:
             raise ValueError("a build folder lease must be a regular file with one link")
     text = json.dumps(record) + "\n"
-    temporary = name + "." + secrets.token_hex(8) + ".tmp"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+    staged = name + "." + secrets.token_hex(8) + ".tmp"
+    descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=directory)
     try:
         with os.fdopen(descriptor, "w") as output:
             _ = output.write(text)
-        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.replace(staged, name, src_dir_fd=directory, dst_dir_fd=directory)
     finally:
         try:
-            os.unlink(temporary, dir_fd=directory)
+            os.unlink(staged, dir_fd=directory)
         except FileNotFoundError:
             pass
 
@@ -404,7 +406,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         if not stat.S_ISDIR(existing.st_mode):
                             raise FileExistsError(errno.EEXIST, "build folder is not a directory", str(path))
                     new_folder = existing is None
-                    _write_lease(path, directory, allocation)
+                    _write_lease(path, directory, allocation,
+                                 temporary=isinstance(request, _TemporaryFolderRequest) and not stable)
                     if existing is None:
                         mode = request.mode if isinstance(request, StableOwnerFolder) else 0o777 if stable else 0o700
                         try:
@@ -567,9 +570,28 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                             temporary=temporary, dir_fd=directory)
 
 
-def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
-    """Remove free allocations in a parent reserved for temporary maker folders.
-    With wait False, a held folder costs one lock try, not the probe wait."""
+def _marked_temporary(name: str, directory: int) -> bool:
+    """Whether name's lease marks a temporary_build_folder allocation."""
+    try:
+        descriptor = os.open(name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except OSError:
+        return False
+    with os.fdopen(descriptor, encoding="utf-8") as lease:
+        try:
+            record = cast(object, json.load(lease))
+        except (OSError, ValueError):
+            return False
+    return isinstance(record, dict) and cast(dict[str, object], record).get("temporary") is True
+
+
+def sweep_temporary_build_folders(parent: Path, *, wait: bool = True, ended_only: bool = False,
+                                  removing: Callable[[Path], object] | None = None) -> list[Path]:
+    """Remove free allocations in a parent reserved for temporary maker folders, and return them.
+    With wait False, a held folder costs one lock try, not the probe wait.
+    With ended_only, the parent is shared: only a free allocation whose lease marks a
+    temporary_build_folder goes, since that caller removes its folder when it ends.
+    removing sees each folder under its lock just before the removal."""
+    removed: list[Path] = []
     try:
         with _folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
@@ -580,16 +602,23 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
             for name in sorted(names):
                 path = parent / name
 
-                def cleanup() -> None:
+                def cleanup() -> bool:
+                    if ended_only and not _marked_temporary(path.name, directory):
+                        return False
                     try:
                         allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
-                        return
+                        return True
+                    if removing is not None:
+                        _ = removing(path)
                     _remove_folder(path, directory, allocated)
+                    return True
 
-                _ = remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+                if remove_build_folder(path, cleanup, dir_fd=directory, wait=wait):
+                    removed.append(path)
     except FileNotFoundError:
         pass
+    return removed
 
 
 @contextmanager

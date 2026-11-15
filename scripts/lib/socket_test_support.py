@@ -24,7 +24,7 @@ def socket_parent() -> Path:
     parent.mkdir(mode=0o700, exist_ok=True)
     if parent not in _swept:
         _swept.add(parent)
-        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        _ = build_folders.sweep_temporary_build_folders(parent, wait=False)
     return parent
 
 

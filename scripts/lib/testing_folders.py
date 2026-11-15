@@ -12,6 +12,8 @@ from scripts.lib import build_folders
 
 
 RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
+# The test-run parent in each temporary parent; tmp_sweep.py also clears its ended runs.
+TEST_RUNS_NAME = "test-runs"
 BUILDLOG_ENV = "BUILDLOG_DIR"
 
 
@@ -25,9 +27,9 @@ def test_run_folder() -> Generator[Path]:
     old_tempdir = tempfile.tempdir
     inherited = build_folders.inherited_temporary_parent().resolve()
     parent = (inherited.parent if str(inherited) == previous[RUN_FOLDER_ENV]
-              else inherited / "test-runs")
+              else inherited / TEST_RUNS_NAME)
     parent.mkdir(parents=True, exist_ok=True)
-    build_folders.sweep_temporary_build_folders(parent)
+    _ = build_folders.sweep_temporary_build_folders(parent)
     request = build_folders.UniqueBuildFolder("test-run-", build_folders.ExplicitBuildParent(parent))
     with build_folders.temporary_build_folder(request) as path:
         os.environ["TMPDIR"] = str(path)
