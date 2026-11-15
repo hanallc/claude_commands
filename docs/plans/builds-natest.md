@@ -4257,20 +4257,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (builds assigned the crate_run trial timeout; builds gave the go on 11-15; sdlc has no objection).
 
-#### Work Order
+#### As-built
 
-**Goal:** a paired trial box gets `lifetime_minutes` from its launch, so a slot queue wait does not shorten its run budgets.
-
-**Spec:**
-- Cause: `gate_trial.py` set each request `expires` when it wrote request.json, before the slot queue wait. `gate_box.py` gives each run `(expires - now - delivery_s) / (2 x runs left)`. A 7 minute wait gave `style/test_crate_run.py` about 67 s a run; it needs about 70 s, so all 6 runs exited 124.
-- `coordinate_trial`: after every module holds its slot, set each pending request `expires` to `worker.clock() + lifetime_minutes * 60`, save its request.json, then reserve the cost.
-- `paired_module`: read request.json after the coordinator sends `launch`.
-- Trial branch names keep their start stamp. A box clones its branch within about one minute of launch.
-
-**Files:** `scripts/aws_target/gate_trial.py`, `scripts/aws_target/test_cloud_gate.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the new test (a queue wait does not shorten the box lifetime) fails without the fix and passes with it; test_cloud_gate, test_gate_trial and test_gate_box pass on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count.
+- Cause of the crate_run trial 124: `gate_trial.py` set the box expiry before the slot queue wait, and `gate_box.py` splits the time left into run budgets.
+- `coordinate_trial` sets each pending request expiry to launch time + `lifetime_minutes` after every slot is held; `paired_module` reads request.json after `launch`. Branch names keep their start stamp.
+- Test `test_paired_queue_wait_does_not_shorten_the_box_lifetime` in `test_cloud_gate.py`.
+- AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
+- Commit abe4afc09. Production change.
