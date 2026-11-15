@@ -128,6 +128,7 @@ td.best { font-weight: 700; }
 const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
+const NO_REGION = "No region chosen.";
 const NOT_SOLD = "Not sold here";
 const SVG = "http://www.w3.org/2000/svg";
 const VIEWS = [["spot", "Spot price"], ["cost", "Cost per gate"]];
@@ -187,6 +188,7 @@ function scaleColor(value, low, middle, high) {
 // The scale color of each numbered cell in view, column by column, the lowest and highest cells of each column,
 // and the cheapest cells of the whole table.
 // A column or a table with fewer than two different numbers in view compares nothing, so it has no color or mark.
+// A column with two numbers has no box: each is an end, and the colors already show which.
 function scaleCells(table, cells) {
   const colors = new Map();
   const ends = new Set();
@@ -203,7 +205,7 @@ function scaleCells(table, cells) {
     const [low, high] = [sorted[0], sorted[sorted.length - 1]];
     for (const [place, value] of columnCells) {
       colors.set(place, scaleColor(value, low, middle, high));
-      if (value === low || value === high) ends.add(place);
+      if (sorted.length > 2 && (value === low || value === high)) ends.add(place);
     }
   }
   const values = numbered.map(([, value]) => value);
@@ -278,7 +280,7 @@ function fill(section, table, note) {
   section.replaceChildren(heading(table.title));
   if (note) section.appendChild(element("p", note, "note"));
   if (shows([table])) section.appendChild(tableElement([table], false));
-  else if (table.rows.length) section.appendChild(element("p", NOTHING_SHOWN, "note"));
+  else if (table.rows.length) section.appendChild(element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
   return section;
 }
 
@@ -329,7 +331,7 @@ function drawScope() {
   document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;
   document.getElementById("explanation").textContent = costs.explanation;
   const tables = document.getElementById("run-tables");
-  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", NOTHING_SHOWN, "note"));
+  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
   fill(document.getElementById("refused"), costs.refused);
   fill(document.getElementById("launched"), costs.launched);
 }
@@ -375,7 +377,7 @@ for (const group of scopeFilters) {
   for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
 }
 
-// The region filter: all regions by default, any combination; the last chosen region stays on.
+// The region filter: all regions by default, any combination. None clears every region, so one click then shows only that one.
 const chips = document.getElementById("regions");
 const allChip = element("button", "All", "all");
 allChip.type = "button";
@@ -387,19 +389,24 @@ const regionChips = data.regions.map(region => {
   chips.appendChild(chip);
   return chip;
 });
+const noneChip = element("button", "None", "all");
+noneChip.type = "button";
+chips.appendChild(noneChip);
 function showRegions(next) {
   shown = next;
   allChip.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+  noneChip.setAttribute("aria-pressed", String(shown.size === 0));
   for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
 allChip.addEventListener("click", () => showRegions(new Set(data.regions)));
+noneChip.addEventListener("click", () => showRegions(new Set()));
 for (const chip of regionChips) {
   chip.addEventListener("click", () => {
     const next = new Set(shown);
     if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
-    if (next.size) showRegions(next);
+    showRegions(next);
   });
 }
 

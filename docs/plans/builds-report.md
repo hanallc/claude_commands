@@ -1577,4 +1577,6 @@ From the user (via builds, 2026-11-15): "we should white box outline both the lo
 
 - `aws_prices.html`: `scaleCells` returns `ends`, the lowest and the highest cells of each type column with two or more different values. An `end` cell has a 3 px white box inside a 1 px dark edge (`--box`, `--box-edge`), the same in both themes. The cheapest cell of each table stays bold (`best`) and lost its outline.
 - The legend reads "White box: the lowest and the highest of each type." and "Bold: the cheapest in the table."
-- Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, and phone width).
+- A column with only two values in view has no box, because the colors already show which is which.
+- From the user (via builds, 2026-11-15): "the filter on the aws page - we need a None at the end that turns all fiters off so i can quickly just select one or two i want to look at". From builds (not the user): add it to this phase. The region filter has a `None` chip after the last region. It clears every region, and each card then says "No region chosen." A region chip can now turn off the last chosen region. The view and run kind switches choose one value each, so they have no `None`.
+- Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, phone width, and the region filter with All, None, None then one region, and None then two regions).

@@ -644,6 +644,7 @@ The user asked for these page changes on 2026-11-14 through builds:
    In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    A thin dark edge around the white box keeps it visible on the light page. Equal cells all have the box.
+   A column with only two values has no box, because the colors already show which is which.
    The cheapest cell of each table is bold. One legend line explains the colors, the box and the bold.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
@@ -655,10 +656,12 @@ The user asked for these page changes on 2026-11-14 through builds:
    The user asked for it on 2026-11-15 through builds.
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
-1. A chip for each region toggles it, and `All` shows every region again. The last chosen region stays on.
+1. A chip for each region toggles it. `All` shows every region again.
+   `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
+   With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
 3. The colors, the white box and the bold use only the chosen regions. `Table.values` holds the number of each cell.
-   One region shows no color and no mark.
+   One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
 6. The page keeps the region choice in browser storage. The URL keeps the price view and the run kind.
