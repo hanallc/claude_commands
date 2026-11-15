@@ -418,7 +418,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}" value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows) for item in prepared.questions))
-    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}">'
+    content = (PAGE_STYLE + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
                + f'<h1>{change_page.TITLES[kind]}</h1>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
@@ -681,6 +681,8 @@ function applyHeldPage(){
  if(!heldPage || activeSaves || [...content.querySelectorAll('textarea,input[type=text]')].some(field=>field.value!=='' && !field.closest('form')?.hidden)) return;
  const fresh=heldPage;heldPage=null;
  if(fresh.outerHTML===shownPage) return;
+ // A page from an older server script cannot bind the new rows, so it loads again.
+ if(fresh.dataset.script!==content.dataset.script){location.reload();return;}
  const opened=new Set([...content.querySelectorAll('details[open]')].map(detailKey));
  const left=scrollX,top=scrollY,focused=document.activeElement;
  const controlId=focused===runnerMenu ? focused.id : '';
@@ -727,3 +729,4 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
+SCRIPT_VERSION = change_page.script_version(SCRIPT)

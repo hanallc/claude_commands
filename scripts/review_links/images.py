@@ -192,7 +192,7 @@ def render(root: Path) -> bytes:
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
-               + f'<div><div data-images>{cards}</div><p hidden data-empty></p></div></div>'
+               + f'<div><div data-images data-script="{SCRIPT_VERSION}">{cards}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to filter images, delete an image or send feedback.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return change_page.document(content, "Images")
@@ -374,6 +374,11 @@ async function refresh() {
     if (!response.ok) return;
     const fresh = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('[data-images]');
     if (!fresh || sending) return;
+    // A page from an older server script cannot bind the new cards, so it loads again.
+    if (fresh.dataset.script !== list.dataset.script) {
+      location.reload();
+      return;
+    }
     const top = scrollY;
     list.replaceWith(fresh);
     list = fresh;
@@ -401,6 +406,7 @@ if (target) {
   target.scrollIntoView({block: 'start'});
 }
 })();"""
+SCRIPT_VERSION = change_page.script_version(SCRIPT)
 
 
 def main(arguments: list[str]) -> int:
