@@ -4095,3 +4095,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `lib/test_py_floor_sources` keeps its full parse: it must parse each file at the floor version.
 - AWS pair (3 rounds, median CPU s): 46.0 -> 15.5 in total; `session_send_sources` 7.23 -> 0.33, `launch_accounts_sources` 9.86 -> 3.23, `push_texts_sources` 8.64 -> 2.77.
 - Commit bddca5e1e. Test-only change.
+
+### Phase 282 — A full gate time limit counts only runs that ran test modules  · status: done
+**Depends on:** none
+**Owner:** natest (production change; nightly red e986a7389d0cf7a911935fe5).
+
+#### As-built
+
+- `history_time_limit` in `scripts/test_times/gate_record.py` counts a full run only when `modules_run > 0`. A run of the type check alone does not set the limit.
+- Cause of nightly red e986a7389d0cf7a911935fe5: five passing admin-console `--full` runs of the type check alone (104-135 s) gave a 175.09 s limit. The 11-15 nightly stopped with 747 of 788 modules not started.
+- Until a natedev full run with tests passes, a natedev full run has no time limit.
+- The queue_place tests wait on their own fixture queue, not the live queue.
+- Commit a92140f44. Production change (needs the sdlc go).
+
+### Phase 283 — The queue_place fixture waits no start spacing or stop grace  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change; builds asked 11-15).
+
+#### As-built
+
+- `QueuePlaceFixture` in `scripts/build_queue/test_queue_place.py` opens `AdmissionFixture` with `skip_idle_spacing=True`. Its config sets `program_stop_seconds=0.2` and `program_sample_seconds=0.1`; a test that rewrites the config keeps its own values.
+- Cause: the fixture queue waited 5 s of start spacing between starts, and `cleanup_program_starts` waited a 5 s stop grace on a TERM-resistant program.
+- AWS pair (3 rounds): CPU 15.65 -> 15.21 s, wall 127.7 -> 24.8 s; all pass, same tests.
+- Commit ce8c5dc7c. Test-only change.
