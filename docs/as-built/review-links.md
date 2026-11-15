@@ -474,7 +474,8 @@ A reload restores that place when the row waits, awaits validation, or has an op
 An answered row stays absent from the browser list during delivery and after a reload.
 An empty showrunner filter shows **No changes for this showrunner.** or **No questions for this showrunner.** and hides Skip for now.
 The showrunner filter supplies the count; the card has no separate remaining count.
-Each successful save opens the next waiting change in the same filter.
+Works and Does not work open the next waiting change at once, before the server answers.
+Other answers open the next waiting change in the same filter after a successful save.
 Skip for now skips a change without saving an answer.
 The page keeps the current row if the user selects Skip for now or another tab during the save.
 
@@ -566,7 +567,10 @@ Owner unavailable changes retain their verdict controls and hide every showrunne
 
 Each answer uses a background `fetch` POST.
 The row shows **Saving** during a save.
-An automatic move shows **Answer saved.** or **Review saved.** above the next card.
+After Works or Does not work, the next card shows **Saving review.** until the save ends, then **Review saved.**
+An automatic move after another answer shows **Answer saved.**, **Follow-up sent.**, **Skipped.** or **Review saved.** above the next card.
+A failed Works or Does not work save puts the row back in the list with its typed text and answer form.
+The notice then shows **Not saved: <row>. <reason> It is back in the list.** and an **Open it** button that shows the row.
 Skip for now stays available during a save.
 A failed save retains the feedback and selected outcome on that row.
 A failed save keeps the row in that count and does not change the current row.

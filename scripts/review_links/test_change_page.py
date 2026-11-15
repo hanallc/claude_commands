@@ -2750,12 +2750,21 @@ class ChangePageTests(unittest.TestCase):
    for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
    navigate();const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
    field.value='Keep <these> words';
-   window.fetch=async()=>({ok:false,json:async()=>({reason:'Fixture save failed'})});
-   await save(row,form,'not works');
-   check(current===row && row.dataset.pending==='true' && !form.hidden,'failed save keeps the card open');
+   let answer;
+   window.fetch=()=>new Promise(resolve=>{answer=resolve;});
+   const saving=save(row,form,'not works');
+   check(current!==row && row.dataset.pending==='false','Does not work shows the next change before the server answers');
+   check(!saveNotice.hidden && saveNotice.textContent==='Saving review.','the notice says the review is saving');
+   const shown=current;
+   answer({ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
+   check(current===shown,'a failed save does not move the shown change');
+   check(row.dataset.pending==='true' && !form.hidden,'a failed save puts the change back in the list');
    check(field.value==='Keep <these> words','failed save keeps the text');
-   check(row.querySelector('[data-save-state]').textContent==='Not saved: Fixture save failed','failed save shows the reason');
-   check(saveNotice.hidden,'failed save hides the previous success notice');
+   check(row.querySelector('[data-save-state]').textContent==='Not saved: Fixture save failed.','failed save shows the reason');
+   check(row.dataset.shown && row.querySelector('.change-details dd').textContent===row.dataset.shown,'the notice uses the change id the card shows');
+   check(saveNotice.textContent==='Not saved: '+row.dataset.shown+'. Fixture save failed. It is back in the list. Open it','the notice names the change that was not saved');
+   saveNotice.querySelector('button').click();
+   check(current===row && saveNotice.hidden,'Open it shows the change again');
    for(const row of rows) row.dataset.pending='false';
    navigate('');check(!empty.hidden && empty.textContent==='No changes to review.','changes empty page');
    first.dataset.pending='true';go(first.dataset.key);

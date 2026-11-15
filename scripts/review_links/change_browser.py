@@ -219,7 +219,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
     text = change_page.answer_status(row.get("Verdict", ""), change.slots)
     saved = f'<p>{html.escape(text)}</p>' if text else ""
-    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
+    return f'''<section hidden data-type="changes" data-key="{html.escape(change.key)}" data-shown="{html.escape(shown)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
@@ -638,6 +638,14 @@ async function save(row,form,outcome){
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
+ const moveOn=notice=>{
+  row.dataset.pending='false';form.hidden=true;
+  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
+  else show();
+ };
+ // Works and Does not work show the next change at once; a failed save puts the change back.
+ const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
+ if(early) moveOn('Saving review.');
  try{
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
@@ -646,14 +654,18 @@ async function save(row,form,outcome){
    outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   saved=true;
-  row.dataset.pending='false';form.hidden=true;
-  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){
-   advance(row);saveNotice.textContent=kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.';
+  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
+  else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
+ }catch(error){
+  const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
+  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  if(early){
+   row.dataset.pending='true';form.hidden=false;show();
+   const open=document.createElement('button');open.type='button';open.textContent='Open it';
+   open.addEventListener('click',()=>go(row.dataset.key));
+   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
    saveNotice.hidden=false;
   }
-  else show();
- }catch(error){
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+(error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message);
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
