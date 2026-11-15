@@ -1,6 +1,6 @@
 """Delete the disks and buckets that a Hana stack retains.
 
-The Hana template retains its data disk, root disk and control bucket, so CloudFormation never deletes them.
+The Hana template retains its data disk and control bucket, so CloudFormation never deletes them.
 A Hana down and a failed Hana change delete them here, so neither leaves a paid resource behind."""
 from __future__ import annotations
 
@@ -55,12 +55,6 @@ def skipped_since(api: AwsCli, stack: str, started: float) -> Retained:
                 for row in ledger.rows(reply, 'StackEvents')
                 if row.get('ResourceStatus') == 'DELETE_SKIPPED'
                 and datetime.fromisoformat(ledger.text(row, 'Timestamp').replace('Z', '+00:00')).timestamp() >= started])
-
-
-def tagged_disks(api: AwsCli, tag: tuple[str, str]) -> Retained:
-    """The unattached disks with the deployment tag."""
-    reply = api.call('describe-volumes', '--filters', f'Name=tag:{tag[0]},Values={tag[1]}', 'Name=status,Values=available')
-    return Retained(frozenset(ledger.text(row, 'VolumeId') for row in ledger.rows(reply, 'Volumes')))
 
 
 def delete(api: AwsCli, retained: Retained, *, wait_s: float) -> None:

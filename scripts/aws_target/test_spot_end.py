@@ -52,7 +52,7 @@ class Request:
 class FakeEc2:
     """An AWS executor with persistent Spot requests, retained disks and buckets, and a Hana stack.
 
-    A box's root disk stays after the box is terminated, as the Hana launch template sets."""
+    A box's root disk is deleted with the box, as the Hana launch template sets."""
     boxes: dict[str, Box] = field(default_factory=dict)
     requests: dict[str, Request] = field(default_factory=dict)
     disks: dict[str, Disk] = field(default_factory=dict)
@@ -121,7 +121,6 @@ class FakeEc2:
         if operation == 'describe-instances':
             value = {'Reservations': [{'Instances': [
                 {'InstanceId': key, 'SpotInstanceRequestId': row.request, 'State': {'Name': row.state},
-                 'BlockDeviceMappings': [{'Ebs': {'VolumeId': row.root, 'DeleteOnTermination': False}}],
                  'Tags': [{'Key': name, 'Value': tag} for name, tag in row.tags.items()]}
                 for key, row in self.boxes.items() if self.matches(rest, row)]}]}
         elif operation == 'describe-spot-instance-requests':
@@ -139,7 +138,7 @@ class FakeEc2:
             for key in rest[1:]:
                 row = self.boxes[key]
                 row.state = 'terminated'
-                self.disks[row.root].state = 'available'
+                del self.disks[row.root]
                 request = self.requests.get(row.request)
                 if request and request.kind == 'persistent' and request.state == 'active':
                     # AWS opens the persistent request again and launches a box with no tags.
@@ -172,8 +171,6 @@ class FakeEc2:
                                         for logical, (kind, physical) in self.resources.items()]}
         elif operation == 'describe-stack-events':
             value = {'StackEvents': self.events}
-        elif operation == 'describe-volumes':
-            value = {'Volumes': [{'VolumeId': key} for key, row in self.disks.items() if self.disk_matches(rest, row)]}
         elif operation == 'delete-volume':
             if self.disks.get(rest[1], Disk('', {})).state != 'available':
                 return subprocess.CompletedProcess(list(arguments), 255, '', 'InvalidVolume.NotFound or in use')
@@ -192,16 +189,6 @@ class FakeEc2:
         elif operation not in ('wait', 'create-change-set', 'delete-change-set'):
             raise AssertionError('Unexpected fake AWS operation: ' + operation)
         return subprocess.CompletedProcess(list(arguments), 0, json.dumps(value), '')
-
-    @staticmethod
-    def disk_matches(arguments: list[str], row: Disk) -> bool:
-        for item in arguments[1:]:
-            name, _, values = item.removeprefix('Name=').partition(',Values=')
-            if name == 'status' and row.state not in values.split(','):
-                return False
-            if name.startswith('tag:') and row.tags.get(name.removeprefix('tag:')) not in values.split(','):
-                return False
-        return True
 
     @staticmethod
     def matches(arguments: list[str], row: Box) -> bool:
@@ -232,7 +219,7 @@ class SpotEndTests(CostFixture):
     def test_end_boxes_cancels_before_terminate_and_leaves_nothing_live(self) -> None:
         fake = FakeEc2()
         _ = fake.launch(tagged=True)
-        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG).boxes, 1)
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
         self.assertLess(fake.operations.index('cancel-spot-instance-requests'), fake.operations.index('terminate-instances'))
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
 
@@ -242,7 +229,7 @@ class SpotEndTests(CostFixture):
         fake.boxes[box].state = 'terminated'
         fake.requests[fake.boxes[box].request].state = 'open'
         _ = fake.launch(tagged=False, request=fake.boxes[box].request)
-        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG).boxes, 1)
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
 
     def test_end_boxes_reads_again_after_a_launch_between_the_cancel_and_the_terminate(self) -> None:
@@ -250,7 +237,7 @@ class SpotEndTests(CostFixture):
         box = fake.launch(tagged=True)
         fake.boxes[box].state = 'terminated'
         fake.requests[fake.boxes[box].request].state = 'open'
-        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG).boxes, 1)
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
 
     def test_a_failed_cancel_terminates_nothing(self) -> None:
@@ -265,7 +252,7 @@ class SpotEndTests(CostFixture):
         fake = FakeEc2()
         kept = fake.launch(tagged=True)
         _ = fake.launch(tagged=True)
-        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG, keep=kept).boxes, 1)
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG, keep=kept), 1)
         self.assertEqual(fake.live_boxes(), [kept])
         self.assertEqual(fake.live_requests(), [fake.boxes[kept].request])
 
@@ -280,20 +267,13 @@ class SpotEndTests(CostFixture):
         subject._hana_stack_change(self.api(fake), self.hana_settings(), self.root / 'template.json',  # pyright: ignore[reportPrivateUsage]
                                    {'DeploymentId': TAG[1]}, keep=keep)
 
-    def test_end_boxes_reports_the_disks_that_stay_after_terminate(self) -> None:
-        fake = FakeEc2()
-        box = fake.launch(tagged=True)
-        ended = spot_end.end_boxes(self.api(fake), TAG)
-        self.assertEqual(ended.volumes, {fake.boxes[box].root})
-        self.assertEqual(fake.disks[fake.boxes[box].root].state, 'available')
-
     def test_a_failed_create_leaves_no_request_box_disk_bucket_or_stack(self) -> None:
         fake = FakeEc2(launch_on_execute=True, fail_wait='stack-create-complete')
         # A disk that an earlier rollback kept, outside this change, stays.
         fake.disks['other-disk'] = Disk('available', {})
         fake.events.append({'LogicalResourceId': 'DataVolume', 'ResourceType': retained.VOLUME,
                             'PhysicalResourceId': 'other-disk', 'ResourceStatus': 'DELETE_SKIPPED', 'Timestamp': OLD_EVENT})
-        with self.assertRaisesRegex(AwsUnavailable, 'ended 1 Spot boxes and their requests, and deleted 2 disks and 1 buckets'):
+        with self.assertRaisesRegex(AwsUnavailable, 'ended 1 Spot boxes and their requests, and deleted 1 disks and 1 buckets'):
             self.change(fake)
         self.assertEqual(fake.leftovers(), ([], [], ['other-disk'], [], False))
         self.assertLess(fake.operations.index('describe-stack-events'), fake.operations.index('delete-stack'))
@@ -305,7 +285,7 @@ class SpotEndTests(CostFixture):
             self.change(fake, kept)
         self.assertEqual(fake.live_boxes(), [kept])
         self.assertEqual(fake.live_requests(), [fake.boxes[kept].request])
-        # The kept box keeps its root disk; the rollback's disk and bucket and the ended box's root disk are deleted.
+        # The kept box keeps its root disk; the rollback's disk and bucket are deleted.
         self.assertEqual((sorted(fake.disks), fake.buckets), ([fake.boxes[kept].root], {}))
         self.assertTrue(fake.stack)
 
@@ -324,8 +304,6 @@ class SpotEndTests(CostFixture):
         fake.create_retained()
         box = fake.launch(tagged=True)
         fake.boxes[box].state = 'stopped'
-        # An earlier box left its root disk; the down deletes it by its tag.
-        fake.disks['old-root'] = Disk('available', dict([TAG]))
         hana = self.state / 'hana'
         hana.mkdir()
         _ = (hana / 'setup.json').write_text(json.dumps({'deployment': TAG[1], 'stack': STACK, 'data_volume': 'data-disk',
@@ -360,6 +338,12 @@ class OneTimeLaunchTests(CostFixture):
             options = ledger.mapping(ledger.mapping(ledger.mapping(data)['InstanceMarketOptions'])['SpotOptions'])
             self.assertEqual((options['SpotInstanceType'], options['InstanceInterruptionBehavior']), ('one-time', 'terminate'), name)
         self.assertEqual(sorted(gate.keys() & {'Instance', 'LaunchTemplate', 'DataVolume'}), [])
+
+    def test_hana_root_disk_is_deleted_with_its_box(self) -> None:
+        hana = ledger.mapping(remote.read_record(deploy.HANA_TEMPLATE)['Resources'])
+        data = ledger.mapping(ledger.mapping(ledger.mapping(hana['LaunchTemplate'])['Properties'])['LaunchTemplateData'])
+        disks = [ledger.mapping(ledger.mapping(row)['Ebs']) for row in ledger.rows(data, 'BlockDeviceMappings')]
+        self.assertEqual([disk['DeleteOnTermination'] for disk in disks], [True])
 
     def test_gate_launches_keep_the_template_market_options(self) -> None:
         source = (Path(deploy.__file__).parent / 'cloud_gate.py').read_text()

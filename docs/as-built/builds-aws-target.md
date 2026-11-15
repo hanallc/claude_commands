@@ -216,7 +216,7 @@ The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
 Without approval, `hana-setup` prints only its local plan.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
-It creates a retained data volume, retained root disk, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
+It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
 Its Spot interruption behavior is `stop`.
 Setup uses Hana sizes and prices from `config/hana_aws.conf`.
 It reserves setup costs within both account and workload limits before the stack request.
@@ -231,8 +231,8 @@ It refuses an Instance, Volume or VolumeAttachment replace or remove before it e
 A failed create or update calls `spot_end.end_boxes` before it reports the error.
 That call keeps only the box that `hana/setup.json` records.
 It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
-It also deletes the root disks of the ended boxes, because the Hana launch template keeps a root disk after termination.
-A failed create also deletes the failed stack and every unattached disk with the deployment tag.
+A failed create also deletes the failed stack.
+The launch template sets `DeleteOnTermination` true on the root disk, so AWS deletes each root disk with its box.
 
 ## Ending persistent Spot boxes
 
@@ -246,11 +246,12 @@ The request then launches a new box with no tags.
 5. Read again. `SpotEndIncomplete` names any request or box that stays live.
 A failed cancel raises before any terminate.
 `deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
-It then deletes the data disk, the root disks and the control bucket, and removes the local Hana records.
+It then deletes the data disk and the control bucket, and removes the local Hana records.
 The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
 `test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
 It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
 A failed update keeps only the recorded box and its root disk.
+A template test shows that the Hana root disk has `DeleteOnTermination` true.
 It also shows that each one-time launch uses one-time Spot with terminate.
 
 The provider maps every remote operation through `PROVIDER_OPERATIONS`.
