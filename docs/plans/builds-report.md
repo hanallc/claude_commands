@@ -1629,3 +1629,12 @@ From builds (not the user), 2026-11-15: in the 390 px view the red cap line runs
 - The table room row has no dashes. The stacked table leaves it out, and its queue header takes the top divider. Beside the chart, the row is empty and keeps the rows aligned.
 - `memory_page_proof.mjs`: it fails when chart text shows on the cap line, or when the table room row shows text. The row offset check applies only beside the chart. The cap pixel check reads the longest line part.
 - Proof: `phases/91/proof/before-*` and `after-*` (the Running card at 390 px light and dark, 900 px dark and 1400 px dark), from a fixture of the live feed. Before: text on the line at all four widths. After: none.
+
+### Phase 92 — A placed Mac row shows only its step name · status: done
+
+From builds (not the user), 2026-11-15: the lfo row shows its step name as "lfo nextest · placement v20261115T162519-1093145-12392-step-2/709e465c…", a raw internal id over five lines in the chart and the table. Show the readable step name only.
+
+#### As-built
+
+- `memory_feed.mac_work_row`: a placed Mac run's name leaves out `placement <id>`. The id stays in the row's `gate_label`. A `user`, `hana-ci` or `unplaced` run still adds that one word to its name, because it marks an exception.
+- `test_memory_feed`: a placed run's name has no `placement`, and its `gate_label` keeps the id.

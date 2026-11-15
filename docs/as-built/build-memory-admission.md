@@ -1893,6 +1893,8 @@ The step name uses the command's package, then the repository when the command h
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
 The Mac row shows the repository on its second label line.
+A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
+A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.
 The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
 It embeds the shared Cargo folder reader in the same Mac reading.
