@@ -178,8 +178,12 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
-The function takes the review root and returns the keys of the items that wait on the page.
-Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes`.
+Questions uses `change_browser.waiting_questions`.
+Images uses `images.waiting_images` for registered images without `feedback_at`.
+The Images page and its items function share the same waiting-record filter.
+Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
 The console posts `open=<id>` for the page it shows to `/console/news`.
 While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
@@ -194,7 +198,8 @@ An items function that fails writes one line to the server log, and its page sho
 In the open sidebar the icon's center lines up with the status dots of unavailable pages.
 In the collapsed rail the icon sits at the top right of the page icon.
 At phone width the menu button shows the icon while any page holds new items.
-Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+Each poll reads the change lists once, about 0.1 seconds of server time.
+The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
 The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.

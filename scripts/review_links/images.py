@@ -74,6 +74,16 @@ def records(root: Path) -> list[image_store.ImageRecord]:
     return sorted(found, key=lambda record: record["registered_at"])
 
 
+def waiting_records(root: Path) -> list[image_store.ImageRecord]:
+    """Return the Images records that still wait for the user's answer."""
+    return [record for record in records(root) if "feedback_at" not in record]
+
+
+def waiting_images(request: console.NewsRequest) -> frozenset[str]:
+    """Name the images that wait for the user, for the console's new mark."""
+    return frozenset(record["id"] for record in waiting_records(request.root))
+
+
 def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
              *, before: Path | None = None) -> image_store.ImageRecord:
     """Register one image or a before and after pair for its staff owner."""
@@ -150,7 +160,7 @@ def render(root: Path) -> bytes:
     token = console_token(root)
     members = staff.snapshot()
     rows = conf.read("review_links").whole("feedback_rows")
-    cards = "".join(card(record, token, members, rows) for record in records(root) if "feedback_at" not in record)
+    cards = "".join(card(record, token, members, rows) for record in waiting_records(root))
     content = (STYLE + '<h1 class="page-title">Images</h1><div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
