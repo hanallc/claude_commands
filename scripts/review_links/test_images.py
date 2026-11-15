@@ -135,6 +135,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
         _ = self.register()
         current = images.render(self.root).decode()
