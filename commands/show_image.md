@@ -9,6 +9,10 @@ Use this when the user must look at an image: before and after shots of a page c
 Register the image on the console Images page and give the user the image's own link.
 A file path alone is not something the user can view.
 
+An image for the user's review is one dark mode shot at desktop width.
+Send a light mode or phone width shot only when the user asks for it.
+Check the light mode and phone width yourself when the change needs them.
+
 ## Steps
 
 1. Write a caption. Say what changed and what to look at.
