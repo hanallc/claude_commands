@@ -65,8 +65,9 @@ Before deployment:
 
 1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
 2. Confirm that each status is `ENABLED`.
-3. Allow all 19 regions in the Organizations `RegionFloor` policy: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
-4. Preserve the current region permissions.
+3. Allow all 19 regions in the `RegionFloor` statement of the Organizations policy `AdvancedModeRegionRestrictionSecurityControlPolicy`: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+4. Make sure that no other statement in that policy denies EC2 in one of these regions.
+5. Preserve the current region permissions.
 
 Use these commands at your terminal:
 
