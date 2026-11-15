@@ -1,26 +1,45 @@
-"""Records of the checkpoint lands that run now.
+"""Records of the checkpoint lands that run now, and the result of each land.
 
 `merge_checkpoint.py` writes one record while it holds a production's merge lock, and removes it at exit.
 A record whose process ended is not a running land; the next read removes it.
-The units board reads the records to tell a running checkpoint from a queued one.
+It also adds one result row for each checkpoint it lands or stops.
+The units board reads the records to tell a running checkpoint from a queued one, and the results to say how a land ended.
 """
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
 
+from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
+
+
+# The results file keeps only this many newest rows.
+KEPT_RESULTS = 300
 
 
 class LandRecord(TypedDict):
     pid: int
     start: str
     commits: list[str]
+
+
+class LandResult(TypedDict):
+    commit: str
+    production: str
+    unit: str
+    phase: str
+    landed: bool
+    step: str
+    state: str
+    detail: str
+    time: str
 
 
 def state_dir() -> Path:
@@ -30,6 +49,10 @@ def state_dir() -> Path:
 
 def lands_dir() -> Path:
     return state_dir() / "lands"
+
+
+def results_path() -> Path:
+    return state_dir() / "land_results.jsonl"
 
 
 @contextmanager
@@ -73,3 +96,44 @@ def running_commits() -> frozenset[str]:
 def holds(running: frozenset[str], commit: str) -> bool:
     """True when a running land names this commit; a land can name a short hash."""
     return any(commit.startswith(listed) or listed.startswith(commit) for listed in running if listed and commit)
+
+
+def record_result(*, commit: str, production: str, unit: str, phase: str,
+                  landed: bool, step: str = "", state: str = "", detail: str = "") -> None:
+    """Add the result of one checkpoint land, and keep only the newest rows."""
+    row: LandResult = {"commit": commit, "production": production, "unit": unit, "phase": phase, "landed": landed,
+                       "step": step, "state": state, "detail": detail,
+                       "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    path = results_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path.with_name(path.name + ".lock")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        lines = [*lines, json.dumps(row)][-KEPT_RESULTS:]
+        write_text_atomic(path, "\n".join(lines) + "\n")
+
+
+def last_results() -> dict[str, LandResult]:
+    """The newest result of each commit; a bad row is not a result."""
+    results: dict[str, LandResult] = {}
+    try:
+        lines = results_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return results
+    for line in lines:
+        try:
+            row = cast(LandResult, json.loads(line))
+            commit = cast(object, row["commit"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if isinstance(commit, str) and commit:
+            results[commit] = row
+    return results
+
+
+def result_for(results: dict[str, LandResult], commit: str) -> LandResult | None:
+    """The newest result whose commit names this commit; a result can name a short hash."""
+    found = [row for listed, row in results.items() if holds(frozenset({listed}), commit)]
+    return max(found, key=lambda row: row["time"]) if found else None

@@ -800,9 +800,18 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The open step belongs to that phase instance in the selected run.
     A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
     `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
-    The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`, else `waiting on queued checkpoint`.
-    `table` reads the land records once. `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits) while it holds the merge lock, and removes it at exit.
-    A record whose process ended is not running; the next read removes it. A short hash in a record matches its full commit.
+    `table` reads one `LandView` (`land_view()`): the running land commits, the land line places, and the newest land results.
+    The wait is `waiting on running checkpoint` when `land_runs.running_commits()` holds the event's `checkpoint_commit`.
+    Else, at a place in the line, it is `waiting on queued checkpoint, <Nth> in line`; a failed newest result adds `; last try: <result>`.
+    Else the newest result shows: `checkpoint landed <time>`, or `land <state> at <step> <time>: <first detail line>`.
+    Else it is `checkpoint sent, not in the land line`. With no line file, it stays `waiting on queued checkpoint`.
+    `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits) while it holds the merge lock, and removes it at exit.
+    A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
+    `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).
+    The row has the commit, production, unit, phase, landed, step, state, detail and UTC time. The file keeps the newest 300 rows.
+    `scripts/production/land_queue.py` keeps the land line in `$MERGE_GATE_STATE_DIR/land_queue.json` under a file lock.
+    `add LABEL --batch FILE | --commit HASH [--first | --before LABEL]`, `move`, `remove`, `list`, and `next`; `next` removes the first item and prints its label, or prints nothing when the line is empty.
+    An item's commits are its `--commit` values and the third field of each batch file line, read when the board reads the line.
     `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
     Queued compares its items with Notes before the waits are added.
     Empty text, role-only text, and `<label> dispatch` add nothing.

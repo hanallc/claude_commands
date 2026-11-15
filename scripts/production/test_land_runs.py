@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -9,11 +10,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
-from scripts.production import land_runs, merge_checkpoint, merge_gate
+from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
 
 
 class LandRunTests(unittest.TestCase):
@@ -68,6 +69,37 @@ class LandRunTests(unittest.TestCase):
         self.assertFalse(land_runs.holds(frozenset({"9" * 9}), full))
         self.assertFalse(land_runs.holds(frozenset({""}), full))
         self.assertFalse(land_runs.holds(frozenset({full}), ""))
+
+
+    def test_merge_checkpoint_records_each_land_result(self) -> None:
+        request = cast(merge_checkpoint.MergeRequest, cast(object, SimpleNamespace(
+            commit="a" * 40, phase="board", unit=SimpleNamespace(name="unit-board"),
+            production=SimpleNamespace(name="sdlc", checkout=self.root))))
+        stop = checkpoint_gate.Stop("conflicts", "held", "scripts/x.py conflicts\nmore", "resolve it")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(merge_checkpoint.report_checkpoint_stop(request, stop), 1)
+        failed = land_runs.result_for(land_runs.last_results(), "a" * 9)
+        assert failed is not None
+        self.assertEqual((failed["landed"], failed["step"], failed["state"], failed["detail"], failed["unit"]),
+                         (False, "conflicts", "held", "scripts/x.py conflicts\nmore", "unit-board"))
+        with (patch.object(merge_checkpoint, "record"), patch.object(merge_checkpoint, "end_phase_scratch"),
+              patch.object(merge_checkpoint, "checkpoint_step_record", return_value=self.root / "steps" / "promotion"),
+              contextlib.redirect_stdout(io.StringIO())):
+            merge_checkpoint.finish_checkpoint(request, "b" * 40, "merge tests")
+        landed = land_runs.result_for(land_runs.last_results(), "a" * 40)
+        assert landed is not None
+        self.assertTrue(landed["landed"])
+        self.assertEqual(len(land_runs.results_path().read_text().splitlines()), 2)
+
+    def test_the_results_keep_only_the_newest_rows_and_skip_bad_rows(self) -> None:
+        with patch.object(land_runs, "KEPT_RESULTS", 3):
+            for number in range(5):
+                land_runs.record_result(commit=f"{number}" * 40, production="sdlc", unit="u", phase="p", landed=True)
+        with land_runs.results_path().open("a") as stream:
+            _ = stream.write("not json\n" + json.dumps({"commit": 7}) + "\n" + json.dumps({"unit": "u"}) + "\n")
+        self.assertEqual(sorted(land_runs.last_results()), ["2" * 40, "3" * 40, "4" * 40])
+        self.assertIsNone(land_runs.result_for(land_runs.last_results(), "0" * 40))
+        self.assertIsNone(land_runs.result_for(land_runs.last_results(), ""))
 
 
 if __name__ == "__main__":

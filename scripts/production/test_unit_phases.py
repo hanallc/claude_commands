@@ -24,7 +24,7 @@ from typing import cast, override
 from unittest.mock import Mock, patch
 
 
-from scripts.production import census, claude_table_layout, display_cells, land_runs, live_units, unit_queue
+from scripts.production import census, claude_table_layout, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
 from scripts.lib import conf, unit_runs
 from scripts.lib import names as display_names
@@ -835,19 +835,47 @@ class UnitPhasesTests(unittest.TestCase):
             {"event_type": "checkpoint", "phase_instance_id": "one", "checkpoint_commit": "c" * 40},
             {"event_type": "eta_stated", "phase_instance_id": "one", "eta_phase_id": "images-card"},
             {"event_type": "activity_started", "phase_instance_id": "two"}]
-        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset()), "waiting on queued checkpoint")
-        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset({"ccccccccc"})), "waiting on running checkpoint")
-        self.assertEqual(unit_phases.checkpoint_wait(events[:4], frozenset({"d" * 40})), "waiting on queued checkpoint")
-        self.assertIsNone(unit_phases.checkpoint_wait([*events[:4], events[1]], frozenset({"c" * 40})))
-        self.assertIsNone(unit_phases.checkpoint_wait(events[:2], frozenset()))
+        utc = ZoneInfo("UTC")
+        failed: land_runs.LandResult = {"commit": "c" * 40, "production": "sdlc", "unit": "shelled", "phase": "images-card",
+                                        "landed": False, "step": "red", "state": "failed", "detail": "test_cards red\nmore",
+                                        "time": datetime.fromtimestamp(now - 600, UTC).isoformat()}
+        landed: land_runs.LandResult = {**failed, "landed": True, "step": "", "state": "", "detail": ""}
+        second = {"d" * 40: land_queue.Place(1, "sdlc other"), "c" * 9: land_queue.Place(2, "sdlc images")}
+
+        def wait(found: list[dict[str, object]], running: frozenset[str] | None = None,
+                 line: dict[str, land_queue.Place] | None = None,
+                 results: dict[str, land_runs.LandResult] | None = None) -> str | None:
+            view = unit_phases.LandView(running or frozenset(), land_queue.NoLine() if line is None else line, results or {})
+            return unit_phases.checkpoint_wait(found, view, now=now, zone=utc)
+
+        self.assertEqual(wait(events[:4]), "waiting on queued checkpoint")
+        self.assertEqual(wait(events[:4], frozenset({"ccccccccc"})), "waiting on running checkpoint")
+        self.assertEqual(wait(events[:4], frozenset({"d" * 40})), "waiting on queued checkpoint")
+        self.assertEqual(wait(events[:4], line=second), "waiting on queued checkpoint, 2nd in line")
+        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: failed}),
+                         "waiting on queued checkpoint, 2nd in line; last try: land failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], line=second, results={"c" * 40: landed}), "waiting on queued checkpoint, 2nd in line")
+        self.assertEqual(wait(events[:4], line={}), "checkpoint sent, not in the land line")
+        self.assertEqual(wait(events[:4], line={}, results={"c" * 12: failed}), "land failed at red 13:30: test_cards red")
+        self.assertEqual(wait(events[:4], results={"c" * 40: landed}), "checkpoint landed 13:30")
+        self.assertEqual(wait(events[:4], frozenset({"c" * 40}), second, {"c" * 40: failed}), "waiting on running checkpoint")
+        self.assertIsNone(wait([*events[:4], events[1]], frozenset({"c" * 40})))
+        self.assertIsNone(wait(events[:2]))
+        self.assertEqual([unit_phases.ordinal(number) for number in (1, 2, 3, 4, 11, 12, 13, 21, 22, 101, 111)],
+                         ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "101st", "111th"])
         phase = phase_table.OpenPhase("images-card", "Images card", datetime(2026, 11, 15, 14, tzinfo=UTC),
             phase_table.PhaseProgressNotReported(), phase_table.EtaUnavailable(), phase_table.EtaNeverStated(), "one")
-        self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, lands=frozenset()),
-                         "phase images-card — Images card · waiting on queued checkpoint")
+
+        def notes() -> str:
+            return unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now, zone=utc,
+                                                land=unit_phases.land_view())
+
+        self.assertEqual(notes(), "phase images-card — Images card · waiting on queued checkpoint")
+        self.assertEqual(land_queue.main(["add", "sdlc images", "--commit", "c" * 40]), 0)
+        self.assertEqual(land_queue.main(["add", "sdlc other", "--commit", "d" * 40, "--first"]), 0)
+        self.assertEqual(notes(), "phase images-card — Images card · waiting on queued checkpoint, 2nd in line")
         with land_runs.landing(["c" * 9]):
-            self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now,
-                                                          lands=land_runs.running_commits()),
-                             "phase images-card — Images card · waiting on running checkpoint")
+            self.assertEqual(notes(), "phase images-card — Images card · waiting on running checkpoint")
 
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")

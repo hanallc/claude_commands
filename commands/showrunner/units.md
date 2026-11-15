@@ -87,7 +87,11 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
    A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
    It is ` · waiting on running checkpoint` while a land run that holds the checkpoint commit runs now.
-   Otherwise it is ` · waiting on queued checkpoint`.
+   In the land line it is ` · waiting on queued checkpoint, 2nd in line`; 1st lands next.
+   A failed earlier try adds `; last try: land failed at red 11:20: <first detail line>`.
+   Out of the line it is the last land result: `checkpoint landed 11:20` or `land held at ancestry 11:20: <detail>`.
+   With no result, it is ` · checkpoint sent, not in the land line`.
+   Before any runner uses the line, it is ` · waiting on queued checkpoint`.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.

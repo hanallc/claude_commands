@@ -1347,11 +1347,22 @@ def finish_checkpoint(request: MergeRequest, merge_head: str, tests_green: str) 
     promotion_done.touch()
     record(request, merge_head, tests_green)
     end_phase_scratch(request)
+    record_land(request, landed=True)
     print(f"send {request.unit.name}: phase {request.phase} merged and pushed as {merge_head}; continue with the next step")
+
+
+def record_land(request: MergeRequest, *, landed: bool, step: str = "", state: str = "", detail: str = "") -> None:
+    """Add the land result for the units board; a failed write does not change the land."""
+    try:
+        land_runs.record_result(commit=request.commit, production=request.production.name, unit=request.unit.name,
+                                phase=request.phase, landed=landed, step=step, state=state, detail=detail)
+    except OSError as error:
+        print(f"land result: not recorded — {error}", flush=True)
 
 
 def report_checkpoint_stop(request: MergeRequest, error: checkpoint_gate.Stop) -> int:
     checkpoint_gate.report(error.step, error.state, error.detail.replace("\n", "; "))
+    record_land(request, landed=False, step=error.step, state=error.state, detail=error.detail)
     print(f"send {request.unit.name}: {error.message}")
     return checkpoint_gate.TREE_CHANGED_STATUS if error.state == "cancelled" else 1
 
@@ -1458,6 +1469,7 @@ def run(request: MergeRequest) -> int:
         return report_checkpoint_stop(request, error)
     except (OSError, ValueError) as error:
         checkpoint_gate.report("run", "failed", str(error).replace("\n", "; "))
+        record_land(request, landed=False, step="run", state="failed", detail=str(error))
         print(f"send {request.unit.name}: the showrunner will inspect the failed command")
         return 1
 
