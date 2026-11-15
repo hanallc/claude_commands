@@ -510,6 +510,9 @@ The old `aws-target.service` remains disabled.
 `aws_target.py tick` reads account charges only.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.
 `deploy.py up` runs the same reader with `force=True` after the stack update, so prices fill at once.
+A forced read does not move the interval, so the next hourly read still runs.
+The hourly timer starts one hour after the last run ends, so two hourly reads are always more than 3600 s apart.
+A price read is therefore never older than one hour plus the run time.
 It tries `deploy_price_fill_attempts=3` times, `deploy_price_fill_pause_s=10` seconds apart, while IAM shows the new policy.
 The deploy prints the reasons and sends no alert; a failed fill does not fail the deploy, and the hourly refresh sends the alert.
 The snapshot takes `spot-prices.lock` without blocking.

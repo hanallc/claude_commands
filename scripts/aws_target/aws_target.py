@@ -187,7 +187,7 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
              force: bool = False) -> int:
     """Replace successful regional reads and preserve failed regional reads.
 
-    force reads before the refresh interval ends; deploy.py up uses it."""
+    force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
     # Import here because administrator deployment also uses the shared read functions.
     from scripts.aws_target import admin_secrets
 
@@ -281,9 +281,11 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                 output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
                 write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
                 print('aws_target: snapshot user notice remains pending', file=sys.stderr)
-        _ = lock.seek(0)
-        _ = lock.truncate()
-        _ = lock.write(str(now))
+        # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
+        if not force:
+            _ = lock.seek(0)
+            _ = lock.truncate()
+            _ = lock.write(str(now))
         return status
 
 
