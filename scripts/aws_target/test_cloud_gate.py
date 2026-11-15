@@ -1500,11 +1500,19 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
                                                              self.now, self.now + 3, 'merge-gate')
                 _ = destination.write_text('{"interrupted":')
+                cloud_gate.save(self.folder / cloud_gate.RESULT_FILE, result)
                 with (mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(buildlog)}),
                       mock.patch.object(store, 'host_file', return_value=destination) as host_file):
                     cloud_gate.import_record(self.folder, result)
                     cloud_gate.import_record(self.folder, result)
                 self.assertEqual(host_file.call_args.args[0], 'fixture-guest')
+                # The result leaves the gate copy for the store, beside the gate run record.
+                self.assertFalse((self.folder / cloud_gate.RESULT_FILE).exists())
+                kept_result = ledger.text(cloud_gate.read(self.folder / 'imported.json'), 'result')
+                self.assertTrue(kept_result.startswith('fixture-guest/results/'))
+                if not retried:
+                    # The store keeps the first result of a record id, as it keeps the first record.
+                    self.assertEqual(json.loads(gzip.decompress((buildlog / kept_result).read_bytes())), result)
                 records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
                 self.assertEqual([row['id'] for row in records], ['gate-attempt'])
                 self.assertEqual(records[0]['host'], 'fixture-guest')
@@ -1518,6 +1526,17 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                     self.assertEqual((second['attempt'], second['status'], second['log']), (2, 0, ''))
                 else:
                     self.assertEqual(modules[0]['log'], '')
+        # A store that cannot keep the result leaves it in the gate copy.
+        result = self.result()
+        cloud_gate.save(self.folder / cloud_gate.RESULT_FILE, result)
+        with (mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(buildlog)}),
+              mock.patch.object(store, 'host_file', return_value=destination),
+              mock.patch('scripts.buildlog.record.keep_result', side_effect=OSError('fixture store is full')),
+              mock.patch('scripts.test_times.gate_record.report_not_written') as reported):
+            cloud_gate.import_record(self.folder, result)
+        self.assertTrue((self.folder / cloud_gate.RESULT_FILE).exists())
+        self.assertNotIn('result', cloud_gate.read(self.folder / 'imported.json'))
+        reported.assert_called_once()
 
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)

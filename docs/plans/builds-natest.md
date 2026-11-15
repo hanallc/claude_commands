@@ -4357,3 +4357,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - outcome.json names `cloud_gate.RESULT_FILE` (remote-result.json); `cloud_gate.outcome_result` reads it, or an older outcome's inline result. A missing or broken file is a local fallback. A validated paired result and a time-limit result are written to that file.
 - Gate f7bd8f16: two 20.2 MB files become one 5.7 MB file (gate 0.8 MB, record 4.8 MB).
 - Commit a04d00a10. Production change; the diff went to sdlc.
+
+### Phase 305 — A cloud gate result moves out of the checkout, beside its gate run record  · status: done
+**Depends on:** Phase 304
+**Owner:** natest (builds asked on 11-15: gate copies become reused slots; production change, the diff goes to sdlc).
+
+#### Work Order
+
+**Goal:** after a cloud gate is imported, its result is in the buildlog store beside the gate run record, and the copy keeps no result file.
+
+**Spec:**
+- `store.RESULTS_DIR = "results"`. `record.keep_result(data, host, epoch, record_id)` writes `<host>/results/<YYYY-MM>/<record_id>.json.gz` with the same atomic gzip write as `keep_log`, and returns the relative path. One private helper does the write for both.
+- `cloud_gate.import_record` keeps the result after the record append: the data is the imported row as JSON. It then deletes `remote-result.json` from the gate folder. `imported.json` names the stored file in `result`.
+- A store write failure reports with `gate_record.report_not_written` and leaves the folder file. The gate verdict does not change.
+- A result that fails validation is not imported and stays in its folder.
+- Nothing reads `remote-result.json` after import: a complete outcome makes `run_cloud` use a new folder.
+
+**Files:** `scripts/buildlog/store.py`, `scripts/buildlog/record.py`, `scripts/aws_target/cloud_gate.py`, and their tests.
+
+**Workers:** 1 writer (the director; no-worker mode).
+
+**Constraints from prior phases:** Phase 304: outcome.json names `cloud_gate.RESULT_FILE`; `outcome_result` reads it.
+
+**Acceptance gate:** the aws_target and buildlog record test modules pass on natedev; a cloud gate test shows the stored result and no folder result; every behavior check stays.

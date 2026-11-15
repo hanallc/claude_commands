@@ -937,7 +937,15 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.keep_failure_logs(ledger.text(record, 'id'), host, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
-    save(folder / 'imported.json', {'id': record['id']})
+    from scripts.buildlog.record import keep_result
+    imported: dict[str, object] = {'id': record['id']}
+    try:
+        # The result leaves the checkout: a gate copy is a reused slot.
+        imported['result'] = keep_result(json.dumps(row).encode(), host, at, ledger.text(record, 'id'))
+        (folder / RESULT_FILE).unlink(missing_ok=True)
+    except OSError as error:
+        gate_record.report_not_written(error)
+    save(folder / 'imported.json', imported)
 
 
 def working_tree(repo: Path) -> tuple[str, set[str]]:

@@ -2,8 +2,8 @@
 
 The permanent record is JSON lines, one file per host per month, appended and
 never edited: ~/.local/state/buildlog/<host>/<YYYY-MM>.jsonl, with the logs of
-failed steps beside it under <host>/logs/<YYYY-MM>/. CI timings sit in ci/ the
-same way. index.py derives the SQLite index from these lines and can rebuild it
+failed steps beside it under <host>/logs/<YYYY-MM>/ and cloud gate results under
+<host>/results/<YYYY-MM>/. CI timings sit in ci/ the same way. index.py derives the SQLite index from these lines and can rebuild it
 from nothing. BUILDLOG_DIR moves the root, for tests.
 
 Many processes append at once (every lint step on the machine). Each append
@@ -32,6 +32,7 @@ from typing import BinaryIO, TypedDict, cast
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
 LOGS_DIR = "logs"
+RESULTS_DIR = "results"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
