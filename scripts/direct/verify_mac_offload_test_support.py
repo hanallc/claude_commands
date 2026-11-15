@@ -10,6 +10,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lib.build_folders_test_support import tool_folders
 
 import json
 import os
@@ -1630,7 +1631,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         from scripts.build_queue import admission_client
 
         def delivered() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+            for path in (wait for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for wait in hold.glob("placement-*.json.wait")):
                 try:
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                 except (OSError, ValueError):
@@ -1691,7 +1693,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                   for saved in admission.server.assignments.values()),
                         "a settled remote attempt", (process,))
         def delivered_retry_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):

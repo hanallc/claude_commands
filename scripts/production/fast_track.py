@@ -210,7 +210,7 @@ def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> lis
 
 def patch_for(runner: GitRunner, repo: Path, paths: list[str]) -> bytes:
     """Use a private index to include new files without changing the director's index."""
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-index"])) as temporary:
+    with build_folders.tool_folder("fast-track-index") as temporary:
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
         _ = runner.git(repo, "read-tree", "HEAD", environment=environment)
@@ -458,7 +458,7 @@ def fast_check(runner: GitRunner, repo: Path, paths: list[str], config: FastTrac
             modules.update(p.relative_to(repo) for p in (repo / path.parent).glob(pattern))
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD")}
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-check"])) as temporary:
+    with build_folders.tool_folder("fast-track-check") as temporary:
         for number, module in enumerate(sorted(modules)):
             root = temporary / str(number)
             root.mkdir()
@@ -498,7 +498,7 @@ def select_patch(runner: GitRunner, repo: Path, paths: list[str]) -> Generator[S
         patch = patch_for(runner, repo, paths)
         if runner.git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
-        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track-restore-index"])) as temporary:
+        with build_folders.tool_folder("fast-track-restore-index") as temporary:
             environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index")}
             _ = runner.git(repo, "read-tree", head, environment=environment)
             if patch:
@@ -763,7 +763,7 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["fast-track"])) as temporary:
+    with build_folders.tool_folder("fast-track") as temporary:
         fetch_main(runner, repo, settings_read)
         with copies.standing(copies.source_owner(repo), repo, copies.CommittedSource("origin/main")) as copy:
             _ = runner.git(copy, "remote", "set-url", "origin", runner.git(repo, "remote", "get-url", "origin").strip())
