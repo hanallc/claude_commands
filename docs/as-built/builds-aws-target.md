@@ -502,7 +502,8 @@ The runbook gives the preparation steps.
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job calls `aws_target.snapshot`; `python3 scripts/aws_target/aws_target.py snapshot` runs the same reader manually.
+The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
+`python3 scripts/aws_target/aws_target.py snapshot` runs the same two steps manually.
 No systemd unit change or NixOS rebuild is required.
 The old `aws-target.service` remains disabled.
 `aws_target.py tick` reads account charges only.
@@ -626,7 +627,8 @@ Days run from the window start day up to, but not including, the end day, like t
 `run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` row.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
-The hourly `aws_target.py snapshot` command checks the last `run_cost_days` days after its price read.
+`aws_target.hourly` checks the last `run_cost_days` days after its price read.
+`buildlog hourly` and `aws_target.py snapshot` both call it.
 It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
 Each type, region and day that is over sends one `aws.hours_gap` user notice.
 The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
