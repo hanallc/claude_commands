@@ -125,6 +125,55 @@ if __name__ == "__main__":
         status, output, errors = self.request(process, "next", "next input", "next")
         self.assertEqual((status, output["value"], output["leak"]), (0, "next", None))
 
+    def test_shell_environment_matches_env_for_exported_values(self) -> None:
+        _ = self.program.write_text('''import json, os
+def main():
+    print(json.dumps(dict(os.environ)))
+    return 0
+if __name__ == "__main__":
+    os.environ["FIXTURE_EXECUTION"] = "local"
+    raise SystemExit(main())
+''')
+        script = shell_functions(DIRECT / "verify.sh", "verify_helper") + r'''
+VERIFY_START_DIR=$1; PY=$2; FIXTURE_ROOT=$4
+verify_helper --start
+export FIXTURE_SPACE='one two' FIXTURE_EQUALS='one=two=three'
+export FIXTURE_NEWLINES=$'one\ntwo\n' FIXTURE_EMPTY=''
+export FIXTURE_UNSET
+declare -ax FIXTURE_ARRAY=(one two)
+declare -Ax FIXTURE_MAPPING=([one]=two)
+env -0 > "$4/environment"
+env() { return 91; }
+lock_file_descriptor() {
+    builtin printf '%s\n' "$BASHPID" > "$FIXTURE_ROOT/lock-pid"
+}
+printf() {
+    if [[ "$1" == '%s\0' ]]; then
+        builtin printf '%s\n' "$BASHPID" > "$FIXTURE_ROOT/write-pid"
+    fi
+    builtin printf "$@"
+}
+verify_helper "$3"
+compgen() { return 1; }
+verify_helper "$3" > "$4/fallback-environment"
+'''
+        result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
+                                 str(self.program), str(self.root)], capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = dict(entry.split("=", 1) for entry in
+                        (self.root / "environment").read_text().split("\0") if entry)
+        actual = cast(dict[str, str], json.loads(result.stdout))
+        # Bash sets this entry to each external command's path.
+        _ = expected.pop("_", None)
+        _ = actual.pop("_", None)
+        self.assertEqual(actual, expected)
+        self.assertEqual((self.root / "lock-pid").read_text(), (self.root / "write-pid").read_text())
+        fallback = cast(dict[str, str], json.loads((self.root / "fallback-environment").read_text()))
+        self.assertEqual(fallback.pop("FIXTURE_EXECUTION"), "local")
+        _ = fallback.pop("_", None)
+        self.assertEqual(fallback, expected)
+
     def test_shell_recovers_after_helper_death_and_keeps_shell_fixtures(self) -> None:
         shell = self.root / "shell-fixture"
         _ = shell.write_text('#!/bin/sh\ncase "$1" in TERM|INT|HUP) kill -s "$1" "$$" ;; esac\n'

@@ -574,7 +574,8 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry
+    local input="" has_input=0 status output errors entry name write_status
+    local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
@@ -593,13 +594,22 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if lock_file_descriptor 72 2>/dev/null && (
+        if lock_file_descriptor 72 2>/dev/null && {
+            # A dead helper must reach the fallback instead of stopping this shell.
+            trap '' PIPE
+            write_status=0
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            env -0
+            compgen -V names -e || write_status=1
+            for name in "${names[@]}"; do
+                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
+                printf '%s=%s\0' "$name" "${!name}"
+            done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
-            printf '\0'
-        ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
+            printf '\0' || write_status=1
+            trap - PIPE
+            (( write_status == 0 ))
+        } 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null \
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then

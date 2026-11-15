@@ -4379,3 +4379,63 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `try_mac_test` in verify.sh calls it through `verify_helper`. A helper status other than 0 or 1 prints `verify.sh: runner_result.py failed (status N); the Mac result is not used`. An unusable result no longer sets MAC_FIX_RESULT or REMOTE_BUILD_TARGET_DIR.
 - `test_runner_result.py` checks the reading in process; three result modules were removed; test_verify_mac_malformed keeps one flow. About 16 natedev CPU s less.
 - Commit a3d9484e2. verify-unit reviewed the diff.
+
+### Phase 307 — A verify_helper call starts no env process and no subshell  · status: done
+**Depends on:** Phase 306
+**Owner:** natest (builds gave a go on 11-15: fix 2 of the flow cost plan, with the git_identity cache folded in; verify-unit reviews the verify.sh diff).
+
+#### Work Order
+
+**Goal:** each `verify_helper` call in verify.sh starts no `env` process and forks no request subshell, and place-step runs its git identity checks once per process. Measured cost now: about 100 natedev ms per flow, about 70 AWS s over the verify family (estimate from p305/flowcost.txt: perl 1.27 ms per call, env 1.0 ms per call, one inner subshell fork per call, 23.5 calls per flow).
+
+**Spec:**
+1. **Request write without a fork.** In `verify_helper` (verify.sh about line 596), the `( printf …; env -0; … ) 1>&"$VERIFY_HELPER_INPUT" 2>/dev/null` subshell becomes a `{ …; }` group with the same redirections. The bytes on the pipe do not change.
+2. **Environment without `env`.** When bash is 5.3 or newer (`BASH_VERSINFO`), write the exported variables with `compgen -V names -e` and one `printf '%s=%s\0' "$name" "${!name}"` for each name. Check bash on natedev, the Mac and the AWS gate image. If all three run 5.3 or newer, ship one path and remove `env -0`. Otherwise keep `env -0` only for the machine that needs it, and name it. verify.sh exports no functions (no `export -f`); state in the report what `env -0` sends that the builtin form does not (for example `BASH_FUNC_*` entries from a caller) and why no helper program needs it. A test checks that the helper sees the same environment as `env -0` for a fixture environment with spaces, `=`, newlines and empty values in values.
+3. **Lock stays as it is.** Every call keeps the perl `flock` (file_lock.sh `lock_file_descriptor`). Builds dropped the windowed lock on 11-15: it adds a mode the code must track by hand, and a missed set is silent and unsafe. About 30 ms per flow does not pay for that. Simple ranks above fast. A later phase may propose a lock that is always on and starts no process, with its measured gain.
+4. **git identity once per helper process.** `step_estimator.git_identity(argv, cwd)` runs 3-4 git processes per call (record.git_facts, repository.repository_key) and place-step calls it 2.9 times per flow. Cache its result for each git directory for the life of the process. Check every caller and test of `git_identity` (`ci_cargo_front.py`, `width_trial.py`, `test_memory_admit.py`, `test_admission_client.py`, `test_admission_service.py`, `test_merge_gate_suites_admission.py`) for a case that changes a repository's origin or root within one process; such a test clears the cache.
+5. No signal handlers in new Python code. Do not touch `finish_mac_fix` (verify-unit's acffebbc6; test_fix_return.py reads it by its `finish_mac_fix() {` line), or the berth guard area (`run_lint_sequence`, the clippy fix loop in `run_lint_judgment`), which verify has in flight.
+6. Tests: new checks run in process or in one small bash program each; no new full verify.sh flow. Every behavior check stays.
+7. Measure with `python3 ~/.claude/scripts/test_times/module_cost.py --tree <copy> --commands 15` on the 8 sample modules, before and after, in `copies.py run` copies (fresh TMPDIR). Report CPU s, process starts and env starts per module.
+
+**Files:** `scripts/direct/verify.sh`, `scripts/build_queue/step_estimator.py`, `scripts/direct/test_verify_helper.py`, and a test beside `step_estimator` for the cache (`scripts/build_queue/test_step_estimator.py` if it exists, otherwise the closest existing module). The worker may read every file named above.
+
+**Workers:** 1 writer; one shell function and one cache.
+- impl: all files.
+
+**Constraints from prior phases:** Phase 306: `try_mac_test` reads the runner result through `runner_result.py` in the helper. Phase 232: no signal handlers. Shellcheck baseline on verify.sh: 23 findings; add none.
+
+**Acceptance gate:** test_verify_helper, test_verify_step_routes_helpers, the 8 sample modules, test_verify_mac_only, test_verify_wait_holder, test_verify_token_renew and every module that calls `git_identity` pass on natedev; basedpyright is clean on changed Python; `bash -n` and shellcheck on verify.sh add no finding; verify-unit reviews the diff; an AWS pair shows the saving.
+
+### Phase 308 — A Mac clippy failure in verify.sh lint starts no local mend fix  · status: todo
+**Depends on:** Phase 307
+**Owner:** natest (builds assigned it on 11-15; verify-unit reviews the diff, because the code is from its phase maclintfix, e07d86209).
+
+#### Work Order
+
+**Goal:** when `verify.sh lint` sends mend and clippy to the Mac, and Mac mend passes but Mac clippy fails, verify.sh exits with the clippy failure. It does not start a local `cargo mend --fix`, so the run does not wait for natedev.
+
+**Cause (builds and queue, confirmed in the source):**
+1. `run_lint_sequence` runs `invoke_mend --workspace --fix`. When that step leaves the queue (`LINT_LEFT_QUEUE_STATUS`), it calls `run_lint_held_sequence`.
+2. `run_lint_held_sequence` runs mend with `--fail-on-warn`, then clippy, on the Mac. A clippy failure sets `lint_status=1`.
+3. `run_lint_sequence` then sets `HOLD_LINT=0` and does `continue`. The next loop pass runs a local `cargo mend --fix`.
+4. `step_writes_tree` marks `mend --fix` as a tree write. Placement gets `--writes-tree`, and `build_targets.step_routing_rule` returns `NatedevOnly("step writes the tree")`. The step waits for natedev while the Mac has room.
+5. A local `mend --fix` cannot fix a clippy finding, so the wait buys nothing.
+
+Full diagnosis: /tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/bf3s/review_reply_1.txt
+
+**Spec:**
+1. `run_lint_held_sequence` tells its caller which tool failed. Mend failure keeps today's path: the Mac fix pass (`run_mac_lint_fix`), else the local `mend --fix` loop.
+2. When Mac mend passed (or mend is off) and Mac clippy failed, `run_lint_sequence` exits with the clippy failure at once. It removes `MEND_LOG` and the `lint-held` mark as the other exits do.
+3. Keep the `step_writes_tree` rule as it is. A command that changes the source tree still runs on natedev only.
+4. Do not change the memory-judgment path (`LINT_MEMORY_JUDGMENT`) or the `--check` path.
+5. Regression test, in process or in one small bash program: Mac mend passes, Mac clippy fails, natedev is busy. verify.sh exits with the clippy failure, and it makes no local mend request. Every behavior check stays.
+6. No signal handlers in new Python code. No new full verify.sh flow in tests.
+
+**Files:** `scripts/direct/verify.sh` (`run_lint_held_sequence`, `run_lint_sequence`), and the closest existing lint test module (`scripts/direct/test_verify_lint_judgment.py` or the module that covers `run_lint_held_sequence`).
+
+**Workers:** 1 writer; one shell change and one test.
+- impl: all files.
+
+**Constraints from prior phases:** Phase 307: `verify_helper` writes its request in a `{ …; }` group and sends the environment without `env`. verify-unit's berth pass 9f8fc1c39 (branch verify-berth-fix-pass, not on main yet) edits the mend branch and the fmt step, and adds `lint_copy_*` functions. Check a trial merge with it before the hash goes to builds. Shellcheck baseline on verify.sh: 23 findings; add none.
+
+**Acceptance gate:** the new regression test, test_verify_lint_judgment, test_verify_step_state and every lint test module that covers `run_lint_sequence` pass on natedev; `bash -n` and shellcheck on verify.sh add no finding; a trial merge with 9f8fc1c39 and origin/main is clean; verify-unit reviews the diff.
