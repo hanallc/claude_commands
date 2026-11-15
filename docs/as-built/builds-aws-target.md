@@ -510,6 +510,9 @@ The old `aws-target.service` remains disabled.
 `aws_target.py tick` reads account charges only.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.
 `deploy.py up` runs the same reader with `force=True` after the stack update, so prices fill at once.
+A forced read does not move the interval, so the next hourly read still runs.
+The hourly timer starts one hour after the last run ends, so two hourly reads are always more than 3600 s apart.
+A price read is therefore never older than one hour plus the run time.
 It tries `deploy_price_fill_attempts=3` times, `deploy_price_fill_pause_s=10` seconds apart, while IAM shows the new policy.
 The deploy prints the reasons and sends no alert; a failed fill does not fail the deploy, and the hourly refresh sends the alert.
 The snapshot takes `spot-prices.lock` without blocking.
@@ -529,6 +532,12 @@ The table and snapshot commands never deploy a policy.
 The snapshot atomically writes prices and quota values together in `spot-prices.json`.
 The existing `prices` array keeps its ranking format: `region`, `zone`, `instance_type`, `usd_per_hour`, and `read_at`.
 The new `regions` array stores `region`, `read_at`, `standard_vcpus`, and `gpu_vcpus`.
+After that write, the snapshot adds each read to `spot-price-days.json`.
+For each type and region, it adds the lowest zone price of the read to that UTC day.
+Each `days` row keeps `instance_type`, `region`, `day`, `usd_sum`, and `reads`; the mean is `usd_sum / reads`.
+The file keeps the last `spot_price_days_keep` days from `config/aws_target.conf`.
+A run estimate can then use the Spot price of each billed day.
+A failed history write leaves `spot-prices.json` written and returns a failure status.
 A regional failure preserves that region's previous prices, quotas, and read time.
 Other regions still refresh, and the command returns a failure status.
 The `failures` array saves the latest failed attempt for each region.
@@ -648,6 +657,10 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    A day with a bill read and no usage row for the type bills 0 hours.
 2. Box hours: each gate in the cost ledger, from its reservation to its confirmed end, split at UTC midnight.
    Open and absent gates do not count. A gate without a region ran in the home region.
+   The builder box also counts, as the `aws_target.conf` `instance_type` in the home region.
+   Its time runs from each `running` observation in the cost ledger to the next other state.
+   A `running` observation with no later state counts to the window end.
+   Reason: on 2026-11-08 the builder box ran 8.8 h, and the check reported its Spot hours as a gate gap.
 3. The gap ratio is `abs(billed - box) / box`.
    A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
    Billed hours with no box hours are also over.
@@ -698,6 +711,10 @@ Placement does not try a type and region whose median box time, boot included, i
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
 The median uses the type's runs in that region, or its runs in all regions when the region has none.
 A type without runs is tried; `lifetime_minutes` is not a measurement.
+Placement also does not try a type in a region whose Spot quota in the hourly snapshot is below one box of that type.
+The showrunner, 2026-11-14: a region with a pending quota request must not get launch attempts.
+A G or VT type uses the G and VT quota; other types use the Standard quota.
+A quota that is missing or older than `price_max_age_seconds` does not cause a skip.
 Each skip prints `Cloud gate skips <type> in <region>`.
 When every variant is skipped, the gate falls back to natedev before a launch.
 Available variants precede variants under a capacity cooldown.

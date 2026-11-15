@@ -11,9 +11,12 @@ Tree-writing steps remain local.
 Unpinned build and final steps retain their local rules.
 A pinned final keeps its clean-tree check and saves no local pass.
 A remote build prints its target and binary path.
-A step with a named package checks only that package against `linux_only.<repo>`, for every kind.
+A step with a named package checks only that package against `linux_only.<repo>`.
 `linux_only` keeps a package's own steps off the Mac; a package that depends on one still runs there.
 A step with no package refuses Mac offload when any workspace member is `linux_only`.
+`lint` and `doc` steps cover the whole workspace for every package, so they always use the workspace check.
+`eligibility.step_package` holds this rule.
+Without it, a `lint hana_diegetic --check` on the Mac judged the macOS code of `hana_video`, which CI never judges.
 
 `fixed_placement_constraints` retains every configured candidate that a fixed rule permits.
 Disk, busy, spending, reachability, and hold results remain refreshed evidence.
@@ -187,17 +190,17 @@ A failed activity check changes neither idle key.
 The full process scan runs only after `alert_seconds` while work waits.
 Repeated stale-record diagnostics print once until their evidence changes.
 Repairs run only when no block or live claim reserves the Mac.
-A live session record permits recreation of its missing temporary folder.
-Missing leave hooks and pending retry deadlines create `.retry` markers.
-Hold, memory, and CPU-token waits preserve their existing marker behavior.
+The watch reads each waiting call from its step record; `verify.sh` registers no call.
+A wait with no leave hook gets one `missing_leave_hook` row with action `recorded` and no message.
+The watch writes no marker file and repairs no temporary folder.
 The watch starts no build step.
 Other repair notices go to the builds showrunner.
 
 Buildlog schema 21 keeps one `mac_idle` row per cause per call.
 The `.cases` record prevents duplicate rows.
 Failed repair messages remain pending.
-The recorded action is `message_showrunner`.
-`MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private test roots.
+An `idle_with_waiter` row records the action `message_showrunner`.
+`MAC_IDLE_STATE_DIR` selects a private test root.
 
 2026-11-11: Dailies and their Mac block footer were retired.
 Use `/build:mac status` to read the Mac block state.

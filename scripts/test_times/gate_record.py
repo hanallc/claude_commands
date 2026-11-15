@@ -430,6 +430,7 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
 
     A full run also matches the job count: a cloud host runs one job per vCPU, and a
     shared natedev run with the same vCPU count runs fewer jobs and takes longer.
+    A full run counts only when it ran test modules: a run of the type check alone is shorter.
     """
     factor = conf.read("merge_gate").number("GATE_TIME_LIMIT_FACTOR")
     count = conf.read("test_times").whole("TOP_RUNS")
@@ -437,7 +438,7 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
         walls = [float(row[0]) for row in cast(list[tuple[float]], connection.execute(
             """SELECT wall_s FROM gate_runs
                WHERE vcpus = ? AND max_jobs = ? AND status = 0 AND aborted = 0
-                 AND selection = 'full' AND step = 'merge-gate' AND wall_s > 0
+                 AND selection = 'full' AND step = 'merge-gate' AND wall_s > 0 AND modules_run > 0
                ORDER BY started_at DESC, id DESC LIMIT ?""", (vcpus, jobs, count)).fetchall())]
         if walls:
             return GateTimeLimit(factor * statistics.median(walls))

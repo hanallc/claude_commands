@@ -37,10 +37,25 @@ class UnreadableRecord:
     reason: str
 
 
+# A sweep asks for a root once per entry; a parse costs 0.35 ms, a stat a few microseconds.
+_ROOTS: dict[str, tuple[tuple[str, int, int], str]] = {}
+
+
 def _configured_root(key: str) -> str:
     from scripts.lib import conf
 
-    return conf.read_or_repository("build_folders").text(key)
+    live = conf.path("build_folders")
+    try:
+        status = live.stat()
+        stamp = (str(live), status.st_mtime_ns, status.st_size)
+    except FileNotFoundError:
+        stamp = (str(live), -1, -1)
+    cached = _ROOTS.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = conf.read_or_repository("build_folders").text(key)
+    _ROOTS[key] = (stamp, value)
+    return value
 
 
 def root() -> Path:

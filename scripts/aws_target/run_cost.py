@@ -167,26 +167,38 @@ def hours_check(billed: Decimal | None, box: Decimal, max_ratio: Decimal) -> Hou
     return HoursCheck(billed, box, ratio, over)
 
 
-def box_hours(book: ledger.CostLedger, start: datetime, end: datetime, home: str) -> dict[DayKey, Decimal]:
+def box_hours(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str) -> dict[DayKey, Decimal]:
     """The recorded box hours of each type, region and UTC day in [start, end).
 
-    A gate counts from its reservation to its confirmed end; open and absent gates do not count."""
+    A gate counts from its reservation to its confirmed end; open and absent gates do not count.
+    The builder box of type builder in the home region counts from each running observation to the next other state."""
     first, last = start.date().isoformat(), end.date().isoformat()
     hours: dict[DayKey, Decimal] = defaultdict(Decimal)
-    for reservation in book.read_snapshot().gate_reservations:
-        if not isinstance(reservation.state, ledger.GateTerminated) or not reservation.instance_type:
-            continue
-        left, right = reservation.at, reservation.state.at
+    def add(size: str, region: str, left: int, right: int) -> None:
         while left < right:
             day = datetime.fromtimestamp(left, UTC).date()
             stop = min(right, int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()) + 86400)
             if first <= day.isoformat() < last:
-                hours[reservation.instance_type, reservation.region or home, day.isoformat()] += Decimal(stop - left) / 3600
+                hours[size, region, day.isoformat()] += Decimal(stop - left) / 3600
             left = stop
+    snapshot = book.read_snapshot()
+    for reservation in snapshot.gate_reservations:
+        if isinstance(reservation.state, ledger.GateTerminated) and reservation.instance_type:
+            add(reservation.instance_type, reservation.region or home, reservation.at, reservation.state.at)
+    # A builder day bills Spot hours of the builder type, so its running time is box time too.
+    running: int | None = None
+    for observation in sorted(snapshot.observations, key=lambda row: row.at):
+        if observation.state == 'running' and running is None:
+            running = observation.at
+        elif observation.state != 'running' and running is not None:
+            add(builder, home, running, observation.at)
+            running = None
+    if running is not None:
+        add(builder, home, running, int(end.timestamp()))
     return dict(hours)
 
 
-def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str,
+def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
                      sizes: Collection[str], max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
     """The hours check of each type in sizes, region and UTC day in [start, end).
 
@@ -194,18 +206,18 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
     readings = billed_readings(book, start, end)
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
-    boxes = box_hours(book, start, end, home)
+    boxes = box_hours(book, start, end, home, builder)
     keys = {key for key in boxes.keys() | bills.keys() if key[0] in sizes}
     return {key: hours_check(bills[key][1] if key in bills else Decimal(0) if key[2] in read_days else None,
                              boxes.get(key, Decimal(0)), max_ratio) for key in keys}
 
 
-def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str,
+def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
                  sizes: Collection[str], max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
     """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
     billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
     unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    for (size, region, _day), check in day_hours_checks(book, start, end, home, sizes, max_ratio).items():
+    for (size, region, _day), check in day_hours_checks(book, start, end, home, builder, sizes, max_ratio).items():
         (unbilled if check.billed_hours is None else billed)[size, region].append(check)
     checks: dict[tuple[str, str], HoursCheck] = {}
     for key in billed.keys() | unbilled.keys():

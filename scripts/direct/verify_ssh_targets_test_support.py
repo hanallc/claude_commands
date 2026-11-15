@@ -489,10 +489,26 @@ source() {
         return path, {"BUILDLOG_MEM_WAIT_SINCE": "100.25", "BUILDLOG_MEM_WAIT_FIRST_FILE": str(path)}
 
 
-RUN_BUILD_TARGETS = r'''
-status = 0
-try:
-    runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
-except SystemExit as result:
-    status = result.code or 0
+# A wrapper with a top-level main runs inside the verify helper, as build_targets.py does.
+# Then the real build_targets.py loads once for each helper.
+BUILD_TARGETS_STATUS = r'''
+import importlib.util
+from types import ModuleType
+
+REAL_BUILD_TARGETS: dict[Path, ModuleType] = {}
+
+
+def build_targets_status() -> object:
+    path = source / "scripts/build_targets/build_targets.py"
+    if path not in REAL_BUILD_TARGETS:
+        specification = importlib.util.spec_from_file_location("fixture_build_targets", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        REAL_BUILD_TARGETS[path] = module
+    try:
+        return REAL_BUILD_TARGETS[path].main() or 0
+    except SystemExit as result:
+        return result.code or 0
 '''

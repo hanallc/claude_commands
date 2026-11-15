@@ -341,6 +341,15 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
     return False
 
 
+# verify.sh runs these kinds over the whole workspace, whichever package the call names.
+WORKSPACE_STEP_KINDS = frozenset({"lint", "doc"})
+
+
+def step_package(kind: str, package: str) -> str:
+    """Return the package a step covers: no package for a kind that covers the workspace."""
+    return "" if kind in WORKSPACE_STEP_KINDS else package
+
+
 def has_linux_only(repo_root: Path, package: str, excluded: set[str]) -> bool:
     """Check a named package alone, or the whole workspace when no package is named.
 
@@ -380,6 +389,11 @@ def verb_kind(verb: MacVerb) -> str:
     return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check") else verb
 
 
+def recorded_step_kind(step: str) -> str:
+    """Map a recorded step to its command kind; a recorded mend is the mend-check verb."""
+    return verb_kind(cast(MacVerb, "mend-check" if step == "mend" else step))
+
+
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
                          verb: MacVerb, target: str = "", *, kind: str = "",
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
@@ -393,7 +407,7 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
         if not linux_kind_permitted(config.values, kind or verb_kind(verb)):
             return IneligibleMacStep("target does not permit this command")
         return backoff_eligibility(repository, target, backoff)
-    policy = linux_only_policy(config, repository, repo_root, package)
+    policy = linux_only_policy(config, repository, repo_root, step_package(kind or verb_kind(verb), package))
     if isinstance(policy, IneligibleMacStep):
         return policy
     return backoff_eligibility(repository, target, backoff)

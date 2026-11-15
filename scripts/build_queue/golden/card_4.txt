@@ -41,7 +41,7 @@ run tool-based-ui     widget            widget nextest     0 fixture-host   17 p
  30 tool-based-ui     trunk             trunk nextest      2                   pid 1030 ███████ 10.8
  31 tool-based-ui     fastest           fastest clippy     1                   pid 1031 ██████▊ 6.8
  32 tool-based-ui     assembly          assembly clippy    0                   pid 1032 ██████▊ 6.8
-Head: free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB
+Head: need 7.6 GiB <= room 15.5 GiB (free 24.5 GiB − safety 3.0 GiB − kept aside 6.0 GiB)
 
 #4 of 32 · pid 1003 · tool-based-ui · hana-migration · hana-migration mend · 7.6 GiB
 Folder /tmp/hana_catalyst-hana-migration. Queue arrival 10:07; waiting 39 min. Likely start ~10:51.

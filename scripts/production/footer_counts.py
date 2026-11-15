@@ -12,7 +12,7 @@ from scripts.production import change_routing, staff
 from scripts.production import proposals_folder
 from scripts.production import proposals_table
 from scripts.production.production_doc import Refusal, production_field
-from scripts.production.issues import source_paths
+from scripts.production.issues import Issue, source_paths
 
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
@@ -65,13 +65,15 @@ def unrouted_changes(doc: Path) -> int:
     return change_counts(doc, staff.snapshot())[1]
 
 
-def proposals(doc: Path, *, source: str = "", sources: list[Path] | None = None) -> int:
+def proposals(doc: Path, *, source: str = "", sources: list[Path] | None = None,
+              own: list[Issue] | None = None) -> int:
+    """Count the waiting proposals. `own` is the doc's `open_proposals` when the caller already read them."""
+    found = proposals_table.scope_issues(doc, sources=sources) if own is None else own
     if source:
         waiting = proposals_table.issue_entries(
-            [issue for issue in proposals_table.scope_issues(doc, sources=sources)
-             if issue.value("proposed_by") == source], sources=sources)[0]
+            [issue for issue in found if issue.value("proposed_by") == source], sources=sources)[0]
         return len(waiting)
-    return len(proposals_table.waiting_entries(doc, sources=sources)[0])
+    return len(proposals_table.waiting_entries(doc, sources=sources, issues=found)[0])
 
 
 def open_efficiency(line: str, *, source: str = "") -> bool:
@@ -113,12 +115,16 @@ def efficiency(doc: Path, *, source: str = "", sources: list[Path] | None = None
 
 
 def read_counts(doc: Path, *, questions: int = 0, record: staff.StaffSnapshot | None = None,
-                source: str = "", sources: list[Path] | None = None) -> FooterCounts:
-    """Read counts. A source collector requires complete reads; other callers retain available counts."""
+                source: str = "", sources: list[Path] | None = None,
+                own: list[Issue] | None = None) -> FooterCounts:
+    """Read counts. A source collector requires complete reads; other callers retain available counts.
+
+    `own` is the doc's `open_proposals` when the caller already read them.
+    """
     try:
         change_count, unrouted_count = change_counts(
             doc, record if record is not None else staff.snapshot(), source=source, sources=sources)
-        return FooterCounts(change_count, proposals(doc, source=source, sources=sources), questions,
+        return FooterCounts(change_count, proposals(doc, source=source, sources=sources, own=own), questions,
                             efficiency(doc, source=source, sources=sources), unrouted_count)
     except OSError:
         if sources is not None:
@@ -138,8 +144,11 @@ def routing_sources(record: staff.StaffSnapshot | None = None, *, sources: list[
 
 
 def sources(doc: Path, *, identities: QuestionStaff | None = None,
-            read_sources: list[Path] | None = None) -> list[Path]:
-    """Watch count sources. A supplied collector retains paths and requires complete reads."""
+            read_sources: list[Path] | None = None, own: list[Issue] | None = None) -> list[Path]:
+    """Watch count sources. A supplied collector retains paths and requires complete reads.
+
+    `own` is the doc's `open_proposals` when the caller already read them.
+    """
     from scripts.production.update_registration import (QuestionFolder, QuestionStaff, RegistrationFailure,
                                      question_folder, question_records_for_document)
 
@@ -173,7 +182,9 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None,
         efficiency_queue = None
     if efficiency_queue is not None:
         found.append(efficiency_queue)
-    if folder is not None:
+    if own is not None:
+        found.extend(issue.path for issue in own)
+    elif folder is not None:
         try:
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc, sources=read_sources))
         except OSError:

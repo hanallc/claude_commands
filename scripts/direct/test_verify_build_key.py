@@ -218,7 +218,6 @@ buildlog_wait_for_memory() {
 }
 build_hold_check_local() { return 0; }
 buildlog_exec() { :; }
-nextest_share_end() { :; }
 buildlog_release_memory() { :; }
 sweep_after_step() { :; }
 run_once cargo nextest run -E "package(sample) & test(native_rate)"

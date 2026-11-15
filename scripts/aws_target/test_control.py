@@ -151,7 +151,7 @@ class ControlTests(CostFixture):
         self.assertEqual(self.snapshot(), 0)
         self.assertEqual(len(self.calls), 2 * count)
 
-    def test_forced_snapshot_reads_inside_the_refresh_interval(self) -> None:
+    def test_forced_snapshot_reads_inside_the_refresh_interval_and_keeps_the_scheduled_read(self) -> None:
         self.assertEqual(self.snapshot(), 0)
         count = len(self.calls)
         self.clock.advance(1)
@@ -160,6 +160,10 @@ class ControlTests(CostFixture):
         self.assertEqual(len(self.calls), 2 * count)
         readings = ledger.rows(aws_target.read_snapshot(self.state), 'regions')
         self.assertTrue(all(row['read_at'] == self.clock.now for row in readings))
+        # The forced read does not move the interval: the next scheduled read runs one interval after the last one.
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds') - 1)
+        self.assertEqual(self.snapshot(), 0)
+        self.assertEqual(len(self.calls), 3 * count)
 
     def test_regional_failure_preserves_its_values_and_time_but_refreshes_other_regions(self) -> None:
         self.assertEqual(self.snapshot(), 0)
@@ -768,7 +772,9 @@ class HoursCheckTests(CostFixture):
     home: str = ''
     other: str = ''
     size: str = ''
+    builder: str = ''
     limit: Decimal = Decimal(0)
+    observations: list[ledger.InstanceObservation] = []
     reservations: list[ledger.GateReservation] = []
     bills: list[ledger.ChargeRead] = []
     notices: list[tuple[str, push_texts.RenderedPush]] = []
@@ -782,12 +788,14 @@ class HoursCheckTests(CostFixture):
         self.home = configuration.text('region')
         self.other = next(region for region in ledger.REGION_USAGE_PREFIXES if region != self.home)
         self.size = conf.read_or_repository('cloud_gate').words('instance_types')[0]
+        self.builder = configuration.text('instance_type')
+        self.observations = []
         self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
         self.reservations, self.bills, self.notices = [], [], []
         self.notice_accepted = True
 
         def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
-            return ledger.LedgerEvidence(gate_reservations=list(self.reservations))
+            return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations))
 
         def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
             return tuple(self.bills)
@@ -818,7 +826,7 @@ class HoursCheckTests(CostFixture):
         end = datetime.fromtimestamp(self.clock.now, UTC)
         days = conf.read(self.settings).whole('run_cost_days')
         return run_cost.day_hours_checks(ledger.CostLedger(self.state), end - timedelta(days=days), end, self.home,
-                                         (self.size,), self.limit)
+                                         self.builder, (self.size, self.builder), self.limit)
 
     def notify(self, key: str, push: push_texts.RenderedPush, _timeout: float) -> bool:
         self.notices.append((key, push))
@@ -836,7 +844,7 @@ class HoursCheckTests(CostFixture):
         self.gate(self.size, self.home, one + timedelta(hours=4), 3600, ledger.GateRunning('i-fixture'))
         self.gate(self.size, self.home, one + timedelta(hours=6), 3600, ledger.GateAbsent(int(one.timestamp())))
         self.gate(self.size + 'x', self.home, one, 3600)
-        boxes = run_cost.box_hours(ledger.CostLedger(self.state), two, self.day(0), self.home)
+        boxes = run_cost.box_hours(ledger.CostLedger(self.state), two, self.day(0), self.home, self.builder)
         self.assertEqual(boxes, {(self.size, self.home, two.date().isoformat()): Decimal('0.5'),
                                  (self.size, self.home, one.date().isoformat()): Decimal('1.5'),
                                  (self.size + 'x', self.home, one.date().isoformat()): Decimal(1)})
@@ -862,10 +870,28 @@ class HoursCheckTests(CostFixture):
         self.assertNotIn((self.size, self.home, self.day(0).date().isoformat()), checks)
         end = datetime.fromtimestamp(self.clock.now, UTC)
         window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
-                                       (self.size,), self.limit)
+                                       self.builder, (self.size,), self.limit)
         self.assertEqual(window[self.size, self.home],
                          run_cost.hours_check(within + above, Decimal(2), self.limit))
         self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
+
+    def test_builder_running_time_counts_as_box_hours_of_the_builder_type(self) -> None:
+        one = self.day(1)
+        def observe(hours: float, state: ledger.InstanceState) -> None:
+            self.observations.append(ledger.InstanceObservation(int((one + timedelta(hours=hours)).timestamp()), state, 'fixture'))
+        # The builder runs 13:00-13:30, stops, then runs 14:00-22:00 with a repeated running read; it is stopped after.
+        for hours, state in ((12, 'stopped'), (13, 'running'), (13.5, 'stopping'), (13.6, 'stopped'),
+                             (14, 'running'), (18, 'running'), (22, 'stopped')):
+            observe(hours, cast(ledger.InstanceState, state))
+        self.gate(self.builder, self.home, one + timedelta(hours=1), 1800)
+        self.bill(one, {(self.builder, self.home): Decimal('9')})
+        check = self.checks()[self.builder, self.home, one.date().isoformat()]
+        self.assertEqual(check.box_hours, Decimal('9'))
+        self.assertFalse(check.hours_gap_over)
+        # A builder still running at the window end counts until the window end.
+        observe(23, 'running')
+        boxes = run_cost.box_hours(ledger.CostLedger(self.state), one, self.day(0), self.home, self.builder)
+        self.assertEqual(boxes[self.builder, self.home, one.date().isoformat()], Decimal('10'))
 
     def test_billed_hours_without_a_gate_box_are_over_and_unread_days_have_no_bill(self) -> None:
         one = self.day(1)
