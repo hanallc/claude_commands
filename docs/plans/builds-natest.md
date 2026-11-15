@@ -4303,19 +4303,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 298
 **Owner:** natest (the 298 AWS pair failed on this race on 11-15; the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** `_write_lease` accepts a lease that a concurrent `os.replace` unlinks between its lookup and its link count read.
-
-**Spec:**
-- Cause: the 298 AWS pair (changed, round 3) failed `test_stable_owner_reuses_contents_and_existing_permissions`. Eight threads hold the shared lock of one stable folder and each writes the lease. One thread's `os.replace` unlinked the old lease after another thread's `os.stat` lookup, so `st_nlink` was 0 and `_write_lease` raised `ValueError`. Base has the same check.
-- `_write_lease` in `scripts/lib/build_folders.py` refuses only a non-regular file and `st_nlink > 1`. The later `os.replace` writes the lease in both cases.
-- Test `test_a_lease_replaced_after_its_lookup_is_not_a_fault` replaces the lease between the lookup and the read. It fails without the fix.
-
-**Files:** `scripts/lib/build_folders.py`, `scripts/lib/test_build_folders.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is one line and one test.
-
-**Constraints from prior phases:** Phase 298 made the same change in `_open_lock`.
-
-**Acceptance gate:** test_build_folders passes on natedev; the new test fails without the fix; basedpyright reports zero errors and zero warnings.
+- Cause of the 298 AWS pair red (test_stable_owner_reuses_contents_and_existing_permissions): threads that share a stable folder lock each write the lease; one `os.replace` unlinked the old lease after another thread's lookup, and `_write_lease` raised on `st_nlink == 0`. Base had the same check.
+- `_write_lease` in `scripts/lib/build_folders.py` refuses only a non-regular file and `st_nlink > 1`.
+- Test `test_a_lease_replaced_after_its_lookup_is_not_a_fault` in `test_build_folders.py`.
+- Commit e564852f9. Production change.
