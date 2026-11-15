@@ -13,7 +13,7 @@ from unittest.mock import patch
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.lib import conf
-from scripts.review_links import change_page, console
+from scripts.review_links import change_browser, change_page, console, review_link
 
 
 class ConsoleMarkup(HTMLParser):
@@ -58,7 +58,15 @@ class ConsoleTests(unittest.TestCase):
         markup.feed(source)
         self.assertEqual(markup.pages, ["aws", "builds", "changes", "images", "questions"])
         self.assertEqual(markup.sources, [])
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 10)
+        # Each page has its own icon and a hidden new mark; the menu button has one more mark.
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 16)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 6)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 5)
+        self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
+        self.assertIn('data-news="/console/news"', source)
+        self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
+        self.assertIn("const value = fresh.has(entry.dataset.page) && !entry.hasAttribute('aria-current');", source)
+        self.assertIn("function refresh() { loadRebuilds(); loadNews(); }", source)
         base = f"/{change_page.CONSOLE_FOLDER}"
         changes = f"{base}/{change_page.PAGE_NAME}"
         self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
@@ -140,6 +148,36 @@ class ConsoleTests(unittest.TestCase):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
                 pages = console.read_pages()
                 self.assertIsInstance(pages[1].destination, console.UnavailablePage)
+
+    def news_pages(self, changes: set[str], questions: set[str]) -> tuple[console.ConsolePage, ...]:
+        with (patch.object(change_browser, "waiting_changes", return_value=frozenset(changes)),
+              patch.object(change_browser, "waiting_questions", return_value=frozenset(questions))):
+            return console.read_pages()
+
+    def test_a_page_is_new_when_an_item_arrives_after_its_last_open(self) -> None:
+        root = self.root / "snapshots"
+        # The first visit records every page's items, so nothing shows as new.
+        self.assertEqual(console.news(root, self.news_pages({"a/C1"}, {"q1"}), "changes"), ())
+        self.assertEqual(console.news(root, self.news_pages({"a/C1"}, {"q1", "q2"}), "changes"), ("questions",))
+        # A new change on the open page is seen at once.
+        self.assertEqual(console.news(root, self.news_pages({"a/C1", "a/C2"}, {"q1", "q2"}), "changes"), ("questions",))
+        self.assertEqual(console.news(root, self.news_pages({"a/C1", "a/C2"}, {"q1", "q2"}), "questions"), ())
+        # A question answered on its page and filed again is new again.
+        self.assertEqual(console.news(root, self.news_pages({"a/C1", "a/C2"}, {"q2"}), "questions"), ())
+        self.assertEqual(console.news(root, self.news_pages({"a/C2"}, {"q1", "q2"}), "changes"), ("questions",))
+        self.assertTrue(review_link.private_name(console.SEEN_NAME))
+
+    def test_a_failing_or_unavailable_page_shows_no_mark_and_keeps_its_record(self) -> None:
+        root = self.root / "snapshots"
+        _ = console.news(root, self.news_pages({"a/C1"}, {"q1"}), "changes")
+        with (patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})),
+              patch.object(change_browser, "waiting_questions", side_effect=OSError("fixture list unreadable"))):
+            pages = console.read_pages()
+        self.assertEqual(console.news(root, pages, "questions"), ())
+        self.assertEqual(console.news(root, self.news_pages({"a/C1"}, {"q1", "q2"}), "changes"), ("questions",))
+        unavailable = tuple(console.ConsolePage(page.identity, page.label, page.icon, page.title, console.UnavailablePage(), page.items)
+                            for page in self.news_pages({"a/C1"}, {"q1", "q2"}))
+        self.assertEqual(console.news(root, unavailable, "changes"), ())
 
 
 if __name__ == "__main__":

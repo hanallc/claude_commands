@@ -330,6 +330,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
             return
+        if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
+            self.news_post()
+            return
         try:
             branches = branch_page.page_at(server.root, self.path)
         except FileNotFoundError:
@@ -478,11 +481,29 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         self.json_response(200, {"state": "done"})
 
+    def news_post(self) -> None:
+        """Record the page the console shows, and name the other pages that hold new items."""
+        root = cast(ReviewLinksServer, self.server).root
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            opened = parse_qs(self.rfile.read(length).decode("utf-8")).get("open", [])
+            pages = console.read_pages()
+            if len(opened) != 1 or opened[0] not in {page.identity for page in pages}:
+                raise ValueError("name one console page")
+            fresh = console.news(root, pages, opened[0])
+        except ValueError as error:
+            self.browser_failure(400, "Name one console page.", error)
+            return
+        except (OSError, ImportError) as error:
+            self.browser_failure(503, "The console is not available.", error)
+            return
+        self.json_response(200, {"new": list(fresh)})
+
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: dict[str, str]) -> None:
+    def json_response(self, status: int, fields: dict[str, str] | dict[str, list[str]]) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

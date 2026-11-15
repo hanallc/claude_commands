@@ -92,6 +92,23 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
             raise ValueError("type must be changes or questions")
 
 
+def waiting_changes(root: Path) -> frozenset[str]:
+    """Name the changes that wait for the user, for the console's new mark."""
+    prepared = prepare(console_browser(root, "changes"), change_page.DeliveryStatus(root))
+    return frozenset(item.key for item in prepared.changes if item.waiting)
+
+
+def waiting_questions(root: Path) -> frozenset[str]:
+    """Name the questions that wait for the user, for the console's new mark."""
+    prepared = prepare(console_browser(root, "questions"), change_page.DeliveryStatus(root))
+    return frozenset(item.key for item in prepared.questions)
+
+
+def console_browser(root: Path, kind: change_page.ReviewKind) -> ReviewBrowser:
+    token, initial = browser_manifest(change_page.console_folder(root))
+    return ReviewBrowser(token, initial, kind)
+
+
 def rebuilds_at(root: Path, path: str) -> None:
     """Accept the rebuild needs path only beside a published browser."""
     match = re.fullmatch(FOLDER + "/" + re.escape(change_page.REBUILDS_NAME), urlsplit(path).path)
