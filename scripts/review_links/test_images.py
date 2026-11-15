@@ -132,7 +132,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn('<option value="week" selected>', source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("(feedback ? 'Not sent: ' : 'Not deleted: ') + error.message", source)
+        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
@@ -160,9 +160,9 @@ class ImagesTests(ImagesFixture):
  form.elements.feedback.value = 'Too dark.';
  form.requestSubmit(form.querySelector('button[value="feedback"]'));
  for (let step = 0; step < 100 && card.isConnected; step++) await wait(20);
- check(!card.isConnected, 'Send feedback removes the card from the page');
+ check(!card.isConnected, 'Send Feedback removes the card from the page');
  await wait(200);
- check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send feedback');
+ check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
  await report(failures);
 })();
 </script>"""
@@ -236,7 +236,7 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(len(gets), 4, "load, update, reload, update")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [(["feedback"], ["Too dark."])])
 
-    def test_card_shows_the_caption_details_image_feedback_field_delete_and_send_feedback(self) -> None:
+    def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
         images.write_record(self.root / images.FOLDER / record["id"], record)
@@ -254,8 +254,9 @@ class ImagesTests(ImagesFixture):
             + f'<input type="hidden" name="token" value="{token}">'
             + f'<label for="feedback-{record['id']}">Feedback</label>'
             + f'<textarea id="feedback-{record['id']}" name="feedback" rows="3"></textarea>'
-            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
-            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<div class="image-actions"><button type="submit" name="action" value="approved">Approved</button>'
+            + '<button type="submit" name="action" value="not approved">Not Approved</button>'
+            + '<button type="submit" name="action" value="feedback">Send Feedback</button>'
             + '<span role="status" data-image-status></span></div></form></article>'))
         with patch.dict(os.environ, {"USER_ZONE": "Europe/Berlin"}):
             self.assertIn(">Nov 15, 2026, 04:09<", images.card(record, "token", staff.snapshot(), 3))
@@ -283,19 +284,37 @@ class ImagesTests(ImagesFixture):
                 images.submit(self.root, body)
         self.assertEqual(images.records(self.root), [record])
 
-    def test_an_old_record_with_a_delete_request_reads_and_shows_delete(self) -> None:
+    def test_an_old_record_with_a_delete_request_reads_and_shows_the_answer_buttons(self) -> None:
         record = self.register()
         folder = self.root / images.FOLDER / record["id"]
         stored = cast(dict[str, object], json.loads((folder / images.RECORD).read_text()))
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
         _ = (folder / images.RECORD).write_text(json.dumps(stored))
         self.assertEqual(images.read_record(folder), record)
-        self.assertIn('<button type="submit" name="action" value="delete">Delete</button>',
-                      images.render(self.root).decode())
+        page = images.render(self.root).decode()
+        self.assertIn('<button type="submit" name="action" value="approved">Approved</button>', page)
+        self.assertNotIn('value="delete"', page)
 
-    def feedback_body(self, record: images.ImageRecord, feedback: str) -> str:
+    def feedback_body(self, record: images.ImageRecord, feedback: str, action: str = "feedback") -> str:
         token = images.request_token(images.console_token(self.root), record["id"])
-        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": "feedback"})
+        return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
+
+    def test_approved_and_not_approved_send_the_answer_with_feedback_only_when_written(self) -> None:
+        for action, first, feedback, lines in (
+                ("approved", "your image is approved.", "", ()),
+                ("not approved", "your image is not approved.", "  The counts are wrong. ", ("Feedback: The counts are wrong.",))):
+            with self.subTest(action=action):
+                self.sent.clear()
+                record = self.register("After: the panel.")
+                images.submit(self.root, self.feedback_body(record, feedback, action))
+                self.assertEqual([message for _, _, message in self.sent], ["\n".join((
+                    f"From the user (via the Images page): {first}", *lines,
+                    f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
+                    "Caption: After: the panel.", "For: Phase console-images",
+                    "After you act on it, delete the image: "
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
+                self.assertIn("feedback_at", images.read_record(self.root / images.FOLDER / record["id"]))
+                self.assertNotIn(record["id"], images.render(self.root).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
         record = self.register("After: the panel. Look at the counts.")
@@ -322,7 +341,7 @@ class ImagesTests(ImagesFixture):
     def test_feedback_that_reaches_no_one_keeps_the_image_shown(self) -> None:
         record = self.register()
         with patch.object(change_page, "send_message", side_effect=RuntimeError("session gone")) as send:
-            with self.assertRaisesRegex(images.FeedbackNotSent, "session gone"):
+            with self.assertRaisesRegex(images.AnswerNotSent, "session gone"):
                 images.submit(self.root, self.feedback_body(record, "Wrong colors."))
         self.assertEqual(send.call_count, 3)
         self.assertEqual(images.records(self.root), [record])
