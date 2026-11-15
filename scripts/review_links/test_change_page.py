@@ -1393,6 +1393,41 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(page.count(page_frame.COPY_STYLE), 1)
                 self.assertEqual(page.count(page_frame.COPY_BUTTON), page.count('<pre><code>'))
 
+    def test_change_code_blocks_from_the_add_command_copy_exact_text_on_both_pages(self) -> None:
+        code = '  printf \'%s\\n\' "copy check $HOME <tag> & value"\n\techo done | cat\n'
+        before = 'Before:\n- Read the label.\n\n'
+        after = '\n\nAfter:\n- Read the result.'
+        for kind in ('See in action', 'Read only'):
+            for name, block, expected in (
+                ('fenced', '```sh\n' + code + '\n```', [code]),
+                ('backtick line', '`echo "$HOME"`', ['echo "$HOME"']),
+                ('plain', 'Run `echo` without a code block.', []),
+            ):
+                with self.subTest(kind=kind, block=name):
+                    title = f'{kind}: {name}'
+                    result = self.command(change_review, change_review.main, [
+                        'add', '--repo', str(self.repo), '--production', 'page-owner',
+                        '--list', str(self.review_list), '--change', title,
+                        '--check', before + block + after, '--see', 'The command stays exact',
+                    ])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
+                    self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')
+                    _ = change_review.set_row_kind(self.review_list, row['#'], kind, self.production)
+                    selected = change_page.render(replace(self.page, rows=(row['#'],)), change_page.DeliveryStatus(self.root)).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row['#']
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (section[1], selected):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, expected)
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(expected))
+                        self.assertIn(change_page.review_text_html(before, 'pre'), body)
+                        self.assertIn(change_page.review_text_html(after + ' You see: The command stays exact', 'pre'), body)
+                        if not expected:
+                            self.assertIn(change_page.review_text_html(row[change_review.CHECK], 'pre'), body)
+
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser behavior')
     def test_code_copy_handles_results_repeated_clicks_and_new_blocks_inside_an_iframe(self) -> None:
         text = '  first <tag> & value\n\tsecond\n'
