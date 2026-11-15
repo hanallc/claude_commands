@@ -122,7 +122,8 @@ It prints no resource identities.
 
 `quota-request` requests Standard Spot quota in each configured gate region.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-It requests G and VT Spot quota in each candidate region.
+It requests G and VT Spot quota in each configured gate region.
+A region with only a price read gets no quota request.
 It uses `gpu_spot_quota_request_vcpus` from the same file.
 It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.

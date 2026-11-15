@@ -727,7 +727,9 @@ Credential refusals print their message once and stop the command with a nonzero
 AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
-The same command requests G and VT Spot quota (`L-3819A6DF`) in each region from `spot_candidate_regions`.
+The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
+A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
+`deploy.py quota-status` reads the same gate regions.
 It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
 All three new keys are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.
