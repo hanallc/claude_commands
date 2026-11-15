@@ -16,7 +16,7 @@ from scripts.review_links import review_link
 
 PAGE_NAME = "console.html"
 ICONS = Path(__file__).with_name("lucide")
-ICON_NAMES = frozenset(("list-checks", "hammer", "panel-left-close", "panel-left-open", "menu"))
+ICON_NAMES = frozenset(("list-checks", "hammer", "cloud", "panel-left-close", "panel-left-open", "menu"))
 
 
 @dataclass(frozen=True)
