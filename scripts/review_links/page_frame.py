@@ -10,6 +10,65 @@ STYLE = ('main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 16px}'
          '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}')
 
+COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
+<svg data-copy-icon width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
+<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+<svg data-copied-icon hidden width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+<path d="M20 6 9 17l-5-5"/></svg></button>'''
+
+COPY_STYLE = '''
+.code-block{position:relative}
+.code-block pre{padding-right:48px}
+.code-block [data-copy-code]{position:absolute;top:6px;right:6px;display:grid;place-items:center;
+box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
+background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}
+.code-block:hover [data-copy-code],.code-block [data-copy-code]:focus-visible{opacity:1}
+.code-block [data-copy-code]:hover,.code-block [data-copy-code]:focus-visible{background:#8882}
+[data-copy-code] [hidden]{display:none}
+'''
+
+COPY_SCRIPT = r'''(() => {
+const resultMs=2000, states=new WeakMap();
+function show(button,label){
+ button.setAttribute('aria-label',label);button.title=label==='Copy code' ? 'Copy' : label;
+ button.querySelector('[data-copy-icon]').toggleAttribute('hidden',label==='Copied');
+ button.querySelector('[data-copied-icon]').toggleAttribute('hidden',label!=='Copied');
+}
+function copyText(text){
+ const active=document.activeElement, selection=getSelection();
+ const ranges=selection ? Array.from({length:selection.rangeCount},(_,index)=>selection.getRangeAt(index).cloneRange()) : [];
+ const field=active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active : null;
+ const start=field?.selectionStart,end=field?.selectionEnd,direction=field?.selectionDirection;
+ const area=document.createElement('textarea');area.value=text;area.readOnly=true;area.tabIndex=-1;
+ area.setAttribute('aria-hidden','true');area.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';
+ document.body.append(area);
+ try{area.select();if(!document.execCommand('copy')) throw new Error('Copy failed');}
+ finally{
+  area.remove();active?.focus({preventScroll:true});
+  if(field && start!==null && start!==undefined && end!==null && end!==undefined) field.setSelectionRange(start,end,direction);
+  if(selection){selection.removeAllRanges();ranges.forEach(range=>selection.addRange(range));}
+ }
+}
+document.addEventListener('click',async event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-copy-code]') : null;
+ if(!button) return;
+ const code=button.closest('.code-block')?.querySelector('pre code');
+ if(!code) return;
+ const state=states.get(button) || {timer:0,request:0};states.set(button,state);
+ clearTimeout(state.timer);const request=++state.request;
+ let label='Copied';
+ try{
+  if(navigator.clipboard?.writeText) await navigator.clipboard.writeText(code.textContent);
+  else copyText(code.textContent);
+ }catch(error){label='Copy failed';}
+ if(request!==state.request) return;
+ show(button,label);state.timer=setTimeout(()=>show(button,'Copy code'),resultMs);
+});
+})();'''
+
 # A plain click on a data-image-zoom link shows its image over the page; Escape returns.
 # A click with a modifier key, or any other button, keeps the browser's link action.
 ZOOM_STYLE = '''

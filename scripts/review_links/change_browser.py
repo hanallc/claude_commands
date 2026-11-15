@@ -291,7 +291,8 @@ def item_html(entry: str) -> str:
     """Show an item that is one backtick span, such as a command, as a code block."""
     whole = change_page.CODE_SPAN.fullmatch(entry.strip())
     if whole is not None:
-        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+        return ('<div class="code-block"><pre><code>' + html.escape(whole.group(1))
+                + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
@@ -824,4 +825,5 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
+                                          + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)
