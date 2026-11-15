@@ -373,6 +373,7 @@ The memory bar divides the machine's RAM into three groups, in this order:
 Brackets above the bar name each group and the three parts of free RAM.
 A bracket under the bar shows the queue cap, from 0 to the end of free.
 `RamBlocks.cap_bytes` is that cap: builds, build reserved, and free. The page's taken amount is the cap less free.
+The hana CI amount is its swap-backed use from `ci_cap_use`, the same amount that admission counts.
 The legend shows each group under its own heading, and the queue cap rows sit under Builds.
 The status line under the free amount names one cause, in this order:
 1. An unavailable reading.
@@ -1133,6 +1134,9 @@ Only removal ends the holder's hold.
 **Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
+`remote_step_callers` names these gates, and clear, drain and the enforcer never stop them.
+On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
 Unreadable claims or admission state keep every outermost gate.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
@@ -1154,6 +1158,11 @@ A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
 Legacy CI cargo requests use the same hold and lineage check before memory admission.
 CI requests outside the keep list remain queued until release.
+A held CI request gets a `NatedevHeld` wait and waits through the hold; the release admits it.
+Only an unreadable hold state gives `ReadingUnavailable`, which the client refuses after its retry time.
+The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
+`snapshot_codec` writes it as `BehindHead` with a `_natedev_hold` field, and current readers restore it.
+GPU slot waits use the same shape with a `_gpu_slot` field.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
 **Clear.** `build_hold.py clear --for '<why>'` stops existing queued gates and running work outside the hold's allow rules.
@@ -1884,6 +1893,11 @@ The view shows zero room during a shortfall and records that shortfall in the ca
 The queue view and cards show captured process ids as `pid N` for each process row.
 The memory page shows `Stage`, `Duration`, `Unit`, `Pid`, `Machine`, and `vCPU` for running rows.
 The first column shows `building` or `testing` from the recorded progress counter.
+A natedev row shows `waiting for jobserver tokens` while its nextest step waits for test tokens; its `Done` cell shows `—`.
+`progress_profile.token_wait_line` prints the wait line in `nextest_tokens.py`, and `CounterParser` reads it from the step log as `NoCounter.token_wait`.
+The wait ends at the next line, which reports the tokens taken.
+`NoCounter.token_wait` is an optional field, so the counter wire union does not change for pinned clients.
+`build_queue.py --json` shows it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, merge gates, and cloud rows use their recorded counters.
 hana CI currently has no admission counter.
@@ -1892,7 +1906,15 @@ Idle or unreadable runners have no separate Running row.
 Their memory remains in the taken total, the cap, and the summary tooltip.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
-The narrow layout adds the `Step` column.
+The narrow layout adds the `Step` column and shows each cell in full.
+When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
+Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
+`memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
+The narrow table leaves out the room row, because the chart above it shows free.
+Beside the chart, the table room row is empty and only keeps the rows aligned.
+The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
+`cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
+`memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
 The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
 It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
 A v3 registration must match the current boot, process start time, uid, PID, and generation.
@@ -1904,6 +1926,8 @@ The step name uses the command's package, then the repository when the command h
 A step name never contains an unknown-value dash.
 The reader also reads the repository URL from the workspace manifest when the Git origin is absent.
 The Mac row shows the repository on its second label line.
+A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
+A `user`, `hana-ci` or `unplaced` run adds that label to its name.
 The stage uses a test counter or a running test binary as evidence for `testing`.
 The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
 It embeds the shared Cargo folder reader in the same Mac reading.

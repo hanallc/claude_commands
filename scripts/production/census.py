@@ -21,19 +21,11 @@ class CensusMachine(NamedTuple):
     reachable: bool
 
 
-class CensusShell(NamedTuple):
-    """A background command that the session's tile shows. `started_at` is None when the census cannot read the start."""
-
-    name: str
-    started_at: float | None
-
-
 class CensusSession(NamedTuple):
     """A session that a handler tile shows. `status` is None when the accounts command has no entry."""
 
     session: str
     status: str | None
-    shells: tuple[CensusShell, ...] = ()
 
 
 class CensusRun(NamedTuple):
@@ -109,24 +101,15 @@ def _optional_text(fields: dict[str, object], key: str, where: str) -> str | Non
     return value
 
 
-def _started_at(fields: dict[str, object], where: str) -> float | None:
-    started = fields.get("started_at")
-    if started is not None and (isinstance(started, bool) or not isinstance(started, int | float)):
-        raise _BadField(f"{where}.started_at is not a number or null")
-    return None if started is None else float(started)
-
-
 def _run(value: object, where: str) -> CensusRun:
     fields = _object(value, where)
     state = fields.get("state")
     if state not in RUN_STATES:
         raise _BadField(f"{where}.state is not one of {', '.join(RUN_STATES)}")
-    return CensusRun(_text(fields, "label", where), _started_at(fields, where), state)
-
-
-def _shell(value: object, where: str) -> CensusShell:
-    fields = _object(value, where)
-    return CensusShell(_text(fields, "name", where), _started_at(fields, where))
+    started = fields.get("started_at")
+    if started is not None and (isinstance(started, bool) or not isinstance(started, int | float)):
+        raise _BadField(f"{where}.started_at is not a number or null")
+    return CensusRun(_text(fields, "label", where), None if started is None else float(started), state)
 
 
 def _assignment(value: object, where: str) -> CensusPass | NoPass:
@@ -137,11 +120,8 @@ def _assignment(value: object, where: str) -> CensusPass | NoPass:
 
 
 def _session(value: object, where: str) -> CensusSession:
-    """A census without `shells` lists no background commands."""
     fields = _object(value, where)
-    shells = _list(fields, "shells", where) if "shells" in fields else []
-    return CensusSession(_text(fields, "session", where), _optional_text(fields, "status", where),
-                         tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells)))
+    return CensusSession(_text(fields, "session", where), _optional_text(fields, "status", where))
 
 
 def _worker(value: object, where: str) -> CensusWorker:

@@ -1333,7 +1333,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
             self.comment_only_change(relative)
         self.set_tip(self.commit("Change comments only"))
-        with self.ledger() as ledger, self.tip_builds() as builds:
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
+        with self.ledger() as ledger, mock.patch.object(style_ledger, "_tip", wraps=builder) as builds:
             for _ in range(2):
                 for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
                     with self.subTest(rule=rule):

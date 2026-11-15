@@ -34,9 +34,7 @@ An idle alert marker does not control admission.
 Blocks, live repository claims, and retry delays still apply.
 Tree repair steps remain local.
 
-Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A busy Mac keeps the lint on natedev. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting.
-
-A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fix` verb runs `mend --fix --fail-on-warn` on the Mac copy. clippy then judges the fixed copy with `--all-targets --all-features`. On a pass, `return_fix` lists the mirror files that differ from the worktree in content, under the run's claim. It skips the mirror mark, `/.git`, `/target` and git-ignored paths. It writes the changed files and removes the deleted files only when the worktree tree key still equals the sent key. natedev then runs `cargo fmt` and records the verdict key on the fixed tree. The result file adds `fix=applied|none|refused|failed|not_run`. A failed fix pass, a refused or failed return, or any decline other than busy or blocked returns the lint to the natedev queue for `mend --fix`, as before. Other writing steps always run on natedev, and their leave hooks remain disabled while the commands run. A Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
+Lint during a hold keeps local `cargo fmt` and `taplo fmt`. It then runs `mend-check` (`mend --fail-on-warn`) and clippy judgment (`--workspace --all-targets --all-features -- -D warnings`) on the Mac. A lint can use this sequence when its first `mend --fix` waits for memory and a Mac becomes free. A clean judgment ends the call without local repairs. A Mac finding from this memory transition returns the lint to the natedev queue for `mend --fix`. A busy Mac keeps the lint on natedev. Writing steps always run on natedev. Their leave hooks remain disabled while the commands run. Local formatting uses the protected `local_noncompiling` record state, including when a hold starts during formatting. The mirror never writes changes back. A finding must be fixed locally; a Linux-only lint error can appear later at the merge gate. A local step stopped for a new hold is routed again after the stop, rather than counted as a completed failure.
 
 ## How it works
 
@@ -266,7 +264,7 @@ The runner command has this form:
 
 ```sh
 offload.py run --repo-root DIR [--package PKG] \
-  [--verb nextest|check|clippy|mend-check|mend-fix|doc|build] --call-id ID \
+  [--verb nextest|check|clippy|mend-check|doc|build] --call-id ID \
   [--settings FILE] [--last-decline busy|blocked] [--filter-run] \
   [--result FILE] -- <verb arguments>
 ```

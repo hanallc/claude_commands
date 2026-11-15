@@ -1,17 +1,14 @@
 """Test Claude launcher validation and artifact placement."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
 import json
 import os
-import select
 import shutil
 import shlex
 import signal
 import socket
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, suppress
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import patch
 from scripts.whoami.account_test_support import write_codex_auth
@@ -48,43 +45,6 @@ with socket.socket(socket.AF_UNIX) as connection:
 """
 
 
-@contextmanager
-def exit_watch(pid: int) -> Generator[Callable[[], None]]:
-    """Watch pid from before the stop; the wait returns after the kernel ends the process.
-
-    The peer socket closes before the process is a zombie, so its end of file does not prove the exit.
-    """
-    if sys.platform == "darwin":
-        queue = select.kqueue()
-        try:
-            try:
-                _ = queue.control([select.kevent(pid, select.KQ_FILTER_PROC,
-                    select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
-            except ProcessLookupError:
-                yield lambda: None
-                return
-
-            def wait_mac() -> None:
-                assert queue.control(None, 1, TEST_HANG_GUARD_SECS), f"process {pid} did not exit"
-
-            yield wait_mac
-        finally:
-            queue.close()
-        return
-    try:
-        descriptor = os.pidfd_open(pid)
-    except ProcessLookupError:
-        yield lambda: None
-        return
-    try:
-        def wait_linux() -> None:
-            assert select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], f"process {pid} did not exit"
-
-        yield wait_linux
-    finally:
-        os.close(descriptor)
-
-
 def stop_assignment(command: list[str], environment: dict[str, str], number: int, *, private_worker: bool = False) -> tuple[subprocess.CompletedProcess[str], int]:
     """Stop a private assignment group from the external test controller."""
     with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
@@ -97,7 +57,6 @@ def stop_assignment(command: list[str], environment: dict[str, str], number: int
             try:
                 with ExitStack() as connections:
                     peers: list[socket.socket] = []
-                    exits: list[Callable[[], None]] = []
                     child = 0
                     for _ in range(2 if private_worker else 1):
                         connection = connections.enter_context(listener.accept()[0])
@@ -105,7 +64,6 @@ def stop_assignment(command: list[str], environment: dict[str, str], number: int
                         with connection.makefile() as incoming:
                             pid, group, kind = cast(tuple[int, int, str], json.loads(incoming.readline()))
                         assert group == launcher.pid, (group, launcher.pid)
-                        exits.append(connections.enter_context(exit_watch(pid)))
                         if kind == "stop":
                             child = pid
                         peers.append(connection)
@@ -114,8 +72,6 @@ def stop_assignment(command: list[str], environment: dict[str, str], number: int
                     for connection in peers:
                         assert connection.recv(1) == b""
                     output, errors = launcher.communicate(timeout=TEST_HANG_GUARD_SECS)
-                    for wait in exits:
-                        wait()
                     assert isinstance(process_start.process_start(child), (process_start.Gone, process_start.Zombie))
                     if private_worker:
                         pid = int((Path(environment["STUB_CLAUDE_ROOT"]) / "private-worker-pid").read_text())

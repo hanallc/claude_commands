@@ -63,22 +63,15 @@ if __name__ == "__main__":
             process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def encode(self, value: str, text: str, *arguments: str, directory: Path | None = None) -> bytes:
+    def request(self, process: subprocess.Popen[bytes], value: str, text: str,
+                *arguments: str, directory: Path | None = None) -> tuple[int, dict[str, object], str]:
         environment = {**os.environ, "VALUE": value}
         _ = environment.pop("LEAK", None)
         fields = [str(self.program), str(directory or self.root), str(len(arguments)), *arguments,
                   *(f"{name}={value}" for name, value in environment.items()), "", text, ""]
-        return b"\0".join(os.fsencode(value) for value in fields) + b"\0"
-
-    def request(self, process: subprocess.Popen[bytes], value: str, text: str,
-                *arguments: str, directory: Path | None = None) -> tuple[int, dict[str, object], str]:
-        assert process.stdin is not None
-        _ = process.stdin.write(self.encode(value, text, *arguments, directory=directory))
+        assert process.stdin is not None and process.stdout is not None
+        _ = process.stdin.write(b"\0".join(os.fsencode(value) for value in fields) + b"\0")
         process.stdin.flush()
-        return self.reply(process)
-
-    def reply(self, process: subprocess.Popen[bytes]) -> tuple[int, dict[str, object], str]:
-        assert process.stdout is not None
         replies = list(map(self.read_field, (cast(BinaryIO, process.stdout),) * 3))
         decoded = cast(dict[str, object], json.loads(replies[1]))
         return int(replies[0]), decoded, replies[2]
@@ -104,17 +97,6 @@ if __name__ == "__main__":
                                               args=arguments, pid=process.pid))
                 self.assertEqual(errors, "fixture diagnostic\n")
         self.assertEqual(self.program.with_suffix(".imports").read_text(), "imported\n")
-
-    def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
-        process = self.start_helper()
-        assert process.stdin is not None
-        _ = process.stdin.write(self.encode("first", "one", "one") + self.encode("second", "two", "two"))
-        process.stdin.flush()
-        for value, text in (("first", "one"), ("second", "two")):
-            with self.subTest(value=value):
-                status, output, _ = self.reply(process)
-                self.assertEqual(status, 0)
-                self.assertEqual((output["value"], output["stdin"], output["args"]), (value, text, [text]))
 
     def test_nonzero_exit_keeps_its_status_and_output(self) -> None:
         process = self.start_helper()

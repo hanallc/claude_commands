@@ -22,9 +22,6 @@ It runs beside the other reads, within `units_census_seconds` in `config/product
 For the phase status table, **Status** is the tile's status word for the unit's current session.
 The session is the staff row's current session, or the session of the Claude in the unit's pane when the unit has no staff row.
 The words are `busy`, `idle`, `paused` and `exited`. Starting and waiting are activities, not status words.
-A session is `busy` during a turn, during a start, while a background command runs after its turn, and while it owns a live detached run.
-`idle` means that none of these is in flight.
-The shared session classifier gives this word to the accounts board, the handler tiles and this table.
 A tile without an accounts entry shows `—`.
 A unit whose session the census does not list shows `exited` when the census scanned the unit's machine.
 A unit on a machine that the census did not scan shows `—`.
@@ -84,7 +81,6 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    A matching phase label at the start of the title appears once, regardless of case or dash.
    The phase instance in the selected run supplies the open step.
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-   A checkpoint after the instance's last phase, pass or activity start appends ` · checkpoint sent, waits to land` in place of the step.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
@@ -95,9 +91,6 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    An unknown holder keeps its recorded name or ID.
    A reason that starts with `waiting on`, `waiting for`, or either phrase after `blocked:` keeps that wording.
    A finished wait or pass removes its wait text.
-   The first row of a unit appends ` · waiting on <name> <elapsed>` for each background command that the census lists for the unit's session.
-   The name is the command's description, as the handler tile shows it. A command without a start time omits the elapsed time.
-   With no other note, the waits replace `—`. Queued compares its items with Notes before the waits are added.
    Status keeps the census word even while Notes shows a wait.
 4. **ETA Next** shows the latest stated promise for that row's phase instance.
    `eta_phase_id` names the target; the active instance on an ETA event does not override that target.

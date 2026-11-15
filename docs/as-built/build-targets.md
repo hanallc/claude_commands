@@ -149,7 +149,7 @@ The default order is Mac, then natedev.
 A pin keeps admission, spending, and version checks.
 Remote steps take no natedev grant or cargo token.
 A remote refusal never sends a pinned movable step to natedev.
-Lint repairs run on natedev, including under `lint --mac`. The one exception is the Mac fix pass after a held Mac `mend-check` finding.
+Lint repairs always run on natedev, including under `lint --mac`.
 
 | Step | Remote verb | Kind |
 | --- | --- | --- |
@@ -157,7 +157,6 @@ Lint repairs run on natedev, including under `lint --mac`. The one exception is 
 | check | check | check |
 | doc | doc | doc |
 | lint judgment | clippy, mend-check | lint |
-| Mac lint fix pass | mend-fix (mend --fix, then clippy) | lint |
 | example | clippy with example arguments | example |
 | build | build | build |
 | final | check, nextest | check, test |

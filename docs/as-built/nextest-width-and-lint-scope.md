@@ -29,7 +29,7 @@ On natedev, compiles and test threads share one jobserver pool, `/dev/steve`. Ea
 1. `run_nextest` calls `nextest_token_pool` in `physical` and `logical` mode. It sets `LINT_NEXTEST_POOL` to the path in `CARGO_MAKEFLAGS` `--jobserver-auth=fifo:PATH` when that path is a readable and writable character device or FIFO. Otherwise the pool is empty.
 2. After the memory gate admits the step, `run_step_attempt` runs `nextest_tokens.py --pool P --width-file F --reservation R -- cargo nextest run --test-threads W ...` inside the step's scope.
 3. The holder builds first with `--no-run` and the selection arguments before `--`. The compile takes tokens as cargo always does, and the step holds no test token while it compiles.
-4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. Then it takes free tokens without a wait, up to W.
+4. It takes `test_token_floor` tokens (`config/build_admission.conf`, 4), and waits for them with `nextest: waiting for K more jobserver tokens`. `progress_profile.token_wait_line` defines that line; the Builds page shows the wait as the stage `waiting for jobserver tokens`. Then it takes free tokens without a wait, up to W.
 5. It writes the token count N to F. When N is not W, it sets the reservation's `test_threads` to N (`admission_client.width`).
 6. It prints `nextest: N of W test threads; load <one-minute load> on <cpu count> CPUs (<host>); one jobserver token for each thread`, then runs the tests with `--test-threads N`.
 7. Every token goes back when the tests end, on any exit or signal. TERM, INT and HUP go on to the child, and the holder exits 128 + the signal. steve also takes back the tokens of a process that dies.

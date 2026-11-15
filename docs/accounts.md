@@ -144,8 +144,6 @@ Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
 Spare counts are blank.
 Running Claude session records supply `busy` during a turn.
-A record with the `shell` state also counts as busy.
-Claude Code writes `shell` when the turn has ended and a background command still runs.
 Other running Claude sessions count as idle.
 A missing messaging socket does not make a running Claude session count as exited.
 A unit or showrunner without a live session counts as exited on its selected role account.

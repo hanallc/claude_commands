@@ -785,38 +785,6 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(unit_phases.census_workers(view, member, "two"), ())
         self.assertEqual(unit_phases.census_workers(unit_phases.census_view(failed), member, "one"), failed)
 
-    def test_notes_name_background_commands_and_a_sent_checkpoint(self) -> None:
-        owner = fixture_member("showrunner", name="shell-owner")
-        member = fixture_member("unit", name="shelled", parent=owner.id,
-            worktree=staff.PresentWorktree(remote.local_machine(), self.root))
-        now = 1_794_750_000.0
-        shells = (census.CensusShell("Run the AWS gate", now - 720), census.CensusShell("Watch CI", None))
-        read = tiles(sessions=[census.CensusSession(member.current_session, "busy", shells)])
-        shelled = unit("shelled", live("shelled"))
-        waits = ("waiting on Run the AWS gate 12m", "waiting on Watch CI")
-        self.assertEqual(unit_phases.shell_waits(unit_phases.census_view(read), shelled, now=now), waits)
-        self.assertEqual(unit_phases.shell_waits(census.CensusFailed("census exited 2"), shelled, now=now), ())
-        self.assertEqual(unit_phases.shell_waits(unit_phases.census_view(LOCAL), shelled, now=now), ())
-        self.assertEqual(unit_phases.with_waits("—", waits), " · ".join(waits))
-        self.assertEqual(unit_phases.with_waits("no plan", ()), "no plan")
-        rendered = unit_phases.table([shelled], {"shelled": {"unavailable": "no plan"}},
-                                     now=now, zone=ZoneInfo("UTC"), census_read=read)
-        self.assertIn("| shelled | busy |", rendered)
-        self.assertIn("| shelled | no plan · waiting on Run the AWS gate 12m · waiting on Watch CI |", rendered)
-        events: list[dict[str, object]] = [
-            {"event_type": "phase_started", "phase_id": "images-card", "phase_instance_id": "one"},
-            {"event_type": "activity_started", "phase_instance_id": "one", "activity": "write the card"},
-            {"event_type": "checkpoint", "phase_instance_id": "one"},
-            {"event_type": "eta_stated", "phase_instance_id": "one", "eta_phase_id": "images-card"},
-            {"event_type": "activity_started", "phase_instance_id": "two"}]
-        self.assertTrue(unit_phases.checkpoint_sent(events[:4]))
-        self.assertFalse(unit_phases.checkpoint_sent([*events[:4], events[1]]))
-        self.assertFalse(unit_phases.checkpoint_sent(events[:2]))
-        phase = phase_table.OpenPhase("images-card", "Images card", datetime(2026, 11, 15, 14, tzinfo=UTC),
-            phase_table.PhaseProgressNotReported(), phase_table.EtaUnavailable(), phase_table.EtaNeverStated(), "one")
-        self.assertEqual(unit_phases.phase_notes_cell(phase, events, snapshot=staff.snapshot(), now=now),
-                         "phase images-card — Images card · checkpoint sent, waits to land")
-
     def test_each_open_phase_has_its_work_eta_wait_and_recorded_workers(self) -> None:
         owner = fixture_member("showrunner", name="parallel-owner")
         member = fixture_member("unit", name="parallel", parent=owner.id,
@@ -1300,7 +1268,7 @@ class UnitPhasesTests(unittest.TestCase):
         _ = staff.resume(second.id)
         resumed = render()
         self.assertIn("| second | exited |", resumed)
-        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "busy", False),
+        for activity, hold, expected, detached in (("busy", "", "busy", False), ("shell", "", "idle", False),
                 ("busy", "pause", "paused", False), ("busy", "exit", "exited", False),
                 ("idle", "", "busy", True), ("busy", "", "busy", True),
                 ("starting", "", "busy", False), ("starting", "", "busy", True),

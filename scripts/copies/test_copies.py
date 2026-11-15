@@ -126,8 +126,6 @@ class StandingTests(unittest.TestCase):
             "SCRATCH_HOLDS": str(self.base / "holds.json"),
             "SCRATCH_COPIES_ROOT": str(self.base / "old-copies"),
             "COPIES_CONFIG": str(self.configuration),
-            # A child's fresh copy goes in the test folder, so a killed child leaves nothing outside it.
-            "TMPDIR": str(temporary),
         })
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         self.enterContext(isolated_staff_file(self.base / "staff.json", {}))
@@ -2210,7 +2208,7 @@ with copies.standing(copies.caller_owner(), Path(sys.argv[1]), copies.CommittedS
         self.assertEqual(self.git(self.source, "remote", "get-url", "origin"), relative)
 
     def test_command_keeps_busy_lock_after_wrapper_is_killed(self) -> None:
-        command = "import os,sys; print(os.getpid(), os.getcwd(), flush=True); sys.stdin.read(1)"
+        command = "import os,sys; print(os.getpid(), flush=True); sys.stdin.read(1)"
         process = subprocess.Popen(
             [sys.executable, str(Path(copies.__file__)), "run",
              "--repo", str(self.source), "--commit", "HEAD", "--", sys.executable, "-c", command],
@@ -2219,10 +2217,7 @@ with copies.standing(copies.caller_owner(), Path(sys.argv[1]), copies.CommittedS
             self.assertIsNotNone(process.stdout)
             output = cast(TextIO, process.stdout)
             self.assertTrue(select.select([output], [], [], 10)[0], "command did not start")
-            pid, checkout = output.readline().strip().split(" ", 1)
-            child = int(pid)
-            # The wrapper cannot remove its copy after a kill; the test folder removes it.
-            self.assertTrue(Path(checkout).is_relative_to(self.base / "temporary"), checkout)
+            child = int(output.readline().strip())
             process.kill()
             _ = process.wait(timeout=10)
             os.kill(child, 0)

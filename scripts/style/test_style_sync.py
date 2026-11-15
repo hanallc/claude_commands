@@ -194,8 +194,6 @@ class StyleSyncTests(unittest.TestCase):
             "SCRATCH_ROOT": str(self.root / "scratch"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
-            # A child's fresh gate copy goes in the test folder, so a killed child leaves nothing outside it.
-            "TMPDIR": str(self.root),
         })))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(style_staff_fixture(self.root, self.repo))
@@ -1377,8 +1375,6 @@ with (Path('target').resolve().parent / '.claude-busy').open('r+') as lock:
         self.assertEqual(lease["pid"], process.pid)
         self.assertIsInstance(lease["start_time"], str)
         self.assertEqual(build_folders.build_folder_state(directory), "free")
-        # The killed owner cannot remove its gate copy; the test folder removes it.
-        self.assertTrue((directory / "checkout").resolve().is_relative_to(self.root.resolve()))
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertTrue((directory / "checkout").exists())

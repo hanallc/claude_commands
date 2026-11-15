@@ -27,7 +27,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from functools import lru_cache, wraps
+from functools import wraps
 from itertools import groupby
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -2090,22 +2090,6 @@ def _tip_input_blobs(blobs: dict[str, str]) -> dict[str, str]:
             if PurePosixPath(path).name == "Cargo.toml" or path in TIP_CONFIG_PATHS}
 
 
-_VALID_REF_NAMES: set[str] = set()
-
-
-def _check_ref_format(repo: Path, name: str) -> None:
-    """Refuse an invalid ref name. The answer depends only on the name, so keep each valid one."""
-    if name not in _VALID_REF_NAMES:
-        _ = _git(repo, "check-ref-format", name)
-        _VALID_REF_NAMES.add(name)
-
-
-@lru_cache(maxsize=16)
-def _read_tip(repo: Path, commit: str) -> RepositoryTip:
-    """A full commit name fixes its tip, so one process reads each tip once."""
-    return _tip(repo, commit)
-
-
 def _tip(repo: Path, commit: str) -> RepositoryTip:
     command = ("git", "-C", str(repo), "rev-parse", "--end-of-options",
                f"{commit}^{{commit}}", f"{commit}^{{tree}}")
@@ -2747,7 +2731,7 @@ class GitReadCache:
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if commit not in self.tips:
-            self.tips[commit] = _read_tip(self.repo, commit)
+            self.tips[commit] = _tip(self.repo, commit)
         return self.tips[commit]
 
     def read(self, commit: str, paths: Iterable[str]) -> None:
@@ -3070,7 +3054,7 @@ class Ledger:
             tip = self.git_cache.tip(commit)
         else:
             if commit not in self._tips:
-                self._tips[commit] = _read_tip(self.repo, commit)
+                self._tips[commit] = _tip(self.repo, commit)
             tip = self._tips[commit]
         if self._maintaining_cell:
             self._judgment_reads.update(tip.read_objects)
@@ -3413,7 +3397,7 @@ class Ledger:
         commit = _git(self.repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
         if style_branch is not None:
             style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
-            _check_ref_format(self.repo, style_branch)
+            _ = _git(self.repo, "check-ref-format", style_branch)
         # The sites exist before the tip is visible, so the write lock holds only the sync row.
         self._catalog = self._load_rules()
         self._refresh_sites(self._tip(commit))
@@ -4649,7 +4633,7 @@ class Ledger:
                     raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
             if target == "assigned":
                 try:
-                    _check_ref_format(self.repo, branch)
+                    _ = _git(self.repo, "check-ref-format", branch)
                 except GitReadFailed:
                     raise
                 except LedgerError as error:

@@ -42,6 +42,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
             return file
 
         cast(dict[str, style_ledger.RepositoryTip], getattr(ledger, "_tips")).clear()
+        builder = cast(Callable[[Path, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
         flush = refill_facts.RefillWriteBatch.flush
         batch_versions: list[set[int]] = []
 
@@ -56,7 +57,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
                 batch_versions.append(set(versions))
             flush(batch, facts)
 
-        with (self.tip_builds() as inventories,
+        with (mock.patch.object(style_ledger, "_tip", wraps=builder) as inventories,
               mock.patch.object(style_ledger, "read_declarations", wraps=remember) as reads,
               mock.patch.object(declarations, "read_declarations", wraps=declarations.read_declarations) as separate,
               mock.patch.object(refill_facts.RefillWriteBatch, "flush", autospec=True, side_effect=flush_batch)):

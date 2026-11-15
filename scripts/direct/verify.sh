@@ -741,8 +741,6 @@ step_was_killed_for_memory() {
 }
 
 step_writes_tree() {
-    # The Mac fix pass writes the tree only through its key check in offload.py.
-    [[ "${LINT_MAC_FIX:-0}" == 0 ]] || return 1
     if [[ "${1:-}" == env ]]; then
         shift
         while [[ "${1:-}" == *=* || "${1:-}" == -u ]]; do
@@ -826,7 +824,6 @@ run_step() {
         if buildlog_step_compiles "$@"; then
             route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
             if [[ "$STEP_RAN_ON_MAC" == 1 ]]; then rm -f "$step_log"; return 0; fi
-            if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then rm -f "$step_log"; return "$LINT_LEFT_QUEUE_STATUS"; fi
         fi
         if buildlog_step_compiles "$@"; then
             step_state on_natedev
@@ -2149,9 +2146,6 @@ MAC_VERB_ARGS=()
 MAC_FINISH_CALL=1
 MAC_PASSED=0
 STEP_RAN_ON_MAC=0
-# LINT_MAC_FIX=1 sends mend --fix to the Mac as one fix pass (run_mac_lint_fix).
-LINT_MAC_FIX=0
-MAC_FIX_RESULT=""
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2 runner_pid
@@ -2204,7 +2198,6 @@ try_mac_test() {
     REMOTE_BUILD_TARGET_DIR=""
     local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
     local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
-    MAC_FIX_RESULT=""
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE")
@@ -2320,7 +2313,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 seconds=*) result_seconds="${line#seconds=}" ;;
                 holder=*) result_holder="${line#holder=}" ;;
                 fetch=*) result_fetch="${line#fetch=}" ;;
-                fix=*) MAC_FIX_RESULT="${line#fix=}" ;;
                 build_target_directory=*) REMOTE_BUILD_TARGET_DIR="${line#build_target_directory=}" ;;
             esac
         done <<< "$result_text"
@@ -2562,9 +2554,8 @@ route_compiling_step() {
         if [[ "${1:-}" == +* ]]; then shift; fi
         MAC_VERB=${1:-}
         shift || true
-        if [[ "$MAC_VERB" == mend && "${LINT_MAC_FIX:-0}" == 1 ]]; then MAC_VERB=mend-fix
-        elif [[ "$MAC_VERB" == mend ]]; then MAC_VERB=mend-check; fi
-        if [[ "$command" != cargo || ( "$MAC_VERB" != check && "$MAC_VERB" != doc && "$MAC_VERB" != clippy && "$MAC_VERB" != mend-check && "$MAC_VERB" != mend-fix && "$MAC_VERB" != build && "$MAC_VERB" != nextest ) ]]; then
+        if [[ "$MAC_VERB" == mend ]]; then MAC_VERB=mend-check; fi
+        if [[ "$command" != cargo || ( "$MAC_VERB" != check && "$MAC_VERB" != doc && "$MAC_VERB" != clippy && "$MAC_VERB" != mend-check && "$MAC_VERB" != build && "$MAC_VERB" != nextest ) ]]; then
             build_check_stop 2 'cannot route this compiling step to the Mac'
             return 2
         fi
@@ -2572,7 +2563,6 @@ route_compiling_step() {
         while (( $# )); do
             case "$MAC_VERB:$1" in
                 doc:--no-deps|clippy:--all-targets|mend-check:--all-targets|mend-check:--fail-on-warn) shift ;;
-                mend-fix:--all-targets|mend-fix:--fail-on-warn|mend-fix:--fix) shift ;;
                 clippy:--allow-dirty|clippy:--allow-staged|clippy:--allow-no-vcs) shift ;;
                 doc:--jobs) shift 2 ;;
                 *) MAC_VERB_ARGS+=("$1"); shift ;;
@@ -2739,11 +2729,6 @@ placement_once() {
                 printf '%s\n' "${line#left }"
                 buildlog_memory_event left ;;
             refused$'\t'*)
-                if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
-                    LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=${line#*$'\t'}
-                    status=$LINT_LEFT_QUEUE_STATUS
-                    continue
-                fi
                 if [[ -n "$PINNED_TARGET" ]]; then
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
@@ -2851,11 +2836,6 @@ route_test() {
             exit "$LOOKUP_STATUS"
         fi
         if [[ "$PLACEMENT_PROVIDER" == local ]]; then
-            if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
-                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                    --pid $$ --reason "the Mac fix pass runs only on the Mac" >/dev/null || return $?
-                return "$LINT_LEFT_QUEUE_STATUS"
-            fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
                 verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                     --pid $$ --reason "local memory permits lint repair" >/dev/null || return $?
@@ -2872,17 +2852,18 @@ route_test() {
                 --token required >/dev/null || return $?
         fi
         local claim_status=0
-        # reserve and recover-reservation take the same words.
-        local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
-            --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
-            --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
-            --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
-        verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
+        verify_helper "$BUILD_TARGETS_SCRIPT" reserve --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
+            --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG" \
+            --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
+            --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" || claim_status=$?
         if (( claim_status != 0 && claim_status != 13 )); then
             local recovered=78
             while (( recovered == 78 )); do
                 recovered=0
-                verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
+                verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
+                    --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG" \
+                    --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" \
+                    --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity" || recovered=$?
                 if (( recovered == 78 )); then wait_for_claim_recovery; fi
             done
             if (( recovered == 0 || recovered == 13 )); then
@@ -2907,11 +2888,6 @@ route_test() {
         fi
         try_reserved_target "$last_decline" || return $?
         [[ "$MAC_PASSED" != 1 ]] || return 0
-        if [[ "${LINT_MAC_FIX:-0}" == 1 && "${LAST_TARGET_REASON:-}" != busy && "${LAST_TARGET_REASON:-}" != blocked ]]; then
-            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
-                --pid $$ --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
-            return "$LINT_LEFT_QUEUE_STATUS"
-        fi
         last_decline=${LAST_TARGET_REASON:-}
         if (( admission == 10 )) && [[ "$STEP_ASSIGNED_PLATFORM" == macos \
                 && ( "$last_decline" == busy || "$last_decline" == blocked ) \
@@ -4072,28 +4048,6 @@ run_lint_judgment() {
     fi
 }
 
-# The Mac runs mend --fix and then clippy on its copy in one run. offload.py
-# writes the changed files into the worktree only when the worktree still has
-# the tree key that the copy sent. Any other answer leaves the tree as it was,
-# and the caller repairs it on natedev.
-run_mac_lint_fix() {
-    local STEP_FORCE_MAC=1 LINT_MAC_FIX=1 fix_status=0
-    MAC_FIX_RESULT=""
-    echo 'verify.sh: mend found findings on the Mac; running the fix pass there.'
-    invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" || fix_status=$?
-    if (( fix_status != 0 )) || [[ "$STEP_RAN_ON_MAC" != 1 \
-            || ( "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ) ]]; then
-        echo 'verify.sh: the Mac fix pass did not finish; natedev repairs the tree.'
-        return 1
-    fi
-    # Format the returned files with natedev's rustfmt, then judge this tree.
-    fmt_cargo --all
-    if [[ -n "${RUN_LOG}" ]]; then
-        set_verdict_keys
-    fi
-    echo 'verify.sh: the Mac fix pass passed; the worktree has its files.'
-}
-
 run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
     # Format locally; the Mac judges the resulting tree without fixes.
@@ -4103,7 +4057,6 @@ run_lint_held_sequence() {
     lint_status=0
     if lint_config_enabled mend; then
         local mend_status=0
-        LAST_TARGET_OUTCOME=""
         invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || mend_status=$?
         if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 && "$mend_status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
             LINT_MEMORY_JUDGMENT=0
@@ -4111,13 +4064,7 @@ run_lint_held_sequence() {
             return 0
         fi
         LINT_MEMORY_JUDGMENT=0
-        if (( mend_status != 0 )); then
-            # A finding the Mac reported gets its fix pass there; clippy judges the fixed copy.
-            if [[ "$LAST_TARGET_OUTCOME" == failed ]] && run_mac_lint_fix; then
-                return 0
-            fi
-            lint_status=1
-        fi
+        (( mend_status == 0 )) || lint_status=1
     fi
     if lint_config_enabled clippy; then
         start_tree_watch

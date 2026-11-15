@@ -88,8 +88,9 @@ class JudgmentCellsTests(LedgerTestCase):
         self.set_tip(tip)
         with self.ledger() as cold:
             expected = self.coverage(cold)
+        builder = cast(Callable[[object, str], style_ledger.RepositoryTip], vars(style_ledger)["_tip"])
         code = cast(Callable[[bytes], object], vars(style_ledger)["_rust_code"])
-        with self.ledger() as warm, self.tip_builds() as tips:
+        with self.ledger() as warm, mock.patch.object(style_ledger, "_tip", wraps=builder) as tips:
             judgments = cast(Callable[..., object], getattr(warm, "_judgments"))
             with mock.patch.object(warm, "_judgments", wraps=judgments) as histories:
                 with mock.patch.object(style_ledger, "_rust_code", wraps=code) as sources:
@@ -107,7 +108,6 @@ class JudgmentCellsTests(LedgerTestCase):
                 _ = object_path.rename(hidden)
                 try:
                     for maintained in (False, True):
-                        self.forget_tips()
                         with self.subTest(maintained=maintained), self.ledger() as ledger:
                             with mock.patch.object(ledger, "_maintain_judgments", maintained):
                                 with self.assertRaises(style_ledger.GitReadFailed):

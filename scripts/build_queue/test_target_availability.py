@@ -86,66 +86,58 @@ class MacRouteTests(unittest.TestCase):
     def routes(self, *mac_states: targets.TargetState) -> target_availability.MacRoutes:
         return target_availability.MacRoutes((snapshot(MAC, *mac_states), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
 
-    def test_each_mac_state_gives_its_fit(self) -> None:
+    def test_each_mac_state_gives_its_line(self) -> None:
         job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
-        Allowed, Unreadable = target_availability.Allowed, target_availability.FitUnreadable
-        cases: tuple[tuple[targets.TargetState, target_availability.TargetFit], ...] = (
-            (MAC_BLOCK, Allowed("blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC")),
-            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER)), Allowed("blocked by solo until 15:10 UTC")),
-            (targets.Running((job, job)), Allowed("busy with nextest hana; nextest hana")),
-            (targets.Unreachable("probe failed"), Allowed("unreachable, probe failed")),
-            (targets.StateUnreadable("block.json: bad"), Unreadable("Mac state unreadable, block.json: bad")),
-            (targets.Free(), Allowed("no block or claim recorded")),
+        cases: tuple[tuple[targets.TargetState, str], ...] = (
+            (MAC_BLOCK, "Mac: blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC"),
+            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER)), "Mac: blocked by solo until 15:10 UTC"),
+            (targets.Running((job, job)), "Mac: busy with nextest hana; nextest hana"),
+            (targets.Unreachable("probe failed"), "Mac: unreachable, probe failed"),
+            (targets.StateUnreadable("block.json: bad"), "Mac: state unreadable, block.json: bad"),
+            (targets.Free(), "Mac: no recorded block or claim; availability not checked"),
         )
         for state, expected in cases:
             with self.subTest(expected=expected), \
                  mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("hana", "/r")):
                 routes = self.routes(state)
-                self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"), expected)
+                self.assertEqual(routes.line("nextest", "/fixture/hana", "hana"), expected)
                 self.assertEqual(routes.blocked(), isinstance(state, targets.Held))
 
     def test_kind_and_routing_rule_come_before_target_state(self) -> None:
         routes = self.routes(MAC_BLOCK)
         with mock.patch.object(build_targets, "step_policy", side_effect=AssertionError("no policy read")):
-            self.assertEqual(routes.fit("fmt", "/fixture/hana", "hana"),
-                             target_availability.NotAllowed("this step kind does not run on the Mac"))
-            self.assertEqual(routes.fit("build", "/fixture/hana", "hana"),
-                             target_availability.NotAllowed("makes natedev artifacts"))
+            self.assertEqual(routes.line("fmt", "/fixture/hana", "hana"), "Mac: kind not offloaded")
+            self.assertEqual(routes.line("build", "/fixture/hana", "hana"), "Mac: natedev only, makes natedev artifacts")
 
     def test_policy_exclusion_names_its_reason_and_reads_once_for_each_key(self) -> None:
         routes = self.routes(targets.Free())
         excluded = ExcludedTarget(MAC, "linux_only")
-        linux_only = target_availability.NotAllowed("this package runs only on Linux")
         with mock.patch.object(build_targets, "step_policy", return_value=excluded) as policy:
-            self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"), linux_only)
-            self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"), linux_only)
-            self.assertEqual(routes.fit("nextest", "/fixture/hana", PackageNotRecorded()),
-                             target_availability.NotAllowed("this package runs only on Linux; package not recorded"))
-            self.assertEqual(routes.fit("nextest", "/fixture/hana", ""), linux_only)
+            self.assertEqual(routes.line("nextest", "/fixture/hana", "hana"), "Mac: excluded, linux_only")
+            self.assertEqual(routes.line("nextest", "/fixture/hana", "hana"), "Mac: excluded, linux_only")
+            self.assertEqual(routes.line("nextest", "/fixture/hana", PackageNotRecorded()),
+                             "Mac: excluded, linux_only; package not recorded")
+            self.assertEqual(routes.line("nextest", "/fixture/hana", ""), "Mac: excluded, linux_only")
         self.assertEqual(policy.call_count, 3)
-        with mock.patch.object(build_targets, "step_policy", return_value=ExcludedTarget(MAC, "disk")):
-            self.assertEqual(self.routes(targets.Free()).fit("check", "/fixture/hana", "hana"),
-                             target_availability.NotAllowed("disk"))
 
-    def test_dynamic_exclusions_leave_the_state(self) -> None:
+    def test_dynamic_exclusions_leave_the_state_line(self) -> None:
         for reason in sorted(target_availability.DYNAMIC_REASONS):
             with self.subTest(reason=reason), \
                  mock.patch.object(build_targets, "step_policy", return_value=ExcludedTarget(MAC, reason)):
-                self.assertEqual(self.routes(targets.Unreachable("retry backoff")).fit("check", "/fixture/hana", "hana"),
-                                 target_availability.Allowed("unreachable, retry backoff"))
+                self.assertEqual(self.routes(targets.Unreachable("retry backoff")).line("check", "/fixture/hana", "hana"),
+                                 "Mac: unreachable, retry backoff")
 
     def test_a_policy_read_error_shows_as_unreadable(self) -> None:
         with mock.patch.object(build_targets, "step_policy", side_effect=ConfigError("offload.conf: bad")):
-            self.assertEqual(self.routes(targets.Free()).fit("check", "/fixture/hana", "hana"),
-                             target_availability.FitUnreadable("Mac state unreadable, offload.conf: bad"))
+            self.assertEqual(self.routes(targets.Free()).line("check", "/fixture/hana", "hana"),
+                             "Mac: state unreadable, offload.conf: bad")
 
     def test_unreadable_or_absent_mac_target(self) -> None:
         unreadable = target_availability.MacRoutes(target_availability.SnapshotsUnreadable("targets.conf: missing"), {}, UTC)
-        self.assertEqual(unreadable.fit("nextest", "/r", "p"),
-                         target_availability.FitUnreadable("Mac state unreadable, targets.conf: missing"))
+        self.assertEqual(unreadable.line("nextest", "/r", "p"), "Mac: state unreadable, targets.conf: missing")
         self.assertFalse(unreadable.blocked())
         absent = target_availability.MacRoutes((snapshot(NATEDEV, targets.Free()),), {}, UTC)
-        self.assertEqual(absent.fit("nextest", "/r", "p"), target_availability.NoMacTarget())
+        self.assertEqual(absent.line("nextest", "/r", "p"), "")
         self.assertFalse(absent.blocked())
 
 
