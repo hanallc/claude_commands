@@ -27,7 +27,8 @@ from itertools import chain
 
 from scripts.build_queue import admission_records as records, progress_profile as progress, snapshot_codec as codec, step_estimator
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
-    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses)
+    NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, ServiceJobState, ScopeActivityReader, ScopeProcesses,
+    SESSION_KEYS, environment_values)
 
 
 from scripts.lint.build_shape import (BuildShape, recorded_build_shape)
@@ -1624,11 +1625,7 @@ class QueueIdentityReader:
         while not session and current in self.processes and current not in seen:
             seen.add(current)
             if current not in self.environments:
-                try:
-                    raw = (self.proc / str(current) / "environ").read_bytes().decode(errors="replace")
-                    self.environments[current] = dict(part.split("=", 1) for part in raw.split("\0") if "=" in part)
-                except OSError:
-                    self.environments[current] = {}
+                self.environments[current] = environment_values(self.proc / str(current) / "environ", SESSION_KEYS)
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
             name = name or env.get("CLAUDE_SESSION_NAME", "")
