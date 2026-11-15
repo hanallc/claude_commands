@@ -134,6 +134,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(200, branch_page.render(branches))
             return None
         try:
+            change_browser.rebuilds_at(root, self.path)
+            content = change_browser.render_rebuilds()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links rebuilds: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>The rebuild list is not available.</p>"))
+            return None
+        else:
+            self.html_response(200, content)
+            return None
+        try:
             browser = change_browser.page_at(root, self.path)
         except FileNotFoundError:
             pass
