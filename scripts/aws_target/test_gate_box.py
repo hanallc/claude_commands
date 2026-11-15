@@ -453,11 +453,16 @@ class GateResourcesTests(unittest.TestCase):
                                   check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         before = ledger.mapping(cast(object, json.loads(original.stdout)))
         current = self.template()
+        # The retired builder pieces must stay removed; every other Rust resource must stay unchanged.
+        retired = {'InstanceRole', 'InstanceProfile', 'SecurityGroup', 'LaunchTemplate', 'Instance', 'DataVolume',
+                   'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy', 'InstanceId', 'DataVolumeId'}
         for section in ('Resources', 'Parameters', 'Outputs'):
+            rows = ledger.mapping(current[section])
+            self.assertFalse(retired & set(rows), section)
             for name, row in ledger.mapping(before[section]).items():
-                if name.startswith("Gate") or name.startswith("EnableGates"):
+                if name.startswith("Gate") or name.startswith("EnableGates") or name in retired:
                     continue
-                self.assertEqual(ledger.mapping(current[section])[name], row, (section, name))
+                self.assertEqual(rows[name], row, (section, name))
 
     def test_cloud_resources_use_the_machine_name(self) -> None:
         names = {'GateBucket': 'BucketName', 'GateRole': 'RoleName', 'GateProfile': 'InstanceProfileName',

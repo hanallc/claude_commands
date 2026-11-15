@@ -431,19 +431,8 @@ Replacement uses its saved `DataVolumeId`. Configuration contains no instance or
 Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
 The command records stage results and times in `up.json` beside `deployment.json`.
 It checks live state before each stage. It always refreshes the price.
-To inspect builder removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder`.
-To remove the builder, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder --approve-destroy`.
-The command disables builder routing and `aws-target.service`, removes its Tailscale device, and removes its compute resources.
-It deletes the retained data volume after the stack update. The `/home` build cache is lost.
-It keeps the stack, Budget, scaler credentials, every gate resource, and `gate-deployment.json`.
-The command preserves spending history and resolves builder observations, pending compute requests, and resource inventory.
-A saved `builder-removal.json` identity supports a repeat after a partial removal.
-Current instance and volume identities take priority over the receipt.
-Removal uses the live CloudFormation template and changes only the builder role, profile, and security group conditions to `Compute`.
-It preserves live gate definitions that differ from the repository template.
-The repository template has the same three conditions for later gate deployment.
+The builder is removed. Its compute resources are no longer in the template, and the `remove-builder` command is removed.
 `down --approve-destroy` removes the whole stack, including the gate resources, then deletes the retained volume and Budget.
-It is not the builder-only removal command.
 No removal command changes a tracked configuration value.
 Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
 The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
