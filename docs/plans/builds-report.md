@@ -1617,3 +1617,15 @@ From builds (not the user), 2026-11-15, from a phase 89 note: the phone-width Ru
 - The chart row names wrap in the stacked layout. The row height match now includes the room row and the queue header.
 - `memory_page_proof.mjs`: in the stacked layout no table cell or chart name may be cut, and only 390 px uses two lines. Row offsets measure from the header row. The proof fails at 900 px on the old page.
 - Proof: `phases/90/proof/before-*` and `after-*` (the Running card at 390 px light and dark, and at 900 px dark), from a fixture of the live feed.
+
+### Phase 91 — The cap line crosses no text, and the table room row is gone · status: done
+
+From builds (not the user), 2026-11-15: in the 390 px view the red cap line runs through row text ("setup · bo|ot", "waits for a| cloud slot: 9 of 9 in use"). The "Next step room" table row shows only dashes. Make the line pass behind no text, and give that row its value or remove it.
+
+#### As-built
+
+- `memory_live.html`: `cutCapLine` draws the cap line as `.cap-part` parts. It leaves a 3 px gap around each line of chart text that the line would cross: cloud status text, bar labels and the queue title. Text clipped by an ellipsis does not count.
+- The cap line has no `left` transition. Each layout measure moved the line, so the bar labels and the line parts were measured in mid-move.
+- The table room row has no dashes. The stacked table leaves it out, and its queue header takes the top divider. Beside the chart, the row is empty and keeps the rows aligned.
+- `memory_page_proof.mjs`: it fails when chart text shows on the cap line, or when the table room row shows text. The row offset check applies only beside the chart. The cap pixel check reads the longest line part.
+- Proof: `phases/91/proof/before-*` and `after-*` (the Running card at 390 px light and dark, 900 px dark and 1400 px dark), from a fixture of the live feed. Before: text on the line at all four widths. After: none.

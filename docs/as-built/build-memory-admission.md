@@ -1877,6 +1877,11 @@ The narrow layout adds the `Step` column and shows each cell in full.
 When that table is wider than the card, each step uses two lines: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU.
 Text wraps only when it does not fit. The chart row names also wrap in the narrow layout.
 `memory_page_proof.mjs` fails when a narrow table cell or chart name is cut, and uses two lines only at 390 px.
+The narrow table leaves out the room row, because the chart above it shows the next step room.
+Beside the chart, the table room row is empty and only keeps the rows aligned.
+The red cap line in the Running chart stops at each line of chart text that it would cross, so no text shows on it.
+`cutCapLine` draws the line as parts after the bar labels are placed; text clipped by an ellipsis does not count.
+`memory_page_proof.mjs` fails when chart text shows on the cap line or the table room row shows text.
 The Mac reader reads process data and cargo tile registrations in one SSH call per refresh.
 It uses cargo tile's `/tmp/cargo-tile/<uid>/state/pids` records and their named log files.
 A v3 registration must match the current boot, process start time, uid, PID, and generation.
