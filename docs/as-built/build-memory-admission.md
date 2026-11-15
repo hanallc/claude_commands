@@ -1104,8 +1104,11 @@ Every present holder file remains in force, including when the cycle has `releas
 There is no releasing state.
 Only removal ends the holder's hold.
 
-**Drain.** `build_hold.py drain --for '<why>'` keeps existing queued and running natedev runs until they finish.
-It captures outermost gates, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+**Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
+It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
+A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
+A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
+Unreadable claims or admission state keep every outermost gate.
 It publishes the hold with the first keep list and records a boot-relative start-tick bound immediately before publication.
 A second scan adds only identities whose start ticks do not exceed that bound.
 The command merges those identities under the release lock before starting the enforcer.
@@ -1120,6 +1123,7 @@ Each 60 seconds, it prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
 Ctrl-C returns 130 and retains the hold.
 Status derives `draining (N runs left)` or `held` from matching live keep entries.
+Status and the enforcer report list only live keep entries.
 A reused PID does not count when its start time differs.
 Status names each queued or running local CI placement and its state start time from existing admission records.
 Legacy CI cargo requests use the same hold and lineage check before memory admission.
