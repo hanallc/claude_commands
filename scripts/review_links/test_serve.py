@@ -122,7 +122,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertNotEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn(b"<h1>Hana console</h1>", body)
         self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
-        self.assertIn(b'data-rebuilds="/console/rebuilds.html"', body)
+        self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
         for path in ("/console", "/console?page=questions"):
             with self.subTest(path=path):
@@ -152,6 +152,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         questions.return_value = frozenset({"q1", "q2"})
         self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
         self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        # The Rebuilds page names no open page; the marks still follow new items.
+        questions.return_value = frozenset({"q1", "q2", "q3"})
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
         for body in ("open=nowhere", "", "open=changes&open=questions"):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)

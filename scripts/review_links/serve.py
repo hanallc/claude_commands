@@ -486,10 +486,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         root = cast(ReviewLinksServer, self.server).root
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            opened = parse_qs(self.rfile.read(length).decode("utf-8")).get("open", [])
+            opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
             pages = console.read_pages()
-            if len(opened) != 1 or opened[0] not in {page.identity for page in pages}:
-                raise ValueError("name one console page")
+            # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
+            if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                raise ValueError("name one console page or none")
             fresh = console.news(root, pages, opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
