@@ -4398,36 +4398,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 307
 **Owner:** natest (builds assigned it on 11-15; verify-unit reviews the diff, because the code is from its phase maclintfix, e07d86209).
 
-#### Work Order
+#### As-built
 
-**Goal:** when `verify.sh lint` sends mend and clippy to the Mac, and Mac mend passes but Mac clippy fails, verify.sh exits with the clippy failure. It does not start a local `cargo mend --fix`, so the run does not wait for natedev.
-
-**Cause (builds and queue, confirmed in the source):**
-1. `run_lint_sequence` runs `invoke_mend --workspace --fix`. When that step leaves the queue (`LINT_LEFT_QUEUE_STATUS`), it calls `run_lint_held_sequence`.
-2. `run_lint_held_sequence` runs mend with `--fail-on-warn`, then clippy, on the Mac. A clippy failure sets `lint_status=1`.
-3. `run_lint_sequence` then sets `HOLD_LINT=0` and does `continue`. The next loop pass runs a local `cargo mend --fix`.
-4. `step_writes_tree` marks `mend --fix` as a tree write. Placement gets `--writes-tree`, and `build_targets.step_routing_rule` returns `NatedevOnly("step writes the tree")`. The step waits for natedev while the Mac has room.
-5. A local `mend --fix` cannot fix a clippy finding, so the wait buys nothing.
-
-Full diagnosis: /tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/bf3s/review_reply_1.txt
-
-**Spec:**
-1. `run_lint_held_sequence` tells its caller which tool failed. Mend failure keeps today's path: the Mac fix pass (`run_mac_lint_fix`), else the local `mend --fix` loop.
-2. When Mac mend passed (or mend is off) and Mac clippy failed, `run_lint_sequence` exits with the clippy failure at once. It removes `MEND_LOG` and the `lint-held` mark as the other exits do.
-3. Keep the `step_writes_tree` rule as it is. A command that changes the source tree still runs on natedev only.
-4. Do not change the memory-judgment path (`LINT_MEMORY_JUDGMENT`) or the `--check` path.
-5. Regression test, in process or in one small bash program: Mac mend passes, Mac clippy fails, natedev is busy. verify.sh exits with the clippy failure, and it makes no local mend request. Every behavior check stays.
-6. No signal handlers in new Python code. No new full verify.sh flow in tests.
-7. **Phase 307 fixes in `verify_helper`** (builds held 307 on 11-15; one hash carries both).
-   - No signal disposition: remove `trap '' PIPE` and `trap - PIPE`. The request write goes back in a `( ... )` subshell, so a dead helper kills only that subshell and the call reaches the local fallback. The builtin environment write stays.
-   - `compgen -V names -e` runs before the lock and the write, so a failure sends nothing (verify-unit review). Before this, a compgen failure sent a full request with no environment: the command ran twice, and the unread reply stayed in the pipe for the next call.
-   - Test in the existing `test_verify_helper` bash program: a failing compgen sends no request, takes the fallback, and the next call returns its own result.
-
-**Files:** `scripts/direct/verify.sh` (`run_lint_held_sequence`, `run_lint_sequence`, `verify_helper`), `scripts/direct/test_verify_helper.py`, and the closest existing lint test module (`scripts/direct/test_verify_lint_judgment.py` or the module that covers `run_lint_held_sequence`).
-
-**Workers:** 1 writer; one shell change and one test.
-- impl: all files.
-
-**Constraints from prior phases:** Phase 307: `verify_helper` sends the environment without `env`. verify-unit's berth pass 9f8fc1c39 (branch verify-berth-fix-pass, not on main yet) edits the mend branch and the fmt step, and adds `lint_copy_*` functions. Check a trial merge with it before the hash goes to builds. Shellcheck baseline on verify.sh: 23 findings; add none.
-
-**Acceptance gate:** the new regression test, test_verify_lint_judgment, test_verify_step_state and every lint test module that covers `run_lint_sequence` pass on natedev; `bash -n` and shellcheck on verify.sh add no finding; a trial merge with 9f8fc1c39 and origin/main is clean; verify-unit reviews the diff.
+- `run_lint_held_sequence` sets `LINT_HELD_CLIPPY_FAILED` when Mac mend passed (or is off) and Mac clippy failed. `run_lint_sequence` then removes `MEND_LOG` and the `lint-held` mark and exits with the clippy failure, only on the Mac path (`force_mac=1`). A failed Mac mend and the memory-judgment path keep their behavior; `step_writes_tree` is unchanged.
+- Phase 307 fixes in `verify_helper`: the request write is a `( ... )` subshell again with no PIPE trap (no signal dispositions); `compgen -V names -e` runs before the lock and the write, so a failure sends no request.
+- Tests: `test_verify_lint_judgment` checks the Mac clippy exit (held calls, exit 1, no second mend). `test_verify_helper`'s bash program checks the compgen fallback and that the next call reads its own reply. `test_verify_lint_local_writes` holds natedev before the clippy fix in its clippy cases.
+- Commit ffd2432f2. verify-unit reviews the diff.
