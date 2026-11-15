@@ -152,7 +152,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
             client.CLOCK.now(), str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width)
-        output = client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+        output = client.WaitOutput()
         grant = client.service_admit(request, output)
         if not isinstance(grant, wire.RunnerAdmitted):
             if isinstance(grant, wire.Refused):

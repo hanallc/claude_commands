@@ -691,8 +691,6 @@ def request_id() -> str:
 def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.Wait], None],
                   timing: wire.AcquisitionTiming = wire.PROTOCOL_ACQUISITION_TIMING
                   ) -> wire.Admitted | wire.Refused | LeftQueue:
-    if isinstance(on_wait, WaitOutput):
-        on_wait.configuration = timing
     reply = _call(request, on_wait, configuration=timing)
     if isinstance(reply, (wire.Admitted, wire.Refused, LeftQueue)):
         return reply
@@ -749,9 +747,7 @@ class QueuedPlacementEpisode:
 @dataclass(frozen=True)
 class PlacementWaitNotice:
     started: float
-    next_notice: float
     last_reasons: tuple[str, ...]
-    last_need: int
     last_position: int
     last_reply: wire.Wait | wire.PlacementResourceWait
     elapsed_memory_seconds: float = 0.0
@@ -762,19 +758,16 @@ class PlacementWaitNotice:
 class WaitOutput:
     started: float = field(default_factory=lambda: CLOCK.monotonic())
     deadline_reached: bool = False
-    next_notice: float = 0.0
     held: bool = False
     last_reasons: tuple[str, ...] = ()
-    last_need: int = 0
     last_position: int = 0
     last_holder: records.WaitHolder | UnseenWaitHolder = field(default_factory=UnseenWaitHolder)
     on_event: Callable[[str], None] = field(default=lambda _event: None)
-    configuration: records.MemoryConfig | wire.AcquisitionTiming | ReadConfigurationAtUse = field(
-        default=READ_CONFIGURATION_AT_USE, kw_only=True)
     last_resource: wire.PlacementResourceWait | wire.PlacementEvidenceWait = field(default_factory=wire.PlacementEvidenceWait)
     elapsed_memory_seconds: float = 0.0
     last_provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     announced_retries: set[str] = field(default_factory=set)
+    status_open: bool = False
 
     def retry_notices(self, notices: tuple[placement.ProviderRetryNotice, ...], *, placement_events: bool) -> None:
         for retry in notices:
@@ -785,6 +778,7 @@ class WaitOutput:
                 if placement_events:
                     self.on_event("retry " + text)
                 else:
+                    self.end_status()
                     print(text, file=sys.stderr, flush=True)
                 self.announced_retries.add(retry.target)
 
@@ -794,6 +788,7 @@ class WaitOutput:
         for diagnostic in diagnostics:
             if diagnostic not in self.last_provider_diagnostics:
                 since = datetime.fromisoformat(diagnostic.since).astimezone(user_zone()).strftime("%H:%M")
+                self.end_status()
                 print(f"busy: {diagnostic.what} since {since}", file=sys.stderr)
                 self.on_event("provider " + json.dumps({"target": diagnostic.target, "what": diagnostic.what}, separators=(",", ":")))
         self.last_provider_diagnostics = diagnostics
@@ -828,22 +823,28 @@ class WaitOutput:
         self.held = True
         self.last_resource = reply
 
-    def reply_seconds(self) -> float:
-        from scripts.build_queue import admission_records as records
-        configuration = (records.read_memory_config(report=False)
-            if isinstance(self.configuration, ReadConfigurationAtUse) else self.configuration)
-        return configuration.wait_reply_seconds
+    def status(self, text: str) -> None:
+        """Print one wait status line; on a terminal, write it over the last status line."""
+        if sys.stderr.isatty():
+            print("\r\x1b[K" + text, end="", file=sys.stderr, flush=True)
+            self.status_open = True
+        else:
+            print(text, file=sys.stderr, flush=True)
+
+    def end_status(self) -> None:
+        """End a status line that a terminal holds open, before other output."""
+        if self.status_open:
+            print(file=sys.stderr, flush=True)
+            self.status_open = False
 
     def __call__(self, reply: wire.Wait) -> None:
-        from scripts.build_queue import admission_records as records, queue_lines
-        from scripts.lib import build_steps
+        from scripts.build_queue import admission_records as records
         from scripts.lib.user_zone import user_zone
         if isinstance(self.last_resource, wire.PlacementResourceWait):
             self.on_event("done")
             self.held = False
             self.last_resource = wire.PlacementEvidenceWait()
             self.started = CLOCK.monotonic()
-        now = CLOCK.monotonic()
         first = not self.held
         if isinstance(reply.reason, wire.CloudSlotWait):
             reasons = (reply.text,)
@@ -851,16 +852,13 @@ class WaitOutput:
                 self.held = True
                 self.on_event("first")
                 self.on_event('holder {"kind":"none"}')
-            if first or reasons != self.last_reasons or now >= self.next_notice:
-                print(reply.text, file=sys.stderr)
+            if first or reasons != self.last_reasons:
+                self.status(reply.text)
                 self.last_reasons = reasons
-                self.next_notice = now + self.reply_seconds()
             return
         reasons = wait_reasons(reply.snapshot)
-        changed = (reasons != self.last_reasons or reply.snapshot.peak.bytes != self.last_need
-                   or reply.position != self.last_position)
         if first:
-            self.next_notice, self.held = now + self.reply_seconds(), True
+            self.held = True
             self.on_event("first")
         if first or reply.snapshot.holder != self.last_holder:
             holder = reply.snapshot.holder
@@ -869,54 +867,25 @@ class WaitOutput:
                        {"kind": "unit", "unit": holder.unit} if isinstance(holder, records.UnitHolder) else {"kind": "none"})
             self.on_event("holder " + json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
             self.last_holder = reply.snapshot.holder
-        if not first and now < self.next_notice and not changed:
+        if not first and reasons == self.last_reasons and reply.position == self.last_position:
             return
-        if now >= self.next_notice:
-            self.next_notice = now + self.reply_seconds()
-        self.last_reasons, self.last_need = reasons, reply.snapshot.peak.bytes
+        self.last_reasons, self.last_position = reasons, reply.position
         snapshot = reply.snapshot
-        decision, peak = snapshot.decision, snapshot.peak
-        subject = f"{snapshot.repo} {snapshot.step}".strip()
-        count = peak.count
-        descriptions = {"measured": f"the 90th percentile of {count} measured runs",
-            "buildlog": f"0.65 of the 90th percentile peak of {count} runs",
-            "pooled": f"the 90th percentile of {count} measured runs of this step in every repo",
-            "shape": ("the same-shape fallback: no earlier builds" if not count else
-                      f"a same-shape promise from {count} earlier builds")}
-        description = descriptions.get(peak.source, "no history, so the fallback")
         prefix = ("waiting for memory since " + datetime.fromtimestamp(CLOCK.now(), user_zone()).strftime("%H:%M %Z")
-                  if first else f"still waiting for memory ({int(now - self.started) // 60} min)")
-        text = (f"{prefix}: the machine has {snapshot.available / records.GIB:.1f} GiB free; "
-            f"a build starts at {decision.threshold / records.GIB:.1f} ({subject}: {peak.bytes / records.GIB:.3f} GiB needed")
-        if first:
-            text += f", {description}"
-        if reply.position == 1 and self.last_position != 1:
-            text += "; this step is now first in line"
-        self.last_position = reply.position
-        if reply.position == 1:
-            text += "; this build is the queue head"
-        elif snapshot.head_need:
-            text += f"; head {snapshot.head_label} needs {snapshot.head_need / records.GIB:.1f} GiB"
-        from scripts.message import unit_labels
-
-        labels = unit_labels.unit_labels_for([item.session_id for item in snapshot.running], os.environ)
-        summary = ", ".join(("" if queue_lines.step_owner_name(item, labels) else Path(item.folder).name + " ")
-            + f"{queue_lines.step_text(item, build_steps.RECORDED_STEP_NAMES, labels=labels)} in {item.folder}"
-            for item in snapshot.running)
-        reason_text = (records.head_wait_text(snapshot.head_reason, user_zone())
+                  if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
+        place = ("this build is the queue head" if reply.position == 1 else
+                 f"place {reply.position} in line" if reply.position > 1 else "")
+        subject = f"{snapshot.repo} {snapshot.step}".strip()
+        reason = (records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
-            records.pressure_text(decision.pressure) if isinstance(decision.pressure, records.MemoryPressure) else "")
-        summary = "; ".join(part for part in (reason_text, summary) if part)
-        if not snapshot.running and summary:
-            text += "; " + summary
-        else:
-            text += (f"; {decision.promised / records.GIB:.1f} GiB promised, {decision.measured / records.GIB:.1f} GiB measured "
-                     f"across {len(snapshot.running)} running steps")
-            if snapshot.running:
-                text += ": " + summary
-        if decision.reserve:
-            text += f"; {decision.reserve / records.GIB:.1f} GiB kept for earlyoom"
-        print(text + ")", file=sys.stderr, flush=True)
+            records.pressure_text(snapshot.decision.pressure)
+            if isinstance(snapshot.decision.pressure, records.MemoryPressure) else "reason: " + "; ".join(reasons))
+        head = (" ".join(word for word in ("head", snapshot.head_label, f"needs {snapshot.head_need / records.GIB:.1f} GiB") if word)
+                if snapshot.head_need and reply.position != 1 else "")
+        parts = (place, f"{subject} needs {snapshot.peak.bytes / records.GIB:.1f} GiB",
+                 f"{snapshot.available / records.GIB:.1f} GiB free", reason, head,
+                 "/build:queue shows the detail" if first else "")
+        self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
 
     def elapsed_seconds(self) -> int:
         if isinstance(self.last_resource, wire.PlacementResourceWait):
@@ -934,6 +903,7 @@ class WaitOutput:
             seconds = self.elapsed_seconds()
             text = (f"another machine is free after {seconds // 60} min {seconds % 60} s: leaving the memory wait" if left else
                     f"memory free after {seconds // 60} min {seconds % 60} s: starting")
+        self.end_status()
         if left and placement_events:
             self.on_event("left " + text)
         else:
@@ -1142,8 +1112,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             except (ValueError, TypeError):
                 placement_wait_state.unlink(missing_ok=True)
             else:
-                output.started, output.next_notice = saved.started, saved.next_notice
-                output.last_reasons, output.last_need = saved.last_reasons, saved.last_need
+                output.started, output.last_reasons = saved.started, saved.last_reasons
                 output.last_position = saved.last_position
                 output.elapsed_memory_seconds = saved.elapsed_memory_seconds
                 output.last_provider_diagnostics = saved.provider_diagnostics
@@ -1222,13 +1191,13 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 break
             if isinstance(answer.wait, wire.Wait) and not isinstance(prerequisite, placement.TokenRequired):
                 output(answer.wait)
-                notice = PlacementWaitNotice(output.started, output.next_notice, output.last_reasons,
-                    output.last_need, output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
+                notice = PlacementWaitNotice(output.started, output.last_reasons,
+                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             elif isinstance(answer.wait, wire.PlacementResourceWait):
                 output.resource_wait(answer.wait)
-                notice = PlacementWaitNotice(output.started, output.next_notice, output.last_reasons,
-                    output.last_need, output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
+                notice = PlacementWaitNotice(output.started, output.last_reasons,
+                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             if isinstance(answer.wait, wire.Wait):
                 cause = answer.wait.reason
