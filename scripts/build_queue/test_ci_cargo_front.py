@@ -29,7 +29,7 @@ from scripts.buildlog import store
 from scripts.lib import conf
 
 request = wire.parse_request(sys.stdin.readline())
-output = client.WaitOutput(configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+output = client.WaitOutput()
 def held(reply):
     output(reply)
     print('WAIT', flush=True)
