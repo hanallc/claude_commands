@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
-from scripts.agents import detached_runs, remote, restart
+from scripts.agents import detached_runs, remote, restart, shutdown_record
 from scripts.direct import progress_history
 from scripts.herdr import herdr, herdr_types, worker_panes
 from scripts.production import broadcast, session_staff, showrunners, staff, worker_capacity
@@ -121,6 +121,14 @@ class WorkerCapacityTests(StaffTestCase):
         self.assertEqual(self.stop_row.call_count, 2)
         self.close.assert_not_called()
         self.assertIn("Stopped: implementer.", self.sent[0][2])
+
+    def test_a_stopped_codex_worker_leaves_the_restart_record_while_its_pane_stays(self) -> None:
+        self.assertNotEqual(shutdown_record.record_path(), Path.home() / ".local/state/shutdown/restart.json")
+        shutdown_record.save([str(self.parent.id), str(self.codex.id)])
+        opened = self.open_worker()
+        self.assertEqual(self.stop([opened], opened, worker_panes.ClosedWorker(self.codex)), 0)
+        self.close.assert_not_called()
+        self.assertEqual(shutdown_record.read(), [str(self.parent.id)])
 
     def test_a_claude_worker_and_an_idle_closed_codex_worker_get_no_stop_and_no_report(self) -> None:
         self.assertEqual(self.stop([self.open_worker(self.claude), worker_panes.ClosedWorker(self.codex)]), 0)

@@ -216,7 +216,10 @@ def classify_drain_runs(
 def drain_identities(
     proc_root: Path, identity: build_hold.HolderIdentity,
 ) -> tuple[build_hold.ProcessIdentity, ...]:
-    """Keep existing gates, CI workers, and builds that the hold could stop."""
+    """Keep working gates, CI workers, and builds that the hold could stop.
+
+    A gate that only waits is not kept: it waits for the release like new work.
+    """
     processes = build_hold.read_audit_processes(proc_root)
     holder = build_hold.Holder(identity.name, datetime.now(timezone.utc), "drain",
                                build_hold.UnknownReleaseEta(), identity.key)
@@ -226,8 +229,9 @@ def drain_identities(
     candidates = {decision.process.identity for decision in
                   decide_builds(processes, (holder,), os.getuid(), os.getpid(), claimed)
                   if isinstance(decision, WouldStopBuild)}
+    candidates.update(working_gates(processes, claims))
     candidates.update(process.identity for process in processes.values()
-                      if is_waiting_gate(process) or process.command == "Runner.Worker"
+                      if process.command == "Runner.Worker"
                       or process.executable == "Runner.Worker"
                       or process.argv and Path(process.argv[0]).name == "Runner.Worker")
     return tuple(process.identity for process in processes.values()
@@ -254,16 +258,21 @@ def wait_for_kept_runs(
     return 0
 
 
-def working_drain_identities(proc_root: Path) -> tuple[build_hold.ProcessIdentity, ...]:
-    """Keep existing work through the enforcer when the drain hold starts."""
-    processes = build_hold.read_audit_processes(proc_root)
-    claims = claimed_processes(proc_root)
-    runs = classify_drain_runs(processes, admitted_processes(), claims)
-    if isinstance(runs, build_hold.ClaimsUnreadable):
-        print(f"claims unreadable: {runs.reason}", file=sys.stderr)
-        return tuple(process.identity for process in processes.values()
-                     if is_outermost_gate(process, build_hold.audit_ancestors(process, processes)))
-    return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
+def working_gates(
+    processes: Mapping[int, build_hold.AuditProcess], claims: build_hold.LiveClaims | build_hold.ClaimsUnreadable,
+) -> tuple[build_hold.ProcessIdentity, ...]:
+    """Name the outermost gates that hold work; unreadable evidence keeps every gate."""
+    try:
+        runs = classify_drain_runs(processes, admitted_processes(), claims)
+    except OSError as error:
+        unreadable = str(error)
+    else:
+        if not isinstance(runs, build_hold.ClaimsUnreadable):
+            return tuple(run.process.identity for run in runs if isinstance(run, WorkingRun))
+        unreadable = f"claims unreadable: {runs.reason}"
+    print(unreadable, file=sys.stderr)
+    return tuple(process.identity for process in processes.values()
+                 if is_outermost_gate(process, build_hold.audit_ancestors(process, processes)))
 
 
 def detached_run(
@@ -1038,7 +1047,7 @@ def decision_lines(decisions: Sequence[BuildDecision]) -> list[str]:
 def report(proc_root: Path, directory: Path, *, drain: bool = False) -> list[str]:
     holders = build_hold.natedev_holds(directory).in_force
     lines = [f"kept by {holder.name}: pid {run.pid}, start {run.start_time}"
-             for holder in holders for run in holder.keep]
+             for holder in holders for run in build_hold.live_kept_runs(holder, proc_root)]
     processes = read_processes(proc_root, os.getuid())
     claims = claimed_processes(proc_root) if holders else build_hold.LiveClaims(frozenset())
     if isinstance(claims, build_hold.ClaimsUnreadable):

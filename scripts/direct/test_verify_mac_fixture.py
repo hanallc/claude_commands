@@ -4,7 +4,6 @@ from __future__ import annotations
 import unittest
 import json
 import os
-import runpy
 import select
 import subprocess
 import sys
@@ -49,16 +48,16 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
                     replace(source, destination)
 
                 def run_wrapper() -> None:
-                    with self.assertRaises(SystemExit) as exited:
-                        exec(TARGETS_WRAPPER, {"__name__": "__main__"})
-                    self.assertEqual(exited.exception.code, 10)
+                    wrapper: dict[str, object] = {"__name__": "targets_wrapper"}
+                    exec(TARGETS_WRAPPER, wrapper)
+                    wrapper["real_targets"] = lambda: 10
+                    self.assertEqual(cast(Callable[[], object], wrapper["main"])(), 10)
 
                 with mock.patch.dict(os.environ, {**self.environment,
                         "TEST_RUNNER_STATE": str(root), "TEST_LOCAL_WAIT_SECONDS": "1",
                         "BUILDLOG_HOLD_WAIT_FILE": str(root / "hold-wait"),
                         "TEST_REAL_TARGETS": str(VERIFY.parent.parent / "build_targets/build_targets.py")}), \
-                        mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]), \
-                        mock.patch.object(runpy, "run_path", side_effect=SystemExit(10)):
+                        mock.patch.object(sys, "argv", ["targets-wrapper", command, *arguments]):
                     with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=interrupt_publication):
                         with self.assertRaisesRegex(OSError, "interrupted publication"):
                             run_wrapper()

@@ -22,6 +22,7 @@ from scripts.buildlog import cli
 from scripts.lib import conf
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
+from scripts.buildlog.health import Machine
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 
@@ -218,7 +219,10 @@ class VaultPullTests(unittest.TestCase):
         return [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
 
     def question(self) -> str:
-        return option(self.questions()[-1], "--question")
+        """Join the filed parts, so a check can look for a phrase in any part."""
+        args = self.questions()[-1]
+        return " ".join(args[index + 1] for index, value in enumerate(args)
+                        if value in ("--ask", "--context", "--choice", "--recommend"))
 
     def conflict(self) -> tuple[str, str]:
         local = self.commit(self.local, {"shared.md": "natedev edit\n"})
@@ -277,7 +281,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(len(self.questions()), 1)
         self.assertIn("shared.md", self.question())
         self.assertIn("In a terminal on the Mac", self.question())
-        self.assertIn("I recommend choice 1", self.question())
+        self.assertIn("Combine the edits: the next hourly sync", self.question())
         self.assertFalse(any("push" in args and "origin" in args for args in self.commands))
         self.assertFalse(any("pushover" in " ".join(args) or "send.py" in " ".join(args) for args in self.commands))
 
@@ -540,9 +544,13 @@ class VaultPullTests(unittest.TestCase):
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
-        self.assertIn("conflict", option(args, "--question"))
-        self.assertIn("Combine the edits and commit the result", option(args, "--question"))
-        self.assertNotIn("Keep the current branch", option(args, "--question"))
+        self.assertIn("conflict", option(args, "--context"))
+        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.")
+        self.assertEqual([args[index + 1] for index, value in enumerate(args) if value == "--choice"], [
+            "Combine the edits and commit the result. This keeps the wanted content from both copies.",
+            "Choose one copy for each file and commit the result. This replaces the other copy's content."])
+        self.assertEqual(option(args, "--recommend"), "Combine the edits: the next hourly sync retries the merge.")
+        self.assertNotIn("--question", args)
         self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
         self.assertEqual(option(args, "--urgency"), "soon")
         self.assertEqual(option(args, "--due"), "2027-01-16")
@@ -837,6 +845,29 @@ class VaultPullTests(unittest.TestCase):
                 self.assertEqual(outcome, vault_pull.VaultCommandFailed("stderr: fixture stderr\nstdout: fixture stdout"))
                 assert isinstance(outcome, vault_pull.VaultCommandFailed)
                 self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
+
+    def test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged(self) -> None:
+        transport = self.run_transport
+
+        def refused(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            if "fetch" in args and "fixture-mac:rust/hanadocs" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal: did not send all necessary objects")
+            return transport(args, timeout)
+
+        _ = self.commit(self.mac, {"mac.md": "Mac\n"})
+        with mock.patch.object(vault_pull, "run", new=refused):
+            self.assertEqual(vault_pull.pull(), vault_pull.VaultCommandFailed(
+                "stderr: fatal: did not send all necessary objects", Machine.MAC))
+            # A power loss keeps a ref update but leaves its loose commit object empty.
+            commit = self.commit(self.local, {"local.md": "natedev\n"})
+            damaged = self.local / ".git/objects" / commit[:2] / commit[2:]
+            damaged.chmod(0o644)
+            _ = damaged.write_bytes(b"")
+            outcome = vault_pull.pull()
+        self.assertEqual(outcome, vault_pull.VaultCommandFailed(
+            "stderr: fatal: did not send all necessary objects", Machine.NATEDEV))
+        assert isinstance(outcome, vault_pull.VaultCommandFailed)
+        self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
 
     def test_each_stop_cause_survives_an_atomic_state_write(self) -> None:
         for cause in vault_pull.STOP_CAUSES:

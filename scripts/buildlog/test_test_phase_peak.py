@@ -371,7 +371,7 @@ BUILDLOG_RECORD=$TEST_PHASE_RECORDER
 scope_path=$1 scope=$2 maximum=$3 ticks=$4 reservation=$5 peak=$6 completion_pipe=$7
 shift 7
 exec 7<>"$completion_pipe"
-LINT_NEXTEST_SHARE="$ticks/share"
+LINT_NEXTEST_POOL="$ticks/pool"
 build_hold_wait_local() { :; }
 build_hold_check_local() { return 0; }
 buildlog_now() { BUILDLOG_NOW=1790942400; }
@@ -386,18 +386,29 @@ buildlog_wait_for_memory() {
     BUILDLOG_MEM_SAMPLING_CONTEXT=$reservation
 }
 buildlog_memory_python() {
-    if [[ "${2:-}" == claim ]]; then
-        printf '8\n'
-    elif [[ "${2:-}" == width ]]; then
-        return 0
-    elif [[ "${2:-}" == release ]]; then
+    if [[ "${2:-}" == release ]]; then
         rm -f "$maximum" "${maximum%.max}.wave"
     else
-        if [[ "${2:-}" == test-phase-context ]]; then printf 'context\n' >> "$ticks/context-calls"; fi
+        if [[ "${2:-}" == test-phase-context ]]; then
+            printf 'context %s\n' "${8:-}" >> "$ticks/context-calls"
+            # The sampler starts before the holder; hold its first tick until the width is known.
+            local attempt
+            for attempt in {1..200}; do [[ -s "$LINT_NEXTEST_WIDTH_FILE" ]] && break; command sleep 0.05; done
+        fi
         "$HOME/.claude/scripts/lib/py" "$@"
     fi
 }
 buildlog_exec() {
+    # Act as nextest_tokens.py: the pool has 8 tokens free for a run 32 wide.
+    local width_file=""
+    [[ "$1" != cargo ]] || return 94
+    while [[ "$1" != -- ]]; do
+        [[ "$1" != --width-file ]] || width_file=$2
+        shift
+    done
+    shift
+    printf '8\n' > "$width_file"
+    set -- "${@:1:4}" 8 "${@:6}"
     printf '%s\n' "$@" > "$ticks/executed-argv"
     local completed
     read -r -t 10 completed <&7 || return 92
@@ -438,7 +449,8 @@ test ! -e "${maximum%.max}.wave"
         self.assertEqual((timeline.ticks / "executed-argv").read_text().splitlines(), expected_argv)
         released = cast(dict[str, object], json.loads((timeline.ticks / "released-reservation.json").read_text()))
         self.assertEqual(released["test_threads"], 8)
-        self.assertEqual((timeline.ticks / "context-calls").read_text().splitlines(), ["context"])
+        # The first context has the step's width; the context at the test phase start has the tokens' width.
+        self.assertEqual((timeline.ticks / "context-calls").read_text().splitlines(), ["context 32", "context 8"])
         self.assertEqual((timeline.ticks / "observed").read_text().splitlines(),
                          ["0:9000", "1:9000", "2:9000", "3:9000"])
         self.assertFalse(list(timeline.files.maximum.parent.glob("*.reservation")))
@@ -447,7 +459,7 @@ test ! -e "${maximum%.max}.wave"
         self.assertFalse(peak.exists())
         self.assertFalse(Path(str(peak) + ".test-phase.json").exists())
 
-    def test_terminal_and_tee_steps_keep_the_actual_shared_width_after_admission_release(self) -> None:
+    def test_terminal_and_tee_steps_keep_the_token_width_after_admission_release(self) -> None:
         for caller in ("verify", "cargo-port", "validate_ci"):
             for filtered in (False, True):
                 for terminal in (False, True):

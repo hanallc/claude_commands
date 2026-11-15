@@ -271,23 +271,34 @@ def recorded_branches(record: staff.StaffSnapshot, roots: tuple[Path, ...],
     return UnitBranchEvidence(branches, latest)
 
 
-def is_ancestor(repository: Path, tip: str, target: str) -> bool:
-    result = git(repository, "merge-base", "--is-ancestor", tip, target)
-    if result.returncode not in (0, 1):
-        result.check_returncode()
-    return result.returncode == 0
+@dataclass(frozen=True)
+class MainHistory:
+    """Each commit that origin main holds, with its commit date and its first mainline commit."""
+    dates: dict[str, str]
+    merges: dict[str, str]
 
 
-def mainline_merge(repository: Path, tip: str, mainline: list[str]) -> tuple[str, str]:
-    low, high = 0, len(mainline) - 1
-    while low < high:
-        middle = (low + high) // 2
-        if is_ancestor(repository, tip, mainline[middle]):
-            high = middle
-        else:
-            low = middle + 1
-    merge = mainline[low]
-    return merge, git_text(repository, "show", "-s", "--format=%cI", merge)
+def main_history(repository: Path, main: str) -> MainHistory:
+    """Read the graph of main in one git call, so no branch costs a git call of its own."""
+    dates: dict[str, str] = {}
+    parents: dict[str, list[str]] = {}
+    for line in git_text(repository, "log", "--format=%H %cI %P", main).splitlines():
+        commit, date, *above = line.split()
+        dates[commit] = date
+        parents[commit] = above
+    mainline = [main]
+    while parents[mainline[-1]]:
+        mainline.append(parents[mainline[-1]][0])
+    # The oldest mainline commit takes each commit it holds; a newer one takes only the rest.
+    merges: dict[str, str] = {}
+    for merge in reversed(mainline):
+        pending = [merge]
+        while pending:
+            commit = pending.pop()
+            if commit not in merges:
+                merges[commit] = merge
+                pending.extend(parents[commit])
+    return MainHistory(dates, merges)
 
 
 def kept_branches() -> set[str]:
@@ -338,7 +349,7 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
     main = heads.get("main", "")
     if not main:
         raise ValueError("origin has no main branch")
-    mainline = git_text(repository, "rev-list", "--first-parent", "--reverse", main).splitlines()
+    history = main_history(repository, main)
     rows: list[MergedUnitBranch | MergedUnownedBranch] = []
     unowned: list[MergedUnownedHead] = []
     kept = kept_branches()
@@ -346,20 +357,20 @@ def list_branches(repository: Path, record: staff.StaffSnapshot,
         if name not in recorded.units and name in kept:
             continue
         tip = heads[name]
-        if not is_ancestor(repository, tip, main):
+        if tip not in history.merges:
             continue
-        commit_date = git_text(repository, "show", "-s", "--format=%cI", tip)
+        commit_date = history.dates[tip]
         if name in recorded.units:
             unit = recorded.units[name]
-            merge, merge_date = mainline_merge(repository, tip, mainline)
-            rows.append(MergedUnitBranch(name, unit, tip, commit_date, merge, merge_date,
+            merge = history.merges[tip]
+            rows.append(MergedUnitBranch(name, unit, tip, commit_date, merge, history.dates[merge],
                                          active_branches.get(unit, InactiveUnit())))
         else:
             unowned.append(MergedUnownedHead(name, tip, commit_date))
     unowned.sort(key=lambda row: (datetime.fromisoformat(row.commit_date), row.name))
     for head in unowned[:10]:
-        merge, merge_date = mainline_merge(repository, head.tip, mainline)
-        rows.append(MergedUnownedBranch(head.name, head.tip, head.commit_date, merge, merge_date))
+        merge = history.merges[head.tip]
+        rows.append(MergedUnownedBranch(head.name, head.tip, head.commit_date, merge, history.dates[merge]))
     return BranchListing(tuple(rows), len(unowned))
 
 

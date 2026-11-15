@@ -143,6 +143,7 @@ class PaneWorld(herdr.Herdr):
             "CLAUDE_CONFIG_DIR": str(test.root / "claude"), "CODEX_HOME": str(test.root / "codex"),
             "HERDR_BIN": "/nonexistent/herdr", "TMPDIR": str(test.root),
             "UNIT_RUN_DIR": str(test.root / "run"), "ROSTER_RUN_ROOT": str(test.root),
+            "SHUTDOWN_STATE_DIR": str(test.root / "shutdown"),
         })))
         _ = test.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
         _ = test.enterContext(patch.object(herdr, "Herdr", return_value=self))

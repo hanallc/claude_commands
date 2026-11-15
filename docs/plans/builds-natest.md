@@ -3954,3 +3954,313 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The events each command writes stay the same.
 - AWS pair (c7a.4xlarge, 3 rounds): `direct/test_verify_wait_holder.py` 63.94 -> 57.83 CPU s.
 - Commit 0a9c37dd6. Production change; sdlc gave the go.
+
+### Phase 270 — The test times report ranks the AWS gate hosts  · status: done
+**Depends on:** none
+**Owner:** natest (production change in `scripts/test_times/show.py`, `config/test_times.conf` and `commands/test_times.md`; sdlc gives the go).
+
+#### As-built
+
+- `show.py top --host aws` selects each host that starts with `AWS_HOST_PREFIX` (`ip-`) and counts runs from the new key `TOP_AWS_CHECKOUT`.
+- Any other host value keeps one host and `TOP_CHECKOUT`. The trend view uses the same prefix constant.
+- `commands/test_times.md` names the new value.
+- Commit 5f1f770a6. Production change; sdlc gave the go.
+
+### Phase 271 — The Mac-only verify tests run fewer full verify.sh calls  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change in `scripts/direct/test_verify_mac_only.py`).
+
+#### As-built
+
+- `test_runner_refusals_never_fall_back_or_retry` checks all 12 reason texts through the real `mac_only_refuse` in one shell. Five full `verify.sh` calls cover each runner mode and each `placement.retry_decision` class.
+- The fetch test keeps a written word and the absent word. The two environment tests forward all their names in one call each.
+- AWS pair (c7a.4xlarge, 3 rounds, same box): `direct/test_verify_mac_only.py` 59.28 -> 38.39 CPU s.
+- Commit f0a59896a. Test-only change.
+
+### Phase 272 — Fixture processes read a step row without the step state test imports  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `scripts/direct/step_row_test_support.py` holds `read_step_row` and imports only `step_record` and `step_selection`.
+- `test_verify_step_state` and the nine fixture imports read it from there.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 7 verify modules 182.56 -> 171.38 CPU s.
+- Commit a9fed9fdd. Test-only change.
+
+### Phase 273 — The step-routes targets fixture runs inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- The step-routes `targets.py` fixture has a top-level `main`, so verify_helper runs it inside the helper process.
+- It loads the real `build_targets.py` once for each helper and calls its `main`. Each answer and route event stays the same.
+- The four tests that edit the fixture text use the indented layout.
+- AWS pair (c7a.4xlarge, 3 rounds): sum of 9 verify modules 175.06 -> 116.08 CPU s; `test_verify_lint_local_writes` 59.44 -> 31.14.
+- Commit a8e5d997f. Test-only change.
+
+### Phase 274 — The status line reads staff.json with one jq start  · status: done
+**Depends on:** none
+**Owner:** natest (production change; needs the sdlc go).
+
+#### As-built
+
+- One jq call in `statusline.sh` reads staff.json. It prints `unit <id> <session>` for the payload session's unit row, or else the showrunner ids.
+- The payload goes in with `--arg` and `fromjson` in a `try`. A bad payload matches no unit row; `/dev/null` staff gives no owners.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_statusline` 45.11 -> 44.66 CPU s.
+- Commit 9d9e95bab. Production change; sdlc go 2026-11-14.
+
+### Phase 275 — The ssh-targets wrapper fixtures run inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `verify_ssh_targets_test_support.BUILD_TARGETS_STATUS` loads the real `build_targets.py` once for each process and returns its `main` status. It replaces `RUN_BUILD_TARGETS`.
+- `reserve-refusal.py` and `reserve-response-loss.py` have a top-level `main`, so verify_helper runs them inside its process. Each answer and observation stays the same.
+- `interrupted-reservation.py` uses the same loader and stays a separate process.
+- AWS pair (c7a.4xlarge, 3 rounds): `test_verify_ssh_targets_routing` 45.76 -> 36.50 CPU s.
+- Commit 785de7dbe. Test-only change.
+
+### Phase 276 — The Mac offload targets and record wrappers run inside verify_helper  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `TARGETS_WRAPPER` and `RECORD_WRAPPER` in `verify_mac_offload_test_support.py` have a top-level `main`, so verify_helper runs them inside its process.
+- `real_targets()` and `real_record()` load the real `build_targets.py` and `record.py` once for each process and return the `main` status. They replace the runpy calls.
+- `verify_hold_wait_test_support` puts its observation code before `return real_record()`.
+- `test_verify_mac_fixture` replaces `real_targets` in the wrapper globals in place of the `runpy.run_path` stub.
+- AWS pair (c7a.4xlarge, 3 rounds): 7 modules 166.71 -> 159.43 CPU s; `test_verify_mac_only` 37.85 -> 34.79.
+- Commit 1e8b2f6fd. Test-only change.
+
+### Phase 277 — The stopped-worker startup stub imports staff only where a child stops a worker  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `stopped_worker_module` in `staff_test_support.py` writes a `sitecustomize.py` with a `sys.meta_path` finder. When a child imports `scripts.agents.stop_resume`, the finder loads the real module and replaces `stop`. The stub `stop` imports `staff` when it runs.
+- In `test_assign_claude_follow`, the delivery retry test runs its three launches in process. The catalog retry part is the `@process_boundary` test `test_failed_catalog_switch_retries_on_the_first_model`.
+- AWS pair (3 rounds, median CPU s): `test_assign_claude_follow` 30.98 -> 20.51; `test_assign_claude_workers` 10.76 -> 8.33; `test_claude_worker` 9.08 -> 6.93.
+- Commit dd647b551. Test-only change.
+
+### Phase 278 — Python starts reuse the compiled dataclass method code  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 2026-11-14 with six conditions).
+
+#### As-built
+
+- `sitecustomize.start_process` inserts a `DataclassCodeFinder`. When a process imports `dataclasses`, the finder sets its global `exec` to `dataclass_exec`.
+- `dataclass_code(source, folder)` reads the marshal code of each generated source from `/var/tmp/dataclass-code-<uid>/<cache tag>`, keyed by the sha1 of the compile flags, the optimize level and the source. A miss, or a truncated or corrupt entry, compiles with `<string>`, flags 0 and `dont_inherit=True`, and replaces the file.
+- A root that is not a 0700 folder of the user turns the cache off with no error.
+- A read refreshes an entry once a day. `tmp_sweep.prune_dataclass_code` removes the entries that no process read in lint.conf `dataclass_code_days` days, and each emptied cache tag folder. Only the live `/tmp` roots add the cache root.
+- `lib/test_dataclass_code.py` fails when the startup hook does not give `dataclasses` the cached exec on the current Python.
+- AWS pair (3 rounds, median CPU s): 8 modules 290.41 -> 255.76; `test_statusline` 45.05 -> 34.42; `test_offload` 46.90 -> 40.08.
+- Live CLI start CPU on natedev: `direct.assign` 335 -> 199 ms; `admission_protocol` 144 -> 85 ms; `progress_history` 118 -> 83 ms.
+- Commit 3f52df2c3. Production change (sdlc go 2026-11-14).
+
+### Phase 279 — One cheap perl start for each shell file lock  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 2026-11-15).
+
+#### As-built
+
+- `scripts/direct/file_lock.sh` finds perl once, when a script sources it, and keeps it in `FILE_LOCK_PERL`. The lookup is `command -v perl`, then `/run/current-system/sw/bin/perl`, then `/usr/bin/perl`.
+- The perl text uses 2 (LOCK_EX) and 4 (LOCK_NB) and loads no Fcntl. It saves the errno and loads Errno only after a refusal: exit 0 lock, 75 busy, 2 error.
+- Each lock costs 0.9 ms CPU, not 5.8 ms. One perl path stays for Linux and the Mac.
+- AWS pair (3 rounds, median CPU s): 9 modules 228.02 -> 213.42; `test_verify_mac_only` 31.38 -> 27.88; `test_verify_ssh_targets_routing` 28.63 -> 25.83.
+- Commit 55ba55287. Production change (sdlc go 2026-11-15).
+
+### Phase 280 — The group signal source scan parses only files that name kill  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `unguarded_group_signals` in `scripts/lib/test_process_group.py` skips a file whose text, with line continuations joined, has no "kill". Each finding needs that word.
+- One `ast.walk` for each file; the `Name` nodes match the `killpg` import names after the walk. The shell and `killpg` checks run only on a string constant or shell line that has "kill".
+- AWS pair (3 rounds, median CPU s): `lib/test_process_group_sources` 16.41 -> 5.21.
+- Commit f7d26d4c5. Test-only change.
+
+### Phase 281 — Six repository scans parse only files that name their finding words  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- Six repository scans skip a file whose text lacks the words that every finding needs (the phase 280 pattern): `message/test_session_send_sources`, `notify/test_push_texts_sources`, `accounts/test_launch_accounts_sources` (`EXCEPTIONS` files always scanned), `astra/test_design_roles_sources`, `unguarded_launches` in `lib/test_claude_launch_scan.py` (Python files only), and `forbidden_launches` in `direct/test_one_launch_path.py`.
+- `lib/test_py_floor_sources` keeps its full parse: it must parse each file at the floor version.
+- AWS pair (3 rounds, median CPU s): 46.0 -> 15.5 in total; `session_send_sources` 7.23 -> 0.33, `launch_accounts_sources` 9.86 -> 3.23, `push_texts_sources` 8.64 -> 2.77.
+- Commit bddca5e1e. Test-only change.
+
+### Phase 282 — A full gate time limit counts only runs that ran test modules  · status: done
+**Depends on:** none
+**Owner:** natest (production change; nightly red e986a7389d0cf7a911935fe5).
+
+#### As-built
+
+- `history_time_limit` in `scripts/test_times/gate_record.py` counts a full run only when `modules_run > 0`. A run of the type check alone does not set the limit.
+- Cause of nightly red e986a7389d0cf7a911935fe5: five passing admin-console `--full` runs of the type check alone (104-135 s) gave a 175.09 s limit. The 11-15 nightly stopped with 747 of 788 modules not started.
+- Until a natedev full run with tests passes, a natedev full run has no time limit.
+- The queue_place tests wait on their own fixture queue, not the live queue.
+- Commit a92140f44. Production change (needs the sdlc go).
+
+### Phase 283 — The queue_place fixture waits no start spacing or stop grace  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change; builds asked 11-15).
+
+#### As-built
+
+- `QueuePlaceFixture` in `scripts/build_queue/test_queue_place.py` opens `AdmissionFixture` with `skip_idle_spacing=True`. Its config sets `program_stop_seconds=0.2` and `program_sample_seconds=0.1`; a test that rewrites the config keeps its own values.
+- Cause: the fixture queue waited 5 s of start spacing between starts, and `cleanup_program_starts` waited a 5 s stop grace on a TERM-resistant program.
+- AWS pair (3 rounds): CPU 15.65 -> 15.21 s, wall 127.7 -> 24.8 s; all pass, same tests.
+- Commit ce8c5dc7c. Test-only change.
+
+### Phase 284 — The branch page reads the history of main in one git call  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 11-15).
+
+#### As-built
+
+- `main_history` in `scripts/review_links/branch_page.py` reads `git log --format=%H %cI %P main` once. `list_branches` takes the merged check, the commit date, the merge commit and the merge date from it.
+- The walk starts at the oldest mainline commit, so each commit gets the oldest mainline commit that holds it. `is_ancestor` and `mainline_merge` are gone.
+- Live ~/.claude repo: 104 heads, 42 merged; old and new rows agree; 0.11 s against 0.93 s.
+- AWS pair (3 rounds): `review_links/test_branch_page` 16.67 -> 9.29 CPU s, wall 16.9 -> 9.7 s; all pass, same tests.
+- Commit b4b5396bb. Production change (sdlc go 11-15).
+
+### Phase 285 — The report speed test builds the full index once  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_report_cli_work_grows_near_linearly_at_the_live_index_size` in `scripts/buildlog/test_report.py` measures the CLI on the full rows after the first `index.update`. Then it writes the quarter rows, reindexes and measures them.
+- Cause: the test built the index of the full rows two times.
+- AWS pair (3 rounds): 24.09 -> 19.98 CPU s, wall 29.5 -> 25.3 s; all pass, same tests.
+- Commit f36c878c1. Test-only change.
+
+### Phase 286 — A test run keeps its build log in its run folder  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc land go 11-15).
+
+#### As-built
+
+- `test_run_folder` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+- Every direct test run of every module keeps its build log in its run folder. The gate already sets `BUILDLOG_DIR` for each module (`merge_gate.py:1129`).
+- `scripts/buildlog/test_log_isolation.py` is removed: it re-ran 5 modules under a new HOME and guarded only those 5. `test_testing_folders` checks the two cases and the restore.
+- `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
+- AWS pair (3 rounds): the changed and guarded modules do not change; the removed module cost 16.0 CPU s.
+- Commit 8e5756b00. Production change (sdlc trial go and land go 11-15).
+
+### Phase 287 — The verify Mac argument test checks argument shapes by a direct call  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_decline_runs_same_nextest_words_locally_after_runner` in `scripts/direct/test_verify_mac_arguments.py` keeps 2 complete `verify.sh` runs: a filter run with a package, and an ignored-only run with no package and no filter. They cover `FILTER_RUN` from `--filter` and from `--run-ignored`.
+- `NextestArgumentTests.test_each_argument_shape_gives_its_ignored_and_package_words` runs `parse_command_arguments` and `compose_nextest_args` for all 5 argument shapes. It checks the `--run-ignored`, `--no-tests=warn`, `--workspace` and `package(sample)` assertions. `compose_script` shares the function and metadata setup with the existing direct test.
+- A `verify.sh` mutation for each moved assertion fails the new test.
+- AWS pair (3 rounds): 14.19 -> 8.33 CPU s, all pass.
+- Commit fef7152f0. Test-only change.
+
+### Phase 288 — The ssh-targets routing tests drop repeated complete runs  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally` in `scripts/direct/test_verify_ssh_targets_routing.py` keeps 3 complete `verify.sh` runs: `completed-decline` (a one-word reason after the run), `runtime-version-mismatch` (a long reason with spaces) and `probe-leftovers` (a busy reason from the probe). All pinned modes go to the same `pinned_target_refuse` branch. The offload tests check the dropped disk and probe nextest-mismatch reasons.
+- `test_saved_reservation_survives_a_lost_reserve_response` keeps the 0-read and 3-read cases. The 3-read case covers the recovery retry loop and its poll spacing.
+- AWS pair (3 rounds): 25.67 -> 22.61 CPU s, all pass.
+- Commit 78f9a3130. Test-only change.
+
+### Phase 289 — The lint key test checks each lint script by a direct call  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_a_lint_script_edit_invalidates_a_previously_reused_pass` in `scripts/direct/test_verify_token_renew.py` keeps one complete lint run after a `verify.sh` edit. It was `test_each_lint_script_edit_invalidates_a_previously_reused_pass`.
+- `LintKeyInputTests.test_the_lint_tree_key_reads_verify_invoke_and_the_lint_config` runs `tree_key` with a `verify_helper` that prints its words. It checks that the key call names `verify.sh`, `invoke.sh` and the lint config.
+- A `tree_key` mutation that drops each path fails the new test.
+- AWS pair (3 rounds): 19.27 -> 16.76 CPU s, all pass.
+- Commit 85116f891. Test-only change.
+
+### Phase 290 — The result environment tests drop repeated complete runs  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_mac_routes_carry_result_values_and_fixed_terminal_values` in `scripts/direct/test_verify_result_environment.py` keeps the auto route. `verify.sh` sets the forwarded values before it picks a route, and each Mac route starts the runner in `try_mac_test`. `test_changed_forwarded_value_reaches_the_mac_and_runs_again` keeps a value check on the `--mac` route.
+- `test_result_values_distinguish_unset_empty_and_changed_values_in_saved_passes` checks the empty and unset values for `NO_COLOR` only.
+- AWS pair (3 rounds): 17.60 -> 13.12 CPU s, all pass.
+- Commit feb588554. Test-only change.
+
+### Phase 291 — The launch settings test checks fewer interchangeable keys  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_launch_settings_match_shell_role_resolution_and_tier_precedence` in `scripts/lib/test_models_registry.py` checks `direct` (`impl`, `review`), `design_roles` (`designer`), `producers` (`morty`) and `producer_only`, for both families and all five tiers. Neither resolver has a branch for one key name.
+- AWS pair (3 rounds): 11.20 -> 6.09 CPU s, all pass.
+- Commit 3a8806fd6. Test-only change.
+
+### Phase 292 — The agent launcher and copy import tests drop repeated launches  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `scripts/agents/test_agent_exec.sh` runs one failed-extraction case and one print-error event for each Claude task. The codex readonly dry run carries the extra arguments, and the simplify readonly dry run carries the session id.
+- `test_copy_imports_stay_in_the_copy` in `scripts/lib/test_py_root.py` uses a regular decoy copy only. Eleven `sitecustomize.py` mutations found no break that only a namespace copy catches.
+- AWS pairs (3 rounds): agent_exec 16.41 -> 14.46 CPU s, py_root 9.17 -> 6.73 CPU s, all pass.
+- Commit cbfbce6aa. Test-only change.
+
+### Phase 293 — The token handoff hold waits use a short pass interval  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `VerifyTokenWaitFixture.hold_environment` in `scripts/direct/verify_token_wait_test_support.py` sets `BUILD_TARGETS_POLL_S=0.5`. The fixture provider ends the hold at the next host probe, which comes with the next routing pass; the default pass is 15 seconds.
+- A 0.05-second interval used more CPU (more passes while the peer held the token).
+- AWS pair (3 rounds): 21.90 -> 14.47 CPU s, all pass.
+- Commit 272d392b0. Test-only change.
+
+### Phase 294 — The token-wait fixture stops a board.sh wait from spinning  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `VerifyTokenWaitFixture.write_wait_sleep` in `scripts/direct/verify_token_wait_test_support.py` makes the `sleep 3` stub pause a real 0.1 seconds; the memory poll sleep stays faked. A faked `sleep 3` let a `board.sh acquire --wait` loop spin at full CPU while a peer held the token.
+- AWS pair (3 rounds, 9 modules): token_reservation 15.55 -> 9.27 CPU s, about 9.2 CPU s less in total, all pass.
+- Commit 99927dcf3. Test-only change.
+### Phase 295 — The style ledger reads each repository tip once a process  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc gave no objection on 11-15).
+
+#### As-built
+
+- `scripts/style/style_ledger.py`: `_read_tip` (lru_cache 16) serves `Ledger._tip` and `GitReadCache.tip`, so one process builds each tip once; `_check_ref_format` keeps valid ref names. A production command is one process, so its git reads do not change.
+- `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
+- AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
+- Commit 232d9f01e. Production change.
+
+### Phase 296 — A paired trial box keeps its full lifetime after a queue wait  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the crate_run trial timeout; builds gave the go on 11-15; sdlc has no objection).
+
+#### As-built
+
+- Cause of the crate_run trial 124: `gate_trial.py` set the box expiry before the slot queue wait, and `gate_box.py` splits the time left into run budgets.
+- `coordinate_trial` sets each pending request expiry to launch time + `lifetime_minutes` after every slot is held; `paired_module` reads request.json after `launch`. Branch names keep their start stamp.
+- Test `test_paired_queue_wait_does_not_shorten_the_box_lifetime` in `test_cloud_gate.py`.
+- AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
+- Commit abe4afc09. Production change.

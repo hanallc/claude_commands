@@ -961,6 +961,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
         if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
+        if refusal := merge_gate.live_state_refusal(checkout, tip):
+            raise checkpoint_gate.Stop("promote", "failed", refusal,
+                       "run the conversion that the refusal names, then rerun this checkpoint")
         contained = not git(checkout, "merge-base", "--is-ancestor", tip, current).returncode
         if not contained and git(checkout, "merge-base", "--is-ancestor", current, tip).returncode:
             raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
