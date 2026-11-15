@@ -31,6 +31,14 @@ The status count and `/next question` retain their behavior. The queue keeps a f
 
 After the user answers, follow the `answer` relay line. It resolves the asker's current staff row after a rename or transfer.
 
+A follow-up from the Questions page comes to the asker with a `reply` command. Run it with your reply:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production <showrunner name> --item "<question text>" --text "<your reply>"
+```
+
+The question then returns to the user with the follow-up and the reply.
+
 ## Question form
 
 @~/.claude/docs/question_template.md

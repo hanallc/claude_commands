@@ -136,6 +136,9 @@ class SentCloseoutAlerts(TypedDict):
     messages: list[str]
 
 
+QuestionOutcome = Literal["answer", "followup", "skip"]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -144,6 +147,8 @@ class StoredUserAnswer(TypedDict):
     question: str
     answer: str
     message: str
+    # A record saved before follow-ups and skips has no kind; it is an answer.
+    kind: NotRequired[QuestionOutcome]
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1037,8 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 question = next((item for item in update_registration.question_records_for_document(page.production, identities)
                                  if item.path == page.review_list), None)
-                if question is None or question.status != "closed":
+                # An answer closes its question; a follow-up or a skip leaves it open.
+                if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):

@@ -217,12 +217,12 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 - **Context**;
 - **Items** as a numbered list, with each line of an item on its own line;
 - **Recommended**;
-- **Choices** as buttons above the Answer box. A choice fills the Answer box and marks itself; the user can add words, then saves.
+- **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
 A question stored as one text, from before the parts form, shows in sections too:
 - the text up to its first numbered item;
 - **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
 - the text after the first sentence of the last item, as its own paragraph;
-- **Choices**: the text after `Choices:`. Numbered choices show as buttons; other choice text shows as text;
+- **Choices**: the text after `Choices:`. Numbered choices show as radio items; other choice text shows as text;
 - **Recommended**: the text after `Recommended:`.
 A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
 In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
@@ -230,7 +230,16 @@ A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
 An item that is only one backtick span, such as a command, shows as a code block.
 The form of a new question is in `~/.claude/docs/question_template.md`.
-The field label stays **Answer**, and its action stays **Save answer**.
+The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
+Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
+Answer and Followup stay disabled until the box holds text.
+- **Answer** records the answer and sends it to the asker.
+- **Followup** sends the text to the asker as a question about the question.
+  The question leaves the page, the counts and `/next` until the asker replies.
+  The message gives the asker the `update_registration.py reply` command.
+- **Skip** saves no answer. It moves the question to the end of the list that the page and `/next` use, and tells the asker that it stays open.
+A question card shows each earlier follow-up and its reply as **Follow-up** and **Reply** sections.
+A question card has no Skip for now control.
 An **Owner unavailable** card shows the question and `No showrunner owns this question.`
 It has no answer form, and the server refuses an answer.
 It has no Ask showrunner to check or Ask a question controls.
@@ -242,6 +251,7 @@ An answer without a relay goes to the question's showrunner.
 Each message starts with `From the user (via the review page): ` and names the question.
 
 A saved answer opens the next waiting question and shows **Answer saved.** above the card.
+A follow-up shows **Follow-up sent.**, and a skip shows **Skipped.**
 A failed save retains the typed answer and shows **Not saved: <reason>**.
 An answer to a question already answered elsewhere fails without sending another message.
 Question answers use the existing delivery budget, pause, claims, startup recovery, and failure alert.

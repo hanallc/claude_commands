@@ -228,8 +228,8 @@ class ReviewTextTests(unittest.TestCase):
                          + '<li>AWS filter<br>After: <a href="http://h:1/i" target="_top">http://h:1/i</a></li>'
                          + '<li>Memory &lt;bar&gt;</li></ol><h2>Recommended</h2><p>go for both</p>')
         self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
-                         + '<button type="button" data-choice="go for both" aria-pressed="false">go for both</button>'
-                         + '<button type="button" data-choice="no &quot;yet&quot;" aria-pressed="false">no &quot;yet&quot;</button>'
+                         + '<label><input type="radio" name="choice" value="go for both"><span>go for both</span></label>'
+                         + '<label><input type="radio" name="choice" value="no &quot;yet&quot;"><span>no &quot;yet&quot;</span></label>'
                          + '</fieldset>')
         parts["ask"] = "approve both"
         parts["context"] = parts["recommend"] = ""
@@ -247,8 +247,8 @@ class ReviewTextTests(unittest.TestCase):
                          + '<li>A &lt;b&gt; shows</li><li>One click works.</li></ol><p>It takes a minute.</p>'
                          + '<h2>Recommended</h2><p>ready, see <a href="http://h:1/i" target="_top">http://h:1/i</a></p>')
         self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
-                         + '<button type="button" data-choice="ready: launch now" aria-pressed="false">ready: launch now</button>'
-                         + '<button type="button" data-choice="later: name a time." aria-pressed="false">later: name a time.</button>'
+                         + '<label><input type="radio" name="choice" value="ready: launch now"><span>ready: launch now</span></label>'
+                         + '<label><input type="radio" name="choice" value="later: name a time."><span>later: name a time.</span></label>'
                          + '</fieldset>')
         with self.subTest("choices without numbers show as text"):
             self.assertEqual(change_browser.text_sections("Keep it? Choices: yes = keep; no = drop. Recommended: yes"),
@@ -261,8 +261,8 @@ class ReviewTextTests(unittest.TestCase):
             self.assertEqual(change_browser.text_sections("Pick one.\n\nChoices:\n1. Add it. Then measure.\n2. Keep it.\n\nMeanwhile I port."),
                              ('<p>Pick one.</p><p>Meanwhile I port.</p>',
                               '<fieldset class="question-choices"><legend>Choices</legend>'
-                              + '<button type="button" data-choice="Add it. Then measure." aria-pressed="false">Add it. Then measure.</button>'
-                              + '<button type="button" data-choice="Keep it." aria-pressed="false">Keep it.</button></fieldset>'))
+                              + '<label><input type="radio" name="choice" value="Add it. Then measure."><span>Add it. Then measure.</span></label>'
+                              + '<label><input type="radio" name="choice" value="Keep it."><span>Keep it.</span></label></fieldset>'))
         with self.subTest("1. items"):
             self.assertEqual(change_browser.text_sections("Steps: 1. open 2. close")[0],
                              '<p>Steps:</p><h2>Items</h2><ol class="question-items"><li>open</li><li>close</li></ol>')
@@ -1206,7 +1206,9 @@ class ChangePageTests(unittest.TestCase):
                             ["answer-question", "--production", "page-owner", "--list", str(self.review_list),
                              "--row", row, "--question", question_id, "--text", text])
 
-    def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None) -> str:
+    def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None,
+                           question: str = "Which layout gives each review card enough space for its controls?\n"
+                           + "1. Compact <layout>\n2. Wide layout") -> str:
         """File a canonical question without a reviewer or a real message sender."""
         document = self.production.read_text()
         if "- **Merge branch:**" not in document:
@@ -1216,9 +1218,8 @@ class ChangePageTests(unittest.TestCase):
         owner = next(row for row in record.rows if row.name == "page-owner")
         production = read_production(owner, record)
         items = [item.item for item in update_registration.question_records(production, identities) if item.status == "open"]
-        item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text,
-            question="Which layout gives each review card enough space for its controls?\n1. Compact <layout>\n2. Wide layout",
-            asked_by=(asker or self.unit).id)
+        item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text, question=question,
+                                                   asked_by=(asker or self.unit).id)
         update_registration.store_questions(production, [*items, item], identities)
         filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
         return "question/" + owner.id + "/" + filed.path.name
@@ -1259,7 +1260,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Asked by builder-unit", body)
         self.assertNotIn("The old and new comments agree with the tests", body)
         self.assertEqual(forms.tabs[question], "page-owner")
-        self.assertEqual(forms.outcomes[question], ["answer"])
+        self.assertEqual(forms.outcomes[question], ["answer", "followup", "skip"])
         self.assertEqual(forms.question_counts["page-owner"], 1)
         for kind in ("changes", "questions"):
             with self.subTest(kind=kind, controls="absent"):
@@ -1403,10 +1404,10 @@ class ChangePageTests(unittest.TestCase):
             second_status = change_page.DeliveryStatus(self.root)
             first = next(item for item in change_browser.prepare(browser, first_status).questions if item.key == key)
             second = next(item for item in change_browser.prepare(browser, second_status).questions if item.key == key)
-            delivery, _ = change_browser.submit_question(first, "First answer", first_status)
+            delivery, _ = change_browser.submit_question(first, "answer", "First answer", first_status)
             pending = first_status.path(delivery.page, delivery.row).read_bytes()
             with self.assertRaises(change_page.QuestionAnswerRefused):
-                _ = change_browser.submit_question(second, "Second answer", second_status)
+                _ = change_browser.submit_question(second, "answer", "Second answer", second_status)
             self.assertEqual(first_status.path(delivery.page, delivery.row).read_bytes(), pending)
             count = len(self.messages)
             change_page.deliver(delivery, first_status)
@@ -1414,6 +1415,51 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
+
+    def test_followup_waits_for_the_reply_and_skip_moves_a_question_to_the_end(self) -> None:
+        texts = {self.file_user_question("Choose first"): "Choose first",
+                 self.file_user_question("Choose second"): "Choose second"}
+        path, forms, body = self.browser("questions")
+        first, second = [key for key in forms.rows if key.startswith("question/")]
+        self.assertEqual({first, second}, set(texts))
+        self.assertIn('<p class="answer-help" id=', body)
+        self.assertIn('>Your answer</label>', body)
+
+        with self.subTest(outcome="skip"):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, self.browser_fields(forms, first, "skip", "")).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+            _, after, _ = self.browser("questions")
+            self.assertEqual([key for key in after.rows if key.startswith("question/")], [second, first])
+            self.assertEqual(self.messages[-1][2], "From the user (via the review page), skipped for now; "
+                             + f"it stays open at the end of the list: {texts[first]}\nFor: builder-unit")
+
+        with self.subTest(outcome="followup without text"):
+            reply = self.http_request(path, self.browser_fields(forms, second, "followup", " "))
+            self.assertEqual(reply.status, 400)
+
+        with self.subTest(outcome="followup"):
+            self.delivery_done.clear()
+            reply = self.http_request(path, self.browser_fields(forms, second, "followup", "Which file holds it?"))
+            self.assertEqual(reply.status, 200, reply.body)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(self.messages[-1][0], self.unit.name)
+            self.assertIn("Which file holds it?", self.messages[-1][2])
+            self.assertIn(f"update_registration.py reply --production page-owner --item '{texts[second]}' --text",
+                          self.messages[-1][2])
+            _, after, _ = self.browser("questions")
+            self.assertNotIn(second, after.rows)
+            self.assertIn(first, after.rows)
+
+        with self.subTest(outcome="reply"):
+            record = staff.snapshot()
+            owner = next(row for row in record.rows if row.name == "page-owner")
+            production = read_production(owner, record)
+            identities = update_registration.QuestionStaff.for_record(record)
+            update_registration.reply(production, texts[second], "The file is layout.toml.", identities=identities)
+            _, after, body = self.browser("questions")
+            self.assertIn(second, after.rows)
+            self.assertIn("<h2>Follow-up</h2><p>Which file holds it?</p><h2>Reply</h2><p>The file is layout.toml.</p>", body)
 
     def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
@@ -2467,7 +2513,7 @@ class ChangePageTests(unittest.TestCase):
             question = next(item for item in change_browser.prepare(browser, pending_status).questions if item.key == key)
             with patch.object(update_registration, "answer", side_effect=OSError("answer disk unavailable")):
                 with self.assertRaisesRegex(OSError, "answer disk unavailable"):
-                    _ = change_browser.submit_question(question, "Failed answer", pending_status)
+                    _ = change_browser.submit_question(question, "answer", "Failed answer", pending_status)
             page = change_page.ReviewPage(question.record.path, self.production, (question.record.path.stem,), "")
             self.assertIsInstance(pending_status.slots(page, page.rows[0]).verdict, change_page.NoDelivery)
             self.assertEqual(pending_status.request_attempts, {})
@@ -2480,7 +2526,7 @@ class ChangePageTests(unittest.TestCase):
             key = self.file_user_question("Keep an uncertain answer private")
             pending_status = change_page.DeliveryStatus(self.root)
             question = next(item for item in change_browser.prepare(browser, pending_status).questions if item.key == key)
-            delivery, _ = change_browser.submit_question(question, "Unconfirmed answer", pending_status)
+            delivery, _ = change_browser.submit_question(question, "answer", "Unconfirmed answer", pending_status)
             path = pending_status.path(delivery.page, delivery.row)
             saved = cast(change_page.StoredDeliverySlots, json.loads(path.read_text()))
             saved_answer = saved.get("user_answer")
@@ -2572,8 +2618,8 @@ class ChangePageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:
-        _ = self.file_user_question("First question")
-        _ = self.file_user_question("Second question")
+        for text in ("First question", "Second question"):
+            _ = self.file_user_question(text, question="Pick one.\n\nChoices:\n1. Compact\n2. Wide")
         other = self.temporary / "change-review - all.md"
         document = self.temporary / "all.md"
         _ = document.write_text(f"# All\n- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{other}`\n")
@@ -2611,14 +2657,36 @@ class ChangePageTests(unittest.TestCase):
    const question=current;
    check(!question.querySelector('.kind') && question.firstElementChild.tagName==='H1','question title replaces the Question label');
    check(question.textContent.includes('Asked by builder-unit'),'question keeps the asker');
-   check(question.querySelector('label').textContent==='Answer','question keeps the Answer label');
+   const form=question.querySelector('form'),box=form.querySelector('textarea');
+   check(form.querySelector('label[for="'+box.id+'"]').textContent==='Your answer','the box label is Your answer');
+   check(form.querySelector('.answer-help').textContent.startsWith('A choice fills this.'),'the box has its help line');
    check(getComputedStyle(question.querySelector('h1')).fontSize==='20px','card title size');
-   const form=question.querySelector('form');form.querySelector('textarea').value='Use compact';
+   const buttons=[...form.querySelectorAll('button[name=outcome]')];
+   check(buttons.map(button=>button.textContent).join(',')==='Answer,Followup,Skip','the three question buttons');
+   check(new Set(buttons.map(button=>Math.round(button.getBoundingClientRect().top))).size===1,'the three buttons share one row');
+   check(buttons[0].disabled && buttons[1].disabled && !buttons[2].disabled,'Answer and Followup wait for text');
+   check(getComputedStyle(buttons[0]).opacity<getComputedStyle(buttons[2]).opacity,'a disabled button looks disabled');
+   check(next.hidden,'a question shows its own Skip, not Skip for now');
+   const radios=[...form.querySelectorAll('input[type=radio][name=choice]')];
+   check(radios.length===2,'the choices are a list of radio items');
+   radios[0].click();
+   check(box.value==='Compact' && !buttons[0].disabled,'a choice fills the box and enables Answer');
+   box.value='Use compact';box.dispatchEvent(new Event('input',{bubbles:true}));
+   check(!buttons[0].disabled && !buttons[1].disabled,'text enables Answer and Followup');
    const sent=stubSave('answer');
    await save(question,form,'answer');
-   check(sent().get('outcome')==='answer' && sent().get('feedback')==='Use compact','the answer sends the shared field');
+   check(sent().get('outcome')==='answer' && sent().get('feedback')==='Use compact' && !sent().has('choice'),'the answer sends the shared field');
    check(current!==question && question.dataset.pending==='false' && form.hidden,'the answer advances after saving');
    check(!saveNotice.hidden && saveNotice.textContent==='Answer saved.','question save notice');
+   for(const [outcome,notice] of [['followup','Follow-up sent.'],['skip','Skipped.']]){
+    for(const row of rows){row.dataset.pending='true';row.querySelector('form').hidden=false;}
+    navigate('');const row=current,rowForm=row.querySelector('form');
+    rowForm.querySelector('textarea').value=outcome==='skip' ? '' : 'Which file?';
+    const posted=stubSave('');
+    await save(row,rowForm,outcome);
+    check(posted().get('outcome')===outcome,outcome+' sends its outcome');
+    check(current!==row && row.dataset.pending==='false' && saveNotice.textContent===notice,outcome+' advances with its notice');
+   }
    for(const row of rows) row.dataset.pending='false';
    navigate('');check(!empty.hidden && empty.textContent==='No questions to answer.','questions empty page');
    check(next.hidden,'an empty page hides skip');
