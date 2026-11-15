@@ -4146,11 +4146,11 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; sdlc land go 11-15).
 
-#### Work Order
+#### As-built
 
-- **Goal:** No direct test run writes the caller's build log, so `buildlog/test_log_isolation.py` can go.
-- **Spec:** `testing_folders.test_run_folder` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept. `test_testing_folders` checks the two cases and the restore. Remove `scripts/buildlog/test_log_isolation.py`.
-- **Files:** `scripts/lib/testing_folders.py`, `scripts/lib/test_testing_folders.py`, `scripts/buildlog/test_log_isolation.py`.
-- **Workers:** 1 writer: three small edits; the director writes them (no-worker mode).
-- **Constraints from prior phases:** none.
-- **Acceptance gate:** `lib/test_testing_folders` passes; the 5 formerly guarded modules pass with `BUILDLOG_DIR` unset and write no errors.log; basedpyright 0 errors; AWS pair.
+- `test_run_folder` in `scripts/lib/testing_folders.py` sets `BUILDLOG_DIR` to `<run folder>/buildlog` when it is unset, and restores it after the run. A set value is kept.
+- Every direct test run of every module keeps its build log in its run folder. The gate already sets `BUILDLOG_DIR` for each module (`merge_gate.py:1129`).
+- `scripts/buildlog/test_log_isolation.py` is removed: it re-ran 5 modules under a new HOME and guarded only those 5. `test_testing_folders` checks the two cases and the restore.
+- `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
+- AWS pair (3 rounds): the changed and guarded modules do not change; the removed module cost 16.0 CPU s.
+- Commit 8e5756b00. Production change (sdlc trial go and land go 11-15).
