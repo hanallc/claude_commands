@@ -20,7 +20,7 @@ from scripts.production import change_review, change_routing, staff, update_regi
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page
+from scripts.review_links import change_page, console
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -90,6 +90,22 @@ def page_at(root: Path, path: str) -> ReviewBrowser:
             return ReviewBrowser(token, initial, "questions")
         case _:
             raise ValueError("type must be changes or questions")
+
+
+def waiting_changes(request: console.NewsRequest) -> frozenset[str]:
+    """Name the changes that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).changes if item.waiting)
+
+
+def waiting_questions(request: console.NewsRequest) -> frozenset[str]:
+    """Name the questions that wait for the user, for the console's new mark."""
+    return frozenset(item.key for item in request.shared(console_reviews).questions)
+
+
+def console_reviews(root: Path) -> PreparedReviews:
+    """Read the change lists and questions once for the console's news request."""
+    token, initial = browser_manifest(change_page.console_folder(root))
+    return prepare(ReviewBrowser(token, initial), change_page.DeliveryStatus(root))
 
 
 def rebuilds_at(root: Path, path: str) -> None:

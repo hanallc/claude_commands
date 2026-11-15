@@ -140,7 +140,7 @@ Older browser folders still accept answers that a page posts to them.
 
 `config/console.conf` defines entries in file order.
 The server reads it through `conf.read("console")` at each console request.
-Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`.
+Each entry defines `page.<id>.label`, `.icon`, `.title`, and `.url`, and can define `.items`.
 The URL value has the form `python:<module>:<function>`.
 The function takes no arguments and returns a URL path under the review root.
 The console also accepts a full URL from the configured review origin and converts it to a path.
@@ -172,8 +172,26 @@ A click opens a modal overlay titled **Rebuilds needed** with the Rebuilds page 
 The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
 When no machine needs a rebuild, the link hides and an open overlay closes.
 
-The console vendors ten SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
-They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
+A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
+An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
+The function takes the review root and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+A page without an items function, or an unavailable page, never shows the icon.
+The console posts `open=<id>` for the page it shows to `/console/news`.
+It posts when it loads, at each page choice, and at each `page_refresh_seconds` interval while the browser tab is visible.
+The server records the open page's item keys in the private `console/.review-link-seen.json`.
+It answers `{"new": [<id>, ...]}` with each other page that holds a key absent from its record.
+The server keeps the record, so the phone and the desktop show the same marks.
+A page with no record takes its present keys, so the first visit marks nothing.
+Opening a page clears its icon at once.
+An item that leaves a page and comes back after the user opens the page shows as new again.
+An items function that fails writes one line to the server log, and its page shows no icon.
+In the collapsed rail the icon sits at the top right of the page icon.
+At phone width the menu button shows the icon while any page holds new items.
+Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+
+The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
+They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
 That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
