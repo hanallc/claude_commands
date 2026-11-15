@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, main_push_lock, waiting_rows
+from scripts.lib import build_folders, cancellation, conf, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
@@ -1127,6 +1127,7 @@ raise SystemExit(99)
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
+            session_folder.ROOT_ENV: str(root / "session"),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
