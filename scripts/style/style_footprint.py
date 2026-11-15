@@ -190,6 +190,8 @@ def folded_base(repo: Path, base: str, head: str) -> str:
 class TokenizedText:
     tokens: tuple[Token, ...]
     lines: tuple[int, ...]
+    # The source offset where each token starts.
+    starts: tuple[int, ...]
 
 
 @lru_cache(maxsize=128)
@@ -197,6 +199,7 @@ def tokenized_text(text: str) -> TokenizedText:
     """Keep literals opaque; comments cannot turn their contents into Rust code."""
     result: list[Token] = []
     lines: list[int] = []
+    starts: list[int] = []
     previous, line = 0, 1
 
     def append(token: Token) -> None:
@@ -205,6 +208,7 @@ def tokenized_text(text: str) -> TokenizedText:
         previous = cursor
         result.append(token)
         lines.append(line)
+        starts.append(cursor)
 
     cursor = 0
     while cursor < len(text):
@@ -261,7 +265,7 @@ def tokenized_text(text: str) -> TokenizedText:
             continue
         append(Token(text[cursor], "unknown"))
         cursor += 1
-    return TokenizedText(tuple(result), tuple(lines))
+    return TokenizedText(tuple(result), tuple(lines), tuple(starts))
 
 
 def tokens(text: str) -> tuple[Token, ...]:
@@ -285,34 +289,12 @@ class UnreadableTokenSpans(MoveRefused):
 
 def token_spans(text: str) -> tuple[TokenSpan, ...]:
     """Locate code tokens without treating comments as replacement sites."""
+    tokenized = tokenized_text(text)
     result: list[TokenSpan] = []
-    cursor = 0
-    for token in tokens(text):
-        while cursor < len(text):
-            if text[cursor].isspace():
-                cursor += 1
-            elif text.startswith("//", cursor):
-                end = text.find("\n", cursor)
-                cursor = len(text) if end < 0 else end
-            elif text.startswith("/*", cursor):
-                depth = 1
-                cursor += 2
-                while cursor < len(text) and depth:
-                    if text.startswith("/*", cursor):
-                        depth += 1
-                        cursor += 2
-                    elif text.startswith("*/", cursor):
-                        depth -= 1
-                        cursor += 2
-                    else:
-                        cursor += 1
-            else:
-                break
-        if token.kind == "unknown" or not text.startswith(token.value, cursor):
+    for token, start in zip(tokenized.tokens, tokenized.starts, strict=True):
+        if token.kind == "unknown":
             raise UnreadableTokenSpans("source token offsets are unavailable")
-        end = cursor + len(token.value)
-        result.append(TokenSpan(token, cursor, end))
-        cursor = end
+        result.append(TokenSpan(token, start, start + len(token.value)))
     return tuple(result)
 
 

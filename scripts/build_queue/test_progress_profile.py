@@ -12,6 +12,7 @@ from unittest.mock import patch
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_value
 from scripts.lib import conf
 
 GIB = 1 << 30
@@ -214,6 +215,26 @@ class ProgressCounterTests(unittest.TestCase):
         self.assertIsInstance(progress.parse_progress(
             "\r    Building [==========] 10/10: example\nFinished dev profile in 1.0s\n"),
             progress.NoCounter)
+
+
+    def test_the_token_wait_line_is_a_token_wait_until_the_tokens_are_taken(self) -> None:
+        built = "\r    Building [==========] 10/10: tests\nFinished `test` profile in 29s\n"
+        waiting = progress.parse_progress(built + progress.token_wait_line(4) + "\n")
+        self.assertEqual(waiting, progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4)))
+        taken = progress.parse_progress(built + progress.token_wait_line(4) +
+            "\nnextest: 8 of 8 test threads; one jobserver token for each thread\n")
+        self.assertEqual(progress.token_wait(taken), progress.NoTokenWait())
+        tests = progress.parse_progress(built + progress.token_wait_line(4) +
+            "\nnextest: 8 of 8 test threads\nStarting 12 tests across 3 binaries\n")
+        self.assertEqual(tests, progress.ProgressCounter("test:1", 0, 12))
+
+    def test_a_token_wait_keeps_the_counter_wire_union_for_pinned_clients(self) -> None:
+        waiting = progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4))
+        wire = snapshot_value(waiting)
+        self.assertEqual(parse_snapshot_value(wire, progress.ProgressCounter | progress.NoCounter), waiting)
+        older = {"kind": "NoCounter", "reason": "phase ended or waiting"}
+        self.assertEqual(parse_snapshot_value(older, progress.ProgressCounter | progress.NoCounter),
+                         progress.NoCounter("phase ended or waiting"))
 
 
 class ProgressCaptureTests(unittest.TestCase):

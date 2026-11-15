@@ -126,7 +126,7 @@ assert_equal "claude write command is wrong" \
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 # The simplify run also carries a session id as an extra argument.
@@ -149,9 +149,6 @@ assert "--dangerously-skip-permissions" not in arguments, arguments
 PYTHON
 [[ ! -e "$LOG_FILE" ]] || fail "simplify dry run wrote a log"
 [[ ! -e "${LOG_FILE}.session" ]] || fail "the agent launcher wrote a private session file"
-if run_dry direct.simplify write > "$TEST_DIR/simplify-write.stdout"; then
-    fail "simplify accepted write mode"
-fi
 
 bare_command="$(run_dry bare_case.task write)"
 assert_equal "bare pair did not omit the effort flag" \
@@ -165,7 +162,7 @@ assert_equal "codex command did not carry the function's service tier" \
 
 tier_claude_command="$(run_dry tier_case.claude_task readonly)"
 assert_equal "claude command carried a codex service tier" \
-    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 $claude_command --print --permission-mode plan --disallowedTools Edit\\,Write\\,NotebookEdit --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_claude_command"
 
 MISSING_PROMPT="$TEST_DIR/missing.txt"

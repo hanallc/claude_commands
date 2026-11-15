@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from typing import override
 import unittest
@@ -36,6 +37,16 @@ class SimplifyResultTests(unittest.TestCase):
     def test_extracted_errors_do_not_scan_the_agent_log_again(self) -> None:
         with patch.object(simplify_result, "claude_result", side_effect=AssertionError("repeated scan")):
             self.assertEqual(simplify_result.validate("ERROR: credentials expired", "large log", 4), "credentials expired")
+
+    def test_a_failed_run_records_the_error_from_the_launcher_report(self) -> None:
+        log = json.dumps({"type": "result", "is_error": True, "result": "credentials expired"})
+        report = self.directory / "report.md"
+        log_file = self.directory / "agent.log"
+        _ = log_file.write_text(log)
+        launched = subprocess.run([sys.executable, str(ROOT / "scripts/agents/claude_result.py"), str(log_file), str(report)],
+                                  check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(launched.returncode, 1)
+        self.assertEqual(simplify_result.validate(report.read_text(), log, 4), "credentials expired")
 
     def test_failure_reason_uses_log_errors_or_the_exit_code(self) -> None:
         for log, expected in (
