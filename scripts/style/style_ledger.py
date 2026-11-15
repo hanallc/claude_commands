@@ -96,12 +96,9 @@ FINDING_REPLACEMENT_GUIDANCE = (
 )
 
 
-# The git objects that the catalog's synced cells read. CROSS JOIN keeps the cells as the outer loop;
-# the planner otherwise walks every stored git-object dependency of every table.
+# The git objects that the catalog's synced cells read, from each cell's own `objects` list.
 SYNCED_CELL_OBJECTS = (
-    "SELECT DISTINCT d.source_key FROM refill_cells c CROSS JOIN refill_dependencies d "
-    + "ON d.consumer_table='refill_cells' AND d.consumer_key=c.consumer_key AND d.source_kind='git_object' "
-    + "WHERE c.catalog=? AND c.view='synced'"
+    "SELECT DISTINCT o.value FROM refill_cells c, json_each(c.objects) o WHERE c.catalog=? AND c.view='synced'"
 )
 
 UNCOVERED_SUFFIX = "#uncovered"
@@ -2698,6 +2695,8 @@ MIGRATIONS = {
     # When `held unfold-test-files` withdrew a whole test file move that kept none of its item findings. Each row is
     # written with its held_findings state change, so the held_findings triggers version it.
     44: "CREATE TABLE IF NOT EXISTS fold_withdrawals (finding_id TEXT PRIMARY KEY, unfolded_at TEXT NOT NULL);",
+    # No trigger reads a git_object edge, and each consumer row keeps its objects, so the edges go.
+    45: "DELETE FROM refill_dependencies WHERE source_kind='git_object';",
 }
 
 
@@ -2914,6 +2913,7 @@ class Ledger:
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
+        self._name_sites: dict[tuple[str, str, DeclaredItem], declarations.NameSites | declarations.UnreadableBody] = {}
         if access == LedgerAccess.READ_WRITE:
             database.parent.mkdir(parents=True, exist_ok=True)
         self._staff_resolver: session_staff.RowResolver | None = resolver
@@ -6267,6 +6267,7 @@ class Ledger:
                 self._site_sources[blob].release_parsed()
             self._used_site_sources.clear()
             self._item_bodies.clear()
+            self._name_sites.clear()
             self._outside_diffs.clear()
             style_footprint.tokenized_text.cache_clear()
 
@@ -6625,11 +6626,20 @@ class Ledger:
             if not count or not isinstance(body, declarations.ReadableBody) or not body.lines:
                 failures = (OutsideFailure.BODY_UNREADABLE,)
             elif isinstance(old_body, declarations.ReadableBody):
-                unchanged = declarations.preserved_body(old_body, body, old.declaration.name, item.declaration.name)
+                unchanged = declarations.preserved_body(self._old_name_sites(read, old_path, old, old_body), body,
+                                                        item.declaration.name)
                 if 2 * unchanged < count:
                     failures = (OutsideFailure.BODY_FAILED,)
             self._outside_bodies[key] = (unchanged, count, failures)
         return self._outside_bodies[key]
+
+    def _old_name_sites(self, commit: str, path: str, item: DeclaredItem,
+                        body: declarations.ReadableBody) -> declarations.NameSites | declarations.UnreadableBody:
+        """An old body is tokenized once for every candidate it is compared with."""
+        key = (commit, path, item)
+        if key not in self._name_sites:
+            self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
+        return self._name_sites[key]
 
     def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
         """An immutable item's body is shared by every candidate comparison."""
@@ -7779,6 +7789,7 @@ class Ledger:
         """Release historical bytes and comparison data after their findings finish."""
         self._commit_files = {key: value for key, value in self._commit_files.items() if key[0] != commit}
         self._item_bodies = {key: value for key, value in self._item_bodies.items() if key[0] != commit}
+        self._name_sites = {key: value for key, value in self._name_sites.items() if key[0] != commit}
         self._outside_bodies = {key: value for key, value in self._outside_bodies.items() if key[0] != commit and key[2] != commit}
         self._outside_diffs = {key: value for key, value in self._outside_diffs.items() if commit not in key[:2]}
         self._file_modules = {key: value for key, value in self._file_modules.items() if key[0] != commit}
@@ -7801,6 +7812,7 @@ class Ledger:
             self._active_declarations.clear()
             self._commit_files.clear()
             self._item_bodies.clear()
+            self._name_sites.clear()
             self._outside_diffs.clear()
             self._tips.clear()
             self._inputs.clear()

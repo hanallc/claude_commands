@@ -200,7 +200,7 @@ class FindingResults:
                     (key, self.facts.catalog, finding, view, input_identity((FINDING_RESULT_VERSION, identity)),
                      encoded, json.dumps(objects), json.dumps(approvals, ensure_ascii=False),
                      crate, old_name, new_name, owner, json.dumps(footprint, ensure_ascii=False)))
-                self.facts.dependencies("refill_findings", key, (*edges, *(("git_object", name, name) for name in objects)))
+                self.facts.dependencies("refill_findings", key, edges)
         self.facts.publish(publish)
 
     def source_fact[T](self, kind: str, identity: object, calculate: Callable[[], T],
