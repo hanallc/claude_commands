@@ -149,6 +149,30 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
+  "mac_idle.unreachable": {
+    "one_test": {
+      "objections": [
+        {
+          "quote": "builds cannot reach the Mac",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: I can't read and understand what this message is saying. Fix it for good.; reviewer: claude-opus-5-5",
+      "sha256": "d0a03fd393c76d05d167e9e3e2bb59ea1b71c7787e295e834fe0934e0f1b740a",
+      "time": "2026-11-14T19:49:18.684854-05:00"
+    },
+    "three_tests": {
+      "objections": [
+        {
+          "quote": "builds cannot reach the Mac",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: I can't read and understand what this message is saying. Fix it for good.; reviewer: claude-opus-5-5",
+      "sha256": "d0a03fd393c76d05d167e9e3e2bb59ea1b71c7787e295e834fe0934e0f1b740a",
+      "time": "2026-11-14T19:49:28.013260-05:00"
+    }
+  },
   "nate.adhoc": {
     "long_sender": {
       "objections": [
