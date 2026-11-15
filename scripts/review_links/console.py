@@ -191,8 +191,7 @@ dialog::backdrop{background:#0b10184d}
 .dialog-body code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .dialog-body ul{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:12px}
 .dialog-body li{border:1px solid var(--border);border-radius:9px;padding:12px 14px}
-.dialog-body li p{color:var(--text);font-weight:550}
-.dialog-body dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:2px;margin:0;font-size:13px}
+.dialog-body dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:2px;margin:0;font-size:13px}
 .dialog-body dt{color:var(--muted)}.dialog-body dd{margin:0;min-width:0}
 .dialog-body>p:last-child{margin:16px 0 0;font-size:13px}
 [hidden]{display:none!important}.dismiss,.mobile-header{display:none}

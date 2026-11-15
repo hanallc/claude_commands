@@ -176,13 +176,9 @@ Recovery sends only `saved: true` answers for closed questions.
 Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
 The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
 
-Rebuilds counts machines with open needs and shows natedev before the Mac.
-Each block tells the user where to run `rebuild`.
-Multiple needs share one rebuild; their unchanged reasons appear under `After the rebuild`, newest first.
-A closed Details disclosure shows full commits, affected staff names and kinds, and different requesters.
+Rebuilds shows natedev before the Mac.
+Each block has the machine title, then one entry per change with Who, When and Reason, newest first.
 Unknown staff IDs appear as `Unknown session: <id>`.
-The Mac block states that updates can take five minutes while the Mac is reachable.
-The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
 The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.

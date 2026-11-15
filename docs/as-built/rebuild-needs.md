@@ -66,6 +66,12 @@ The reader skips files that a concurrent clear moves before the read.
 `scripts/statusline/rebuild_row.py` combines cached system comparisons with `read_needs()` on each status read.
 Its `read()` answer keeps the compared machines in `compared` and the needs in `needs`.
 The console Rebuilds page renders that answer, so the page and the row name the same machines.
+The refresh also writes each machine's change list to `<rebuild.cache>-changes.json`.
+It reads the machine's last switch from `rebuild.generations` (on the Mac over `rebuild.ssh`) and lists the commits after it.
+Each commit's `Claude-Session` id maps to a local session through the transcript that records it.
+The refresh finds that transcript with one `rg` scan of the Claude projects folders and keeps the answer in `<rebuild.cache>-sessions.json`.
+A new session id costs one scan; a known id costs none.
+A machine that does not answer keeps its last list.
 The Hana console's bottom-left rebuild link shows only while the answer names a machine (`docs/as-built/review-links.md`, Rebuilds page).
 The `For you:` row shows `rebuild natedev`, `rebuild mac`, or both, without duplicates.
 Open needs appear even when evaluation has no result or the cache does not exist.

@@ -396,6 +396,7 @@ class ChangePageTests(unittest.TestCase):
             "STAFF_FILE": str(self.temporary / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.temporary / "showrunner-state"),
             "REBUILD_NEEDS_DIR": str(self.temporary / "rebuild-needs"),
+            "USER_ZONE": "America/New_York",
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
@@ -1264,46 +1265,37 @@ class ChangePageTests(unittest.TestCase):
                 body = change_browser.render_rebuilds().decode()
             reads.assert_called_once_with()
             answer = rebuild_row.read(Path(os.environ["CONF_DIR"]) / "statusline.conf")
-            self.assertIn(change_browser.rebuild_list(answer, staff.snapshot()), self.request(rebuilds, {}).body)
+            self.assertIn(change_browser.rebuild_list(answer, {}, staff.snapshot()), self.request(rebuilds, {}).body)
             block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1].rsplit('</div>', 1)[0]
             self.assertLess(block.index('data-machine="natedev"'), block.index('data-machine="mac"'))
             self.assertIn('<h2>Rebuild natedev</h2>', block)
             self.assertIn('<h2>Rebuild the Mac</h2>', block)
-            self.assertIn('<p>Run <code>rebuild</code> in a terminal on natedev.</p>', block)
-            self.assertIn('<p>Run <code>rebuild</code> in Terminal on the Mac.</p>', block)
-            self.assertIn('<p>Mac updates can take five minutes while the Mac is reachable.</p>', block)
+            for removed in ("Run <code>rebuild</code>", "five minutes", "One rebuild applies", "Completed requests",
+                            "Commit", "Affected session", "running system"):
+                self.assertNotIn(removed, block)
             self.assertLess(block.index("Apply the second settings."), block.index("Apply the first &lt;settings&gt;."))
             natedev, mac = block.split('</article>', 1)
-            self.assertEqual(natedev.count('One rebuild applies all listed changes.'), 1)
-            self.assertNotIn('One rebuild applies all listed changes.', mac)
             newer, older = natedev.split('</li>', 1)
-            self.assertIn('<dt>Source agent</dt><dd>second-session (unit)</dd>', newer)
-            self.assertNotIn('Affected session', newer)
-            self.assertIn('<dt>Commit</dt><dd><code>' + 'b' * 40 + '</code></dd>', newer)
-            self.assertIn('<dt>Source agent</dt><dd>page-owner (showrunner)</dd>', older)
-            self.assertIn('<dt>Affected session</dt><dd>renamed &lt;unit&gt; (unit)</dd>', older)
-            self.assertIn('<dt>Commit</dt><dd><code>' + 'a' * 40 + '</code></dd>', older)
-            self.assertIn('<dt>Source agent</dt><dd>Unknown session: unknown-requester</dd>', mac)
-            self.assertIn('<dt>Affected session</dt><dd>Unknown session: unknown-staff</dd>', mac)
-            self.assertIn('<dt>Commit</dt><dd><code>' + 'c' * 40 + '</code></dd>', mac)
-            self.assertTrue(block.endswith('<p>Completed requests clear automatically.</p>'))
+            self.assertIn('<li><dl><dt>Who</dt><dd>second-session (unit)</dd><dt>When</dt>'
+                          + '<dd><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dd>'
+                          + '<dt>Reason</dt><dd>Apply the second settings.</dd></dl>', newer)
+            self.assertIn('<dt>Who</dt><dd>page-owner (showrunner)</dd>', older)
+            self.assertIn('<dt>Who</dt><dd>Unknown session: unknown-requester</dd>', mac)
             for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
                 self.assertNotIn(control, block)
 
-            with self.subTest(rebuilds="need spacing"):
+            with self.subTest(rebuilds="entry spacing"):
                 self.assertIn('[data-rebuilds] li+li{margin-top:16px}', body)
-                self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:9em minmax(0,1fr)', body)
+                self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr)', body)
 
             with self.subTest(rebuilds="requester absent"):
                 natedev_needs = next(item for item in need.read_needs() if item.newest["machine"] == "natedev")
                 single: need.NeedRecord = {**natedev_needs.newest, "requested_by": ""}
                 summary = need.MachineNeeds(single, (single["reason"],), (single,))
                 content = change_browser.rebuild_list(
-                    rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), staff.snapshot())
+                    rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), {}, staff.snapshot())
                 self.assertIn('data-count="1" data-label="Rebuild natedev"', content)
-                self.assertIn('<dt>Source agent</dt><dd>second-session (unit)</dd>', content)
-                self.assertNotIn('Affected session', content)
-                self.assertNotIn('One rebuild applies all listed changes.', content)
+                self.assertIn('<dt>Who</dt><dd>second-session (unit)</dd>', content)
 
             with self.subTest(rebuilds="status line comparison"):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
@@ -1313,22 +1305,31 @@ class ChangePageTests(unittest.TestCase):
                     "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
                     "/nix/store/" + "1" * 32 + "-natedev", "/nix/store/" + "2" * 32 + "-mac").details()
                 _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{details}\n")
+                _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": [
+                    {"commit": "c" * 40, "at": "2026-11-12T10:00:00+00:00", "reason": "Apply the Mac settings.",
+                     "session": ""},
+                    {"commit": "e" * 40, "at": "2026-11-12T14:30:00+00:00", "reason": "memory: <defer> defrag",
+                     "session": owner.id}]}))
                 body = change_browser.render_rebuilds().decode()
                 self.assertEqual(rebuild_row.read(configuration).machines, ("natedev", "mac"))
                 block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1]
-                natedev, mac = block.split('</article>', 1)
-                self.assertNotIn("running system", natedev)
-                self.assertIn('<ul><li><p>The running system differs from /etc/nixos main <code>' + "d" * 40
-                              + '</code>.</p></li><li><p>Apply the Mac settings.</p>', mac)
-                self.assertIn('<p>One rebuild applies all listed changes.</p>', mac)
+                mac = block.split('</article>', 1)[1]
+                # The filed need covers its commit, so that commit shows once, with the need's requester.
+                self.assertEqual(mac.count("Apply the Mac settings."), 1)
+                self.assertIn('<ul><li><dl><dt>Who</dt><dd>page-owner (showrunner)</dd><dt>When</dt>'
+                              + '<dd><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dd>'
+                              + '<dt>Reason</dt><dd>memory: &lt;defer&gt; defrag</dd></dl></li><li>', mac)
                 only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
+                                                   {"mac": (rebuild_row.Change("f" * 40, "2026-11-12T15:00:00+00:00",
+                                                                               "Turn on swap", ""),)},
                                                    staff.snapshot())
                 self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
                                  + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
-                                 + '<p>Run <code>rebuild</code> in Terminal on the Mac.</p>'
-                                 + '<p>Mac updates can take five minutes while the Mac is reachable.</p>'
-                                 + '<ul><li><p>The running system differs from main.</p></li></ul></article>'
-                                 + '<p>Completed requests clear automatically.</p></div>')
+                                 + '<ul><li><dl><dt>Who</dt><dd>Unknown session</dd><dt>When</dt>'
+                                 + '<dd><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dd>'
+                                 + '<dt>Reason</dt><dd>Turn on swap</dd></dl></li></ul></article></div>')
+                self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
+                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:
         destination = fixture_member("showrunner", name="destination")

@@ -298,18 +298,18 @@ The server serves it only in a folder that holds the browser manifest.
 It is not in the navigation.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
-The Mac instruction states that updates can take five minutes while the Mac is reachable.
-A machine whose running system differs from main lists that first: `The running system differs from /etc/nixos main <commit>.`
-The repository, branch and commit come from the cached evaluation; without one, the line ends `differs from main.`
-A machine with two or more items shows `One rebuild applies all listed changes.`
-Each need shows its stored reason, newest first by creation time.
-Under the reason, a list shows the source agent, the affected session and the full configuration commit.
-The source agent is the recorded requester, or else the affected session.
-The affected session shows only when it differs from the source agent.
+Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then one entry per change, newest first.
+Each entry is a list of three rows: Who, When and Reason.
+The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
+`rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
+A commit's reason is its subject and its time is the author time.
+Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
+A filed need is an entry with its requester (else the affected session), its creation time and its reason.
+A need covers its own commit, so that commit shows once.
 Names come from the current staff record as `<name> (<kind>)`.
-Unknown staff IDs appear as `Unknown session: <id>`.
-The final line states `Completed requests clear automatically.`
+An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
+When shows the time in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+A listed machine without a recorded change list shows `The change list is not available yet.`
 When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
 The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.

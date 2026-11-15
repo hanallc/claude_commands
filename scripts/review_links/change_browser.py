@@ -14,6 +14,7 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
+from scripts.lib.user_zone import shown_time
 from scripts.production import change_review, change_routing, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.issues import frontmatter
@@ -250,53 +251,47 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
-def rebuild_list(answer: rebuild_row.RebuildAnswer, record: staff.StaffSnapshot) -> str:
-    """Show each machine the status line names: its rebuild action, the main comparison, then each need."""
-    def session(identity: str) -> str:
-        member = record.by_id(staff.StaffId(identity))
-        return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
+def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
+                 record: staff.StaffSnapshot) -> str:
+    """Show each machine the status line names, then one entry per change: who made it, when and why."""
+    def who(session: str) -> str:
+        member = record.by_member_reference(session) if session else None
+        return (f"{member.name} ({member.kind})" if member is not None
+                else f"Unknown session: {session}" if session else "Unknown session")
 
-    def field(label: str, value: str) -> str:
-        return f'<dt>{label}</dt><dd>{value}</dd>'
+    def entry(session: str, at: str, reason: str) -> tuple[datetime, str]:
+        moment = datetime.fromisoformat(at)
+        return moment, (f'<li><dl><dt>Who</dt><dd>{html.escape(who(session))}</dd>'
+                        + f'<dt>When</dt><dd><time datetime="{html.escape(at, quote=True)}">{shown_time(moment)}</time></dd>'
+                        + f'<dt>Reason</dt><dd>{html.escape(reason)}</dd></dl></li>')
 
-    expected = answer.expected
     names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
     for machine_name, name in zip(answer.machines, names):
-        terminal = "Terminal" if machine_name == "mac" else "a terminal"
-        items: list[str] = []
-        if machine_name in answer.compared:
-            source = (html.escape(" ".join(expected.source[:2])) + ' <code>' + html.escape(expected.commit) + '</code>'
-                      if isinstance(expected, rebuild_row.ExpectedSystems) else "main")
-            items.append(f'<li><p>The running system differs from {source}.</p></li>')
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
-        for item in sorted(records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
-            source = item["requested_by"] or item["concerns"]
-            affected = (field("Affected session", html.escape(session(item["concerns"])))
-                        if item["concerns"] and item["concerns"] != source else "")
-            items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
-                         + field("Source agent", html.escape(session(source))) + affected
-                         + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
-        blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
-            + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
-            + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
-            + ('<p>One rebuild applies all listed changes.</p>' if len(items) >= 2 else '')
-            + '<ul>' + ''.join(items) + '</ul></article>')
+        filed = {item["nixos_commit"] for item in records}
+        # A filed need and its commit are one change; the need gives the requester and the reason.
+        items = [entry(item["requested_by"] or item["concerns"], item["created_at"], item["reason"]) for item in records]
+        items += [entry(change.session, change.at, change.reason)
+                  for change in changes.get(machine_name, ()) if change.commit not in filed]
+        listed = ('<ul>' + ''.join(shown for _, shown in sorted(items, key=lambda item: item[0], reverse=True)) + '</ul>'
+                  if items else '<p>The change list is not available yet.</p>')
+        blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
-            + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
-            + '</div>')
+            + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
 REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}[data-rebuilds] li p{margin:0 0 8px}
-[data-rebuilds] dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] h2{margin-top:0}[data-rebuilds] ul{list-style:none;padding:0}[data-rebuilds] li+li{margin-top:16px}
+[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
 [data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
 
 
 def render_rebuilds() -> bytes:
     """Render the status line's rebuild answer for the console's rebuild link and overlay."""
-    rebuilds = rebuild_list(rebuild_row.read(conf.path("statusline")), staff.snapshot())
+    config = conf.path("statusline")
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
     return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
