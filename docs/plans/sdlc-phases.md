@@ -243,6 +243,26 @@ The saved baseline reports inserted phases as about 2% of gaps.
 - `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
 - `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
 
+### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every read of a phase's reservation state and the write that follows run under one phase lock (next item, sdlc 2026-11-08).
+
+**Spec:**
+- `phase_reservation.phase_lock(phase_dir)` holds the phase lock file that the baseline writer already used.
+- `committed`, `_repair_command` (its record part), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` take it around their read and write.
+- Test: a checkpoint that starts while a repair is between its read and its write keeps its pending release record. The same test fails with the lock removed.
+
+**Files:**
+- `scripts/direct/phase_reservation.py`
+- `scripts/direct/test_phase_reservation.py`
+
+**Workers:** `director only (no Codex workers until the workers-back notice)`.
+
+**Acceptance gate:** `test_phase_reservation.py`, `test_progress_history.py` and the style plan tests pass; basedpyright reports zero errors and zero warnings on the changed files.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
