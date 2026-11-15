@@ -2021,6 +2021,29 @@ class CapViewTests(QueueViewFixtureTests):
                 self.assertIn(queue_evidence.room_check_text(head.room),
                               plain(queue_card.render_card(shown, [1], 400)))
 
+    def test_head_line_names_the_kept_aside_and_swap_terms_of_the_cap_line(self) -> None:
+        gib = admission_records.GIB
+        for available, text in ((18, "Head: need 7.6 GiB > room 4.0 GiB (free 18.0 GiB − safety 3.0 GiB − 5.0 GiB swapped outside builds"
+                                     + " − kept aside 6.0 GiB)"),
+                                (12, "Head: need 7.6 GiB > room 0.0 GiB (free 12.0 GiB − safety 3.0 GiB − 5.0 GiB swapped outside builds"
+                                     + " − kept aside 6.0 GiB)")):
+            with self.subTest(available=available):
+                inputs = self.fixture.inputs(policy=admission_policy_fixture())
+                inputs = replace(inputs, pressure=admission_records.NoPressureHold(),
+                    host=admission_records.HostMemory(available * gib, 60 * gib, 32 * gib, 27 * gib),
+                    reservations=tuple({**row, "need": 6 * gib} for row in inputs.reservations),
+                    running=(replace(inputs.running[0], promise=6 * gib,
+                        measured=admission_records.MeasuredMemory(0, anonymous=admission_records.AnonymousRunUse(0))),))
+                reading = gate.queue_read_from(inputs, policy=admission_policy_fixture())
+                room = reading.explanation.room
+                assert isinstance(room, admission_records.MemoryRoom)
+                head = queue_view.head_text(replace(self.fixture.model(), reading=reading))
+                self.assertEqual(head.partition(" · ")[0], text)
+                # The head line and the cap line show the same kept-aside and swap amounts.
+                cap_line = queue_evidence.room_text(room)
+                for term in ("kept aside 6.0 GiB", "5.0 GiB swapped outside builds", "safety 3.0 GiB"):
+                    self.assertIn(term, cap_line)
+
     def test_empty_run_set_has_room_before_the_cap_and_safety_after_it(self) -> None:
         room = self.cap_model(need=0, used=0).reading.explanation.room
         bar = queue_view.cap_bar(room, 60, colour=False)
