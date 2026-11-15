@@ -51,7 +51,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         super().__init__(methodName)
         self.root = Path()
         self.paths = mac_idle.MacIdlePaths(Path(), Path(), Path(), Path())
-        self.call = mac_idle.VerifyCall("", 1, "", "", "", "", "", "", "", "", 0, True)
+        self.call = mac_idle.VerifyCall("", 1, "", "", "", "", "", "", "", "", 0)
 
     @override
     def setUp(self) -> None:
@@ -82,7 +82,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         session = "live-session"
         self.call = mac_idle.VerifyCall("v-call", 123, "456", str(self.root / "repo"), "sample", session,
             str(self.paths.session_root / session), str(self.root / "hold-waiter"), str(self.root / "token_waiters"),
-            str(self.root / "settings"), 900, True, updated="1970-01-01T00:16:40Z")
+            str(self.root / "settings"), 900, updated="1970-01-01T00:16:40Z")
         Path(self.call.temp_dir).mkdir(parents=True)
         self.process(123, 1, "456", ("bash", "/repo/scripts/direct/verify.sh", "test", "sample"))
         self.process(122, 1, "455", ("claude",))
@@ -1091,7 +1091,7 @@ done
         self.assertIn(f"Repo {self.call.repo}", reported)
         self.assertIn("verify.sh doc , pid 123", reported)
         self.assertEqual([(row["cause"], row["wait"]) for row in self.rows()],
-                         [("call_has_no_marker_hook", "memory")])
+                         [("idle_with_waiter", "memory")])
         self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
 
     def test_live_session_missing_temp_root_is_created(self) -> None:

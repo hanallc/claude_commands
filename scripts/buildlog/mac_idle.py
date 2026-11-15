@@ -82,7 +82,6 @@ class VerifyCall:
     token_dir: str
     settings: str
     retry_after: float
-    marker_hook: bool
     local_reason: str = ""
     kind: str = "test"
     wait_state: step_record.StepState = step_record.StepState.WAITING_MAC
@@ -201,7 +200,7 @@ def registered_call(row: dict[str, object]) -> VerifyCall:
     return VerifyCall(cast(str, row["call_id"]), pid, cast(str, row["start"]), cast(str, row["repo"]),
                        cast(str, row["package"]), cast(str, row["session"]), cast(str, row["temp_dir"]),
                        cast(str, row["hold_waiter"]), cast(str, row["token_dir"]), cast(str, row["settings"]),
-                       float(retry_after), row.get("marker_hook") is True, str(row.get("local_reason", "")))
+                       float(retry_after), str(row.get("local_reason", "")))
 
 
 def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[VerifyCall, ...]:
@@ -241,9 +240,9 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
             call = registered_call(read_record(call_path(paths, record.call_id)))
         except ValueError:
             call = VerifyCall(record.call_id, record.pid, record.proc_start, str(record.repo), step_record.package_name(record.package),
-                "", "", "", "", "", 0, False)
+                "", "", "", "", "", 0)
         if call.pid != record.pid or call.start != record.proc_start:
-            call = replace(call, pid=record.pid, start=record.proc_start, marker_hook=False,
+            call = replace(call, pid=record.pid, start=record.proc_start,
                            session="", temp_dir="", hold_waiter="", token_dir="")
         if call.local_reason and call.local_reason != "disk" and not disk_excluded:
             continue
@@ -579,9 +578,7 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
                     and session_is_live(call, paths, live)):
                 session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
                 causes.append(("missing_temp_root", "created_session_temp_root"))
-            if not call.marker_hook:
-                cause, action = "call_has_no_marker_hook", "message_showrunner"
-            elif call.retry_after > monotonic:
+            if call.retry_after > monotonic:
                 cause, action = "retry_delayed", "retry_marker"
             else:
                 children = [child for child in live.values() if belongs_to(child, call, live)]
@@ -612,12 +609,12 @@ def watch_once(paths: MacIdlePaths, now: float, monotonic: float) -> None:
 
 def main(args: list[str]) -> int:
     paths = watch_paths()
-    if args[:1] == ["register"] and len(args) == 12:
-        _, call_id, pid_text, repo, package, settings, retry, hold_waiter, token_dir, session, temp_dir, marker = args
+    if args[:1] == ["register"] and len(args) == 11:
+        _, call_id, pid_text, repo, package, settings, retry, hold_waiter, token_dir, session, temp_dir = args
         pid = int(pid_text)
         process = read_process(paths.proc / pid_text)
         call = VerifyCall(call_id, pid, process.start, repo, package, session, temp_dir, hold_waiter, token_dir,
-                           settings, float(retry), marker == "1")
+                           settings, float(retry))
         write_record(call_path(paths, call_id), asdict(call))
         print(marker_path(paths, call_id))
     elif args[:1] == ["remove"] and len(args) == 2:
