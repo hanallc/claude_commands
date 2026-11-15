@@ -2,7 +2,7 @@
 
 Status: implementation plan. Phase bf1 has landed. The devtools part of Phase 2 (bf2d, bf2p, bf9r) is merged into sdlc.
 The build disk is in: `/build` (3.6 TiB) has its file system since 2026-11-14 18:43 EST.
-Next: measure the slot values again on `/build` and send them to the user. Then the queue part of Phase 2 (rescue), then Phase 3.
+The user approved the `/build` slot values on 2026-11-15 (relayed by builds). The queue part of Phase 2 (rescue) is built; Phase 3 is next.
 The user approved D1–D9 on 2026-11-12 at 12:45 EST.
 This plan has nine phases and an estimate of **64 worker hours**.
 
@@ -122,7 +122,7 @@ The user questioned the first #88 values: "Why are we allocating more than we ha
 7. The claude folders are on tmpfs. They count against memory, not the disk sum.
 8. When a slot take deletes a target above its size limit, verify.sh prints one line that names the slot and its measured size. The target is deleted once and the next build starts from nothing; it is not made smaller.
 
-### Slot proposal on /build (2026-11-15, waits for the user)
+### Slot values on /build (approved 2026-11-15)
 
 Measured on natedev 2026-11-15 00:59 to 01:04 EST. The Mac values of 2026-11-14 stand.
 A slot is one fixed workspace path. Its build-dir follows from its folder name, `/build/cargo/<name>`, so a slot folder name is unique across `~/rust` and `~/worktrees`.
@@ -253,6 +253,12 @@ Do not add slots, rescue refs, or size limits during bf1.
 **Devtools part (bf2d):** `build_folders.collector_lease` holds a managed folder's lease lock without waiting.
 `scratch.removal_lock` and `scratch.judgment_lock` take it first and hold it through judgment and deletion; a held lease is busy.
 The folder audit, the tmp sweep, scratch end, the floor sweep and copy removal get the guard through these locks.
+**Rescue (queue):** `scripts/lib/build_rescue.py` `rescue(folder, source, name)` writes one commit under `refs/rescue/<name>-<UTC time>-<random>` in the source repository.
+Its tree holds `worktree` (all files, ignored source included, and a gitlink for each nested repository), `index` (one folder for each stage) and `refs` (the HEAD and ref lines).
+Its parents are HEAD, the ref tips of a repository that does not share the source's objects, and each nested repository's rescue commit.
+A folder with a `CACHEDIR.TAG` file is generated data, so the rescue skips it. A folder with no repository gives `NothingToRescue`.
+The rescue checks that the ref names the commit and that the source has every object it needs; otherwise it raises `RescueFailed`.
+`build_folders.rescue_and_remove_build_folder(path, source, name)` rescues and removes under the free lease lock. A held lease gives `FolderHeld`; a failed rescue keeps the folder.
 **Held child leases (bf2p):** `removal_lock` also holds every lease lock below the folder through deletion; a held one keeps the parent.
 **Lease records (bf9r):** a lock file or lease record is judged by its folder's lease; a live owner's records are busy.
 `tmp_sweep.py` still reports the old busy reason; resources can use `scratch.BUSY_REASON`.

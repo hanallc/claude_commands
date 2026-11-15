@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, cast, override
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
+    from scripts.lib.build_rescue import NothingToRescue, Rescued
     from scripts.lib.conf import ConfigRead
 
 # Python's mkdtemp allocator uses this suffix.
@@ -554,6 +555,34 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
             return True
         finally:
             os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class FolderHeld:
+    """An owner holds the folder's lease, so it stays."""
+
+
+def rescue_and_remove_build_folder(path: Path, source: Path, name: str) -> Rescued | NothingToRescue | FolderHeld:
+    """Under the free folder's lock, save its Git work in source, then remove it with no confirmation.
+
+    A RescueFailed error leaves the folder and its records in place.
+    """
+    from scripts.lib import build_rescue
+
+    saved: list[Rescued | NothingToRescue] = []
+    with _folder_parent(path, path.parent, create=False) as directory:
+        def cleanup() -> None:
+            try:
+                allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                saved.append(build_rescue.NothingToRescue())
+                return
+            saved.append(build_rescue.rescue(path, source, name))
+            _remove_folder(path, directory, allocated)
+
+        if not remove_build_folder(path, cleanup, dir_fd=directory):
+            return FolderHeld()
+    return saved[0]
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
