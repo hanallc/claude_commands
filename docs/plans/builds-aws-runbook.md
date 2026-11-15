@@ -58,13 +58,13 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 `us-east-2` is the home region for shared artifacts.
 Before European deployment:
 
-1. Enable `eu-south-2` on the AWS Account page.
-2. Confirm that its status is `ENABLED`.
-3. Add both European regions to the Organizations `RegionFloor` policy.
+1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
+2. Confirm that each status is `ENABLED`.
+3. Add every configured region to the Organizations `RegionFloor` policy.
 4. Preserve the home and US region permissions.
 
 Use these commands at your terminal:

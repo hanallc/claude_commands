@@ -1011,7 +1011,7 @@ class _BillRates:
 # AWS bill usage types start with the region billing code; us-east-1 rows can have no code.
 REGION_USAGE_PREFIXES: dict[str, tuple[str, ...]] = {
     'us-east-1': ('', 'USE1'), 'us-east-2': ('USE2',), 'us-west-1': ('USW1',), 'us-west-2': ('USW2',),
-    'eu-north-1': ('EUN1',), 'eu-south-2': ('EUS2',)}
+    'eu-north-1': ('EUN1',), 'eu-south-1': ('EUS1',), 'eu-south-2': ('EUS2',)}
 
 
 def usage_region(usage_type: str, usage: str) -> str | None:

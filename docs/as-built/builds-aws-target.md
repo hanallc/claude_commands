@@ -6,7 +6,7 @@ AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU s
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 The saved deployment record identifies the regions available for launch.
 Boxes boot the official NixOS image and fetch their tools at boot.
 GPU trial boxes then import the prepared GPU system and reboot.
@@ -404,7 +404,7 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The list contains `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The list contains `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
@@ -494,9 +494,9 @@ The configured allowance supplies the cost when no needed bill rows exist or the
 The spending limits do not change.
 
 European deployment needs account and policy changes before the regional stacks can start.
-Enable `eu-south-2` on the AWS Account page and wait until its status is `ENABLED`.
+Enable `eu-south-1` and `eu-south-2` on the AWS Account page and wait until each status is `ENABLED`.
 See [AWS Region activation](https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-regions.html).
-Add `eu-north-1` and `eu-south-2` to the allowed regions in `RegionFloor` before deployment.
+Add `eu-north-1`, `eu-south-1`, `eu-south-2`, `us-east-1` and `us-west-1` to the allowed regions in `RegionFloor` before deployment.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
 
@@ -710,7 +710,7 @@ Refusal handling, regional cost bookings, and the $35 daily and $400 monthly lim
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
-`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2` supplies the candidate regions for Spot work and price reads.
+`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2 us-east-1 us-west-1 eu-south-1` supplies the candidate regions for Spot work and price reads.
 `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
