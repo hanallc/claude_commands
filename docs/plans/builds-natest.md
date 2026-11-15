@@ -4118,3 +4118,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Cause: the fixture queue waited 5 s of start spacing between starts, and `cleanup_program_starts` waited a 5 s stop grace on a TERM-resistant program.
 - AWS pair (3 rounds): CPU 15.65 -> 15.21 s, wall 127.7 -> 24.8 s; all pass, same tests.
 - Commit ce8c5dc7c. Test-only change.
+
+### Phase 284 — The branch page reads the history of main in one git call  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc go 11-15).
+
+#### Work Order
+
+- **Goal:** `list_branches` in `scripts/review_links/branch_page.py` makes no git call for each remote head.
+- **Spec:** A new `main_history(repository, main)` reads `git log --format=%H %cI %P main` once. It returns each commit date and each commit's first mainline commit; the walk starts at the oldest mainline commit. `list_branches` uses it for the merged check, the commit date, the merge commit and the merge date. `is_ancestor` and `mainline_merge` go.
+- **Files:** `scripts/review_links/branch_page.py`.
+- **Workers:** 1 writer: one file; the director writes it (no-worker mode).
+- **Constraints from prior phases:** none.
+- **Acceptance gate:** `review_links/test_branch_page` passes; basedpyright 0 errors; on the live repo, old and new rows agree; the AWS pair shows a CPU gain.
