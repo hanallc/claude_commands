@@ -439,7 +439,11 @@ function show(){
  next.hidden=!waiting().some(r=>r!==current);
  (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(tab,current.dataset.key);
- history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''})); shownHash=location.hash; }
+ // The default place, All with no card, keeps a plain URL.
+ history.replaceState(null,'',tab || current ? '#'+new URLSearchParams({showrunner:tab,row:current?.dataset.key || ''}) : location.pathname+location.search);
+ shownHash=location.hash;
+ // The console records this place in its own URL, so a reload or a shared link opens it again.
+ if(parent!==window) parent.postMessage('console-place',location.origin); }
 function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
@@ -504,8 +508,10 @@ function applyHeldPage(){
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
  window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
 }
+// A console frame that another page covers is hidden and loads no update.
+const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 async function refreshPage(supersede=false){
- if(document.visibilityState!=='visible' || (activeLoads && !supersede)) return;
+ if(paused() || (activeLoads && !supersede)) return;
  const request=++newestRequest;
  activeLoads++;
  try{
@@ -523,6 +529,7 @@ function scheduleRefresh(){
 }
 document.addEventListener('input',()=>applyHeldPage());
 document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
+window.addEventListener('message',event=>{if(event.source===parent && event.origin===location.origin && event.data==='console-shown') refreshPage(true);});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''

@@ -101,6 +101,9 @@ Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
 Each storage operation catches failures, so blocked storage does not stop navigation.
 The selected page fills a same-origin frame beside the navigation.
+Each page that the user opens keeps its own live frame, and the console hides the others.
+A navigation click back to a page shows it as the user left it: filter, card, type, scroll and typed text.
+A hidden frame keeps its layout with `visibility:hidden`, so its scroll position stays.
 The shell follows the system light or dark theme.
 At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
@@ -112,6 +115,18 @@ The phone navigation starts closed and does not change the stored desktop state.
 `?page=<id>` selects a page.
 Missing and unknown ids select the first configured entry.
 Navigation clicks update this query with `history.replaceState`.
+
+The console URL also records the place of each opened page as `at.<id>=<path, query and fragment>`.
+A reload or a shared link opens each page at its recorded place.
+The console takes a recorded place only when its path is the configured path of that page; otherwise it opens the configured URL.
+A place equal to the configured URL removes its `at.<id>` key.
+The console reads a frame's place when the frame loads and at each `hashchange` in the frame.
+A page that changes its place with `history.replaceState` posts `console-place` to its parent, so the console reads the place again.
+
+A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
+When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
+The Changes page follows both rules.
+The Builds page refreshes in a hidden frame until it reads the same signal.
 
 Older links forward to the fixed address with a 303 and keep their query.
 The server forwards `/<snapshot>/console.html` to `/console/`.
@@ -183,6 +198,7 @@ All is the default and includes every showrunner in the existing item order.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
+All with no card keeps the URL without a fragment.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
