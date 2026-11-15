@@ -17,10 +17,10 @@ from scripts.lib import conf, urgency
 from scripts.production import change_review, change_routing, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.issues import frontmatter
-from scripts.rebuild import need
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
+from scripts.statusline import rebuild_row
 
 MANIFEST = change_page.BROWSER_MANIFEST
 FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
@@ -250,8 +250,8 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
-def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
-    """Show each machine's rebuild action, then each need's reason, source agent and commit."""
+def rebuild_list(answer: rebuild_row.RebuildAnswer, record: staff.StaffSnapshot) -> str:
+    """Show each machine the status line names: its rebuild action, the main comparison, then each need."""
     def session(identity: str) -> str:
         member = record.by_id(staff.StaffId(identity))
         return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
@@ -259,27 +259,31 @@ def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot)
     def field(label: str, value: str) -> str:
         return f'<dt>{label}</dt><dd>{value}</dd>'
 
-    ordered = sorted(machines, key=lambda item: (
-        item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"]))
-    names = ["the Mac" if machine.newest["machine"] == "mac" else machine.newest["machine"] for machine in ordered]
+    expected = answer.expected
+    names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
-    for machine, name in zip(ordered, names):
-        machine_name = machine.newest["machine"]
+    count = 0
+    for machine_name, name in zip(answer.machines, names):
         terminal = "Terminal" if machine_name == "mac" else "a terminal"
         items: list[str] = []
-        for item in sorted(machine.records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
+        if machine_name in answer.compared:
+            source = (html.escape(" ".join(expected.source[:2])) + ' <code>' + html.escape(expected.commit) + '</code>'
+                      if isinstance(expected, rebuild_row.ExpectedSystems) else "main")
+            items.append(f'<li><p>The running system differs from {source}.</p></li>')
+        records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
+        for item in sorted(records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
             source = item["requested_by"] or item["concerns"]
             affected = (field("Affected session", html.escape(session(item["concerns"])))
                         if item["concerns"] and item["concerns"] != source else "")
             items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
                          + field("Source agent", html.escape(session(source))) + affected
                          + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
+        count += len(items)
         blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
             + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
             + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
-            + ('<p>One rebuild applies all listed changes.</p>' if len(machine.records) >= 2 else '')
+            + ('<p>One rebuild applies all listed changes.</p>' if len(items) >= 2 else '')
             + '<ul>' + ''.join(items) + '</ul></article>')
-    count = sum(len(machine.records) for machine in machines)
     label = f"Rebuild {', '.join(names)} ({count})" if count else ""
     return (f'<div data-rebuilds data-count="{count}" data-label="{html.escape(label, quote=True)}">'
             + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
@@ -293,9 +297,9 @@ REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid G
 
 
 def render_rebuilds() -> bytes:
-    """Render the open rebuild needs for the console's rebuild link and overlay."""
-    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuild_list(need.read_needs(), staff.snapshot()),
-                                "Rebuilds needed")
+    """Render the status line's rebuild answer for the console's rebuild link and overlay."""
+    rebuilds = rebuild_list(rebuild_row.read(conf.path("statusline")), staff.snapshot())
+    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:

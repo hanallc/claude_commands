@@ -153,12 +153,18 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
 
 @dataclass(frozen=True)
 class RebuildAnswer:
-    """The known rebuild machines and whether the cache needs a refresh."""
+    """The known rebuild machines and whether the cache needs a refresh.
+
+    `compared` holds the machines whose running system differs from main;
+    `needs` holds the open rebuild needs that `read` joined into `machines`.
+    """
 
     machines: tuple[str, ...]
     refresh_due: bool
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
+    compared: tuple[str, ...] = ()
+    needs: tuple[need.MachineNeeds, ...] = ()
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -184,10 +190,11 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     """Combine the cached comparison with open rebuild needs."""
     answer = _read_cache(config, clock)
     try:
-        machines = set(answer.machines) | {summary.newest["machine"] for summary in need.read_needs()}
+        needs = tuple(need.read_needs())
+        machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError):
         return answer
-    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines))
+    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines), needs=needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
@@ -221,7 +228,8 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
                             expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
             except (ValueError, KeyError, TypeError):
                 pass
-        return RebuildAnswer(tuple(item.removeprefix("rebuild ") for item in items), refresh_due, expected, failure)
+        compared = tuple(item.removeprefix("rebuild ") for item in items)
+        return RebuildAnswer(compared, refresh_due, expected, failure, compared)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 

@@ -290,23 +290,26 @@ An agent deletes an image with this command:
 
 ### Rebuilds page
 
-`/console/rebuilds.html` lists open rebuild needs for the console's rebuild link.
+`/console/rebuilds.html` lists the machines that the status line names for a rebuild, for the console's rebuild link.
+Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
+That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
 The server serves it only in a folder that holds the browser manifest.
 It is not in the navigation.
-A `data-rebuilds` block carries `data-count`, the number of open needs, and `data-label`, the link label.
-The page shows one block per machine, with natedev first, then the Mac, then other machines in name order.
+A `data-rebuilds` block carries `data-count`, the number of listed items, and `data-label`, the link label.
+The page shows one block per machine, with natedev first, then the Mac.
 Each block starts with `Rebuild natedev` or `Rebuild the Mac` and tells the user where to run `rebuild`.
 The Mac instruction states that updates can take five minutes while the Mac is reachable.
-A machine with multiple needs shows `One rebuild applies all listed changes.`
+A machine whose running system differs from main lists that first: `The running system differs from /etc/nixos main <commit>.`
+The repository, branch and commit come from the cached evaluation; without one, the line ends `differs from main.`
+A machine with two or more items shows `One rebuild applies all listed changes.`
 Each need shows its stored reason, newest first by creation time.
 Under the reason, a list shows the source agent, the affected session and the full configuration commit.
 The source agent is the recorded requester, or else the affected session.
 The affected session shows only when it differs from the source agent.
 Names come from the current staff record as `<name> (<kind>)`.
 Unknown staff IDs appear as `Unknown session: <id>`.
-Each render calls `rebuild.need.read_needs()` once.
 The final line states `Completed requests clear automatically.`
-An empty or missing needs folder shows only `No rebuilds needed.`, with a count of 0 and an empty label.
+When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
 The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
 The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
