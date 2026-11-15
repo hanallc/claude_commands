@@ -4210,3 +4210,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_launch_settings_match_shell_role_resolution_and_tier_precedence` in `scripts/lib/test_models_registry.py` checks `direct` (`impl`, `review`), `design_roles` (`designer`), `producers` (`morty`) and `producer_only`, for both families and all five tiers. Neither resolver has a branch for one key name.
 - AWS pair (3 rounds): 11.20 -> 6.09 CPU s, all pass.
 - Commit 3a8806fd6. Test-only change.
+
+### Phase 292 — The agent launcher and copy import tests drop repeated launches  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `scripts/agents/test_agent_exec.sh` runs one failed-extraction case and one print-error event for each Claude task. The codex readonly dry run carries the extra arguments, and the simplify readonly dry run carries the session id.
+- `test_copy_imports_stay_in_the_copy` in `scripts/lib/test_py_root.py` uses a regular decoy copy only. Eleven `sitecustomize.py` mutations found no break that only a namespace copy catches.
+- AWS pairs (3 rounds): agent_exec 16.41 -> 14.46 CPU s, py_root 9.17 -> 6.73 CPU s, all pass.
+- Commit cbfbce6aa. Test-only change.
