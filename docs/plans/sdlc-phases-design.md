@@ -1984,3 +1984,42 @@ The proposal goes to the user as one question.
 4. Start no new step (B, full A, G or I) until that result.
 5. In the same phase, find why 22 of 29 cargo-liner-handler compactions show no contract Read, and report the cause.
    A change to the measure is a separate proposal, because the trial keeps its frozen measurement version.
+
+### Worker model and NoReload cause (Phase 29)
+
+The showrunner settled the Proposal on 2026-11-15 without a user question: keep cheap A, fix the worker-model recording now, and measure again after the workers-back notice.
+
+#### Worker model at dispatch
+
+1. `progress_history.begin_dispatch` takes a `CalledAgent` (family, model, effort).
+   The default is `CALLED_AGENT_NOT_RECORDED` (`unknown / unknown / unset`).
+2. `worker.launched_agent(row)` reads the worker's newest pane launch record.
+   It returns the launch kind as the family, the kept `--model`, and the kept effort.
+   A Codex launch keeps its effort in `model_reasoning_effort`; a Claude launch keeps no effort, so it records `unset`.
+3. A launch with no record or no kept model records `unknown / unknown / unset`.
+   The recorder never infers a model.
+4. A live check on 607 worker rows: 30 have a launch record and resolve (for example `codex / gpt-6.1-sol / high` and `claude / opus / unset`).
+   The other 577 have no launch record and stay `unknown`.
+
+#### NoReload cause
+
+The probe read the cargo-liner-handler director transcript (`fc0ab8f8`) for each `compact_boundary` from 2026-11-07T23:32:53Z to 2026-11-15T14:00:00Z.
+It counted every tool call whose input names `commands/unit/direct.md`, inside and outside phase windows.
+
+| After the boundary | Restored skill text present | Restored skill text absent | Total |
+| --- | --- | --- | --- |
+| `Read` of `direct.md` | 20 | 7 | 27 |
+| Bash read only (`cat`, `sed -n`, `head`) | 16 | 5 | 21 |
+| No read of `direct.md` | 35 | 3 | 38 |
+| Total | 71 | 15 | 86 |
+
+There are two causes:
+
+1. Claude Code puts the text of each invoked skill back after compaction, cut short.
+   With that text present, the director often continues without a reload: 35 of 71 boundaries.
+2. The director reloads with Bash in 21 of 86 boundaries.
+   The measure counts only the `Read` tool, so a Bash reload is a NoReload.
+
+So NoReload does not mean that the director worked with no contract text.
+It means that the measure did not see a `Read` of the contract.
+The trial keeps its frozen measurement version, so Phase 30 reports NoReload with this cause and does not change the measure.

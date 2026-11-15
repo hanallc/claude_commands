@@ -24,13 +24,13 @@ import subprocess
 import sys
 from typing import Literal, Protocol, cast, final
 
-from scripts.agents import detached_runs, worker_lifecycle
-from scripts.herdr import herdr_types
+from scripts.agents import detached_runs, pane_record, worker_lifecycle
+from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import atomic_file, conf, detached, unit_runs
+from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
@@ -440,6 +440,22 @@ def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: 
         raise herdr_types.HerdrFailure(str(error)) from error
 
 
+def launched_agent(row: staff.StaffRow) -> progress_history.CalledAgent:
+    """Read the family, model and effort the worker's pane launch kept; a launch with no kept model is not recorded."""
+    try:
+        entry = pane_record.launch_for_session(str(row.current_session))
+        if entry is None:
+            return progress_history.CALLED_AGENT_NOT_RECORDED
+        kind = pane_launch.saved_kind(entry if "session_id" in entry else pane_record.resume_launch(entry))
+        settings = worker_panes.kept_settings(models_registry.LaunchSettings(kind, "", "", ""),
+                                              pane_record.resume_arguments(entry))
+    except (OSError, ValueError):
+        return progress_history.CALLED_AGENT_NOT_RECORDED
+    if not settings.model:
+        return progress_history.CALLED_AGENT_NOT_RECORDED
+    return progress_history.CalledAgent(kind, settings.model, settings.effort or "unset")
+
+
 def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) -> ExitCode:
     print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
           file=sys.stderr)
@@ -515,7 +531,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         try:
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row))
         except progress_history.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):

@@ -22,7 +22,8 @@ import unittest
 from unittest.mock import call, patch
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
-from scripts.herdr import herdr_types
+from scripts.agents import pane_record
+from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts
 from scripts.herdr import test_worker_panes as pane_fixtures
 from scripts.herdr import turn_end, worker_panes
@@ -1042,6 +1043,25 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIsInstance(self.fixture.observation(opened.row), worker_panes.ClosedWorker)
                 self.assertNotIn(opened.pane, self.fixture.world.locations)
                 self.assertEqual(errors.getvalue(), "")
+
+    def test_launched_agent_reads_the_kept_launch_settings(self) -> None:
+        row = fixture_worker("called-agent", self.fixture.parent.id)
+        codex = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},
+                                   ["codex", "--model", "gpt-called", "-c", 'model_reasoning_effort="high"'],
+                                   kind="codex")
+        claude = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {},
+                                    ["claude", "--model", "opus"])
+        unnamed = pane_launch.launch("w1:p9", str(row.current_session), str(self.fixture.root), {}, ["claude"])
+        cases: list[tuple[pane_launch.CurrentLaunch | None, progress_history.CalledAgent]] = [
+            (codex, progress_history.CalledAgent("codex", "gpt-called", "high")),
+            (claude, progress_history.CalledAgent("claude", "opus", "unset")),
+            (unnamed, progress_history.CALLED_AGENT_NOT_RECORDED),
+            (None, progress_history.CALLED_AGENT_NOT_RECORDED),
+        ]
+        for entry, expected in cases:
+            with self.subTest(expected=expected, recorded=entry is not None):
+                with patch.object(pane_record, "launch_for_session", return_value=entry):
+                    self.assertEqual(worker.launched_agent(row), expected)
 
     def test_fast_dispatch_writes_reply_without_changing_the_prompt(self) -> None:
         before = self.prompt.read_bytes(), self.prompt.stat().st_mtime_ns
