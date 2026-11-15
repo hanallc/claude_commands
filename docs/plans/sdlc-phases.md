@@ -246,22 +246,18 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** every read of a phase's reservation state and the write that follows run under one phase lock (next item, sdlc 2026-11-08).
-
-**Spec:**
-- `phase_reservation.phase_lock(phase_dir)` holds the phase lock file that the baseline writer already used.
-- `committed`, `_repair_command` (its record part), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` take it around their read and write.
-- Test: a checkpoint that starts while a repair is between its read and its write keeps its pending release record. The same test fails with the lock removed.
+- `phase_reservation.phase_lock(phase_dir)` holds `phase_baseline.lock`, the lock file the baseline writer already used. `committed`, the repair record (`_repair_record`), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` hold it across their read and write.
+- `release_held` takes no lock itself; its final `clear` takes the lock and checks the pending record again.
+- The repair holds the lock during its board check, so a checkpoint can wait up to that check's timeout.
+- Test: `test_a_checkpoint_during_a_repair_keeps_its_pending_release_record` fails with the lock removed and passes with it.
 
 **Files:**
 - `scripts/direct/phase_reservation.py`
 - `scripts/direct/test_phase_reservation.py`
 
-**Workers:** `director only (no Codex workers until the workers-back notice)`.
-
-**Acceptance gate:** `test_phase_reservation.py`, `test_progress_history.py` and the style plan tests pass; basedpyright reports zero errors and zero warnings on the changed files.
+**Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
