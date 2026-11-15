@@ -26,13 +26,14 @@ Send design choices and proposed additions to the showrunner.
    - `--ask`: the question in one line, such as `alpha: keep the old key binding?`. The lists use it as the title.
    - `--context`: the unit, phase, file or screen, why you ask now, and which work waits. Keep it short.
    - `--item`: one entry for each thing to look at, such as a before and after or a link. Repeat it.
+     For an image, give the image's own link that `/show_image` prints, not the Images page link.
    - `--recommend`: the recommended choice and the reason.
    - `--choice`: one answer the user can pick, with its result. Repeat it. Each choice is a button that fills the Answer box.
+   - A question with choices needs at least two `--choice` and one `--recommend`. An open question has no `--choice`.
 3. Run the command:
    ```sh
    ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --unit <your unit staff id> --ask "<one line>" --context "<why now>" --item "<entry>" [--item "<entry>" ...] --recommend "<choice and reason>" --choice "<answer>" [--choice "<answer>" ...] [--urgency blocks]
    ```
-   `--question "<the full question>"` with `--text "<one line>"` still files a question as one text.
    Pass `--urgency blocks` when the phase needs the answer to continue.
    The command reviews the question before it adds the question to the list.
    `ask: ok` and `filed question:` mean that the command added the question.

@@ -497,9 +497,9 @@ LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
 
 
 def linked(text: str) -> str:
-    """Escape text and make each http or https address a link that opens in a new tab."""
+    """Escape text and make each http or https address a link that opens in the same tab, outside the console frame."""
     pieces = LINK.split(text)
-    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_blank" rel="noopener">{html.escape(piece)}</a>'
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_top">{html.escape(piece)}</a>'
                    if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
 
 

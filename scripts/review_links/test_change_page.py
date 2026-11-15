@@ -201,10 +201,10 @@ class ReviewTextTests(unittest.TestCase):
             + '<ul><li>Bullet</li></ul><ol start="8"><li>Eighth</li></ol>')
 
     def test_question_text_links_addresses_and_leaves_punctuation_outside(self) -> None:
-        link = '<a href="http://h:1/x?a=b&amp;c=d" target="_blank" rel="noopener">http://h:1/x?a=b&amp;c=d</a>'
+        link = '<a href="http://h:1/x?a=b&amp;c=d" target="_top">http://h:1/x?a=b&amp;c=d</a>'
         self.assertEqual(change_page.review_text_html("See http://h:1/x?a=b&c=d.\n- <b> https://e.invalid/p)", links=True),
-                         f'<p>See {link}.</p><ul><li>&lt;b&gt; <a href="https://e.invalid/p" target="_blank" '
-                         + 'rel="noopener">https://e.invalid/p</a>)</li></ul>')
+                         f'<p>See {link}.</p><ul><li>&lt;b&gt; <a href="https://e.invalid/p" target="_top">'
+                         + 'https://e.invalid/p</a>)</li></ul>')
         self.assertEqual(change_page.review_text_html("See http://h:1/x"), "<p>See http://h:1/x</p>")
 
     def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
@@ -217,7 +217,7 @@ class ReviewTextTests(unittest.TestCase):
         body, choices = change_browser.question_parts(item)
         self.assertEqual(body, '<p class="question-ask">Approve both page changes to land?</p>'
                          + '<h2>Context</h2><p>Two changes wait.</p><h2>Items</h2><ol class="question-items">'
-                         + '<li>AWS filter<br>After: <a href="http://h:1/i" target="_blank" rel="noopener">http://h:1/i</a></li>'
+                         + '<li>AWS filter<br>After: <a href="http://h:1/i" target="_top">http://h:1/i</a></li>'
                          + '<li>Memory &lt;bar&gt;</li></ol><h2>Recommended</h2><p>go for both</p>')
         self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
                          + '<button type="button" data-choice="go for both" aria-pressed="false">go for both</button>'
@@ -230,6 +230,34 @@ class ReviewTextTests(unittest.TestCase):
         del item["parts"]
         self.assertEqual(change_browser.question_parts(item), ("<p>joined</p>", ""))
 
+
+    def test_one_text_question_shows_items_choices_and_recommendation_as_sections(self) -> None:
+        body, choices = change_browser.text_sections(
+            "Check two things. 1) A <b> shows; 2) One click works. It takes a minute. "
+            + "Choices: (a) ready: launch now; (b) later: name a time. Recommended: ready, see http://h:1/i")
+        self.assertEqual(body, '<p>Check two things.</p><h2>Items</h2><ol class="question-items">'
+                         + '<li>A &lt;b&gt; shows</li><li>One click works.</li></ol><p>It takes a minute.</p>'
+                         + '<h2>Recommended</h2><p>ready, see <a href="http://h:1/i" target="_top">http://h:1/i</a></p>')
+        self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
+                         + '<button type="button" data-choice="ready: launch now" aria-pressed="false">ready: launch now</button>'
+                         + '<button type="button" data-choice="later: name a time." aria-pressed="false">later: name a time.</button>'
+                         + '</fieldset>')
+        with self.subTest("choices without numbers show as text"):
+            self.assertEqual(change_browser.text_sections("Keep it? Choices: yes = keep; no = drop. Recommended: yes"),
+                             ('<p>Keep it?</p><h2>Choices</h2><p>yes = keep; no = drop.</p>'
+                              + '<h2>Recommended</h2><p>yes</p>', ""))
+        with self.subTest("numbers out of order are not items"):
+            self.assertEqual(change_browser.text_sections("Phase 2. Then 1) only one item."),
+                             ("<p>Phase 2. Then 1) only one item.</p>", ""))
+        with self.subTest("lines: a blank line ends the last item"):
+            self.assertEqual(change_browser.text_sections("Pick one.\n\nChoices:\n1. Add it. Then measure.\n2. Keep it.\n\nMeanwhile I port."),
+                             ('<p>Pick one.</p><p>Meanwhile I port.</p>',
+                              '<fieldset class="question-choices"><legend>Choices</legend>'
+                              + '<button type="button" data-choice="Add it. Then measure." aria-pressed="false">Add it. Then measure.</button>'
+                              + '<button type="button" data-choice="Keep it." aria-pressed="false">Keep it.</button></fieldset>'))
+        with self.subTest("1. items"):
+            self.assertEqual(change_browser.text_sections("Steps: 1. open 2. close")[0],
+                             '<p>Steps:</p><h2>Items</h2><ol class="question-items"><li>open</li><li>close</li></ol>')
 
 class ChangePageTests(unittest.TestCase):
     temporary: Path = Path()

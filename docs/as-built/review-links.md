@@ -218,8 +218,15 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 - **Items** as a numbered list, with each line of an item on its own line;
 - **Recommended**;
 - **Choices** as buttons above the Answer box. A choice fills the Answer box and marks itself; the user can add words, then saves.
-A question without parts shows its full text by lines, and `- ` or `1. ` lines show as lists.
-In all question text, each `http` or `https` address is a link that opens in a new tab.
+A question stored as one text, from before the parts form, shows in sections too:
+- the text up to its first numbered item;
+- **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
+- the text after the first sentence of the last item, as its own paragraph;
+- **Choices**: the text after `Choices:`. Numbered choices show as buttons; other choice text shows as text;
+- **Recommended**: the text after `Recommended:`.
+A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
+In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
+A right click can open it in a new tab.
 The field label stays **Answer**, and its action stays **Save answer**.
 An **Owner unavailable** card shows the question and `No showrunner owns this question.`
 It has no answer form, and the server refuses an answer.
@@ -260,7 +267,9 @@ A showrunner or unit registers each image with one command:
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
-- It prints the image link and the console link `http://<host>:<server_port>/console/?page=images`.
+- It prints the image file link and the image's own console link:
+  `http://<host>:<server_port>/console/?page=images&at.images=%2Fconsole%2Fimages.html%23image%3D<id>`.
+  `console.place_query` builds the query from the console's place key.
 - The server serves the copy, so the user never needs the source path.
 
 Each card shows, in this order:
@@ -275,6 +284,7 @@ Each card shows, in this order:
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
+A page URL with `#image=<id>` opens at that card. When the card is outside the default period, the menu changes to **All**.
 
 A group is a run of shown cards in a row with the same owner.
 A panel at the top left of the images pane lists one row per group, in three columns: owner name, count and the time of its first image.

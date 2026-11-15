@@ -214,24 +214,95 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 {change_page.change_details(row, shown)}</section>'''
 
 
+# A question stored as one text marks its parts inline: numbered items, then "Choices:" and "Recommended:".
+CHOICES_MARK = re.compile(r"(?:^|(?<=\s))Choices:\s")
+RECOMMEND_MARK = re.compile(r"(?:^|(?<=\s))Recommended:\s")
+ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re.compile(r"(?<![\w.])(\d+)\.\s"),
+              re.compile(r"\(([a-z])\)\s"))
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+BLANK_LINE = re.compile(r"\n\s*\n")
+
+
+def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
+    found = mark.search(text)
+    return (text, "") if found is None else (text[:found.start()].strip(), text[found.end():].strip())
+
+
+def numbered_run(text: str) -> tuple[str, list[str], str]:
+    """Split the text at its first run of two or more items marked 1) 2), 1. 2., (1) (2) or (a) (b).
+
+    Return the text before the run, the items and the text after a blank line in the last item."""
+    best: list[re.Match[str]] = []
+    for style in ITEM_MARKS:
+        run: list[re.Match[str]] = []
+        for mark in style.finditer(text):
+            value = mark[1]
+            if not run and value in ("1", "a"):
+                run.append(mark)
+            elif run and value == (str(int(run[-1][1]) + 1) if value.isdigit() else chr(ord(run[-1][1]) + 1)):
+                run.append(mark)
+        if len(run) >= 2 and (not best or run[0].start() < best[0].start()):
+            best = run
+    if not best:
+        return text, [], ""
+    ends = [mark.start() for mark in best[1:]] + [len(text)]
+    items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
+    last = BLANK_LINE.split(items[-1], maxsplit=1)
+    items[-1] = last[0]
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+
+
+def item_list(items: list[str]) -> str:
+    return '<h2>Items</h2><ol class="question-items">' + "".join(
+        "<li>" + "<br>".join(change_page.linked(line) for line in entry.splitlines()) + "</li>" for entry in items) + "</ol>"
+
+
+def choice_buttons(choices: list[str]) -> str:
+    buttons = "".join(f'<button type="button" data-choice="{html.escape(choice, quote=True)}" aria-pressed="false">'
+                      + f'{html.escape(choice)}</button>' for choice in choices)
+    return f'<fieldset class="question-choices"><legend>Choices</legend>{buttons}</fieldset>' if buttons else ""
+
+
+def text_sections(text: str) -> tuple[str, str]:
+    """Show a question stored as one text in sections: the text, its items, its choices and the recommendation."""
+    rest, recommend = split_at(text, RECOMMEND_MARK)
+    lead, choice_text = split_at(rest, CHOICES_MARK)
+    lead, items, trailing = numbered_run(lead)
+    if items and "\n" not in text:
+        # In one paragraph, the text after the last item's first sentence is not part of that item.
+        last = SENTENCE_END.split(items[-1], maxsplit=1)
+        items[-1], trailing = last[0], last[1] if len(last) > 1 else ""
+    choice_lead, choices, choice_trailing = numbered_run(choice_text)
+    if not items and not choice_text and not recommend:
+        return change_page.review_text_html(text, links=True), ""
+    body = change_page.review_text_html(lead, links=True) if lead else ""
+    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, links=True) if trailing else "")
+    # Only numbered choices become buttons; other choice text shows as text.
+    if choice_text and not choices:
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, links=True)
+    elif choice_lead:
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, links=True)
+    if choice_trailing:
+        body += change_page.review_text_html(choice_trailing, links=True)
+    if recommend:
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, links=True)
+    return body, choice_buttons(choices)
+
+
 def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]:
-    """Return the question body and its choice buttons; a question without parts shows its text by lines."""
+    """Return the question body and its choice buttons; a question stored as one text shows in sections."""
     if "parts" not in item:
-        return change_page.review_text_html(item.get("question", ""), links=True), ""
+        return text_sections(item.get("question", ""))
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
     body = "" if same else f'<p class="question-ask">{change_page.linked(parts["ask"])}</p>'
     if parts["context"].strip():
         body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], links=True)
     if parts["items"]:
-        body += '<h2>Items</h2><ol class="question-items">' + "".join(
-            "<li>" + "<br>".join(change_page.linked(line) for line in entry.splitlines()) + "</li>"
-            for entry in parts["items"]) + "</ol>"
+        body += item_list(parts["items"])
     if parts["recommend"].strip():
         body += '<h2>Recommended</h2>' + change_page.review_text_html(parts["recommend"], links=True)
-    choices = "".join(f'<button type="button" data-choice="{html.escape(choice, quote=True)}" aria-pressed="false">'
-                      + f'{html.escape(choice)}</button>' for choice in parts["choices"])
-    return body, (f'<fieldset class="question-choices"><legend>Choices</legend>{choices}</fieldset>' if choices else "")
+    return body, choice_buttons(parts["choices"])
 
 
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
@@ -331,7 +402,7 @@ section+section{border:0;margin:0;padding:0}
 .question-ask{font-weight:600}.question-items li{margin:8px 0}
 .question-choices{display:flex;flex-wrap:wrap;gap:8px;border:0;margin:16px 0;padding:0}
 .question-choices legend{padding:0;margin-bottom:8px;font-weight:600}
-.question-choices button[aria-pressed="true"]{outline:2px solid Highlight;outline-offset:2px}
+.question-choices button{text-align:left}.question-choices button[aria-pressed="true"]{outline:2px solid Highlight;outline-offset:2px}
 .navigation{padding:12px 0;background:Canvas}.navigation:empty{display:none}button{min-height:44px}
 </style>"""
 

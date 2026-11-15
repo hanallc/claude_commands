@@ -351,5 +351,6 @@ class RegistrationFixture(unittest.TestCase):
         with (mock.patch.dict(os.environ, self.env), production_paths(self.env),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
               redirect_stdout(io.StringIO()) as output):
-            registration.ask(read_production("example"), text, question, unit, registration.Ranking())
+            parts = registration.QuestionParts(ask=question, context="", items=[], recommend="", choices=[])
+            registration.ask(read_production("example"), text, parts, unit, registration.Ranking())
         return output.getvalue()
