@@ -41,6 +41,31 @@ class StoreTests(unittest.TestCase):
             with self.subTest(start=start):
                 self.assertEqual(list(store.locked_rows(path, start)), expected)
 
+    def test_rows_in_order_start_at_the_first_reached_row_and_skip_rows_that_cannot_match(self) -> None:
+        path = self.root / "history.jsonl"
+        self.assertEqual(list(store.locked_rows_in_order(path, lambda _row: True, lambda _line: True)), [])
+        path.parent.mkdir(parents=True)
+        rows = [{"at": at, "name": "even" if at % 2 == 0 else "odd"} for at in range(1, 30)]
+        _ = path.write_bytes(b"".join(json.dumps(row).encode() + b"\n" for row in rows) + b'{"at": 30')
+
+        def ats(first: int, name: bytes = b"") -> list[object]:
+            return [row["at"] for row in store.locked_rows_in_order(
+                path, lambda row: cast(int, row["at"]) >= first, lambda line: name in line)]
+
+        for first in (0, 1, 2, 15, 29, 30):
+            with self.subTest(first=first):
+                self.assertEqual(ats(first), list(range(max(first, 1), 30)))
+        self.assertEqual(ats(20, b'"even"'), [20, 22, 24, 26, 28])
+
+    def test_rows_in_order_count_an_unreadable_row_as_reached(self) -> None:
+        path = self.root / "history.jsonl"
+        path.parent.mkdir(parents=True)
+        # The first probe lands on the damaged row, so the search keeps it and the row after it.
+        _ = path.write_bytes(b'{"at": 1}\n{"at": 2}\nbroken\n{"at": 3}\n{"at": 9}\n')
+        found = [row["at"] for row in store.locked_rows_in_order(
+            path, lambda row: cast(int, row["at"]) >= 5, lambda _line: True)]
+        self.assertEqual(found, [3, 9])
+
     def test_locked_rows_wait_for_an_appender_then_release_before_decoding(self) -> None:
         path = self.root / "history.jsonl"
         path.parent.mkdir(parents=True)
