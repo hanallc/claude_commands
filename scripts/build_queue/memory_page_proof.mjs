@@ -265,6 +265,8 @@ try {
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
+              // A long detail wraps at phone width, so compare the first text lines, not the boxes.
+              const firstLine = element => { const range=document.createRange(); range.selectNodeContents(element); return range.getClientRects()[0]; };
               const gauges = ['some','full'].map(key => {
                 const value=document.querySelector('#gv-'+key), limit=document.querySelector('#limit-'+key);
                 return {value:rect(value), limit:rect(limit), text:value.textContent, nowrap:getComputedStyle(value).whiteSpace};
@@ -320,7 +322,7 @@ try {
                 swapRows:swap.length, swapText:swap.map(e=>e.textContent),
                 swapBytes:swap.filter(e=>e.dataset.bytes).map(e=>Number(e.dataset.bytes)),
                 swapContrast:small?contrast(getComputedStyle(small).color,color('--card')):null,
-                swapBaseline:small?rect(small).bottom-rect(small.parentElement.querySelector('.name')).bottom:0,
+                swapBaseline:small?firstLine(small).bottom-firstLine(small.parentElement.querySelector('.name')).bottom:0,
                 gauges, lower, values,
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
