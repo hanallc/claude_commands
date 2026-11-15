@@ -157,6 +157,14 @@ def room_terms(check: admission_records.RoomCheck, room: admission_records.Memor
     return RoomTerms(room.available, room.safety, room.agent_swap_demand, reserved, max(0, ahead))
 
 
+def head_room_values(check: admission_records.RoomCheck, room: admission_records.MemoryRoom) -> tuple[tuple[str, int], ...]:
+    """Use the legend names for the amounts in the room check."""
+    split = room_terms(check, room)
+    values = (("Free RAM", split.available), ("Safety net", split.safety),
+              ("Swap coming back", split.swapped), ("Build reserved", split.reserved))
+    return values + ((("Held for earlier steps", split.ahead),) if split.ahead else ())
+
+
 def head_room_text(check: admission_records.RoomCheck,
                    room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> str:
     """Show the head's room check with the same terms as the cap line, so it never reads as fitting."""

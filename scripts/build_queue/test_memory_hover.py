@@ -458,9 +458,9 @@ class MemoryHoverTests(unittest.TestCase):
         priority = "queue priority: port (the user's bump)"
         swap_note = ("Other programs have 2.0 GiB of memory in swap. "
                      "It comes back into RAM when they run, so the queue holds RAM for it.")
-        room = {"rows": [{"label": "free RAM", "gib": 10.5}, {"label": "− safety net", "gib": 3.0},
-                         {"label": "− swap coming back", "gib": 2.0}, {"label": "− build reserved", "gib": 6.0},
-                         {"label": "= free", "gib": 0.0}, {"label": "needs", "gib": 1.9}], "note": swap_note}
+        room: memory_feed.HeadRoom = {"rows": [{"label": "Free RAM", "gib": 10.5}, {"label": "− Safety net", "gib": 3.0},
+                         {"label": "− Swap coming back", "gib": 2.0}, {"label": "− Build reserved", "gib": 6.0},
+                         {"label": "= Free", "gib": 0.0}, {"label": "need", "gib": 1.9}], "note": swap_note}
         data = {"read_at": 200, "waiters": [
             {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
              "reason": "free memory", "head_room": room, "priority_text": priority, "runs_on": "natedev only"},
@@ -470,9 +470,9 @@ class MemoryHoverTests(unittest.TestCase):
             {"name": "fps nextest", "unit": "fps", "need": 2, "since": 100,
              "reason": "estimate expired"}]}
         expected = ("\n".join((
-            "waiting: 2 min", "reason: free memory", "can run on: natedev only", "First in line", "free RAM: 10.5 GiB",
-            "− safety net: 3.0 GiB", "− swap coming back: 2.0 GiB", "− build reserved: 6.0 GiB", "= free: 0.0 GiB",
-            "needs: 1.9 GiB", swap_note, priority)),
+            "waiting: 2 min", "reason: free memory", "can run on: natedev only", "First in line", "Free RAM: 10.5 GiB",
+            "− Safety net: 3.0 GiB", "− Swap coming back: 2.0 GiB", "− Build reserved: 6.0 GiB", "= Free: 0.0 GiB",
+            "need: 1.9 GiB", swap_note, priority)),
             "waiting: 2 min\nreason: behind #1: the first step in line gets memory first\ncan run on: natedev or Mac",
             "waiting: 2 min\nreason: estimate expired")
         for index, body in enumerate(expected):
@@ -485,6 +485,16 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
+            self.assertNotIn(removed, page)
+        ram = {**RAM_FIXTURE, "available_bytes": int(10.5 * GIB), "safety_target_bytes": 3 * GIB,
+               "swap_target_bytes": 2 * GIB, "build_target_bytes": 6 * GIB, "room_bytes": 0}
+        room_tip = str(self.page_expression("tipText('room', data)[1]", {**data, "ram": ram}))
+        head_tip = str(self.page_expression("tipText('wait:0', data)[1]", data))
+        for row in room["rows"][:4]:
+            term = f"{str(row['label']).removeprefix('− ')}: {row['gib']:.1f} GiB"
+            self.assertIn(term, room_tip)
+            self.assertIn(term, head_tip)
+        for removed in ("admission-terms", "admission-check-rows", "renderAdmissionRequirements"):
             self.assertNotIn(removed, page)
         for unmatched in ("", priority):
             with self.subTest(unmatched=unmatched):
@@ -622,15 +632,15 @@ function fitLabels() {}
             "g-free": ["Free RAM · 30.0 GiB", "RAM that no program holds. It includes cache that Linux can take back.\n" +
                        "The queue divides it into build reserved, free and system reserved."],
             "reserved": ["Build reserved · 6.0 GiB", "RAM the queue holds for running builds.\n" +
-                         "The queue predicts the peak of each build, and the build grows into it."],
+                         "The queue predicts the peak of each build, and the build grows into it.\nBuild reserved: 6.0 GiB."],
             "room": ["Free · 18.0 GiB", "RAM where the next waiting step can start.\nFree RAM: 30.0 GiB.\n" +
                      "− Safety net: 4.0 GiB.\n− Swap coming back: 2.0 GiB.\n− Build reserved: 6.0 GiB."],
             "system": ["System reserved · 6.0 GiB",
                        "RAM the queue never gives to builds.\nSafety net: 4.0 GiB.\nSwap coming back: 2.0 GiB."],
             "safety": ["Safety net · 4.0 GiB",
-                       "RAM the queue always leaves free, so the machine does not run out of memory.\nA fixed setting: 4.0 GiB."],
+                       "RAM the queue always leaves free, so the machine does not run out of memory.\nSafety net: 4.0 GiB."],
             "swap": ["Swap coming back · 2.0 GiB", "Empty RAM the queue holds for memory in swap, mostly agents' memory.\n" +
-                     "That memory can come back into RAM at any time."],
+                     "That memory can come back into RAM at any time.\nSwap coming back: 2.0 GiB."],
             "g-else": ["Everything else · 27.0 GiB",
                        "RAM that the desktop, agents, other programs, the kernel and the cache use."],
             "desktop": ["Desktop · 3.0 GiB",
@@ -660,6 +670,17 @@ function fitLabels() {}
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
     def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
+        for description, needed, covered, expected in (
+                ("Running builds grow into it.", 9, 5,
+                 "Running builds grow into it. Needs 9.0 GiB; free RAM covers 5.0 GiB."),
+                ("A fixed setting.", 3, 2, "A fixed setting. Needs 3.0 GiB; free RAM covers 2.0 GiB."),
+                ("Empty now; held for swapped memory.", 6, 1,
+                 "Empty now; held for swapped memory. Needs 6.0 GiB; free RAM covers 1.0 GiB."),
+                ("Running builds grow into it.", 9, 9, "Running builds grow into it.")):
+            with self.subTest(description=description, covered=covered):
+                shown = self.page_expression("reserveDescription(data.description, data.needed, data.covered)",
+                    {"description": description, "needed": needed * GIB, "covered": covered * GIB})
+                self.assertEqual(shown, expected)
         ram = {**RAM_FIXTURE, "available_bytes": 5 * GIB, "room_bytes": 0, "shortfall_bytes": 3 * GIB,
                "swap_covered_bytes": GIB, "build_covered_bytes": 0, "swap_missing_bytes": GIB,
                "build_missing_bytes": 6 * GIB, "rust_analyzer_bytes": 0, "sccache_bytes": 20 * MIB,
@@ -670,9 +691,10 @@ function fitLabels() {}
             "[tipText('shortfall', data), tipText('reserved', data), tipText('kernel', data), tipText('tools', data)," +
             " ramAmount(0), tipText('unattributed', data), tipText('system', data)]", {"ram": ram}))
         self.assertEqual(tips[0], ["Shortfall · 3.0 GiB",
-                                   "Reserves that free RAM does not cover.\nSwap coming back: 1.0 GiB.\nBuild reserved: 6.0 GiB."])
+                                   "Reserves that free RAM does not cover.\nSwap coming back: 1.0 GiB not covered.\nBuild reserved: 6.0 GiB not covered."])
         self.assertEqual(tips[1], ["Build reserved · 0.0 GiB", "RAM the queue holds for running builds.\n" +
                                    "The queue predicts the peak of each build, and the build grows into it.\n" +
+                                   "Build reserved: 6.0 GiB.\n" +
                                    "Free RAM does not cover 6.0 GiB of it."])
         self.assertEqual(tips[2], ["Kernel · unavailable",
                                    "The latest reading is unavailable.\nThis amount is unknown."])

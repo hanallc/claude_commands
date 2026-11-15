@@ -991,6 +991,61 @@ try {
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
+            for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
+              await show(readings[name]);
+              const headProof=await evaluate(`(() => {
+                const rows=latest.waiters[0].head_room.rows.filter(row=>row.label!=='need'&&!row.label.includes('Held for earlier steps'));
+                const group=document.querySelector('#v-g-free').closest('.legend-group');
+                const legend=Object.fromEntries([...group.querySelectorAll('.row,.group-head')].map(row=>[
+                  row.querySelector('.name').textContent,{
+                    value:row.querySelector('.v').textContent,note:row.querySelector('.note')?.textContent||''}]));
+                return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
+                  values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
+                  hover:tipText('wait:0',latest)[1],room:tipText('room',latest).join('\\n'),legend,
+                  covered:document.querySelector('#v-reserved').textContent,
+                  free:document.querySelector('#v-g-free').textContent,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              assert.ok(headProof.removed,'The removed Head line returns.');
+              for(const [label,value] of Object.entries(headProof.values)) {
+                assert.ok(headProof.hover.includes(label+': '+value),'The head tooltip omits the term: '+label);
+                const row=headProof.legend[label];
+                assert.ok(row,'The legend omits the head term: '+label);
+                assert.ok(row.value===value||row.note.includes('Needs '+value+';'),
+                  'The legend amount differs from the head tooltip: '+label);
+                assert.ok(headProof.room.includes(label+(label==='Free'?' · ':': ')+value),
+                  'The room tooltip differs from the head tooltip: '+label);
+              }
+              assert.equal(headProof.values['Free RAM'],headProof.free);
+              assert.equal(headProof.values['Safety net'],(readings[name].ram.safety_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Swap coming back'],(readings[name].ram.swap_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Build reserved'],(readings[name].ram.build_target_bytes/gib).toFixed(1)+' GiB');
+              assert.notEqual(headProof.values['Build reserved'],headProof.covered,'The fixture has no uncovered build reserve.');
+              if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
+              assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
+              if(name==='head_memory'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+                  const legend=document.querySelector('.legend-box').getBoundingClientRect();
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
+                  showTip('wait:0',card.right-140,row.top);
+                  placeTip(card.right-140,legend.top+document.querySelector('#tip').offsetHeight+50);
+                  const tip=document.querySelector('#tip').getBoundingClientRect();
+                  const groups=[...document.querySelectorAll('.legend-group')];
+                  if(groups.some(group=>group.getBoundingClientRect().right>tip.left)) {
+                    throw new Error('The head tooltip covers a legend group.');
+                  }
+                  return {x:card.left,y:card.top+scrollY,width:card.width,
+                    height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'head-tooltip-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              }
+              proof[name]=headProof;
+            }
+            await show(base);
+            const reserveNotes=await evaluate(`['reserved-note','safety-note','swap-note'].map(id=>document.getElementById(id).textContent)`);
+            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','Empty now; held for swapped memory.']);
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -1505,9 +1560,9 @@ try {
           const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
             pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
           const priority="queue priority: research (the user's bump)";
-          const room={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
-            {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
-            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],
+          const room={rows:[{label:'Free RAM',gib:28.4},{label:'− Safety net',gib:3.0},
+            {label:'− Swap coming back',gib:9.8},{label:'− Build reserved',gib:8.5},
+            {label:'= Free',gib:7.1},{label:'need',gib:16.3}],
             note:'Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
@@ -1611,8 +1666,8 @@ try {
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{rows:[{label:'free RAM',gib:8.5},{label:'− safety net',gib:3.0},
-              {label:'− swap coming back',gib:6.0},{label:'= free',gib:0.0},{label:'needs',gib:1.9}],note:''}}];
+            head_room:{rows:[{label:'Free RAM',gib:8.5},{label:'− Safety net',gib:3.0},
+              {label:'− Swap coming back',gib:6.0},{label:'= Free',gib:0.0},{label:'need',gib:1.9}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
