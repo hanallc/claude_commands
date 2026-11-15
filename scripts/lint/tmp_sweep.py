@@ -150,6 +150,8 @@ WORKS_IN = "works in it"
 MAPS_FILE = "maps a file in it"
 HOLDS_FILE = "holds a file open in it"
 WRITES_FILE = "holds a file open for writing in it"
+# The kept reason when the Cargo output guard keeps a folder's external output.
+CARGO_OUTPUT_KEPT = "its Cargo output is kept"
 # The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
@@ -1182,6 +1184,10 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
         try:
             path = Path(entry.path)
             scratch.remove_marked(path, lambda folder: delete_tree(str(folder)), scratch_settings=scratch_settings)
+        except scratch.CargoOutputKept as error:
+            print(f"tmp sweep: keep {entry.path}: {error}")
+            result.keep(entry.path, CARGO_OUTPUT_KEPT)
+            return False
         except OSError as error:
             if os.path.lexists(entry.path):
                 result.failed.append(FailedEntry(path=entry.path, error=str(error)))
