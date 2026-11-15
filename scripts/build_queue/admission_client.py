@@ -1221,7 +1221,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             local=wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call,
                 local.test_width, local.fresh_test, local.token_back_at), prerequisite=prerequisite,
             purpose=placement.SpeculativeCopy(args.parent_episode, args.call_started)
-                if args.parent_episode else placement.NormalStep())
+                if args.parent_episode else placement.NormalStep(),
+            route=target_config.step_route(local=args.local_only, mac_only=args.mac_only, target=args.target,
+                                           writes_tree=args.writes_tree))
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:

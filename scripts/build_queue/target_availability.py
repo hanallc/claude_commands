@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, TypedDict, final
 
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalRequired, Routing, SshTarget
+from scripts.build_targets.target_config import (LOCAL_CALLER, ConfigError, ExcludedTarget, LocalRequired, MacOnly,
+    PinnedTarget, SshTarget, StepRoute)
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
@@ -92,8 +93,10 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 
 
-# The first line of a step's route: a step the run pins to natedev, or a step either host can take.
+# The first line of a step's route: a step the run pins to natedev, a step only the Mac takes,
+# or a step either host can take.
 LOCAL_LINE = "Runs on natedev because the run asks for it"
+MAC_ONLY_LINE = "Runs only on the Mac"
 EITHER_LINE = "Runs on the Mac or natedev, whichever is available first"
 
 
@@ -115,14 +118,19 @@ class MacRoutes:
         self.policies: dict[tuple[str, str | PackageNotRecorded, str], str] = {}
         self.scopes: dict[str, ClaimScope] = {}
 
-    def line(self, step: str, folder: str, package: str | PackageNotRecorded, routing: Routing) -> str:
+    def line(self, step: str, folder: str, package: str | PackageNotRecorded, route: StepRoute) -> str:
         mac = self.mac
+        if isinstance(route, LocalRequired):
+            return LOCAL_LINE if route == LOCAL_CALLER else "Runs on natedev: " + route.reason
+        if isinstance(route, PinnedTarget) and not (isinstance(mac, targets.TargetSnapshot)
+                                                    and route.target == mac.target.name):
+            return "Runs only on " + route.target
         if isinstance(mac, NoMacTarget):
             return ""
-        if isinstance(routing, LocalRequired):
-            return LOCAL_LINE
         if isinstance(mac, SnapshotsUnreadable):
             return "Mac: state unreadable, " + mac.reason
+        if isinstance(route, (MacOnly, PinnedTarget)):
+            return "\n".join(filter(None, (MAC_ONLY_LINE, self.state_line(mac, folder))))
         kind = build_targets.recorded_step_kind(step)
         if isinstance(kind, build_targets.KindNotOffloaded):
             return "Mac: kind not offloaded"
@@ -186,6 +194,8 @@ class MacRoutes:
         """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
         from scripts.mac_test import mac_test
 
+        # Cost: target_claim_scope runs git once for each waiting or running folder in each page reading,
+        # and only while the Mac runs a claim. self.scopes keeps one result for each folder in the reading.
         if folder not in self.scopes:
             self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
         scope = self.scopes[folder]

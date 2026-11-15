@@ -1530,7 +1530,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
                      "queued": True, "keep_text": run_keep_text(hold, steps_by_owner.get(hold.memory.owner, ())), "group": "", "ci": False, "parts": [],
-                     "mac_text": routes.line(step.step, step.folder, step.package, step.routing) if step is not None and not ci_label else ""})
+                     "mac_text": routes.line(step.step, step.folder, step.package, step.route) if step is not None and not ci_label else ""})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
     for entry in explanation.running:
@@ -1624,7 +1624,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "need": gib(waiter.need), "since": waiter.since,
                         "reason": reason,
                         "fits": need <= captured.signed_room,
-                        "mac_text": "" if ci_label else routes.line(waiter.step, waiter.folder, waiter.package, waiter.routing)})
+                        "mac_text": "" if ci_label else routes.line(waiter.step, waiter.folder, waiter.package, waiter.route)})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_reading = queue_view.read_mac_builds()
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)

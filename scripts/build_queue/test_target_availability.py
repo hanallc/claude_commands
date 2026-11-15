@@ -9,8 +9,8 @@ from unittest import mock
 from scripts.build_queue import target_availability
 from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import (ANY_ELIGIBLE_TARGET as ANY, LOCAL_CALLER, ConfigError,
-                                                 ExcludedTarget, LocalTarget, SshTarget)
+from scripts.build_targets.target_config import (ANY_ELIGIBLE_TARGET as ANY, LOCAL_CALLER, MAC_ONLY, WRITES_TREE,
+                                                 ConfigError, ExcludedTarget, LocalTarget, PinnedTarget, SshTarget)
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.message import unit_labels
 
@@ -173,6 +173,27 @@ class MacRouteTests(unittest.TestCase):
         unreadable = target_availability.MacRoutes(target_availability.SnapshotsUnreadable("targets.conf: missing"), {}, UTC)
         self.assertEqual(unreadable.line("nextest", "/r", "p", LOCAL_CALLER),
                          "Runs on natedev because the run asks for it")
+
+    def test_a_tree_write_names_its_reason(self) -> None:
+        self.assertEqual(self.routes(targets.Free()).line("fmt", "/fixture/hana", "hana", WRITES_TREE),
+                         "Runs on natedev: step writes the tree")
+
+    def test_a_mac_only_or_mac_pinned_step_runs_only_on_the_mac_and_names_what_holds_it(self) -> None:
+        for route in (MAC_ONLY, PinnedTarget("mac")):
+            with self.subTest(route=route), \
+                 mock.patch.object(build_targets, "step_policy", side_effect=AssertionError("no policy read")):
+                self.assertEqual(self.routes(targets.Free()).line("nextest", "/fixture/hana", "hana", route),
+                                 "Runs only on the Mac")
+                self.assertEqual(self.routes(MAC_BLOCK).line("build", "/fixture/hana", "hana", route),
+                                 target_availability.MAC_ONLY_LINE
+                                 + "\nMac: blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC")
+
+    def test_a_step_pinned_to_another_target_names_that_target(self) -> None:
+        absent = target_availability.MacRoutes((snapshot(NATEDEV, targets.Free()),), {}, UTC)
+        for routes in (self.routes(MAC_BLOCK), absent):
+            with mock.patch.object(build_targets, "step_policy", side_effect=AssertionError("no policy read")):
+                self.assertEqual(routes.line("nextest", "/fixture/hana", "hana", PinnedTarget("natedev")),
+                                 "Runs only on natedev")
 
     def test_kind_and_routing_rule_come_before_target_state(self) -> None:
         routes = self.routes(MAC_BLOCK)

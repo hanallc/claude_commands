@@ -2224,7 +2224,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            project=step_project(row.get("repository_name", "")),
                            run=row.get("build_run", NoLiveBuildRun()),
                            package=row["package"] if "package" in row else PackageNotRecorded(),
-                           routing=records.waiter_routing(row))
+                           route=records.waiter_route(row))
         waiting.append(step)
         if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
@@ -2549,8 +2549,8 @@ def build_queue_inputs(ordered: list[tuple[Path, RankedWaiter]],
                                    unit=identity.get("unit", ""), pid=row["pid"],
                                    project=step_project(row.get("queue_waiter", {}).get("repository_name", ""), row["repo"]),
                                    package=row["package"] if "package" in row else PackageNotRecorded(),
-                                   routing=(records.waiter_routing(row["queue_waiter"]) if "queue_waiter" in row
-                                            else ANY_ELIGIBLE_TARGET)))
+                                   route=(records.waiter_route(row["queue_waiter"]) if "queue_waiter" in row
+                                          else ANY_ELIGIBLE_TARGET)))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value,
                    pid=value.pid if isinstance(value, CompilerServiceMemory) else PidNotRecorded())

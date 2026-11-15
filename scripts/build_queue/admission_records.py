@@ -20,7 +20,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
-from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LocalRequired, Routing
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -552,8 +552,8 @@ class Waiter(TypedDict):
     need_runs: NotRequired[int]
     need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
-    # Present when the run pins the step to natedev (verify.sh --local).
-    local_reason: NotRequired[str]
+    # Where the caller lets the step run; absent means any eligible target.
+    route: NotRequired[StepRoute]
 
 
 @dataclass(frozen=True)
@@ -895,7 +895,7 @@ class WaitingStep:
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
-    routing: Routing = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
+    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -914,7 +914,7 @@ class RunningStep:
     execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
-    routing: Routing = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
+    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1367,9 +1367,9 @@ def pressure_text(pressure: MemoryPressure) -> str:
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
-def waiter_routing(row: Waiter) -> Routing:
-    """A step the run pins to natedev, or a step the queue can place on any eligible target."""
-    return LocalRequired(row["local_reason"]) if "local_reason" in row else ANY_ELIGIBLE_TARGET
+def waiter_route(row: Waiter) -> StepRoute:
+    """The route the placement request carried, or any eligible target for a row without one."""
+    return row.get("route", ANY_ELIGIBLE_TARGET)
 
 
 def stored_waiter(row: Waiter) -> Waiter:

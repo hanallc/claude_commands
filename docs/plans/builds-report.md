@@ -1656,16 +1656,19 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 
 #### As-built
 
-- `target_config.LOCAL_CALLER`: the `LocalRequired` routing that `verify.sh --local` sends. `admission_client` uses it for `--local-only`.
-- `admission_service._placement_row`: a step with the `LOCAL_CALLER` fixed Mac exclusion writes `local_reason` into its waiter record.
-- `admission_records.waiter_routing`: reads `local_reason` back. `WaitingStep` and `RunningStep` carry `routing`, and `memory_admit` fills it from the waiter record.
-- `target_availability.MacRoutes.line` takes the routing:
-  - A `LocalRequired` step reads "Runs on natedev because the run asks for it", with no Mac line.
+- `target_config.StepRoute`: where the caller lets a step run. It is `AnyEligibleTarget`, `LocalRequired` (`LOCAL_CALLER` for `verify.sh --local`, `WRITES_TREE` for a step that writes the tree), `MacOnly` or `PinnedTarget(target)`.
+- `target_config.step_route` chooses the route in the placement client's order: a tree write, then `--local`, then `--mac-only`, then `--target`.
+- `admission_wire.PlacementRequest.route` carries the route. `admission_client` sets it from its flags. An older request without it reads as any eligible target.
+- `admission_service._placement_row` stores the route in the waiter record. `admission_records.waiter_route` reads it back. `WaitingStep` and `RunningStep` carry `route`, and `memory_admit` fills it from the waiter record.
+- `target_availability.MacRoutes.line` takes the route:
+  - `LOCAL_CALLER` reads "Runs on natedev because the run asks for it". Another `LocalRequired` reads "Runs on natedev: <reason>". Neither adds a Mac line.
+  - A Mac-only step, or a step pinned to the Mac, reads "Runs only on the Mac", then the Mac state line.
+  - A step pinned to another target reads "Runs only on <target>".
   - A step either host can take reads "Runs on the Mac or natedev, whichever is available first". A second line names what keeps its repository off the Mac: a block, an unreachable or unreadable Mac, or a live claim. A Mac free for this repository adds no line.
-  - A busy Mac names only the live claims of this step's repository. A whole-Mac claim matches every repository. A repository matches by key, else by name.
+  - A busy Mac names only the live claims of this step's repository. A whole-Mac claim matches every repository. A repository matches by key, else by name. The repository lookup runs git once for each folder in a page reading, only while the Mac runs a claim.
 - `memory_live.html`: a waiting step's tooltip puts Needs, Waiting and Reason on their own lines (user feedback on the proof shots, 2026-11-15).
-- `memory_feed` passes each step's routing to the line.
-- Tests: `test_target_availability` (repository filter, whole-Mac claim, local step) and `test_placement` (a local step keeps its routing in the waiting and running views).
+- `memory_feed` passes each step's route to the line.
+- Tests: `test_target_availability` (repository filter, whole-Mac claim, local, tree-write, Mac-only and pinned steps), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`.
 
 ### Phases 95–99 — The Disks page · status: planned
