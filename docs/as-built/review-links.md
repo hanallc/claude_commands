@@ -280,12 +280,17 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 - **Recommended**;
 - **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
 A question stored as one text, from before the parts form, shows in sections too:
-- the text up to its first numbered item;
-- **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
-- the text after the first sentence of the last item, as its own paragraph;
-- **Choices**: the text after `Choices:`. Numbered choices show as radio items; other choice text shows as text;
-- **Recommended**: the text after `Recommended:`.
-A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
+
+1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
+2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
+3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+4. A raw question stored on one line shows each context sentence as a separate paragraph.
+5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
+6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
+7. Reviewed text can end with two or more labeled choice paragraphs. These paragraphs use the same radio items.
+8. Choices without clear labels or numbers remain separate text items. The page does not invent answer values.
+9. **Recommended** uses explicit `Recommended:` text. A reviewed choice keeps its `(recommended)` mark without a second section.
+
 In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
