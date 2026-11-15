@@ -694,7 +694,7 @@ It joins the row's `current_session` to native pane or process evidence.
 An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
-  The phase board prints one Markdown block per production staff unit.
+  The phase board prints the count line, the status table, then one Markdown block per production staff unit.
   It includes paused units, stopped units, and units without a session.
   The style table keeps one row per unit.
   Without `--production`, `showrunners.own_name()` selects the production.
@@ -759,6 +759,10 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The summary is `working N · waiting to merge N · waiting on other work N · idle N · <total> units`.
     It adds `unknown N` before the total only when nonzero.
     Each unit counts once; counts sum to the number of blocks.
+    `status_rows` builds each unit's rows for the status table; `status_table` renders them below the summary.
+    The columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`, with one row per open phase.
+    `display_cells.wrapped` omits all-`—` columns and wraps cells to `display_cells.pane_columns()`.
+    The `Progress:` legend follows the table when any row shows progress. `ETA Plan` shows only while a plan runs.
     A title is `**<unit>** — <bucket>`.
     Titles include machines when `display_cells.machine_column` would show them.
     `Now` and `Next` always appear as bold labels in list items.

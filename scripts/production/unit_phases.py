@@ -118,6 +118,186 @@ def short_time(moment: datetime, *, now: float, zone: ZoneInfo) -> str:
     return local.strftime("%H:%M" if local.date() == today else "%Y-%m-%d %H:%M")
 
 
+class ProgressState(NamedTuple):
+    square: str
+    label: str
+
+
+PROGRESS_DONE = ProgressState("🟩", "done")
+PROGRESS_OPEN = ProgressState("🟨", "open")
+PROGRESS_NOT_STARTED = ProgressState("⬜", "not started")
+
+
+def progress_cell(record: object) -> str:
+    """Show phase states as a colored bar."""
+    rows = plan_phase_rows(record_fields(record))
+    if not rows:
+        return display_cells.NONE
+    size = min(20, len(rows))
+    cells: list[str] = []
+    for index in range(size):
+        states = {row.get("status") for row in rows[index * len(rows) // size:(index + 1) * len(rows) // size]}
+        progress = PROGRESS_OPEN if states & {"running", "open"} else PROGRESS_NOT_STARTED if "todo" in states else PROGRESS_DONE
+        cells.append(progress.square)
+    return "".join(cells)
+
+
+def progress_legend() -> str:
+    """Describe the squares in the Progress bar."""
+    return "Progress: " + " · ".join(f"{state.square} {state.label}" for state in (
+        PROGRESS_DONE, PROGRESS_OPEN, PROGRESS_NOT_STARTED))
+
+
+
+def phase_cell(record: object) -> str:
+    """Show the completed phase count and total."""
+    rows = plan_phase_rows(record_fields(record))
+    return f"{sum(row.get('status') == 'done' for row in rows)}/{len(rows)}" if rows else display_cells.NONE
+
+
+
+def phase_eta_cell(phase: phase_table.OpenPhase | phase_table.TodoPhase, *, now: float, zone: ZoneInfo) -> str:
+    """Show the latest promise for one phase, including its delay."""
+    if not phase.eta_trail:
+        return "no ETA stated"
+    promise = phase.eta_trail[-1][0]
+    text = short_time(promise, now=now, zone=zone)
+    if now > promise.timestamp():
+        text += " · late " + elapsed_text(now - promise.timestamp())
+    return text
+
+
+def running_plan(record: object) -> bool:
+    """Return whether the record has unfinished plan phases."""
+    return any(phase.get("status") != "done" for phase in plan_phase_rows(record_fields(record)))
+
+
+def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
+    """Show the predicted finish of an unfinished plan."""
+    if (running_plan(record) and isinstance(record, phase_table.PhaseRecord)
+            and isinstance(record.plan_finish, phase_table.PredictedFinish)):
+        return short_time(record.plan_finish.at, now=now, zone=zone)
+    return display_cells.NONE
+
+
+def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], land: land_queue.LandView, *,
+                     unit: str, now: float, zone: ZoneInfo, completed_phase_ids: tuple[str, ...] = ()) -> str:
+    """Name promises with no later finish, sent work, or open row."""
+    targets: dict[str, tuple[datetime, float]] = {}
+    instances: dict[str, str] = {}
+    for event in events:
+        kind = event.get("event_type")
+        instance = str(event.get("phase_instance_id", ""))
+        phase_id = str(event.get("phase_id") or instances.get(instance, ""))
+        if kind == "phase_started":
+            instances[instance] = phase_id
+        elif kind in ("phase_finished", "checkpoint"):
+            _ = targets.pop(phase_id, None)
+        elif kind == "eta_stated":
+            target = str(event.get("eta_phase_id", phase_id))
+            at, stated = event.get("eta_at"), event.get("timestamp_epoch")
+            if (target and target not in open_phase_ids and target not in completed_phase_ids
+                    and isinstance(at, int | float)):
+                targets[target] = (datetime.fromtimestamp(at, UTC), float(stated) if isinstance(stated, int | float) else 0.0)
+    results: dict[str, float] = {}
+    for result in land.results.values():
+        if result["unit"] != unit:
+            continue
+        try:
+            at = datetime.fromisoformat(result["time"]).timestamp()
+        except ValueError:
+            continue
+        results[result["phase"]] = max(results.get(result["phase"], at), at)
+    parts: list[str] = []
+    for phase_id, (promise, stated) in targets.items():
+        if results.get(phase_id, stated) > stated:
+            continue
+        text = f"phase {phase_id}: {short_time(promise, now=now, zone=zone)}"
+        if now > promise.timestamp():
+            text += " · late " + elapsed_text(now - promise.timestamp())
+        parts.append(text)
+    return " · ".join(parts) or display_cells.NONE
+
+
+
+
+def eta_cell(record: object, *, now: float, zone: ZoneInfo,
+             open_run_phases: tuple[phase_table.OpenPhase, ...] = ()) -> str:
+    """Show the promise for open work or the next promised plan phase."""
+    phases = record.phases if isinstance(record, phase_table.PhaseRecord) else []
+    phase_ids = {phase.phase for phase in phases}
+    opened = [phase for phase in open_run_phases if phase.phase in phase_ids]
+    if not opened:
+        opened = [phase for phase in phases if isinstance(phase, phase_table.OpenPhase)]
+    current = record.current if isinstance(record, phase_table.PhaseRecord) else phase_table.NoOpenPhase()
+    selected: phase_table.OpenPhase | phase_table.TodoPhase | phase_table.NoOpenPhase
+    if opened:
+        selected = (current if isinstance(current, phase_table.OpenPhase)
+                    and any(phase.phase == current.phase for phase in opened) else opened[-1])
+    elif open_run_phases:
+        selected = open_run_phases[-1]
+    elif isinstance(current, phase_table.OpenPhase):
+        selected = current
+    else:
+        selected = next((phase for phase in phases if isinstance(phase, phase_table.TodoPhase) and phase.eta_trail),
+                        phase_table.NoOpenPhase())
+    if isinstance(selected, phase_table.NoOpenPhase):
+        return display_cells.NONE
+    return phase_eta_cell(selected, now=now, zone=zone)
+
+
+def status_rows(unit: str, status: str, machine: tuple[str, ...], record: object, run_events: list[dict[str, object]],
+                phases: tuple[phase_table.OpenPhase, ...], land: land_queue.LandView, *,
+                now: float, zone: ZoneInfo) -> tuple[tuple[tuple[str, ...], ...], bool]:
+    """Build the unit's status table rows and whether they show a plan ETA."""
+    eta_record = (phase_table.with_run_promises(record, run_events)
+                  if run_events and isinstance(record, phase_table.PhaseRecord) else record)
+    show_plan_eta = running_plan(record)
+    plan_eta = eta_plan_cell(eta_record, now=now, zone=zone)
+    open_ids = tuple(phase.phase for phase in phases)
+    done_ids = {phase.get("phase", "") for phase in plan_phase_rows(record_fields(record)) if phase.get("status") == "done"}
+    for event in run_events:
+        if event.get("event_type") != "phase_finished":
+            continue
+        phase_id = str(event.get("phase_id", ""))
+        if event.get("status") == "completed":
+            done_ids.add(phase_id)
+        else:
+            done_ids.discard(phase_id)
+    if run_events and not run_is_finished(run_events):
+        pending = pending_eta_cell(run_events, open_ids, land, unit=unit, now=now, zone=zone,
+                                   completed_phase_ids=tuple(done_ids))
+        if pending != display_cells.NONE:
+            plan_eta = " · ".join(cell for cell in (plan_eta, pending) if cell != display_cells.NONE)
+            show_plan_eta = True
+    if not phases:
+        return ((unit, status, *machine, progress_cell(record), phase_cell(record),
+                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=phases), plan_eta),), show_plan_eta
+    blank = (display_cells.NONE,) * len(machine)
+    return tuple((unit, status if index == 0 else display_cells.NONE, *(machine if index == 0 else blank),
+                  progress_cell(record) if index == 0 else display_cells.NONE, phase.phase,
+                  phase_eta_cell(phase, now=now, zone=zone), plan_eta if index == 0 else display_cells.NONE)
+                 for index, phase in enumerate(phases)), show_plan_eta
+
+
+def status_table(rows: list[tuple[str, ...]], *, machines: bool, show_plan_eta: bool, columns: int | None) -> str:
+    """Render the status table and its Progress legend."""
+    headers: tuple[str, ...] = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase",
+                                "ETA Next", "ETA Plan")
+    if not show_plan_eta:
+        headers = headers[:-1]
+        rows = [cells[:-1] for cells in rows]
+    progress_column = 3 if machines else 2
+    show_progress = any(cells[progress_column] != display_cells.NONE for cells in rows)
+    headers, rows = display_cells.wrapped(headers, rows, columns)
+    lines = ["| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
+             "| " + " | ".join(("---",) * len(headers)) + " |",
+             *("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in rows)]
+    if show_progress:
+        lines.extend(("", progress_legend()))
+    return "\n".join(lines)
+
+
 class CensusView(NamedTuple):
     """One census, indexed for the table rows."""
 
@@ -910,8 +1090,9 @@ def unit_block(state: UnitBoardState) -> str:
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
           now: float | None = None, zone: ZoneInfo | None = None,
-          snapshot: staff.StaffSnapshot | None = None, census_read: census.Census | census.CensusFailed) -> str:
-    """Build each unit's state once for its block and summary bucket."""
+          snapshot: staff.StaffSnapshot | None = None, census_read: census.Census | census.CensusFailed,
+          columns: int | None = None) -> str:
+    """Build each unit's state once for its status row, block and summary bucket."""
     snapshot = plan_history.staff_record() if snapshot is None else snapshot
     now = plan_history.now_epoch() if now is None else now
     zone = user_zone() if zone is None else zone
@@ -957,10 +1138,14 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     machines = display_cells.machine_column([unit.machine for unit in units])
     no_workers = quota_state.no_worker_mode()
     states: list[UnitBoardState] = []
+    table_rows: list[tuple[str, ...]] = []
+    show_plan_eta = False
     for index, unit in sorted(enumerate(units), key=lambda pair: pair[1].unit.casefold()):
         record = records.get(unit.unit)
+        progress_record = record
         member = unit.member
-        busy = census_status(view, unit) == "busy"
+        status = census_status(view, unit)
+        busy = status == "busy"
         run_events: list[dict[str, object]] = []
         phases: tuple[phase_table.OpenPhase, ...] = ()
         queue: UnitWorkQueue | UnreadableWorkQueue = UnreadableWorkQueue()
@@ -973,7 +1158,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             opened = runs.get(member.id, NoOpenUnitRun())
             if run is not None:
                 run_events = read_run(run.path)
-                if not plan_phase_rows(record_fields(record)):
+                planless = not plan_phase_rows(record_fields(record))
+                if planless:
                     record = fallback_plan(member, run, opened, record, read_plan=read_plan)
                 if isinstance(opened, OpenUnitRun):
                     plan_path = record_fields(record).get("plan", "")
@@ -982,8 +1168,14 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                  for position, row in enumerate(plan_phase_rows(record_fields(record)))}
                     phases = tuple(sorted((phase for phase in built.phases if isinstance(phase, phase_table.OpenPhase)),
                                           key=lambda phase: positions.get(phase.phase, len(positions))))
+                    if planless:
+                        progress_record = built
             if isinstance(view, CensusView):
                 workers = view.workers.get(member.id, ())
+        rows, plan_eta = status_rows(unit.unit, status, (machines[index],) if machines else (), progress_record, run_events,
+                                     phases, land, now=now, zone=zone)
+        table_rows.extend(rows)
+        show_plan_eta = show_plan_eta or plan_eta
         open_sent = {phase.phase: phase_sent_work([
             event for event in run_events if event.get("phase_instance_id") == phase.instance_id]) for phase in phases}
         waits = phase_waits.unit_waits(run_events)
@@ -1031,7 +1223,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     counts = {bucket: sum(state.bucket == bucket for state in states) for bucket in buckets}
     summary = " · ".join(f"{bucket} {counts[bucket]}" for bucket in buckets if bucket != "unknown" or counts[bucket])
     summary += f" · {len(states)} units"
-    return summary + ("\n\n" + "\n\n".join(unit_block(state) for state in states) if states else "")
+    if not states:
+        return summary
+    return "\n\n".join((summary, status_table(table_rows, machines=bool(machines), show_plan_eta=show_plan_eta,
+                                                 columns=columns), *(unit_block(state) for state in states)))
 
 
 def production_records(doc: Path) -> dict[str, object]:
@@ -1107,7 +1302,7 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
         print(f"anomaly: could not send unit anomalies: {' '.join(str(error).splitlines())}")
 
 
-def main(arguments: list[str]) -> int:
+def main(arguments: list[str], columns: int | None = None) -> int:
     match arguments:
         case ["--help"] | ["-h"]:
             print("usage: unit_phases.py [--production <staff name>]")
@@ -1152,7 +1347,8 @@ def main(arguments: list[str]) -> int:
                     if product_units:
                         if isinstance(census_read, census.CensusFailed):
                             session_staff.report_anomaly(census_read.reason)
-                        sections.append(table(product_units, records, zone=production.zone, census_read=census_read))
+                        sections.append(table(product_units, records, zone=production.zone, census_read=census_read,
+                                              columns=columns))
                     if ticket_units:
                         from scripts.production import style_units
                         sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
@@ -1169,4 +1365,4 @@ def main(arguments: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:], display_cells.pane_columns()))
