@@ -8992,8 +8992,7 @@ class StaffProgressHistoryTests(StaffTestCase):
         finished["history_file"] = str(history)
         write(run, finished)
         preserved = [(file.read_bytes(), file.stat().st_mtime_ns) for file in (path, history)]
-        with patch.object(progress_history, "SESSION_ROOTS", (self.root,)):
-            self.assertEqual(progress_history.move_run(history, second, first, "another-branch"), [])
+        self.assertEqual(progress_history.move_run(history, second, first, "another-branch"), [])
         self.assertEqual([(file.read_bytes(), file.stat().st_mtime_ns) for file in (path, history)], preserved)
 
     def test_plan_history_finds_folderless_runs_after_the_staff_folder_changes(self) -> None:

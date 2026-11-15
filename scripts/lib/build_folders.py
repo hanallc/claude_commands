@@ -72,7 +72,7 @@ class SystemTemporaryParent:
 
 @dataclass(frozen=True)
 class UnitRunParent:
-    """Use the current unit root authority."""
+    """Use the director's session run root, else the unit root (unit_runs.new_run_root)."""
 
 
 BuildFolderParent = InheritedTemporaryParent | ExplicitBuildParent | SystemTemporaryParent | UnitRunParent
@@ -114,7 +114,7 @@ def _parent(parent: BuildFolderParent) -> Path:
     if isinstance(parent, UnitRunParent):
         from scripts.lib import unit_runs
 
-        return unit_runs.run_roots()[0]
+        return unit_runs.new_run_root()
     return parent.path
 
 

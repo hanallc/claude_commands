@@ -106,6 +106,18 @@ class SessionFolderTests(unittest.TestCase):
         self.assertEqual(session_folder.read_record(made), {"owner": "m1", "session_id": "new-id"})
         self.assertFalse((self.root / "other").exists())
 
+    def test_the_caller_folder_follows_the_codex_thread_then_the_claude_session(self) -> None:
+        self.root.mkdir()
+        self.member = Member("m1", "verify")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertIsNone(session_folder.caller_folder())
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "claude-id"
+            self.assertEqual(session_folder.caller_folder(), self.root / "verify")
+            os.environ["CODEX_THREAD_ID"] = "codex-id"
+            self.member = Member("m2", "demo-impl")
+            self.assertEqual(session_folder.caller_folder(), self.root / "demo-impl")
+        self.assertEqual(session_folder.folder_for(self.root, "codex-id"), self.root / "demo-impl")
+
     def test_restore_makes_a_removed_folder_again_under_its_linked_name(self) -> None:
         self.root.mkdir()
         self.member = Member("m1", "verify")

@@ -2,7 +2,7 @@
 
 The session root is build_folders.conf roots.session (/session on natedev, ~/session on the Mac).
 A session folder holds the session's TMPDIR, its Claude Code scratchpad (claude-<uid>), its tool
-folders and a unit's run folder. The folder name is the staff member's name (`verify`, `builds`);
+folders, its scratch folders (scripts/lib/scratch.py) and, in `run`, a unit's run folders. The folder name is the staff member's name (`verify`, `builds`);
 a worker adds its unit (`demo-impl`); a session with no staff row takes its working folder's name.
 A name gets `-2`, `-3` and so on only while a live session holds the plain name (user decision 2,
 2026-11-15).
@@ -43,6 +43,8 @@ FOLDER_ENV = "CLAUDE_SESSION_FOLDER"
 RECORD = ".session.json"
 INDEX = ".id"
 LOCK = ".lock"
+# The run root in a session folder (scripts/lib/unit_runs.py); no other folder takes this name.
+RUN = "run"
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -230,6 +232,12 @@ def session_folder(session_id: str, cwd: str = "") -> Path | None:
                            folder_name(owner, session_id, cwd), session_id)
         link(root, session_id, folder)
     return folder
+
+
+def caller_folder() -> Path | None:
+    """The calling session's folder, made when absent; None with no session id or no session root."""
+    session_id = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    return session_folder(session_id) if session_id else None
 
 
 def restore(session_id: str) -> None:
