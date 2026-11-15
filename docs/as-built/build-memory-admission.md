@@ -842,6 +842,10 @@ Wait for a run's result as the next message, or put more files in one run.
 Exit 3 still means the caller is not a registered worker; only that exit permits attached execution.
 
 `queue_place` uses the client in process. Its public call retains `before_check`.
+`queue_place.held_reservation` is the one place that requests and releases a reservation.
+It takes a `RefreshedRequest` (a step or program request, local or cloud) or a `ServiceEstimateRequest` (a CI cargo call).
+It waits for the grant, then releases it with the holder's status when the holder exits, also after an exception.
+`queue_place`, the cloud route's `cloud_reservation` and `ci_cargo_front.py` use it.
 `release()` and `token_wait()` take explicit cleanup timing or the place's acquisition configuration.
 `Admitted.cleanup_timing` supplies `CleanupTiming`; the shell retains it in `BUILDLOG_MEM_CLEANUP_TIMING`.
 Stored `Admitted` replies without cleanup timing receive `PROTOCOL_CLEANUP_TIMING` before strict parsing.
@@ -1948,7 +1952,8 @@ The package wrapper passes `--front "$0"` before the cargo arguments.
 Its PATH entry precedes the cargo-tile shim, which precedes the real cargo.
 The front excludes that wrapper and removes its directory from the child's PATH.
 An explicit `--cargo <shim> -- <arguments>` entry also selects the next shim.
-Building calls hold one reservation until the child and its descendants end.
+Building calls hold one reservation through `queue_place.held_reservation` until the child and its descendants end.
+A grant without runner timing is released at once, and the call exits 1.
 Non-building calls execute the next cargo without admission.
 A direct call to a cargo executable outside this front bypasses admission.
 Calls inside the admitted child tree retain the same reservation.
