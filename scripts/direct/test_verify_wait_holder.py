@@ -124,7 +124,7 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         self.environment["TEST_FAIL_RECORDER"] = failure
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
-            + shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
                               "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
                               "buildlog_memory_event")
             + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
@@ -352,7 +352,7 @@ exec "$TEST_REAL_PYTHON" "$@"
         recorded_count = len(wait_rows(self.root / "session"))
         script = self.root / "identity-wait.sh"
         _ = script.write_text('set -euo pipefail\n' + shell_functions(
-            VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
+            VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
 PY=$TEST_IDENTITY_ROOT/identity-python
 PHASE_WAIT_SESSION=$TEST_IDENTITY_ROOT/session
 PHASE_WAIT_RECORDER=$1
@@ -518,7 +518,7 @@ class VerifyHoldHolderTests(RecordedHoldWaitFixture):
         script = self.fixture.root / "held-step.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "step_state", "publish_step_state", "phase_wait_holder_flags",
+            + shell_functions(VERIFY, "verify_helper", "step_state", "publish_step_state", "phase_wait_holder_flags",
                               "phase_wait_start", "phase_wait_finish", "build_hold_wait_local") + '''
 PY=$TEST_REAL_PYTHON
 PHASE_WAIT_RECORDER=$2 PHASE_WAIT_SESSION=$UNIT_RUN_DIR

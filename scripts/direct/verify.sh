@@ -1597,7 +1597,7 @@ phase_wait_start() {
         for pending in "$HOLD_WAIT_DIR"/phase-close.*.memory.*; do
             [[ -s "$pending" ]] || continue
             read -r id < "$pending"
-            "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+            verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
                 || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
             rm -f "$pending"
         done
@@ -1641,7 +1641,7 @@ phase_wait_start() {
         previous=$(< "$holder_file")
         if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
         read -r id < "$file"
-        if "$PY" "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
+        if verify_helper "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
             --wait-id "$id" ${holder_args[@]+"${holder_args[@]}"}; then
             printf '%s' "$holder" > "$holder_file"
         else
@@ -1657,7 +1657,7 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
+    if id="$(verify_helper "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
         if [[ -n "$id" ]]; then
             printf '%s' "$holder" > "$holder_file"
             printf '%s\n' "$id" > "$file"
@@ -1677,7 +1677,7 @@ phase_wait_finish() {
         return 0
     fi
     read -r id < "$file"
-    if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
+    if verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
@@ -1693,7 +1693,7 @@ phase_wait_finish_all() {
     for file in "$HOLD_WAIT_DIR"/phase-wait.* "$HOLD_WAIT_DIR"/phase-close.*; do
         [[ -s "$file" ]] || continue
         read -r id < "$file"
-        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+        verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
             || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
     done
 }
@@ -3923,7 +3923,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     # the invocation itself: "verify.sh test hana" names both the command that
     # ran and the script to open when a gate misbehaves, where a bare
     # "test hana" answered neither.
-    if "$PY" "${PROGRESS_HISTORY}" start-activity \
+    if verify_helper "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
         --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
@@ -3938,7 +3938,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
                 error) result="fail" ;;
                 cancelled) status=canceled ;;
             esac
-            "$PY" "${PROGRESS_HISTORY}" finish-activity \
+            verify_helper "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true
