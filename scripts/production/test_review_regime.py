@@ -76,6 +76,20 @@ class ReviewRegimeTests(unittest.TestCase):
         self.assertIn("| code findings per phase (mean) | - | - | 3.0 |", report)
         self.assertNotIn("simplify", report)
 
+    def test_each_review_minute_field_reads_numbers_and_skips_other_values(self) -> None:
+        _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1")
+        base = cast(dict[str, object], json.loads(self.ledger.read_text()))
+        for field in ("review_minutes", "ux_check_minutes", "ux_repair_minutes"):
+            for value, expected in ((7, 7.0), (2.5, 2.5), ("7", None), (None, None)):
+                with self.subTest(field=field, value=value):
+                    _ = self.ledger.write_text(json.dumps({**base, field: value}) + "\n")
+                    read = cast(object, getattr(review_regime.read_rows()[0], field))
+                    self.assertEqual(read, expected)
+                    self.assertIs(type(read), type(expected))
+            with self.subTest(field=field, value="missing"):
+                _ = self.ledger.write_text(json.dumps({key: value for key, value in base.items() if key != field}) + "\n")
+                self.assertIsNone(cast(object, getattr(review_regime.read_rows()[0], field)))
+
     def test_legacy_add_keeps_the_serialized_record_bytes(self) -> None:
         _ = self.add("--unit", "dashboard", "--plan", FIRST_PLAN, "--phase", "1")
         expected = {
