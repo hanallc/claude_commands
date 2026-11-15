@@ -2678,6 +2678,7 @@ mac_only_refuse() {
 
 PLACEMENT_STEP_NUMBER=0
 PLACEMENT_EPISODE=""
+PLACEMENT_EVIDENCE_EPISODE=""
 PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE=""
 PLACEMENT_GRANT_FILE=""
@@ -2758,7 +2759,13 @@ start_routing_wait() {
 
 wait_for_placement() {
     local wait_kind=resource wait_target=hold
-    [[ -n "$PHASE_RESOURCE_WAIT" || "${PLACEMENT_WAIT_MEMORY:-0}" != 0 ]] || wait_kind=evidence
+    # Only the first empty reply of an episode wakes at the next pass. Later empty
+    # replies wait the interval, so waiters cannot wake each other through state.json.
+    if [[ -z "$PHASE_RESOURCE_WAIT" && "${PLACEMENT_WAIT_MEMORY:-0}" == 0
+            && "${PLACEMENT_EVIDENCE_EPISODE:-}" != "$PLACEMENT_EPISODE" ]]; then
+        wait_kind=evidence
+        PLACEMENT_EVIDENCE_EPISODE=$PLACEMENT_EPISODE
+    fi
     if [[ "${PLACEMENT_WAIT_MEMORY:-0}" == 0 ]]; then start_routing_wait; fi
     if [[ "$PHASE_RESOURCE_WAIT" != "natedev:build hold" ]] && build_hold_nothing_held; then
         wait_target=assignment
