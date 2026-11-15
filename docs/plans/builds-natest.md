@@ -4269,23 +4269,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; the diff goes to sdlc).
 
-#### Work Order
+#### As-built
 
-**Goal:** the verify helper reads a request with a few large reads, not one read call for each byte.
-
-**Spec:**
-- Cause: `read_field` in `scripts/direct/verify_helper.py` reads the unbuffered stdin one byte a call. A request carries the caller's whole environment (about 31 KB), so each call makes about 31k read calls. In `direct/test_verify_ssh_targets_routing.py` (natedev 21.5 CPU s) the request reads cost 2.54 CPU s of the helper's 6.2 s (445 calls, 5.7 ms a call).
-- `FieldReader` keeps a byte buffer, reads with `os.read(descriptor, READ_SIZE)` (64 KiB) and splits on NUL. `read_call` takes a `FieldReader`.
-- The main loop calls `select` only when the reader holds no buffered bytes. Buffered bytes belong to the next request, and `select` would wait for nothing.
-- The request format, the reply format and the fallback path do not change.
-
-**Files:** `scripts/direct/verify_helper.py`, `scripts/direct/test_verify_helper.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is small and in one module.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the new test (two requests in one write each get a reply) passes, and it hangs without the buffered check; test_verify_helper passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) on the verify modules passes with the same test count.
+- `FieldReader` in `scripts/direct/verify_helper.py` reads stdin in 64 KiB `os.read` chunks and splits on NUL; the main loop skips `select` while buffered bytes remain. Formats do not change.
+- Cause: `read_field` read one byte a call; a request carries the whole environment (about 31 KB on natedev), 2.54 of the helper's 6.2 natedev CPU s in ssh_targets_routing.
+- Test `test_two_requests_in_one_write_each_get_a_reply` in `test_verify_helper.py`.
+- AWS pair (3 rounds, 9 verify modules): all pass, about 1.3 CPU s less; the AWS environment is small. sdlc: no branch touches the files.
+- Commit e60fb3344. Production change.
 
 ### Phase 298 — A build folder lock removed after its open is not current  · status: done
 **Depends on:** none
