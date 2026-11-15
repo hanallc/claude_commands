@@ -710,7 +710,7 @@ Refusal handling, regional cost bookings, and the $35 daily and $400 monthly lim
 The prices command prints regional Spot prices without resource identities.
 It reads gate regions, then `spot_candidate_regions`, without duplicates.
 It preserves the configured order within each list.
-`spot_candidate_regions=us-east-2 us-west-2 eu-north-1 eu-south-2 us-east-1 us-west-1 eu-south-1` supplies the candidate regions for Spot work and price reads.
+`spot_candidate_regions` supplies the candidate regions for Spot work and price reads.
 `gpu_instance_types=g6.xlarge g4dn.xlarge g4ad.xlarge g5.xlarge` adds GPU types to the existing price rows.
 The table header follows the administrator passphrase prompt.
 Whole quota values have no decimal suffix.
