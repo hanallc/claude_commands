@@ -524,6 +524,25 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class StateCheckTests(unittest.TestCase):
+    def test_state_check_reads_current_state_and_refuses_an_old_placement_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with redirect_stderr(output), mock.patch("sys.stdout", io.StringIO()):
+                self.assertEqual(service.state_check(root), 0)
+                state = service.ServiceState({}, {}, {}, records.ReadyToStart(), records.NoHeadAdmissionOverride())
+                write_text_atomic(root / "state.json", wire.encode_record(state))
+                self.assertEqual(service.state_check(root), 0)
+                stored = cast(dict[str, object], json.loads((root / "state.json").read_text()))
+                stored["placement_requests"] = {"episode": {"kind": "PlacementRequest", "episode": "episode"}}
+                write_text_atomic(root / "state.json", json.dumps(stored))
+                before = (root / "state.json").read_bytes()
+                self.assertEqual(service.state_check(root), 2)
+            self.assertIn("stored placement records require external conversion", output.getvalue())
+            self.assertEqual((root / "state.json").read_bytes(), before)
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     def test_close_between_the_loop_check_and_clear_does_not_lose_its_wake(self) -> None:
         from queue import Queue
