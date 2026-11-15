@@ -27,28 +27,30 @@ class LandRunTests(unittest.TestCase):
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
         self.assertEqual(merge_gate.gate_state_dir(), self.root)
-        self.assertEqual(land_runs.running_commits(), frozenset())
-        with land_runs.landing(["a" * 40, "b" * 9]):
-            self.assertEqual(land_runs.running_commits(), frozenset({"a" * 40, "b" * 9}))
+        self.assertEqual(land_runs.running_lands(), {})
+        with land_runs.landing(["a" * 40, "b" * 9], ["shelled images-card"]):
+            self.assertEqual(land_runs.running_lands(), {"a" * 40: "shelled images-card", "b" * 9: ""})
         self.assertEqual(list(land_runs.lands_dir().iterdir()), [])
-        self.assertEqual(land_runs.running_commits(), frozenset())
+        self.assertEqual(land_runs.running_lands(), {})
 
     def test_merge_checkpoint_holds_the_record_while_a_batch_lands(self) -> None:
-        seen: list[frozenset[str]] = []
+        seen: list[dict[str, str]] = []
 
         def land(_requests: object) -> int:
-            seen.append(land_runs.running_commits())
+            seen.append(land_runs.running_lands())
             return 0
 
-        requests = (SimpleNamespace(commit="a" * 40, production=SimpleNamespace(checkout=self.root, name="sdlc")),
-                    SimpleNamespace(commit="b" * 40, production=SimpleNamespace(checkout=self.root, name="sdlc")))
+        requests = (SimpleNamespace(commit="a" * 40, production=SimpleNamespace(checkout=self.root, name="sdlc"),
+                                    unit=SimpleNamespace(name="shelled"), phase="7"),
+                    SimpleNamespace(commit="b" * 40, production=SimpleNamespace(checkout=self.root, name="sdlc"),
+                                    unit=SimpleNamespace(name="phases"), phase="30"))
         with (patch.object(sys, "argv", ["merge_checkpoint.py", "--production", "sdlc", "--batch", str(self.root / "batch.txt")]),
               patch.object(merge_checkpoint, "batch_requests", return_value=requests),
               patch.object(merge_checkpoint, "merge_lock", return_value=contextlib.nullcontext()),
               patch.object(merge_checkpoint, "run_batch", side_effect=land)):
             self.assertEqual(merge_checkpoint.main(), 0)
-        self.assertEqual(seen, [frozenset({"a" * 40, "b" * 40})])
-        self.assertEqual(land_runs.running_commits(), frozenset())
+        self.assertEqual(seen, [{"a" * 40: "shelled 7", "b" * 40: "phases 30"}])
+        self.assertEqual(land_runs.running_lands(), {})
 
     def test_an_ended_or_unreadable_record_is_not_running(self) -> None:
         start = process_start(os.getpid())
@@ -59,7 +61,7 @@ class LandRunTests(unittest.TestCase):
         _ = (folder / "broken.json").write_text("not json")
         _ = (folder / "partial.json").write_text(json.dumps({"pid": os.getpid()}))
         _ = (folder / "live.json").write_text(json.dumps({"pid": os.getpid(), "start": start.start, "commits": ["f" * 40]}))
-        self.assertEqual(land_runs.running_commits(), frozenset({"f" * 40}))
+        self.assertEqual(land_runs.running_lands(), {"f" * 40: ""})
         self.assertEqual(sorted(path.name for path in folder.iterdir()), ["broken.json", "live.json", "partial.json"])
 
     def test_a_short_hash_holds_its_full_commit(self) -> None:

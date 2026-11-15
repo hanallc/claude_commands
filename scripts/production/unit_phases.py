@@ -41,7 +41,7 @@ from scripts.direct import phase_table, phase_waits
 from scripts.direct import plan_history
 
 from scripts.production import display_cells, land_queue, land_runs
-from scripts.production import unit_queue
+from scripts.production import unit_queue, waits_on
 from scripts.lib import unit_runs
 from scripts.whoami import quota_state
 
@@ -215,19 +215,38 @@ def eta_plan_cell(record: object, *, now: float, zone: ZoneInfo) -> str:
     return display_cells.NONE
 
 
-def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], done_phase_ids: set[str], *,
-                     now: float, zone: ZoneInfo) -> str:
-    """Name promises for unfinished targets that have no open row."""
-    targets: dict[str, datetime] = {}
+def pending_eta_cell(events: list[dict[str, object]], open_phase_ids: tuple[str, ...], land: land_queue.LandView, *,
+                     unit: str, now: float, zone: ZoneInfo, completed_phase_ids: tuple[str, ...] = ()) -> str:
+    """Name promises with no later finish, sent work, or open row."""
+    targets: dict[str, tuple[datetime, float]] = {}
+    instances: dict[str, str] = {}
     for event in events:
-        if event.get("event_type") != "eta_stated":
+        kind = event.get("event_type")
+        instance = str(event.get("phase_instance_id", ""))
+        phase_id = str(event.get("phase_id") or instances.get(instance, ""))
+        if kind == "phase_started":
+            instances[instance] = phase_id
+        elif kind in ("phase_finished", "checkpoint"):
+            _ = targets.pop(phase_id, None)
+        elif kind == "eta_stated":
+            target = str(event.get("eta_phase_id", phase_id))
+            at, stated = event.get("eta_at"), event.get("timestamp_epoch")
+            if (target and target not in open_phase_ids and target not in completed_phase_ids
+                    and isinstance(at, int | float)):
+                targets[target] = (datetime.fromtimestamp(at, UTC), float(stated) if isinstance(stated, int | float) else 0.0)
+    results: dict[str, float] = {}
+    for result in land.results.values():
+        if result["unit"] != unit:
             continue
-        phase_id = str(event.get("eta_phase_id", event.get("phase_id", "")))
-        at = event.get("eta_at")
-        if phase_id and phase_id not in open_phase_ids and phase_id not in done_phase_ids and isinstance(at, int | float):
-            targets[phase_id] = datetime.fromtimestamp(at, UTC)
+        try:
+            at = datetime.fromisoformat(result["time"]).timestamp()
+        except ValueError:
+            continue
+        results[result["phase"]] = max(results.get(result["phase"], at), at)
     parts: list[str] = []
-    for phase_id, promise in targets.items():
+    for phase_id, (promise, stated) in targets.items():
+        if results.get(phase_id, stated) > stated:
+            continue
         text = f"phase {phase_id}: {short_time(promise, now=now, zone=zone)}"
         if now > promise.timestamp():
             text += " · late " + elapsed_text(now - promise.timestamp())
@@ -362,24 +381,20 @@ def phase_note_label(phase_id: str, title: str) -> str:
     return f"phase {phase_id} — {title}"
 
 
-def notes_cell(record: object, *, read_run: RunEventsReader = read_work_events) -> str:
+def notes_cell(record: object, *, queue_note: str = "queue empty", read_run: RunEventsReader = read_work_events) -> str:
     """Show the current phase, task, and repair rounds."""
     fields = record_fields(record)
-    if not fields:
-        return display_cells.NONE
-    unavailable = fields.get("unavailable")
-    if isinstance(unavailable, str):
-        return "no plan"
     current = fields.get("current")
     phases = plan_phase_rows(fields)
-    if (not isinstance(current, dict)
+    if (isinstance(fields.get("unavailable"), str) or not isinstance(current, dict)
             or current.get("phase") not in {row.get("phase") for row in phases}):
-        done = sum(row.get("status") == "done" for row in phases)
-        if not phases:
-            return "no phases"
-        if done == len(phases):
-            return "plan done"
-        return "between phases" if done else "not started"
+        if not phases or isinstance(fields.get("unavailable"), str):
+            plan_note = "no plan"
+        elif next_phase := next((row for row in phases if row.get("status") != "done"), None):
+            plan_note = f"next plan phase {next_phase.get('phase', '')} not started"
+        else:
+            plan_note = "plan done"
+        return f"nothing open: {plan_note}, {queue_note}"
     phase = current
     task = task_cell(fields, read_run=read_run)
     if task == display_cells.NONE:
@@ -408,22 +423,10 @@ def task_cell(record: object, *, read_run: RunEventsReader = read_work_events) -
     return single_spaced(task)
 
 
-# Notes for a sent checkpoint that has not landed (user, 2026-11-15).
-CHECKPOINT_WAITS = {"running": "waiting on running checkpoint", "queued": "waiting on queued checkpoint"}
-NOT_IN_LINE = "checkpoint sent, not in the land line"
+# The repository whose local origin/main a queued item's wait is checked against; no fetch.
+REPOSITORY = Path(__file__).resolve().parents[2]
+
 WORK_STARTS = frozenset({"phase_started", "pass_started", "activity_started"})
-
-
-class LandView(NamedTuple):
-    """The lands that run now, the land line, and the newest result of each land."""
-
-    running: frozenset[str]
-    line: dict[str, land_queue.Place] | land_queue.NoLine
-    results: dict[str, land_runs.LandResult]
-
-
-def land_view() -> LandView:
-    return LandView(land_runs.running_commits(), land_queue.places(), land_runs.last_results())
 
 
 def ordinal(number: int) -> str:
@@ -431,54 +434,102 @@ def ordinal(number: int) -> str:
     return f"{number}{suffix}"
 
 
-def land_result_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
-    """Say how a land ended: "checkpoint landed 11:20", or "land failed at red 11:20: <first detail line>"."""
+def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
+    """Say how a land ended: "merged 11:20", or "failed at red 11:20: <first detail line>".
+
+    A merge conflict names its files, not the first detail line.
+    """
     try:
         when = short_time(datetime.fromisoformat(result["time"]), now=now, zone=zone)
     except (ValueError, TypeError):
         when = ""
     if result["landed"]:
-        return single_spaced(f"checkpoint landed {when}")
+        return single_spaced(f"merged {when}")
+    if conflicts := re.findall(r"Merge conflict in (\S+)", result["detail"]):
+        return single_spaced(f"merge conflict in {', '.join(dict.fromkeys(conflicts))} {when}")
     detail = single_spaced(result["detail"].splitlines()[0]) if result["detail"].strip() else ""
-    return single_spaced(f"land {result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
+    return single_spaced(f"{result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
 
 
-def checkpoint_wait(events: list[dict[str, object]], land: LandView, *, now: float, zone: ZoneInfo) -> str | None:
-    """Name the state of a checkpoint sent after the phase instance's last start of work.
+def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo, unit: str = "") -> str:
+    """Say in plain words where a done commit is on its way to main (user, 2026-11-15: a human must understand it; the user does not read the word land).
 
-    A land that holds its commit runs now, or it waits at a place in the land line, or its last land ended.
-    A failed land that waits in the line again names that failure after its place.
+    A carried commit names the work that carries it; the row's own unit name is left out.
     """
+    match state:
+        case land_queue.LandRunning():
+            return "merging now"
+        case land_queue.InLine(place, failed, carried):
+            carrier = place.owner.removeprefix(f"{unit} ") if unit else place.owner
+            text = f"waits to merge{f' with {carrier}' if carried else ''}, {ordinal(place.number)} in line"
+            return f"{text}; last try {try_text(failed, now=now, zone=zone)}" if failed else text
+        case land_queue.LandEnded(result) if result["landed"]:
+            return try_text(result, now=now, zone=zone)
+        case land_queue.LandEnded(result):
+            return f"did not merge: {try_text(result, now=now, zone=zone)}"
+        case land_queue.NotInLine():
+            return "not sent to merge yet"
+        case land_queue.LineUnused():
+            return "waits to merge"
+
+
+def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, *,
+                    now: float, zone: ZoneInfo, unit: str = "") -> str | None:
+    """Say where the checkpoint sent after the phase instance's last start of work is on its way to main."""
     for event in reversed(events):
         kind = event.get("event_type")
         if kind == "checkpoint":
             commit = event.get("checkpoint_commit")
-            if not isinstance(commit, str) or not commit:
-                return CHECKPOINT_WAITS["queued"]
-            if land_runs.holds(land.running, commit):
-                return CHECKPOINT_WAITS["running"]
-            result = land_runs.result_for(land.results, commit)
-            place = None if isinstance(land.line, land_queue.NoLine) else land_queue.place_of(land.line, commit)
-            if place is None and result is not None:
-                return land_result_text(result, now=now, zone=zone)
-            if place is None:
-                return CHECKPOINT_WAITS["queued"] if isinstance(land.line, land_queue.NoLine) else NOT_IN_LINE
-            queued = f"{CHECKPOINT_WAITS['queued']}, {ordinal(place.number)} in line"
-            if result is None or result["landed"]:
-                return queued
-            return f"{queued}; last try: {land_result_text(result, now=now, zone=zone)}"
+            state = land_queue.land_state(land, commit) if isinstance(commit, str) and commit else land_queue.LineUnused()
+            return f"done, {land_text(state, now=now, zone=zone, unit=unit)}"
         if kind in WORK_STARTS:
             return None
     return None
 
 
+def unit_lands(unit: str, land: land_queue.LandView, *, skip: Sequence[str], now: float, zone: ZoneInfo,
+               on_main: Callable[[str], bool]) -> str:
+    """Say where each of the unit's sent checkpoints is on its way to main, from the lands, the line and the results.
+
+    It names checkpoints that land now, wait in the land line, or did not land and are not on main yet; the phases
+    of one line item share one entry. Phases in skip have their own row (sdlc C1701: done work that waits to land).
+    """
+    prefix = f"{unit} "
+
+    def own(owner: str) -> str:
+        phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
+        return "" if phase in skip else phase
+
+    landing = [phase for owner in land.running.values() if (phase := own(owner))]
+    items: dict[int, list[str]] = {}
+    for place in ({} if isinstance(land.line, land_queue.NoLine) else land.line).values():
+        if (phase := own(place.owner)) and phase not in items.setdefault(place.number, []):
+            items[place.number].append(phase)
+    queued = {phase for phases in items.values() for phase in phases}
+    newest: dict[str, land_runs.LandResult] = {}
+    for result in land.results.values():
+        phase = result["phase"]
+        if result["unit"] == unit and (phase not in newest or result["time"] > newest[phase]["time"]):
+            newest[phase] = result
+    parts: list[str] = []
+    if landing:
+        parts.append(f"merging now: {', '.join(landing)}")
+    if entries := [f"{' + '.join(phases)} ({ordinal(number)} in line)" for number, phases in sorted(items.items()) if phases]:
+        parts.append(f"done, waits to merge: {', '.join(entries)}")
+    parts.extend(f"{phase} did not merge: {try_text(result, now=now, zone=zone)}" for phase, result in newest.items()
+                 if not result["landed"] and phase not in skip and phase not in queued and phase not in landing
+                 and not on_main(result["commit"]))
+    return " · ".join(parts)
+
+
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
-                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: LandView) -> str:
+                     snapshot: staff.StaffSnapshot, now: float, zone: ZoneInfo, land: land_queue.LandView,
+                     unit: str = "") -> str:
     """Show one open phase's work, repair rounds, and open waits."""
     instance = [event for event in events if event.get("phase_instance_id") == phase.instance_id]
     step = display_cells.open_step(instance)
     parts = [phase_note_label(phase.phase, phase.title)]
-    if (wait := checkpoint_wait(instance, land, now=now, zone=zone)) is not None:
+    if (wait := checkpoint_wait(instance, land, now=now, zone=zone, unit=unit)) is not None:
         parts.append(wait)
     elif isinstance(step, display_cells.OpenStep):
         label, text = single_spaced(step.label), single_spaced(step.text)
@@ -576,7 +627,7 @@ def open_unit_runs(snapshot: staff.StaffSnapshot, *,
         else:
             if not isinstance(owner.run, staff.OpenRun) or not unit_runs.run_is_open(owner.run.path):
                 continue
-            path = plan_history.history_root() / "runs" / f"{owner.run.path.name}.jsonl"
+            path = plan_history.run_events_path(owner.run.path)
         events = read_run(path)
         if run_is_finished(events):
             continue
@@ -621,27 +672,77 @@ def non_phase_cell(record: object, run: OpenUnitRun | NoOpenUnitRun, *, notes_re
             text = (f"{step.label}: {step.text}" if step.label and step.text else step.label or step.text
                     ) if isinstance(step, display_cells.OpenStep) else display_cells.NONE
             work.append(single_spaced(f"{identifier}: {text}"))
-    return (work[-1] + (f" +{len(work) - 1} more" if len(work) > 1 else "")) if work else display_cells.NONE
+    return " · ".join(work) or display_cells.NONE
+
+
+def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
+    """Say in plain words the state of the work a queued item waits on."""
+    match found:
+        case waits_on.PhaseSent(commit):
+            state = land_queue.land_state(land, commit)
+            landed = isinstance(state, land_queue.LandEnded) and state.result["landed"]
+            return f"done, {land_text(state, now=now, zone=zone)}{', not on main yet' if landed else ''}"
+        case waits_on.NotOnMain(commit):
+            state = land_queue.land_state(land, commit)
+            if isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
+                return "not on main"
+            landed = isinstance(state, land_queue.LandEnded) and state.result["landed"]
+            return f"{land_text(state, now=now, zone=zone)}{', not on main yet' if landed else ''}"
+        case waits_on.PhaseOpen(eta_at):
+            when = short_time(datetime.fromtimestamp(eta_at, UTC), now=now, zone=zone) if eta_at is not None else ""
+            return f"in work, ETA {when}" if when else "in work, no ETA"
+        case waits_on.PhaseNotStarted():
+            return "not started"
+        case _:
+            return "not found"
+
+
+def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
+                land: land_queue.LandView, *, now: float, zone: ZoneInfo) -> str:
+    """An item with no wait is its text; a met wait says ready; else the item names its wait and that wait's state."""
+    if not item.after or found is None:
+        return item.text
+    if isinstance(found, waits_on.OnMain):
+        return f"ready: {item.text} ({item.after} on main)"
+    return f"{item.text} — after {item.after}: {wait_text(found, land, now=now, zone=zone)}"
+
+
+class UnitWorkQueue(NamedTuple):
+    """The work items that a unit has not started."""
+
+    items: tuple[unit_queue.QueuedItem, ...]
+
+
+class UnreadableWorkQueue(NamedTuple):
+    """The unit's work queue could not be read."""
+
+
+def read_work_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
+    """Read the unit's work queue and report a read failure."""
+    try:
+        return UnitWorkQueue(tuple(unit_queue.read_items(staff_id)))
+    except (OSError, ValueError) as error:
+        print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
+        return UnreadableWorkQueue()
 
 
 def queued_cell(staff_id: staff.StaffId, record: object = None, *, notes: str = display_cells.NONE,
-                open_phase_ids: tuple[str, ...] = ()) -> str:
-    """Show queued work, excluding queue items equal to Notes."""
-    try:
-        items = unit_queue.read(staff_id)
-    except (OSError, ValueError) as error:
-        print(f"unit_phases: {unit_queue.state_path(staff_id)}: {error}", file=sys.stderr)
+                open_phase_ids: tuple[str, ...] = (),
+                describe: Callable[[unit_queue.QueuedItem], str] = unit_queue.shown,
+                read_queue: Callable[[staff.StaffId], UnitWorkQueue | UnreadableWorkQueue] = read_work_queue) -> str:
+    """Show every work item and pending plan phase, excluding items equal to Notes."""
+    work_queue = read_queue(staff_id)
+    if isinstance(work_queue, UnreadableWorkQueue):
         queue = "queue unreadable"
     else:
-        items = [item for item in items if item != notes]
-        queue = (single_spaced(items[0]) + (f" +{len(items) - 1} more" if len(items) > 1 else "")) if items else ""
+        queue = " · ".join(single_spaced(describe(item)) for item in work_queue.items if item.text != notes)
     rows = [row for row in plan_phase_rows(record_fields(record))
             if row.get("status") not in ("done", "running", "open") and row.get("phase") not in open_phase_ids]
     plan = ""
     if rows:
         title = single_spaced(rows[0].get("title", ""))
         plan = (f"plan: phase {rows[0].get('phase')}: {title}"
-                + (f" +{len(rows) - 1} more" if len(rows) > 1 else ""))
+                + (", then " + ", ".join(row.get("phase", "") for row in rows[1:]) if len(rows) > 1 else ""))
     return " · ".join(part for part in (queue, plan) if part) or display_cells.NONE
 
 
@@ -686,10 +787,17 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     now = plan_history.now_epoch() if now is None else now
     view = census_view(census_read)
     reason = no_worker_reason()
-    land = land_view()
+    land = land_queue.land_view(REPOSITORY)
     zone = user_zone() if zone is None else zone
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
+    queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
+    wait_states: dict[str, waits_on.WaitState] = {}
+
+    def read_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
+        if staff_id not in queues:
+            queues[staff_id] = read_work_queue(staff_id)
+        return queues[staff_id]
 
     def read_plan(path: Path) -> list[plan_history.PlanPhase]:
         if path not in plans:
@@ -704,6 +812,32 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             events[path] = plan_history.read_run_events(path)
         return events[path]
 
+    def wait_state(after: str) -> waits_on.WaitState:
+        if after not in wait_states:
+            wait_states[after] = waits_on.state(after, repo=REPOSITORY, snapshot=snapshot, read_run=read_run)
+        return wait_states[after]
+
+    def describe(item: unit_queue.QueuedItem) -> str:
+        found = wait_state(item.after) if item.after else None
+        return queued_text(item, found, land, now=now, zone=zone)
+
+    unit_names = {unit.unit for unit in units}
+    merge_owners = {owner for owner in land.running.values() if owner.partition(" ")[0] in unit_names}
+    if not isinstance(land.line, land_queue.NoLine):
+        merge_owners.update(place.owner for place in land.line.values() if place.owner.partition(" ")[0] in unit_names)
+    today = datetime.fromtimestamp(now, zone).date()
+    merged: set[tuple[str, str]] = set()
+    for result in land.results.values():
+        if not result["landed"] or result["unit"] not in unit_names:
+            continue
+        try:
+            merged_date = datetime.fromisoformat(result["time"]).astimezone(zone).date()
+        except ValueError:
+            continue
+        if merged_date == today:
+            merged.add((result["unit"], result["phase"]))
+    in_work = 0
+    waiting = 0
     unit_snapshot = staff.StaffSnapshot(tuple(
         current for unit in units if isinstance(unit.member, staff.StaffRow)
         if (current := snapshot.by_id(unit.member.id)) is not None))
@@ -727,7 +861,19 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         workers = unit_reason
         open_run_phases: tuple[phase_table.OpenPhase, ...] = ()
         run_events: list[dict[str, object]] = []
+        queue_note = "queue empty"
         if isinstance(member, staff.StaffRow):
+            work_queue = read_queue(member.id)
+            if isinstance(work_queue, UnreadableWorkQueue):
+                queue_note = "queue unreadable"
+            else:
+                waiting += sum(bool(item.after) and not isinstance(wait_state(item.after), waits_on.OnMain)
+                               for item in work_queue.items)
+                if work_queue.items:
+                    first_item = work_queue.items[0]
+                    queue_note = (f"queued work waits on {first_item.after}"
+                                  if first_item.after and not isinstance(wait_state(first_item.after), waits_on.OnMain)
+                                  else "queued work not started")
             if run is not None:
                 run_events = read_run(run.path)
             opened = runs.get(member.id, NoOpenUnitRun())
@@ -765,18 +911,29 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             else:
                 done_ids.discard(phase_id)
         if run_events and not run_is_finished(run_events):
-            pending_eta = pending_eta_cell(run_events, open_ids, done_ids, now=now, zone=zone)
+            pending_eta = pending_eta_cell(run_events, open_ids, land, unit=unit.unit, now=now, zone=zone,
+                                           completed_phase_ids=tuple(done_ids))
             if pending_eta != display_cells.NONE:
                 plan_eta = " · ".join(cell for cell in (plan_eta, pending_eta) if cell != display_cells.NONE)
                 show_plan_eta = True
+        sent_text = unit_lands(unit.unit, land, skip=open_ids, now=now, zone=zone,
+                               on_main=lambda commit: waits_on.on_main(REPOSITORY, commit))
+        sent = (sent_text,) if sent_text else ()
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
-                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land)
-                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids)
+                notes = phase_notes_cell(phase, run_events, snapshot=snapshot, now=now, zone=zone, land=land,
+                                         unit=member.name)
+                instance = [event for event in run_events if event.get("phase_instance_id") == phase.instance_id]
+                if checkpoint_wait(instance, land, now=now, zone=zone, unit=member.name) is None:
+                    in_work += 1
+                else:
+                    merge_owners.add(f"{unit.unit} {phase.phase}")
+                queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids,
+                                      describe=describe, read_queue=read_queue)
                           if first else display_cells.NONE)
                 if first:
-                    notes = with_waits(notes, waits)
+                    notes = with_waits(notes, (*sent, *waits))
                 phase_workers = census_workers(view, member, phase.instance_id)
                 status_rows.append((unit.unit, status if first else display_cells.NONE,
                                     *((machines[index] if first else display_cells.NONE,) if machines else ()),
@@ -787,10 +944,12 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                                   workers_cell(phase_workers, now=now, reason=unit_reason if first else display_cells.NONE),
                                   notes, display_cells.NONE, queued))
         else:
-            notes = notes_cell(notes_record, read_run=read_run)
-            queued = (queued_cell(member.id, queued_record, notes=notes)
+            in_work += sum(phase.get("status") in ("running", "open")
+                           for phase in plan_phase_rows(record_fields(notes_record)))
+            notes = notes_cell(notes_record, queue_note=queue_note, read_run=read_run)
+            queued = (queued_cell(member.id, queued_record, notes=notes, describe=describe, read_queue=read_queue)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
-            notes = with_waits(notes, waits)
+            notes = with_waits(notes, (*sent, *waits))
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
                                 progress_cell(progress_record), phase_cell(progress_record),
                                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=open_run_phases),
@@ -814,7 +973,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         lines.extend(("| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
                       "| " + " | ".join(("---",) * len(headers)) + " |"))
         lines.extend("| " + " | ".join(display_cells.escaped(cell) for cell in cells) + " |" for cells in table_rows)
-    return "\n".join(lines)
+    summary = (f"in work {in_work} · waiting to merge {len(merge_owners)}"
+               f" · waiting on other work {waiting} · merged today {len(merged)}")
+    return summary + "\n\n" + "\n".join(lines)
 
 
 def production_records(doc: Path) -> dict[str, object]:

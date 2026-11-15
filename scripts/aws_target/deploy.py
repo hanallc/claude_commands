@@ -28,13 +28,12 @@ from typing import cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, teardown
+from scripts.aws_target import admin_secrets, box, hana_box, hana_spend, ledger, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
 from scripts.aws_target.terminal_table import aligned_table
 from scripts.lib import conf, user_zone
-from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
@@ -500,13 +499,9 @@ class Deployment:
                     raise DeploymentRefused('The Hana setup reservation expired; reconcile the separate stack before retry')
                 saved['requested'] = True
                 write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n')
-                # CloudFormation deploy uses its existing stack waiter and private admin executor.
                 with step('hana-setup', 'updating the separate Hana stack', self.settings_path):
-                    _ = api.call('deploy', '--stack-name', settings.stack_name,
-                        '--template-file', str(child.output / 'template.json'), '--capabilities', 'CAPABILITY_NAMED_IAM',
-                        '--no-fail-on-empty-changeset', '--parameter-overrides',
-                        *[f'{key}={value}' for key, value in parameters.items()], service='cloudformation',
-                        timeout_s=conf.read(self.settings_path).whole('stack_wait_timeout_s'))
+                    self._hana_stack_change(api, settings, child.output / 'template.json', parameters,
+                                            keep=str(saved.get('instance', '')))
                 outputs = child._stack(settings)
             instance, bucket = outputs['Instance'], outputs['ControlBucket']
             if saved.get('instance', instance) != instance or saved.get('data_volume', outputs['DataVolume']) != outputs['DataVolume']:
@@ -536,6 +531,113 @@ class Deployment:
         hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
             clock=self.clock).register(hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region))
         print('Hana setup complete: the box is stopped; placement remains disabled')
+        return True
+
+    def _hana_stack_change(self, api: AwsCli, settings: DeploymentSettings, template: Path, parameters: dict[str, str],
+                           *, keep: str) -> None:
+        """Change the Hana stack through a change set that refuses a box or disk replacement.
+
+        The Hana box, disks and bucket are retained, so CloudFormation never deletes them. A failed change
+        ends every Hana box except the kept one, then deletes what the rollback kept.
+        A failed create also deletes the failed stack and every unattached Hana disk."""
+        timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        started = self.clock()
+        try:
+            kind = 'UPDATE' if ledger.rows(api.call('describe-stacks', '--stack-name', settings.stack_name,
+                                                    service='cloudformation'), 'Stacks') else 'CREATE'
+        except AwsUnavailable as error:
+            if 'does not exist' not in str(error):
+                raise
+            kind = 'CREATE'
+        name = 'hana-' + uuid4().hex
+        try:
+            _ = api.call('create-change-set', '--stack-name', settings.stack_name, '--change-set-name', name,
+                         '--change-set-type', kind, '--template-body', 'file://' + str(template),
+                         '--capabilities', 'CAPABILITY_NAMED_IAM', '--parameters', json.dumps(
+                             [{'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()]),
+                         service='cloudformation')
+            wait_error: Exception | None = None
+            try:
+                _ = api.call('wait', 'change-set-create-complete', '--stack-name', settings.stack_name,
+                             '--change-set-name', name, service='cloudformation', timeout_s=timeout)
+            except (AwsUnavailable, subprocess.SubprocessError) as error:
+                wait_error = error
+            change = api.call('describe-change-set', '--stack-name', settings.stack_name, '--change-set-name', name,
+                              service='cloudformation')
+            reason = str(change.get('StatusReason', '')).lower()
+            if change.get('Status') == 'FAILED' and any(text in reason for text in ("didn't contain changes", 'no changes')):
+                _ = self._discard_change_set(api, settings.stack_name, name)
+                return
+            if wait_error is not None:
+                raise wait_error
+            if change.get('Status') != 'CREATE_COMPLETE':
+                raise AwsUnavailable('the Hana change set is not complete')
+            replaced = [ledger.text(resource, 'LogicalResourceId') for resource in
+                        (ledger.mapping(item.get('ResourceChange')) for item in ledger.rows(change, 'Changes'))
+                        if resource.get('ResourceType') in ('AWS::EC2::Instance', 'AWS::EC2::Volume', 'AWS::EC2::VolumeAttachment')
+                        and (resource.get('Action') == 'Remove' or resource.get('Replacement') in ('True', 'Conditional'))]
+            if replaced:
+                leftover = self._discard_change_set(api, settings.stack_name, name)
+                raise DeploymentRefused('hana-setup refuses replacement: ' + ', '.join(replaced)
+                                        + '; run deploy.py down --workload hana --approve-destroy first' + leftover)
+            _ = api.call('execute-change-set', '--stack-name', settings.stack_name, '--change-set-name', name,
+                         service='cloudformation')
+            _ = api.call('wait', 'stack-create-complete' if kind == 'CREATE' else 'stack-update-complete',
+                         '--stack-name', settings.stack_name, service='cloudformation', timeout_s=timeout)
+        except (AwsUnavailable, subprocess.SubprocessError) as error:
+            tag = ('HanaDeployment', parameters['DeploymentId'])
+            try:
+                ended = spot_end.end_boxes(api, tag, keep=keep)
+                # Read the rollback events before a stack delete makes them unreadable by name.
+                kept = retained.skipped_since(api, settings.stack_name, started)
+                if kind == 'CREATE':
+                    _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
+                    _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                                 service='cloudformation', timeout_s=timeout)
+                retained.delete(api, kept, wait_s=timeout)
+            except (AwsUnavailable, subprocess.SubprocessError, spot_end.SpotEndIncomplete) as end_error:
+                raise AwsUnavailable(f'{error}\nthe failed Hana change did not remove what it made: {end_error}') from None
+            raise AwsUnavailable(f'{error}\nthe failed Hana change ended {ended} Spot boxes and their requests, '
+                                 + f'and deleted {len(kept.volumes)} disks and {len(kept.buckets)} buckets') from None
+
+    def hana_down(self, *, approve_destroy: bool = False) -> bool:
+        """Cancel every Hana Spot request, terminate its boxes, delete the Hana stack, then its data disk and bucket."""
+        print('down --workload hana cancels each Hana Spot request, then terminates its boxes and deletes the Hana stack.')
+        print('down --workload hana then deletes the Hana data disk and control bucket; their data is lost.')
+        if not approve_destroy:
+            print('Run deploy.py down --workload hana --approve-destroy to remove the Hana box.')
+            return True
+        self._check_credentials()
+        path = self.directory / 'hana' / 'setup.json'
+        if not path.exists():
+            print('down --workload hana: no Hana deployment is saved')
+            return True
+        saved = remote.read_record(path)
+        settings, _, _ = self._hana_inputs()
+        api = self._api(settings)
+        timeout = conf.read(self.settings_path).whole('stack_wait_timeout_s')
+        tag = ('HanaDeployment', ledger.text(saved, 'deployment'))
+        with control_lock(self.directory):
+            # Read the stack's disk and bucket before the stack delete removes the record of them.
+            kept = retained.in_stack(api, settings.stack_name) | retained.Retained(
+                frozenset([str(saved['data_volume'])] if saved.get('data_volume') else []),
+                frozenset([str(saved['bucket'])] if saved.get('bucket') else []))
+            with step('hana-down', 'ending the Hana Spot boxes', self.settings_path):
+                ended = spot_end.end_boxes(api, tag)
+            if 'generation' in saved:
+                hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path,
+                    hana_spend.read_settings(conf.read_or_repository('hana_aws'))).reconcile(
+                        int(self.clock()), 'terminated', generation=ledger.instant(saved, 'generation'))
+            with step('hana-down', 'deleting the Hana stack', self.settings_path, hint='can take several minutes'):
+                _ = api.call('delete-stack', '--stack-name', settings.stack_name, service='cloudformation')
+                _ = api.call('wait', 'stack-delete-complete', '--stack-name', settings.stack_name,
+                             service='cloudformation', timeout_s=timeout)
+            with step('hana-down', 'deleting the Hana data disk and control bucket', self.settings_path):
+                retained.delete(api, kept, wait_s=timeout)
+            for name in ('lifecycle.json', 'setup.json'):
+                (self.directory / 'hana' / name).unlink(missing_ok=True)
+        print(f'down --workload hana: done; {ended} Spot boxes ended; '
+              + f'{len(kept.volumes)} disks and {len(kept.buckets)} buckets deleted')
         return True
 
     def _hana_inputs(self) -> tuple[DeploymentSettings, dict[str, str], bytes]:
@@ -721,18 +823,17 @@ class Deployment:
             lines.append('stack status is unavailable')
         return AwsUnavailable('\n'.join(lines).replace(notification, '<notification address>'))
 
-    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str], *,
-                      remove_builder: bool = False) -> None:
+    def _update_stack(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
         api = self._api(settings)
         stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
         live = self._stack(settings)
         notification = parameters.get('NotificationEmail') or '<notification address>'
         values: list[dict[str, object]] = [
-            {'ParameterKey': key, 'UsePreviousValue': True} if remove_builder and key != 'EnableCompute' or key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
+            {'ParameterKey': key, 'UsePreviousValue': True} if key in ('Bootstrap', 'AmiId') and live.get('InstanceId')
             else {'ParameterKey': key, 'ParameterValue': value}
             for key, value in {**parameters, 'EnableCompute': 'false'}.items()
         ]
-        if not remove_builder and (self.directory / 'gate-deployment.json').exists():
+        if (self.directory / 'gate-deployment.json').exists():
             template = ledger.mapping(cast(object, json.loads(TEMPLATE.read_text())))
             values.extend({'ParameterKey': key, 'UsePreviousValue': True}
                           for key in ledger.mapping(template['Parameters']) if key.startswith('Gate') or key == 'EnableGates')
@@ -772,18 +873,13 @@ class Deployment:
             replacements: list[str] = []
             for item in ledger.rows(change, 'Changes'):
                 resource = ledger.mapping(item.get('ResourceChange'))
-                if remove_builder and resource.get('Action') == 'Remove' and resource.get('LogicalResourceId') in (
-                        'Instance', 'DataVolume', 'DataAttachment', 'LaunchTemplate', 'InstanceRole', 'InstanceProfile',
-                        'SecurityGroup', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy'):
-                    continue
                 if resource.get('ResourceType') in protected and (resource.get('Action') == 'Remove'
                         or resource.get('Replacement') in ('True', 'Conditional')):
                     replacements.append(f"{ledger.text(resource, 'LogicalResourceId')} ({ledger.text(resource, 'ResourceType')})")
             if replacements:
                 raise DeploymentRefused('up refuses replacement: ' + ', '.join(replacements)
                                         + '; run deploy.py down --approve-destroy, then deploy.py up --approve-resources')
-            if not remove_builder:
-                self._before_request(settings, parameters)
+            self._before_request(settings, parameters)
             _ = api.call('execute-change-set', '--stack-name', stack_id, '--change-set-name', name, service='cloudformation')
             executed = True
             _ = api.call('wait', 'stack-update-complete', '--stack-name', stack_id, service='cloudformation',
@@ -1403,67 +1499,6 @@ class Deployment:
         print('cloud-gate: deployed, but the Spot price read failed for the regions above. '
               + 'The hourly refresh tries again.', flush=True)
 
-    def remove_builder(self, *, approve_destroy: bool = False) -> bool:
-        if not approve_destroy:
-            print(teardown.BUILDER_DRY_RUN)
-            return True
-        self._check_credentials()
-        settings = read_deployment_settings(self.settings_path, self.directory)
-        api = self._api(settings)
-        removal = teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
-            api, self.execute, tailnet=box.tailnet_request, clock=self.clock, builder_only=True)
-        with control_lock(self.directory / 'up'):
-            with step('remove-builder', 'checking the deployment', self.settings_path):
-                _ = removal.verify()
-            removal.remember()
-            with step('remove-builder', 'disabling builder routing', self.settings_path):
-                _ = removal.routing()
-            paths = box.builder_state_paths()
-            with mac_test.locked(paths.lock), control_lock(self.directory):
-                if box.running_claims(paths):
-                    raise DeploymentRefused('AWS claims remain live; retry after their completion')
-                with step('remove-builder', 'removing the builder from Tailscale', self.settings_path):
-                    _ = removal.devices()
-                stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
-                stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
-                                            service='cloudformation'), 'Stacks')[0]
-                body = api.call('get-template', '--stack-name', stack_id, service='cloudformation')['TemplateBody']
-                template = ledger.mapping(cast(object, json.loads(body)) if isinstance(body, str) else body)
-                resources = ledger.mapping(template['Resources'])
-                builder_roles = ('InstanceRole', 'InstanceProfile', 'SecurityGroup')
-                needs_update = (self._stack(settings).get('ComputeEnabled') != 'false'
-                                or any(ledger.mapping(resources[name]).get('Condition') != 'Compute' for name in builder_roles))
-                for name in builder_roles:
-                    ledger.mapping(resources[name])['Condition'] = 'Compute'
-                self.output.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(self.output / 'template.json', json.dumps(template) + '\n')
-                parameters = {ledger.text(row, 'ParameterKey'): str(row.get('ParameterValue', ''))
-                              for row in ledger.rows(stack, 'Parameters')}
-                if needs_update:
-                    with step('remove-builder', 'updating the stack', self.settings_path, hint='can take several minutes'):
-                        self._update_stack(settings, parameters, remove_builder=True)
-                with step('remove-builder', 'deleting builder storage', self.settings_path):
-                    _ = removal.data_volume()
-                now = int(self.clock())
-                book = ledger.CostLedger(self.directory)
-                book.observe(ledger.InstanceObservation(now, 'terminated', 'confirmed builder removal'), confirms_transition=True)
-                for request in book.pending_compute_requests():
-                    book.resolve_compute_request(request, ledger.ComputeResourcesAbsent(now))
-                inventories = book.read_snapshot().inventories
-                if not inventories or not inventories[-1].builder_removed:
-                    builder_costs = {key for key, _cost in read_settings(self.settings_path).fixed_components}
-                    kept = tuple(resource for resource in inventories[-1].resources
-                                 if resource.name not in builder_costs) if inventories else ()
-                    book.record_inventory(ledger.ResourceInventory(now, kept, 'confirmed builder removal', builder_removed=True))
-                saved = deployment_record(self.directory)
-                saved.update(outputs=self._stack(settings), data_volume_id='')
-                write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
-                with step('remove-builder', 'deleting local builder records', self.settings_path):
-                    for name in ('up.json', 'box-tools.json', 'box-shell.json'):
-                        (self.directory / name).unlink(missing_ok=True)
-        print('remove-builder: done; gate resources and gate-deployment.json kept')
-        return True
-
     def down(self, *, approve_destroy: bool = False) -> bool:
         if not approve_destroy:
             print(teardown.DRY_RUN)
@@ -1597,7 +1632,7 @@ def main() -> int:
         with step('gate-trial', 'running the trial', settings_path):
             return gate_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-builder', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'spot-table', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'apply'))
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--workload', choices=('merge-gates', 'hana'), default='merge-gates')
@@ -1619,9 +1654,9 @@ def main() -> int:
         elif args.command == 'up':
             return 0 if deploy.gate_up(approve_resources=args.approve_resources) else 1
         elif args.command == 'down':
+            if args.workload == 'hana':
+                return 0 if deploy.hana_down(approve_destroy=args.approve_destroy) else 1
             return 0 if deploy.down(approve_destroy=args.approve_destroy) else 1
-        elif args.command == 'remove-builder':
-            return 0 if deploy.remove_builder(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'remove-images':
             return 0 if deploy.remove_images(approve_destroy=args.approve_destroy) else 1
         elif args.command == 'spot-table':
