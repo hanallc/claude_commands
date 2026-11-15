@@ -253,6 +253,8 @@ ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re
               re.compile(r"\(([a-z])\)\s"))
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 BLANK_LINE = re.compile(r"\n\s*\n")
+ITEM_CODE = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
+                       + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
 CHOICE_LABEL_PATTERN = r'''(?:'[^'\n]+'|"[^"\n]+"|[^'"\n:.!?;]{1,60}?)(?:\s+\(recommended\))?:\s+'''
 CHOICE_LABEL = re.compile(CHOICE_LABEL_PATTERN, re.IGNORECASE)
 INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IGNORECASE)
@@ -268,9 +270,12 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
     Return the text before the run, the items and the text after a blank line in the last item."""
     best: list[re.Match[str]] = []
+    code_blocks = list(ITEM_CODE.finditer(text))
     for style in ITEM_MARKS:
         run: list[re.Match[str]] = []
         for mark in style.finditer(text):
+            if any(block.start() <= mark.start() < block.end() for block in code_blocks):
+                continue
             value = mark[1]
             if not run and value in ("1", "a"):
                 run.append(mark)
@@ -282,22 +287,39 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
         return text, [], ""
     ends = [mark.start() for mark in best[1:]] + [len(text)]
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
-    last = BLANK_LINE.split(items[-1], maxsplit=1)
-    items[-1] = last[0]
-    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+    last = items[-1]
+    blocks = list(ITEM_CODE.finditer(last))
+    trailing = ""
+    for blank in BLANK_LINE.finditer(last):
+        if any(block.start() <= blank.start() < block.end()
+               or block.start() == blank.end() and last[:blank.start()].rstrip().endswith(":") for block in blocks):
+            continue
+        items[-1], trailing = last[:blank.start()], last[blank.end():]
+        break
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], trailing
 
 
 def item_html(entry: str) -> str:
-    """Show an item that is one backtick span, such as a command, as a code block."""
-    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    """Show a code block alone or after an item's text that ends with a colon."""
+    whole = ITEM_CODE.fullmatch(entry.strip())
     if whole is not None:
-        return ('<div class="code-block"><pre><code>' + html.escape(whole.group(1))
+        return ('<div class="code-block"><pre><code>' + html.escape(whole[1] if whole[1] is not None else whole[2])
                 + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
+    for block in ITEM_CODE.finditer(entry):
+        before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
+        if before.endswith(":"):
+            return item_html(before) + item_html(block[0]) + (item_html(after) if after else "")
     return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
 
 
 def item_list(items: list[str]) -> str:
-    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
+    entries: list[str] = []
+    for entry in items:
+        if entries and entries[-1].rstrip().endswith(":") and ITEM_CODE.fullmatch(entry.strip()) is not None:
+            entries[-1] += "\n" + entry
+        else:
+            entries.append(entry)
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in entries) + "</ol>"
 
 
 def choice_list(choices: list[str]) -> str:
@@ -319,7 +341,10 @@ def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
     text = item.get("reviewed", item.get("question", item["text"])).strip()
     if "reviewed" in item:
         title, _, context = text.partition("\n")
-        return title.strip(), context.strip()
+        if "?" in title:
+            return title.strip(), context.strip()
+        first = SENTENCE_END.split(title, maxsplit=1)
+        return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
     question = SENTENCE_END.split(text[:text.index("?") + 1])[-1] if "?" in text else ""
     if question:
         before, _, after = text.partition(question)
