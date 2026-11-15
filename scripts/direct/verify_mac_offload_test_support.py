@@ -704,10 +704,17 @@ if os.environ.get("TEST_RUNNER_HOLD") == "1":
 mode = os.environ.get("TEST_RUNNER_MAC", "declined")
 reason = os.environ.get("TEST_RUNNER_REASON", "")
 runner_status = int(os.environ.get("TEST_RUNNER_STATUS", "75"))
+fix = ""
 answer = root / "runner-answer"
 if answer.exists():
     mode, reason, status_text = answer.read_text().splitlines()
     runner_status = int(status_text)
+# runner-answer-<verb> answers one verb: mode, reason, status, then an optional fix= word.
+verb_answer = root / ("runner-answer-" + (arguments[arguments.index("--verb") + 1] if "--verb" in arguments else ""))
+if verb_answer.exists():
+    mode, reason, status_text, *fix_words = verb_answer.read_text().splitlines()
+    runner_status = int(status_text)
+    fix = fix_words[0] if fix_words else ""
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
@@ -729,7 +736,8 @@ else:
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
-        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else ""),
+        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else "")
+        + ("fix=" + fix + "\n" if fix else ""),
         encoding="utf-8",
     )
 if mode == "declined":
@@ -1660,6 +1668,10 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         temporary = answer.with_suffix(".new")
         _ = temporary.write_text(f"{mode}\n{reason}\n{status}\n")
         _ = temporary.replace(answer)
+
+    def set_verb_answer(self, verb: str, mode: str, status: int, fix: str = "") -> None:
+        """Answer one Mac verb; fix is the fix= word of a mend-fix result."""
+        _ = (self.runner_state / f"runner-answer-{verb}").write_text(f"{mode}\n\n{status}\n{fix}\n")
 
     def runner_episode(self) -> str:
         """Read the episode from the actual runner assignment."""
