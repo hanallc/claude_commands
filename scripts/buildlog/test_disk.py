@@ -51,6 +51,24 @@ class DiskTests(unittest.TestCase):
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
 
+    def test_mapping_asks_cargo_only_for_checkouts_no_saved_row_maps(self) -> None:
+        base = self.base()
+        rows: dict[str, CargoOutputRoots] = {}
+        for name in ("saved", "new"):
+            for checkout in (base / name, base / name / "member"):
+                checkout.mkdir(parents=True)
+                _ = (checkout / "Cargo.toml").write_text("[package]\n")
+            rows[name] = CargoOutputRoots(base / name, base / name / "target", base / "build" / name)
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((rows["saved"],)))
+        with mock.patch.object(disk, "read_cargo_output_roots", return_value=rows["new"]) as read:
+            outputs, unavailable = disk.mapped_output_paths([("base", str(base))])
+            again, _ = disk.mapped_output_paths([("base", str(base))])
+        read.assert_called_once_with(base / "new")
+        self.assertEqual(unavailable, [])
+        expected = sorted(path for row in rows.values() for path in (row.target_directory, row.build_directory))
+        self.assertEqual((outputs, again), (expected, expected))
+        self.assertIn(rows["new"], sweep.saved_cargo_output_roots().workspaces)
+
     def test_scanned_folders_add_the_scratch_root_only_outside_the_folders(self) -> None:
         base = self.base()
         folders = [("tmp", str(base / "tmp"))]
