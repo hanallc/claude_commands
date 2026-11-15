@@ -311,6 +311,10 @@ Builder slots, warm mirrors, idle shutdown, and queue-based starts are historica
 Only historical cost, ownership, and teardown compatibility remain.
 The foundation template has no builder instance, launch template, data volume, roles or stop action.
 The `remove-builder` command and the `down` compute stage are removed.
+The foundation template has no builder parameters or outputs, such as `EnableCompute` or `ComputeEnabled`, since 2026-11-15.
+`deploy.py` has no legacy record migration, data volume adoption, saved builder image or compute request reconcile.
+`down` reads a record without `ComputeEnabled` as a foundation with no builder.
+The ledger still prices the recorded builder hours with `instance_type` and `spot_max_usd_per_hour`.
 
 On 2026-11-04 an `up` with `cloudformation deploy` replaced the builder instance, and the update failed.
 The rollback terminated the new instance, so its persistent Spot request opened again.
@@ -653,7 +657,9 @@ The user asked for this layout on 2026-11-14 through builds. Each line shows:
 4. The estimate: Spot price times that box time, plus the refusal wait cost.
 5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
 6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
-   Runs on days without a bill show `bill due`.
+   The cell also counts the runs whose day has no bill yet, such as `0.0314 (17 bill due)`.
+   A bill comes up to about a day late.
+   A region whose runs all wait for a bill shows `17 bill due`; a region with no own runs of the type shows `no runs`.
 7. Paid runs: the count of runs that paid USD/run covers.
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.

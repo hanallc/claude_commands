@@ -206,7 +206,7 @@ class TargetRemoval:
         self.saved = deployment_record(self.directory)
         receipt = self.directory / 'down-complete.json'
         builder_receipt = self.directory / 'builder-removal.json'
-        if builder_receipt.exists() and ledger.mapping(self.saved.get('outputs', {})).get('ComputeEnabled') == 'false':
+        if builder_receipt.exists() and ledger.mapping(self.saved.get('outputs', {})).get('ComputeEnabled', 'false') == 'false':
             previous = remote.read_record(builder_receipt)
             outputs = ledger.mapping(self.saved.get('outputs', {})).copy()
             previous_outputs = ledger.mapping(previous.get('outputs', {}))
@@ -260,7 +260,8 @@ class TargetRemoval:
                 raise ValueError('a completed removal record cannot authorize another stack deletion')
             return True
         # Refusals must leave up available to record missing deletion identities.
-        foundation_without_volume = (outputs.get('ComputeEnabled') == 'false'
+        # The foundation template has no ComputeEnabled output now; a record without it has no builder.
+        foundation_without_volume = (outputs.get('ComputeEnabled', 'false') == 'false'
                                      and not outputs.get('InstanceId') and not outputs.get('DataVolumeId')
                                      and saved.get('data_volume_id', '') == '')
         for key in ('data_volume_id', 'budget_name'):
@@ -277,7 +278,7 @@ class TargetRemoval:
         _ = self._device_identity()
         if stack:
             outputs = self._outputs(stack)
-            if foundation_without_volume and (outputs.get('ComputeEnabled') != 'false'
+            if foundation_without_volume and (outputs.get('ComputeEnabled', 'false') != 'false'
                     or outputs.get('InstanceId') or outputs.get('DataVolumeId')):
                 raise ValueError('the live foundation has compute resources absent from the deployment record')
             for key, value in (('InstanceId', self.identity.instance), ('DataVolumeId', self.identity.volume),
