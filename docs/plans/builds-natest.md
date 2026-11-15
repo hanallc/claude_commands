@@ -4112,19 +4112,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change; builds asked 11-15).
 
-#### Work Order
+#### As-built
 
-**Goal:** `build_queue/test_queue_place` does not wait seconds of real time on fixture start spacing or on the stop grace.
-
-**Spec:**
-- `QueuePlaceFixture` in `scripts/build_queue/test_queue_place.py` opens `AdmissionFixture` with `skip_idle_spacing=True`. No queue_place test checks the start spacing.
-- The fixture config sets `program_stop_seconds=0.2` and `program_sample_seconds=0.1`. A test that rewrites the config keeps its own values.
-- Cause: `cleanup_program_starts` waits `program_stop_seconds` (5 s) on a TERM-resistant program; the start window test runs 6 subtests.
-
-**Files:** `scripts/build_queue/test_queue_place.py`.
-
-**Workers:** 1 writer; no split (one fixture). impl: the file. test opens as impl.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `build_queue/test_queue_place` passes with the same tests; AWS pair shows no CPU rise.
+- `QueuePlaceFixture` in `scripts/build_queue/test_queue_place.py` opens `AdmissionFixture` with `skip_idle_spacing=True`. Its config sets `program_stop_seconds=0.2` and `program_sample_seconds=0.1`; a test that rewrites the config keeps its own values.
+- Cause: the fixture queue waited 5 s of start spacing between starts, and `cleanup_program_starts` waited a 5 s stop grace on a TERM-resistant program.
+- AWS pair (3 rounds): CPU 15.65 -> 15.21 s, wall 127.7 -> 24.8 s; all pass, same tests.
+- Commit ce8c5dc7c. Test-only change.
