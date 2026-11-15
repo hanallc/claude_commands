@@ -4051,31 +4051,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (production change; sdlc go 2026-11-14 with six conditions).
 
-#### Work Order
+#### As-built
 
-**Goal:** each Python start reads the compiled dataclass method code from a shared cache, so the AWS gate uses less CPU.
-
-**Decision:** on 7d085e2fe, the compile of the generated dataclass methods was 45-80% of the import CPU of the hot CLIs (direct.assign 278 of 428 ms, admission_protocol 146 of 183 ms, progress_history 74 of 133 ms). Probe trial 7565fb4ec: AWS pair 299.0 -> 274.9 CPU s on 8 modules.
-
-**Spec:**
-1. `sitecustomize.start_process` inserts a `DataclassCodeFinder` in `sys.meta_path` before `dataclasses` loads. When a process imports `dataclasses`, the finder sets the module global `exec` to `dataclass_exec`.
-2. `dataclass_code(source, folder)` keys an entry by the sha1 of the compile flags, `sys.flags.optimize` and the source, in `/var/tmp/dataclass-code-<uid>/<sys.implementation.cache_tag>`. It compiles with the filename `<string>`, flags 0 and `dont_inherit=True`, as the dataclasses exec does.
-3. A missing, truncated or corrupt entry compiles again and replaces the file atomically; it never raises.
-4. The root must be a folder that the user owns with mode 0700. Any other root turns the cache off with no error.
-5. A read refreshes the entry time once a day. `tmp_sweep.sweep` prunes the entries that no process read in lint.conf `dataclass_code_days` days, and each emptied cache tag folder.
-6. `lib/test_dataclass_code.py` fails when the startup hook does not give `dataclasses` the cached exec on the current Python.
-
-**Files:**
-- `scripts/lib/python_startup/sitecustomize.py`
-- `scripts/lint/tmp_sweep.py`
-- `config/lint.conf`
-- `scripts/lib/test_dataclass_code.py`
-
-**Workers:** director; no-worker mode.
-- impl: all files.
-
-**Constraints from prior phases:** none.
-
-**Acceptance gate:**
-- The startup, sweep and new modules pass; basedpyright 0 errors and 0 warnings.
-- AWS pair (3 rounds) shows a gain; the checkpoint names the live CLI start gains.
+- `sitecustomize.start_process` inserts a `DataclassCodeFinder`. When a process imports `dataclasses`, the finder sets its global `exec` to `dataclass_exec`.
+- `dataclass_code(source, folder)` reads the marshal code of each generated source from `/var/tmp/dataclass-code-<uid>/<cache tag>`, keyed by the sha1 of the compile flags, the optimize level and the source. A miss, or a truncated or corrupt entry, compiles with `<string>`, flags 0 and `dont_inherit=True`, and replaces the file.
+- A root that is not a 0700 folder of the user turns the cache off with no error.
+- A read refreshes an entry once a day. `tmp_sweep.prune_dataclass_code` removes the entries that no process read in lint.conf `dataclass_code_days` days, and each emptied cache tag folder. Only the live `/tmp` roots add the cache root.
+- `lib/test_dataclass_code.py` fails when the startup hook does not give `dataclasses` the cached exec on the current Python.
+- AWS pair (3 rounds, median CPU s): 8 modules 290.41 -> 255.76; `test_statusline` 45.05 -> 34.42; `test_offload` 46.90 -> 40.08.
+- Live CLI start CPU on natedev: `direct.assign` 335 -> 199 ms; `admission_protocol` 144 -> 85 ms; `progress_history` 118 -> 83 ms.
+- Commit 3f52df2c3. Production change (sdlc go 2026-11-14).
