@@ -138,14 +138,13 @@ function visible(table) {
 }
 
 // For each ranking, the cells of its first set that has a cell in view: the lowest price in the chosen regions.
+// A ranking with fewer than two prices in view compares nothing, so it marks no cell.
 function lowestShown(rankings, view) {
   const columns = new Set(view.columns);
   const marked = new Set();
   for (const ranking of rankings || []) {
-    for (const ties of ranking) {
-      const inView = ties.filter(([, column]) => columns.has(column));
-      if (inView.length) { inView.forEach(cell => marked.add(String(cell))); break; }
-    }
+    const sets = ranking.map(ties => ties.filter(([, column]) => columns.has(column))).filter(ties => ties.length);
+    if (sets.flat().length > 1) sets[0].forEach(cell => marked.add(String(cell)));
   }
   return marked;
 }

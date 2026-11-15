@@ -633,6 +633,7 @@ A region filter at the top of the page shows all regions by default; the user as
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
 3. The fill and the outline mark the lowest price in the chosen regions. `Table.row_ranks` and `Table.group_ranks`
    hold each row and each vCPU count from the lowest price up, so the page marks the first set that has a chosen region.
+   A row or vCPU count with fewer than two prices in the chosen regions has no mark: one region shows no fill.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
 6. The page keeps the choice in browser storage, with the run kind.
