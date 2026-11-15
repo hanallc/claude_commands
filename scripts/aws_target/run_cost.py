@@ -6,10 +6,13 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import json
 from statistics import median
+from typing import cast
 
 from scripts.aws_target import ledger
 from scripts.aws_target.measurement import number
+from scripts.lib import conf
 
 KINDS = (('merge-gate', 'merge gates'), ('targeted-test', 'targeted tests'))
 EVERY_KIND = tuple(mode for mode, _label in KINDS)
@@ -266,14 +269,25 @@ class RunEvidence:
         return Decimal(refused) / max(launched, 1), refused, launched
 
     def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
-                     default_seconds: Decimal) -> Decimal:
-        """Spot price for the median box time, plus the wait cost of the expected refusals first."""
-        seconds, _own = self.box_seconds(size, region, modes)
+                     default_seconds: Decimal, *, unmeasured_extra_s: Decimal) -> Decimal:
+        """Spot price for the median box time, plus the wait cost of the expected refusals first.
+
+        A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
+        seconds, own = self.box_seconds(size, region, modes)
         seconds = seconds or [time for mode in modes for time in self.by_mode.get(mode, [])]
-        box = Decimal(median(seconds)) if seconds else default_seconds
+        box = (Decimal(median(seconds)) if seconds else default_seconds) + (Decimal(0) if own else unmeasured_extra_s)
         # Capacity refusals do not depend on the run kind, so every request counts.
         refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+
+
+def region_numbers(values: conf.ConfigRead, key: str) -> dict[str, Decimal]:
+    """Read a JSON map from region names to nonnegative numbers; a missing region has none."""
+    numbers = {region: conf.decimal(str(value))
+               for region, value in ledger.mapping(cast(object, json.loads(values.text(key)))).items()}
+    if any(not region or value < 0 for region, value in numbers.items()):
+        raise ValueError(f'{key} needs region names and nonnegative numbers')
+    return numbers
 
 
 def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: datetime, home: str) -> RunEvidence:

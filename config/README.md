@@ -856,11 +856,13 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` sets `regions=us-east-2 us-west-2` in launch order.
+`cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.
 The list can include other regions that the account policy permits.
-Each gate tries every configured type and public zone in one region before it tries the next region.
+Each gate tries its types, regions and zones in order of expected USD per run.
+`region_transfer_usd` sets the transfer USD per gate for a far region.
+`unmeasured_region_extra_seconds` adds seconds to the borrowed box time of a region without its own runs.
 Capacity refusals and unsupported types select the next variant.
 After all regions refuse, a normal gate can use natedev.
 All regions use the same daily and monthly spend caps.
