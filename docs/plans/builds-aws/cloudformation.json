@@ -2,52 +2,13 @@
   "AWSTemplateFormatVersion": "2010-09-09",
   "Description": "Guarded Spot gate target: Budget, scaler user and one-time Spot gate boxes.",
   "Parameters": {
-    "InstanceType": {
-      "Type": "String",
-      "AllowedValues": [
-        "m7a.4xlarge"
-      ]
-    },
-    "AmiId": {
-      "Type": "AWS::EC2::Image::Id"
-    },
-    "AvailabilityZone": {
-      "Type": "AWS::EC2::AvailabilityZone::Name"
-    },
     "VpcId": {
       "Type": "AWS::EC2::VPC::Id"
-    },
-    "SubnetId": {
-      "Type": "AWS::EC2::Subnet::Id"
     },
     "NotificationEmail": {
       "Type": "String"
     },
     "RootDeviceName": {
-      "Type": "String"
-    },
-    "RootVolumeGiB": {
-      "Type": "Number"
-    },
-    "DataVolumeGiB": {
-      "Type": "Number",
-      "AllowedValues": [
-        500
-      ]
-    },
-    "DataVolumeIops": {
-      "Type": "Number",
-      "AllowedValues": [
-        6000
-      ]
-    },
-    "DataVolumeThroughput": {
-      "Type": "Number",
-      "AllowedValues": [
-        500
-      ]
-    },
-    "SpotMaxPrice": {
       "Type": "String"
     },
     "MonthlyLimitUsd": {
@@ -69,23 +30,8 @@
     "CostTagValue": {
       "Type": "String"
     },
-    "Bootstrap": {
-      "Type": "String"
-    },
     "ScalerUserName": {
       "Type": "String"
-    },
-    "EnableCompute": {
-      "Type": "String",
-      "AllowedValues": [
-        "false",
-        "true"
-      ],
-      "Default": "false"
-    },
-    "ExistingDataVolumeId": {
-      "Type": "String",
-      "Default": ""
     },
     "DeploymentId": {
       "Type": "String",
@@ -1308,16 +1254,6 @@
     "BudgetName": {
       "Value": {
         "Ref": "MonthlyBudget"
-      }
-    },
-    "ComputeEnabled": {
-      "Value": {
-        "Ref": "EnableCompute"
-      }
-    },
-    "ExistingDataInput": {
-      "Value": {
-        "Ref": "ExistingDataVolumeId"
       }
     },
     "ScalerUserName": {
