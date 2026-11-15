@@ -268,7 +268,8 @@ Each card shows, in this order:
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
 3. The image, as a link to the full size.
-4. The **Delete** button.
+4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
+5. The **Delete** and **Send feedback** buttons.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
@@ -289,7 +290,17 @@ The server checks the token and removes the image folder at once under `images/.
 No message goes to the owner.
 The page does not wait: the card leaves the page at once, and the request runs in the background.
 A failed delete puts the card back in its place with one line: **Not deleted: <reason>**.
-The page skips its refresh while a delete runs.
+The page skips its refresh while a delete or a feedback send runs.
+
+**Send feedback** posts the same signed form with the feedback text.
+The page refuses empty feedback with **Enter feedback first.** and keeps the card.
+Otherwise the card leaves the page at once, and the request runs in the background.
+The server sends one message to the owner's staff id, resolved to its current session at each try.
+It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
+The message holds the feedback, the image link, the caption, the For line and the delete command for the owner to run after it acts.
+After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
+When no try reaches the owner, the server answers 503 and writes nothing.
+The card goes back in its place with one line: **Not sent: <reason>**.
 An agent deletes an image with this command:
 
 ```sh

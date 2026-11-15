@@ -1,4 +1,4 @@
-"""Register images for the console's Images page, render the page, and delete images."""
+"""Register images for the console's Images page, render the page, delete images, and send feedback to owners."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 from urllib.parse import parse_qs
 
 from scripts.lib import atomic_file, conf, file_lock
@@ -28,6 +28,8 @@ LOCK = ".review-link-images.lock"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 IDENTITY = re.compile(r"[0-9a-f]{12}")
+SENDER = Path(__file__).stem
+ACTIONS = frozenset(("delete", "feedback"))
 
 
 class ImageRecord(TypedDict):
@@ -37,6 +39,12 @@ class ImageRecord(TypedDict):
     owner: str
     subject: str
     registered_at: str
+    # Set when the owner received the user's feedback; the page hides the image until the owner deletes it.
+    feedback_at: NotRequired[str]
+
+
+class FeedbackNotSent(Exception):
+    """No try reached the owner; the image stays on the page."""
 
 
 def images_root(root: Path) -> Path:
@@ -63,9 +71,13 @@ def read_record(folder: Path) -> ImageRecord:
     texts = ("id", "file", "caption", "owner", "subject", "registered_at")
     if any(not isinstance(fields.get(key), str) for key in texts) or fields["id"] != folder.name:
         raise ValueError(f"{folder.name}: invalid image record")
-    return {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]), "caption": cast(str, fields["caption"]),
-            "owner": cast(str, fields["owner"]), "subject": cast(str, fields["subject"]),
-            "registered_at": cast(str, fields["registered_at"])}
+    record: ImageRecord = {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]),
+                           "caption": cast(str, fields["caption"]), "owner": cast(str, fields["owner"]),
+                           "subject": cast(str, fields["subject"]), "registered_at": cast(str, fields["registered_at"])}
+    feedback_at = fields.get("feedback_at")
+    if isinstance(feedback_at, str):
+        record["feedback_at"] = feedback_at
+    return record
 
 
 def write_record(folder: Path, record: ImageRecord) -> None:
@@ -142,8 +154,8 @@ def owner_name(record: staff.StaffSnapshot, identity: str) -> str:
     return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
 
 
-def card(record: ImageRecord, token: str, members: staff.StaffSnapshot) -> str:
-    """Show the caption as the title, then the aligned details, the image and the Delete button."""
+def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
+    """Show the caption as the title, then the aligned details, the image, the feedback field and the buttons."""
     path = html.escape(image_path(record), quote=True)
     caption = record["caption"]
     added = datetime.fromisoformat(record["registered_at"])
@@ -157,42 +169,90 @@ def card(record: ImageRecord, token: str, members: staff.StaffSnapshot) -> str:
             + f'{shown_time(added)}</time></dd></dl>'
             + f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
             + f'alt="{html.escape(caption.splitlines()[0], quote=True)}" loading="lazy"></a>'
-            + '<form method="post" data-delete>'
+            + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
-            + '<button type="submit">Delete</button><span role="status" data-delete-status></span></form></article>')
+            + f'<label for="feedback-{record["id"]}">Feedback</label>'
+            + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
+            + '<div class="image-actions"><button type="submit" name="action" value="delete">Delete</button>'
+            + '<button type="submit" name="action" value="feedback">Send feedback</button>'
+            + '<span role="status" data-image-status></span></div></form></article>')
 
 
 def render(root: Path) -> bytes:
     token = console_token(root)
     members = staff.snapshot()
-    cards = "".join(card(record, token, members) for record in records(root))
+    rows = conf.read("review_links").whole("feedback_rows")
+    cards = "".join(card(record, token, members, rows) for record in records(root) if "feedback_at" not in record)
     content = (STYLE + '<h1>Images</h1><div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images>{cards}</div><p hidden data-empty></p></div></div>'
-               + '<noscript>Enable JavaScript to filter images and to delete an image.</noscript>'
+               + '<noscript>Enable JavaScript to filter images, delete an image or send feedback.</noscript>'
                + f'<script>{SCRIPT}</script>')
     return change_page.document(content, "Images")
 
 
 def submit(root: Path, body: str) -> None:
-    """Delete the image that a signed form names."""
+    """Delete the image that a signed form names, or send its feedback to the image's owner."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) != {"image", "token"} or any(len(value) != 1 for value in fields.values()):
-        raise change_page.AnswerRefused("use the delete form on this page")
+    # A page loaded before Send feedback existed posts only the image and its token, which means delete.
+    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action"} or any(
+            len(value) != 1 for value in fields.values()):
+        raise change_page.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
     if not IDENTITY.fullmatch(identity):
         raise change_page.AnswerRefused("not an image id")
     expected = request_token(console_token(root), identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
         raise change_page.AnswerRefused("the image token does not match this page")
+    action = fields.get("action", ["delete"])[0]
+    if action not in ACTIONS:
+        raise change_page.AnswerRefused("use the form on this page")
+    if action == "feedback":
+        send_feedback(root, identity, fields.get("feedback", [""])[0].strip())
+        return
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
             delete(root, identity)
         except ValueError as error:
             raise change_page.AnswerRefused(str(error)) from error
+
+
+def feedback_message(record: ImageRecord, feedback: str) -> str:
+    origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
+    return "\n".join((
+        "From the user (via the Images page): feedback on your image.",
+        f"Feedback: {feedback}", f"Image: {origin}{image_path(record)}", f"Caption: {record['caption']}",
+        f"For: {record['subject']}",
+        "After you act on it, delete the image: "
+        + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
+
+
+def send_feedback(root: Path, identity: str, feedback: str) -> None:
+    """Send the feedback to the owner's current session, then hide the image until the owner deletes it."""
+    if not feedback:
+        raise change_page.AnswerRefused("enter feedback")
+    folder = images_root(root) / identity
+    try:
+        record = read_record(folder)
+    except (OSError, ValueError) as error:
+        raise change_page.AnswerRefused(f"no image {identity}") from error
+    settings = conf.read("review_links")
+    failures = change_page.send_with_retries(SENDER, (staff.StaffId(record["owner"]),),
+                                             feedback_message(record, feedback), settings.whole("delivery_tries"),
+                                             settings.number("delivery_pause_seconds"))
+    if failures:
+        raise FeedbackNotSent(failures[-1].error)
+    with file_lock.exclusive(images_root(root) / LOCK):
+        try:
+            current = read_record(folder)
+        except (OSError, ValueError):
+            # The owner deleted the image while the message was on its way.
+            return
+        current["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        write_record(folder, current)
 
 
 STYLE = """<style>[hidden]{display:none!important}
@@ -203,7 +263,9 @@ STYLE = """<style>[hidden]{display:none!important}
 .caption{margin:0 0 8px;font-size:1.25rem;line-height:1.35;font-weight:600;white-space:pre-line}
 .image-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:0 0 12px;font:14px/1.45 ui-monospace,monospace;opacity:.8}
 .image-details dt{white-space:pre}.image-details dd{margin:0}
-[data-images] form{margin-top:12px}[data-delete-status]{margin-left:8px}
+[data-images] form{display:grid;gap:8px;margin-top:12px}
+[data-images] textarea{font:inherit;width:100%;box-sizing:border-box;color:CanvasText;background:Canvas}
+.image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 main{max-width:1060px}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
@@ -222,7 +284,7 @@ const empty = document.querySelector('[data-empty]');
 const spans = {day: 86400, week: 604800, all: Infinity};
 const groups = document.querySelector('[data-image-groups]');
 let list = document.querySelector('[data-images]');
-let deleting = 0;
+let sending = 0;
 function apply() {
   const now = Date.now() / 1000, span = spans[menu.value];
   let shown = 0;
@@ -264,14 +326,19 @@ function showGroups() {
   groups.hidden = rows.length === 0;
 }
 function bind(root) {
-  root.querySelectorAll('form[data-delete]').forEach(form => form.addEventListener('submit', async event => {
+  root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();
-    // The card leaves at once and the delete runs in the background; a failure puts the card back.
+    const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
+    if (feedback && !form.elements.feedback.value.trim()) {
+      status.textContent = 'Enter feedback first.';
+      return;
+    }
+    // The card leaves at once and the request runs in the background; a failure puts the card back.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
-    const body = new URLSearchParams(new FormData(form));
-    form.querySelector('[data-delete-status]').textContent = '';
+    const body = new URLSearchParams(new FormData(form, event.submitter));
+    status.textContent = '';
     card.remove();
-    deleting++;
+    sending++;
     apply();
     try {
       const response = await fetch(location.pathname, {method: 'POST', body});
@@ -281,21 +348,21 @@ function bind(root) {
       }
     } catch (error) {
       home.insertBefore(card, next?.parentNode === home ? next : null);
-      form.querySelector('[data-delete-status]').textContent = 'Not deleted: ' + error.message;
+      status.textContent = (feedback ? 'Not sent: ' : 'Not deleted: ') + error.message;
       apply();
     } finally {
-      deleting--;
+      sending--;
     }
   }));
 }
 async function refresh() {
   if (document.visibilityState !== 'visible' || window.frameElement?.hidden === true) return;
-  if (deleting) return;
+  if (sending) return;
   try {
     const response = await fetch(location.pathname, {cache: 'no-store'});
     if (!response.ok) return;
     const fresh = new DOMParser().parseFromString(await response.text(), 'text/html').querySelector('[data-images]');
-    if (!fresh || deleting) return;
+    if (!fresh || sending) return;
     const top = scrollY;
     list.replaceWith(fresh);
     list = fresh;

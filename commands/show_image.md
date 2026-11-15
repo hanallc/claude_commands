@@ -26,4 +26,6 @@ A file path alone is not something the user can view.
 
 The page shows the oldest image first, and a new image goes to the end.
 The user removes an image with its **Delete** button.
+The user can also send feedback on an image. It arrives as a message that starts `From the user (via the Images page): feedback on your image.`
+Act on it as on the user's words. Then delete the image with the command in the message.
 To remove your own image, run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id <id>`.
