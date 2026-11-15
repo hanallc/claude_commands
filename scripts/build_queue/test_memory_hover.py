@@ -554,7 +554,10 @@ function fitLabels() {}
         self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]],
                          [*order, "cap", "shortfall", "waiting", "progress"])
         self.assertIn('<details class="legend-box" open>', page)
-        for removed in ('id="mark"', 'id="marklabel"', "updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText"):
+        # The user, 11-15: the memory bar keeps its cap marker.
+        self.assertIn('<div class="mark" id="mark" data-tip="cap">', bar)
+        self.assertIn('id="marklabel" data-tip="cap"', page)
+        for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText"):
             self.assertNotIn(removed, page)
 
     def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:

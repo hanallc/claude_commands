@@ -616,6 +616,56 @@ try {
             assert.ok(disagree.bar>0,'A disagreement hides the memory bar.');
             assert.equal(disagree.scale,false,'A disagreement hides the scale.');
             proof.disagree=disagree;
+            // Build tools and the CI file cache sit outside the memory bar's room block; the cap line still marks the cap.
+            const gib=1024**3, capReading=structuredClone(base);
+            Object.assign(capReading.ram,{builds_bytes:capReading.ram.queued_builds_bytes+2*gib,sccache_bytes:2*gib,
+              ci_bytes:gib/2,ci_counted_bytes:3*gib/2,room_bytes:capReading.ram.room_bytes-3*gib/2});
+            capReading.room-=1.5;
+            await show(capReading);
+            const capLine=await evaluate(`(() => {
+              const line=document.querySelector('#walk .walk-bud');
+              const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
+              const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
+              const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+              return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
+                left:box?box.left+1:null,top:box?.top,bottom:box?.bottom,roomRight:room?room.right:null,
+                expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:line?getComputedStyle(line).borderLeftColor:'',
+                scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+            })()`);
+            assert.ok(capLine.present,'The Running chart has no cap line.');
+            if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
+            assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
+            assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
+            const capClip={...capLine.card,scale:1};
+            const capShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:capClip})).data,'base64');
+            const capPixel=pngPixels(capShot)(Math.floor(capLine.left-capLine.card.x),Math.floor((capLine.top+capLine.bottom)/2+capLine.scrollY-capLine.card.y));
+            const capColor=capLine.color.match(/[0-9.]+/g).slice(0,3).map(Number);
+            assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
+              'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
+            if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
+            proof.capLine=capLine;
+            // The memory bar draws its cap marker and label at the cap value.
+            const barMark=await evaluate(`(() => {
+              const mark=document.querySelector('#barwrap #mark'), label=document.querySelector('#barwrap #marklabel');
+              const bar=document.querySelector('#barwrap .bar').getBoundingClientRect(), box=mark?.getBoundingClientRect();
+              const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+              return {present:!!mark&&!mark.hidden&&getComputedStyle(mark).display!=='none'&&box.height>0,
+                label:label&&!label.hidden?label.textContent:'',left:box?box.left+7:null,middle:(bar.top+bar.bottom)/2,
+                expected:bar.left+bar.width*latest.cap*${gib}/latest.ram.total_bytes,
+                color:mark?getComputedStyle(mark,'::before').borderLeftColor:'',scrollY,
+                card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
+            })()`);
+            assert.ok(barMark.present,'The memory bar has no cap marker.');
+            assert.equal(barMark.label,'cap '+capReading.cap.toFixed(1));
+            assert.ok(Math.abs(barMark.left-barMark.expected)<=1.5,'The memory bar cap marker is off the cap value. '+JSON.stringify(barMark));
+            const barShot=Buffer.from((await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{...barMark.card,scale:1}})).data,'base64');
+            const barPixel=pngPixels(barShot)(Math.floor(barMark.left-barMark.card.x),Math.floor(barMark.middle+barMark.scrollY-barMark.card.y));
+            const barColor=barMark.color.match(/[0-9.]+/g).slice(0,3).map(Number);
+            assert.ok(barPixel.every((value,index)=>Math.abs(value-barColor[index])<=1),
+              'The memory bar cap marker pixels differ. '+JSON.stringify({barPixel,barColor}));
+            if(width===1400) await writeFile(join(folder,`${theme}-${width}-bar-cap.png`),barShot);
+            proof.barMark=barMark;
             for(const [name,expected] of [['priority',"queue priority: research (the user's bump)"],
               ['priority_unmatched',''],['good','']]) {
               await show(readings[name]);
