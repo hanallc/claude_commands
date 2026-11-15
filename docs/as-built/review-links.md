@@ -246,36 +246,39 @@ A showrunner or unit registers each image with one command:
 ```
 
 - The caption says what changed and what to look at.
-- The owner is the staff id that gets delete requests. The command refuses an id that is not in the staff record.
+- The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
 - It prints the image link and the console link `http://<host>:<server_port>/console/?page=images`.
 - The server serves the copy, so the user never needs the source path.
 
-Each card shows the image as a link to the full size, the caption, and **For**, **Owner** and **Added**.
-**For** is `Change <id>` or `Phase <id>`. **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`.
-The browser shows **Added** in local time.
+Each card shows, in this order:
+
+1. The caption as the card title, in a larger font.
+2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
+3. The image, as a link to the full size.
+4. The **Delete** button.
+
+**Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
+**Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The **Show** menu filters by age: **Last day**, **Last 7 days** (the default) or **All**.
 A period other than the default goes in the URL as `#show=day` or `#show=all`, and the console keeps it.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
 
-**Request delete** posts the image id and a token signed with the console browser token.
-The server records the request under `images/.review-link-images.lock`, replies at once, then sends the message.
-The message goes to the owner with `delivery_tries` and `delivery_pause_seconds`, as Send feedback does.
-It starts `From the user (via the Images page): delete this image.`
-It names the image link, caption, subject and time, and the command that deletes it:
+**Delete** posts the image id and a token signed with the console browser token.
+The server checks the token and removes the image folder at once under `images/.review-link-images.lock`.
+No message goes to the owner.
+The page does not wait: the card leaves the page at once, and the request runs in the background.
+A failed delete puts the card back in its place with one line: **Not deleted: <reason>**.
+The page skips its refresh while a delete runs.
+An agent deletes an image with this command:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id ID
 ```
-
-The delete removes the image folder and its file.
-A request that is pending or sent shows **Delete requested. The owner gets a message.** and sends nothing more.
-A failed send shows **Not sent: <error>** above the button, and the user can request again.
-At startup, the server sends each request that a stopped server left pending.
 
 ### Rebuilds page
 
