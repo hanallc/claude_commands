@@ -233,6 +233,30 @@ Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
 
+Each change can hold one image id in its optional `Image` cell.
+`change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py image --image <png>` registers a screenshot for a checkpoint line.
+`image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
+The parser accepts twelve lowercase hexadecimal characters.
+`list-ready` and `live` leave the cell empty and print one line when the image is missing.
+
+Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
+The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
+It has a 420px height limit and crops from the top left.
+It opens the full image in a new tab.
+Below 1000px, it moves under the text.
+A row without an image retains its text width and position.
+
+`image_store.register_file` shares draft creation, image suffix checks, and atomic publication between the two image stores.
+It stores a single image or a before and after pair with one record.
+`image_store.read_record` checks the optional `before` and `feedback_at` fields.
+Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
+The snapshot sweep skips both image stores during normal snapshot deletion.
+It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
+The setting starts at 14 days and is read at each sweep.
+
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.
 A question without a staff owner appears under **Owner unavailable**.

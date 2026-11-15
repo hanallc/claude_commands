@@ -34,7 +34,7 @@ from scripts.production import change_routing, change_review, footer_counts, nex
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve
+from scripts.review_links import change_browser, change_page, serve, image_store, review_link
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -334,8 +334,6 @@ class ChangePageTests(unittest.TestCase):
                       change_browser.section(change, 5))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
-        from scripts.review_links import review_link
-
         settings = Path(os.environ["CONF_DIR"]) / "change_review.conf"
         original = settings.read_text()
         real_write = atomic_file.write_bytes_atomic
@@ -1187,6 +1185,34 @@ class ChangePageTests(unittest.TestCase):
     def answer(self, row: str = "C1", outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return {"row": row, "outcome": outcome, "feedback": feedback, "token": self.page.token}
 
+    def test_change_image_markup_is_shared_by_both_pages_and_absent_without_an_image(self) -> None:
+        _, _, before = self.browser()
+        self.assertNotIn('class="change-image"', before)
+        shot = self.temporary / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        text, reviewed = self.review_list.read_text().split(change_review.REVIEWED, 1)
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.startswith("| # |"):
+                lines[index] = line.rstrip() + f" {change_review.IMAGE} |\n"
+            elif line.startswith("| ---"):
+                lines[index] = line.rstrip() + " --- |\n"
+            elif line.startswith("| C"):
+                lines[index] = line.rstrip() + (f" {identity} |\n" if line.startswith("| C1 |") else "  |\n")
+        _ = self.review_list.write_text("".join(lines) + change_review.REVIEWED + reviewed)
+        _, _, browser = self.browser()
+        page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        for body in (browser, page):
+            self.assertIn(f'href="/change-images/{identity}/image.png" target="_blank" rel="noopener"', body)
+            self.assertIn('alt="Screenshot: Numbered moves"', body)
+            self.assertIn('class="change-text"', body)
+            self.assertEqual(body.count('class="change-image"'), 1)
+        with patch.object(change_review, "end_row_scratch", return_value=[]):
+            _ = change_page.submit(self.page, urlencode({"token": self.page.token, "row": "C1", "outcome": "works", "feedback": ""}),
+                                   change_page.DeliveryStatus(self.root))
+        self.assertFalse((self.root / image_store.CHANGE_FOLDER / identity).exists())
+
     def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
         path = change_page.page_url()
         reply = self.request(path + ("?type=questions" if kind == "questions" else ""), {})
@@ -1495,8 +1521,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
     def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
@@ -1504,8 +1528,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         status = change_page.DeliveryStatus(self.root)
         delivery = change_page.submit(self.page, urlencode(self.answer(outcome="validate")), status)
         owner = staff.snapshot().by_path("page-owner")
@@ -2050,7 +2072,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
         self.assertEqual(refreshed.outcomes["page-owner/C1"], [])
         self.assertIn("The showrunner will act on this", content)
-        direct = self.request(self.page_path, {}).body.split('<section id="C1">', 1)[1].split('</section>', 1)[0]
+        direct = self.request(self.page_path, {}).body.split('<section id="C1" data-change-card>', 1)[1].split('</section>', 1)[0]
         self.assertIn("The showrunner will act on this", direct)
         self.assertNotIn('<form', direct)
         repeat = self.http_request(path, fields)
@@ -3052,7 +3074,7 @@ class ChangePageTests(unittest.TestCase):
                 reply = self.request(path, {})
                 self.assertEqual(reply.status, 200)
                 for row in ("C1", "C2", "C3"):
-                    self.assertEqual(f'<section id="{row}">' in reply.body, row in rows)
+                    self.assertEqual(f'<section id="{row}" data-change-card>' in reply.body, row in rows)
 
     def test_delivery_failure_keeps_the_saved_answer_and_repeated_saves_send_nothing(self) -> None:
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
