@@ -162,11 +162,13 @@ The selected showrunner filter supplies the count; the card has no separate rema
 A question stays with the showrunner whose question list holds it.
 An unknown question owner appears under **Owner unavailable**.
 Owned question cards show the title before the filed text, choices, and `Asked by <session>`.
-They omit the separate Question label and keep `Answer` and `Save answer`.
+They omit the separate Question label.
+Choices show as radio items; a choice fills the **Your answer** box.
 An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
-Save answer records the answer and opens the next waiting question.
-Skip for now skips a question without saving.
-It hides when no other item waits in the selected showrunner filter.
+Answer records the answer and opens the next waiting question.
+Followup sends the text to the asker; the question returns with the reply after the asker runs `update_registration.py reply`.
+Skip moves the question to the end of the list without an answer.
+Answer and Followup need text in the box.
 Questions have no Ask showrunner to check or Ask a question controls.
 A stale question refuses an answer if another session already answered it.
 Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.
@@ -176,13 +178,9 @@ Recovery sends only `saved: true` answers for closed questions.
 Recovery clears other intents; a closed question without save confirmation prints `answer save state unknown; not sent`.
 The relay follows the asker's current staff route; an answer without a relay goes to the question's showrunner.
 
-Rebuilds counts machines with open needs and shows natedev before the Mac.
-Each block tells the user where to run `rebuild`.
-Multiple needs share one rebuild; their unchanged reasons appear under `After the rebuild`, newest first.
-A closed Details disclosure shows full commits, affected staff names and kinds, and different requesters.
+Rebuilds shows natedev before the Mac.
+Each block has the machine title, then one entry per change with Who, When and Reason, newest first.
 Unknown staff IDs appear as `Unknown session: <id>`.
-The Mac block states that updates can take five minutes while the Mac is reachable.
-The last line tells the user that requests clear automatically and asks them to refresh after the rebuild.
 An empty view shows `No rebuilds needed.`
 Rebuilds has no showrunner menu, card navigation, Skip for now, or answer form.
 The status line also shows open needs as `rebuild natedev` or `rebuild mac`, even before system evaluation completes.

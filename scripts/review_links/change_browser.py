@@ -7,6 +7,7 @@ import html
 import json
 import re
 import secrets
+import shlex
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -14,13 +15,14 @@ from typing import cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from scripts.lib import conf, urgency
+from scripts.lib.user_zone import shown_time
 from scripts.production import change_review, change_routing, staff, update_registration
-from scripts.production.production_doc import read_production
+from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
-from scripts.rebuild import need
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
+from scripts.statusline import rebuild_row
 
 MANIFEST = change_page.BROWSER_MANIFEST
 FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
@@ -53,6 +55,17 @@ class WaitingQuestion:
     production: Path | update_registration.QuestionOwnerUnavailable
     owner: staff.StaffId
     asker: str
+
+
+def question_order(questions: list[WaitingQuestion]) -> list[WaitingQuestion]:
+    """Order the questions as /next orders them: by urgency and age, and a skipped question last."""
+    entries = [update_registration.question_entry(question.owner, question.record.item, question.record.path)
+               for question in questions]
+    by_key = {entry.key: question for entry, question in zip(entries, questions)}
+    ended: dict[str, datetime] = {}
+    for owner in {question.owner for question in questions}:
+        ended |= urgency.ended(update_registration.question_queue_name(owner))
+    return [by_key[entry.key] for entry in urgency.order(entries, "", urgency.URGENT, ended)]
 
 
 @dataclass(frozen=True)
@@ -170,7 +183,8 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
     questions: list[WaitingQuestion] = []
     for document, lines in routing.document_lines.items():
         for question in update_registration.question_records_for_document(document, identities, include_unrouted=True, lines=lines):
-            if question.status != "open":
+            # A question with a follow-up waits for the asker's reply, not for the user.
+            if question.status != "open" or "followup" in question.item:
                 continue
             owner = routing.runners.get(question.owner)
             tab = owner.name if owner is not None else "unrouted"
@@ -179,13 +193,13 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
                 tab, question, document, question.owner, asker.name if asker is not None else str(question.asker)))
     known = {item.record.path for item in questions}
     for question in update_registration.unowned_question_records(identities):
-        if question.status != "open" or question.path in known:
+        if question.status != "open" or "followup" in question.item or question.path in known:
             continue
         asker = routing.record.by_id(question.asker)
         questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
             "unrouted", question, update_registration.QuestionOwnerUnavailable(question.path), question.owner,
             asker.name if asker is not None else str(question.asker)))
-    questions.sort(key=lambda item: (item.record.item["since"], item.key))
+    questions = question_order(questions)
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
     return PreparedReviews(tuple(changes), queues, tuple(questions), question_tabs, routing.record)
@@ -213,65 +227,179 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
 {change_page.change_details(row, shown)}</section>'''
 
 
+# A question stored as one text marks its parts inline: numbered items, then "Choices:" and "Recommended:".
+CHOICES_MARK = re.compile(r"(?:^|(?<=\s))Choices:\s")
+RECOMMEND_MARK = re.compile(r"(?:^|(?<=\s))Recommended:\s")
+ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re.compile(r"(?<![\w.])(\d+)\.\s"),
+              re.compile(r"\(([a-z])\)\s"))
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+BLANK_LINE = re.compile(r"\n\s*\n")
+
+
+def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
+    found = mark.search(text)
+    return (text, "") if found is None else (text[:found.start()].strip(), text[found.end():].strip())
+
+
+def numbered_run(text: str) -> tuple[str, list[str], str]:
+    """Split the text at its first run of two or more items marked 1) 2), 1. 2., (1) (2) or (a) (b).
+
+    Return the text before the run, the items and the text after a blank line in the last item."""
+    best: list[re.Match[str]] = []
+    for style in ITEM_MARKS:
+        run: list[re.Match[str]] = []
+        for mark in style.finditer(text):
+            value = mark[1]
+            if not run and value in ("1", "a"):
+                run.append(mark)
+            elif run and value == (str(int(run[-1][1]) + 1) if value.isdigit() else chr(ord(run[-1][1]) + 1)):
+                run.append(mark)
+        if len(run) >= 2 and (not best or run[0].start() < best[0].start()):
+            best = run
+    if not best:
+        return text, [], ""
+    ends = [mark.start() for mark in best[1:]] + [len(text)]
+    items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
+    last = BLANK_LINE.split(items[-1], maxsplit=1)
+    items[-1] = last[0]
+    return text[:best[0].start()].strip(), [item.rstrip(";,").strip() for item in items], last[1] if len(last) > 1 else ""
+
+
+def item_html(entry: str) -> str:
+    """Show an item that is one backtick span, such as a command, as a code block."""
+    whole = change_page.CODE_SPAN.fullmatch(entry.strip())
+    if whole is not None:
+        return f"<pre><code>{html.escape(whole.group(1))}</code></pre>"
+    return "<br>".join(change_page.inline_html(line) for line in entry.splitlines())
+
+
+def item_list(items: list[str]) -> str:
+    return '<h2>Items</h2><ol class="question-items">' + "".join(f"<li>{item_html(entry)}</li>" for entry in items) + "</ol>"
+
+
+def choice_list(choices: list[str]) -> str:
+    """Show the choices as a list of radio items; a choice fills the answer box."""
+    options = "".join(f'<label><input type="radio" name="choice" value="{html.escape(choice, quote=True)}">'
+                      + f'<span>{change_page.inline_html(choice)}</span></label>' for choice in choices)
+    return f'<fieldset class="question-choices"><legend>Choices</legend>{options}</fieldset>' if options else ""
+
+
+def followup_sections(item: update_registration.OutstandingItem) -> str:
+    """Show each follow-up the user sent and the asker's reply."""
+    return "".join('<h2>Follow-up</h2>' + change_page.review_text_html(each["followup"], inline=True)
+                   + '<h2>Reply</h2>' + change_page.review_text_html(each["reply"], inline=True)
+                   for each in item.get("followups", []))
+
+
+def text_sections(text: str) -> tuple[str, str]:
+    """Show a question stored as one text in sections: the text, its items, its choices and the recommendation."""
+    rest, recommend = split_at(text, RECOMMEND_MARK)
+    lead, choice_text = split_at(rest, CHOICES_MARK)
+    lead, items, trailing = numbered_run(lead)
+    if items and "\n" not in text:
+        # In one paragraph, the text after the last item's first sentence is not part of that item.
+        last = SENTENCE_END.split(items[-1], maxsplit=1)
+        items[-1], trailing = last[0], last[1] if len(last) > 1 else ""
+    choice_lead, choices, choice_trailing = numbered_run(choice_text)
+    if not items and not choice_text and not recommend:
+        return change_page.review_text_html(text, inline=True), ""
+    body = change_page.review_text_html(lead, inline=True) if lead else ""
+    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, inline=True) if trailing else "")
+    # Only numbered choices become buttons; other choice text shows as text.
+    if choice_text and not choices:
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, inline=True)
+    elif choice_lead:
+        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, inline=True)
+    if choice_trailing:
+        body += change_page.review_text_html(choice_trailing, inline=True)
+    if recommend:
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, inline=True)
+    return body, choice_list(choices)
+
+
+def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]:
+    """Return the question body and its choice buttons; a question stored as one text shows in sections."""
+    if "parts" not in item:
+        body, choices = text_sections(item.get("question", ""))
+        return body + followup_sections(item), choices
+    parts = item["parts"]
+    same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
+    body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
+    if parts["context"].strip():
+        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], inline=True)
+    if parts["items"]:
+        body += item_list(parts["items"])
+    if parts["recommend"].strip():
+        body += '<h2>Recommended</h2>' + change_page.review_text_html(parts["recommend"], inline=True)
+    return body + followup_sections(item), choice_list(parts["choices"])
+
+
+ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends until you press Answer."
+
+
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
-    form = '<p>No showrunner owns this question.</p>' if question.tab == "unrouted" else f'''<form method="post" action="{change_page.PAGE_NAME}">
+    body, choices = question_parts(question.record.item)
+    owned = question.tab != "unrouted"
+    # Without an owner there is no form, so the choices show as a list the user cannot pick.
+    shown_choices = "" if owned else choices.replace('<input type="radio"', '<input type="radio" disabled')
+    form = '<p>No showrunner owns this question.</p>' if not owned else f'''<form method="post" action="{change_page.PAGE_NAME}">
 <input type="hidden" name="row" value="{key}">
-<input type="hidden" name="token" value="{row_token(browser, question.key)}">
-<label for="answer-{key}">Answer</label><textarea id="answer-{key}" name="feedback" rows="{feedback_rows}"></textarea>
-<button name="outcome" value="answer">Save answer</button></form>'''
+<input type="hidden" name="token" value="{row_token(browser, question.key)}">{choices}
+<label for="answer-{key}">Your answer</label>
+<p class="answer-help" id="answer-help-{key}">{ANSWER_HELP}</p>
+<textarea id="answer-{key}" name="feedback" rows="{feedback_rows}" aria-describedby="answer-help-{key}"></textarea>
+<div class="question-actions"><button name="outcome" value="answer" disabled data-needs-text>Answer</button>
+<button name="outcome" value="followup" disabled data-needs-text>Followup</button>
+<button name="outcome" value="skip">Skip</button></div></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(question.record.item["text"])}</h1>
-{change_page.review_text_html(question.record.item.get("question", ""))}
+{body}{shown_choices}
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
 
-def rebuild_list(machines: list[need.MachineNeeds], record: staff.StaffSnapshot) -> str:
-    """Show each machine's rebuild action, then each need's reason, source agent and commit."""
-    def session(identity: str) -> str:
-        member = record.by_id(staff.StaffId(identity))
-        return f"{member.name} ({member.kind})" if member is not None else f"Unknown session: {identity}"
+def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
+                 record: staff.StaffSnapshot) -> str:
+    """Show each machine the status line names, then one entry per change: who made it, when and why."""
+    def who(session: str) -> str:
+        member = record.by_member_reference(session) if session else None
+        return (f"{member.name} ({member.kind})" if member is not None
+                else f"Unknown session: {session}" if session else "Unknown session")
 
-    def field(label: str, value: str) -> str:
-        return f'<dt>{label}</dt><dd>{value}</dd>'
+    def entry(session: str, at: str, reason: str) -> tuple[datetime, str]:
+        moment = datetime.fromisoformat(at)
+        return moment, (f'<li><dl><dt>Who</dt><dd>{html.escape(who(session))}</dd>'
+                        + f'<dt>When</dt><dd><time datetime="{html.escape(at, quote=True)}">{shown_time(moment)}</time></dd>'
+                        + f'<dt>Reason</dt><dd>{html.escape(reason)}</dd></dl></li>')
 
-    ordered = sorted(machines, key=lambda item: (
-        item.newest["machine"] not in ("natedev", "mac"), item.newest["machine"] != "natedev", item.newest["machine"]))
-    names = ["the Mac" if machine.newest["machine"] == "mac" else machine.newest["machine"] for machine in ordered]
+    names = ["the Mac" if machine == "mac" else machine for machine in answer.machines]
     blocks: list[str] = []
-    for machine, name in zip(ordered, names):
-        machine_name = machine.newest["machine"]
-        terminal = "Terminal" if machine_name == "mac" else "a terminal"
-        items: list[str] = []
-        for item in sorted(machine.records, key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True):
-            source = item["requested_by"] or item["concerns"]
-            affected = (field("Affected session", html.escape(session(item["concerns"])))
-                        if item["concerns"] and item["concerns"] != source else "")
-            items.append(f'<li><p>{html.escape(item["reason"])}</p><dl>'
-                         + field("Source agent", html.escape(session(source))) + affected
-                         + field("Commit", '<code>' + html.escape(item["nixos_commit"]) + '</code>') + '</dl></li>')
-        blocks.append(f'<article data-machine="{html.escape(machine_name)}">'
-            + f'<h2>Rebuild {html.escape(name)}</h2><p>Run <code>rebuild</code> in {terminal} on {html.escape(name)}.</p>'
-            + ('<p>Mac updates can take five minutes while the Mac is reachable.</p>' if machine_name == "mac" else '')
-            + ('<p>One rebuild applies all listed changes.</p>' if len(machine.records) >= 2 else '')
-            + '<ul>' + ''.join(items) + '</ul></article>')
-    count = sum(len(machine.records) for machine in machines)
-    label = f"Rebuild {', '.join(names)} ({count})" if count else ""
-    return (f'<div data-rebuilds data-count="{count}" data-label="{html.escape(label, quote=True)}">'
-            + (''.join(blocks) + '<p>Completed requests clear automatically.</p>' if blocks else '<p>No rebuilds needed.</p>')
-            + '</div>')
+    for machine_name, name in zip(answer.machines, names):
+        records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
+        filed = {item["nixos_commit"] for item in records}
+        # A filed need and its commit are one change; the need gives the requester and the reason.
+        items = [entry(item["requested_by"] or item["concerns"], item["created_at"], item["reason"]) for item in records]
+        items += [entry(change.session, change.at, change.reason)
+                  for change in changes.get(machine_name, ()) if change.commit not in filed]
+        listed = ('<ul>' + ''.join(shown for _, shown in sorted(items, key=lambda item: item[0], reverse=True)) + '</ul>'
+                  if items else '<p>The change list is not available yet.</p>')
+        blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
+    label = f"Rebuild {' and '.join(names)}" if names else ""
+    return (f'<div data-rebuilds data-count="{len(names)}" data-label="{html.escape(label, quote=True)}">'
+            + (''.join(blocks) if blocks else '<p>No rebuilds needed.</p>') + '</div>')
 
 
 REBUILD_STYLE = """<style>[data-rebuilds] article+article{border-top:1px solid GrayText;margin-top:32px;padding-top:16px}
-[data-rebuilds] h2{margin-top:0}[data-rebuilds] li+li{margin-top:16px}[data-rebuilds] li p{margin:0 0 8px}
-[data-rebuilds] dl{display:grid;grid-template-columns:9em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
+[data-rebuilds] h2{margin-top:0}[data-rebuilds] ul{list-style:none;padding:0}[data-rebuilds] li+li{margin-top:16px}
+[data-rebuilds] dl{display:grid;grid-template-columns:5em minmax(0,1fr);column-gap:12px;row-gap:4px;margin:0;font-size:15px}
 [data-rebuilds] dt{color:GrayText}[data-rebuilds] dd{margin:0;min-width:0;overflow-wrap:anywhere}</style>"""
 
 
 def render_rebuilds() -> bytes:
-    """Render the open rebuild needs for the console's rebuild link and overlay."""
-    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuild_list(need.read_needs(), staff.snapshot()),
-                                "Rebuilds needed")
+    """Render the status line's rebuild answer for the console's rebuild link and overlay."""
+    config = conf.path("statusline")
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot())
+    return change_page.document(REBUILD_STYLE + '<h1>Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -307,6 +435,18 @@ PAGE_STYLE = """<style>[hidden]{display:none!important}
 [data-showrunner-filter] label{white-space:nowrap}
 [data-showrunner-filter] select{font:inherit;min-width:0;max-width:100%;flex:1;min-height:44px;color:CanvasText;background:Canvas}
 section+section{border:0;margin:0;padding:0}
+.question-ask{font-weight:600}.question-items li{margin:8px 0}
+[data-type="questions"] code{font:.9em ui-monospace,monospace;background:#8882;padding:1px 4px;border-radius:4px}
+[data-type="questions"] pre{margin:8px 0}[data-type="questions"] pre code{font:inherit;background:none;padding:0}
+.question-choices{display:grid;gap:8px;border:0;margin:16px 0;padding:0}
+.question-choices legend{padding:0;margin-bottom:8px;font-weight:600}
+.question-choices label{display:flex;gap:10px;align-items:flex-start;line-height:1.5;padding:10px 12px;border:1px solid #8886;border-radius:6px;cursor:pointer}
+.question-choices label:has(:checked){border-color:Highlight;outline:1px solid Highlight}
+.question-choices input{font:inherit;width:1em;height:1em;margin:.25em 0 0;flex:none}.question-choices label:has(:disabled){cursor:default}
+.answer-help{margin:4px 0 8px;font-size:14px;opacity:.8}
+[data-type="questions"] textarea{width:100%;box-sizing:border-box;font:inherit}
+.question-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.question-actions button{margin:0}
+.question-actions button:disabled{opacity:.45;cursor:default}
 .navigation{padding:12px 0;background:Canvas}.navigation:empty{display:none}button{min-height:44px}
 </style>"""
 
@@ -323,9 +463,12 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         question = next((item for item in prepared.questions if item.key == key), None)
         if question is None:
             raise change_page.QuestionAnswerRefused("this question is no longer open; refresh the page")
-        if fields["outcome"] != ["answer"] or not fields["feedback"][0].strip():
+        outcome = fields["outcome"][0]
+        if outcome not in ("answer", "followup", "skip"):
+            raise change_page.AnswerRefused("use the answer form on this page")
+        if outcome != "skip" and not fields["feedback"][0].strip():
             raise change_page.AnswerRefused("enter an answer")
-        return submit_question(question, fields["feedback"][0], status)
+        return submit_question(question, outcome, fields["feedback"][0], status)
     found = next((item for item in prepared.changes if item.key == key), None)
     if found is None:
         # A repeated save uses its original signed token.
@@ -359,8 +502,38 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
     return delivery, answer
 
 
-def submit_question(question: WaitingQuestion, answer: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
-    """Save through the production API before the existing sender delivers the answer."""
+def question_message(outcome: change_page.QuestionOutcome, production: str, text: str, unit: str, words: str) -> str:
+    """The message the asker gets for an answer, a follow-up or a skip."""
+    lead = {"answer": "From the user (via the review page): ",
+            "followup": "From the user (via the review page), a follow-up on your question: ",
+            "skip": "From the user (via the review page), skipped for now; it stays open at the end of the list: "}[outcome]
+    message = lead + text + (f"\nFor: {unit}" if unit else "")
+    if outcome == "answer":
+        return message + "\n" + words
+    if outcome == "followup":
+        return (message + "\n" + words.strip() + "\nReply with this command; the question then returns to the user with your reply:\n"
+                + f"~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production {shlex.quote(production)} "
+                + f"--item {shlex.quote(text)} --text '<your reply>'")
+    return message
+
+
+def save_outcome(production: Production, question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
+                 identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
+    """Answer, send a follow-up or move the question to the end of its queue; return whom the message goes to."""
+    text = question.record.item["text"]
+    if outcome == "answer":
+        return update_registration.answer(production, text, identities=identities, only_open=True)
+    if outcome == "followup":
+        return update_registration.followup(production, text, words, identities=identities)
+    urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
+                        datetime.now(production.zone).replace(tzinfo=None))
+    return update_registration.answer_relay(production, production.name, update_registration.question_asker(
+        question.record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
+
+
+def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
+                    status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+    """Save through the production API before the existing sender delivers the message to the asker."""
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
     identities = update_registration.QuestionStaff.read()
@@ -369,12 +542,10 @@ def submit_question(question: WaitingQuestion, answer: str, status: change_page.
     relay = update_registration.answer_relay(production, production.name,
         update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
     recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
-    message = "From the user (via the review page): " + item["text"]
-    if relay.unit:
-        message += "\nFor: " + relay.unit
-    message += "\n" + answer
+    message = question_message(outcome, production.name, item["text"], relay.unit, words)
+    answer = words if outcome == "answer" else ""
     saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(production.doc),
-        "owner": question.owner, "question": item["text"], "answer": answer, "message": message}
+        "owner": question.owner, "question": item["text"], "answer": answer, "message": message, "kind": outcome}
     page = change_page.UserQuestionPage(question.record.path, production.doc, (question.record.path.stem,), "", saved)
     # The delivery lock prevents startup recovery from reading an answer during its save.
     with status.locked():
@@ -385,7 +556,7 @@ def submit_question(question: WaitingQuestion, answer: str, status: change_page.
         status.write_slots(page, page.rows[0], change_page.DeliverySlots(change_page.NoDelivery(), intent))
         status.request_attempts[attempt] = change_page.AttemptOwnership(status.path(page, page.rows[0]), "claimed")
         try:
-            relay = update_registration.answer(production, item["text"], identities=identities, only_open=True)
+            relay = save_outcome(production, question, outcome, words, identities)
             recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
             intent = replace(intent, recipients=(recipient,))
             page = replace(page, saved={**saved, "saved": True})
@@ -417,6 +588,14 @@ function bindPage(){
  rows.forEach(row=>{
   const form=row.querySelector('form');
   if(form) form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
+  // A choice fills the answer box; the user can edit it, then presses Answer.
+  const box=form?.querySelector('textarea');
+  form?.querySelectorAll('input[name=choice]').forEach(choice=>choice.addEventListener('change',()=>{
+   box.value=choice.value;box.dispatchEvent(new Event('input',{bubbles:true}));box.focus();
+  }));
+  // Answer and Followup send the box text, so they wait for text.
+  const needsText=()=>form.querySelectorAll('[data-needs-text]').forEach(button=>button.disabled=!box.value.trim());
+  if(box && form.querySelector('[data-needs-text]')){box.addEventListener('input',needsText);needsText();}
  });
 }
 function waiting(){return rows.filter(r=>(tab==='' || r.dataset.tab===tab) && r.dataset.pending==='true');}
@@ -436,7 +615,8 @@ function show(){
  empty.textContent=kind==='questions' ? (pending.length ? 'No questions for this showrunner.' : 'No questions to answer.') :
   (pending.length ? 'No changes for this showrunner.' : 'No changes to review.');
  rows.forEach(r=>r.hidden=r!==current);
- next.hidden=!waiting().some(r=>r!==current);
+ // A question has its own Skip, which the server keeps.
+ next.hidden=kind==='questions' || !waiting().some(r=>r!==current);
  (current?.querySelector('form:not([hidden]) .answer-actions') || content.querySelector('.navigation')).append(next);
  if(current) remembered.set(tab,current.dataset.key);
  // The default place, All with no card, keeps a plain URL.
@@ -455,19 +635,21 @@ async function save(row,form,outcome){
  activeSaves++;let saved=false;
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
- data.set('row',row.dataset.key);data.set('outcome',outcome);
+ data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
  state.textContent='Saving'; row.dataset.saveState='saving';
  try{
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : outcome==='feedback' ? 'The showrunner will act on this' : 'The showrunner will validate this';
+  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' ? 'The showrunner will answer this' : outcome==='feedback' ? 'The showrunner will act on this' :
+   outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   saved=true;
   row.dataset.pending='false';form.hidden=true;
   if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){
-   advance(row);saveNotice.textContent=kind==='questions' ? 'Answer saved.' : 'Review saved.';saveNotice.hidden=false;
+   advance(row);saveNotice.textContent=kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.';
+   saveNotice.hidden=false;
   }
   else show();
  }catch(error){

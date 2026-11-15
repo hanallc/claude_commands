@@ -13,12 +13,12 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import quote
 
-from scripts.lib import conf_reads
+from scripts.lib import atomic_file, conf_reads
 from scripts.rebuild import need
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
@@ -153,12 +153,18 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
 
 @dataclass(frozen=True)
 class RebuildAnswer:
-    """The known rebuild machines and whether the cache needs a refresh."""
+    """The known rebuild machines and whether the cache needs a refresh.
+
+    `compared` holds the machines whose running system differs from main;
+    `needs` holds the open rebuild needs that `read` joined into `machines`.
+    """
 
     machines: tuple[str, ...]
     refresh_due: bool
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
+    compared: tuple[str, ...] = ()
+    needs: tuple[need.MachineNeeds, ...] = ()
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -180,14 +186,133 @@ def cache_path(config: Path) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class Change:
+    """One /etc/nixos commit that a machine's next rebuild applies.
+
+    `session` is the local session that wrote it, from the commit's Claude-Session
+    line; it is empty when that line is absent or names no known transcript.
+    """
+
+    commit: str
+    at: str
+    reason: str
+    session: str
+
+
+BRIDGE = re.compile(r"https://claude\.ai/code/(session_[0-9A-Za-z]+)")
+LOG_PATH = re.compile(r"~?[\w./-]+")
+SWITCH_FIELDS = 5
+
+
+def changes_path(cache: Path) -> Path:
+    return cache.with_name(cache.name + "-changes.json")
+
+
+def sessions_path(cache: Path) -> Path:
+    return cache.with_name(cache.name + "-sessions.json")
+
+
+def switched_commit(log: str, running: str) -> str:
+    """Return the commit of the last logged switch to the running system, else of the last switch."""
+    switches = [fields for fields in (line.split() for line in log.splitlines())
+                if len(fields) == SWITCH_FIELDS and fields[1] == "switch"]
+    last = next((fields for fields in reversed(switches) if fields[4] == running), switches[-1] if switches else None)
+    return last[3].removesuffix("-dirty") if last is not None else ""
+
+
+def transcript_session(bridge: str, run: CommandRunner) -> str:
+    """Find the local session whose transcript records the Remote Control session `bridge`."""
+    from scripts.message import session_records
+
+    roots = sorted({path.resolve() for path in (folder / "projects" for folder in session_records.config_dirs())
+                    if path.is_dir()})
+    if not roots:
+        return ""
+    marker = f'"type":"remote_session_change","url":"https://claude.ai/code/{bridge}"'
+    found = run(["rg", "--no-ignore", "--files-with-matches", "--fixed-strings", "--glob", "*.jsonl", marker,
+                 *map(str, roots)], timeout=120)
+    # A subagent transcript sits one folder deeper; only a session transcript names the session.
+    sessions = sorted(Path(line).stem for line in found.splitlines() if Path(line).parent.parent in roots)
+    return sessions[0] if sessions else ""
+
+
+def machine_changes(settings: RebuildSettings, command: list[str], known: dict[str, str],
+                    run: CommandRunner) -> tuple[Change, ...] | None:
+    """List the commits on the configured ref after the machine's last switch, or None when unknown."""
+    lines = run(command).splitlines()
+    commit = switched_commit("\n".join(lines[1:]), lines[0]) if lines else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return None
+    listing = run(["git", "-C", str(settings.repo), "log",
+                   "--format=%H%x1f%aI%x1f%s%x1f%(trailers:key=Claude-Session,valueonly,separator=%x20)",
+                   f"{commit}..{settings.ref}"])
+    changes: list[Change] = []
+    for line in listing.splitlines():
+        fields = line.split("\x1f")
+        if len(fields) != 4:
+            continue
+        bridge = BRIDGE.search(fields[3])
+        if bridge is not None and bridge[1] not in known:
+            known[bridge[1]] = transcript_session(bridge[1], run)
+        changes.append(Change(fields[0], fields[1], fields[2], known[bridge[1]] if bridge is not None else ""))
+    return tuple(changes)
+
+
+def write_changes(config: Path, run: CommandRunner = command_output) -> None:
+    """Record each machine's pending /etc/nixos changes and the session that wrote each one."""
+    try:
+        settings = RebuildSettings.read(config)
+        cache = cache_path(config)
+        log = config_values(config)["rebuild.generations"]
+    except (OSError, ValueError, KeyError):
+        return
+    if not LOG_PATH.fullmatch(log):
+        return
+    script = f"realpath /run/current-system && tail -n 200 {log}"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    with changes_path(cache).with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        try:
+            known = cast(dict[str, str], json.loads(sessions_path(cache).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            known = {}
+        # A machine that does not answer keeps its last list.
+        previous = read_changes(config)
+        machines: dict[str, list[dict[str, str]]] = {}
+        for machine, command in (("natedev", ["sh", "-c", script]),
+                                 ("mac", ["ssh", "-o", "BatchMode=yes", settings.ssh, script])):
+            changes = machine_changes(settings, command, known, run)
+            if changes is None:
+                changes = previous.get(machine)
+            if changes is not None:
+                machines[machine] = [asdict(change) for change in changes]
+        atomic_file.write_text_atomic(sessions_path(cache), json.dumps(known))
+        atomic_file.write_text_atomic(changes_path(cache), json.dumps(machines))
+
+
+def read_changes(config: Path = DEFAULT_CONFIG) -> dict[str, tuple[Change, ...]]:
+    """Read the recorded changes per machine; a machine without a record has no list."""
+    try:
+        recorded = cast(dict[str, list[dict[str, str]]],
+                        json.loads(changes_path(cache_path(config)).read_text(encoding="utf-8")))
+        return {machine: tuple(Change(**change) for change in changes) for machine, changes in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
 def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time) -> RebuildAnswer:
     """Combine the cached comparison with open rebuild needs."""
     answer = _read_cache(config, clock)
     try:
-        machines = set(answer.machines) | {summary.newest["machine"] for summary in need.read_needs()}
+        needs = tuple(need.read_needs())
+        machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError):
         return answer
-    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines))
+    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines), needs=needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
@@ -221,7 +346,8 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
                             expected = ExpectedSystems(commit, tuple(cast(list[str], source)), local, mac)
             except (ValueError, KeyError, TypeError):
                 pass
-        return RebuildAnswer(tuple(item.removeprefix("rebuild ") for item in items), refresh_due, expected, failure)
+        compared = tuple(item.removeprefix("rebuild ") for item in items)
+        return RebuildAnswer(compared, refresh_due, expected, failure, compared)
     except (OSError, ValueError):
         return RebuildAnswer((), True)
 
@@ -281,6 +407,7 @@ def main(argv: list[str]) -> int:
             print(machine)
     else:
         write(config)
+        write_changes(config)
     return 0
 
 
