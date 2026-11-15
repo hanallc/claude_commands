@@ -41,22 +41,27 @@ def service_snapshot() -> records.AdmissionWaitSnapshot:
     return replace(wait_reply(records.NeedsMemory()).snapshot, running=(running,))
 
 
+# The CI pin, and the last main before older clients read a GPU slot wait as a wait behind the slot.
+OLDER_CLIENTS = ("7fdfd9a6a", "6a0923b23")
+
+
 @contextmanager
-def pinned_snapshot_reader() -> Generator[tuple[Callable[[object, object], object], type, ModuleType]]:
-    """Load the pinned schemas and codec directly from Git."""
+def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Callable[[object, object], object], type, ModuleType]]:
+    """Load the schemas and codec of an older client directly from Git."""
     names = ("snapshot_codec", "placement", "admission_records", "admission_wire", "admission_protocol")
     modules = {"_pinned_" + name: ModuleType("_pinned_" + name) for name in names}
     with mock.patch.dict(sys.modules, modules):
         for name, module in modules.items():
             path = "scripts/build_queue/" + name.removeprefix("_pinned_") + ".py"
-            source = subprocess.run(["git", "show", "7fdfd9a6a:" + path],
+            source = subprocess.run(["git", "show", revision + ":" + path],
                 cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, check=True).stdout
             for dependency in ("snapshot_codec", "placement", "admission_records"):
                 source = source.replace("from scripts.build_queue import " + dependency + " as ",
                                         "import _pinned_" + dependency + " as ")
-            source = source.replace("from scripts.build_queue.admission_wire import (",
-                                    "from _pinned_admission_wire import (")
-            exec(compile(source, "7fdfd9a6a:" + path, "exec"), module.__dict__)
+            for dependency in ("admission_wire", "placement"):
+                source = source.replace("from scripts.build_queue." + dependency + " import (",
+                                        "from _pinned_" + dependency + " import (")
+            exec(compile(source, revision + ":" + path, "exec"), module.__dict__)
         setattr(modules["_pinned_admission_records"], "placement", modules["_pinned_placement"])
         setattr(modules["_pinned_admission_wire"], "records", modules["_pinned_admission_records"])
         setattr(modules["_pinned_admission_wire"], "placement", modules["_pinned_placement"])
@@ -229,19 +234,40 @@ class SnapshotCodecTests(unittest.TestCase):
         reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0)]
         reasons += [snapshot_with_head_cause(snapshot, cause).head_reason for cause in causes.values()]
         self.assertEqual({type(reason) for reason in reasons}, set(get_args(records.WaitReason)))
-        with pinned_snapshot_reader() as (_parse, _schema, pinned):
-            for reason in reasons:
-                cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-                with self.subTest(reason=type(reason).__name__, cause=type(cause).__name__):
-                    reply = replace(wait_reply(reason), snapshot=replace(snapshot, head_reason=reason))
-                    line = wire.encode_reply(reply)
-                    self.assertEqual(wire.parse_reply(line), reply)
-                    parsed = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
-                    pinned_reason = cast(object, getattr(parsed, "reason"))
-                    pinned_cause = (cast(object, getattr(pinned_reason, "cause"))
-                                    if type(pinned_reason).__name__ == "HeadAdmissionStatus" else pinned_reason)
-                    self.assertEqual(type(pinned_cause).__name__,
-                                     "BehindHead" if isinstance(cause, records.GpuSlotWait) else type(cause).__name__)
+        for revision in OLDER_CLIENTS:
+            with pinned_snapshot_reader(revision) as (_parse, _schema, pinned):
+                parse_reply = cast(Callable[[str], object], getattr(pinned, "parse_reply"))
+                for reason in reasons:
+                    cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                    with self.subTest(revision=revision, reason=type(reason).__name__, cause=type(cause).__name__):
+                        reply = replace(wait_reply(reason), snapshot=replace(snapshot, head_reason=reason))
+                        line = wire.encode_reply(reply)
+                        self.assertEqual(wire.parse_reply(line), reply)
+                        older_reason = cast(object, getattr(parse_reply(line), "reason"))
+                        older_cause = (cast(object, getattr(older_reason, "cause"))
+                                       if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
+                        self.assertEqual(type(older_cause).__name__,
+                                         "BehindHead" if isinstance(cause, records.GpuSlotWait) else type(cause).__name__)
+
+    def test_gpu_slot_wait_keeps_its_shape_in_a_field_with_no_wait_behind_the_head(self) -> None:
+        waiting = wait_reply(records.NeedsMemory()).snapshot
+        decision = replace(waiting.decision, gpu=records.GpuSlotWait(1, 1))
+        status = snapshot_with_head_cause(waiting, records.GpuSlotWait(1, 1)).head_reason
+        assert isinstance(status, records.HeadAdmissionStatus)
+        status = replace(status, decision=decision)
+        snapshot = replace(waiting, decision=decision, head_reason=status)
+        reply = replace(wait_reply(status), snapshot=snapshot)
+        line = wire.encode_reply(reply)
+        written = cast(dict[str, object], cast(dict[str, object], codec.snapshot_value(snapshot))["decision"])
+        self.assertEqual(written["gpu"], {"kind": "GpuSlotWait", "used": 1, "slots": 1})
+        self.assertNotIn("gpu" + codec.GPU_SLOT_SUFFIX, written)
+        self.assertEqual(wire.parse_reply(line), reply)
+        for revision in OLDER_CLIENTS:
+            with self.subTest(revision=revision), pinned_snapshot_reader(revision) as (_parse, _schema, pinned):
+                parsed = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+                older_snapshot = cast(object, getattr(parsed, "snapshot"))
+                gpu = cast(object, getattr(cast(object, getattr(older_snapshot, "decision")), "gpu", None))
+                self.assertEqual(type(gpu).__name__, "NoneType" if revision == "7fdfd9a6a" else "GpuSlotWait")
 
     def test_acquisition_defaults_unused_variants_and_restores_strict_reads(self) -> None:
         for field in ("job_state", "service_job_state"):
