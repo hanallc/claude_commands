@@ -331,6 +331,57 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
 
+### Phase 38 — A change-review write holds the lock under 1 s, and one batch writes many rows  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a change-review write commits its list with no index refresh, so the folder lock is held under 1 s in hanadocs; `change_review.py batch` writes many edits and verdicts under one lock and one commit.
+
+**Spec:**
+- Cause (measured 2026-11-15 by the director): one write holds the folder lock 4 to 8 s. The parse and the file write take 0.36 s. The rest is `git commit --only`, which refreshes the whole hanadocs index twice. Each refresh runs the `hanadocs-strip-generated` clean filter, one Python process for each modified `issues/*.md` file. hanadocs keeps about 140 uncommitted user changes (106 of them issue files): `git status -uno` takes 2.1 s with the filter and 0.11 s without it. The user's changes stay; the fix must not depend on them (showrunner, 2026-11-15).
+- `_commit(paths, what)` in `scripts/production/change_review.py` commits one or more list files of one folder with plumbing only. It never runs `git status`, `git commit` or another command that refreshes the whole index:
+  1. Check the folder is inside a work tree, as today. Outside one, return.
+  2. For each path, `git hash-object -w --path <path relative to the top level> -- <file>` gives its blob.
+  3. Read the old HEAD with `git rev-parse --verify -q HEAD`; an unborn HEAD has no parent.
+  4. With `GIT_INDEX_FILE` set to a temporary file that is always removed: `git read-tree <old HEAD>` (or `--empty`), then `git update-index --add --cacheinfo 100644,<blob>,<path>` for each path, then `git write-tree`.
+  5. When the tree equals the old HEAD's tree, make no commit.
+  6. Set each path's entry in the real index with `git update-index --add --cacheinfo 100644,<blob>,<path>`. A refusal (another process holds `index.lock`) gives today's one warning, "written but not committed: <reason>; the next write commits it", and moves no ref.
+  7. `git commit-tree <tree> [-p <old HEAD>] -m "change-review: <owner> <what>"`, then `git update-ref -m <subject> HEAD <new> <old HEAD>` (an unborn HEAD compares with the zero id).
+  8. When `update-ref` fails because HEAD moved (the hanadocs-push timer commits too), go back to step 3 with the new HEAD. Try at most 5 times, then warn as in step 6.
+  - Keep `--literal-pathspecs`. Other staged and unstaged changes stay where they were; a list that is new to git gets committed with no `--intent-to-add` step. Hooks do not run; hanadocs has none.
+- `change_review.py batch --file <json>`: the file is a JSON array; each item is an object with `op` (`edit` or `verdict`), `production`, `row`, and for `edit` any of `change`, `check`, `see`, `image`, for `verdict` the field `verdict`. An optional `list` field acts as `--list`. Same rules as the single commands: `edit` with only `image` keeps the row text; `edit` with text needs `change`, `check` and `see`.
+  1. Before the lock: parse and check every item, resolve each row with `resolve_row`, and register each image. Any error exits 1, names the item's index and writes nothing.
+  2. All target lists must sit in one folder (the lock); else exit 1 before any write.
+  3. Take `_list_lock` once. Apply every item's write to the in-memory lines of its list, in file order. An error from any item (row not on the list, a verdict conflict) exits 1 and writes nothing.
+  4. Sort, stamp and write each changed list with `write_text_atomic`, then one `_commit` of all changed lists. Subject: `change-review: batch <N> writes` and the owners with counts, such as `(hana 28, natedev 2)`.
+  5. After the lock: the per-row work the single commands do after their write (image removal, scratch end for a verdict). Print one line for each item, the line its single command prints.
+- Split `edit_row` and `record_verdict` so each keeps its own behavior and gives its `write` callback and its after-lock step to both its single command and `batch`. Keep one copy of each rule.
+- Defect (showrunner 2026-11-15, found on builds/C1721): `add --output <file>` takes `--output` and ignores it, so the row gets no image. `add`, `edit` and each `batch` item accept `--output` (`output` in JSON) the same way the `image` action does: `image_store.register_output`, and the row's Image cell gets that id. `--image` with `--output` is refused, as in the `image` action. Any other action given `--image` or `--output` exits 1 with an error, so no option is ignored without a word.
+- Defect (showrunner 2026-11-15, found by cargo-liner): `show --production cargo-liner --row C305` printed `nothing to review` while C305 is open. `show --row <id>` prints that row with `describe`, resolved like `edit --row`; a row not on the list exits 1. Rule for every action: no action accepts an option it ignores. One table maps each action to the options it reads; any other option given a value exits 1 and names the option. This table replaces the `--image`/`--output` check.
+- `commands/change_review.md`: document `batch` and its JSON form next to `edit`, and say a write commits by plumbing with no index refresh.
+
+**Files:**
+- `scripts/production/change_review.py` — `_commit`, `_edit`, the `edit_row` and `record_verdict` split, `batch` in `_run` and the parser
+- `scripts/production/test_change_review.py` — commit and batch tests
+- `commands/change_review.md` — `batch`, commit note
+
+**Workers:** 1 writer + 1 tester — the code and the tests split by file.
+- `impl` — `scripts/production/change_review.py`, `commands/change_review.md`
+- `test` — `scripts/production/test_change_review.py`: from the Spec alone, in the commit test class beside `test_an_edit_commits_the_list`:
+  1. A repository with a clean filter (`filter.x.clean` set to a command that counts its runs into a file) on `*.md` and 20 modified filtered files: an edit commits the list and the filter does not run.
+  2. A lost race: `update-ref` sees a moved HEAD once (patch `subprocess.run` for the first `update-ref`, or move HEAD between calls); the commit lands on the new HEAD and both commits stay.
+  3. A held `index.lock`: today's test stays green (warning, no new commit, the next write commits both rows).
+  4. Staged changes to other files stay staged (today's test stays green); an unborn HEAD commits the first list.
+  5. `batch` with 30 items over two lists in one folder (edits with and without images, and verdicts): one commit holds all changes; output has 30 lines.
+  6. `batch` with one bad item (a row not on the list) writes nothing and makes no commit; a bad JSON item names its index.
+
+**State:** writes the list files, the git objects, the real index entries of the lists and HEAD of the lists' repository. Each write can fail after the file write and before the ref moves: the next write commits it.
+
+**Constraints from prior phases:** `change_review.py` imports need `env -C ~/.claude` when run against the live lists, because the worktree's scripts package shadows it. Tests never read `~/rust/hanadocs`.
+
+**Acceptance gate:** `python3 -m unittest scripts.production.test_change_review` from the worktree root under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`; `basedpyright scripts/production/change_review.py scripts/production/test_change_review.py` prints `0 errors, 0 warnings`; the director times one write against a filtered repository with 140 modified files (old and new) and runs a batch of 30 rows in one commit.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
