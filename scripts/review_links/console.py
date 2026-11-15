@@ -30,8 +30,24 @@ REFERENCE = re.compile(r"python:([a-zA-Z_][\w.]*)\:([a-zA-Z_]\w*)")
 SEEN_NAME = ".review-link-seen.json"
 SEEN_LOCK = ".review-link-seen.lock"
 ITEM_ERRORS = (*review_link.SNAPSHOT_ERRORS, ChangeReviewError, Refusal)
+
+
+class NewsRequest:
+    """One news request: the review root, and work that the items functions share within the request."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.results: dict[Callable[[Path], object], object] = {}
+
+    def shared[T](self, function: Callable[[Path], T]) -> T:
+        """Run a function of the root once per request; later calls take its first result."""
+        if function not in self.results:
+            self.results[function] = function(self.root)
+        return cast(T, self.results[function])
+
+
 # A page's items function names the items that wait on the page, such as its waiting changes.
-ItemsFunction = Callable[[Path], frozenset[str]]
+ItemsFunction = Callable[[NewsRequest], frozenset[str]]
 
 
 @dataclass(frozen=True)
@@ -137,11 +153,12 @@ def news(root: Path, pages: tuple[ConsolePage, ...], opened: str) -> tuple[str, 
                 for page, keys in cast(dict[str, object], stored).items() if isinstance(keys, list)}
         fresh: list[str] = []
         updated = dict(seen)
+        request = NewsRequest(root)
         for page in pages:
             if page.items is None or not isinstance(page.destination, AvailablePage):
                 continue
             try:
-                items = page.items(root)
+                items = page.items(request)
             except ITEM_ERRORS as error:
                 print(f"review-links news: {page.identity}: {error}", file=sys.stderr)
                 continue
