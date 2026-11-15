@@ -4154,3 +4154,15 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `BUILDLOG_TRANSCRIPTS` is not set: it is a read root.
 - AWS pair (3 rounds): the changed and guarded modules do not change; the removed module cost 16.0 CPU s.
 - Commit 8e5756b00. Production change (sdlc trial go and land go 11-15).
+
+### Phase 287 — The verify Mac argument test checks argument shapes by a direct call  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_decline_runs_same_nextest_words_locally_after_runner` in `scripts/direct/test_verify_mac_arguments.py` keeps 2 complete `verify.sh` runs: a filter run with a package, and an ignored-only run with no package and no filter. They cover `FILTER_RUN` from `--filter` and from `--run-ignored`.
+- `NextestArgumentTests.test_each_argument_shape_gives_its_ignored_and_package_words` runs `parse_command_arguments` and `compose_nextest_args` for all 5 argument shapes. It checks the `--run-ignored`, `--no-tests=warn`, `--workspace` and `package(sample)` assertions. `compose_script` shares the function and metadata setup with the existing direct test.
+- A `verify.sh` mutation for each moved assertion fails the new test.
+- AWS pair (3 rounds): 14.19 -> 8.33 CPU s, all pass.
+- Commit fef7152f0. Test-only change.
