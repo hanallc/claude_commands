@@ -226,6 +226,27 @@ Setup resumes an existing stack through reads before another mutation.
 It refuses changed resource inputs or an expired reservation before another stack request.
 It registers the deployment only after the Spot request and stopped state match.
 Setup adds no route, target, or slot capacity.
+Setup changes the stack through a change set, never through `cloudformation deploy`.
+It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
+A failed create or update calls `spot_end.end_boxes` before it reports the error.
+That call keeps only the box that `hana/setup.json` records.
+
+## Ending persistent Spot boxes
+
+AWS opens a persistent Spot request again when its box is terminated.
+The request then launches a new box with no tags.
+`scripts/aws_target/spot_end.py` ends such boxes in this order:
+1. Read the live boxes by deployment tag.
+2. Cancel every live request of those boxes and every request with the tag.
+3. Read the boxes again by tag and by request id, so a box launched between the read and the cancel is found.
+4. Terminate the boxes and wait until they are terminated.
+5. Read again. `SpotEndIncomplete` names any request or box that stays live.
+A failed cancel raises before any terminate.
+`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, deletes the Hana stack, and removes the local Hana records.
+It keeps the retained data volume and control bucket.
+`test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
+It shows that a failed create, a failed update and the Hana `down` each leave zero open requests and zero boxes.
+It also shows that each one-time launch uses one-time Spot with terminate.
 
 The provider maps every remote operation through `PROVIDER_OPERATIONS`.
 A policy test derives its required IAM actions from that mapping.
@@ -282,6 +303,13 @@ The target registry contains `mac,natedev`.
 The builder configuration and offload route have been removed.
 Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
 Only historical cost, ownership, and teardown compatibility remain.
+The foundation template has no builder instance, launch template, data volume, roles or stop action.
+The `remove-builder` command and the `down` compute stage are removed.
+
+On 2026-11-04 an `up` with `cloudformation deploy` replaced the builder instance, and the update failed.
+The rollback terminated the new instance, so its persistent Spot request opened again.
+AWS then launched a stopped box with no tags, which stayed until the user removed it.
+Since that day, `up` uses a change set and refuses an instance or volume replace before it executes.
 
 `deploy.py down --approve-destroy` can remove the remaining gate resources without registering the former target.
 Teardown resolves former builder claim and lock paths directly from the AWS state folder.
