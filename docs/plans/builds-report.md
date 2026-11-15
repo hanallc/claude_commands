@@ -1508,3 +1508,14 @@ From the user (via builds, 2026-11-14 20:2x): seven changes to the AWS prices pa
 - `/aws_prices` prints the same tables without marks, the cheapest line after the run tables, then Refused, Launched and the billed hours.
 - Proof: `phases/81/proof/before-*` and `after-*` (four shots each, plus the terminal text). Live: the one over cell is m7a.4xlarge us-east-2, `21.1/13.5 (56%) over`, as aws said.
 - Tests: 43 in `test_control` pass, with new tests for the marks and the hours table; basedpyright 0/0/0.
+
+### Phase 82 — A failed vault transfer names the machine at fault · status: done
+
+From builds (not the user), 2026-11-14: the 20:27 hourly vault sync stopped with exit 1. The question named the Mac, but natedev's own vault was damaged. Builds gave the go for this fix.
+
+#### As-built
+
+- Cause: natedev lost power at 18:18:27, 2 s after an agent-notes commit. The ref update was saved, but the loose commit object stayed empty. The fetch from the Mac then failed its connectivity check on natedev ("did not send all necessary objects").
+- `vault_pull.mac_git` keeps the unreachable rule. Any other failed transfer calls `failing_machine()`. It runs `git fsck --connectivity-only --no-dangling` on `LOCAL_VAULT` (about 0.3 s). A failed check gives `Machine.NATEDEV`; a good check gives `Machine.MAC`.
+- The failure in the Mac script (`remote_outcome`) still names the Mac.
+- Test `test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged`: a refused fetch names the Mac; after an empty loose commit object on natedev, the same failure names natedev. 46 tests in `test_vault_pull` pass; basedpyright 0/0/0.
