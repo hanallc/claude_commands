@@ -35,6 +35,7 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -1924,6 +1925,33 @@ class LaunchDestinationTests(StaffTestCase):
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
         self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
         started.assert_called_once()
+
+    def test_a_member_claude_launch_starts_in_the_member_session_folder(self) -> None:
+        member = fixture_member("showrunner", name="boss")
+        account = self.root / "folder-account"
+        account.mkdir()
+        session_root = Path(os.environ["SESSION_TEMP_ROOT"])
+        for root_exists in (False, True):
+            with self.subTest(root_exists=root_exists):
+                if root_exists:
+                    session_root.mkdir()
+                prepared = herdr.PreparedAgentEnvironment(self.root, {"CLAUDE_CONFIG_DIR": str(account)})
+                with (patch.object(herdr, "open_tab", return_value="unit-pane") as opened,
+                      patch.object(herdr.Herdr, "run_in_pane"),
+                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                      patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+                    _ = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "boss"), prepared, "claude",
+                        ["--resume", str(member.current_session)], herdr.NoOpeningPrompt(), 5000, agent="boss")
+                environment = cast(dict[str, str], opened.call_args.args[4])
+                folder = session_root / "boss"
+                if root_exists:
+                    self.assertEqual(environment["TMPDIR"], str(folder))
+                    self.assertEqual(environment[session_folder.FOLDER_ENV], "boss")
+                    self.assertEqual(session_folder.read_record(folder),
+                                     {"owner": str(member.id), "session_id": str(member.current_session)})
+                else:
+                    self.assertNotIn("TMPDIR", environment)
+                    self.assertNotIn(session_folder.FOLDER_ENV, environment)
 
     def test_failed_claude_trust_write_prints_one_anomaly_and_does_not_start(self) -> None:
         account = self.root / "broken-account"
