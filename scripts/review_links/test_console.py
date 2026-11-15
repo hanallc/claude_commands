@@ -29,7 +29,7 @@ class ConsoleMarkup(HTMLParser):
     @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
-        if identity := values.get("data-page"):
+        if values.get("class") == "nav-entry" and (identity := values.get("data-page")):
             self.pages.append(identity)
         if tag in ("script", "link", "img", "iframe"):
             self.sources.extend(value for key in ("src", "href") if (value := values.get(key)))
@@ -63,7 +63,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(markup.pages, ["aws", "builds", "changes", "images", "questions"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 16)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 15)
         self.assertEqual(source.count('class="lucide lucide-sparkle"'), 6)
         self.assertEqual(source.count('<span class="new-mark" hidden>'), 5)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
@@ -75,21 +75,24 @@ class ConsoleTests(unittest.TestCase):
         changes = f"{base}/{change_page.PAGE_NAME}"
         self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
         self.assertIn(f'data-url="{changes}?type=questions" data-title="Questions"', source)
-        self.assertIn(f'data-rebuilds="{base}/{change_page.REBUILDS_NAME}"', source)
+        self.assertIn(f'data-url="{base}/{change_page.REBUILDS_NAME}" data-title="Rebuilds needed" hidden>', source)
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
         self.assertIn("try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}", source)
         self.assertIn("setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);", source)
-        self.assertIn('aria-controls="rebuild-dialog" hidden>', source)
+        self.assertIn('<a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"', source)
+        self.assertIn("const pages = [...entries, rebuildLink];", source)
+        self.assertIn("if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));", source)
+        self.assertIn("open: current === rebuildLink ? '' : current.dataset.page", source)
         self.assertNotIn("<iframe", source)
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
         self.assertIn("if (opened) frame.contentWindow.postMessage('console-shown', location.origin);", source)
-        self.assertIn('<dialog id="rebuild-dialog" aria-labelledby="rebuild-title">', source)
+        for removed in ("<dialog", "showModal", "lucide-x"):
+            self.assertNotIn(removed, source)
         self.assertIn('class="lucide lucide-refresh-cw"', source)
-        self.assertIn('aria-label="Close"', source)
         self.assertIn("/builds/memory_live.html", source)
         self.assertIn("/aws/aws_prices.html", source)
         self.assertIn('class="lucide lucide-cloud"', source)
@@ -130,7 +133,7 @@ class ConsoleTests(unittest.TestCase):
         source = console.render(pages, console.UnavailablePage()).decode()
         markup.feed(source)
         self.assertEqual(markup.pages, ["questions", "images", "changes", "builds", "aws"])
-        self.assertIn('data-rebuilds=""', source)
+        self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
 

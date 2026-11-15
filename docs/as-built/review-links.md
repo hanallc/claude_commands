@@ -109,7 +109,6 @@ At phone width, a slim top bar shows **Hana console** and a menu button.
 The frame uses the full page width below the top bar.
 The menu button opens the navigation above the frame.
 A page choice, the Escape key, or a click outside closes the navigation.
-When the rebuild overlay is open, the Escape key closes only the overlay.
 The phone navigation starts closed and does not change the stored desktop state.
 
 `?page=<id>` selects a page.
@@ -168,9 +167,10 @@ Its label names each machine, with no count: **Rebuild natedev**, **Rebuild the 
 A long label wraps to a second line and stays inside the sidebar.
 The collapsed rail shows the icon with a badge of the machine count, and hover or focus shows the label.
 At phone width the link is a small fixed button at the bottom left, never wider than the open sidebar (220px), so it wraps and stays inside the sidebar.
-A click opens a modal overlay titled **Rebuilds needed** with the Rebuilds page content.
-The close button, the Escape key or a click outside closes the overlay, and focus returns to the link.
-When no machine needs a rebuild, the link hides and an open overlay closes.
+A click opens the Rebuilds page in the frame, titled **Rebuilds needed**, as a navigation entry opens its page.
+`?page=rebuilds` selects it, and the link shows an inset outline while the page is open.
+Each read of the page for the link also replaces the list on an open Rebuilds page, so that page needs no refresh of its own.
+When no machine needs a rebuild, the link hides, and an open Rebuilds page shows `No rebuilds needed.`
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
@@ -178,6 +178,7 @@ The function takes the review root and returns the keys of the items that wait o
 Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
 A page without an items function, or an unavailable page, never shows the icon.
 The console posts `open=<id>` for the page it shows to `/console/news`.
+While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
 It posts when it loads, at each page choice, and at each `page_refresh_seconds` interval while the browser tab is visible.
 The server records the open page's item keys in the private `console/.review-link-seen.json`.
 It answers `{"new": [<id>, ...]}` with each other page that holds a key absent from its record.
@@ -360,25 +361,29 @@ An agent deletes an image with this command:
 Each render reads `rebuild_row.read()` once (`scripts/statusline/rebuild_row.py`), with `config/statusline.conf`.
 That answer joins the cached system comparison with the open rebuild needs, so the page and the status line name the same machines.
 The server serves it only in a folder that holds the browser manifest.
-It is not in the navigation.
+It has no navigation entry; the rebuild link opens it.
 A `data-rebuilds` block carries `data-count`, the number of machines, and `data-label`, the link label.
 The page shows one block per machine, with natedev first, then the Mac.
-Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then one entry per change, newest first.
-Each entry is a list of three rows: Who, When and Reason.
+Each block has the title `Rebuild natedev` or `Rebuild the Mac`, then the changes grouped by owner.
+Each owner shows once, as a heading, and the owner with the newest change comes first.
+Under an owner, the changes go newest first, and changes with the same shown time share one time.
+The time is a column at the left, with the reasons of that time beside it.
 The changes are the `/etc/nixos` commits on the configured ref after the commit the machine last switched to.
 `rebuild_row.read_changes()` reads them from `<rebuild.cache>-changes.json`; the status line refresh writes that file.
 A commit's reason is its subject and its time is the author time.
 Its Who comes from the commit's `Claude-Session` line: the session whose transcript records that Remote Control session.
-A filed need is an entry with its requester (else the affected session), its creation time and its reason.
+A filed need is a change with its requester (else the affected session) as owner, its creation time and its reason.
 A need covers its own commit, so that commit shows once.
 Names come from the current staff record as `<name> (<kind>)`.
 An unknown session appears as `Unknown session: <id>`; a commit without a known session shows `Unknown session`.
-When shows the time in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
+The time shows in the user's zone as `Nov 15, 2026, 08:45` (24-hour).
 A listed machine without a recorded change list shows `The change list is not available yet.`
 When no machine needs a rebuild, the page shows only `No rebuilds needed.`, with a count of 0 and an empty label.
 
-The page heading uses 26px text; machine and card headings use 20px text; body text uses 17px.
-The content column stays at 680px, with 8px control gaps, 16px content gaps, and 32px between machine blocks.
+The page heading uses 26px text; machine headings use 20px text; owner headings use 17px; the changes use 15px.
+The content column is up to 1060px wide.
+The machine blocks sit side by side when each block has at least 420px, with 48px between them; otherwise they stack with 32px between them.
+At 480px or less, each time sits above its reasons.
 Controls wrap on narrow screens, keep a minimum height of 44px, and show keyboard focus in both color themes.
 
 ### Answering a change review
