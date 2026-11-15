@@ -20,7 +20,7 @@ from scripts.production import change_review, change_routing, staff, update_regi
 from scripts.production.production_doc import Production, read_production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_page, console
+from scripts.review_links import change_page, console, page_frame
 from scripts.review_links.change_page import ReviewBrowser as ReviewBrowser
 from scripts.statusline import rebuild_row
 
@@ -253,6 +253,9 @@ ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re
               re.compile(r"\(([a-z])\)\s"))
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 BLANK_LINE = re.compile(r"\n\s*\n")
+CHOICE_LABEL_PATTERN = r'''(?:'[^'\n]+'|"[^"\n]+"|[^'"\n:.!?;]{1,60}?)(?:\s+\(recommended\))?:\s+'''
+CHOICE_LABEL = re.compile(CHOICE_LABEL_PATTERN, re.IGNORECASE)
+INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IGNORECASE)
 
 
 def split_at(text: str, mark: re.Pattern[str]) -> tuple[str, str]:
@@ -310,42 +313,85 @@ def followup_sections(item: update_registration.OutstandingItem) -> str:
                    for each in item.get("followups", []))
 
 
-def text_sections(text: str) -> tuple[str, str]:
-    """Show a question stored as one text in sections: the text, its items, its choices and the recommendation."""
+def question_text(item: update_registration.OutstandingItem) -> tuple[str, str]:
+    """Separate the question sentence from its context without repeating the title."""
+    text = item.get("reviewed", item.get("question", item["text"])).strip()
+    if "reviewed" in item:
+        title, _, context = text.partition("\n")
+        return title.strip(), context.strip()
+    question = SENTENCE_END.split(text[:text.index("?") + 1])[-1] if "?" in text else ""
+    if question:
+        before, _, after = text.partition(question)
+        return question.strip(), (before.strip() + "\n\n" + after.strip()).strip()
+    title, _, context = text.partition("\n")
+    first = SENTENCE_END.split(title, maxsplit=1)
+    return first[0], "\n\n".join(part for part in (*first[1:], context.strip()) if part)
+
+
+def question_paragraphs(text: str) -> str:
+    """Keep paragraphs and list lines separate; split sentences in text stored on one line."""
+    paragraphs = BLANK_LINE.split(text.strip()) if "\n" in text else SENTENCE_END.split(text.strip())
+    return "".join(change_page.review_text_html(paragraph, inline=True) for paragraph in paragraphs if paragraph)
+
+
+def reviewed_choices(text: str) -> tuple[str, list[str]]:
+    """Recognize a final group of labeled choice paragraphs after the context."""
+    paragraphs = BLANK_LINE.split(text)
+    start = len(paragraphs)
+    while start and CHOICE_LABEL.match(paragraphs[start - 1]) is not None:
+        start -= 1
+    choices = paragraphs[start:]
+    if len(choices) < 2 or any("\n" in choice for choice in choices):
+        return text, []
+    return "\n\n".join(paragraphs[:start]), choices
+
+
+def text_sections(text: str, *, reviewed: bool = False) -> tuple[str, str]:
+    """Show context, items, choices and the recommendation as separate sections."""
     rest, recommend = split_at(text, RECOMMEND_MARK)
     lead, choice_text = split_at(rest, CHOICES_MARK)
+    paragraphs: list[str] = []
+    if reviewed and not choice_text:
+        lead, paragraphs = reviewed_choices(lead)
     lead, items, trailing = numbered_run(lead)
     if items and "\n" not in text:
         # In one paragraph, the text after the last item's first sentence is not part of that item.
         last = SENTENCE_END.split(items[-1], maxsplit=1)
         items[-1], trailing = last[0], last[1] if len(last) > 1 else ""
     choice_lead, choices, choice_trailing = numbered_run(choice_text)
-    if not items and not choice_text and not recommend:
-        return change_page.review_text_html(text, inline=True), ""
-    body = change_page.review_text_html(lead, inline=True) if lead else ""
-    body += (item_list(items) if items else "") + (change_page.review_text_html(trailing, inline=True) if trailing else "")
-    # Only numbered choices become buttons; other choice text shows as text.
+    choices = paragraphs or choices
     if choice_text and not choices:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_text, inline=True)
+        marks = list(INLINE_CHOICE.finditer(choice_text))
+        if len(marks) >= 2 and marks[0].start() == 0:
+            choices = [choice_text[mark.start():end].strip().rstrip(";")
+                       for mark, end in zip(marks, [mark.start() for mark in marks[1:]] + [len(choice_text)])]
+            choice_lead = ""
+    body = question_paragraphs(lead) if lead else ""
+    body += (item_list(items) if items else "") + (question_paragraphs(trailing) if trailing else "")
+    # Unmarked choices stay text because their boundaries do not identify safe answer values.
+    if choice_text and not choices:
+        lines = [part.strip() for part in re.split(r";\s+|\n+|(?<=[.!?])\s+", choice_text) if part.strip()]
+        body += '<h2>Choices</h2><ul>' + "".join(f'<li>{change_page.inline_html(line)}</li>' for line in lines) + '</ul>'
     elif choice_lead:
-        body += '<h2>Choices</h2>' + change_page.review_text_html(choice_lead, inline=True)
+        body += '<h2>Choices</h2>' + question_paragraphs(choice_lead)
     if choice_trailing:
-        body += change_page.review_text_html(choice_trailing, inline=True)
+        body += question_paragraphs(choice_trailing)
     if recommend:
-        body += '<h2>Recommended</h2>' + change_page.review_text_html(recommend, inline=True)
+        body += '<h2>Recommended</h2>' + question_paragraphs(recommend)
     return body, choice_list(choices)
 
 
 def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]:
     """Return the question body and its choice buttons; a question stored as one text shows in sections."""
     if "parts" not in item:
-        body, choices = text_sections(item.get("question", ""))
+        _, context = question_text(item)
+        body, choices = text_sections(context, reviewed="reviewed" in item)
         return body + followup_sections(item), choices
     parts = item["parts"]
     same = parts["ask"].strip().rstrip("?.").casefold() == item["text"].strip().rstrip("?.").casefold()
     body = "" if same else f'<p class="question-ask">{change_page.inline_html(parts["ask"])}</p>'
     if parts["context"].strip():
-        body += '<h2>Context</h2>' + change_page.review_text_html(parts["context"], inline=True)
+        body += '<h2>Context</h2>' + question_paragraphs(parts["context"])
     if parts["items"]:
         body += item_list(parts["items"])
     if parts["recommend"].strip():
@@ -359,6 +405,7 @@ ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends unt
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
     body, choices = question_parts(question.record.item)
+    title = question.record.item["text"] if "parts" in question.record.item else question_text(question.record.item)[0]
     owned = question.tab != "unrouted"
     # Without an owner there is no form, so the choices show as a list the user cannot pick.
     shown_choices = "" if owned else choices.replace('<input type="radio"', '<input type="radio" disabled')
@@ -372,7 +419,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
 <button name="outcome" value="followup" disabled data-needs-text>Followup</button>
 <button name="outcome" value="skip">Skip</button></div></form>'''
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
-<h1>{html.escape(question.record.item["text"])}</h1>
+<h1>{html.escape(title)}</h1>
 {body}{shown_choices}
 <p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
 
@@ -768,4 +815,4 @@ window.addEventListener('message',event=>{if(event.source===parent && event.orig
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
 bindPage();show();scheduleRefresh();
 '''
-SCRIPT_VERSION = change_page.script_version(SCRIPT)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)

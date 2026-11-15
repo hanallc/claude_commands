@@ -34,7 +34,7 @@ from scripts.production import change_routing, change_review, footer_counts, nex
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve, image_store, review_link
+from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -128,6 +128,27 @@ class BrowserForms(HTMLParser):
 
 
 SEND_MESSAGE = change_page.send_message
+
+# The Memory bar record predates structured question parts.
+MEMORY_BAR_ASK = "Memory bar on the Builds page: what name should the new block have?"
+MEMORY_BAR_REVIEWED = MEMORY_BAR_ASK + """
+
+The cap mark is the memory limit for builds that the build queue runs. The block holds:
+- sccache, the compiler cache: 2.2 GiB now, nearly all of the block.
+- rust-analyzer, the editor's Rust checker: 0 GiB now.
+- Other build programs: 0.1 GiB now.
+
+The resources unit named the block 'Build tools'. Nobody approved that name.
+
+'Compiler cache' (recommended): the block shows this name. It fits because nearly all of the block is sccache.
+
+'Build tools': the block keeps the name it has now.
+
+Your own name: the resources unit puts your name on the block."""
+MEMORY_BAR_RAW = (MEMORY_BAR_ASK + " The cap mark is the memory limit for builds that the build queue runs. "
+    + "The resources unit named the block 'Build tools'. Nobody approved that name. "
+    + "Choices: 'Compiler cache': nearly all of the block is sccache. 'Build tools': keep the current name. "
+    + "Your own name: the resources unit puts your name on the block. Recommended: 'Compiler cache', because it names the contents.")
 
 
 @cache
@@ -236,7 +257,70 @@ class ReviewTextTests(unittest.TestCase):
         parts["items"] = parts["choices"] = []
         self.assertEqual(change_browser.question_parts(item), ("", ""))
         del item["parts"]
-        self.assertEqual(change_browser.question_parts(item), ("<p>joined</p>", ""))
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+
+    def test_memory_bar_reviewed_text_keeps_paragraphs_lists_and_three_choice_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="2026-11-15", text=MEMORY_BAR_RAW,
+            question=MEMORY_BAR_RAW, reviewed=MEMORY_BAR_REVIEWED)
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, MEMORY_BAR_ASK)
+        self.assertNotIn(MEMORY_BAR_ASK, context)
+        body, choices = change_browser.question_parts(item)
+        self.assertNotIn(MEMORY_BAR_ASK, body + choices)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertIn("<li>rust-analyzer, the editor&#x27;s Rust checker: 0 GiB now.</li>", body)
+        self.assertIn("<p>The resources unit named the block &#x27;Build tools&#x27;. Nobody approved that name.</p>", body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+        self.assertIn('(recommended)', choices)
+        self.assertNotIn('because it names the contents', body + choices)
+        item["reviewed"] = MEMORY_BAR_REVIEWED + "\n\nRecommended: Keep the compiler cache name."
+        body, choices = change_browser.question_parts(item)
+        self.assertIn('<h2>Recommended</h2><p>Keep the compiler cache name.</p>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+
+    def test_open_question_forms_use_short_titles_and_separate_context(self) -> None:
+        parts = update_registration.QuestionParts(ask="Keep the name?", context="First paragraph.\n\nSecond paragraph.",
+            items=["First item", "Second item"], recommend="Keep it", choices=["Keep it", "Change it"])
+        cases: tuple[tuple[str, update_registration.OutstandingItem, str, int], ...] = (
+            ("parts", update_registration.OutstandingItem(since="now", text="Keep the name?", parts=parts), "Keep the name?", 2),
+            ("reviewed only", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                reviewed=MEMORY_BAR_REVIEWED), MEMORY_BAR_ASK, 3),
+            ("raw one line", update_registration.OutstandingItem(since="now", text="Stored summary",
+                question="Keep the name? First paragraph. Second paragraph."), "Keep the name?", 0),
+            ("raw choices", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                question=MEMORY_BAR_RAW), MEMORY_BAR_ASK, 3),
+        )
+        owner = staff.StaffId("owner")
+        for name, item, title, choices in cases:
+            with self.subTest(form=name):
+                record = update_registration.QuestionRecord(Path("/unused/question.md"), owner, owner, item, "open")
+                question = change_browser.WaitingQuestion("q1", "owner", record, Path("/unused/production.md"), owner, "asker")
+                section = change_browser.question_section(question, change_page.ReviewBrowser("private"), 4)
+                self.assertEqual(section.count(title), 1)
+                self.assertIn(f'<h1>{title}</h1>', section)
+                self.assertEqual(section.count('name="choice"'), choices)
+                if name in ("parts", "raw one line"):
+                    self.assertIn('<p>First paragraph.</p><p>Second paragraph.</p>', section)
+                if name == "raw choices":
+                    self.assertIn('<h2>Recommended</h2><p>&#x27;Compiler cache&#x27;, because it names the contents.</p>', section)
+                    self.assertIn('Your own name: the resources unit puts your name on the block.', section)
+
+    def test_reviewed_presence_and_ambiguous_choices_do_not_restore_raw_text_or_invent_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="Do not show this raw question? Raw text.", reviewed="Reviewed question?\n\nOne paragraph.\n\nAnother paragraph.")
+        self.assertEqual(change_browser.question_parts(item), ('<p>One paragraph.</p><p>Another paragraph.</p>', ""))
+        item["reviewed"] = ""
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+        _ = item.pop("reviewed")
+        item["question"] = "Keep it? Choices: yes = keep; no = drop. Recommended: yes"
+        self.assertEqual(change_browser.question_parts(item),
+            ('<h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul><h2>Recommended</h2><p>yes</p>', ""))
+
+    def test_title_uses_the_first_question_sentence_and_context_keeps_earlier_sentences(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="A change waits. Keep it? use this name. Is that clear?")
+        self.assertEqual(change_browser.question_text(item), ("Keep it?", "A change waits.\n\nuse this name. Is that clear?"))
 
 
     def test_one_text_question_shows_items_choices_and_recommendation_as_sections(self) -> None:
@@ -252,11 +336,11 @@ class ReviewTextTests(unittest.TestCase):
                          + '</fieldset>')
         with self.subTest("choices without numbers show as text"):
             self.assertEqual(change_browser.text_sections("Keep it? Choices: yes = keep; no = drop. Recommended: yes"),
-                             ('<p>Keep it?</p><h2>Choices</h2><p>yes = keep; no = drop.</p>'
+                             ('<p>Keep it?</p><h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul>'
                               + '<h2>Recommended</h2><p>yes</p>', ""))
         with self.subTest("numbers out of order are not items"):
             self.assertEqual(change_browser.text_sections("Phase 2. Then 1) only one item."),
-                             ("<p>Phase 2. Then 1) only one item.</p>", ""))
+                             ("<p>Phase 2.</p><p>Then 1) only one item.</p>", ""))
         with self.subTest("lines: a blank line ends the last item"):
             self.assertEqual(change_browser.text_sections("Pick one.\n\nChoices:\n1. Add it. Then measure.\n2. Keep it.\n\nMeanwhile I port."),
                              ('<p>Pick one.</p><p>Meanwhile I port.</p>',
@@ -1204,6 +1288,9 @@ class ChangePageTests(unittest.TestCase):
         _, _, browser = self.browser()
         page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
         for body in (browser, page):
+            self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
+            self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
+            self.assertIn('data-image-zoom class="change-image"', body)
             self.assertIn(f'href="/change-images/{identity}/image.png" target="_blank" rel="noopener"', body)
             self.assertIn('alt="Screenshot: Numbered moves"', body)
             self.assertIn('class="change-text"', body)
@@ -1250,6 +1337,24 @@ class ChangePageTests(unittest.TestCase):
         filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
         return "question/" + owner.id + "/" + filed.path.name
 
+    def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
+        key = self.file_user_question(MEMORY_BAR_RAW, question=MEMORY_BAR_RAW)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
+                        if item.key == key)
+        update_registration.write_question_record(replace(question.record,
+            item={**question.record.item, "reviewed": MEMORY_BAR_REVIEWED}))
+        before = question.record.path.read_bytes()
+        _, forms, body = self.browser("questions")
+        self.assertIn(key, forms.rows)
+        self.assertIn(f'<h1>{MEMORY_BAR_ASK}</h1>', body)
+        self.assertEqual(body.count(MEMORY_BAR_ASK), 1)
+        self.assertEqual(body.count('name="choice"'), 3)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertNotIn('because it names the contents', body)
+        self.assertEqual(question.record.path.read_bytes(), before)
+
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
@@ -1281,7 +1386,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn('<title>Questions to answer</title>', body)
         self.assertIn('<h1 class="page-title">Questions to answer</h1>', body)
         self.assertIn("Which layout gives each review card enough space for its controls?", body)
-        self.assertEqual(body.count("Choose the layout"), 1)
+        self.assertNotIn("Choose the layout", body)
         self.assertIn("Compact &lt;layout&gt;", body)
         self.assertIn("Asked by builder-unit", body)
         self.assertNotIn("The old and new comments agree with the tests", body)
