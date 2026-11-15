@@ -1,52 +1,33 @@
-"""Register images for the console's Images page, render the page, delete images, and send feedback to owners."""
+"""Store console images and temporary change images in separate folders."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import hmac
 import html
-import json
-import re
 import secrets
 import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import cast
 from urllib.parse import parse_qs
 
-from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
-from scripts.review_links import change_browser, change_page, console, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, review_link
 
 FOLDER = "images"
 PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
-RECORD = ".review-link-image.json"
 LOCK = ".review-link-images.lock"
-DRAFT_PREFIX = ".review-link-draft-"
-SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-IDENTITY = re.compile(r"[0-9a-f]{12}")
 SENDER = Path(__file__).stem
 # Each answer button and the first line of the message that it sends to the owner.
 ANSWERS = {"approved": "your image is approved.", "not approved": "your image is not approved.",
            "feedback": "feedback on your image."}
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", *ANSWERS))
-
-
-class ImageRecord(TypedDict):
-    id: str
-    file: str
-    caption: str
-    owner: str
-    subject: str
-    registered_at: str
-    # A before and after pair keeps the after image in `file` and the before image here.
-    before: NotRequired[str]
-    # Set when the owner received the user's answer; the page hides the image until the owner deletes it.
-    feedback_at: NotRequired[str]
 
 
 class AnswerNotSent(Exception):
@@ -63,106 +44,59 @@ def page_url() -> str:
     return PAGE_PATH
 
 
-def image_path(record: ImageRecord, file: str = "") -> str:
+def image_path(record: image_store.ImageRecord, file: str = "") -> str:
     return f"/{FOLDER}/{record['id']}/{file or record['file']}"
 
 
-def shown_files(record: ImageRecord) -> tuple[tuple[str, str], ...]:
+def shown_files(record: image_store.ImageRecord) -> tuple[tuple[str, str], ...]:
     """Return each image's label and file: a pair shows Before, then After; one image has no label."""
     if "before" in record:
         return ("Before", record["before"]), ("After", record["file"])
     return ("", record["file"]),
 
 
-def read_record(folder: Path) -> ImageRecord:
-    if folder.is_symlink() or (folder / RECORD).is_symlink():
-        raise ValueError(f"{folder.name}: not a regular image record")
-    value = cast(object, json.loads((folder / RECORD).read_text(encoding="utf-8")))
-    if not isinstance(value, dict):
-        raise ValueError(f"{folder.name}: invalid image record")
-    fields = cast(dict[str, object], value)
-    texts = ("id", "file", "caption", "owner", "subject", "registered_at")
-    if any(not isinstance(fields.get(key), str) for key in texts) or fields["id"] != folder.name:
-        raise ValueError(f"{folder.name}: invalid image record")
-    record: ImageRecord = {"id": cast(str, fields["id"]), "file": cast(str, fields["file"]),
-                           "caption": cast(str, fields["caption"]), "owner": cast(str, fields["owner"]),
-                           "subject": cast(str, fields["subject"]), "registered_at": cast(str, fields["registered_at"])}
-    for key in ("before", "feedback_at"):
-        value = fields.get(key)
-        if value is not None and not isinstance(value, str):
-            raise ValueError(f"{folder.name}: invalid image record")
-    if isinstance(before := fields.get("before"), str):
-        record["before"] = before
-    if isinstance(feedback_at := fields.get("feedback_at"), str):
-        record["feedback_at"] = feedback_at
-    return record
-
-
-def write_record(folder: Path, record: ImageRecord) -> None:
-    atomic_file.write_bytes_atomic(folder / RECORD, json.dumps(record).encode("utf-8"), mode=0o600)
-
-
-def records(root: Path) -> list[ImageRecord]:
+def records(root: Path) -> list[image_store.ImageRecord]:
     """Read every registered image, oldest first; an unreadable record prints one line and stays out."""
     folder = images_root(root)
-    found: list[ImageRecord] = []
+    found: list[image_store.ImageRecord] = []
     try:
         entries = sorted(folder.iterdir())
     except FileNotFoundError:
         return found
     for entry in entries:
-        if not IDENTITY.fullmatch(entry.name) or entry.is_symlink() or not entry.is_dir():
+        if not image_store.IDENTITY.fullmatch(entry.name) or entry.is_symlink() or not entry.is_dir():
             continue
         try:
-            found.append(read_record(entry))
+            found.append(image_store.read_record(entry))
         except (OSError, ValueError) as error:
             print(f"review-links images: {error}", file=sys.stderr)
     # A new image goes to the end, so the cards above it keep their places.
     return sorted(found, key=lambda record: record["registered_at"])
 
 
-def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
-             *, before: Path | None = None) -> ImageRecord:
-    """Copy the image, or a before and after pair, into a folder that its record owns.
+def waiting_records(root: Path) -> list[image_store.ImageRecord]:
+    """Return the Images records that still wait for the user's answer."""
+    return [record for record in records(root) if "feedback_at" not in record]
 
-    The server serves the folder's images, and a delete removes the folder.
-    """
-    sources = (("before", before), ("after", image)) if before is not None else (("image", image),)
-    for _, source in sources:
-        if source.suffix.casefold() not in SUFFIXES:
-            raise ValueError(f"{source}: use one of {', '.join(sorted(SUFFIXES))}")
-        if not source.is_file():
-            raise ValueError(f"{source}: no such image file")
+
+def waiting_images(request: console.NewsRequest) -> frozenset[str]:
+    """Name the images that wait for the user, for the console's new mark."""
+    return frozenset(record["id"] for record in waiting_records(request.root))
+
+
+def register(image: Path, caption: str, owner: staff.StaffId, subject: str,
+             *, before: Path | None = None) -> image_store.ImageRecord:
+    """Register one image or a before and after pair for its staff owner."""
     if not caption.strip():
         raise ValueError("the caption is empty; say what changed and what to look at")
     if staff.snapshot().by_id(owner) is None:
         raise ValueError(f"no staff record for owner {owner}")
-    folder = images_root(review_link.review_root().resolve())
-    folder.mkdir(parents=True, exist_ok=True)
-    identity = secrets.token_hex(6)
-    draft = folder / (DRAFT_PREFIX + identity)
-    draft.mkdir(mode=0o755)
-    try:
-        files = {stem: stem + source.suffix.casefold() for stem, source in sources}
-        # The last source is the after image of a pair, or the one image.
-        record: ImageRecord = {"id": identity, "file": files[sources[-1][0]],
-                               "caption": caption.strip(), "owner": owner, "subject": subject,
-                               "registered_at": datetime.now(UTC).isoformat(timespec="seconds")}
-        if "before" in files:
-            record["before"] = files["before"]
-        for stem, source in sources:
-            _ = shutil.copyfile(source, draft / files[stem])
-        write_record(draft, record)
-        # The page shows a folder only after its image and record are complete.
-        _ = draft.rename(folder / identity)
-    except BaseException:
-        shutil.rmtree(draft, ignore_errors=True)
-        raise
-    return record
+    return image_store.register_file(image, images_root(review_link.review_root().resolve()),
+                                     caption, str(owner), subject, before=before)
 
 
 def delete(root: Path, identity: str) -> None:
-    if not IDENTITY.fullmatch(identity):
+    if not image_store.IDENTITY.fullmatch(identity):
         raise ValueError(f"{identity}: not an image id")
     folder = images_root(root) / identity
     if folder.is_symlink() or not folder.is_dir():
@@ -187,7 +121,7 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
     return f"{member.name} ({member.kind})", member.name
 
 
-def picture(record: ImageRecord, label: str, file: str) -> str:
+def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     """Link one image to its full size; a pair image shows its label above it."""
     path = html.escape(image_path(record, file), quote=True)
     alt = record["caption"].splitlines()[0]
@@ -196,7 +130,7 @@ def picture(record: ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def card(record: ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
+def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -226,7 +160,7 @@ def render(root: Path) -> bytes:
     token = console_token(root)
     members = staff.snapshot()
     rows = conf.read("review_links").whole("feedback_rows")
-    cards = "".join(card(record, token, members, rows) for record in records(root) if "feedback_at" not in record)
+    cards = "".join(card(record, token, members, rows) for record in waiting_records(root))
     content = (STYLE + '<h1 class="page-title">Images</h1><div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
@@ -245,7 +179,7 @@ def submit(root: Path, body: str) -> None:
             len(value) != 1 for value in fields.values()):
         raise change_page.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
-    if not IDENTITY.fullmatch(identity):
+    if not image_store.IDENTITY.fullmatch(identity):
         raise change_page.AnswerRefused("not an image id")
     expected = request_token(console_token(root), identity)
     if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
@@ -263,7 +197,7 @@ def submit(root: Path, body: str) -> None:
             raise change_page.AnswerRefused(str(error)) from error
 
 
-def answer_message(record: ImageRecord, answer: str, feedback: str) -> str:
+def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) -> str:
     """Name the answer, then the feedback when the user wrote some, the image, and the delete command."""
     origin = f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}"
     return "\n".join((
@@ -281,7 +215,7 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
         raise change_page.AnswerRefused("enter feedback")
     folder = images_root(root) / identity
     try:
-        record = read_record(folder)
+        record = image_store.read_record(folder)
     except (OSError, ValueError) as error:
         raise change_page.AnswerRefused(f"no image {identity}") from error
     settings = conf.read("review_links")
@@ -292,12 +226,12 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
         raise AnswerNotSent(failures[-1].error)
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
-            current = read_record(folder)
+            current = image_store.read_record(folder)
         except (OSError, ValueError):
             # The owner deleted the image while the message was on its way.
             return
         current["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-        write_record(folder, current)
+        image_store.write_record(folder, current)
 
 
 # At 1108px and wider, the page fills the frame inside its 32px gutters, and the

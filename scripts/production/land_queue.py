@@ -25,7 +25,7 @@ from typing import NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import land_runs
+from scripts.production import land_runs, waits_on
 
 HASH = re.compile(r"[0-9a-f]{7,40}")
 
@@ -48,10 +48,54 @@ class NoLine(NamedTuple):
 
 
 class Place(NamedTuple):
-    """A commit's place in the line; 1 lands next."""
+    """A commit's place in the line; 1 lands next. The owner is the batch line's unit and phase, else the label."""
 
     number: int
     label: str
+    owner: str
+
+
+class LandView(NamedTuple):
+    """The lands that run now, the land line, and the newest result of each land.
+
+    A land also takes each commit its listed commit holds that is not on main: carried_running and carried_line.
+    """
+
+    running: dict[str, str]
+    line: dict[str, Place] | NoLine
+    results: dict[str, land_runs.LandResult]
+    carried_running: frozenset[str]
+    carried_line: dict[str, Place]
+
+
+class LandRunning(NamedTuple):
+    pass
+
+
+class InLine(NamedTuple):
+    """The commit waits at a place; failed is the newest result when that try did not land.
+
+    carried is True when a later commit at that place holds this commit.
+    """
+
+    place: Place
+    failed: land_runs.LandResult | None
+    carried: bool
+
+
+class LandEnded(NamedTuple):
+    result: land_runs.LandResult
+
+
+class NotInLine(NamedTuple):
+    pass
+
+
+class LineUnused(NamedTuple):
+    """No runner uses the line, and the commit has no land result."""
+
+
+LandState = LandRunning | InLine | LandEnded | NotInLine | LineUnused
 
 
 class Refusal(Exception):
@@ -98,10 +142,6 @@ def batch_commits(batch: str) -> tuple[BatchCommit, ...]:
     return tuple(found)
 
 
-def item_commits(item: LineItem) -> tuple[str, ...]:
-    return (*item["commits"], *(entry.commit for entry in batch_commits(item["batch"])))
-
-
 def places() -> dict[str, Place] | NoLine:
     """The place of each commit in the line; an unreadable line is an empty line."""
     found: dict[str, Place] = {}
@@ -110,8 +150,10 @@ def places() -> dict[str, Place] | NoLine:
         if isinstance(items, NoLine):
             return items
         for number, item in enumerate(items, 1):
-            for commit in item_commits(item):
-                _ = found.setdefault(commit, Place(number, item["label"]))
+            for commit in item["commits"]:
+                _ = found.setdefault(commit, Place(number, item["label"], item["label"]))
+            for entry in batch_commits(item["batch"]):
+                _ = found.setdefault(entry.commit, Place(number, item["label"], f"{entry.unit} {entry.phase}"))
     except (OSError, ValueError, KeyError, TypeError):
         return {}
     return found
@@ -121,6 +163,38 @@ def place_of(line: dict[str, Place], commit: str) -> Place | None:
     """The first place whose commit names this commit; an item can name a short hash."""
     found = [place for listed, place in line.items() if land_runs.holds(frozenset({listed}), commit)]
     return min(found, key=lambda place: place.number) if found else None
+
+
+def land_view(repo: Path) -> LandView:
+    """Read the lands; one git call for each listed commit finds the commits it carries."""
+    running, line = land_runs.running_lands(), places()
+    carried_running = frozenset(commit for listed in running for commit in waits_on.carried(repo, listed))
+    carried_line: dict[str, Place] = {}
+    if not isinstance(line, NoLine):
+        for listed, place in sorted(line.items(), key=lambda entry: entry[1].number):
+            for commit in waits_on.carried(repo, listed):
+                _ = carried_line.setdefault(commit, place)
+    return LandView(running, line, land_runs.last_results(), carried_running, carried_line)
+
+
+def land_state(view: LandView, commit: str) -> LandState:
+    """Where a commit is on its way to land: running, at a place in the line, or ended with its newest result."""
+    if land_runs.holds(view.running, commit):
+        return LandRunning()
+    result = land_runs.result_for(view.results, commit)
+    failed = result if result is not None and not result["landed"] else None
+    place = None if isinstance(view.line, NoLine) else place_of(view.line, commit)
+    if place is not None:
+        return InLine(place, failed, False)
+    if result is not None and result["landed"]:
+        return LandEnded(result)
+    if land_runs.holds(view.carried_running, commit):
+        return LandRunning()
+    if (carrier := place_of(view.carried_line, commit)) is not None:
+        return InLine(carrier, failed, True)
+    if result is not None:
+        return LandEnded(result)
+    return LineUnused() if isinstance(view.line, NoLine) else NotInLine()
 
 
 def position(items: list[LineItem], label: str) -> int:

@@ -178,8 +178,12 @@ When no machine needs a rebuild, the link hides, and an open Rebuilds page shows
 
 A navigation entry shows the Lucide `sparkle` icon when its page holds an item added after the user last opened that page.
 An optional `page.<id>.items` key names the page's items function, in the form `python:<module>:<function>`.
-The function takes the review root and returns the keys of the items that wait on the page.
-Changes uses `change_browser.waiting_changes` and Questions uses `change_browser.waiting_questions`.
+The function takes a `console.NewsRequest` and returns the keys of the items that wait on the page.
+Changes uses `change_browser.waiting_changes`.
+Questions uses `change_browser.waiting_questions`.
+Images uses `images.waiting_images` for registered images without `feedback_at`.
+The Images page and its items function share the same waiting-record filter.
+Temporary change images stay outside the Images page and its new mark.
 A page without an items function, or an unavailable page, never shows the icon.
 The console posts `open=<id>` for the page it shows to `/console/news`.
 While the Rebuilds page is open, it posts an empty `open=`, which records no page as seen.
@@ -194,7 +198,8 @@ An items function that fails writes one line to the server log, and its page sho
 In the open sidebar the icon's center lines up with the status dots of unavailable pages.
 In the collapsed rail the icon sits at the top right of the page icon.
 At phone width the menu button shows the icon while any page holds new items.
-Each poll reads the change lists one time, about 0.1 seconds of server time. The two items functions share that read through `NewsRequest.shared`.
+Each poll reads the change lists once, about 0.1 seconds of server time.
+The Changes and Questions items functions share that read through `NewsRequest.shared`.
 
 The console vendors eleven SVGs from `lucide-static` **0.468.0** under `scripts/review_links/lucide/`.
 They are `list-checks`, `message-circle-question`, `hammer`, `cloud`, `image`, `refresh-cw`, `sparkle`, `x`, `panel-left-close`, `panel-left-open`, and `menu`.
@@ -232,6 +237,30 @@ All with no card keeps the URL without a fragment.
 Skip for now skips a card without saving an answer.
 The control hides when no other item waits in the selected filter.
 An empty page shows **No questions to answer.** or **No changes to review.**
+
+Each change can hold one image id in its optional `Image` cell.
+`change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py image --image <png>` registers a screenshot for a checkpoint line.
+`image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
+The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
+The parser accepts twelve lowercase hexadecimal characters.
+`list-ready` and `live` leave the cell empty and print one line when the image is missing.
+
+Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
+The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
+It has a 420px height limit and crops from the top left.
+It opens the full image in a new tab.
+Below 1000px, it moves under the text.
+A row without an image retains its text width and position.
+
+`image_store.register_file` shares draft creation, image suffix checks, and atomic publication between the two image stores.
+It stores a single image or a before and after pair with one record.
+`image_store.read_record` checks the optional `before` and `feedback_at` fields.
+Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
+The snapshot sweep skips both image stores during normal snapshot deletion.
+It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
+The setting starts at 14 days and is read at each sweep.
 
 Questions read the canonical records through `update_registration.question_records_for_document`.
 A question belongs to the showrunner whose record owns it.

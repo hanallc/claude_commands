@@ -138,6 +138,11 @@ def history_root() -> Path:
     return unit_runs.history_root()
 
 
+def run_events_path(session_dir: Path) -> Path:
+    """The events file of the run that uses this session folder."""
+    return history_root() / "runs" / f"{session_dir.name}.jsonl"
+
+
 def now_epoch() -> float:
     configured = unit_runs.environ("NOW_EPOCH")
     if configured:

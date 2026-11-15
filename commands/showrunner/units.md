@@ -52,6 +52,16 @@ Style column headers set the minimum text widths.
 Fixed style columns and minimum text widths can exceed a smaller configured width.
 
 For units outside the `Style units` table in a production without `Kind: style`, the command prints two tables.
+The first line shows `in work N · waiting to merge N · waiting on other work N · merged today N`.
+One empty line separates the summary from table 1.
+The summary counts only units in these phase tables and always includes zero counts.
+
+1. `in work` counts open phases whose Notes do not say `done, …`.
+2. `waiting to merge` counts distinct unit and phase owners in active merges or the merge line.
+   It also includes open phases whose Notes say `done, …`, without counting an owner twice.
+3. `waiting on other work` counts every queue item with an unmet `after` wait.
+4. `merged today` counts distinct unit and phase pairs with successful merge results on today's date in the production zone.
+
 Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
 Table 2 shows `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
 Both tables use the same unit order.
@@ -86,15 +96,26 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    The phase instance in the selected run supplies the open step.
    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
    A checkpoint after the instance's last phase, pass or activity start replaces the step with a wait.
-   It is ` · waiting on running checkpoint` while a land run that holds the checkpoint commit runs now.
-   In the land line it is ` · waiting on queued checkpoint, 2nd in line`; 1st lands next.
-   A failed earlier try adds `; last try: land failed at red 11:20: <first detail line>`.
-   Out of the line it is the last land result: `checkpoint landed 11:20` or `land held at ancestry 11:20: <detail>`.
-   With no result, it is ` · checkpoint sent, not in the land line`.
-   Before any runner uses the line, it is ` · waiting on queued checkpoint`.
+   The wait uses plain words (user, 2026-11-15: a human must understand it).
+   It is ` · done, merging now` while a merge run that holds the checkpoint commit runs now.
+   In the merge line (`land_queue.py list`) it is ` · done, waits to merge, 2nd in line`; 1st merges next.
+   A checkpoint that a later checkpoint in the line holds says ` · done, waits to merge with <unit> <phase>, 2nd in line`.
+   A failed earlier try adds `; last try failed at red 11:20: <first detail line>`.
+   Out of the line it is the last merge result: `done, merged 11:20` or `done, did not merge: held at ancestry 11:20: <detail>`.
+   With no result, it is ` · done, not sent to merge yet`.
+   Before any runner uses the line, it is ` · done, waits to merge`.
+   The unit's first row also names each sent checkpoint with no phase row of its own, from the merge line and the merge results:
+   ` · merging now: <phase>`, ` · done, waits to merge: shot-rule (1st in line), a + b (2nd in line)`, or ` · <phase> did not merge: merge conflict in <files> 13:58`.
+   Phases in one merge line item share one entry. A failed merge whose commit is on main later is not shown.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
-   Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
+   A unit without open work shows `nothing open: <plan reason>, <queue reason>`.
+   The plan reason is `plan done`, `no plan`, or `next plan phase <id> not started`.
+   A missing record, an unavailable record, or a plan without phases uses `no plan`.
+   The queue reason is `queue empty`, `queued work waits on <after>`, or `queued work not started`.
+   The first queue item's wait selects the queue reason.
+   A ready item uses `queued work not started`.
+   Sent work and background command waits still append after these reasons.
    Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
    Each open worker or director wait appends ` · waiting on <reason> <elapsed>`.
    A recorded holder adds `(held by <holder>)` before the elapsed time.
@@ -116,10 +137,12 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    Duration predictions still use the plan's recorded history.
    It never precedes the latest promise of any open or not-started plan phase.
    The first row also names promises for unfinished targets without open rows, as `phase <id>: <time>[ · late <elapsed>]`.
-   The latest `phase_finished` event for each target decides whether that target is done.
-   Only status `completed` marks a target as done.
-   A later `error` or `stopped` finish overrides earlier completions and plan-record done rows.
-   That target's promise remains visible.
+   A later promise for the same target replaces the earlier promise.
+   Any later `phase_finished` event removes the promise, regardless of its status.
+   A later `checkpoint` event for the target also removes the promise.
+   A merge result for the same unit and phase removes the promise when its time follows the promise event.
+   A later `phase_started` event opens the phase again.
+   Open phases show their promises in ETA Next.
    A row without an unfinished plan or such a promise shows `—`.
 6. **Workers** lists the census workers of the unit.
    An open phase row lists only the workers whose open pass is in that phase instance.
@@ -133,13 +156,19 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    The reason keeps `+<n> idle` for idle workers.
    A failed census, or a machine that the census did not scan, shows `—`.
 7. **Non-Phase Work** shows `—` for an open phase row because Notes already describes that phase.
-   A row without a recorded phase instance keeps the existing summary for work outside the plan.
-8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
+   A row without a recorded phase instance names every open phase outside the plan with its step text.
+   The list preserves run order and joins entries with ` · `.
+8. **Queued** names every `/unit:queue` item, joined with ` · `.
    It excludes each queue item whose text equals Notes in the same row.
-   Each part adds ` +<n> more` for later items.
-   The queue count includes only remaining items.
+   An item added with `--after <work>` names its wait: `<text> — after <work>: <state>`.
+   The state comes from the local `origin/main` (no fetch), the merge line, the merge results, and the owner unit's run.
+   Example states: `done, waits to merge, 3rd in line`, `done, merging now`, `done, merged 14:10, not on main yet`, `in work, ETA 16:00`, `not started`, `not on main`, `not found`.
+   When the work is on main, the item shows `ready: <text> (<work> on main)`.
+   Every item includes its wait text when applicable.
    With no remaining queue item, it shows the plan part or `—`.
    Plan work includes every phase that is neither done nor open.
+   The plan part shows `plan: phase 30: <title>, then 31, 32`.
+   Only the first phase has its title; every later phase has its id.
    Every open phase of the selected run stays outside Queued, including phases absent from the configured plan.
    It uses the configured plan when that plan has phases; otherwise, it uses the selected run's plan.
    A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
