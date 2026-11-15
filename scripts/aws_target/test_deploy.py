@@ -1267,16 +1267,17 @@ sys.exit(7)
         after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
+        # The candidate region has only a price read, so the report reads no quota there.
         self.assertEqual(calls, [(region, code, operation) for region, code in (
-            (home, 'L-34B43A08'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'), (candidate, 'L-3819A6DF'))
+            (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
             for operation in ('get-service-quota', history)])
         lines = output.getvalue().splitlines()
         self.assertEqual([line for line in lines if line and not line.startswith((' ', 'Summary:'))],
-                         [home, other, candidate])
+                         [home, other])
         self.assertEqual([line.strip() for line in lines if line.startswith('  ') and not line.startswith('    ')], [
             f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
-            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
             f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied',
+            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
             f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied'])
         headers = [line for line in lines if 'Asked vCPUs' in line]
         requests = [line for line in lines if line.startswith('    ') and any(
@@ -1290,7 +1291,7 @@ sys.exit(7)
             self.assertEqual(line.index(date if status == 'CASE_OPENED' else created_date), headers[0].index('Updated'))
         self.assertEqual(lines.count('    No requests.'), 2)
         needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
-        fits = f'{other}, {candidate}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
+        fits = f'{home}, {other}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
         self.assertEqual(lines[-1], f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
             + f'open requests: {home} Standard Spot {desired["L-34B43A08"] + 1} vCPUs (CASE_OPENED), '
             + f'{other} G and VT Spot {desired["L-3819A6DF"]} vCPUs (PENDING)')
@@ -1548,7 +1549,8 @@ sys.exit(7)
                       redirect_stdout(StringIO()) as captured):
                     self.assertEqual(deploy.main(), 0 if success else 1)
                 lines = [line for line in captured.getvalue().splitlines() if 'G and VT' not in line]
-                self.assertEqual(gpu_regions, ['us-east-2', 'us-west-2'])
+                # us-east-2 has only a price read, so it gets no quota call.
+                self.assertEqual(gpu_regions, ['us-east-1', 'us-west-2'])
                 self.assertEqual([line for line in captured.getvalue().splitlines() if 'G and VT' in line],
                     [f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gpu_regions])
                 self.assertEqual(lines[-1], 'us-west-2: Spot quota 300 vCPUs; no request is needed for 128 vCPUs')
@@ -1571,12 +1573,15 @@ sys.exit(7)
                 for private in ('fixture-admin-id', 'fixture-admin-secret', request_id, case_id, account_id):
                     self.assertNotIn(private, captured.getvalue())
 
-    def test_gpu_quota_request_cases_and_failures_in_each_candidate_region(self) -> None:
+    def test_gpu_quota_request_cases_and_failures_in_each_gate_region(self) -> None:
         get_quota = 'get-service-quota'
         history = 'list-requested-service-quota-change-history-by-quota'
         request = 'request-service-quota-increase'
         candidates = ('us-west-2', 'us-east-2')
-        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', ' '.join(candidates))
+        gates = ('us-east-1', *candidates)
+        text_setting(self.root / 'cloud_gate.conf', 'regions', ' '.join(gates))
+        # eu-north-1 has only a price read, so it gets no quota call.
+        text_setting(self.root / 'cloud_gate.conf', 'spot_candidate_regions', ' '.join((*candidates, 'eu-north-1')))
         cases = (
             (8, '', '', '', True),
             (4, '', '', '', True),
@@ -1623,7 +1628,7 @@ sys.exit(7)
                             expected.extend(['--desired-value', '4'])
                         self.assertEqual(list(arguments[arguments.index('service-quotas'):]), [*expected, '--output', 'json'])
                         if code == 'L-34B43A08':
-                            self.assertEqual(region, 'us-east-1')
+                            self.assertIn(region, gates)
                             self.assertEqual(operation, get_quota)
                             reply: dict[str, object] = {'Quota': {'Value': 128}}
                         elif region != selected_region:
@@ -1655,8 +1660,8 @@ sys.exit(7)
                           mock.patch.object(sys, 'argv', ['deploy.py', 'quota-request', '--settings', str(self.settings)]),
                           redirect_stdout(StringIO()) as captured):
                         self.assertEqual(deploy.main(), 0 if success else 1)
-                    expected_calls = [('us-east-1', 'L-34B43A08', get_quota)]
-                    for region in candidates:
+                    expected_calls = [(region, 'L-34B43A08', get_quota) for region in gates]
+                    for region in gates:
                         expected_calls.append((region, 'L-3819A6DF', get_quota))
                         if region == selected_region and quota < 4 and failure != get_quota:
                             expected_calls.append((region, 'L-3819A6DF', history))
@@ -1664,7 +1669,8 @@ sys.exit(7)
                                 expected_calls.append((region, 'L-3819A6DF', request))
                     self.assertEqual(calls, expected_calls)
                     lines = captured.getvalue().splitlines()
-                    self.assertEqual(lines[0], 'us-east-1: Spot quota 128 vCPUs; no request is needed for 128 vCPUs')
+                    standard = [f'{region}: Spot quota 128 vCPUs; no request is needed for 128 vCPUs' for region in gates]
+                    self.assertEqual(lines[:len(gates)], standard)
                     if failure:
                         reason = {'timeout': 'TimeoutExpired', 'uncoded': 'AwsUnavailable', 'malformed': 'KeyError'}.get(
                             failure, 'AccessDeniedException')
@@ -1675,9 +1681,9 @@ sys.exit(7)
                         expected_line = f'{selected_region}: open G and VT Spot quota request 8 vCPUs; status {history_status}'
                     else:
                         expected_line = f'{selected_region}: G and VT Spot quota request 4 vCPUs; status {request_status}'
-                    self.assertEqual(lines, [lines[0], *[
+                    self.assertEqual(lines, [*standard, *[
                         expected_line if region == selected_region else
-                        f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in candidates]])
+                        f'{region}: G and VT Spot quota 4 vCPUs; no request is needed for 4 vCPUs' for region in gates]])
                     for private in ('private-request', 'private-case', 'private-account', 'fixture-admin-id', 'fixture-admin-secret'):
                         self.assertNotIn(private, captured.getvalue())
 

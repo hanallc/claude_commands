@@ -90,11 +90,14 @@ class DeploymentRefused(ValueError):
 
 
 def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...]:
-    """Share the configured regions and quota codes between requests and reports."""
+    """Share the gate regions and quota codes between requests and reports.
+
+    A region with only a price read has no gate stack, so a quota request there buys nothing."""
     values = conf.read_or_repository('cloud_gate')
+    regions = gate_regions(home, values)
     return (
-        (gate_regions(home, values), 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
-        (values.words('spot_candidate_regions'), 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
+        (regions, 'L-34B43A08', values.whole('spot_quota_request_vcpus'), 'Spot'),
+        (regions, 'L-3819A6DF', values.whole('gpu_spot_quota_request_vcpus'), 'G and VT Spot'),
     )
 
 
