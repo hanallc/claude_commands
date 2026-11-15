@@ -227,7 +227,7 @@ def render(root: Path) -> bytes:
     members = staff.snapshot()
     rows = conf.read("review_links").whole("feedback_rows")
     cards = "".join(card(record, token, members, rows) for record in records(root) if "feedback_at" not in record)
-    content = (STYLE + '<h1>Images</h1><div data-image-filter><label for="image-window">Show:</label>'
+    content = (STYLE + '<h1 class="page-title">Images</h1><div data-image-filter><label for="image-window">Show:</label>'
                + '<select id="image-window"><option value="day">Last day</option>'
                + '<option value="week" selected>Last 7 days</option><option value="all">All</option></select></div>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
@@ -300,8 +300,8 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
         write_record(folder, current)
 
 
-# At 1104px and wider, the page starts at the console's 30px header padding, so
-# the groups panel sits under the header title. 1104 = 30 + 300 + 64 + 680 + 30.
+# At 1108px and wider, the page fills the frame inside its 32px gutters, and the
+# image column keeps its full 680px. 1108 = 32 + 300 + 64 + 680 + 32.
 # There a single card keeps 680px, and a pair card takes up to two of them: 1376 = 680 + 16 + 680.
 # A pair stacks, before on top, when its card is narrower than 600px.
 STYLE = """<style>[hidden]{display:none!important}
@@ -320,7 +320,7 @@ STYLE = """<style>[hidden]{display:none!important}
 [data-images] textarea{font:inherit;width:100%;box-sizing:border-box;color:CanvasText;background:Canvas}
 .image-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.image-actions button{margin:0}
 @media (max-width:480px){.image-actions{gap:6px}.image-actions button{font-size:15px;padding:6px 8px}}
-main{max-width:1060px}
+main{max-width:1124px}
 [data-image-layout]{display:grid;grid-template-columns:300px minmax(0,680px);gap:32px;align-items:start}
 [data-image-groups]{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;display:grid;
 grid-template-columns:minmax(0,max-content) max-content max-content;font-size:14px;border:1px solid #8886;border-radius:8px}
@@ -332,7 +332,7 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-image-groups] .group-count{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:900px){[data-image-layout]{display:block}
 [data-image-groups]{position:static;max-height:none;margin-bottom:16px;grid-template-columns:minmax(0,1fr) max-content max-content}}
-@media (min-width:1104px){main{max-width:none;margin:0;padding-left:30px;padding-right:30px}
+@media (min-width:1108px){main{max-width:none}
 [data-image-layout]{grid-template-columns:300px minmax(0,1fr);column-gap:64px}
 [data-image-layout]>div{width:100%;max-width:1376px;justify-self:center}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
