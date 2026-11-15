@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
@@ -29,9 +29,10 @@ def pane_columns() -> int | None:
 
 
 def wrapped(headers: Sequence[str], rows: Sequence[Sequence[str]],
-            columns: int | None = None) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
-    """Remove empty columns and split cells for the terminal width, or for the configured floor without one."""
-    kept = [index for index in range(len(headers)) if not rows or any(row[index] != NONE for row in rows)]
+            columns: int | None = None, *, keep: Collection[int] = ()) -> tuple[tuple[str, ...], list[tuple[str, ...]]]:
+    """Remove empty columns except the `keep` indexes, and split cells for the terminal width or the floor."""
+    kept = [index for index in range(len(headers))
+            if not rows or index in keep or any(row[index] != NONE for row in rows)]
     titles = tuple(headers[index] for index in kept)
     table_rows = [tuple(row[index] for index in kept) for row in rows]
     settings = conf.read_or_repository("production")

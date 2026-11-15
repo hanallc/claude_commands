@@ -302,6 +302,10 @@ A showrunner or unit registers each image with one command:
 ```
 
 - The caption says what changed and what to look at.
+- `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
+  It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
+  It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
+  `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
 - The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
