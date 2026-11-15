@@ -4226,19 +4226,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** none
 **Owner:** natest (test-only change).
 
-#### Work Order
+#### As-built
 
-**Goal:** the hold tests in `scripts/direct/test_verify_token_handoff.py` do not sleep the default 15-second routing pass, with the same checks of behavior.
-
-**Spec:**
-- `VerifyTokenWaitFixture.hold_environment` in `scripts/direct/verify_token_wait_test_support.py` sets `BUILD_TARGETS_POLL_S=0.5`.
-- The fixture provider ends the hold at the next host probe, and that probe comes with the next routing pass. Without the setting, `local_release_wait.py` sleeps the default 15 seconds first.
-- A 0.05-second interval made more passes while the peer held the token, and used more CPU (16.1 -> 20.0 s on natedev).
-
-**Files:** `scripts/direct/verify_token_wait_test_support.py`.
-
-**Workers:** 1 writer (the director; no-worker mode). The change is in one file.
-
-**Constraints from prior phases:** Phases 287-292 cut test CPU without a change of behavior checks.
-
-**Acceptance gate:** the module passes on natedev; basedpyright reports zero errors and zero warnings; an AWS pair (3 rounds) passes with the same test count and less CPU.
+- `VerifyTokenWaitFixture.hold_environment` in `scripts/direct/verify_token_wait_test_support.py` sets `BUILD_TARGETS_POLL_S=0.5`. The fixture provider ends the hold at the next host probe, which comes with the next routing pass; the default pass is 15 seconds.
+- A 0.05-second interval used more CPU (more passes while the peer held the token).
+- AWS pair (3 rounds): 21.90 -> 14.47 CPU s, all pass.
+- Commit 272d392b0. Test-only change.
