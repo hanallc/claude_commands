@@ -1568,3 +1568,15 @@ From the user (via builds, 2026-11-15): "let's have the same table be able to sw
 - `aws_prices.html`: a `Spot price | Cost per gate` switch, and a `Merge gates | Targeted runs | Both` switch shown only for cost. The URL keeps both (`?prices=cost&runs=merge-gate`); the run kind left browser storage. Each column has a green, white (the card color in dark mode) and red scale from the minimum through the median to the maximum. A strong outline marks the cheapest cell of each table. One legend line explains both.
 - Proof: `phases/86/proof/before-*` (the phase 85 after shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, and phone width).
 - Tests: 45 in `test_control` pass; basedpyright 0/0/0.
+
+### Phase 87 — The price cards box the lowest and the highest price of each type · status: done
+
+From the user (via builds, 2026-11-15): "we should white box outline both the lowest price and the highest price now that we have color coding - this is very interesting". From builds (not the user): on every price table that marks the best cell, box the lowest and the highest cell of each type with the same white box, in both themes and at phone width; keep the color coding.
+
+#### As-built
+
+- `aws_prices.html`: `scaleCells` returns `ends`, the lowest and the highest cells of each type column with two or more different values. An `end` cell has a 3 px white box inside a 1 px dark edge (`--box`, `--box-edge`), the same in both themes. The cheapest cell of each table stays bold (`best`) and lost its outline.
+- The legend reads "White box: the lowest and the highest of each type." and "Bold: the cheapest in the table."
+- A column with only two values in view has no box, because the colors already show which is which.
+- From the user (via builds, 2026-11-15): "the filter on the aws page - we need a None at the end that turns all fiters off so i can quickly just select one or two i want to look at". From builds (not the user): add it to this phase. The region filter has a `None` chip after the last region. It clears every region, and each card then says "No region chosen." A region chip can now turn off the last chosen region. The view and run kind switches choose one value each, so they have no `None`.
+- Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, phone width, and the region filter with All, None, None then one region, and None then two regions).
