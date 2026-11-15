@@ -159,7 +159,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 
 **Ruled out:** mode recording (showrunner, 2026-11-08); `--before-at` for this sample (`--route-revision` reads the before hashes from the route's parent).
 
-### Phase 5 — Measure the first step and propose the next  · status: todo
+### Phase 5 — Measure the first step and propose the next  · status: done
 **Depends on:** Phase 4
 
 **Waits for:** at least twenty eligible `AfterChange` phases from the same units as the before sample, after the route's main time (2026-11-07 23:32:53Z).
@@ -183,13 +183,41 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `docs/plans/sdlc-phases-design.md` — Step log, Steps
 
-**Workers:** `1 writer + 1 tester` — one doc. `impl` runs the measure and writes the Step log.
-- `impl` — `docs/plans/sdlc-phases-design.md`
-- `test` — opens as test — independently re-runs the frozen measure, recomputes the percentage from the exact observations (values near 1.5% included), and checks the Step log; it writes no doc text
+**Workers:** `director only (no Codex workers until the workers-back notice)` — the director runs the measure, writes the Step log, and re-runs the frozen measure once to check the percentage.
 
 **Constraints from prior phases:** Deployed revisions: Phase 4's **Constraints from prior phases** lists the main commit and time for Phases 3, 6 to 16, 18 and 19, the staff-lifecycle cut and postmaster-unit's records. The route is on main at 7733bee4c (2026-11-07 23:32:53Z). The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the route revision and its main time, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample from recorded hashes after the route shipped. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. The after window ends at the collection time. A change to the recorder, a launcher, a hook (the Stop and prompt hooks included), a wait publisher or `phase_process.py` does not end it: these files change on main almost daily (the first, `d6ed85d3e` at 2026-11-08T00:50:40Z, changed `codex_mesh.py` and `mesh_runs.py` 78 minutes after the route), so a cutoff would leave no sample. Exposure already guards the measure: a phase counts as `AfterChange` only when it starts and finishes with the route's recorded `direct.md` hash. The Step log lists each such change inside the after window with hash and main time, and the result names them. hierarchies Phase 30, which deletes `codex_mesh.py`, is one. Run the measure at the Step log's measurement version of `phase_process.py`. The Step log also lists each main change to `docs/direct/*.md` and to `scripts/direct/phase_reservation.py` inside either window, with hash and time; Phase 21 is one. `trial_exposure` reads only the `direct.md` hash, so the result names these changes. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green. The before sample (Phase 4, checkpoint 271be2de5) holds 31 instances from 9 units: cargo-liner-handler, claude-natedev-builds-natest, claude-natedev-builds-resources, claude-natedev-efficiency, claude-natedev-unit-board, devtools, hana_catalyst-build-speed-tests, remove-running-section-handler and sdlc-devtools. `--units` matches the run-start unit, worktree, branch and working-directory name, so the `remove-running-section-handler` selector also picks `cargo-liner-handler` phases and `sdlc-devtools` also picks `devtools` phases. Compute each unit's after numbers from its own `--detail trial` rows, as the Step log does; never add selector totals. The detail rows omit the phase instance id: keep the Step log's `Ambiguous` mark on a display id with several starts in a window. Scope class and gates use the Step log's sources: for builds-resources, the Work Order at the phase's checkpoint commit; a field with no retained source stays `NotRecorded`. The two devtools selectors have unavailable compaction counts (invalid JSON in their transcript).
 
 **Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
+
+### Phase 29 — Each worker pass records its model, and cheap A is measured again  · status: todo
+**Depends on:** Phase 5
+
+**Waits for:** the user's answer to the Phase 5 question (keep cheap A, record the worker model, measure again). Then, for the measure step, at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after the fix reaches main.
+
+#### Work Order
+
+**Goal:** every worker pass names its model, and the design doc says whether cheap A moved director tokens on worker-mode phases.
+
+**Spec:**
+- `progress_history.begin_dispatch` takes the called family, model and effort. It no longer writes `unknown` and `unset` for every pane dispatch.
+- `scripts/production/worker.py` passes the family, model and effort of the worker the pane launched: the launch policy's settings, or the `--model` and `--effort` values when given. A worker whose model the pane does not know still records `unknown`; the recorder never infers a model.
+- Tests: a pane dispatch records the launched worker's family, model and effort in `pass_started.called_agent`; a dispatch with an unknown model records `unknown`.
+- Find why 22 of 29 cargo-liner-handler after compactions show no contract Read (Step log, After sample), and report the cause in the Step log. Make no change to `phase_process.py` in this phase.
+- Measure step, after the fix reaches main and the wait condition holds: run the frozen protocol of Phase 5. Fixed `--since` (the fix's main time) and `--until` (the collection time) as UTC stamps; one invocation per unit, summary and `--detail trial`; the measurement version is blob `98bef1370ee83586a43f1b0e12cd16b92b30876e` from `git archive 96c882a1e`; `--exposure after --route-revision 7733bee4cdb9d75cd9680482809eff05c1a788e3`. Record each after instance and its matching metadata (scope class, worker model, gates) as Phase 5 did.
+- Measure: weighted director tokens over the phase plus its following gap. Target: the pooled median and the median of each matched unit 3–7% lower than the Step log's before sample; a fall below 1.5% is a proposal to undo or change cheap A. n counts phases with known weighted tokens. Report compactions per phase and context size after reload with no target, and median and p90 phase time per unit.
+- Report each excluded state with n: `ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed, open unmixed, `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload`.
+- Matching: a phase with no worker pass, or with a worker model `NotRecorded`, is not a match for a before row with a recorded worker model. A control `NotRecorded` in either window makes the result `inconclusive`. Mode stays a named `NotRecorded` limit.
+- Send the showrunner the result and the next step (B, full A, G or I) as one question.
+
+**Files:**
+- `scripts/direct/progress_history.py` — `begin_dispatch`
+- `scripts/production/worker.py` — the `begin_dispatch` call
+- `scripts/direct/test_progress_history.py`, `scripts/production/test_worker.py` — called-agent tests
+- `docs/plans/sdlc-phases-design.md` — Step log, Steps
+
+**Workers:** one Codex worker writes the recorder fix and its tests when workers are back; the director runs the measure and writes the Step log. In no-worker mode the director writes the fix.
+
+**Acceptance gate:** `test_progress_history.py`, `test_worker.py` and `test_phase_process.py` pass; basedpyright reports zero errors on the changed files; a live pane dispatch after the fix records a known `called_agent`; the Step log has the after numbers with n and window, the matching result and the phase-time check.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
