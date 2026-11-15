@@ -473,10 +473,10 @@ class SystemEvidence:
     read_at: float
     started_monotonic: float
     processes: Mapping[int, gate.ProcessIdentity]
-    accounts: Mapping[int, int | OwnerProcessGone]
     lifetimes: Mapping[str, gate.StepLifetime]
     reservations: Mapping[str, ReservationEvidence]
-    runs: Mapping[int, LiveBuildRun | NoLiveBuildRun]
+    # The reader thread is done with this reader when it publishes the reading; only the pass uses it after that.
+    activity: ScopeActivityReader = field(compare=False)
     unowned: tuple[records.UnownedSliceMemory, ...]
     scope_members: Mapping[str, frozenset[int]]
     scope_process_memory: Mapping[int, records.MeasuredMemory]
@@ -485,6 +485,10 @@ class SystemEvidence:
     host: records.HostMemory | records.ReadingUnavailable
     pressure: records.Pressure
     compilers: tuple[records.StepMemory, ...]
+
+    def build_run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
+        """Find one owner's build run from this reading's process table."""
+        return self.activity.run(pid)
 
 
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
@@ -563,9 +567,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     pressure = readings.pressure(host if isinstance(host, records.HostMemory) else
                                  records.HostMemory(0, records.UnknownHostTotal()), pressure_policy)
     return SystemEvidence(now, started_monotonic, MappingProxyType(processes),
-        MappingProxyType({pid: process_uid(pid, proc.path) for pid in processes}),
-        MappingProxyType(lifetimes), MappingProxyType(reservations),
-        MappingProxyType({pid: activity.run(pid) for pid in processes}),
+        MappingProxyType(lifetimes), MappingProxyType(reservations), activity,
         tuple(unowned), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
         tuple(between), host, pressure, tuple(readings.compilers()))
 
@@ -1411,7 +1413,8 @@ class AdmissionServer:
 
     def _account(self, pid: int) -> int | OwnerProcessGone:
         if not isinstance(self.system_reader, NoSystemReader):
-            return self.system_reader.latest.accounts.get(pid, OwnerProcessGone())
+            if pid not in self.system_reader.latest.processes:
+                return OwnerProcessGone()
         return process_uid(pid, self.proc.path)
 
     def _run_alive(self, run: wire.RunIdentity | LiveBuildRun) -> bool:
@@ -1516,7 +1519,7 @@ class AdmissionServer:
                     continue
             row = reservation_row(record)
             if "build_run" not in row:
-                row["build_run"] = evidence.runs.get(record.owner.pid, NoLiveBuildRun())
+                row["build_run"] = evidence.build_run(record.owner.pid)
                 row["run_origin"] = records.FoundRun(row["build_run"])
             elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = records.CallerRun(NoLiveBuildRun())
@@ -1540,7 +1543,7 @@ class AdmissionServer:
             if "build_run" not in waiting.row:
                 waiting.row["build_run"] = (_live_run(request.run)
                     if isinstance(request, wire.AdmitRequest) and isinstance(request.run, wire.RunIdentity)
-                    else evidence.runs.get(request.owner.pid, NoLiveBuildRun()))
+                    else evidence.build_run(request.owner.pid))
         pressure = evidence.pressure
         if isinstance(pressure, records.MemoryPressure):
             pressure = gate.pressure_from_readings(pressure.full_avg10, pressure.some_avg10,
@@ -1756,6 +1759,14 @@ class AdmissionServer:
 
     def _run_pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
                   ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
+        from scripts.build_targets import target_config
+
+        # One pass reads the target list once; each placement check in the pass uses that read.
+        with target_config.command_configuration():
+            return self._pass(configuration)
+
+    def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
+              ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
