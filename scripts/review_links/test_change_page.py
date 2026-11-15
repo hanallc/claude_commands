@@ -2216,6 +2216,9 @@ class ChangePageTests(unittest.TestCase):
                 path, _, content = self.browser()
                 del path
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
+                # An open page reloads, not updates, when the server's page script is newer than its own.
+                self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
+                self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
                 _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
@@ -2570,7 +2573,9 @@ class ChangePageTests(unittest.TestCase):
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
                          "row.dataset.key===current?.dataset.key", "rows.slice(previous+1)"):
                 self.assertIn(rule, body)
-            self.assertNotIn('location.reload', body)
+            # The one full reload is for a page whose script is older than the server's.
+            self.assertEqual(body.count('location.reload'), 1)
+            self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads++", body)

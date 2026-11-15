@@ -184,6 +184,9 @@ Any other `type` value gets a 503 page.
 The page has no tab bar and no combined total.
 The heading and document title follow the kind: **Changes to review** or **Questions to answer**.
 The page updates itself through its existing GET URL without a full reload.
+The one exception is a server update that changes the page script.
+The content carries `data-script`, a hash of the script from `change_page.script_version()`.
+When an update brings a different hash, the page loads again, because the old script cannot bind the new rows.
 `page_refresh_seconds` sets the interval from 5 to 300 seconds; it starts at 15.
 The page loads updates only while its browser tab is visible.
 It loads an update at once when the tab becomes visible again.
@@ -309,6 +312,9 @@ On a narrow screen the panel goes above the cards and scrolls with them.
 An empty period shows **No images in this period. Choose a longer period.**, and no images shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
+The card list carries `data-script`, the page script hash.
+When a refresh brings a different hash, the page loads again in place of the swap.
+An older script does not bind the new card forms, so a form would post outside the script.
 
 **Delete** posts the image id and a token signed with the console browser token.
 The server checks the token and removes the image folder at once under `images/.review-link-images.lock`.

@@ -4,17 +4,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -132,6 +134,108 @@ class ImagesTests(ImagesFixture):
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
         self.assertIn("(feedback ? 'Not sent: ' : 'Not deleted: ') + error.message", source)
         self.assertIn("new FormData(form, event.submitter)", source)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_update_reloads_a_page_from_an_older_script_and_send_feedback_stays_on_the_page(self) -> None:
+        _ = self.register()
+        current = images.render(self.root).decode()
+        marker = f'data-script="{images.SCRIPT_VERSION}"'
+        self.assertEqual(current.count(marker), 1)
+        probe = """<script>
+(async () => {
+ const wait = ms => new Promise(done => setTimeout(done, ms));
+ const report = failures => fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
+ const list = () => document.querySelector('[data-images]');
+ if (list().dataset.script === 'older-script') {
+  document.dispatchEvent(new Event('visibilitychange'));
+  await wait(5000);
+  await report(['an update from a newer script did not reload the page']);
+  return;
+ }
+ const failures = [], check = (ok, text) => { if (!ok) failures.push(text); };
+ const before = list();
+ document.dispatchEvent(new Event('visibilitychange'));
+ for (let step = 0; step < 100 && list() === before; step++) await wait(20);
+ check(list() !== before, 'the update puts in a new list');
+ const card = list().querySelector('article'), form = card.querySelector('form');
+ form.elements.feedback.value = 'Too dark.';
+ form.requestSubmit(form.querySelector('button[value="feedback"]'));
+ for (let step = 0; step < 100 && card.isConnected; step++) await wait(20);
+ check(!card.isConnected, 'Send feedback removes the card from the page');
+ await wait(200);
+ check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send feedback');
+ await report(failures);
+})();
+</script>"""
+        gets: list[str] = []
+        posts: list[dict[str, list[str]]] = []
+        results: list[list[str]] = []
+        probe_complete = threading.Event()
+
+        class BrowserProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the asynchronous checks report their result.
+                    if not probe_complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                if self.path == "/":
+                    # A frame holds the page, as in the console, so its reload does not end the screenshot load.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    _ = self.wfile.write(f'<iframe src="{images.PAGE_PATH}" width="1100" height="800"></iframe>'
+                                         .encode() + b'<img src="/probe-complete" alt="" hidden>')
+                    return
+                if self.path != images.PAGE_PATH:
+                    self.send_error(404)
+                    return
+                gets.append(self.path)
+                # The first load is a page from an older script; every later answer is the current page.
+                page = current.replace(marker, 'data-script="older-script"') if len(gets) == 1 else current
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                _ = self.wfile.write(page.replace("</body>", probe + "</body>").encode())
+
+            def do_POST(self) -> None:
+                payload = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(payload)))
+                    probe_complete.set()
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                posts.append(parse_qs(payload))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(b'{"state": "done"}')
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), BrowserProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / "browser-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "1200,900", "--screenshot", str(self.temporary / "browser.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"],
+                                     capture_output=True, text=True, timeout=45)
+                self.assertEqual(run.returncode, 0, run.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+        self.assertEqual(len(gets), 4, "load, update, reload, update")
+        self.assertEqual([(post["action"], post["feedback"]) for post in posts], [(["feedback"], ["Too dark."])])
 
     def test_card_shows_the_caption_details_image_feedback_field_delete_and_send_feedback(self) -> None:
         record = self.register("Look at <the> cards")
