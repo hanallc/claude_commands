@@ -343,15 +343,40 @@ class ControlTests(CostFixture):
         # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         self.assertEqual(block(fast), [
-            [home, '0.2500', '6m', '0s', '(1', 'runs)', '0.0250', 'not', 'billed', 'not', 'billed', '1/1'],
+            [home, '0.2500', '6m', '0s', '(1', 'runs)', '0.0250', 'not', 'billed', '1', 'bill', 'due', '1/1'],
             [other, '0.2500', '6m', '0s', '(1', 'runs', 'in', 'other', 'regions)', '0.0250', 'not', 'billed',
-             'not', 'billed', '0/0']])
+             'no', 'runs', '0/0']])
         self.assertEqual([cells[:7] for cells in block(slow)], [[home, '0.2500', '12m', '0s', '(1', 'runs)', '0.0500'],
                                                                [other, '0.2500', '12m', '0s', '(1', 'runs', 'in']])
         for size in self.compare:
-            self.assertEqual([cells[2:] for cells in block(size)], [['no', 'runs', '—', 'not', 'billed', 'not', 'billed', '0/0']]
+            self.assertEqual([cells[2:] for cells in block(size)], [['no', 'runs', '—', 'not', 'billed', 'no', 'runs', '0/0']]
                              * len(self.regions))
         self.assertEqual(lines[-1], f'Cheapest merge gate: {fast} in {home}, 0.0250 USD (estimate)')
+
+    def test_paid_run_cell_counts_the_runs_whose_bill_is_still_due(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        billed_size, due_size = self.standard
+        home = self.regions[0]
+        today = datetime.fromtimestamp(self.clock.now, UTC).date()
+        midnight = int(datetime(today.year, today.month, today.day, tzinfo=UTC).timestamp())
+        events: list[dict[str, object]] = []
+        # The billed type runs yesterday and today; the other type runs only today. Only yesterday has a bill.
+        for attempt, size, finished in (('old', billed_size, midnight - 3600), ('new', billed_size, midnight + 60),
+                                        ('due', due_size, midnight + 60)):
+            row: dict[str, object] = {'attempt': attempt, 'instance_type': size, 'mode': 'merge-gate', 'region': home}
+            events.extend(({**row, 'time': finished - 360, 'result': 'launched'},
+                           {**row, 'time': finished, 'result': 'finished', 'gate_s': 300}))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
+        yesterday = midnight - 86400
+        bill = ledger.ChargeRead((today - timedelta(days=1)).isoformat(), midnight + 3600, yesterday, midnight,
+                                 Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost(
+                                     ledger.REGION_USAGE_PREFIXES[home][-1] + '-SpotUsage:' + billed_size,
+                                     Decimal('0.05'), Decimal('0.1'), 'Hrs'),))
+        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
+            tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
+        cells = {table.title: table.rows[0][5] for table in tables.runs[0].tables}
+        self.assertEqual(cells[billed_size], '0.0500 (1 runs, 1 bill due)')
+        self.assertEqual(cells[due_size], '1 bill due')
 
     def test_each_scope_counts_only_its_run_kinds(self) -> None:
         self.assertEqual(self.snapshot(), 0)

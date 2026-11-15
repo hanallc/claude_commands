@@ -607,7 +607,9 @@ The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
 A region without its own runs uses the type's runs in other regions, and the cell says so.
-Runs on days without a bill show `not billed`.
+The paid USD/run cell counts the runs it comes from and the runs whose day has no bill yet, such as `0.0314 (94 runs, 17 bill due)`.
+The bill comes up to about a day late.
+A region whose runs all wait for a bill shows `17 bill due`; a region with no own runs of the type shows `no runs`.
 The last line names the cheapest merge gate by estimate.
 These blocks do not split for a narrow terminal.
 

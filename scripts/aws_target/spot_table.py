@@ -174,18 +174,27 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
                 if estimate is not None and (cheapest is None or estimate < cheapest.usd):
                     cheapest = Cheapest(estimate, size, region)
                 # Allocations split each bill between both kinds, so only the share of the scope's kinds counts here.
-                billed = run_cost.billed_runs([run for run in runs if (run.instance_type, run.region) == (size, region)
-                                               and run.mode in scope.modes], allocations)
+                own_runs = [run for run in runs if (run.instance_type, run.region) == (size, region) and run.mode in scope.modes]
+                billed = run_cost.billed_runs(own_runs, allocations)
+                # A run whose day has no bill yet waits for the bill, which comes up to about a day late.
+                due = len(own_runs) - len(billed)
                 paid = paid_hourly.get((size, region))
                 _refusals, refused, launched = evidence.refusals_per_launch(size, region)
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', duration,
                               f'{estimate:.4f}' if estimate is not None else '—',
                               f'{paid:.4f}' if paid is not None else 'not billed',
-                              f'{run_cost.billed_cost_per_run(billed, allocations):.4f} ({len(billed)} runs)' if billed
-                              else 'not billed', f'{refused}/{launched}'))
+                              paid_run_cell(billed, due, allocations), f'{refused}/{launched}'))
             tables.append(Table(size, headers, frozenset(range(1, len(headers))), tuple(table)))
         scopes.append(RunCosts(scope, explanation, tuple(tables), cheapest))
     return tuple(scopes)
+
+
+def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations: dict[run_cost.BilledKey, Decimal]) -> str:
+    """The paid USD per run, with the count of runs it comes from and of runs whose bill is still due."""
+    if not billed:
+        return f'{due} bill due' if due else 'no runs'
+    return (f'{run_cost.billed_cost_per_run(billed, allocations):.4f} ({len(billed)} runs'
+            + (f', {due} bill due' if due else '') + ')')
 
 
 def render(directory: Path, now: int, *, width: int | None = None, settings_path: Path | None = None) -> str:
