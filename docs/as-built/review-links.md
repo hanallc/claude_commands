@@ -1004,3 +1004,14 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+
+Changes, Questions, and Images share one motion helper.
+A different Changes or Questions card fades out for 120ms, then fades in for 180ms with a 4px upward move.
+A new switch completes the active switch first.
+The first load and an update that keeps the same card do not fade.
+A new card above the viewport scrolls into view smoothly.
+Image links scroll smoothly to their image, then reveal it over 180ms with a 4px upward move.
+Other image cards stay visible.
+An image fades before removal, and the cards below close the gap over 180ms.
+Reduced motion disables fades and uses instant scrolling.
