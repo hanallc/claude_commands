@@ -1206,18 +1206,19 @@ class OffloadCommandTests(OffloadCommandFixture):
                         result = self.command(verb=verb, copy=option == "copy", filter_run=option == "filter")
                         self.assertEqual(result.returncode, 2, result.stdout)
 
-    def test_linux_only_workspace_member_declines_every_non_test_verb_before_claim(self) -> None:
+    def test_linux_only_workspace_member_declines_a_workspace_build_before_claim(self) -> None:
         self.write_portable_workspace()
         self.config["linux_only.hana"] = "portable"
         self.sync_config()
-        for verb in ("check", "clippy", "mend-check", "doc", "build"):
+        for verb in ("build",):
             with self.subTest(verb=verb):
                 self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
 
-    def test_named_package_is_checked_alone_for_every_verb(self) -> None:
-        # linux_only keeps the named package's own steps off the Mac; a package that depends on it still builds.
+    def test_named_package_is_checked_alone_and_compile_verbs_ignore_linux_only(self) -> None:
+        # linux_only keeps the named package's tests and builds off the Mac; a package that depends on it still builds.
+        # check, lint and doc only compile, and only the Mac compiles macOS code, so linux_only never applies to them.
         self.write_portable_workspace()
         _ = (self.repository / "Cargo.toml").write_text('[workspace]\nmembers=["portable", "linux-part"]\n')
         member = self.repository / "linux-part"
@@ -1228,15 +1229,32 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.config["linux_only.hana"] = "linux-part"
         self.sync_config()
         config = eligibility.read_config(self.config_path)
-        verbs: tuple[eligibility.MacVerb, ...] = ("nextest", "check", "clippy", "mend-check", "doc", "build")
-        for verb in verbs:
+        compile_verbs: tuple[eligibility.MacVerb, ...] = ("check", "clippy", "mend-check", "doc")
+        for verb in (*compile_verbs, "nextest", "build"):
             with self.subTest(verb=verb):
                 self.assertIsInstance(eligibility.mac_step_eligibility(config, self.repository, "portable", verb),
                                       eligibility.KnownRepository)
-                self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
-                self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
+                for package in ("linux-part", ""):
+                    policy = eligibility.mac_step_eligibility(config, self.repository, package, verb)
+                    if verb in compile_verbs:
+                        self.assertIsInstance(policy, eligibility.KnownRepository)
+                    else:
+                        self.assertEqual(policy, eligibility.IneligibleMacStep("linux_only"))
+                if verb not in compile_verbs:
+                    self.assert_declined(self.command(verb=verb, package="linux-part"), "linux_only")
+                    self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
+        self.assertEqual(eligibility.mac_step_eligibility(config, self.repository, "linux-part", "clippy", kind="example"),
+                         eligibility.IneligibleMacStep("linux_only"))
+        result = self.command(verb="clippy", package="linux-part")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.events_for("rsync")), 1)
+        _ = self.config.pop("linux_only.hana")
+        self.sync_config()
+        self.assertEqual(eligibility.mac_step_eligibility(eligibility.read_config(self.config_path), self.repository,
+                                                          "linux-part", "clippy"),
+                         eligibility.IneligibleMacStep("repo"))
 
     def test_workspace_test_with_a_linux_only_member_declines_before_claim(self) -> None:
         self.write_portable_workspace()
@@ -1259,7 +1277,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     _ = output.write(f'[{section}]\nimplicit={{workspace=true}}\n')
                 self.config["linux_only.hana"] = "linux-part"
                 self.sync_config()
-                for verb in ("check", "clippy", "mend-check", "doc"):
+                for verb in ("nextest", "build"):
                     self.assert_declined(self.command("--workspace", verb=verb, package=""), "linux_only")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
@@ -1268,7 +1286,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.write_portable_workspace()
         with (self.repository / "portable/Cargo.toml").open("a") as output:
             _ = output.write('[dependencies]\nmissing={path="../missing"}\n')
-        for verb in ("check", "clippy", "mend-check", "doc"):
+        for verb in ("nextest", "build"):
             self.assert_declined(self.command("--workspace", verb=verb, package=""), "repo")
         self.assertEqual(self.events_for("ssh"), [])
         self.assertEqual(self.events_for("rsync"), [])
@@ -1289,8 +1307,9 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.config["linux_only.hana"] = "staged"
         self.sync_config()
         snapshot_source = offload.StagedDocSnapshot(snapshot)
-        self.assert_declined(self.command("--workspace", verb="doc", package="", source=snapshot_source), "linux_only")
-        self.assertEqual(len(self.events_for("rsync")), 1)
+        result = self.command("--workspace", verb="doc", package="", source=snapshot_source)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self.events_for("rsync")), 2)
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")
@@ -1417,7 +1436,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 "mac:.local/state/mac-test/mirror/hana/",
             ],
         )
-        self.assertEqual(copy.get("exclude"), "/.git\n/target/\n/generated/\n")
+        self.assertEqual(copy.get("exclude"), "/.git\n/target\n/generated/\n")
 
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)
@@ -1433,7 +1452,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         )
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
-        self.assertIn("PATH=$HOME/.cargo/bin:$PATH", remote_words)
+        self.assertIn("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH", remote_words)
         self.assertIn("BUILDLOG_CALLER=verify-mac", remote_words)
         self.assertIn("BUILDLOG_CALL_ID=call-17", remote_words)
         self.assertIn("BUILDLOG_SYNC=1", remote_words)
@@ -1515,6 +1534,28 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
 
+
+
+class MirrorExcludeTests(unittest.TestCase):
+    def test_a_symlinked_target_leaves_the_mirror_target_folder_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, cache, mirror = root / "source", root / "cache", root / "mirror"
+            for folder in (source, cache, mirror / "target"):
+                folder.mkdir(parents=True)
+            _ = (source / "lib.rs").write_text("fn main() {}\n", encoding="utf-8")
+            _ = (cache / "gate.o").write_text("gate\n", encoding="utf-8")
+            (source / "target").symlink_to(cache)
+            _ = (mirror / "target" / "mac.o").write_text("mac\n", encoding="utf-8")
+            excludes = root / "excludes"
+            _ = excludes.write_text(offload.MIRROR_EXCLUDES, encoding="utf-8")
+            result = subprocess.run(["rsync", "-rlpc", "--delete", f"--exclude-from={excludes}",
+                                     f"{source}/", f"{mirror}/"], capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((mirror / "target").is_symlink())
+            self.assertEqual((mirror / "target" / "mac.o").read_text(encoding="utf-8"), "mac\n")
+            self.assertEqual((mirror / "lib.rs").read_text(encoding="utf-8"), "fn main() {}\n")
 
 
 class BackoffReadTests(unittest.TestCase):

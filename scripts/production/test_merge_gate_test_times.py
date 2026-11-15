@@ -221,6 +221,9 @@ class MergeGateTestTimesTests(MergeGateFixture):
             _ = merge_gate.typecheck_python()
         with mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 16.0}), \
                 mock.patch.object(merge_gate, "one_minute_load", return_value=0.0):
+            # A first passing run gives each compared run the same time limit history.
+            history = self.run_gate("--tests-only", "--full")
+            self.assertEqual(history.returncode, 0, history.stdout + history.stderr)
             baseline = self.run_gate("--tests-only", "--full")
             self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             write = gate_record.write_gate_run
@@ -247,7 +250,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
                     remaining = "".join(line + "\n" for line in result.stderr.splitlines()
                                         if not line.startswith(("gate run not written:", "warning:")))
                     self.assertEqual(remaining, baseline.stderr)
-        self.assertEqual(len(self.gate_run_records()), 1)
+        self.assertEqual(len(self.gate_run_records()), 2)
         self.assertEqual(blocked_log.read_text(), "This file cannot hold a build log.\n")
 
     @gate_suites("hooks", "notify", "direct")

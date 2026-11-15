@@ -2017,11 +2017,14 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         self.assertIn("wait for release", build_hold.register_wait("waiter"))
         holder, = build_hold.natedev_holds(self.scratch / "holders").in_force
         self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        proc = self.scratch / "proc"
+        (proc / "10").mkdir(parents=True)
+        _ = (proc / "10/stat").write_text("10 (bash) S " + " ".join(["0"] * 18 + ["100"]))
         output = io.StringIO()
         with redirect_stdout(output):
-            self.assertEqual(build_hold.main(["status"]), 0)
+            self.assertEqual(build_hold.main(["status", "--proc-root", str(proc)]), 0)
         self.assertIn("kept by holder: pid 10, start 100", output.getvalue())
-        self.assertIn("kept by holder: pid 20, start 200", output.getvalue())
+        self.assertNotIn("pid 20", output.getvalue())
 
     def begin(self, name: str = "holder") -> None:
         _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),

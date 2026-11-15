@@ -27,8 +27,9 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         self.assert_removed()
 
     def test_natedev_only_waits_for_release_before_running(self) -> None:
+        # A check is natedev_only only through --local; linux_only never keeps a check off the Mac.
         self.fixture.environment["TEST_MAC_ALLOWED"] = "0"
-        result = self.run_verify("check", "sample")
+        result = self.run_verify("check", "sample", "--local", "makes natedev artifacts")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [cast(dict[str, object], json.loads(line))["command"] for line in self.events.read_text().splitlines()]
         self.assertTrue(self.fixture.local_waits)
@@ -40,10 +41,10 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_unreadable_record_refuses_before_local_or_mac_compile(self) -> None:
         script = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
         # Damage the record in a check that still reports the active hold.
-        source = TARGETS.replace('if command in ("constraints",', '''if command == "assigned-info":
-    for record in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
-        record.write_text("{")
-if command in ("constraints",''')
+        source = TARGETS.replace('    if command in ("constraints",', '''    if command == "assigned-info":
+        for record in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+            record.write_text("{")
+    if command in ("constraints",''')
         _ = script.write_text(source)
         result = self.run_verify("check", "sample")
         self.assertNotEqual(result.returncode, 0)

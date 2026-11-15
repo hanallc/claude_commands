@@ -251,6 +251,30 @@ def read_spot_prices(directory: Path) -> tuple[RegionalSpotPrice, ...]:
     return prices
 
 
+@dataclass(frozen=True)
+class SpotQuota:
+    """The Standard and the G and VT Spot vCPU quotas of one region, from the hourly snapshot."""
+    region: str
+    standard_vcpus: Decimal
+    gpu_vcpus: Decimal
+    read_at: int
+
+
+def read_spot_quotas(directory: Path) -> tuple[SpotQuota, ...]:
+    """Read the regional Spot quotas of the snapshot, or return no rows when absent."""
+    try:
+        document = mapping(cast(object, json.loads((directory / 'spot-prices.json').read_text())))
+    except FileNotFoundError:
+        return ()
+    if 'regions' not in document:
+        return ()
+    quotas = tuple(SpotQuota(text(row, 'region'), Decimal(text(row, 'standard_vcpus')), Decimal(text(row, 'gpu_vcpus')),
+                             instant(row, 'read_at')) for row in rows(document, 'regions'))
+    if any(not row.region or row.standard_vcpus < 0 or row.gpu_vcpus < 0 or row.read_at < 0 for row in quotas):
+        raise ValueError('The regional Spot quota snapshot has invalid rows')
+    return quotas
+
+
 def write_spot_prices(directory: Path, prices: Sequence[RegionalSpotPrice]) -> None:
     """Replace the complete regional price snapshot atomically."""
     document = {'prices': [dict(region=row.region, zone=row.zone, instance_type=row.instance_type,

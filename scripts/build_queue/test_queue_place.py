@@ -278,7 +278,9 @@ class QueuePlaceFixture(ExitStack):
         self.proc: Path = self.root / "proc"
         self.proc.mkdir()
         self.config: Path = self.root / "build_admission.conf"
-        write_memory_config(self.config, **{"program_first_peak_gib.rust-analyzer": "18"})
+        # A short stop grace and sample interval: a test waits seconds on each with the live values.
+        write_memory_config(self.config, program_stop_seconds="0.2", program_sample_seconds="0.1",
+                            **{"program_first_peak_gib.rust-analyzer": "18"})
         self.enter_context(mock.patch.dict(os.environ, {
             **gate_isolation_environment(self.root), **fake_memory_readings(self.root),
             "LINT_CONFIG_FILE": str(self.config.with_name("lint.conf")), "BUILDLOG_DIR": str(self.log),
@@ -287,7 +289,7 @@ class QueuePlaceFixture(ExitStack):
             "UNIT_SESSION_DIR": "", "UNIT_RUN_DIR": "", "CLAUDE_CODE_SESSION_ID": "queue-place-test",
             "QUEUE_TEST_LIFELINE": str(self.lifeline_read),
         }))
-        self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root))
+        self.admission: AdmissionFixture = self.enter_context(AdmissionFixture(root=self.root, skip_idle_spacing=True))
         self.admission.clock.epoch = time.time()
         _ = self.enter_context(self.admission.serving())
         self.children: list[subprocess.Popen[bytes]] = []

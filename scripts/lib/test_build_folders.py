@@ -50,6 +50,23 @@ class BuildFolderTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
 
+    def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        lines = [line for line in settings.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("roots.scratch")]
+
+        def configure(root: Path) -> None:
+            text = "\n".join(f"{line}\nroots.scratch={root}" if line == "[roots]" else line for line in lines)
+            _ = settings.write_text(text + "\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ):
+            del os.environ[copy_record.ROOT_ENV]
+            configure(self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            self.assertEqual(copy_record.root(), self.root / "first")
+            configure(self.root / "second-root")
+            self.assertEqual(copy_record.root(), self.root / "second-root")
+
     def test_cli_remove_cleans_free_records_and_keeps_a_held_folder(self) -> None:
         allocated = self.command("unique", "--prefix", "remove-cli-")
         self.assertEqual(allocated.returncode, 0, allocated.stderr)
@@ -1418,6 +1435,74 @@ os._exit(0)
                     if process.poll() is None:
                         process.kill()
                     _ = process.communicate(timeout=10)
+
+    def test_a_sweep_without_wait_tries_a_held_lock_once(self) -> None:
+        held = folders.create_build_folder(folders.UniqueBuildFolder("sweep-held-"))
+        self.addCleanup(_release_folder, held)
+        free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
+        _release_folder(free)
+        with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+            folders.sweep_temporary_build_folders(self.root, wait=False)
+        self.assertTrue(held.is_dir())
+        self.assertFalse(free.exists())
+
+    def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
+        real_open = os.open
+        for action in ("sweep", "create"):
+            with self.subTest(action=action):
+                removed: list[str] = []
+
+                def open_then_remove(name: str | os.PathLike[str], flags: int, mode: int = 0o777, *,
+                                     dir_fd: int | None = None) -> int:
+                    descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+                    if os.fspath(name).endswith(".lock") and not removed:
+                        # Another process removes the free folder's lock between this open and its check.
+                        removed.append(os.fspath(name))
+                        os.unlink(name, dir_fd=dir_fd)
+                    return descriptor
+
+                if action == "sweep":
+                    free = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    _release_folder(free)
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertEqual(removed, [free.name + ".lock"])
+                    folders.sweep_temporary_build_folders(self.root, wait=False)
+                    self.assertFalse(free.exists())
+                else:
+                    with mock.patch.object(os, "open", side_effect=open_then_remove):
+                        made = folders.create_build_folder(folders.UniqueBuildFolder("removed-lock-"))
+                    self.addCleanup(_release_folder, made)
+                    self.assertEqual(len(removed), 1)
+                    self.assertNotEqual(removed[0], made.name + ".lock")
+                    self.assertTrue(made.is_dir())
+                    self.assertEqual(folders.build_folder_state(made), "held")
+
+    def test_a_lease_replaced_after_its_lookup_is_not_a_fault(self) -> None:
+        request = folders.StableOwnerFolder("replaced-lease", folders.ExplicitBuildParent(self.root))
+        first = folders.create_build_folder(request)
+        real_stat = os.stat
+        replaced: list[str] = []
+
+        def stat_then_replace(name: str | os.PathLike[str], *, dir_fd: int | None = None,
+                              follow_symlinks: bool = True) -> os.stat_result:
+            if not os.fspath(name).endswith(".lease.json") or replaced:
+                return real_stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            # Another holder replaces the lease between this lookup and the read of its link count.
+            descriptor = os.open(name, os.O_RDONLY, dir_fd=dir_fd)
+            try:
+                newer = os.fspath(name) + ".newer"
+                os.close(os.open(newer, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=dir_fd))
+                os.replace(newer, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                replaced.append(os.fspath(name))
+                return os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+        with mock.patch.object(os, "stat", side_effect=stat_then_replace):
+            again = folders.create_build_folder(request)
+        self.assertEqual(replaced, [first.name + ".lease.json"])
+        self.assertEqual(again, first)
 
     def test_sweep_removes_free_folders_and_partial_records_but_keeps_held_allocations(self) -> None:
         for stage in ("folder", "lease", "temporary-lease", "lock"):

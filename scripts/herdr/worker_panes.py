@@ -31,7 +31,7 @@ from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -1514,7 +1514,16 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
+            forget_restart(row)
             return Closed()
+
+
+def forget_restart(row: staff.StaffRow) -> None:
+    """Remove a suspended worker from the restart record: a restart never starts it."""
+    try:
+        shutdown_record.forget([str(row.id)])
+    except (OSError, ValueError) as error:
+        print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:

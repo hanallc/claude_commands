@@ -762,6 +762,8 @@ def main(argv: list[str] | None = None) -> int:
                     restart.prune_live_rows(reading)
                 else:
                     for row in rows:
+                        if restart.leaves_record(row, record) is not None:
+                            continue
                         try:
                             with staff.row_operation(str(row.id)):
                                 shutdown_record.update(started=[], pending=[str(row.id)])

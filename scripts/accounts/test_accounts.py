@@ -610,7 +610,8 @@ class AccountsTests(unittest.TestCase):
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
         ))
-        units = accounts.RoleSessionCountsDocument(busy=1, idle=1, paused=0, exited=1, total=3)
+        # unit-b's `shell` record counts as busy: its turn ended while a background command runs.
+        units = accounts.RoleSessionCountsDocument(busy=2, idle=0, paused=0, exited=1, total=3)
         runners_count = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=0, total=1)
         selected_runners = accounts.RoleSessionCountsDocument(busy=0, idle=1, paused=0, exited=1, total=2)
         cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
@@ -789,14 +790,14 @@ class AccountsTests(unittest.TestCase):
             {"busy": 0, "paused": 0, "exited": 1, "idle": 0, "total": 1}])
         self.assertEqual(rows["claude4"]["roles"], ["units"])
         self.assertEqual(rows["claude4"]["selected_roles"], [])
-        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 1, "idle": 1, "paused": 0, "exited": 0, "total": 2}])
+        self.assertEqual(rows["claude4"]["role_counts"], [{"busy": 2, "idle": 0, "paused": 0, "exited": 0, "total": 2}])
         self.assertEqual(rows["claude4"]["sessions"], sorted([
             {"session": members[0].current_session, "state": "busy"},
-            {"session": members[2].current_session, "state": "idle"},
+            {"session": members[2].current_session, "state": "busy"},
         ], key=lambda entry: entry["session"]))
         self.assertIn({"session": members[3].current_session, "state": "exited"}, rows["claude2"]["sessions"])
         table = accounts.render_status_table(reading)
-        for text in ("units ✓ 2 (busy 1, idle 0, paused 0, exited 1)", "units 2 (busy 1, idle 1, paused 0, exited 0)",
+        for text in ("units ✓ 2 (busy 1, idle 0, paused 0, exited 1)", "units 2 (busy 2, idle 0, paused 0, exited 0)",
                      "showrunners ✓ 1 (busy 0, idle 0, paused 0, exited 1)"):
             self.assertIn(text, table)
             self.assertIn(text, "\n".join(reading.detail_lines))
@@ -807,7 +808,7 @@ class AccountsTests(unittest.TestCase):
                                                 "UNIT_QUEUE_STATE_DIR": str(self.root / "unit-queues")}))
         from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 
-        states = [("busy", "", "busy", "none"), ("idle", "", "idle", "none"), ("shell", "", "idle", "none"),
+        states = [("busy", "", "busy", "none"), ("idle", "", "idle", "none"), ("shell", "", "busy", "none"),
                   ("busy", "pause", "paused", "none"), ("", "pause", "paused", "none"),
                   ("busy", "exit", "exited", "none"), ("", "exit", "exited", "none"),
                   ("busy", "both", "exited", "none"), ("", "both", "exited", "none"), ("", "", "exited", "none"),
@@ -883,6 +884,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(session_state.classify(member, session_state.NoLiveSession(), detached=detached), "busy")
         idle = session_state.NO_DETACHED_WORK
         self.assertEqual(session_state.classify(member, session_state.LiveActivity("starting"), detached=idle), "busy")
+        self.assertEqual(session_state.classify(member, session_state.LiveActivity("shell"), detached=idle), "busy")
         self.assertEqual(session_state.classify(member, session_state.LiveActivity("idle"), detached=idle), "idle")
 
     def test_peer_counts_read_an_older_peer_starting_count_as_busy(self) -> None:

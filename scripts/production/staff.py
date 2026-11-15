@@ -1874,10 +1874,23 @@ def require_stopped(identity: StaffId) -> None:
 def retire(staff_id: StaffId) -> StaffRow | None:
     if not is_owner():
         value = _remote(["retire", staff_id])
-        return None if value is None else StaffRow.from_json(value)
+        removed = None if value is None else StaffRow.from_json(value)
+    else:
+        require_stopped(staff_id)
+        removed = _transaction(lambda rows: _retire_row(rows, staff_id))
+    if removed is not None:
+        _forget_restart([staff_id])
+    return removed
 
-    require_stopped(staff_id)
-    return _transaction(lambda rows: _retire_row(rows, staff_id))
+
+def _forget_restart(staff_ids: list[StaffId]) -> None:
+    """A removed row never restarts, so its id leaves this machine's restart record."""
+    # The restart record sits above the writer, like the runtime checks.
+    forget = cast(Callable[[list[str]], None], import_module("scripts.agents.shutdown_record").forget)
+    try:
+        forget([str(staff_id) for staff_id in staff_ids])
+    except (OSError, ValueError) as error:
+        print(f"staff: restart record anomaly: {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -1925,7 +1938,9 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
         rows[:] = [candidate for candidate in rows if candidate.id not in selected]
         return FixtureRemoved(row)
 
-    return _transaction(edit)
+    removed = _transaction(edit)
+    _forget_restart(list(selected))
+    return removed
 
 
 def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:

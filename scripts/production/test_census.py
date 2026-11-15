@@ -29,7 +29,8 @@ SAMPLE: dict[str, object] = {
                 {"staff_id": "handler-test", "name": "handler-test", "parent_staff_id": "handler-unit",
                  "machine": "natedev", "status": "idle", "activity": "", "activity_started_at": None,
                  "pass": None, "pane": "closed", "runs": [], "unknown": None}],
-    "sessions": [{"session": "4dbdb78e", "machine": "natedev", "status": "busy", "activity": "impl · waiting"},
+    "sessions": [{"session": "4dbdb78e", "machine": "natedev", "status": "busy", "activity": "impl · waiting",
+                  "shells": [{"name": "Run the AWS gate", "started_at": 1794600100}, {"name": "Watch CI", "started_at": None}]},
                  {"session": "01a18dbb", "machine": "natedev", "status": None, "activity": None}],
 }
 
@@ -38,7 +39,9 @@ class CensusTests(unittest.TestCase):
     def test_schema_two_parses_into_typed_records(self) -> None:
         expected = census.Census(
             (census.CensusMachine("natedev", True), census.CensusMachine("mac", False)),
-            (census.CensusSession("4dbdb78e", "busy"), census.CensusSession("01a18dbb", None)),
+            (census.CensusSession("4dbdb78e", "busy", (census.CensusShell("Run the AWS gate", 1794600100.0),
+                                                        census.CensusShell("Watch CI", None))),
+             census.CensusSession("01a18dbb", None)),
             (census.CensusWorker(staff.StaffId("handler-impl"), "handler-impl", staff.StaffId("handler-unit"), "busy", "verify test",
                                  census.CensusPass("impl", "8"),
                                  (census.CensusRun("verify test", 1794600060.0, "running"),
@@ -58,6 +61,13 @@ class CensusTests(unittest.TestCase):
              "census: census.sessions is not a list"),
             (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": 2}]}),
              "census: sessions[0].status is not text or null"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy", "shells": {}}]}),
+             "census: sessions[0].shells is not a list"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy", "shells": [{"name": 1}]}]}),
+             "census: sessions[0].shells[0].name is not text"),
+            (json.dumps({**SAMPLE, "sessions": [{"session": "s", "status": "busy",
+                                                 "shells": [{"name": "x", "started_at": "1"}]}]}),
+             "census: sessions[0].shells[0].started_at is not a number or null"),
             (json.dumps({**SAMPLE, "machines": [{"name": "natedev", "reachable": "yes"}]}),
              "census: machines[0].reachable is not true or false"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "status": 3}]}),

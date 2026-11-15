@@ -22,6 +22,7 @@ from scripts.buildlog import cli
 from scripts.lib import conf
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
+from scripts.buildlog.health import Machine
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 
@@ -844,6 +845,29 @@ class VaultPullTests(unittest.TestCase):
                 self.assertEqual(outcome, vault_pull.VaultCommandFailed("stderr: fixture stderr\nstdout: fixture stdout"))
                 assert isinstance(outcome, vault_pull.VaultCommandFailed)
                 self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
+
+    def test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged(self) -> None:
+        transport = self.run_transport
+
+        def refused(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            if "fetch" in args and "fixture-mac:rust/hanadocs" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal: did not send all necessary objects")
+            return transport(args, timeout)
+
+        _ = self.commit(self.mac, {"mac.md": "Mac\n"})
+        with mock.patch.object(vault_pull, "run", new=refused):
+            self.assertEqual(vault_pull.pull(), vault_pull.VaultCommandFailed(
+                "stderr: fatal: did not send all necessary objects", Machine.MAC))
+            # A power loss keeps a ref update but leaves its loose commit object empty.
+            commit = self.commit(self.local, {"local.md": "natedev\n"})
+            damaged = self.local / ".git/objects" / commit[:2] / commit[2:]
+            damaged.chmod(0o644)
+            _ = damaged.write_bytes(b"")
+            outcome = vault_pull.pull()
+        self.assertEqual(outcome, vault_pull.VaultCommandFailed(
+            "stderr: fatal: did not send all necessary objects", Machine.NATEDEV))
+        assert isinstance(outcome, vault_pull.VaultCommandFailed)
+        self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
 
     def test_each_stop_cause_survives_an_atomic_state_write(self) -> None:
         for cause in vault_pull.STOP_CAUSES:
