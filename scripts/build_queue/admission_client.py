@@ -589,22 +589,23 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         return LeftQueue()
                     if CLOCK.monotonic() >= retry.deadline:
                         return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
-                    if isinstance(cause, records.EstimateExpired) and isinstance(first, wire.ServiceEstimateRequest):
-                        break
                     if isinstance(cause, records.EstimateExpired):
-                        if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
-                            raise CheckerFailure("estimate cannot be refreshed")
-                        estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
-                        refresh_pending = True
                         answered_expiry = cause.estimated_at
-                        try:
-                            request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
-                                              code_version=LOADED_ADMISSION_CODE_VERSION)
-                            refresh_pending = False
-                        except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
-                            raise
-                        except Exception as error:
-                            raise CheckerFailure(str(error)) from error
+                        if isinstance(first, wire.ServiceEstimateRequest):
+                            request = first
+                        else:
+                            if refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
+                                raise CheckerFailure("estimate cannot be refreshed")
+                            estimate: Callable[[], wire.AdmitRequest | wire.LaunchRequest] = refresh
+                            refresh_pending = True
+                            try:
+                                request = replace(_refreshed(first, estimate, channel=EstimateConnection(connection, pending)),
+                                                  code_version=LOADED_ADMISSION_CODE_VERSION)
+                                refresh_pending = False
+                            except (_QueueLeft, _QueueUnreachable, OSError, TransportUnavailable):
+                                raise
+                            except Exception as error:
+                                raise CheckerFailure(str(error)) from error
                         # A new connection would end this waiter's place, and a pass could start a later step in the gap.
                         connection.sendall(wire.encode_request(request).encode())
                         continue

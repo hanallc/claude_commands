@@ -11,6 +11,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 import errno
 import hashlib
+import heapq
 import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
@@ -26,7 +27,7 @@ import threading
 import time
 import uuid
 from types import MappingProxyType
-from typing import Callable, Protocol, cast
+from typing import Callable, Protocol, cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
@@ -321,6 +322,50 @@ class ReplayEntry:
     reply: wire.Reply
     ended_at: float | LiveGrant
     reservation: str = ""
+
+
+class ReplayLedger(dict[str, ReplayEntry]):
+    """Index live replies and expiry without scanning ended replies each pass."""
+
+    def __init__(self, entries: dict[str, ReplayEntry]) -> None:
+        super().__init__()
+        self.revision: int = 0
+        self.live: set[str] = set()
+        self.ended: list[tuple[float, int, str]] = []
+        for key, entry in entries.items():
+            self[key] = entry
+
+    @override
+    def __setitem__(self, key: str, entry: ReplayEntry) -> None:
+        if self.get(key) is entry:
+            return
+        super().__setitem__(key, entry)
+        self.revision += 1
+        if isinstance(entry.ended_at, LiveGrant):
+            self.live.add(key)
+        else:
+            self.live.discard(key)
+            heapq.heappush(self.ended, (entry.ended_at, self.revision, key))
+
+    @override
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key)
+        self.live.discard(key)
+        self.revision += 1
+
+    def expire(self, cutoff: float, protected_keys: set[str], reservations: set[str]) -> None:
+        retained: list[tuple[float, int, str]] = []
+        while self.ended and self.ended[0][0] <= cutoff:
+            at, revision, key = heapq.heappop(self.ended)
+            entry = self.get(key)
+            if entry is None or entry.ended_at != at:
+                continue
+            if key in protected_keys or entry.reservation in reservations:
+                retained.append((at, revision, key))
+            else:
+                del self[key]
+        for item in retained:
+            heapq.heappush(self.ended, item)
 
 
 @dataclass(frozen=True)
@@ -977,9 +1022,10 @@ def _place_key(owner: wire.Owner, since: float) -> str:
 def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
     """A new estimate for the same episode keeps its connection, so the waiter keeps its place."""
     same_kind = ((isinstance(first, wire.AdmitRequest) and isinstance(request, wire.AdmitRequest))
-                 or (isinstance(first, wire.LaunchRequest) and isinstance(request, wire.LaunchRequest)))
-    return (same_kind and isinstance(first, (wire.AdmitRequest, wire.LaunchRequest))
-            and isinstance(request, (wire.AdmitRequest, wire.LaunchRequest))
+                 or (isinstance(first, wire.LaunchRequest) and isinstance(request, wire.LaunchRequest))
+                 or (isinstance(first, wire.ServiceEstimateRequest) and isinstance(request, wire.ServiceEstimateRequest)))
+    return (same_kind and isinstance(first, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest))
+            and isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest))
             and (request.episode, request.owner, request.since) == (first.episode, first.owner, first.since))
 
 
@@ -1102,7 +1148,7 @@ class AdmissionServer:
         self.places: dict[str, WaiterPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
-        self.ledger: dict[str, ReplayEntry] = {}
+        self.ledger: ReplayLedger = ReplayLedger({})
         self.placement_requests: dict[str, wire.PlacementRequest] = {}
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
@@ -1176,6 +1222,7 @@ class AdmissionServer:
         self.stopped: bool = False
         self.closed: bool = False
         self.next_pass: float = float("inf")
+        self.next_progress_sweep: float = float("-inf")
         self.next_source_check: float = float("inf")
         # The service watches each loaded module under this folder and stops when one changes.
         self.source_root: Path = Path(__file__).resolve().parents[1]
@@ -1214,7 +1261,8 @@ class AdmissionServer:
         path = self.state_dir / "state.json"
         if path.exists():
             state = read_state(self.state_dir)
-            self.reservations, self.places, self.ledger = state.reservations, state.places, state.ledger
+            self.reservations, self.places = state.reservations, state.places
+            self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.override, self.priority = state.spacing, state.override, state.priority
             self.build_history_generation = state.build_history_generation
             self.run_places = state.run_places
@@ -1272,47 +1320,57 @@ class AdmissionServer:
         live_reservations = self._live_reservation_ids()
         live_dispatches = {"dispatch:" + key for key, saved in self.assignments.items()
                            if isinstance(saved.state, placement.CurrentAssignment)}
-        self.ledger = {key: replace(entry, ended_at=now)
-                       if isinstance(entry.ended_at, LiveGrant)
-                       and key not in self.reservations and entry.reservation not in live_reservations
-                       and key not in live_dispatches
-                       else entry for key, entry in self.ledger.items()}
+        protected_keys = self.reservations.keys() | live_dispatches
+        for key in tuple(self.ledger.live):
+            entry = self.ledger[key]
+            if key not in protected_keys and entry.reservation not in live_reservations:
+                self.ledger[key] = replace(entry, ended_at=now)
         if not isinstance(self.last_usable_configuration, NoPass):
-            self.ledger = {key: entry for key, entry in self.ledger.items()
-                           if isinstance(entry.ended_at, LiveGrant) or key in self.reservations
-                           or key in live_dispatches
-                           or entry.reservation in live_reservations
-                           or now - entry.ended_at < self.last_usable_configuration.replay_retention_seconds}
+            self.ledger.expire(now - self.last_usable_configuration.replay_retention_seconds,
+                               protected_keys, live_reservations)
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.override, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
+        changed = False
 
         def encoded_record(name: str, key: str, value: object) -> DurableRecordEncoding:
+            nonlocal changed
             previous = self.durable_encodings.get((name, key))
             if previous is None or previous.value != value:
+                changed = True
                 previous = DurableRecordEncoding(durable_copy(value), wire.encode_record(value),
                     previous.key if previous is not None else json.dumps(key, ensure_ascii=False))
             encodings[name, key] = previous
             return previous
 
-        parts = ['"kind":"ServiceState"']
+        parts: list[tuple[str, str]] = []
         for member in fields(state):
             value = cast(object, getattr(state, member.name))
-            if isinstance(value, dict):
+            if member.name == "ledger":
+                previous = self.durable_encodings.get(("ledger", ""))
+                if previous is None or previous.value != self.ledger.revision:
+                    changed = True
+                    previous = DurableRecordEncoding(self.ledger.revision,
+                        wire.encode_record(dict(self.ledger)), "")
+                encodings["ledger", ""] = previous
+                encoded_value = previous.encoded
+            elif isinstance(value, dict):
                 records = (encoded_record(member.name, key, item)
                            for key, item in cast(dict[str, object], value).items())
                 encoded_value = "{" + ",".join(record.key + ":" + record.encoded for record in records) + "}"
             else:
                 encoded_value = encoded_record(member.name, "", value).encoded
-            parts.append(json.dumps(member.name) + ":" + encoded_value)
-        encoded = "{" + ",".join(parts) + "}"
+            parts.append((member.name, encoded_value))
+        changed = changed or encodings.keys() != self.durable_encodings.keys()
+        if changed:
+            encoded = '{"kind":"ServiceState",' + ",".join(json.dumps(name) + ":" + value for name, value in parts) + "}"
+            if encoded != self._persisted:
+                write_text_atomic(self.state_dir / "state.json", encoded)
+                self._persisted = encoded
+                self.fault("after_state_write")
         self.durable_encodings = encodings
-        if encoded != self._persisted:
-            write_text_atomic(self.state_dir / "state.json", encoded)
-            self._persisted = encoded
-            self.fault("after_state_write")
         self._drain_lifecycle()
 
     def _unwatch(self, descriptor: int) -> None:
@@ -1375,7 +1433,7 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ci_hold_reasons(self) -> dict[str, str]:
+    def _ci_hold_reasons(self) -> dict[str, records.NatedevHeld | records.ReadingUnavailable]:
         """Apply the existing hold policy to legacy CI admission requests."""
         waiting = {episode: item for episode, item in self.waiters.items()
                    if isinstance(item.request, ServiceEstimatedAdmission)}
@@ -1388,14 +1446,14 @@ class AdmissionServer:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
         except OSError as error:
-            return {episode: f"natedev hold state is unreadable: {error}" for episode in waiting}
-        reasons: dict[str, str] = {}
+            return {episode: records.ReadingUnavailable(f"natedev hold state is unreadable: {error}") for episode in waiting}
+        reasons: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         for episode, item in waiting.items():
             owner = item.request.owner
             lineage = build_targets.read_caller_lineage(self.proc.path, owner.pid, owner.start_time)
             blocking = build_targets.hold_waited_on(holds, NoOwningSession(), directory, lineage)
             if isinstance(blocking, build_hold.Holder):
-                reasons[episode] = f"natedev is held by {blocking.name} for {blocking.purpose}; waiting for release"
+                reasons[episode] = records.NatedevHeld(blocking.name, blocking.purpose)
         return reasons
 
     def _ordered_waiters(self) -> list[tuple[Path, records.RankedWaiter]]:
@@ -1653,8 +1711,12 @@ class AdmissionServer:
                         if isinstance(step.run, LiveBuildRun) and (step.run.pid, step.run.start_time) not in represented)
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
+        if self.clock.monotonic() >= self.next_progress_sweep:
+            self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
+                rank=profile_rank, share_percent=profile_share)
+            self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
         return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
-                                     config.policy, profile_rank, profile_share, sweep_seconds)
+                                     config.policy, profile_rank, profile_share)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -1737,13 +1799,11 @@ class AdmissionServer:
                 pass
 
     def _progress_inputs(self, inputs: records.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int,
-                         sweep_seconds: float) -> records.QueueInputs:
+                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int) -> records.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
         attributed = iter(gate.attributed_step_uses(inputs))
         running: list[records.RunningStep] = []
         cutoff = inputs.now - step_estimator.HISTORY_DAYS * 86400
-        self.progress_history.prune(cutoff, sweep_seconds, rank=profile_rank, share_percent=profile_share)
         for step in inputs.running:
             if not gate.running_has_reservation(step):
                 running.append(step)
@@ -1760,7 +1820,8 @@ class AdmissionServer:
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
             if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
-            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+            if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
+                    and row["step"] != "merge-gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -1975,11 +2036,10 @@ class AdmissionServer:
                 if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                     self._deliver(waiting, reply)
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
-        for position, (episode, text) in enumerate(ci_holds.items(), len(result.rows) + 1):
+        for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
             waiting = self.waiters[episode]
-            reason = records.ReadingUnavailable(text)
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
-            reply = wire.Wait(reason, position, "", text,
+            reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
                 self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
@@ -2113,8 +2173,8 @@ class AdmissionServer:
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
-                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], records.ReadingUnavailable(text),
-                row.get("unit", "")) for episode, text in ci_holds.items() for row in (self.waiters[episode].row,))
+                row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
+                row.get("unit", "")) for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
                     gate.rank_waiter(self.waiters[episode].row, records.NormalOrder())) for episode in ci_holds)])
@@ -3192,6 +3252,8 @@ done
             if isinstance(request, wire.PrerequisiteReport):
                 if not self._placement_owner_live(request.owner):
                     return [wire.Refused("placement coordinator ended")]
+                if self.prerequisites.get(request.episode) == request.prerequisite:
+                    return [wire.Ok()]
                 self.prerequisites[request.episode] = request.prerequisite
             else:
                 saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
@@ -3231,6 +3293,14 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+            if (isinstance(connection, Connection) and previous == request
+                    and not isinstance(self.system_reader, NoSystemReader)
+                    and self.system_reader.latest.started_monotonic <= self.last_pass_started
+                    and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
+                    and isinstance(self.last_result, gate.PassResult)
+                    and self.clock.monotonic() < self.next_pass):
+                return [self._placement_reply(request,
+                    self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
             self.placement_requests[request.episode] = request
             if previous is None:
                 self.prerequisites[request.episode] = request.prerequisite

@@ -353,6 +353,30 @@ class ClientTests(unittest.TestCase):
             self.assertGreater(len(transport.requests), 1)
             self.assertEqual(transport.requests, [request] * len(transport.requests))
 
+    def test_a_ci_step_waits_through_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        held = wait_reply(records.NatedevHeld("fps", "Phase 3 timing"), 3, "",
+                          "natedev is held by fps for Phase 3 timing; waiting for release")
+        for reason, granted in ((held.reason, True), (records.ReadingUnavailable("natedev hold state is unreadable"), False)):
+            with self.subTest(reason=type(reason).__name__), AdmissionFixture() as fixture:
+                request = fixture.service_request()
+                reply = replace(held, reason=reason)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(reply),
+                    *(TimedChunk(5, reply_bytes(reply)) for _ in range(24)), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+                if granted:
+                    self.assertEqual(result, GRANTED)
+                    self.assertEqual(fixture.clock.monotonic(), 120)
+                    self.assertEqual(len(waits), 25)
+                    self.assertEqual(transport.requests, [request])
+                    self.assertNotIn("memory admission check failed", output.getvalue())
+                else:
+                    self.assertEqual(result, wire.Refused("natedev hold state is unreadable"))
+                    self.assertIn("natedev hold state is unreadable); step refused", output.getvalue())
+                self.doCleanups()
+
     def test_runner_wait_recovers_and_cleanup_uses_its_own_timing_without_home_reads(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.service_request()
@@ -871,28 +895,41 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("BUILDLOG_MEM_OUTCOME=Granted", shell_state.read_text())
 
     def test_cli_refresh_uses_step_estimate_and_keeps_the_episode_and_first_since(self) -> None:
-        with AdmissionFixture() as fixture:
-            original = fixture.request()
-            updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
-            estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
-                         step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
-            with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
-                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                 redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
-                status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
-                                      "--", "cargo", "nextest", "run"])
-            self.assertEqual(status, 0)
-            self.assertEqual(estimate.call_count, 2)
-            self.assertEqual(len(transport.attempts), 1)
-            first, second = transport.requests
-            assert isinstance(first, wire.AdmitRequest)
-            assert isinstance(second, wire.AdmitRequest)
-            self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
-            self.assertEqual(first.since, original.since)
-            self.assertTrue(first.fresh_test)
-            self.assertFalse(second.fresh_test)
-            self.assertEqual(second.profile, updated)
+        for caller in ("verify.sh", "ci_cargo_front.py"):
+            with self.subTest(caller=caller), AdmissionFixture() as fixture:
+                original = fixture.request()
+                runner_request = fixture.service_request(owner=original.owner)
+                updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
+                estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
+                             step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
+                with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
+                     mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                     redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                    if caller == "verify.sh":
+                        status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
+                                                  "--", "cargo", "nextest", "run"])
+                        self.assertEqual(status, 0)
+                        self.assertEqual(estimate.call_count, 2)
+                    else:
+                        # The CI front uses this path through held_reservation.
+                        self.assertEqual(shell_place.request_place(runner_request, client.WaitOutput()), GRANTED)
+                        estimate.assert_not_called()
+                self.assertEqual(len(transport.attempts), 1)
+                first, second = transport.requests
+                if caller == "verify.sh":
+                    assert isinstance(first, wire.AdmitRequest)
+                    assert isinstance(second, wire.AdmitRequest)
+                    self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
+                    self.assertEqual(first.since, original.since)
+                    self.assertTrue(first.fresh_test)
+                    self.assertFalse(second.fresh_test)
+                    self.assertEqual(second.profile, updated)
+                else:
+                    assert isinstance(first, wire.ServiceEstimateRequest)
+                    self.assertEqual(first, runner_request)
+                    self.assertEqual(second, first)
+                self.doCleanups()
 
     def test_build_generation_precedes_history_and_survives_transport_reconnect(self) -> None:
         for expired_cache in (False, True):

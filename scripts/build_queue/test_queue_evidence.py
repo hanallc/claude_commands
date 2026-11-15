@@ -86,6 +86,10 @@ class RoomTextTests(unittest.TestCase):
                     admission_policy_fixture(), ci_use=ci_use)
                 assert isinstance(room, records.MemoryRoom)
                 self.assertEqual(queue_evidence.room_text(room), text)
+                check = records.RoomCheck(16 * GIB, room.signed_room, False, basis=records.DoesNotFit())
+                values = dict(queue_evidence.head_room_values(check, room))
+                self.assertEqual(values, {"Free RAM": room.available, "Safety net": room.safety,
+                    "Swap coming back": room.agent_swap_demand, "Build reserved": room.kept})
 
 
 
@@ -330,6 +334,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 release = gate.HeadStartsAt(NOW + 30, (0,), 0, 0, 0)
                 text = queue_evidence.release_text(release, explanation, {}, user_zone(), names=names)
                 self.assertIn(f" {prose} end ", text)
+                self.assertIn("; then the queue waits a few seconds between starts, so it starts at ", text)
                 self.assertNotIn(step, text)
 
     def test_optional_load_failure_preserves_evidence_and_release_advice(self) -> None:
