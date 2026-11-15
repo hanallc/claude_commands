@@ -37,6 +37,14 @@ Send design choices and proposed additions to the showrunner.
    When no work can continue, end the turn with `— decision: filed for the user: <one line>`.
 5. Apply the answer that the showrunner sends with `From the user (via the showrunner):`.
    Treat the answer as the user's instruction.
+6. The user can send a follow-up from the Questions page.
+   The message starts with `From the user (via the review page), a follow-up on your question:`.
+   Answer it with the command that the message gives:
+   ```sh
+   ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py reply --production <showrunner name> --item "<question text>" --text "<your reply>"
+   ```
+   The question then returns to the user with the follow-up and your reply.
+   A skip message needs no action; the question stays open.
 
 ## Question form
 

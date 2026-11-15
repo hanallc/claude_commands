@@ -162,11 +162,13 @@ The selected showrunner filter supplies the count; the card has no separate rema
 A question stays with the showrunner whose question list holds it.
 An unknown question owner appears under **Owner unavailable**.
 Owned question cards show the title before the filed text, choices, and `Asked by <session>`.
-They omit the separate Question label and keep `Answer` and `Save answer`.
+They omit the separate Question label.
+Choices show as radio items; a choice fills the **Your answer** box.
 An **Owner unavailable** card shows `No showrunner owns this question.` without an answer form; the server refuses an answer.
-Save answer records the answer and opens the next waiting question.
-Skip for now skips a question without saving.
-It hides when no other item waits in the selected showrunner filter.
+Answer records the answer and opens the next waiting question.
+Followup sends the text to the asker; the question returns with the reply after the asker runs `update_registration.py reply`.
+Skip moves the question to the end of the list without an answer.
+Answer and Followup need text in the box.
 Questions have no Ask showrunner to check or Ask a question controls.
 A stale question refuses an answer if another session already answered it.
 Saved question answers use the same delivery attempts, startup recovery, and failure alert as changes.

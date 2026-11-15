@@ -517,6 +517,31 @@ class QuestionIdentityTests(RegistrationFixture):
         self.assertIn("destination", result.stdout)
         self.assertIn("alpha", result.stdout)
 
+    def test_followup_waits_for_the_reply_and_keeps_the_exchange(self) -> None:
+        self.file_question()
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            production = read_production("example")
+            relay = registration.followup(production, "Choose the layout", "Which file holds it?")
+            self.assertEqual(relay.recipient, self.asker_id)
+            with self.assertRaises(registration.RegistrationFailure):
+                _ = registration.followup(production, "Choose the layout", "A second one")
+        waiting = self.run_command("open")
+        self.assertEqual(waiting.returncode, 0, waiting.stdout + waiting.stderr)
+        self.assertIn("waiting for the asker's reply since", waiting.stdout)
+        self.assertIn("0 due, 0 deferred, 1 waiting for a reply", waiting.stdout)
+        self.assertNotIn("Keep the layout?", self.run_command("next").stdout)
+
+        replied = self.run_command("reply", "--item", "Choose the layout", "--text", "The file is layout.toml.")
+        self.assertEqual(replied.returncode, 0, replied.stdout + replied.stderr)
+        self.assertIn("reply: ok", replied.stdout)
+        again = self.run_command("reply", "--item", "Choose the layout", "--text", "Again")
+        self.assertNotEqual(again.returncode, 0)
+        listed = self.run_command("open")
+        self.assertIn("1 due, 0 deferred", listed.stdout)
+        self.assertIn("Follow-up: Which file holds it?\nReply: The file is layout.toml.", listed.stdout)
+        self.assertEqual(self.question_rows()[-1].get("followups"),
+                         [{"followup": "Which file holds it?", "reply": "The file is layout.toml."}])
+
     def test_reminder_replacement_and_answer_preserve_the_filed_question(self) -> None:
         self.file_question()
         state = self.question_state(["Review the release notes"])

@@ -498,7 +498,7 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The record keeps the parts in `parts` and the joined full text in `question`, so `/next`, messages and the review read one text.
-  The Questions page shows the parts as sections: the items as a numbered list, links as links, and each choice as a button that fills the Answer box.
+  The Questions page shows the parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
   `--ask` is required and holds one line; `--text` defaults to it. There is no `--question` option.
   A question with `--choice` needs at least two of them and a `--recommend`; otherwise `ask` refuses before the review.
   A question stored as one text before the parts form keeps its `question` text, and the page still shows it.
@@ -519,6 +519,11 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
   More or fewer than one match exits 2.
   It prints `relay: to <unit>`, `relay: to the showrunner of <showrunner name>, for <unit>`, or `relay: none; …`.
   It then prints `answer: ok — <showrunner name>: <text>`.
+- `reply --item <text> --text <reply>` records the asker's reply to the user's follow-up from the Questions page.
+  A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
+  `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
+  It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
   Use `update_registration.py withdraw --item <text>` when the cause of a filed item is gone.
   It writes a `withdrawn` time to the history and writes no answered record.
