@@ -1117,6 +1117,8 @@ class AdmissionServer:
         self.placement_host_keys: dict[tuple[str, placement.PlacementDestination], placement.HostEvidenceKey] = {}
         # Start time of each hold that keeps a remote destination for an older waiting request.
         self.placement_holds: dict[tuple[str, placement.PlacementDestination], float] = {}
+        # The reading that answered each ended hold. That reading never starts another hold.
+        self.placement_hold_answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.spacing: records.StartSpacing = records.ReadyToStart()
         self.override: records.HeadAdmissionOverride | records.NoHeadAdmissionOverride = records.NoHeadAdmissionOverride()
         self.last_inputs: records.QueueInputs | NoPass = NoPass()
@@ -1689,7 +1691,10 @@ class AdmissionServer:
             if workers and all(gate.process_tree({pid: evidence.processes[pid].start},
                                dict(evidence.processes)).intersection(tree_pids | scoped_pids) for pid in workers):
                 legacy_job = IdleService()
-            result.append(replace(memory, bytes=max(0, memory.bytes - use), job_state=legacy_job, service_job_state=job,
+            anonymous = gate.swap_backed_use_less(memory.anonymous,
+                                                  (item.anonymous for item in (*duplicate, *scoped)))
+            result.append(replace(memory, bytes=max(0, memory.bytes - use), anonymous=anonymous,
+                                  job_state=legacy_job, service_job_state=job,
                                   swap_bytes=max(0, memory.swap_bytes - sum(item.swap_bytes for item in (*duplicate, *scoped)))))
         return tuple(result)
 
@@ -2901,6 +2906,7 @@ done
         """Remove remote selections before the local planner commits any effects."""
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
+            self.placement_hold_answers = {}
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
@@ -2931,6 +2937,7 @@ done
         held: list[PlacementHold] = []
         taken: list[placement.PlacementDestination] = []
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
+        answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:
             owner = records.waiter_owner(row)
             request = owners.get(owner)
@@ -2945,7 +2952,7 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    hold = self._placement_hold(request, candidate)
+                    hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
                     continue
@@ -2990,12 +2997,17 @@ done
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
         self.placement_holds = holds
+        self.placement_hold_answers = answers
         return replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
             if records.waiter_owner(row) not in removed], slots=tuple(self.slots.values()))
 
-    def _placement_hold(self, request: wire.PlacementRequest,
-                        candidate: placement.CandidateEligibility) -> PlacementHold | None:
-        """Return the hold that keeps a remote destination for a waiting request whose evidence is not current."""
+    def _placement_hold(self, request: wire.PlacementRequest, candidate: placement.CandidateEligibility,
+                        answers: dict[tuple[str, placement.PlacementDestination], float]) -> PlacementHold | None:
+        """Return the hold that keeps a remote destination for a waiting request that can use it now.
+
+        The request can use it when its last reading allowed it or said busy, or when it has no reading.
+        A reading that answered an earlier hold starts no new hold: the request cannot use the destination now.
+        """
         destination = candidate.destination
         eligibility = candidate.eligibility
         key = self.placement_host_keys.get((request.episode, destination))
@@ -3004,7 +3016,20 @@ done
                 or not (isinstance(eligibility, placement.EvidenceNeeded)
                         or isinstance(eligibility, placement.TemporaryExclusion) and eligibility.reason == "busy")):
             return None
-        return PlacementHold(request.episode, destination, key, self.host_evidence(key).observed_at)
+        reader = self.host_readers.get(key)
+        latest = reader.latest if reader is not None else self.host_observations.get(key)
+        if (isinstance(latest, placement.FreshHostEvidence) and not isinstance(latest.eligibility, placement.AllowedHost)
+                and not (isinstance(latest.eligibility, placement.TemporaryExclusion) and latest.eligibility.reason == "busy")):
+            return None
+        pair = (request.episode, destination)
+        observed_at = self.host_evidence(key).observed_at
+        start = self.placement_holds.get(pair)
+        answer = observed_at if start is not None and observed_at >= start else self.placement_hold_answers.get(pair)
+        if answer is not None:
+            answers[pair] = answer
+        if answer == observed_at:
+            return None
+        return PlacementHold(request.episode, destination, key, observed_at)
 
     def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                         held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:

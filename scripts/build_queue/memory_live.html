@@ -91,6 +91,9 @@ h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 .hatch-swap { background: repeating-linear-gradient(135deg, var(--agents) 0 3px, var(--free) 3px 6px); }
 .bar > div { cursor: help; }
 .bar > div:hover { filter: brightness(1.12); }
+.mark { position: absolute; top: 18px; bottom: -6px; width: 15px; margin-left: -7px; cursor: help; transition: left 0.6s ease; }
+.mark::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; border-left: 3px solid var(--cap); }
+.mark-label { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; font-size: 0.8rem; font-weight: 600; color: var(--cap); cursor: help; transition: left 0.6s ease; }
 .legend .row { display: grid; grid-template-columns: 12px minmax(0, 1fr) max-content; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 6px; cursor: help; }
 .legend .row[hidden] { display: none; }
 .legend .row:hover { background: var(--free); }
@@ -308,7 +311,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .why { padding-left: 28px; }
   .answer .big { font-size: 2.2rem; }
 }
-.cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
+#mark[hidden], #marklabel[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -347,8 +350,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="last-reading" id="last-reading" hidden></div>
     </div>
 
-    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree</p>
+    <p class="ram-disagree" id="ram-disagree" hidden>RAM readings do not agree: the named parts exceed the total.</p>
     <div class="bar-wrap" id="barwrap" role="img" aria-label="Build memory bar">
+      <span class="mark-label num" id="marklabel" data-tip="cap">cap</span>
       <div class="bar">
         <div class="seg-used" id="s-builds" data-tip="builds"><span class="lbl" id="l-builds"></span></div>
         <div class="seg-ci" id="s-ci" data-tip="ci"><span class="lbl" id="l-ci"></span></div>
@@ -363,6 +367,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
         <div class="seg-cache" id="s-cache" data-tip="cache"><span class="lbl" id="l-cache"></span></div>
         <div class="seg-unattributed" id="s-unattributed" data-tip="unattributed"><span class="lbl" id="l-unattributed"></span></div>
       </div>
+      <div class="mark" id="mark" data-tip="cap"></div>
     </div>
     <div class="scale num" id="scale"><div class="ticks" id="ticks-top" data-tip="budget"></div></div>
 
@@ -479,7 +484,7 @@ const TIPS = {
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
     "Limit for queued builds and hana CI.", `Queued use counted: ${ramAmount(d.ram.queued_builds_bytes)}.`,
-    optional(d.ram.ci_bytes, `CI use counted: ${ramAmount(d.ram.ci_bytes)}.`), "Reservations count toward this limit.")],
+    optional(d.ram.ci_counted_bytes, `CI use counted, file cache included: ${ramAmount(d.ram.ci_counted_bytes)}.`), "Reservations count toward this limit.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines(
     optional(d.ram.safety_missing_bytes, `Safety reserve missing: ${ramAmount(d.ram.safety_missing_bytes)}.`),
     optional(d.ram.swap_missing_bytes, `Swap reserve missing: ${ramAmount(d.ram.swap_missing_bytes)}.`),
@@ -548,9 +553,11 @@ function swapTip(row) {
   const owner = row.owner_count === 1 ? identityFields(row).map(([name, value]) => `${sentence(name)}: ${value}`) : [];
   return [title, lines("Swap charged to this program or build.", ...owner)];
 }
-function capEnd(r) {
-  const total = recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes : 1;
-  return (r.builds_bytes + r.ci_bytes + r.build_covered_bytes + r.room_bytes) / total;
+// The fraction of all RAM at the queue cap: both charts draw their cap line here.
+// The Running chart bars use the cap terms (queued use, CI use counted, covered reservations, room), which add to the cap.
+function capEnd(d) {
+  const total = recorded(d.ram.total_bytes) && d.ram.total_bytes > 0 ? d.ram.total_bytes : 1;
+  return hasCap(d) ? d.cap * GIB / total : 0;
 }
 function poolTip(pool, d) {
   if (pool === "builds_ci") return [`Builds and CI · ${swapAmount(d.swap.builds_ci_bytes)}`,
@@ -824,10 +831,9 @@ function render(d) {
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
   const total = recorded(r.total_bytes) ? r.total_bytes : 0;
-  const disagree = r.agreement === "disagree";
-  $("ram-disagree").hidden = !disagree;
-  $("barwrap").hidden = !total || disagree;
-  $("scale").hidden = !total || disagree;
+  $("ram-disagree").hidden = r.agreement !== "disagree";
+  $("barwrap").hidden = !total;
+  $("scale").hidden = !total;
   const parts = [];
   for (const [key, name, amount] of RAM_BLOCKS) {
     const bytes = amount(r);
@@ -842,6 +848,9 @@ function render(d) {
   $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(d.cap)} GiB`;
   $("v-shortfall").textContent = ramAmount(r.shortfall_bytes);
   $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${f1(d.cap)} GiB`;
+  $("mark").hidden = !hasCap(d);
+  $("marklabel").hidden = !hasCap(d);
+  $("marklabel").textContent = hasCap(d) ? `cap ${f1(d.cap)}` : "";
 
   const [roomValue, roomUnit] = ramAmount(r.room_bytes).split(" ");
   $("room").textContent = roomValue;
@@ -1084,7 +1093,7 @@ function renderWalk(d) {
       (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
       `</div>`);
   });
-  if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d.ram)})"></div>`);
+  if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
   $("walk").classList.toggle("has-cap", hasCap(d));
   $("walk").innerHTML = `<div class="walk-chart"><div class="walk-chart-head"><span class="report-window">Used · reserved</span></div>${rows.join("")}` +
     `<div class="walk-axis num"><span></span><div class="ticks" id="ticks" data-tip="ticks"></div></div></div>` +
@@ -1093,7 +1102,7 @@ function renderWalk(d) {
   const step = 6;
   const ticks = [];
   for (let v = 0; v <= scale; v += step) ticks.push(`<span style="left:${pct(v)}">${v}</span>`);
-  const axisEnd = hasCap(d) ? Math.max(0, Math.ceil(capEnd(d.ram) * scale / step) - 1) * step : Math.floor(scale / step) * step;
+  const axisEnd = hasCap(d) ? Math.max(0, Math.ceil(capEnd(d) * scale / step) - 1) * step : Math.floor(scale / step) * step;
   const lowerTicks = [];
   for (let v = 0; v <= axisEnd; v += step) lowerTicks.push(`<span style="left:${(axisEnd ? v / axisEnd * 100 : 0)}%">${v}</span>`);
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
@@ -1131,8 +1140,10 @@ function fitWalkDetails() {
   const track = walk.querySelector(".track");
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
+  // Measure without the last layout: a stacked table is full width, so the chart would stay stacked on a wider page.
+  walk.classList.remove("beside", "stacked");
   walk.classList.add("measuring");
-  const capFraction = !hasCap(latest) ? 0 : capEnd(latest.ram);
+  const capFraction = capEnd(latest);
   function measure(labelWidth) {
     const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
@@ -1229,8 +1240,8 @@ function placeMemoryBars(d) {
   const progressEnd = !hasCap(d) ? 0 : Math.max(0, Math.floor(document.querySelector(".walk-bud").getBoundingClientRect().left) - range.left);
   const r = d.ram;
   const unit = width / (recorded(r.total_bytes) && r.total_bytes > 0 ? r.total_bytes / GIB : d.total);
-  const used = r.builds_bytes / GIB * unit;
-  const ciWidth = r.ci_bytes / GIB * unit;
+  const used = r.queued_builds_bytes / GIB * unit;
+  const ciWidth = r.ci_counted_bytes / GIB * unit;
   const reserved = r.build_covered_bytes / GIB * unit;
   const room = r.room_bytes / GIB * unit;
   const reserveAt = used + ciWidth;
@@ -1259,7 +1270,7 @@ function placeMemoryBars(d) {
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci", "ci");
+      bars = box(used, ciWidth, "seg-ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
@@ -1328,6 +1339,9 @@ function fitLabels() {
   fitWalkDetails();
   if (latest) placeMemoryBars(latest);
   fitAxisLabels();
+  const at = latest ? $("barwrap").getBoundingClientRect().width * capEnd(latest) : 0;
+  $("mark").style.left = `${at}px`;
+  $("marklabel").style.left = `${at}px`;
   for (const [k] of RAM_BLOCKS) {
     const seg = $(`s-${k}`), lbl = $(`l-${k}`);
     lbl.classList.remove("tight");

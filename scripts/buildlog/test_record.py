@@ -845,7 +845,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
             env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: the machine has 10\.5 GiB free; a build starts at 12\.0")
+        self.assertRegex(result.stderr, r"waiting for memory since \d\d:\d\d P[DS]T: .* needs \d+\.\d GiB; 10\.5 GiB free; ")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
         reason = "memory admission check failed (launch wait limit reached without admission); step refused"
         self.assertEqual(result.stderr.count(reason), 1)
