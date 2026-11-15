@@ -786,6 +786,21 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 request.constraints, command_kind=kind)), destination) for kind in kinds}
             self.assertEqual(len(keys), len(kinds))
 
+    def test_each_mac_run_kind_returns_its_mac_placement_with_a_cancel(self) -> None:
+        for kind in placement.MAC_RUN_KINDS:
+            with self.subTest(kind=kind), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints, command_kind=kind))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                # mac_queue_run returns the placement this way after each run.
+                reply, = fixture.server.handle_request(wire.CancelPlacement(
+                    "return", request.episode, request.owner, "the Mac run ended with status 0"))
+                self.assertIsInstance(reply, wire.Ok)
+                self.assertNotIn(request.episode, fixture.server.current_assignments)
+                self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("cancelled"))
+
     def test_a_busy_mac_holds_a_mac_run_kind(self) -> None:
         with PlacementFixture() as fixture:
             repository = fixture.root / "hana"
