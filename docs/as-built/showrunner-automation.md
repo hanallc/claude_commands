@@ -777,6 +777,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Configured plan order precedes start order for work outside the plan.
     A reopened run stays open until a later finish.
     Work names use the full title and phase id, with a repeated leading id removed.
+    Inside a sentence, `in_sentence` lowercases a leading article or number word; names such as Mac keep their capital.
     Open pass events join `worker_id` to `CensusWorker.staff_id` before the phase assignment fallback.
     Workers must belong to the displayed unit; finished passes supply no current work.
     Pass roles supply actions for implementation, tests, fixes, review, and design.

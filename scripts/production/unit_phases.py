@@ -576,6 +576,16 @@ def work_name(phase_id: str, title: str) -> str:
     return f"{title} ({phase_id})" if title else phase_id
 
 
+SENTENCE_START_WORDS = frozenset({"The", "A", "An", "This", "That", "These", "Those", "Each", "Every", "All", "No",
+                                  "Some", "One", "Two", "Three", "Four", "Five", "Six"})
+
+
+def in_sentence(work: str) -> str:
+    """Lower a title's first word inside a sentence when it is an article or a number; names keep their capital."""
+    first, _, rest = work.partition(" ")
+    return f"{first.lower()} {rest}" if rest and first in SENTENCE_START_WORDS else work
+
+
 def wait_sentence(work: str, wait: phase_waits.PhaseWait, *, snapshot: staff.StaffSnapshot,
                   now: float, zone: ZoneInfo) -> str:
     """Name the wait's resource, latest holder, and original start."""
@@ -657,24 +667,24 @@ def phase_tasks(phase: phase_table.OpenPhase, events: list[dict[str, object]], *
         role, verb = role_words(str(event.get("pass_kind", "")), worker.name)
         runs = [run for run in worker.runs if run.state == "running"]
         if runs:
-            tasks.extend(TaskLine(f"The {role} runs {run.label} for {work} and waits for its result.", "running")
+            tasks.extend(TaskLine(f"The {role} runs {run.label} for {in_sentence(work)} and waits for its result.", "running")
                          for run in runs)
         elif any(run.state == "finished_queued" for run in worker.runs):
             tasks.append(TaskLine(f"{work}: the worker finished; the director has not read its result.", "result"))
         elif worker.runs:
             tasks.append(TaskLine(f"{work} is open, but nothing runs; reason not recorded.", "unexplained"))
         elif worker.status == "busy":
-            tasks.append(TaskLine(f"The {role} {verb} {work}.", "running"))
+            tasks.append(TaskLine(f"The {role} {verb} {in_sentence(work)}.", "running"))
     for index, wait in enumerate(waits):
         if index not in used_waits:
             tasks.append(TaskLine(wait_sentence(work, wait, snapshot=snapshot, now=now, zone=zone), "waiting"))
     activities = director_activities(instance)
     director_waits = any(not wait.pass_instance_id for wait in waits)
     if activities and not director_waits:
-        tasks.extend(TaskLine(f"The director {activity} for {work}. No worker is needed for this step.", "running")
+        tasks.extend(TaskLine(f"The director {activity} for {in_sentence(work)}. No worker is needed for this step.", "running")
                      for activity in activities)
     if not tasks:
-        tasks.append(TaskLine(f"The director works on {work}. No worker runs; the director's step is not recorded.", "running")
+        tasks.append(TaskLine(f"The director works on {in_sentence(work)}. No worker runs; the director's step is not recorded.", "running")
                      if busy else TaskLine(f"{work} is open, but nothing runs; reason not recorded.", "unexplained"))
     if phase.eta_trail:
         promise = phase.eta_trail[-1][0]

@@ -352,6 +352,18 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn(expected, rendered)
                 self.assertNotIn("reviews the fixes", rendered)
 
+    def test_a_title_inside_a_sentence_lowers_only_a_leading_article(self) -> None:
+        member = self.member("inline")
+        for title, inside, start in (("The ten suites pass on the Mac", "the ten suites pass on the Mac",
+                                      "The ten suites pass on the Mac"),
+                                     ("Mac suites pass", "Mac suites pass", "Mac suites pass")):
+            with self.subTest(title=title):
+                _ = self.write_run(member, "inline", [("39", title)])
+                busy = self.blocks([member], {}, statuses=["busy"])
+                self.assertIn(f"The director works on {inside} (39). No worker runs;", busy)
+                idle = self.blocks([member], {}, statuses=["idle"])
+                self.assertIn(f"- **Now:** {start} (39) is open, but nothing runs; reason not recorded.", idle)
+
     def test_no_task_is_shown_once_its_step_or_phase_has_closed(self) -> None:
         member = self.member("closed")
         for terminal in ("pass_finished", "phase_finished"):
