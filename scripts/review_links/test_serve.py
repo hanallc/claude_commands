@@ -102,7 +102,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         folder.mkdir()
         pages = (console.ConsolePage("changes", "Changes", "list-checks", "Changes",
                                      console.AvailablePage("/abc123/changes.html")),)
-        _ = (folder / "console.html").write_bytes(console.render(pages))
+        _ = (folder / "console.html").write_bytes(console.render(pages, console.AvailablePage("/abc123/rebuilds.html")))
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
         try:
             connection.request("GET", "/abc123/console.html?page=changes")
