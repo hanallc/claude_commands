@@ -420,13 +420,18 @@ def ordinal(number: int) -> str:
 
 
 def try_text(result: land_runs.LandResult, *, now: float, zone: ZoneInfo) -> str:
-    """Say how a land ended: "landed 11:20", or "failed at red 11:20: <first detail line>"."""
+    """Say how a land ended: "landed 11:20", or "failed at red 11:20: <first detail line>".
+
+    A merge conflict names its files, not the first detail line.
+    """
     try:
         when = short_time(datetime.fromisoformat(result["time"]), now=now, zone=zone)
     except (ValueError, TypeError):
         when = ""
     if result["landed"]:
         return single_spaced(f"landed {when}")
+    if conflicts := re.findall(r"Merge conflict in (\S+)", result["detail"]):
+        return single_spaced(f"merge conflict in {', '.join(dict.fromkeys(conflicts))} {when}")
     detail = single_spaced(result["detail"].splitlines()[0]) if result["detail"].strip() else ""
     return single_spaced(f"{result['state']} at {result['step']} {when}") + (f": {detail}" if detail else "")
 
@@ -465,6 +470,41 @@ def checkpoint_wait(events: list[dict[str, object]], land: land_queue.LandView, 
         if kind in WORK_STARTS:
             return None
     return None
+
+
+def unit_lands(unit: str, land: land_queue.LandView, *, skip: Sequence[str], now: float, zone: ZoneInfo,
+               on_main: Callable[[str], bool]) -> str:
+    """Say where each of the unit's sent checkpoints is on its way to main, from the lands, the line and the results.
+
+    It names checkpoints that land now, wait in the land line, or did not land and are not on main yet; the phases
+    of one line item share one entry. Phases in skip have their own row (sdlc C1701: done work that waits to land).
+    """
+    prefix = f"{unit} "
+
+    def own(owner: str) -> str:
+        phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
+        return "" if phase in skip else phase
+
+    landing = [phase for owner in land.running.values() if (phase := own(owner))]
+    items: dict[int, list[str]] = {}
+    for place in ({} if isinstance(land.line, land_queue.NoLine) else land.line).values():
+        if (phase := own(place.owner)) and phase not in items.setdefault(place.number, []):
+            items[place.number].append(phase)
+    queued = {phase for phases in items.values() for phase in phases}
+    newest: dict[str, land_runs.LandResult] = {}
+    for result in land.results.values():
+        phase = result["phase"]
+        if result["unit"] == unit and (phase not in newest or result["time"] > newest[phase]["time"]):
+            newest[phase] = result
+    parts: list[str] = []
+    if landing:
+        parts.append(f"landing now: {', '.join(landing)}")
+    if entries := [f"{' + '.join(phases)} ({ordinal(number)} in line)" for number, phases in sorted(items.items()) if phases]:
+        parts.append(f"done, waits to land: {', '.join(entries)}")
+    parts.extend(f"{phase} did not land: {try_text(result, now=now, zone=zone)}" for phase, result in newest.items()
+                 if not result["landed"] and phase not in skip and phase not in queued and phase not in landing
+                 and not on_main(result["commit"]))
+    return " · ".join(parts)
 
 
 def phase_notes_cell(phase: phase_table.OpenPhase, events: list[dict[str, object]], *,
@@ -802,6 +842,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if pending_eta != display_cells.NONE:
                 plan_eta = " · ".join(cell for cell in (plan_eta, pending_eta) if cell != display_cells.NONE)
                 show_plan_eta = True
+        sent_text = unit_lands(unit.unit, land, skip=open_ids, now=now, zone=zone,
+                               on_main=lambda commit: waits_on.on_main(REPOSITORY, commit))
+        sent = (sent_text,) if sent_text else ()
         if run is not None and open_run_phases and isinstance(member, staff.StaffRow):
             for phase_index, phase in enumerate(open_run_phases):
                 first = phase_index == 0
@@ -810,7 +853,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 queued = (queued_cell(member.id, queued_record, notes=notes, open_phase_ids=open_ids, describe=describe)
                           if first else display_cells.NONE)
                 if first:
-                    notes = with_waits(notes, waits)
+                    notes = with_waits(notes, (*sent, *waits))
                 phase_workers = census_workers(view, member, phase.instance_id)
                 status_rows.append((unit.unit, status if first else display_cells.NONE,
                                     *((machines[index] if first else display_cells.NONE,) if machines else ()),
@@ -824,7 +867,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             notes = notes_cell(notes_record, read_run=read_run)
             queued = (queued_cell(member.id, queued_record, notes=notes, describe=describe)
                       if isinstance(member, staff.StaffRow) else display_cells.NONE)
-            notes = with_waits(notes, waits)
+            notes = with_waits(notes, (*sent, *waits))
             status_rows.append((unit.unit, status, *((machines[index],) if machines else ()),
                                 progress_cell(progress_record), phase_cell(progress_record),
                                 eta_cell(eta_record, now=now, zone=zone, open_run_phases=open_run_phases),

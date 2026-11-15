@@ -61,7 +61,7 @@ class LandView(NamedTuple):
     A land also takes each commit its listed commit holds that is not on main: carried_running and carried_line.
     """
 
-    running: frozenset[str]
+    running: dict[str, str]
     line: dict[str, Place] | NoLine
     results: dict[str, land_runs.LandResult]
     carried_running: frozenset[str]
@@ -167,7 +167,7 @@ def place_of(line: dict[str, Place], commit: str) -> Place | None:
 
 def land_view(repo: Path) -> LandView:
     """Read the lands; one git call for each listed commit finds the commits it carries."""
-    running, line = land_runs.running_commits(), places()
+    running, line = land_runs.running_lands(), places()
     carried_running = frozenset(commit for listed in running for commit in waits_on.carried(repo, listed))
     carried_line: dict[str, Place] = {}
     if not isinstance(line, NoLine):

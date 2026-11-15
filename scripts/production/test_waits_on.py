@@ -89,7 +89,7 @@ class WaitsOnTests(unittest.TestCase):
 
         def text(found: waits_on.WaitState | None, running: frozenset[str] | None = None,
                  results: dict[str, land_runs.LandResult] | None = None) -> str:
-            view = land_queue.LandView(running or frozenset(), line, results or {}, frozenset(), {})
+            view = land_queue.LandView(dict.fromkeys(running or (), ""), line, results or {}, frozenset(), {})
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
         self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
@@ -105,10 +105,34 @@ class WaitsOnTests(unittest.TestCase):
         self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland — after builds/589: not started")
         self.assertEqual(text(waits_on.NotFound()), "acctland — after builds/589: not found")
         self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("plain"), None,
-                                                 land_queue.LandView(frozenset(), {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
+                                                 land_queue.LandView({}, {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
                          "acctland — after builds/589: done, landed 13:30, not on main yet")
+
+    def test_the_first_row_names_each_sent_checkpoint_of_the_unit(self) -> None:
+        now, utc = 1_794_750_000.0, ZoneInfo("UTC")
+        held: land_runs.LandResult = {"commit": "e" * 40, "production": "sdlc", "unit": "shelled", "phase": "center-column",
+                                      "landed": False, "step": "conflicts", "state": "held", "detail": "conflict: stdout: 1234\nCONFLICT (content): Merge conflict in docs/a.md\nCONFLICT (content): Merge conflict in b.md",
+                                      "time": datetime.fromtimestamp(now - 600, UTC).isoformat()}
+        later: land_runs.LandResult = {**held, "commit": "f" * 40, "phase": "images", "time": datetime.fromtimestamp(now, UTC).isoformat()}
+        older: land_runs.LandResult = {**later, "commit": "9" * 40, "landed": True, "time": datetime.fromtimestamp(now - 900, UTC).isoformat()}
+        line = {"a" * 40: land_queue.Place(1, "sdlc first", "shelled shot-rule"),
+                "b" * 40: land_queue.Place(2, "sdlc pair", "shelled workers-why"),
+                "c" * 40: land_queue.Place(2, "sdlc pair", "shelled land-line"),
+                "d" * 40: land_queue.Place(3, "builds batch9", "shelledx 2")}
+        view = land_queue.LandView({"0" * 40: "shelled images-card", "1" * 40: "other 1"}, line,
+                                   {"e" * 40: held, "f" * 40: later, "9" * 40: older}, frozenset(), {})
+
+        def lands(skip: tuple[str, ...] = (), on_main: bool = False) -> str:
+            return unit_phases.unit_lands("shelled", view, skip=skip, now=now, zone=utc, on_main=lambda _commit: on_main)
+
+        self.assertEqual(lands(), "landing now: images-card · done, waits to land: shot-rule (1st in line), "
+                         + "workers-why + land-line (2nd in line) · center-column did not land: merge conflict in docs/a.md, b.md 13:30 "
+                         + "· images did not land: merge conflict in docs/a.md, b.md 13:40")
+        self.assertEqual(lands(("images-card", "shot-rule", "land-line", "images"), on_main=True),
+                         "done, waits to land: workers-why (2nd in line)")
+        self.assertEqual(unit_phases.unit_lands("nobody", view, skip=(), now=now, zone=utc, on_main=lambda _commit: False), "")
 
 
 if __name__ == "__main__":

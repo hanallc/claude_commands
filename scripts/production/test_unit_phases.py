@@ -858,7 +858,7 @@ class UnitPhasesTests(unittest.TestCase):
                  line: dict[str, land_queue.Place] | None = None,
                  results: dict[str, land_runs.LandResult] | None = None, carried_running: frozenset[str] | None = None,
                  carried: dict[str, land_queue.Place] | None = None) -> str | None:
-            view = land_queue.LandView(running or frozenset(), land_queue.NoLine() if line is None else line, results or {},
+            view = land_queue.LandView(dict.fromkeys(running or (), ""), land_queue.NoLine() if line is None else line, results or {},
                                        carried_running or frozenset(), carried or {})
             return unit_phases.checkpoint_wait(found, view, now=now, zone=utc)
 
@@ -881,7 +881,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(wait(events[:4], line={}, carried=carrier, results={"c" * 40: landed}), "done, landed 13:30")
         self.assertEqual(wait(events[:4], line=second, carried=carrier), "done, waits to land, 2nd in line")
         self.assertEqual(wait(events[:4], line={}, carried_running=frozenset({"c" * 40})), "done, landing now")
-        view = land_queue.LandView(frozenset(), {}, {}, frozenset(), carrier)
+        view = land_queue.LandView({}, {}, {}, frozenset(), carrier)
         self.assertEqual(unit_phases.checkpoint_wait(events[:4], view, now=now, zone=utc, unit="unit-board"),
                          "done, waits to land with land-line, 3rd in line")
         self.assertIsNone(wait(events[:2]))

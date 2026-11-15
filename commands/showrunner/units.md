@@ -94,6 +94,9 @@ ETA Plan appears when a unit has unfinished plan phases or a promise for an unfi
    Out of the line it is the last land result: `done, landed 11:20` or `done, did not land: held at ancestry 11:20: <detail>`.
    With no result, it is ` · done, not sent to land yet`.
    Before any runner uses the line, it is ` · done, waits to land`.
+   The unit's first row also names each sent checkpoint with no phase row of its own, from the land line and the land results:
+   ` · landing now: <phase>`, ` · done, waits to land: shot-rule (1st in line), a + b (2nd in line)`, or ` · <phase> did not land: merge conflict in <files> 13:58`.
+   Phases in one land line item share one entry. A failed land whose commit is on main later is not shown.
    Empty text, role-only text, and `<label> dispatch` add nothing.
    Text equal to the title adds nothing; this comparison ignores case and whitespace.
    Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.

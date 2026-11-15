@@ -2080,7 +2080,8 @@ def main() -> int:
         try:
             requests = batch_requests(batch, cast(str, args.production))
             production = requests[0].production
-            with merge_lock(production.checkout, production.name), land_runs.landing([item.commit for item in requests]):
+            owners = [f"{item.unit.name} {item.phase}" for item in requests]
+            with merge_lock(production.checkout, production.name), land_runs.landing([item.commit for item in requests], owners):
                 return run_batch(requests)
         except (Refusal, staff.StaffRefused, OSError, ValueError, checkpoint_gate.Stop) as error:
             checkpoint_gate.report("input", "failed", str(error))
@@ -2115,7 +2116,8 @@ def main() -> int:
     require_unit_arguments(parser, args)
     try:
         request = request_from(args)
-        with merge_lock(request.production.checkout, request.production.name), land_runs.landing([request.commit]):
+        owners = [f"{request.unit.name} {request.phase}"]
+        with merge_lock(request.production.checkout, request.production.name), land_runs.landing([request.commit], owners):
             return run(request)
     except staff.StaffUnreadable as error:
         checkpoint_gate.report("change review", "failed", f"{error}: the staff record is read before the push")
