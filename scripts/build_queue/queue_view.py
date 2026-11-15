@@ -1151,8 +1151,7 @@ def head_text(model: QueueModel) -> str:
     head = model.reading.explanation.head
     text = ""
     if isinstance(head, admission_records.HeadExplanation) and head.decision.state == "hold":
-        text = (f"free {head.free.available / admission_records.GIB:.1f} GiB; "
-                + f"reserve {head.free.reserve / admission_records.GIB:.1f} GiB; need {head.free.need / admission_records.GIB:.1f} GiB")
+        text = queue_evidence.head_room_text(head.room, model.reading.explanation.room)
     if isinstance(model.reading, wire.CloudQueueRead):
         used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in cloud_rows(model))
         text += (" · " if text else "") + f"cloud {used} of {model.reading.cloud_slots} slots"
