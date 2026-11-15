@@ -45,14 +45,12 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main, :root.layout-measuring main { margin: 0 auto; padding: 24px 10vw 48px; }
-h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
+__PAGE_FRAME_STYLE__
 .num { font-variant-numeric: tabular-nums; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
+.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.status-content { display: contents; }
-.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); height: var(--status-height); }
-.status.is-stale .status-content { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px; align-items: center; flex-wrap: inherit; background: var(--bg); }
+#status { flex: 1 1 12rem; min-width: 0; }
+.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
 .dot.stale { background: var(--cap); }
 .card, :root.layout-measuring .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .answer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-bottom: 6px; }
@@ -312,7 +310,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .walk-axis .ticks { position: relative; height: 16px; }
 .walk-axis .ticks span { position: absolute; transform: translateX(-50%); }
 @media (max-width: 560px) {
-  main { padding: 16px 12px 32px; }
   .card { padding: 14px 12px; }
   .walk-head { flex-wrap: wrap; gap: 4px; }
   .walk-sum { margin-left: 0; }
@@ -352,9 +349,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <body>
 <main>
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
-  <h1>Builds</h1>
+  <h1 class="page-title">Builds</h1>
   <div class="queue-error" id="queue-error" role="status"></div>
-  <div class="status"><div class="status-content"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -1415,10 +1412,6 @@ function esc(s) {
 let lastRead = 0;
 let readingFailure = "";
 function showStatus(text, stale) {
-  const status = $("status").closest(".status");
-  if (!status.classList.contains("is-stale")) {
-    status.style.setProperty("--status-height", `${status.getBoundingClientRect().height}px`);
-  }
   $("status").textContent = text;
   $("dot").classList.toggle("stale", stale);
   $("status").closest(".status").classList.toggle("is-stale", stale);

@@ -155,7 +155,7 @@ Typed text or an active save holds replacement; only the newest loaded update wa
 Replacement continues when all unsaved fields are empty or the save ends.
 After a successful save, the page requests a fresh update to exclude older responses.
 A failed load changes nothing; the next interval tries again.
-The heading follows the type: Questions to answer, Changes to review, or Rebuilds needed.
+The heading follows the type: Questions to answer or Changes to review.
 An empty showrunner filter shows `No questions for this showrunner.` or `No changes for this showrunner.`
 An empty type shows `No questions to answer.` or `No changes to review.`
 The selected showrunner filter supplies the count; the card has no separate remaining count.

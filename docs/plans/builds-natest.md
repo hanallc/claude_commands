@@ -4242,3 +4242,81 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `VerifyTokenWaitFixture.write_wait_sleep` in `scripts/direct/verify_token_wait_test_support.py` makes the `sleep 3` stub pause a real 0.1 seconds; the memory poll sleep stays faked. A faked `sleep 3` let a `board.sh acquire --wait` loop spin at full CPU while a peer held the token.
 - AWS pair (3 rounds, 9 modules): token_reservation 15.55 -> 9.27 CPU s, about 9.2 CPU s less in total, all pass.
 - Commit 99927dcf3. Test-only change.
+### Phase 295 — The style ledger reads each repository tip once a process  · status: done
+**Depends on:** none
+**Owner:** natest (production change; sdlc gave no objection on 11-15).
+
+#### As-built
+
+- `scripts/style/style_ledger.py`: `_read_tip` (lru_cache 16) serves `Ledger._tip` and `GitReadCache.tip`, so one process builds each tip once; `_check_ref_format` keeps valid ref names. A production command is one process, so its git reads do not change.
+- `LedgerTestCase.forget_tips()` and `tip_builds()` clear the cache for the tip spies and the hidden-object test.
+- AWS pair (3 rounds, 8 modules): about 12.6 CPU s less, all pass. sdlc gave no objection.
+- Commit 232d9f01e. Production change.
+
+### Phase 296 — A paired trial box keeps its full lifetime after a queue wait  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the crate_run trial timeout; builds gave the go on 11-15; sdlc has no objection).
+
+#### As-built
+
+- Cause of the crate_run trial 124: `gate_trial.py` set the box expiry before the slot queue wait, and `gate_box.py` splits the time left into run budgets.
+- `coordinate_trial` sets each pending request expiry to launch time + `lifetime_minutes` after every slot is held; `paired_module` reads request.json after `launch`. Branch names keep their start stamp.
+- Test `test_paired_queue_wait_does_not_shorten_the_box_lifetime` in `test_cloud_gate.py`.
+- AWS pair (3 rounds): test_cloud_gate and test_gate_trial pass, same CPU. builds gave the go; sdlc has no objection.
+- Commit abe4afc09. Production change.
+
+### Phase 297 — The verify helper reads each request in large reads  · status: done
+**Depends on:** none
+**Owner:** natest (production change; the diff goes to sdlc).
+
+#### As-built
+
+- `FieldReader` in `scripts/direct/verify_helper.py` reads stdin in 64 KiB `os.read` chunks and splits on NUL; the main loop skips `select` while buffered bytes remain. Formats do not change.
+- Cause: `read_field` read one byte a call; a request carries the whole environment (about 31 KB on natedev), 2.54 of the helper's 6.2 natedev CPU s in ssh_targets_routing.
+- Test `test_two_requests_in_one_write_each_get_a_reply` in `test_verify_helper.py`.
+- AWS pair (3 rounds, 9 verify modules): all pass, about 1.3 CPU s less; the AWS environment is small. sdlc: no branch touches the files.
+- Commit e60fb3344. Production change.
+
+### Phase 298 — A build folder lock removed after its open is not current  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the test_queue_card flake on 11-15; queue owns the queue card; the diff goes to sdlc).
+
+#### As-built
+
+- Cause of the test_queue_card flake (devtools gate on 7b1ecd3fd, AWS): `AdmissionFixture` sweeps the shared socket parent; the sweep opened another module's free folder lock, the owner unlinked it, and `_open_lock` raised on `st_nlink == 0`.
+- `_open_lock` in `scripts/lib/build_folders.py` refuses only a non-regular file and `st_nlink > 1`. Every caller checks `_lock_current`, which refuses a removed lock.
+- Test `test_a_lock_removed_after_its_open_is_not_current` (sweep and create) in `test_build_folders.py`.
+- builds accepted the cause; queue and sdlc have the diff.
+- Commit eb9561c7d. Production change.
+
+### Phase 299 — The assign stop test waits for the kernel exit of each stopped process  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the test_assign_claude_claim_follow flake on 11-15; test-only change).
+
+#### As-built
+
+- Cause of the test_assign_claude_claim_follow SIGHUP flake: `stop_assignment` read the stopped child's state after its socket end of file and the launcher exit; the kernel closes files before it makes the task a zombie.
+- `exit_watch(pid)` in `scripts/direct/test_assign_claude.py` opens a pidfd (kqueue `NOTE_EXIT` on the Mac) before the stop signal; `stop_assignment` waits for each exit event before the state check.
+- Commit e6348babb. Test-only change.
+
+### Phase 300 — A build folder lease replaced after its lookup is not a fault  · status: done
+**Depends on:** Phase 298
+**Owner:** natest (the 298 AWS pair failed on this race on 11-15; the diff goes to sdlc).
+
+#### As-built
+
+- Cause of the 298 AWS pair red (test_stable_owner_reuses_contents_and_existing_permissions): threads that share a stable folder lock each write the lease; one `os.replace` unlinked the old lease after another thread's lookup, and `_write_lease` raised on `st_nlink == 0`. Base had the same check.
+- `_write_lease` in `scripts/lib/build_folders.py` refuses only a non-regular file and `st_nlink > 1`.
+- Test `test_a_lease_replaced_after_its_lookup_is_not_a_fault` in `test_build_folders.py`.
+- Commit e564852f9. Production change.
+
+### Phase 301 — A test that kills a gate owner keeps its gate copy inside the test folder  · status: done
+**Depends on:** none
+**Owner:** natest (builds assigned the gate copy leak on 11-15; test-only change).
+
+#### As-built
+
+- Cause of the gate copy leak (builds, 11-15; 278 folders, oldest 11-09): two tests SIGKILL a gate owner by design, and their children used the outer TMPDIR, so the dead owner's fresh copy survived the test folder.
+- The `StandingTests` fixture (`test_copies.py`) and the `StyleSyncTests` fixture (`test_style_sync.py`) give their children a TMPDIR inside the test folder. The two kill tests assert that the killed owner's checkout is inside the test folder.
+- The free leftovers are deleted.
+- Commit 0a92e8ed5. Test-only change.

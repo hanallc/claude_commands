@@ -29,12 +29,11 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+__PAGE_FRAME_STYLE__
 /* The content fills the window, so the region filter fits on one row; the user likes dense pages. */
-main { margin: 0 auto; padding: 24px 16px 48px; }
-h1 { font-size: 1.4rem; margin: 0; letter-spacing: -0.01em; }
 h2 { font-size: 1.05rem; margin: 0 0 4px; }
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 2px 0 16px; }
+.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; margin: 0 0 16px; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
@@ -99,7 +98,7 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 </head>
 <body>
 <main>
-<h1>AWS prices</h1>
+<h1 class="page-title">AWS prices</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
 <nav class="regions" aria-label="Regions to show">
   <span class="regions-label" id="regions-label">Regions</span>
