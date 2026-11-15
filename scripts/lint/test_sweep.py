@@ -5138,6 +5138,44 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         self.assertEqual(list(base.glob("workspace-*-alert.lock")), [])
         send.assert_not_called()
 
+    def enter_removable_checkout(self, base: Path) -> Path:
+        checkout = base / "checkout"
+        checkout.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(checkout)
+        return checkout
+
+    def test_checkout_removed_during_the_sweep_is_not_a_failure(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "workspace", APP, time.time() - DAY)
+        checkout = self.enter_removable_checkout(base)
+
+        def roots_then_remove_checkout(*_cwd: str) -> list[str]:
+            checkout.rmdir()
+            return [str(tree.parent)]
+
+        with (mock.patch.object(sweep, "cargo_roots", side_effect=roots_then_remove_checkout),
+              mock.patch.object(sweep, "sweep", return_value=0) as assess,
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, 60), 0)
+        self.assertEqual(errors.getvalue(), "")
+        assess.assert_called_once()
+        send.assert_not_called()
+        self.assertEqual(list(base.glob("workspace-*.json")), [])
+
+    def test_sweep_started_in_a_removed_checkout_skips_the_workspace(self) -> None:
+        base = self.base()
+        self.enter_removable_checkout(base).rmdir()
+        with (mock.patch.object(sweep, "sweep", return_value=0) as assess,
+              mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, 60), 0)
+        self.assertEqual(output.getvalue(), "lint sweep: the working folder was removed; workspace sweep skipped\n")
+        self.assertEqual(errors.getvalue(), "")
+        assess.assert_not_called()
+        send.assert_not_called()
+
     def test_temporary_sweep_failure_episode_survives_not_due_and_recovers(self) -> None:
         base = self.base()
         now = time.time()
