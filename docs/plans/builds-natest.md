@@ -4166,3 +4166,14 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - A `verify.sh` mutation for each moved assertion fails the new test.
 - AWS pair (3 rounds): 14.19 -> 8.33 CPU s, all pass.
 - Commit fef7152f0. Test-only change.
+
+### Phase 288 — The ssh-targets routing tests drop repeated complete runs  · status: done
+**Depends on:** none
+**Owner:** natest (test-only change).
+
+#### As-built
+
+- `test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally` in `scripts/direct/test_verify_ssh_targets_routing.py` keeps 3 complete `verify.sh` runs: `completed-decline` (a one-word reason after the run), `runtime-version-mismatch` (a long reason with spaces) and `probe-leftovers` (a busy reason from the probe). All pinned modes go to the same `pinned_target_refuse` branch. The offload tests check the dropped disk and probe nextest-mismatch reasons.
+- `test_saved_reservation_survives_a_lost_reserve_response` keeps the 0-read and 3-read cases. The 3-read case covers the recovery retry loop and its poll spacing.
+- AWS pair (3 rounds): 25.67 -> 22.61 CPU s, all pass.
+- Commit 78f9a3130. Test-only change.

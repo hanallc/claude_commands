@@ -122,7 +122,8 @@ def main() -> object:
 if __name__ == "__main__":
     raise SystemExit(main())
 ''')
-        for unknown_reads, poll_seconds in ((0, "0.05"), (1, "0.05"), (3, "0.25")):
+        # The 3-read case checks the recovery retry loop and its poll spacing; the 0-read case recovers at once.
+        for unknown_reads, poll_seconds in ((0, "0.05"), (3, "0.25")):
             with self.subTest(unknown_reads=unknown_reads, poll_seconds=poll_seconds):
                 self.clear_observations()
                 for name in ("saved-reserve.json", "recovery-observations.jsonl", "ssh-events.jsonl"):
@@ -271,11 +272,10 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.configure("natedev,linux")
         settings = self.root / "linux_target.conf"
         _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/linux-build.nix\n")
+        # Each decline reason takes the same pinned refusal branch; the offload tests check how each reason is found.
+        # These runs keep a one-word reason after the run, a long reason with spaces and a busy reason from the probe.
         for mode, reason, detail in (
-            ("disk", "disk", "not running on the linux (disk)"),
             ("completed-decline", "state", "not running on the linux (state)"),
-            ("version-mismatch", "linux version mismatch: nextest box=nextest other natedev=nextest fixture; "
-             + "move the box pins in nixos hosts/linux-build.nix", "nextest box=nextest other"),
             ("runtime-version-mismatch", "linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
              + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix",
              "nextest box=nextest other"),
