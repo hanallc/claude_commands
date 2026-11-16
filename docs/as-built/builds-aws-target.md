@@ -677,7 +677,9 @@ The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
 `spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
-The day is the UTC day. The hourly AWS snapshot job publishes the page again, so the spend is current to the last hour.
+The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
+After each push to main, `.claude/config/post_push.sh` publishes it again
+when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
 The Prices and Quotas sections follow the Spend card.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
