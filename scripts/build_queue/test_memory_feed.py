@@ -428,7 +428,7 @@ process.stdout.write(JSON.stringify({
                     page = memory_feed.reading()
                 ci, = [row for row in page["walk"] if row.get("ci")]
                 self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
-                self.assertIn("start spacing", page["waiters"][0]["reason"])
+                self.assertIn("another step just started; the queue waits a few seconds between starts", page["waiters"][0]["reason"])
                 self.assertEqual(page["taken"], 0.125)
                 self.assertEqual(page["ci_ram"], 0.125)
 
@@ -1202,7 +1202,7 @@ process.stdout.write(JSON.stringify({
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (admission_records.StartSpacingWait(200_010), "start spacing"),
+            (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts"),
             (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         )
         for reason, expected in reasons:

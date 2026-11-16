@@ -330,6 +330,7 @@ class QueueEvidenceTests(unittest.TestCase):
                 release = gate.HeadStartsAt(NOW + 30, (0,), 0, 0, 0)
                 text = queue_evidence.release_text(release, explanation, {}, user_zone(), names=names)
                 self.assertIn(f" {prose} end ", text)
+                self.assertIn("; then the queue waits a few seconds between starts, so it starts at ", text)
                 self.assertNotIn(step, text)
 
     def test_optional_load_failure_preserves_evidence_and_release_advice(self) -> None:

@@ -3210,7 +3210,7 @@ class RoomAndSlotTests(unittest.TestCase):
     def test_a_held_head_keeps_one_cause_in_the_wait_line_view_and_client(self) -> None:
         for hold, status, client_reason in (
             ("pressure", "pressure", "memory pressure"),
-            ("spacing", "spacing", "start spacing"),
+            ("spacing", "spacing", "another step just started; the queue waits a few seconds between starts"),
             ("memory", "low room", "free memory"),
             ("expired", "estimate expired", "estimate expired"),
             ("unreadable", "memory reading unavailable", "memory reading unavailable"),

@@ -1486,7 +1486,7 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
         case PressureUnavailable():
             return reason.reason
         case StartSpacingWait():
-            return "start spacing"
+            return "another step just started; the queue waits a few seconds between starts"
         case NeedsMemory():
             return "free memory"
         case GpuSlotWait():

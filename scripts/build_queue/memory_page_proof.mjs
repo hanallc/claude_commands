@@ -964,13 +964,32 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
+            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],
+              ['spacing','another step just started; the queue waits a few seconds between starts'],['head','behind']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
+              if(name==='spacing'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]');
+                  row.scrollIntoView({block:'center'});
+                  const box=row.getBoundingClientRect();
+                  showTip('wait:0',(box.left+box.right)/2,box.top);
+                  const tooltip=document.querySelector('#tip');
+                  const tipBox=tooltip.getBoundingClientRect();
+                  const left=Math.min(box.left,tipBox.left)-4,top=Math.min(box.top,tipBox.top)-4;
+                  return {text:tooltip.textContent,clip:{x:left+scrollX,y:top+scrollY,
+                    width:Math.max(box.right,tipBox.right)-left+4,
+                    height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
+                })()`);
+                assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
+                await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);

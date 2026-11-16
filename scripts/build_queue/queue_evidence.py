@@ -211,7 +211,7 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
-            text += ("; then " if release.ended else "; ") + f"start spacing permits it at {starts_at}"
+            text += ("; then " if release.ended else "; ") + f"the queue waits a few seconds between starts, so it starts at {starts_at}"
     elif isinstance(release, admission_records.EstimateExpired):
         text = estimate_refresh_text(release, zone)
     elif isinstance(release, gate.HeadStillHeld):
