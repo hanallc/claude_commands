@@ -1815,6 +1815,8 @@ Name each action only from the data the page has. Drop the h/day sum plots, or m
 
 #### Phase 100 — Top costs as sentences, sum plots under Details
 
+The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. The as-built notes below describe the code from before that change.
+
 ##### Phase 100 as-built
 
 - `scripts/buildlog/cost_actions.py` (new) names the action from the rows behind each cost:
@@ -1886,7 +1888,7 @@ From builds, relaying the user on C1672: the memory and the queue should be alwa
 As built:
 
 - Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
-- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `charts.chart_series` took only configured targets and machines with a step in the window. buildsteady removed the chart data, so `report.json` now holds Top 3 costs only.
 - `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
 - `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
 - Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
@@ -1902,6 +1904,19 @@ As built:
 - Icons: the Lucide 0.468.0 `chevron-right` turns down on an open row; the `folder` icon marks a repository. Both are inline SVG in `disks.html`.
 - A repository band has an accent-tinted background, a bold name and the count and size; its slot rows are indented.
 - Tests: `test_disks_page` runs `driveView` on a fake document and checks one card write, the same slider after a step and new data, and the rows after a toggle and a slider step; it fails on the old page. The slot test checks the folded and open bands. Chrome check: a drag across the slider now ends at its far end; after new data the slider, the focused row and the open band stay.
+
+#### buildsteady — a refresh keeps the viewed row; no Build history; a shorter Free tooltip
+
+From the user (via builds, 2026-11-16): "changes in the data on the builds page - refreshes - should not change the line the viewer is currently viewing - the builds page constantly jumps around right now and it is disorienting". On C1780: "i think we should remove this history from the builds page for the time being - i'm not learning anything and i want to redesign it later". On C1802: "isn't free and kept for other steps always going to be the same value? that doesn't seem helpful to repeat that".
+
+As built:
+
+- Cause: `renderWalk` replaced all of `#walk`, so the browser lost its scroll anchor, and the tooltip keys were row indexes.
+- `memory_feed.step_key` gives each running and waiting row a stable `key`: machine, kind, pid, start time, group and the CI cgroup. The page uses it in `data-tip`, `data-run` and every `row:`/`wait:` reader. A gone step hides its tooltip.
+- Before each render the page saves an anchor that is in view: the tooltip row, else the focused row, else the first keyed row or section. After the render it scrolls by the anchor's move. `overflow-anchor` is off. The focus, the open `details` and the tooltip stay.
+- The Build history head, plots, details and moments are gone. The feed no longer builds chart data; `charts.chart_data` and its chart-only helpers are deleted. The card keeps Top 3 costs. The recording code is unchanged.
+- The queue admits one step at a time, so only the step it admits next shows Free, Kept, Given back and Short by. The feed marks that step `first_in_line` from the admission head, so a token waiter ahead of it in the list does not take its rows. Every other step shows only Needs. From the user on the Images page: "anything that can't run next doesn't need to show what it goes first to - we can remove Free, goes first to and short by from any item that is after the first in line".
+- Tests: `memory_page_proof.mjs` steady block (old page: the viewed row moved 352 px and the tooltip showed another step; new page: 0 px) and an out-of-view focus check (a rule that took the focused row out of view moved the viewed rows 528 px; new page: 0 px); `test_memory_feed` (stable and unique keys, two CI rows with empty cgroups); `test_memory_hover` (keys, room rows on the first step only).
 
 #### disksmemo — rows start closed and stay as the viewer left them; the filter names top folders only
 
@@ -1935,6 +1950,7 @@ The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/
 4. The feed reads the job from the pid's command line. The queue does not change.
 5. A `--promote` run shows integrate only.
 6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
+7. From the user (via builds), on the Slots pane: "how could the cargo-liner slots both be showing the same merge?" Cause: `copies.py` `standing()` writes `work='gate'` and `purpose='gate · <base commit subject>'` for every slot take, so a `verify.sh test` or `lint` run shows as a gate of main's last merge. Fix at the source: the lease names the real work (the unit and the step, such as test or lint) from the same name source. Never "gate" for a run that is not a gate, and never the base commit subject.
 
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
