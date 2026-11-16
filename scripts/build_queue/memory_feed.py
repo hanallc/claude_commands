@@ -39,11 +39,12 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse
+from scripts.buildlog import charts, cost_actions, mac_idle_alert, parse, store
 from scripts.buildlog.store import host_name
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import cloud_progress, placement
+from scripts.build_queue import unadmitted_apps as app_watch
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
@@ -736,6 +737,7 @@ class MemoryPage(TypedDict):
     report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
+    unadmitted_apps: list[app_watch.UnadmittedApp]
 
 
 class RetainedReading(MemoryPage):
@@ -1834,11 +1836,15 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET, *,
+            app_alerts: app_watch.AppAlertLedger | app_watch.NoAppAlerts = app_watch.NO_APP_ALERTS) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
     parsed = admission_client.view()
+    apps = app_watch.scan(PROC, store.root() / "admission", CGROUP)
+    if isinstance(app_alerts, app_watch.AppAlertLedger):
+        app_alerts.update(apps, notify_unadmitted_app)
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
@@ -2155,13 +2161,35 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "token_counts": holders.reason if isinstance(holders, TokenHoldersUnknown) else "",
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
         "report_version": report_version,
-        "swap_rows": configuration.swap_rows, "leftovers": leftovers,
+        "swap_rows": configuration.swap_rows, "leftovers": leftovers, "unadmitted_apps": list(apps.apps),
     }
 
 
 def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:
     """Preserve named unavailable readings at the JSON boundary."""
     return json.dumps(codec.snapshot_value(payload))
+
+
+UNADMITTED_APP_ALERT = (
+    "Hana pid {pid} runs with no memory hold on natedev. "
+    "Use hana_shot.py launch --purpose <feature> to launch Hana."
+)
+
+
+def notify_unadmitted_app(app: app_watch.UnadmittedApp) -> bool:
+    """Send the owning session one app memory warning."""
+    from scripts.message import send_budget, session_send
+
+    if isinstance(app.owner, app_watch.UnknownAppOwner):
+        return False
+    command = session_send.send_argv("--to", app.owner.recipient, "--from", "Builds feed",
+                                     "--text", UNADMITTED_APP_ALERT.format(pid=app.pid))
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=send_budget.seconds(), check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Builds feed: app alert failed: {error}", file=sys.stderr)
+        return False
+    return result.returncode == 0 or (result.returncode == 1 and result.stdout.startswith("QUEUED:"))
 
 
 def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[tuple[int, float]]) -> None:
@@ -2196,6 +2224,8 @@ def main(argv: Sequence[str]) -> int:
     holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
     next_tokens_at = 0.0
     notified_mac_runs: set[tuple[int, float]] = set()
+    app_alerts = (app_watch.NO_APP_ALERTS if args.once else
+                  app_watch.AppAlertLedger(store.root() / "memory-feed/unadmitted-apps.json"))
     while True:
         if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
@@ -2223,7 +2253,7 @@ def main(argv: Sequence[str]) -> int:
                     holders = TokenHoldersUnknown(refused)
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders)
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders, app_alerts=app_alerts)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

@@ -35,6 +35,30 @@ SWAP_FIXTURE: dict[str, object] = {"used_bytes": 3 * GIB, "capacity_bytes": 8 * 
 
 
 class MemoryHoverTests(unittest.TestCase):
+    def test_unadmitted_apps_show_owner_memory_and_age_near_leftovers(self) -> None:
+        app = {"pid": 101, "start_time": "123", "binary": "/fixture/target/debug/hana",
+               "owner": {"kind": "AppOwner", "name": "fixture <owner>"},
+               "ram_bytes": 3 * GIB, "swap_bytes": GIB, "started_at": 100}
+        data = {"unadmitted_apps": [app], "read_at": 220}
+        rows = str(self.page_expression("(renderLeftovers(data), $('unadmitted-app-rows').innerHTML)", data, walk=True))
+        row = ElementTree.fromstring(rows)
+        self.assertEqual(row.get("data-tip"), "unadmitted:0")
+        self.assertIn("fixture <owner> · hana · pid 101", "".join(row.itertext()))
+        self.assertIn("RAM 3.0 GiB", "".join(row.itertext()))
+        self.assertIn("Swap 1.0 GiB", "".join(row.itertext()))
+        self.assertIn("2 min", "".join(row.itertext()))
+        tip = str(self.page_expression("tooltipHtml('unadmitted:0', data)", data, walk=True))
+        grid = ElementTree.fromstring(tip)
+        self.assertEqual(grid.tag, "dl")
+        self.assertEqual(grid.get("class"), "tip")
+        self.assertEqual([cell.tag for cell in grid], ["dt", "dd"])
+        self.assertEqual([cell.text for cell in grid], ["Binary", "/fixture/target/debug/hana"])
+        self.assertEqual(self.page_expression("(renderLeftovers(data), $('unadmitted-apps').hidden)", {}, walk=True), True)
+        page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        self.assertLess(page.index('id="unadmitted-apps"'), page.index('id="leftovers"'))
+        self.assertIn("#unadmitted-apps { border-color: var(--error); }", page)
+        self.assertIn(".tip dd { margin: 0; padding-left: 24px; text-align: right;", page)
+
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertIn("<title>Builds</title>", page)
@@ -648,6 +672,7 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = html[html.index("const f1 ="):html.index("function setSeg(")]
         if walk:
+            functions += html[html.index("function renderLeftovers(d)"):html.index("function reportCost(")]
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
             functions += html[html.index("function esc(s)"):html.index("let lastRead =")]
             constants += """

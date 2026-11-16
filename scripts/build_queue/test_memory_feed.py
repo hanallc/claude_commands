@@ -26,7 +26,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, moments
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, unadmitted_apps, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
@@ -910,6 +910,95 @@ process.stdout.write(JSON.stringify({
         for name in ("memory_live.html", "memory.json", memory_feed.REPORT_NAME):
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
+
+    def test_unadmitted_app_rows_and_alerts_survive_feed_restart(self) -> None:
+        proc = self.root / "proc"
+        _ = (proc / "stat").write_text("btime 100\n")
+        write_process(proc, 101, 3 * admission_records.GIB, start="123", swap=admission_records.GIB)
+        binary = self.root / "target/debug/hana"
+        binary.parent.mkdir(parents=True)
+        _ = binary.write_text("fixture binary; never execute")
+        (proc / "101/exe").symlink_to(binary)
+        _ = (proc / "101/environ").write_text("HANA_TEST_OWNER=fixture owner\0")
+        _ = (proc / "101/cgroup").write_text("0::/session.scope\n")
+        with (
+            mock.patch.object(admission_client, "view", return_value=captured_reading()),
+            mock.patch.object(memory_feed, "notify_unadmitted_app", return_value=True) as alert,
+        ):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+            alert.assert_not_called()
+            page = (self.output / "memory.json").read_text()
+            self.assertIn('"unadmitted_apps": [{', page)
+            self.assertIn('"name": "fixture owner"', page)
+            self.assertIn('"ram_bytes": 3221225472', page)
+            self.assertIn('"swap_bytes": 1073741824', page)
+            for expected_calls in (1, 1):
+                with (mock.patch.object(time, "sleep", side_effect=FeedStopped), self.assertRaises(FeedStopped)):
+                    _ = memory_feed.main([])
+                self.assertEqual(alert.call_count, expected_calls)
+            alert.assert_called_once()
+            shutil.rmtree(proc / "101")
+            with (mock.patch.object(time, "sleep", side_effect=FeedStopped), self.assertRaises(FeedStopped)):
+                _ = memory_feed.main([])
+            ledger = unadmitted_apps.AppAlertLedger(self.root / "buildlog/memory-feed/unadmitted-apps.json")
+            self.assertEqual(ledger.claimed, set())
+
+    def test_admission_after_process_scan_prevents_the_row_and_alert_claim(self) -> None:
+        proc = self.root / "proc"
+        write_process(proc, 101, start="123")
+        binary = self.root / "target/debug/hana"
+        binary.parent.mkdir(parents=True)
+        _ = binary.write_text("fixture binary; never execute")
+        (proc / "101/exe").symlink_to(binary)
+        _ = (proc / "101/environ").write_text("HANA_TEST_OWNER=fixture owner\0")
+        scope_name = "/builds.slice/builds-appfixture.slice/app-fixture.scope"
+        _ = (proc / "101/cgroup").write_text("0::" + scope_name + "\n")
+        directory = self.root / "buildlog/admission"
+        directory.mkdir(parents=True)
+        sidecar = directory / "app.cgroup"
+        state = directory / "state.json"
+        ledger = unadmitted_apps.AppAlertLedger(self.root / "alerts.json")
+        process_table = gate.process_table
+
+        def grant_after_scan(path: Path) -> dict[int, gate.ProcessIdentity]:
+            processes = process_table(path)
+            self.assertIn(101, processes)
+            self.assertFalse(state.exists())
+            _ = sidecar.write_text(str(memory_feed.CGROUP) + scope_name)
+            atomic_file.write_text_atomic(state, json.dumps({"reservations": {
+                "fixture": {"step": "app", "sidecar": str(sidecar)}}}))
+            return processes
+
+        with (
+            mock.patch.object(admission_client, "view", return_value=captured_reading()),
+            mock.patch.object(gate, "process_table", side_effect=grant_after_scan) as scanned,
+            mock.patch.object(memory_feed, "notify_unadmitted_app", return_value=True) as alert,
+        ):
+            page = memory_feed.reading(app_alerts=ledger)
+        scanned.assert_called_once_with(proc)
+        self.assertEqual(page["unadmitted_apps"], [])
+        self.assertEqual(ledger.claimed, set())
+        self.assertEqual(unadmitted_apps.AppAlertLedger(ledger.path).claimed, set())
+        alert.assert_not_called()
+
+    def test_app_alert_uses_send_and_accepts_a_queued_delivery(self) -> None:
+        from scripts.message import send_budget, session_send
+
+        app = unadmitted_apps.UnadmittedApp(101, "123", "/fixture/hana",
+            unadmitted_apps.AppOwner("fixture owner", "session:fixture"), 1024, 2048, 100)
+        for status, output, accepted in ((0, "SENT: fixture", True), (1, "QUEUED: fixture", True),
+                                         (2, "REFUSED: fixture", False)):
+            with (
+                self.subTest(status=status),
+                mock.patch.object(send_budget, "seconds", return_value=2),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], status, output, "")) as send,
+            ):
+                self.assertEqual(memory_feed.notify_unadmitted_app(app), accepted)
+            command = cast(list[str], send.call_args.args[0])
+            self.assertEqual(command[:2], session_send.send_argv()[:2])
+            self.assertIn("session:fixture", command)
+            self.assertIn("Hana pid 101 runs with no memory hold on natedev.", command[-1])
+            self.assertIn("hana_shot.py launch --purpose <feature>", command[-1])
 
     def test_a_one_time_run_reads_the_mac_but_sends_no_alert(self) -> None:
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
@@ -2549,6 +2638,12 @@ def write_browser_fixture(folder: Path) -> None:
         for name, reading in readings.items():
             with mock.patch.object(admission_client, "view", return_value=reading):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        with mock.patch.object(admission_client, "view", return_value=base):
+            app_page = memory_feed.reading(configuration)
+        app_page["unadmitted_apps"] = [unadmitted_apps.UnadmittedApp(
+            42101, "123", "/build/hana/debug/hana", unadmitted_apps.AppOwner("render", "session:fixture-render"),
+            3 * admission_records.GIB, admission_records.GIB // 2, base.explanation.now - 720)]
+        pages["unadmitted"] = json.loads(memory_feed.page_json(app_page))
         for name, units in (("queued_none", ()), ("queued_one", ("research",)),
                             ("queued_two", ("research", "cables"))):
             with mock.patch.object(admission_client, "view", return_value=queued_reading(base, units)):

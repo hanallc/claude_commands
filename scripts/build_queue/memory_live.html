@@ -353,6 +353,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .walk-key .key { display: inline-flex; align-items: center; gap: 6px; cursor: help; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
+#unadmitted-apps { border-color: var(--error); }
+#unadmitted-apps .section-head { color: var(--error); }
+.unadmitted-app { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 5px 0; }
+.unadmitted-app .owner { flex: 1 1 12rem; overflow-wrap: anywhere; }
+.unadmitted-app .num { text-align: right; white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-chart { width: 100%; height: auto; display: block; }
@@ -472,6 +477,11 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <span class="key" data-tip="waiting"><span class="sw waiting"></span>Waiting step, memory it needs</span>
       <span class="key" data-tip="progress">Progress: <span class="sw progress building"></span>building, <span class="sw progress testing"></span>testing</span>
     </div>
+  </section>
+
+  <section class="card" id="unadmitted-apps" hidden>
+    <div class="section-head">Hana apps without a memory hold</div>
+    <div id="unadmitted-app-rows"></div>
   </section>
 
   <section class="card" id="leftovers" hidden>
@@ -861,6 +871,10 @@ function tooltipRows(key, data) {
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
+  if (kind === 'unadmitted') {
+    const app = data.unadmitted_apps[+index];
+    return [field('Binary', app.binary)];
+  }
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
     rows.push(field('Priority', data.unmatched_priority_entries.map(entry => entry.unit).join(', ')));
@@ -1138,6 +1152,12 @@ document.addEventListener("click", (e) => {
 });
 
 function renderLeftovers(d) {
+  const apps = d.unadmitted_apps || [];
+  $('unadmitted-apps').hidden = apps.length === 0;
+  $('unadmitted-app-rows').innerHTML = apps.map((app, index) =>
+    `<div class="unadmitted-app" data-tip="unadmitted:${index}"><span class="owner">${esc(app.owner.name)} · hana · pid ${app.pid}</span>` +
+    `<span class="num">RAM ${ramAmount(app.ram_bytes)}</span><span class="num">Swap ${ramAmount(app.swap_bytes)}</span>` +
+    `<span class="num">${app.started_at ? esc(ago(app.started_at, d.read_at)) : 'not recorded'}</span></div>`).join('');
   const rows = (d.leftovers || []).flatMap(scope => scope.members.map((member, index) =>
     `<div class="leftover-row"><span class="detail">${esc(scope.owner)} · ${esc(member.program)}${typeof member.pid === "number" ? ` · pid ${member.pid}` : ""}</span><span class="age">${index === 0 ? esc(scope.age) : ""}</span><span class="num">${index === 0 ? memoryAmount(scope.used) : ""}</span></div>`));
   $("leftovers").hidden = rows.length === 0;

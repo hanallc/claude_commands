@@ -9,6 +9,7 @@
 // Add --identity as the fourth argument for the row hover identity block images.
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
+// Add --unadmitted after the output folder for one dark desktop app image.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
@@ -29,7 +30,7 @@ try {
     'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const page = await readFile(join(folder, 'memory_live.html'));
-  const beforePage = process.argv[3] ? (await readFile(process.argv[3], 'utf8'))
+  const beforePage = process.argv[3] && !process.argv[3].startsWith('--') ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
@@ -42,6 +43,7 @@ try {
   const identityComparison = process.argv[4] === '--identity';
   const waitTipComparison = process.argv[4] === '--wait-tip';
   const macrouteComparison = process.argv[4] === '--macroute';
+  const unadmittedProof = process.argv.includes('--unadmitted');
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -52,6 +54,7 @@ try {
       for(const part of row.parts || []) if(part.started_at) part.started_at += shift;
     }
     for (const waiter of reading.waiters) waiter.since += shift;
+    for (const app of reading.unadmitted_apps || []) if (app.started_at) app.started_at += shift;
     reading.read_at = now;
   }
   const base = readings.good;
@@ -246,6 +249,62 @@ try {
           }
           return true;
         };
+        proofModes: {
+        if (unadmittedProof) {
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.unadmitted);
+          const proof = await evaluate(`(() => {
+            const card = document.querySelector('#unadmitted-apps');
+            const row = card.querySelector('.unadmitted-app');
+            card.scrollIntoView({block:'center'});
+            const box = row.getBoundingClientRect();
+            showTip('unadmitted:0', box.right - 200, box.top);
+            const tip = document.querySelector('#tip');
+            const tipBox = tip.getBoundingClientRect();
+            const cardBox = card.getBoundingClientRect();
+            const headingRange = document.createRange();
+            headingRange.selectNodeContents(card.querySelector('.section-head'));
+            const rows = [...tip.querySelectorAll('dt')].map(label => {
+              const value = label.nextElementSibling;
+              const bounds = value.getBoundingClientRect();
+              const range = document.createRange();
+              range.selectNodeContents(value);
+              const text = range.getBoundingClientRect();
+              return {label:label.textContent, value:value.textContent,
+                align:getComputedStyle(value).textAlign, right:bounds.right,
+                inside:text.left >= tipBox.left && text.right <= tipBox.right};
+            });
+            const left = Math.max(0, Math.floor(Math.min(cardBox.left, tipBox.left)) - 12);
+            const top = Math.max(0, Math.floor(Math.min(cardBox.top, tipBox.top)) - 12);
+            const right = Math.ceil(Math.max(cardBox.right, tipBox.right)) + 12;
+            const bottom = Math.ceil(Math.max(cardBox.bottom, tipBox.bottom)) + 16;
+            return {rows, rowText:row.innerText, count:card.querySelectorAll('.unadmitted-app').length,
+              visible:!card.hidden && tip.classList.contains('on'),
+              headingVisible:tipBox.left > headingRange.getBoundingClientRect().right,
+              spacing:{column:getComputedStyle(row).columnGap,row:getComputedStyle(row).rowGap},
+              clipped:tipBox.left < 0 || tipBox.right > innerWidth || tipBox.top < 0 || tipBox.bottom > innerHeight,
+              clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+          })()`);
+          assert.equal(proof.count,1);
+          assert.equal(proof.visible,true);
+          assert.equal(proof.headingVisible,true);
+          assert.equal(proof.clipped,false);
+          assert.match(proof.rowText,/render · hana · pid 42101/);
+          assert.deepEqual(proof.rows.map(row=>[row.label,row.value]),[
+            ['Binary','/build/hana/debug/hana']]);
+          assert.equal(new Set(proof.rows.map(row=>row.label)).size,proof.rows.length);
+          assert.ok(proof.rows.every(row=>row.align==='right' && row.inside));
+          assert.ok(proof.rows.every(row=>Math.abs(row.right-proof.rows[0].right)<=1));
+          assert.ok(proof.rows.every(row=>row.label.length<=12 && !/[.!?]$/.test(row.label)));
+          assert.deepEqual(proof.spacing,{column:'16px',row:'4px'});
+          const imagePath = join(folder,'unadmitted-dark-desktop.png');
+          const shot = await call('Page.captureScreenshot',{
+            format:'png',captureBeyondViewport:true,clip:proof.clip});
+          await writeFile(imagePath,Buffer.from(shot.data,'base64'));
+          await writeFile(join(folder,'proof.json'),JSON.stringify({pass:true,mode:'unadmitted',theme:'dark',width:1400,...proof},null,2)+'\n');
+          console.log(JSON.stringify({pass:true,mode:'unadmitted',images:[imagePath]}));
+          break proofModes;
+        }
         for (const theme of ['light','dark']) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of [1400,900,390]) {
@@ -2238,6 +2297,7 @@ try {
         await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,
           failures:failures.map(({cards,...state})=>state)},null,2)+'\n');
         console.log(JSON.stringify({pass:true,views:proofs.length,...(callerFolder ? {output:folder} : {})}));
+        }
       } finally {
         if(ws) ws.close();
         chrome.kill('SIGTERM');
