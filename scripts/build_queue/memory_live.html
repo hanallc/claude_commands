@@ -119,8 +119,8 @@ __PAGE_FRAME_STYLE__
 #tip .tip-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 16px; margin: 6px 0 0; white-space: normal; }
 #tip .tip-fields dt { text-align: left; }
 #tip .tip-fields dd { margin: 0; overflow-wrap: anywhere; }
-#tip .tip-fields.numbers dd { text-align: right; font-variant-numeric: tabular-nums; }
-#tip .tip-section { display: block; margin-top: 8px; font-weight: 700; }
+#tip .tip-fields.numbers { grid-template-columns: minmax(0, 1fr) max-content; }
+#tip .tip-fields.numbers dd { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 #tip .tip-line { display: block; margin-top: 6px; }
 #tip .identity { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 2px 0; margin: 6px 0; white-space: normal; }
 #tip:has(.identity) { max-width: min(calc(100vw - 20px), 24rem); }
@@ -133,6 +133,7 @@ __PAGE_FRAME_STYLE__
 .machine[data-machine="mac"] { color: var(--machine-mac); }
 .machine[data-machine="aws"] { color: var(--machine-aws); }
 #tip b { display: block; margin-bottom: 2px; }
+#tip b.tip-head { display: flex; justify-content: space-between; gap: 12px; }
 .scale { margin-right: var(--details); margin-left: calc(var(--amt) + var(--gap)); font-size: 0.75rem; color: var(--ink-2); margin-top: 6px; }
 .ticks { position: relative; height: 16px; }
 .ticks span { position: absolute; transform: translateX(-50%); }
@@ -719,7 +720,6 @@ function doneText(row) {
 }
 function macTipFields(row, data) {
   const fields = [[STEP_TABLE_HEADERS.target, "mac"],
-    ["Started", row.started_at ? `${ago(row.started_at, data.read_at)} ago` : "unavailable"],
     ["Used", recorded(row.used) ? `${f1(row.used)} GiB` : "unavailable"],
     ["Reading age", row.read_at ? `${ago(row.read_at, data.read_at)} old` : "unavailable"]];
   if (row.progress?.kind === "RowProgress") fields.push(["Progress",
@@ -730,13 +730,24 @@ function stepRow(key, data) {
   const [kind, index] = key.split(":");
   return kind === "row" ? data.walk[+index] : kind === "wait" ? data.waiters[+index] : null;
 }
+function tipDuration(key, row, data) {
+  const since = key.startsWith("wait:") ? row.since : row.started_at;
+  return since ? ago(since, data.read_at) : "";
+}
+function tipHead(head, duration) {
+  return duration ? `<b class="tip-head"><span>${esc(head)}</span><span>${esc(duration)}</span></b>` : `<b>${esc(head)}</b>`;
+}
 function tooltipHtml(key, data) {
   const [head, body] = tipText(key, data);
   const row = stepRow(key, data);
   if (!row) return `<b>${esc(head)}</b>${esc(body)}`;
-  if (key.startsWith("wait:")) return `<b>${esc(head)}</b>${waitTipHtml(row, data)}`;
-  if (!macRow(row)) return `<b>${esc(head)}</b>${identityHtml(row)}${esc(body)}`;
-  return `<b>${esc(head)}</b>${identityHtml(row)}${fieldsHtml(macTipFields(row, data), "numbers")}` +
+  const top = tipHead(head, tipDuration(key, row, data));
+  if (key.startsWith("wait:")) return top + waitTipHtml(row, data);
+  if (!macRow(row)) {
+    const lines = [rawTipText(key, data)[1], row.priority_text].filter(Boolean).join("\n");
+    return `${top}${identityHtml(row, targetFields(row))}${esc(memoryText(lines))}`;
+  }
+  return `${top}${identityHtml(row)}${fieldsHtml(macTipFields(row, data), "numbers")}` +
     `<span class="mac-note">Mac memory does not count against natedev.</span>`;
 }
 function fieldsHtml(fields, kind = "") {
@@ -747,16 +758,20 @@ function lineHtml(text) { return text ? `<span class="tip-line">${esc(memoryText
 function targetFields(row) {
   return [["can run on", row.runs_on], ["Mac", row.mac_state]].filter(([, value]) => value);
 }
-function waitFields(w, d) {
-  return [["waiting", ago(w.since, d.read_at)], ["reason", w.reason], ...targetFields(w)];
+function waitFields(w) {
+  return [...(w.why === undefined ? [["reason", w.reason]] : []), ...targetFields(w)];
+}
+function waitLines(w) {
+  if (w.why === undefined) return [];
+  return [w.place === 1 ? "It is first in line." : `It is number ${w.place} in line.`,
+    `It needs ${f1(w.need)} GiB to start.`, `Why it waits: ${w.why}`];
 }
 function roomFields(w) { return (w.head_room?.rows || []).map(row => [row.label, `${f1(row.gib)} GiB`]); }
 function waitNotes(w) {
   return [w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
 }
 function waitTipHtml(w, d) {
-  const room = roomFields(w);
-  return identityHtml(w, waitFields(w, d)) + (room.length ? `<span class="tip-section">First in line</span>${fieldsHtml(room, "numbers")}` : "") +
+  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + fieldsHtml(roomFields(w), "numbers") +
     waitNotes(w).map(lineHtml).join("");
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
@@ -822,6 +837,17 @@ function progressTip(row) {
   const counter = `${progress.phase} · ${progress.done} of ${progress.total} ${progress.unit} · ${formatPercent(progress.percent, progress.done === progress.total)} done`;
   return `\n${counter}` + (progress.unit === "modules" ? "\nModules start slowest first, so this reads low early." : "");
 }
+function queuedRunLines(r) {
+  if (r.between_steps) return [`Between steps. The queue holds ${f1(r.reserved)} GiB for its next step.`];
+  if (!recorded(r.used)) return [`Use unavailable: ${r.used.reason}. The queue holds ${f1(r.reserved)} GiB for it.`];
+  const p = r.progress?.kind === "RowProgress" ? r.progress : null;
+  return [`Current memory: ${f1(r.used)} GiB`,
+    `Historically uses ${f1(r.need)} GiB${r.need_part ? " in the next part of the build" : ""}.`,
+    r.reserved > 0 ? `The queue holds ${f1(r.reserved)} GiB more for it, so it has room to grow to ${f1(r.used + r.reserved)} GiB.`
+      : "The queue holds no more memory for it.",
+    p ? `${sentence(p.phase)}: ${p.done} of ${p.total} ${p.unit} done.` : "",
+    p?.unit === "modules" ? "Modules start slowest first, so this reads low early." : ""].filter(Boolean);
+}
 function rawTipText(key, d) {
   const [kind, i] = key.split(":");
   if (kind === "swap" && i !== undefined) {
@@ -836,7 +862,6 @@ function rawTipText(key, d) {
       macTipFields(r, d).map(([name, value]) => `${name.padEnd(11)} ${value}`).join("\n") + "\nMac memory does not count against natedev."];
     if (r.kind === "cloud") return [r.name, `${r.status ? r.status + ". " : ""}Target: ${r.machine}. No local memory reservation.${progressTip(r)}`];
     if (r.ci) return [`${r.name} · ${r.detail}`, [r.unit, r.keep_text].filter(Boolean).join("\n") + progressTip(r)];
-    const when = r.started_at ? `Started ${ago(r.started_at, d.read_at)} ago. ` : "";
     const res = !recorded(r.used) ? `Run use unavailable: ${r.used.reason}. Reserved ${f1(r.reserved)} GiB.` : r.reserved > 0 ? `It uses ${f1(r.used)} GiB. It reserves ${f1(r.reserved)} GiB. The queue counts ${f1(r.counted)} GiB.` : `It uses ${f1(r.used)} GiB. It reserves no memory.`;
     const src = r.queued ? "The queue holds this memory for the run." : "Host free memory already accounts for this use.";
     if (r.group) {
@@ -845,14 +870,14 @@ function rawTipText(key, d) {
       return [`${r.name} · ${f1(r.used)} GiB`, `${how} ${r.detail ? r.detail + ". " : ""}By run: ${parts}.`];
     }
     const detail = !r.queued || r.between_steps ? visibleDetail(r) : "";
-    return [`${r.name}${detail ? " · " + detail : ""}`, `${when}${!recorded(r.used) ? res + " " : ""}${r.keep_text ? sentence(r.keep_text).replace(/\.$/, "") + "." : res} ${src}${progressTip(r)}`];
+    if (r.queued && r.need !== undefined) return [`${r.name}${detail ? " · " + detail : ""}`, queuedRunLines(r).join("\n")];
+    return [`${r.name}${detail ? " · " + detail : ""}`, `${!recorded(r.used) ? res + " " : ""}${r.keep_text ? sentence(r.keep_text).replace(/\.$/, "") + "." : res} ${src}${progressTip(r)}`];
   }
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    const room = roomFields(w);
-    const fields = waitFields(w, d).concat(room.length ? [["First in line", ""], ...room] : room);
-    return [`Waits · ${w.name}`, [...fields.map(([name, value]) => value ? `${name}: ${value}` : name), ...waitNotes(w)]
+    const fields = [...waitFields(w), ...roomFields(w)];
+    return [`Waits · ${w.name}`, [...waitLines(w), ...fields.map(([name, value]) => `${name}: ${value}`), ...waitNotes(w)]
       .filter(Boolean).join("\n")];
   }
   return TIPS[key](d);

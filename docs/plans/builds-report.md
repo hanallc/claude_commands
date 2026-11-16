@@ -1852,3 +1852,19 @@ As built:
 - The plot title is "Hana phase time, without waits for the user or the
   showrunner". The legend says "half of phases take up to" and "most phases
   take up to". The memory action says "Most runs peak at N GiB or less."
+
+#### Builds page hover wording (C1584, C1309, C1578, C1605)
+
+As built:
+
+- Every hover box shows the run or wait time in bold at the top right.
+- A queued running build says "Current memory: N GiB", "Historically uses N
+  GiB" (with "in the next part of the build" for a progress peak), the room
+  the queue holds for it, and its progress.
+- A waiting build says its place in line, "It needs N GiB to start." and
+  "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
+  wait reason, in the same form.
+- The first waiting build keeps the room table: "Free memory now", less the
+  safety margin, other programs' swap, memory held for running builds and
+  for builds ahead in line, "= Free for builds".
+- "can run on" and "Mac" are fields in the running and the waiting boxes.

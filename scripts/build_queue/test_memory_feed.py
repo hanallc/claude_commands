@@ -1398,8 +1398,8 @@ process.stdout.write(JSON.stringify({
         check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
         shown = memory_feed.head_room(check, room)
         self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
-            ("free RAM", 28.0), ("− safety net", 3.0), ("− swap coming back", 10.0), ("− build reserved", 8.0),
-            ("= free", 7.0), ("needs", 16.0)])
+            ("Free memory now", 28.0), ("− Safety margin", 3.0), ("− Other programs' swap, which can come back", 10.0),
+            ("− Held for running builds", 8.0), ("= Free for builds", 7.0)])
         self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
@@ -1407,8 +1407,8 @@ process.stdout.write(JSON.stringify({
         reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
         room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
         states: tuple[tuple[Literal["admit", "hold"], list[list[tuple[str, float]]]], ...] = (("admit", []), ("hold", [[
-                ("free RAM", 30.0), ("− safety net", 3.0), ("− build reserved", 9.0),
-                ("− held for other waiting steps", 3.0), ("= free", 15.0), ("needs", 20.0)]]))
+                ("Free memory now", 30.0), ("− Safety margin", 3.0), ("− Other programs' swap, which can come back", 0.0),
+                ("− Held for running builds", 9.0), ("− Held for builds ahead in line", 3.0), ("= Free for builds", 15.0)]]))
         for state, expected in states:
             with self.subTest(state=state):
                 head = admission_records.HeadExplanation(reading.view.waiting[0], admission_records.NeedSourceNotRecorded(),
@@ -1421,6 +1421,39 @@ process.stdout.write(JSON.stringify({
                 shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
                          for waiter in page["waiters"] if "head_room" in waiter]
                 self.assertEqual(shown, expected)
+                first = page["waiters"][0]
+                self.assertEqual((first.get("place"), first.get("why")),
+                                 (1, "only 15.0 GiB is free for builds. It starts when 20.0 GiB is free."))
+
+    def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
+        gib = admission_records.GIB
+        waiting = with_wait_reason(reservation_reading(), admission_records.NeedsMemory()).view.waiting
+        decision = admission_records.AdmissionDecision("hold", 0, 0, 0, 0)
+        cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
+            (admission_records.NeedsMemory(need=4 * gib, free=gib),
+             "only 1.0 GiB is free for builds. It starts when 4.0 GiB is free."),
+            (admission_records.BehindHead("first", 0, "fixture"), "it is behind the first build in line, which gets memory first."),
+            (admission_records.TokenWaitingWaiter(0), "another build runs in the same work folder. One build at a time can use a folder."),
+            (admission_records.StartSpacingWait(0), "the queue waits a short time between two starts. It starts after that time."),
+            (admission_records.MemoryPressure(1.0), "memory pressure is high. It starts when the pressure goes down."),
+            (admission_records.GpuSlotWait(1, 1), "1 of 1 GPU test slots are in use. It starts when a GPU test ends."),
+            (admission_records.EstimateExpired(0), "its memory estimate expired. The queue reads a new estimate before it starts."),
+            (admission_records.NatedevHeld("research", "a disk walk"), "natedev is held by research for a disk walk. It starts when the hold ends."),
+            (admission_records.ReadingUnavailable("meminfo is missing"),
+             "a memory reading is unavailable: meminfo is missing. It starts when the reading comes back."),
+            (admission_records.PressureUnavailable("PSI is missing"),
+             "a memory reading is unavailable: PSI is missing. It starts when the reading comes back."),
+            (admission_records.ReadyForAdmission(), "nothing. It starts at the next check."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.ReadyForAdmission()),
+             "the build at number 1 in line starts first."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.MemoryPressure(1.0)),
+             "memory pressure is high. It starts when the pressure goes down."))
+        for reason, expected in cases:
+            with self.subTest(reason=type(reason).__name__):
+                self.assertEqual(memory_feed.wait_why(reason, waiting, None), expected)
+        check = admission_records.RoomCheck(6 * gib, -2 * gib, False, basis=admission_records.DoesNotFit())
+        self.assertEqual(memory_feed.wait_why(admission_records.NeedsMemory(), waiting, check),
+                         "only 0.0 GiB is free for builds. It starts when 6.0 GiB is free.")
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)

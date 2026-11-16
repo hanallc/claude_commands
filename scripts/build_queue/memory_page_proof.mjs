@@ -979,7 +979,7 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
+            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','between two starts'],['head','behind']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
@@ -1509,18 +1509,22 @@ try {
           const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
             pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
           const priority="queue priority: research (the user's bump)";
-          const room={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
+          const note='Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.';
+          const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
             {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
-            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],
-            note:'Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.'};
+            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
+          const room={rows:[{label:'Free memory now',gib:28.4},{label:'− Safety margin',gib:3.0},
+            {label:"− Other programs' swap, which can come back",gib:9.8},{label:'− Held for running builds',gib:8.5},
+            {label:'= Free for builds',gib:7.1}],note};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
+          const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
+          const second={...behind,place:2,why:'it is behind the first build in line, which gets memory first.'};
           const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
           Object.assign(cloud,{since:now-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
             runs_on:'AWS (natedev only when AWS cannot start the gate)'});
-          const old={...owner,priority_text:priority,mac_text:'Mac: natedev only, makes natedev artifacts',
-            head_text:'Head: need 16.3 GiB > room 7.1 GiB (free 28.4 GiB − safety 3.0 GiB − 9.8 GiB swapped outside builds − kept aside 8.5 GiB) · cloud 2 of 9 slots'};
-          const cases=[['before','before.html',[old]],['after','memory_live.html',[{...owner,priority_text:priority,runs_on:'natedev only',head_room:room},behind,cloud]]];
+          const cases=[['before','before.html',[{...owner,priority_text:priority,runs_on:'natedev only',head_room:oldRoom},behind,cloud]],
+            ['after','memory_live.html',[{...head,priority_text:priority,runs_on:'natedev only',head_room:room},second,cloud]]];
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const [version,path,waiters] of cases) {
@@ -1531,8 +1535,10 @@ try {
                 const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
                 if (version==='after') {
                   assert.ok(!tooltip.includes('Head'),tooltip);
-                  assert.ok(/\nreason\s/.test(tooltip),tooltip);
+                  assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
                   assert.ok(tooltip.includes('can run on'),tooltip);
+                  assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
+                  assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
                 comparisons.push({version,theme,index,tooltip});
@@ -1613,10 +1619,12 @@ try {
             progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
-            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
+            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
+            why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{rows:[{label:'free RAM',gib:8.5},{label:'− safety net',gib:3.0},
-              {label:'− swap coming back',gib:6.0},{label:'= free',gib:0.0},{label:'needs',gib:1.9}],note:''}}];
+            head_room:{rows:[{label:'Free memory now',gib:8.5},{label:'− Safety margin',gib:3.0},
+              {label:"− Other programs' swap, which can come back",gib:6.0},{label:'− Held for running builds',gib:0.0},
+              {label:'= Free for builds',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
@@ -1690,7 +1698,7 @@ try {
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of ['First in line',review.priority_text,'free memory'])
+                  for(const value of ['= Free for builds',review.priority_text,'Why it waits: '])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }
