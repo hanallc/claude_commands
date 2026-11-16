@@ -4483,107 +4483,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 315
 **Owner:** natest writes; sdlc owns scripts/production (gate rename plan chunk 1; user go via morty and builds 11-16 13:50 EST). builds gave natest the matcher edits in build_queue and build_hold (11-16 ~13:55 EST).
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/production/gate.py` is the gate, and `gate.py --targeted` does what `targeted_test.py` did. `merge_gate.py` and `targeted_test.py` stay only as small entry points until the removal chunk.
-
-**Source:** gate rename plan at fd66bc22c (origin/verify-gate-rename-plan), chunk 1 items 1-7, and decisions 2 and 5.
-
-**Spec:**
-1. `git mv scripts/production/merge_gate.py scripts/production/gate.py`. Keep its content, except the changes below.
-2. Add the `--targeted` mode to `gate.py`, in the same flag form as `--tests-only` and `--nightly`. It does what `targeted_test.py` does now: `run_tests_only(args, SuiteMode.TARGETED)` inside `test_run_folder()`, with the same suite arguments.
-3. Rename `SuiteMode.MERGE_GATE` to `SuiteMode.GATE` and `SuiteMode.TARGETED_TEST` to `SuiteMode.TARGETED`. Keep their stored values (`merge-gate`, `targeted-test`) unchanged. Chunk 4 changes the stored values.
-4. `git mv` `merge_gate_test_support.py` to `gate_test_support.py` and `merge_gate_suites_test_support.py` to `gate_suites_test_support.py`. `git mv` each `test_merge_gate*.py` module to the same name with `test_gate` in place of `test_merge_gate`. `git mv test_targeted_test.py test_gate_targeted.py`; it starts `gate.py --targeted`.
-5. Make `merge_gate.py` a small entry point. Run as a script, it calls `gate.main()` with the same argv and exit code. Imported, it puts the `gate` module in `sys.modules` under its own name, so `scripts.production.merge_gate` is the `gate` module and a patch on one name changes the other.
-6. Make `targeted_test.py` a small entry point that calls `gate.main()` with `--targeted` before its argv. Keep its shebang and the package root lines.
-7. Switch every caller inside `scripts/production` to `gate` and `gate.py`: `merge_checkpoint.py`, `land_runs.py`, `fast_track.py`, `affected_modules.py`, `checkpoint_gate.py` (`runs_merge_gate` accepts both base names until chunk 6) and the tests listed in Files. Callers outside `scripts/production` are chunk 2 work; do not change them, except the matcher files in item 8.
-8. Add `gate.py` next to the old names in the five process-name matchers. Match the exact base name `gate.py`, never a substring: `cloud_gate.py` and `gate_box.py` must not match.
-   - `scripts/build_hold/build_hold.py` program name list.
-   - `scripts/build_queue/admission_service.py` `ADMISSION_CALLERS`: `"gate.py": "production/gate.py"`.
-   - `scripts/build_queue/admission_code.py` `ADMISSION_CODE_PATHS`: add `production/gate.py`. This changes the admission code version.
-   - `scripts/hooks/pre-tool-use-build-hold-guard.sh`: an exact base-name test for `gate.py` beside `*merge_gate*|*targeted_test*`.
-   - `scripts/lib/suite_runners.py` `SUITE_RUNNERS`: add `"gate.py"`.
-9. Matcher tests: add rows to the existing matcher tests, not new test methods. Each matcher gets a row that `gate.py` matches and a row that `cloud_gate.py` and `gate_box.py` do not match.
-10. Update the paths of the moved test and support files in `docs/as-built/merge-gate-and-test-speed.md`, `docs/as-built/staff-accessors.md` and the five test files outside `scripts/production` that name them. Do not change the prose "merge gate" (chunk 5).
-11. Do not edit `/etc/nixos` (claude-nightly.nix), `config/cloud_gate.conf`, `config/fast_track.conf` or `config/merge_gate.conf`. Do not rename `MERGE_GATE_*` variables, the state folder or stored step names (chunks 3 and 4).
-12. No signal handlers, masks or dispositions. Do not change any trap.
-13. Every behavior check stays. Remove no assertion. Rename only test files and the identifiers named above.
-
-**Files:**
-- `scripts/production/merge_gate.py`
-- `scripts/production/gate.py`
-- `scripts/production/targeted_test.py`
-- `scripts/production/merge_gate_test_support.py`
-- `scripts/production/gate_test_support.py`
-- `scripts/production/merge_gate_suites_test_support.py`
-- `scripts/production/gate_suites_test_support.py`
-- `scripts/production/test_merge_gate.py`
-- `scripts/production/test_gate.py`
-- `scripts/production/test_merge_gate_holds.py`
-- `scripts/production/test_gate_holds.py`
-- `scripts/production/test_merge_gate_ledger.py`
-- `scripts/production/test_gate_ledger.py`
-- `scripts/production/test_merge_gate_promotion.py`
-- `scripts/production/test_gate_promotion.py`
-- `scripts/production/test_merge_gate_slot_sweep.py`
-- `scripts/production/test_gate_slot_sweep.py`
-- `scripts/production/test_merge_gate_test_times.py`
-- `scripts/production/test_gate_test_times.py`
-- `scripts/production/test_merge_gate_suites.py`
-- `scripts/production/test_gate_suites.py`
-- `scripts/production/test_merge_gate_suites_admission.py`
-- `scripts/production/test_gate_suites_admission.py`
-- `scripts/production/test_merge_gate_suites_reruns.py`
-- `scripts/production/test_gate_suites_reruns.py`
-- `scripts/production/test_merge_gate_suites_resources.py`
-- `scripts/production/test_gate_suites_resources.py`
-- `scripts/production/test_merge_gate_suites_signals.py`
-- `scripts/production/test_gate_suites_signals.py`
-- `scripts/production/test_merge_gate_suites_tripwires.py`
-- `scripts/production/test_gate_suites_tripwires.py`
-- `scripts/production/test_merge_gate_suites_types.py`
-- `scripts/production/test_gate_suites_types.py`
-- `scripts/production/test_targeted_test.py`
-- `scripts/production/test_gate_targeted.py`
-- `scripts/production/affected_modules.py`
-- `scripts/production/checkpoint_gate.py`
-- `scripts/production/fast_track.py`
-- `scripts/production/land_runs.py`
-- `scripts/production/merge_checkpoint.py`
-- `scripts/production/test_affected_modules.py`
-- `scripts/production/test_change_review.py`
-- `scripts/production/test_change_routing.py`
-- `scripts/production/test_fast_track.py`
-- `scripts/production/test_land_queue.py`
-- `scripts/production/test_land_runs.py`
-- `scripts/production/test_merge_checkpoint_base_red.py`
-- `scripts/production/test_staff.py`
-- `scripts/production/test_unit_phases.py`
-- `scripts/build_hold/build_hold.py`
-- `scripts/build_hold/test_build_hold.py`
-- `scripts/build_hold/test_hold_enforcer.py`
-- `scripts/build_queue/admission_service.py`
-- `scripts/build_queue/admission_code.py`
-- `scripts/build_queue/test_admission_service.py`
-- `scripts/build_queue/test_admission_protocol.py`
-- `scripts/hooks/pre-tool-use-build-hold-guard.sh`
-- `scripts/hooks/test_build_hold_guard.py`
-- `scripts/hooks/test_stop_direct_continue.py`
-- `scripts/lib/suite_runners.py`
-- `scripts/lint/test_memory_admit.py`
-- `docs/as-built/merge-gate-and-test-speed.md`
-- `docs/as-built/staff-accessors.md`
-
-**Workers:** 1 writer. The rename, the entry points and the callers cannot compile apart, so nothing splits.
-- impl: every file above.
-- test: opens as impl.
-
-**Constraints from prior phases:** No re-export layer, except the `merge_gate` `sys.modules` alias that the rename plan requires for the transition. No lazy imports.
-
-**Acceptance gate:**
-1. `python3 scripts/production/merge_gate.py --help`, `python3 scripts/production/gate.py --help` and `python3 scripts/production/targeted_test.py --help` print the same options; `gate.py --help` also shows `--targeted`.
-2. `import scripts.production.merge_gate` gives the same module object as `import scripts.production.gate`.
-3. These modules pass on natedev, in batches of 4 under the hold rules: every renamed `test_gate*` module, every module that imports `scripts.production.gate` or `merge_gate` (the 47 importers at the base), and every matcher test in Files.
-4. basedpyright adds no finding on each touched Python file.
-5. `git grep` shows no `merge_gate` or `targeted_test` name inside `scripts/production` except the two entry points, `checkpoint_gate.runs_merge_gate`, stored values and `MERGE_GATE_*` variables.
-6. Trial merges with origin/main and the open unit branches are clean.
+- `scripts/production/gate.py` is the gate (git mv from `merge_gate.py`). `gate.py --targeted` runs `run_tests_only(args, SuiteMode.TARGETED)` in a test run folder.
+- `merge_gate.py` is a small entry point: as a script it calls `gate.main()`; imported, it puts `gate` in `sys.modules` under its own name. `targeted_test.py` calls `gate.main(["--targeted", *argv])`. Chunk 6 removes both.
+- `gate.py` run as a script puts itself in `sys.modules["scripts.production.gate"]` before its imports, so `cloud_gate` keeps the targeted selection (review F001).
+- `SuiteMode.GATE` and `SuiteMode.TARGETED`; `MERGE_GATE` and `TARGETED_TEST` stay as Enum aliases for callers outside `scripts/production` until chunk 6. Stored values unchanged until chunk 4.
+- The two support files and 14 test modules moved to gate names; `test_targeted_test.py` is `test_gate_targeted.py`.
+- The five matchers know `gate.py` by its exact base name; `ADMISSION_CODE_PATHS` gained `production/gate.py`, so the admission code version changes at merge. `checkpoint_gate.runs_merge_gate` accepts both names.
+- `config/fast_track.conf` `refused_paths` lists `gate.py` beside `merge_gate.py` (/tune on main 935154e9c). The sensitive-path test requires the `refused path:` text (review F002).
+- Config keys, helper and test method names that hold `merge_gate` are chunk 3 work. Checkpoint 0e19e746f; main merged at 935154e9c.
