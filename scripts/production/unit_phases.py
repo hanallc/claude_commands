@@ -949,6 +949,7 @@ class NextWork(NamedTuple):
     first: ReadyNext | BlockedNext | NoNextWork | NextUnavailable
     wait_targets: frozenset[str]
     later: tuple[WorkItem, ...] = ()
+    plan_complete: bool = False
 
 
 class UnitBoardState(NamedTuple):
@@ -970,13 +971,17 @@ class UnitBoardState(NamedTuple):
     current_work: str = ""
 
     @property
+    def nothing_to_do(self) -> bool:
+        """Readable sources show no current task, merge, hold, or next work."""
+        return (self.readable and not self.has_open and not self.tasks and not self.merge.pending
+                and not self.held and isinstance(self.next_work.first, NoNextWork))
+
+    @property
     def bucket(self) -> str:
         if (any(task.kind in ("running", "own_wait") for task in self.tasks)
                 or self.busy and any(task.kind in ("unexplained", "result") for task in self.tasks)):
             return "working"
-        if self.held or (not self.busy and self.readable and not self.has_open and not self.merge.pending
-                         and not any(task.kind == "unit_wait" for task in self.tasks)
-                         and isinstance(self.next_work.first, NoNextWork)):
+        if self.held or self.nothing_to_do:
             return "idle"
         if any(task.kind == "waiting" for task in self.tasks):
             return "waiting on other work"
@@ -1270,7 +1275,7 @@ def next_work(queue: UnitWorkQueue | UnreadableWorkQueue, record: object, *, ope
     if isinstance(queue, UnreadableWorkQueue):
         empty = "Queue unavailable; next task not recorded"
     return NextWork(tuple(items), pending[0] if pending else NoPlanNext(), empty, first,
-                    frozenset(targets), tuple(pending[1:]))
+                    frozenset(targets), tuple(pending[1:]), complete)
 
 
 
@@ -1328,6 +1333,9 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     if (not current and not state.workers_unavailable and pending
             and isinstance(next_item.first, BlockedNext) and state.fallback == next_item.first.reason):
         current.append(pending.pop(0))
+    if state.nothing_to_do:
+        text = "The plan is complete and the queue is empty" if next_item.plan_complete else "No plan or queued work"
+        current = [WorkItem("Nothing to do", text)]
     if not current and not state.workers_unavailable:
         current.append(WorkItem("Not recorded", state.fallback))
     if state.workers_unavailable:
@@ -1339,7 +1347,7 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
     if pending:
         rows.extend(item_rows("Next", pending[:1]))
         rows.extend(item_rows("Later", pending[1:]))
-    else:
+    elif not state.nothing_to_do:
         rows.extend(item_rows("Next", (WorkItem("Not recorded", next_item.empty),)))
     for label in ("Stopped", "Done"):
         rows.extend((label, entry.work, entry.state_text) for kind, entry in state.past if kind == label)
@@ -1521,7 +1529,9 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                        and existing.state_text.startswith(task.state_text) for existing in tasks))
         tasks += tuple(TaskLine(wait.target, unit_wait_state(wait, now=now, zone=zone), "unit_wait")
                        for wait in waits if wait.target not in merge.wait_targets | next_item.wait_targets)
-        fallback = hold or finished_step_text(run_events, now=now, zone=zone)
+        open_instances = {phase.instance_id for phase in phases}
+        open_events = [event for event in run_events if event.get("phase_instance_id") in open_instances]
+        fallback = hold or finished_step_text(open_events, now=now, zone=zone)
         if not hold and isinstance(next_item.first, BlockedNext):
             fallback = next_item.first.reason
         readable = (not isinstance(queue, UnreadableWorkQueue) and "unavailable" not in record_fields(record)
