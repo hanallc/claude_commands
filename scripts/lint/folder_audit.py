@@ -76,7 +76,7 @@ from scripts.lint.tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavaila
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
 KEPT_NAMES = SYSTEM_TEMP_NAMES | {
-    *(root.name for root in unit_runs.run_roots()), copy_record.root().name,
+    unit_runs.RUN_ROOT.name, unit_runs.FORMER_RUN_ROOT.name, copy_record.root().name,
     copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
 }
 KEPT_PREFIXES = (*SYSTEM_TEMP_PREFIXES, "codex-daemon-")
@@ -194,7 +194,8 @@ def expected_rust_names(path: Path = RUST_ROOTS_FILE) -> frozenset[str] | None:
 
 def kept_in_temp(entry: Path, verify_name: re.Pattern[str]) -> bool:
     name = entry.name
-    if name in KEPT_NAMES or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
+    managed_names = {copy_record.root().name, copy_record.copies_root().name}
+    if name in KEPT_NAMES or name in managed_names or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
         return True
     return tmp_sweep.holds_no_file(str(entry)) or verify_name.fullmatch(name) is not None
 

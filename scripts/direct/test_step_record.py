@@ -271,7 +271,7 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
             root = Path(folder)
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
                 record = steps.StepRecord("old", 42, "123", root, "build", steps.WorkspacePackages(),
-                                          steps.NatedevOnly("makes natedev artifacts"), steps.StepState.ON_NATEDEV, "now")
+                                          steps.NatedevOnly("creates a Linux install"), steps.StepState.ON_NATEDEV, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("old"), steps.StaleRecord("old"))
                 process = root / "proc/42"

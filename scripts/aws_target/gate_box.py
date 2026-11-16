@@ -596,6 +596,7 @@ def encode_run(run: object) -> dict[str, object]:
     from scripts.test_times import gate_record
     from scripts.production.merge_gate import GateRun, GateJobResult
     from dataclasses import asdict
+    from typing import cast
     if not isinstance(run, GateRun):
         raise TypeError('expected a completed gate')
 
@@ -606,10 +607,17 @@ def encode_run(run: object) -> dict[str, object]:
         if isinstance(job.wall_clock, gate_record.WallClockSpan):
             row['started_at'] = job.wall_clock.started_at
             row['ended_at'] = job.wall_clock.ended_at
+        times = row['times']
+        if isinstance(times, dict) and 'tests_run' in times:
+            # The record carries the test times and read lists; natedev reads only the counts here.
+            row['times'] = {key: value for key, value in cast(dict[str, object], times).items()
+                            if key not in ('config_reads', 'folder_scans', 'content_reads')} | {'tests': []}
         return row
 
-    return {'jobs': [encode_job(job) for job in run.jobs],
-            'executions': [encode_job(job) for job in run.executions],
+    jobs = [encode_job(job) for job in run.jobs]
+    # A missing executions list means the executions are the jobs: no module ran twice.
+    executions = {} if run.executions == run.jobs else {'executions': [encode_job(job) for job in run.executions]}
+    return {'jobs': jobs, **executions,
             'seconds': run.seconds, 'peak_memory_mib': run.peak_memory_mib,
             'tests_reused': run.tests_reused, 'selection_certified': run.selection_certified,
             'time_limit_report': run.time_limit_report}
@@ -677,7 +685,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     """Return an explicit buildlog record with the remote host identity."""
     from scripts.test_times import gate_record
     from datetime import UTC
-    from scripts.buildlog import record
+    from scripts.buildlog import record, store
     from scripts.production.merge_gate import GateRun
     import os
     if not isinstance(value, GateRun):
@@ -693,7 +701,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
-            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': 'cloud-gate', 'step': mode,
+            'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,
             'aborted': False, 'dirty': False, 'dirty_paths': [], 'dirty_path_count': 0,
             'suites': suites, 'modules': modules, 'slow_test_s': gate_record.slow_test_s(),
             'tests_run': sum(module['tests_run'] for module in modules)}

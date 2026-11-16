@@ -92,7 +92,9 @@ The route releases the cost reservation and cloud slot before local admission.
 Only a real remote test failure remains red.
 A dead instance without a final test result permits local fallback.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
-It imports the explicit `gate_run` record once under the real remote host.
+It imports the explicit `gate_run` record once into the one AWS place, `aws`.
+The record keeps the box host name in `host`.
+The history counts an older file of cloud gate runs under a box name as `aws` too.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
@@ -965,7 +967,7 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
+| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.

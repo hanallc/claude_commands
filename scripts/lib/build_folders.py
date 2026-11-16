@@ -25,7 +25,6 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
-from scripts.lib import process_group
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
@@ -63,6 +62,7 @@ class InheritedTemporaryParent:
 
 @dataclass(frozen=True)
 class ExplicitBuildParent:
+    """The path specifies the parent for a build folder."""
     path: Path
 
 
@@ -73,7 +73,7 @@ class SystemTemporaryParent:
 
 @dataclass(frozen=True)
 class UnitRunParent:
-    """Use the current unit root authority."""
+    """Use the director's session run root, else the unit root (unit_runs.new_run_root)."""
 
 
 BuildFolderParent = InheritedTemporaryParent | ExplicitBuildParent | SystemTemporaryParent | UnitRunParent
@@ -81,12 +81,14 @@ BuildFolderParent = InheritedTemporaryParent | ExplicitBuildParent | SystemTempo
 
 @dataclass(frozen=True)
 class UniqueBuildFolder:
+    """The request holds the prefix and parent for a unique build folder."""
     prefix: str
     parent: BuildFolderParent = InheritedTemporaryParent()
 
 
 @dataclass(frozen=True)
 class StableOwnerFolder:
+    """The request holds the name, parent, and mode for an owner folder."""
     name: str
     parent: BuildFolderParent
     mode: int = 0o777
@@ -115,7 +117,7 @@ def _parent(parent: BuildFolderParent) -> Path:
     if isinstance(parent, UnitRunParent):
         from scripts.lib import unit_runs
 
-        return unit_runs.run_roots()[0]
+        return unit_runs.new_run_root()
     return parent.path
 
 
@@ -125,11 +127,12 @@ def _check_name(name: str) -> None:
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
-                          "scratch", "legacy-unique", "legacy-stable", "slot"]
+                          "scratch", "legacy-unique", "legacy-stable", "tool", "slot"]
 
 
 @dataclass(frozen=True)
 class SlotCheckout:
+    """The checkout holds the source repository and required commit for a slot."""
     source: Path
     commit: str
 
@@ -141,6 +144,7 @@ class NoSlotCheckout:
 
 @dataclass(frozen=True, kw_only=True)
 class BuildFolderSpec:
+    """The specification holds the folder kind, parent, name parts, and checkout source."""
     kind: BuildFolderKind
     parent: Path
     suffix_length: int
@@ -152,6 +156,8 @@ class BuildFolderSpec:
     showrunner: str = ""
     unit: str = ""
     work: str = ""
+    # The process the lease names; 0 names the allocating process.
+    owner_pid: int = 0
     slot_checkout: SlotCheckout | NoSlotCheckout = NoSlotCheckout()
     machine: str = ""
 
@@ -160,6 +166,14 @@ def _settings() -> ConfigRead:
     from scripts.lib import conf
 
     return conf.read_or_repository("build_folders")
+
+
+def repository_git_timeout() -> float:
+    """Keep the copies Git deadline when the maker creates a slot."""
+    from scripts.lib import conf
+
+    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
+    return float(conf.read(path.expanduser()).values()["git_timeout_seconds"])
 
 
 def repository_key_for(name: str, identity: str) -> str:
@@ -327,7 +341,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
                  ready: bool = True) -> None:
     now = datetime.now(timezone.utc).isoformat()
     record = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
-              "work": spec.work, "purpose": spec.purpose, "pid": os.getpid(),
+              "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
     if spec.kind == "slot" and isinstance(spec.slot_checkout, SlotCheckout):
         if released:
@@ -362,6 +376,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
 
 @dataclass(frozen=True)
 class _TemporaryFolderRequest:
+    """The temporary folder request retains its cleanup stack."""
     request: UniqueBuildFolder | BuildFolderSpec
     cleanup: ExitStack
 
@@ -391,6 +406,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
     spec = _request_spec(original)
     stable = _stable_folder(spec)
+    # Only a name with a random part gets a new name on a clash; a tool name is fixed per request.
+    renamed = not stable and not (spec.suffix or spec.work) and spec.kind != "tool"
     descriptor = -1
     try:
         with ExitStack() as allocation_scope:
@@ -411,7 +428,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                 try:
                     if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" else fcntl.LOCK_EX,
                                       wait=spec.kind != "slot"):
-                        if not stable and not (spec.suffix or spec.work):
+                        if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
                     if not _lock_current(path, directory, descriptor):
@@ -422,7 +439,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         existing = None
                     if existing is not None:
                         if not stable:
-                            if spec.suffix or spec.work:
+                            if not renamed:
                                 raise FileExistsError(errno.EEXIST, "build folder already exists", str(path))
                             continue
                         if not stat.S_ISDIR(existing.st_mode):
@@ -436,11 +453,19 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                         except FileNotFoundError:
                             lease = {}
                         if existing is not None and lease.get("ready") is not True:
+                            if (path / ".git").exists():
+                                from scripts.lib import git_files, git_rescue
+
+                                checkout = git_files.at(path)
+                                if checkout.common_dir != git_files.at(spec.slot_checkout.source).common_dir:
+                                    raise ValueError(f"{path}: incomplete slot owns a different Git repository; retained")
+                                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                                _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"])
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
                             _remove_folder(path, directory, existing)
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True, pass_fds=(descriptor,))
+                                               check=True, capture_output=True, pass_fds=(descriptor,), timeout=repository_git_timeout())
                             existing = None
                     new_folder = existing is None
                     if isinstance(spec.slot_checkout, SlotCheckout):
@@ -463,7 +488,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
 
                         _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
                                             str(path), spec.slot_checkout.commit], check=True,
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,))
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,),
+                                           timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
@@ -590,6 +616,16 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
+def leased_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+    """Hold the maker lease while a persistent folder is in use."""
+    path = create_build_folder(spec)
+    try:
+        yield path
+    finally:
+        _release_build_folder(path)
+
+
+@contextmanager
 def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
     """Keep a slot and update its last use before releasing its lock."""
     path = create_build_folder(spec)
@@ -635,6 +671,18 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                             temporary=temporary, dir_fd=directory)
 
 
+def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
+    """Remove a folder and its records when no process holds its lock."""
+    def cleanup() -> None:
+        try:
+            allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _remove_folder(path, directory, allocated)
+
+    return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+
+
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
     """Remove free allocations in a parent reserved for temporary maker folders.
     With wait False, a held folder costs one lock try, not the probe wait."""
@@ -646,16 +694,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
                 if match is not None:
                     names.add(match[1])
             for name in sorted(names):
-                path = parent / name
-
-                def cleanup() -> None:
-                    try:
-                        allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-                    except FileNotFoundError:
-                        return
-                    _remove_folder(path, directory, allocated)
-
-                _ = remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+                _ = _remove_free(parent / name, directory, wait=wait)
     except FileNotFoundError:
         pass
 
@@ -667,6 +706,63 @@ def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Gene
         yield create_build_folder(_TemporaryFolderRequest(request, cleanup))
 
 
+def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[BuildFolderSpec], Path], *,
+                       owner_pid: int = 0) -> Path:
+    """Allocate <parent>/<tool>, or <tool>-2 and up while another run holds a name.
+
+    A folder whose lock is free and whose lease names an ended process is a stopped run's leftover:
+    it is removed and its name reused. Any other folder is passed over.
+    """
+    root = parent if parent is not None else inherited_temporary_parent()
+    number = 1
+    while True:
+        spec = BuildFolderSpec(kind="tool", parent=root, purpose=tool, suffix=f"-{number}" if number > 1 else "",
+                               suffix_length=0, owner_pid=owner_pid)
+        try:
+            return allocate(spec)
+        except BlockingIOError:
+            number += 1
+        except FileExistsError:
+            path = build_folder_path(spec)
+            with _folder_parent(path, root, create=False) as directory:
+                leftover = _lease_owner_ended(path, directory) and _remove_free(path, directory, wait=False)
+            if not leftover:
+                number += 1
+
+
+def _lease_owner_ended(path: Path, directory: int) -> bool:
+    """True when the lease names a process that no longer runs. An unreadable lease is not proof."""
+    try:
+        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except OSError:
+        return False
+    with os.fdopen(descriptor) as lease:
+        try:
+            record = cast(object, json.load(lease))
+        except ValueError:
+            return False
+    pid = cast(dict[str, object], record).get("pid") if isinstance(record, dict) else None
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+@contextmanager
+def tool_folder(tool: str, parent: Path | None = None) -> Generator[Path]:
+    """Give one tool run its own folder in the session folder, and remove it when the run ends.
+
+    The parent is the caller's temporary parent unless the caller names one.
+    """
+    with ExitStack() as cleanup:
+        yield _claim_tool_folder(tool, parent, lambda spec: cleanup.enter_context(temporary_build_folder(spec)))
+
+
 OWNER_MARKER = ".build-folder-owner.json"
 
 
@@ -675,6 +771,7 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
     """Keep the caller until the command and its descendants stop."""
     import subprocess
     from scripts.lib.descendants import adopt_descendants
+    from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
@@ -697,12 +794,12 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
         if sys.platform == "darwin":
             # A descendant outside the group still holds the slot if it inherits the lock descriptor.
             try:
-                process_group.send_process_group(child.pid, signal.SIGKILL)
+                send_process_group(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             while True:
                 try:
-                    process_group.send_process_group(child.pid, 0)
+                    send_process_group(child.pid, 0)
                 except ProcessLookupError:
                     break
                 time.sleep(0.01)
@@ -766,6 +863,10 @@ def main(argv: Sequence[str]) -> int:
     stable_parent = stable.add_mutually_exclusive_group()
     _ = stable_parent.add_argument("--parent", type=Path)
     _ = stable_parent.add_argument("--unit-root", action="store_true")
+    tool = commands.add_parser("tool")
+    _ = tool.add_argument("--tool", required=True)
+    _ = tool.add_argument("--parent", type=Path)
+    _ = tool.add_argument("--owner-pid", type=int, required=True)
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
     run_temp = commands.add_parser("run-temp-path")
@@ -788,6 +889,10 @@ def main(argv: Sequence[str]) -> int:
                 raise ValueError("run needs --owner or --unit")
             return run_build(owner, cast(str, args.name), arguments[1:] if arguments[:1] == ["--"] else arguments,
                              showrunner=cast(str, args.showrunner), unit=cast(str, args.unit), work=cast(str, args.work))
+        if command == "tool":
+            print(_claim_tool_folder(cast(str, args.tool), cast(Path | None, args.parent), create_build_folder,
+                                     owner_pid=cast(int, args.owner_pid)))
+            return 0
         if command == "remove":
             path = cast(Path, args.path)
             _release_build_folder(path)

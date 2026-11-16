@@ -1,6 +1,6 @@
 """Copy locations and record reading, kept as a leaf because nix_env imports it.
 scratch.py reaches herdr, which imports nix_env; only the standard library and conf belong here.
-build_folders.conf roots.scratch and roots.copies set the two roots.
+build_folders.conf roots.scratch and roots.workspace set the two roots.
 """
 from __future__ import annotations
 
@@ -23,17 +23,19 @@ TASK = re.compile(r"(?P<kind>run|phase|row|gate|until|landed):(?P<name>[A-Za-z0-
 
 @dataclass(frozen=True)
 class Registered:
+    """The copy registration holds its task and saved fields."""
     task: str
     fields: dict[str, object]
 
 
 @dataclass(frozen=True)
 class NotRegistered:
-    pass
+    """The copy has no registration record."""
 
 
 @dataclass(frozen=True)
 class UnreadableRecord:
+    """The reason explains why the copy registration record cannot be read."""
     reason: str
 
 
@@ -63,9 +65,7 @@ def root() -> Path:
 
 
 def copies_root() -> Path:
-    # A SCRATCH_ROOT override keeps its copies beside it.
-    configured = (os.environ.get(COPIES_ENV) or (str(root().parent / "copies") if os.environ.get(ROOT_ENV)
-                                                 else _configured_root("roots.copies")))
+    configured = os.environ.get(COPIES_ENV) or _configured_root("roots.workspace")
     return Path(os.path.realpath(Path(configured).expanduser()))
 
 

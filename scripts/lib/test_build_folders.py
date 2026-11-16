@@ -1071,7 +1071,7 @@ assert not loaded, loaded
             former_run = self.root / f"delegate-{index}"
             with (mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch_root),
                                                copy_record.COPIES_ENV: str(copies_root)}),
-                  mock.patch.object(unit_runs, "run_roots", return_value=(current_run, former_run))):
+                  mock.patch.object(unit_runs, "new_run_root", return_value=current_run)):
                 parents = (folders.ExplicitBuildParent(copy_record.root()),
                            folders.ExplicitBuildParent(copy_record.copies_root()), folders.UnitRunParent())
                 for parent, expected in zip(parents, (scratch_root, copies_root, current_run), strict=True):
@@ -1533,6 +1533,70 @@ os._exit(0)
                     self.assertFalse(lease.exists())
                     self.assertFalse(temporary.exists())
                     self.assertFalse(path.with_name(path.name + ".lock").exists())
+
+
+    def test_a_tool_folder_takes_the_tool_name_and_goes_with_its_records(self) -> None:
+        with folders.tool_folder("fast-track") as path:
+            self.assertEqual(path, self.root / "fast-track")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            _ = (path / "output").write_text("x")
+        self.assertEqual(sorted(entry.name for entry in self.root.iterdir()), [])
+
+    def test_a_second_run_at_once_gets_a_number_and_the_name_is_free_again_after(self) -> None:
+        with folders.tool_folder("verify") as first, folders.tool_folder("verify") as second:
+            with folders.tool_folder("verify") as third:
+                self.assertEqual((first.name, second.name, third.name), ("verify", "verify-2", "verify-3"))
+        with folders.tool_folder("verify") as again:
+            self.assertEqual(again, self.root / "verify")
+
+    def test_a_stopped_runs_leftover_is_removed_and_its_name_reused(self) -> None:
+        ended = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True)
+        spec = folders.BuildFolderSpec(kind="tool", parent=self.root, purpose="copies", suffix_length=0,
+                                       owner_pid=int(ended.stdout))
+        leftover = folders.create_build_folder(spec)
+        _ = (leftover / "old").write_text("x")
+        _release_folder(leftover)
+        with folders.tool_folder("copies") as path:
+            self.assertEqual(path, leftover)
+            self.assertEqual(list(path.iterdir()), [])
+
+    def test_a_free_folder_whose_owner_runs_is_passed_over(self) -> None:
+        made = self.command("tool", "--tool", "verify", "--owner-pid", str(os.getpid()))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        with folders.tool_folder("verify") as path:
+            self.assertEqual(path, self.root / "verify-2")
+        self.assertTrue((self.root / "verify").is_dir())
+
+    def test_a_folder_without_a_lease_record_is_kept_and_passed_over(self) -> None:
+        held = self.root / "report"
+        held.mkdir()
+        _ = (held / "kept").write_text("x")
+        with folders.tool_folder("report") as path:
+            self.assertEqual(path, self.root / "report-2")
+        self.assertEqual((held / "kept").read_text(), "x")
+
+    def test_an_error_in_the_tool_run_is_not_taken_as_a_name_clash(self) -> None:
+        with self.assertRaises(FileExistsError), folders.tool_folder("merge-gate"):
+            raise FileExistsError("from the tool")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_a_missing_temporary_parent_is_made_at_the_claim(self) -> None:
+        # A Codex session or a timer can have no session folder; its TMPDIR folder is made on demand.
+        parent = self.root / "session" / "natemerge"
+        with mock.patch.dict(os.environ, {"TMPDIR": str(parent)}), folders.tool_folder("checkpoint-doc") as path:
+            self.assertEqual(path, parent / "checkpoint-doc")
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_cli_tool_prints_the_folder_under_the_named_parent(self) -> None:
+        parent = self.root / "session parent"
+        parent.mkdir()
+        made = self.command("tool", "--tool", "verify", "--parent", str(parent), "--owner-pid", str(os.getpid()))
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(made.stdout, f"{parent / 'verify'}\n")
+        self.assertTrue((parent / "verify").is_dir())
+        removed = self.command("remove", str(parent / "verify"))
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(list(parent.iterdir()), [])
 
 
 if __name__ == "__main__":

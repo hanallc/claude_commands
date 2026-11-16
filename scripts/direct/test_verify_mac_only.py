@@ -20,6 +20,7 @@ from scripts.direct.verify_mac_offload_test_support import (
 )
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 @final
@@ -206,7 +207,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         def busy_wait_delivered() -> bool:
             if not busy_published:
                 return False
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):

@@ -80,6 +80,8 @@ if __name__ == "__main__":
     def reply(self, process: subprocess.Popen[bytes]) -> tuple[int, dict[str, object], str]:
         assert process.stdout is not None
         replies = list(map(self.read_field, (cast(BinaryIO, process.stdout),) * 3))
+        if not replies[1]:
+            self.fail(replies[2])
         decoded = cast(dict[str, object], json.loads(replies[1]))
         return int(replies[0]), decoded, replies[2]
 
@@ -105,6 +107,42 @@ if __name__ == "__main__":
                 self.assertEqual(errors, "fixture diagnostic\n")
         self.assertEqual(self.program.with_suffix(".imports").read_text(), "imported\n")
 
+    def test_a_tree_update_loads_the_new_tree_whole_in_the_next_call(self) -> None:
+        # A call loads base; an update then adds a name to base and a module that imports it.
+        # The update lands between two calls, or during the call that loaded base.
+        for during_call in (False, True):
+            with self.subTest(during_call=during_call):
+                tree = self.root / f"tree-{during_call}"
+                package = tree / "fixturepkg"
+                package.mkdir(parents=True)
+                _ = (package / "__init__.py").write_text("")
+                _ = (package / "base.py").write_text("OLD = 'old'\n")
+                self.program = tree / "lazy_program.py"
+                _ = self.program.write_text('''import json, os, sys
+from pathlib import Path
+def update():
+    package = Path(__file__).parent / "fixturepkg"
+    (package / "base.py.new").write_text("OLD = 'old'\\nNEW = 'new'\\n")
+    os.replace(package / "base.py.new", package / "base.py")
+    (package / "newer.py").write_text("from fixturepkg.base import NEW as VALUE\\n")
+def main():
+    if sys.argv[1:] == ["newer"]:
+        from fixturepkg.newer import VALUE
+    else:
+        from fixturepkg.base import OLD as VALUE
+    if sys.argv[1:] == ["update"]:
+        update()
+    print(json.dumps(dict(value=VALUE)))
+    return 0
+''')
+                process = self.start_helper()
+                status, output, errors = self.request(process, "first", "", "update" if during_call else "base")
+                self.assertEqual((status, output, errors), (0, dict(value="old"), ""))
+                if not during_call:
+                    _ = self.request(process, "update", "", "update")
+                status, output, errors = self.request(process, "second", "", "newer")
+                self.assertEqual((status, output, errors), (0, dict(value="new"), ""))
+
     def test_two_requests_in_one_write_each_get_a_reply(self) -> None:
         process = self.start_helper()
         assert process.stdin is not None
@@ -124,6 +162,54 @@ if __name__ == "__main__":
         self.assertEqual(errors, "fixture diagnostic\n")
         status, output, errors = self.request(process, "next", "next input", "next")
         self.assertEqual((status, output["value"], output["leak"]), (0, "next", None))
+
+    def test_shell_environment_matches_env_for_exported_values(self) -> None:
+        _ = self.program.write_text('''import json, os
+def main():
+    with open(__file__ + ".calls", "a") as calls:
+        calls.write(os.environ.get("FIXTURE_EXECUTION", "helper") + "\\n")
+    print(json.dumps(dict(os.environ)))
+    return 0
+if __name__ == "__main__":
+    os.environ["FIXTURE_EXECUTION"] = "local"
+    raise SystemExit(main())
+''')
+        script = shell_functions(DIRECT / "verify.sh", "verify_helper") + r'''
+VERIFY_START_DIR=$1; PY=$2
+verify_helper --start
+export FIXTURE_SPACE='one two' FIXTURE_EQUALS='one=two=three'
+export FIXTURE_NEWLINES=$'one\ntwo\n' FIXTURE_EMPTY=''
+export FIXTURE_UNSET
+declare -ax FIXTURE_ARRAY=(one two)
+declare -Ax FIXTURE_MAPPING=([one]=two)
+env -0 > "$4/environment"
+env() { return 91; }
+verify_helper "$3"
+compgen() { return 1; }
+verify_helper "$3" > "$4/fallback-environment"
+unset -f compgen
+FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
+'''
+        result = subprocess.run(["bash", "-c", script, "helper-test", str(DIRECT), sys.executable,
+                                 str(self.program), str(self.root)], capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = dict(entry.split("=", 1) for entry in
+                        (self.root / "environment").read_text().split("\0") if entry)
+        actual = cast(dict[str, str], json.loads(result.stdout))
+        # Bash sets this entry to each external command's path.
+        _ = expected.pop("_", None)
+        _ = actual.pop("_", None)
+        self.assertEqual(actual, expected)
+        fallback = cast(dict[str, str], json.loads((self.root / "fallback-environment").read_text()))
+        self.assertEqual(fallback.pop("FIXTURE_EXECUTION"), "local")
+        _ = fallback.pop("_", None)
+        self.assertEqual(fallback, expected)
+        following = cast(dict[str, str], json.loads((self.root / "next-environment").read_text()))
+        self.assertEqual(following.pop("FIXTURE_EXECUTION"), "next")
+        _ = following.pop("_", None)
+        self.assertEqual(following, expected)
+        self.assertEqual(self.program.with_suffix(".py.calls").read_text(), "helper\nlocal\nnext\n")
 
     def test_shell_recovers_after_helper_death_and_keeps_shell_fixtures(self) -> None:
         shell = self.root / "shell-fixture"

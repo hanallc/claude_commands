@@ -181,6 +181,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/phase_reservation.py` | read | snapshot, WorktreeUnfilled |
 | `scripts/direct/phase_reviewers.py` | read | local_snapshot, find; clear_phase_review.sh runs it |
 | `scripts/direct/phase_table.py` | read | active, snapshot |
+| `scripts/direct/phase_wait_holder.py` | read | snapshot, by_id, StaffId, StaffRow; verify.sh runs it through verify_helper |
 | `scripts/direct/plan_history.py` | read | snapshot |
 | `scripts/direct/prepare_session.sh` | write | set-run (shell), line 24; stores the prepared run path |
 | `scripts/direct/progress_history.py` | write | active, initial_snapshot, snapshot, set_worker_role, set_run, clear_run |
@@ -188,7 +189,6 @@ The shared pane launch builder uses `set_home`.
 | `scripts/direct/remove_workers.py` | read | local_snapshot, runtime_id |
 | `scripts/direct/review.sh` | read | local_snapshot, StaffRow |
 | `scripts/direct/review_launcher_test_support.py` | write | local_snapshot, native_id, update_current_session |
-| `scripts/direct/verify.sh` | read | snapshot, by_id, StaffId, StaffRow |
 | `scripts/direct/worker_state.py` | read | StaffRow |
 | `scripts/direct/workers.py` | read | initial_snapshot, local_snapshot |
 | `scripts/hana_shot/hana_shot.py` | read | local_snapshot, runtime_id |
@@ -211,6 +211,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/resume_message.py` | read | StaffId |
 | `scripts/lib/scratch.py` | read | by_current_session, runtime_id, snapshot |
+| `scripts/lib/session_folder.py` | read | local_snapshot, by_current_session, by_id, StaffRow and StaffSnapshot (types), ReportsTo; member_of names the folder of a staff session |
 | `scripts/lib/unit_runs.py` | read | local_snapshot, local_by_current_session, record_path, OpenRun |
 | `scripts/lint/memory_admit.py` | read | snapshot; queue priority takes waiter units from recorded staff rows |
 | `scripts/lint/sweep.py` | read | local_snapshot, StaffSnapshot (type), StaffId; holder_sessions names the parent director of a detached worker run |

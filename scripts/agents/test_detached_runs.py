@@ -98,7 +98,6 @@ class DetachedRunsTests(unittest.TestCase):
         _ = self.stack.enter_context(isolated_staff_file(self.root / "staff.json", {}))
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
-        _ = self.stack.enter_context(patch.object(detached_runs, "RUN_ROOTS", (self.root / "unit",)))
         self.stack.enter_context(patch.dict(os.environ, {
                                                         "HOME": str(self.root),
                                                         "XDG_STATE_HOME": str(self.root / "state"),
