@@ -32,7 +32,7 @@ class Gate(Protocol):
 
 gate = cast(Gate, cast(object, module))
 SEE = ("Change-Review: The grid fades more gently | Run `hana` in a natedev terminal"
-       + " | The grid lines fade out farther away")
+       + " | The grid lines fade out farther away | image 012345abcdef")
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 
 
@@ -140,6 +140,14 @@ class RefusalTest(unittest.TestCase):
         for command in ('git commit -m "checkpoint(u): grid" -m ' + shlex.quote(SEE),
                         "git commit -F - <<'EOF'\ncheckpoint(u): grid\n\nChange-Review: none — scripts only\nEOF"):
             self.assertEqual(self.refused(command), "", command)
+
+    def test_a_visible_checkpoint_without_an_image_uses_the_shared_refusal(self) -> None:
+        self.stage("a.py")
+        line = SEE.removesuffix(" | image 012345abcdef")
+        message = "checkpoint(u): grid\n\n" + line
+        self.assertEqual(self.refused("git commit -m " + shlex.quote(message)),
+                         change_review.problem("checkpoint(u): grid", message, ("a.py",)))
+        self.assertIn("has no image", self.refused("git commit -m " + shlex.quote(message)))
 
     def test_help_passes_each_invocation_without_reading_the_repository(self) -> None:
         for cargo in (False, True):
