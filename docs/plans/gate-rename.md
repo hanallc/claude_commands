@@ -1,6 +1,6 @@
 # Gate rename: merge_gate.py becomes gate.py, and targeted_test.py becomes a gate.py mode
 
-> **Status: PLAN ONLY — sdlc agreed 2026-11-16, with the user's three corrections; no sweep starts before the user's go through morty.** Seven chunks. Each chunk merges alone as a builds item and needs no quiet time.
+> **Status: APPROVED 2026-11-16 — sdlc agreed, and the user gave the go on the plan, the conf rename and "the gate" (through morty and builds). The trial branch prefix change still waits for the user's go. natest starts chunk 1 after its phase 315 work.** Seven chunks. Each chunk merges alone as a builds item and needs no quiet time.
 
 > **Request:** #108 part B, the user via morty and builds, 2026-11-16. Plan written by the verify unit.
 
@@ -157,7 +157,7 @@ the files (21 as-built files). Old plan docs stay.
    `GATE_PARENT_PID` and `MERGE_GATE_PARENT_PID` until chunk 6, because a gate started before the deploy still
    sets the old name for its children.
 2. `config/merge_gate.conf` becomes `config/gate.conf`. The keys do not change. This is a config change; see
-   "Needs the user's go".
+   "The user's go".
 
 ### Chunk 4 — stored names, migration once at deploy · owner: sdlc · writer: natest
 
@@ -203,7 +203,7 @@ lines of 9 files outside old plan docs.
 2. Switch the callers: `deploy.py` (its `gate-trial` subcommand becomes `aws-trial`), `test_cloud_gate.py`,
    `test_gate_box.py`, `test_ledger.py`, `test_deploy.py` and `config/README.md`.
 3. The trial branch prefix `trial_branch_prefix=gate-trial` in `config/cloud_gate.conf` becomes `aws-trial`. This
-   is a changed config value; see "Needs the user's go".
+   is a changed config value; see "The user's go".
 4. The prose "gate trial" becomes "AWS trial" in live docs (2 lines today). Old plan docs stay.
 5. `config/README.md` lines 825–833 name six `gate_trial_*` keys that no conf file or script holds. aws removes
    those lines in the same commit.
@@ -213,12 +213,14 @@ AWS gate run uses them, not only the trial. They become `gate-box` and `/var/lib
 to match `gate_box.py` and `GATE_BOX_DIR`. The box makes the user at boot, so no image rebuild is needed. The risk
 is one changed path in `config/test_times.conf` (`TOP_AWS_CHECKOUT`), which aws changes in the same commit.
 
-## Needs the user's go
+## The user's go
 
-1. The rename itself and the seven chunks of this plan.
-2. **The config file rename: `config/merge_gate.conf` becomes `config/gate.conf`** (chunk 3). The keys do not change.
-3. **The replacement term "the gate"** for the prose "merge gate" (chunk 5).
-4. **The config value change: `trial_branch_prefix` becomes `aws-trial`** in `config/cloud_gate.conf` (chunk 7).
+1. The rename itself and the seven chunks of this plan: given 2026-11-16.
+2. **The config file rename: `config/merge_gate.conf` becomes `config/gate.conf`** (chunk 3). The keys do not change. Given 2026-11-16.
+3. **The replacement term "the gate"** for the prose "merge gate" (chunk 5): given 2026-11-16.
+4. **The config value change: `trial_branch_prefix` becomes `aws-trial`** in `config/cloud_gate.conf` (chunk 7): waits for the user's go through morty. Until then, chunk 7 keeps the `gate-trial` prefix.
+
+The verify unit's calls on the stored step names (decision 3) and the AWS box user and folder (chunk 7) stand.
 
 ## What sdlc agreed (2026-11-16, through builds)
 
