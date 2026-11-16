@@ -422,7 +422,8 @@ shutil.rmtree(path)""", []),
             runner = root / "scripts/test_times/module_run.py"
             runner.parent.mkdir()
             _ = runner.write_text(RUNNER.read_text())
-            for name in ("conf_reads.py", "package_root.py", "python_startup/sitecustomize.py"):
+            for name in ("conf_reads.py", "package_root.py", "python_startup/sitecustomize.py",
+                         "build_folders.py", "boot_identity.py", "conf.py"):
                 (library / name).parent.mkdir(parents=True, exist_ok=True)
                 _ = (library / name).write_text((RUNNER.parents[1] / "lib" / name).read_text())
             for package in (root / "scripts", library, root / "tests", root / "import_only"):
@@ -433,6 +434,8 @@ shutil.rmtree(path)""", []),
                 target.mkdir()
                 _ = (target / "item.txt").write_text("fixture\n")
             (root / "config").mkdir()
+            _ = (root / "config/build_folders.conf").write_text(
+                (RUNNER.parents[2] / "config/build_folders.conf").read_text())
             _ = (root / "config/limits.conf").write_text("value=fixture\n")
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")

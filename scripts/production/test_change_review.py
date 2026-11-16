@@ -12,6 +12,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.lib import copy_record
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -2632,6 +2634,34 @@ class CommitTest(unittest.TestCase):
         return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
 
     def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
+        tools = self.repo.parent / "lease-git"
+        tools.mkdir()
+        log = self.repo.parent / "index-leases"
+        binary = shutil.which("git")
+        assert binary is not None
+        write_python_tool(tools / "git", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+index = os.environ.get("GIT_INDEX_FILE", "")
+if index and Path(index).parent.name.startswith("change-review-index"):
+    folder = Path(index).parent
+    lock = folder.with_name(folder.name + ".lock").stat()
+    inherited = []
+    for entry in Path("/dev/fd").iterdir():
+        try:
+            if os.path.samestat(os.fstat(int(entry.name)), lock):
+                inherited.append(int(entry.name))
+        except OSError:
+            pass
+    assert inherited, "The Git child has no folder lease"
+    fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(""" + repr(str(log)) + """, "a") as output:
+        output.write(build_folders.build_folder_state(folder) + "\\n")
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "TMPDIR": str(self.repo.parent), "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+        }))
         source, *commits = origin_commits(self.repo.parent)
         merged = commits[-1][:8]
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
@@ -2642,6 +2672,7 @@ class CommitTest(unittest.TestCase):
         _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(set(log.read_text().splitlines()), {"held"})
 
     def test_a_verdict_commits_the_list(self) -> None:
         for row, held in (("C1", False), ("C2", True)):
@@ -2768,14 +2799,15 @@ class CommitTest(unittest.TestCase):
         competing: list[str] = []
 
         def move_head(command: list[str], *, capture_output: bool = False, text: bool = False,
-                      check: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                      check: bool = False, env: dict[str, str] | None = None,
+                      pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             if "update-ref" in command and not competing:
                 commit = real_run(["git", "-C", str(self.repo), "commit-tree", tree, "-p", previous,
                                    "-m", "Timer commit"], capture_output=True, text=True, check=True).stdout.strip()
                 _ = real_run(["git", "-C", str(self.repo), "update-ref", "HEAD", commit, previous],
                              capture_output=True, text=True, check=True)
                 competing.append(commit)
-            return real_run(command, capture_output=capture_output, text=text, check=check, env=env)
+            return real_run(command, capture_output=capture_output, text=text, check=check, env=env, pass_fds=pass_fds)
 
         with mock.patch.object(subprocess, "run", side_effect=move_head):
             result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",
