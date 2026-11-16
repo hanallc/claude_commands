@@ -1364,12 +1364,12 @@ process.stdout.write(JSON.stringify({
             explanation=replace(explanation, running=tuple(replace(entry, step=replace(entry.step, route=target_config.MAC_ONLY))
                                                            for entry in explanation.running)))
         with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(target_availability.MacRoutes, "holds", return_value="blocked by research until released")):
+              mock.patch.object(target_availability.MacRoutes, "holds", return_value="build hold by research (hana) until released")):
             page = memory_feed.reading()
         running, = [row for row in page["walk"] if row.get("queued")]
         waiting, = page["waiters"]
         for row in (running, waiting):
-            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "blocked by research until released"))
+            self.assertEqual((row.get("runs_on"), row.get("mac_state")), ("Mac only", "build hold by research (hana) until released"))
 
     def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)

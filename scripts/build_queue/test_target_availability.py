@@ -109,8 +109,8 @@ class MacRouteTests(unittest.TestCase):
 
     def test_holds_names_each_mac_state_and_a_free_mac_gives_nothing(self) -> None:
         cases: tuple[tuple[targets.TargetState, str], ...] = (
-            (MAC_BLOCK, "blocked by research (hana) awaiting unblock; requested expiry was 15:10 UTC"),
-            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER)), "blocked by solo until 15:10 UTC"),
+            (MAC_BLOCK, "build hold by research (hana) awaiting unblock; requested expiry was 15:10 UTC — Mac CI restore"),
+            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER), reason=""), "build hold by solo until 15:10 UTC"),
             (targets.Unreachable("probe failed"), "unreachable, probe failed"),
             (targets.StateUnreadable("block.json: bad"), "state unreadable, block.json: bad"),
             (targets.Free(), ""),
