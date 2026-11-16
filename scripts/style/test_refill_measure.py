@@ -1,11 +1,13 @@
 """Measure real fixture refills while the source ledger stays unchanged."""
 
 from contextlib import closing
+import json
 import os
 from pathlib import Path
 import socket
 import shutil
 import sqlite3
+import sys
 from typing import cast, final, override
 from unittest.mock import patch
 
@@ -25,6 +27,21 @@ class RefillMeasureTests(StylePlanFixture):
                           plan="docs/style-production/units/names-unit.md")
 
     def test_cold_and_warm_refills_preserve_source_and_report_rows_bytes_and_equal_results(self) -> None:
+        bin_dir = self.root / "measure-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "cargo-berth"
+        envelope: dict[str, object] = {
+            "output_contract_version": 6, "verb": "board", "status": "unconfigured", "exit_code": 4,
+            "reservations": [], "blocked_by": [],
+            "message": f"this repository has no cargo-berth configuration at {self.repo}/.claude/config/berth.toml; "
+                       + "run `cargo-berth init` to create it",
+            "presentation": {"kind": "rendered_blocks", "blocks": []},
+            "payload": {"kind": "no_facts", "alerts": []},
+        }
+        _ = fake.write_text(f"#!{sys.executable}\nimport sys\nprint({json.dumps(envelope)!r})\nsys.exit(4)\n")
+        fake.chmod(0o755)
+        self.enterContext(patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}))
+        self.assertEqual(shutil.which("cargo-berth"), str(fake))
         rule = self.rule("measure-name")
         self.sync()
         _ = self.approved_decision(rule, self.sources[:1], "type", name="measure")
