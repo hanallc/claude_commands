@@ -6,10 +6,7 @@ Also from 3p: F046 and F048 are superseded in 3p by F058 and F059 (their defect 
 
 ## F006 (S1), routed from 3p repair round 9
 
-1. **`scripts/production/worker_admission.py:346`, `:398-400`** · `in-phase`
-   - Change: Make `dispatch` a `Callable[[PublishedWorker], SwitchState] | None`. Remove the `SwitchState` alternative and the `callable()` test. With `None`, write no state after publication.
-   - Reason: Codex passes `None` (`codex_mesh.py:4238`). The intent is `prepared` before creation (`:390`), and `_start_turn` writes `sending` before submit (`codex_mesh.py:6170`). The write after publication is redundant.
-   - Callers to update: `test_worker_admission.py:119`, `test_codex_mesh.py:2278`.
+The Codex-specific dispatch proposal closed on 2026-11-08 when commit `ce529466f` removed its caller and test. It requires no mesh edit.
 
 ## F010 (S7)
 
@@ -25,9 +22,7 @@ Also from 3p: F046 and F048 are superseded in 3p by F058 and F059 (their defect 
 
 ## F012 (S9)
 
-9. **`scripts/agents/codex_mesh.py:5625`, `scripts/production/worker_admission.py:367`** · `in-phase` (removes a copy)
-   - Change: Add one `worker_admission.publish_created(allowed, identity, cleanup)` helper. Let `cleanup` return the detail text. Call it from both paths.
-   - Reason: Two "publish, or release the created thread" paths now exist. The start path lost `; created thread stopped` and `; cleanup unproved:`.
+The shared publication helper proposal depended on a mesh caller. Commit `ce529466f` removed that caller on 2026-11-08. The proposal requires no further mesh work.
 
 ## F013 (S11)
 
@@ -85,27 +80,19 @@ Also from 3p: F046 and F048 are superseded in 3p by F058 and F059 (their defect 
 
 ## F022 (S20)
 
-20. **`scripts/agents/codex_mesh.py:4230`, `:5677`** · `in-phase` (removes a copy)
-    - Change: Add `_thread_id(result)` and call it at all 4 sites.
-    - Reason: Deleting `_create_worker_backend` raised the expression from 3 sites to 4.
+The thread-id helper proposal closed on 2026-11-08. Commit `ce529466f` removed all its target sites.
 
 ## F023 (S21)
 
-21. **`scripts/production/worker_fill.py:68`, `scripts/agents/codex_mesh.py:6173`** · `in-phase` (removes a copy)
-    - Change: Add `worker_admission.advance_dispatch(allowed, request, state)`. Merge the adjacent `if turn_id:` blocks at lines 6173 and 6176.
-    - Reason: The same check and write appear at 2 sites, and the same condition appears twice in a row.
+The shared dispatch helper proposal depended on a mesh caller. Commit `ce529466f` removed that caller on 2026-11-08. The proposal requires no further mesh work.
 
 ## F024 (S22)
 
-22. **`scripts/agents/codex_mesh.py:4241`, `:6944`, `scripts/production/worker_fill.py:14`** · `in-phase`
-    - Change: Delete the third blank line. Inline `record`. Merge the split imports.
-    - Reason: These are noise.
+The formatting proposal included removed worker transport files. The mesh part closed with commit `ce529466f` on 2026-11-08.
 
 ## F025 (S23)
 
-23. **`scripts/agents/codex_mesh.py:4348`** · `in-phase`
-    - Change: Use `_as_str(_attr(args, "switch_request"))`.
-    - Reason: The prompt is read 3 times and hashed twice per start.
+The repeated prompt-read proposal closed on 2026-11-08. Commit `ce529466f` removed its target site.
 
 ## F026 (S24)
 
@@ -157,21 +144,15 @@ Also from 3p: F046 and F048 are superseded in 3p by F058 and F059 (their defect 
 
 ## F034 (S32)
 
-32. **`scripts/agents/test_codex_mesh.py:7878`** (also `:7983`, `:8130`, `:9113`, `:9947`, `:10251`, `:10275`, `:10371`, `:10752`) · `in-phase` (removes a copy)
-    - Change: Add `run_worker(args, port, *, started_here=False)` to `MeshCommandFixture`.
-    - Reason: The diff added 9 long lines in 2 spellings with 9 `pyright: ignore` comments.
+The fixture helper proposal closed on 2026-11-08. Commit `ce529466f` removed its target tests.
 
 ## F035 (S33)
 
-33. **`scripts/agents/test_codex_mesh.py:2137`, `:2130`, `:2150`** · `in-phase`
-    - Change: Use the `flock` probe from `test_worker_admission.py:177`. Write `lambda _: streaming.set()`. Delete line 2150.
-    - Reason: A child process and a 12-line program prove one free lock. `done()` is always true in a done callback.
+The lock-probe proposal closed on 2026-11-08. Commit `ce529466f` removed its target tests.
 
 ## F036 (S34)
 
-34. **`scripts/agents/test_codex_mesh.py:2217`, `:2223`, `:4788`** · `in-phase`
-    - Change: Share the source setup with lines 2161-2165. Make the rows `(reason, change)` and pass `start` as a lambda. Seed only when `evidence != "absent"`.
-    - Reason: These lines hold a setup copy, a `def` inside a loop, and 4 wasted roster writes.
+The shared test setup proposal closed on 2026-11-08. Commit `ce529466f` removed its target tests.
 
 ## F037 (S35)
 
@@ -295,6 +276,8 @@ I changed two agent proposals:
 - **Item 8:** Altitude wanted `state` kept so that `coordinate_claude` prints `unchanged` once. Simplification wanted the field deleted. I took the deletion, because the field has no reader and the stdout risk is not present today.
 
 ## Assertion and test changes
+
+Historical review evidence from 2026-11-04 follows. These tables record the reviewed diff, including tests removed later. They do not request new edits.
 
 Skip, xfail and ignore: none. The gate 3 assertions stay. `test_moves.py` and `test_implement_launcher_claude.py` are not in the diff, and the matched, absent and unknown rows stay in `test_worker_fill.py`.
 
