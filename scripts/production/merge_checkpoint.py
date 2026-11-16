@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
+from scripts.lib import build_folders
 from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
@@ -666,7 +667,7 @@ def merge(request: MergeRequest) -> str:
                                                   else request.delivers)
     if request.trailer:
         message += "\n\n" + "\n".join(request.trailer)
-    with tempfile.TemporaryDirectory(prefix="merge-message-") as directory:
+    with build_folders.tool_folder("merge-message") as directory:
         message_path = Path(directory) / f"merge_{short}.msg"
         _ = message_path.write_text(message + "\n", encoding="utf-8")
         result = git(checkout, "merge", "--no-ff", "-q", "-F", str(message_path), request.commit)

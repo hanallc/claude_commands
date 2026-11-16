@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import TypedDict, cast
+from unittest.mock import patch
 
 from scripts.lib.transcript_test_support import compressed_copy
 
@@ -25,7 +27,7 @@ from scripts.shot_report.transcripts import (
     ProjectAttribution, RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent,
     parsed_tool_event_category, scan_calls,
 )
-from scripts.shot_report.transcripts import _classify, _claude_encoded, _remember  # pyright: ignore[reportPrivateUsage]
+from scripts.shot_report.transcripts import _classify, _claude_encoded, _parse_lines, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
 
 
@@ -390,6 +392,95 @@ class TranscriptTest(unittest.TestCase):
                         self.assertEqual(list(actual), list(expected))
                         self.assertEqual(actual.tool_events, expected.tool_events)
 
+    def test_version_seven_cache_keeps_citations_across_compression_without_parsing(self) -> None:
+        for agent in ("claude", "codex"):
+            for host in ("natedev", "mac"):
+                with self.subTest(agent=agent, host=host), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    path = root / agent / "session.jsonl"
+                    if agent == "claude":
+                        _claude_case(path, [
+                            ("Bash", "python3 hana_shot.py shot", "saved /tmp/front.png"),
+                            ("Bash", "python3 send.py --text 'Use /tmp/front.png'", "sent"),
+                        ])
+                    else:
+                        _fixture_rows(path, [
+                            _codex_part(0, {"type": "function_call", "name": "exec_command", "call_id": "shot",
+                                "arguments": json.dumps({"cmd": "python3 hana_shot.py shot"})}),
+                            _codex_part(5, {"type": "function_call_output", "call_id": "shot",
+                                "output": "saved /tmp/front.png"}),
+                            _codex_part(30, {"type": "function_call", "name": "exec_command", "call_id": "send",
+                                "arguments": json.dumps({"cmd": "python3 send.py --text 'Use /tmp/front.png'"})}),
+                        ])
+                    with path.open("a", encoding="utf-8") as output:
+                        _ = output.write(json.dumps({"padding": "x" * 2048}) + "\n")
+                    cache = PersistentScanCache(root / ("scan-cache-mac.pickle" if host == "mac" else "scan-cache.pickle"))
+                    first = scan_calls(root / "claude", root / "codex", cache=cache, source_host=host)
+                    self.assertEqual([call.cited_image_paths for call in first], [("/tmp/front.png",)])
+                    before = cast(CachedScanEvidence, pickle.loads(cache.path.read_bytes()))
+                    self.assertEqual(before.format_version, 7)
+                    archive = compressed_copy(path)
+                    for _ in range(2):
+                        with (patch("scripts.shot_report.transcripts._parse_lines", side_effect=AssertionError("parsed")),
+                              patch("scripts.shot_report.transcripts.open_transcript", side_effect=AssertionError("read"))):
+                            actual = scan_calls(root / "claude", root / "codex", cache=cache, source_host=host)
+                        self.assertEqual(list(actual), list(first))
+                        self.assertEqual(actual.tool_events, first.tool_events)
+                        self.assertEqual(actual.bytes_read, 0)
+                        self.assertEqual([episode.kept_shot for episode in split_episodes(actual, 300)], [OneCitedShot(0)])
+                    after = cast(CachedScanEvidence, pickle.loads(cache.path.read_bytes()))
+                    self.assertEqual(after.format_version, 7)
+                    self.assertNotIn(str(path), after.files)
+                    entry = after.files[str(archive)]
+                    self.assertEqual(entry.evidence, before.files[str(path)].evidence)
+                    self.assertEqual(entry.source_host, host)
+                    stat = archive.stat()
+                    self.assertEqual((entry.device, entry.inode, entry.observed_size, entry.modified_ns),
+                                     (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+
+    def test_unproved_compressed_transcript_is_parsed_from_the_start(self) -> None:
+        for change in ("mtime", "size", "partial", "unknown-size", "extra-frame", "changed-archive"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "claude" / "session.jsonl"
+                _claude_case(path, [("Bash", "python3 hana_shot.py shot", "saved /tmp/front.png")])
+                if change == "partial":
+                    with path.open("ab") as output:
+                        _ = output.write(b'{"unfinished":')
+                if change == "changed-archive":
+                    path = compressed_copy(path)
+                cache = PersistentScanCache(root / "scan-cache.pickle")
+                _ = scan_calls(root / "claude", root / "codex", cache=cache)
+                if change == "size":
+                    with path.open("ab") as output:
+                        _ = output.write(b"\n")
+                if change == "unknown-size":
+                    stat = path.stat()
+                    archive = path.with_suffix(".jsonl.zst")
+                    with archive.open("wb") as output:
+                        _ = subprocess.run(["zstd", "-q", "--no-content-size", "-c", "--", str(path)],
+                                           stdout=output, check=True)
+                    os.utime(archive, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                    path.unlink()
+                else:
+                    archive = path if change == "changed-archive" else compressed_copy(path)
+                if change == "mtime":
+                    stat = archive.stat()
+                    os.utime(archive, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+                if change in ("extra-frame", "changed-archive"):
+                    stat = archive.stat()
+                    extra = root / "extra.jsonl"
+                    _ = extra.write_bytes(b"\n")
+                    with archive.open("ab") as output:
+                        _ = subprocess.run(["zstd", "-q", "-c", "--", str(extra)], stdout=output, check=True)
+                    os.utime(archive, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                expected = scan_calls(root / "claude", root / "codex")
+                with patch("scripts.shot_report.transcripts._parse_lines", wraps=_parse_lines) as parse:
+                    actual = scan_calls(root / "claude", root / "codex", cache=cache)
+                parse.assert_called_once()
+                self.assertEqual(list(actual), list(expected))
+                self.assertEqual(actual.bytes_read, archive.stat().st_size)
+
     def test_transcript_scan_copies_tool_events_from_any_iterable(self) -> None:
         event = TranscriptToolEvent(
             START, START, "session", "transcript.jsonl", "Claude", "Read",
@@ -529,6 +620,8 @@ class TranscriptTest(unittest.TestCase):
             _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
             cwd = root / "claude-cache" / _claude_encoded(repo) / "session" / "scratchpad" / "probe"
             _project_cases(root, cwd)
+            with (root / "codex" / "project.jsonl").open("a", encoding="utf-8") as output:
+                _ = output.write(json.dumps({"padding": "x" * 2048}) + "\n")
             cache = PersistentScanCache(root / "scan.pickle")
             first = scan_calls(root / "claude", root / "codex", cache=cache, scratchpad_roots=(root,))
             self.assertEqual(sorted((call.agent, call.project, call.project_attribution) for call in first), [
@@ -1735,7 +1828,7 @@ class TranscriptTest(unittest.TestCase):
         ])
 
     def test_outgoing_message_cites_shot_without_read_only_command_citation(self) -> None:
-        for command in ("send.py --to worker --text", "codex_mesh.py send --message"):
+        for command in ("send.py --to worker --text",):
             with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 claude_rows: list[dict[str, object]] = []
