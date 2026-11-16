@@ -1,4 +1,4 @@
-"""The accounts board table: the columns, lines, tones and narrow facts that /showrunner:accounts shows."""
+"""Test the accounts board columns, lines, tones, and facts for the Hana console Accounts page."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -35,7 +35,7 @@ def counts(busy: int, idle: int, paused: int, exited: int) -> accounts.RoleSessi
 
 
 def fixture() -> accounts.StatusReading:
-    """The unit-board plugin's readable fixture: deliberately unsorted and mixed case."""
+    """A readable status fixture for the board: deliberately unsorted and mixed case."""
     rows = (
         row("Gamma", ("workers",), (counts(1, 2, 0, 1),), 74, "2026-10-24T18:00:00+00:00", None),
         row("beta", ("workers",), (counts(7, 5, 0, 0),), 20.2, "2026-10-17T18:00:00+00:00", 13446.2, read=False),

@@ -11,8 +11,9 @@ These commands read or write this format:
   production doc.
 - `/showrunner:produce` — runs the production from the showrunner session.
 - `/showrunner:units` — shows the production status.
-- `/showrunner:accounts` — opens the accounts board.
 - `/unit:direct`, `/unit:merge`, and `/unit:style` — unit commands selected by the staff row's `unit_type`.
+
+Use Hana console, Accounts to view the accounts board.
 
 The staff row stores each unit's type: `direct`, `merge`, or `style`.
 

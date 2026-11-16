@@ -84,8 +84,3 @@ export function inspectDrawing(tree: unknown) {
   const lines = visit(tree);
   return { lines, spans, rows, textProps, nodes };
 }
-
-// Keep existing accounts assertions expressed in their original projections.
-export const rowLines = (tree: unknown) => inspectDrawing(tree).lines;
-export const styledText = (tree: unknown) => inspectDrawing(tree).spans;
-export const elements = (tree: unknown) => inspectDrawing(tree).nodes;

@@ -4,8 +4,6 @@ import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput, UiPane } from 'claude-code';
 import { register } from '../hooks/register';
 import type { QueueLines, QueuePaneState } from '../types/queue';
-import type { AccountsPaneState } from '../types';
-import type { StoredAccountsStatus } from '../types/accounts';
 import { CWD, drawnText, inspectDrawing, NOW, SESSION, sessionFixture } from './kit';
 
 const HOME = '/test-home';
@@ -870,9 +868,8 @@ for (const origin of ['person', 'plugin', 'unload'] as const) {
 }
 
 /** Direct host control makes the ordering of state reads and pane reopens explicit. */
-function tablePaneLifetimeHost() {
+function queuePaneLifetimeHost() {
   type Hook = (services: EngineInterface, event: unknown, next: (event: unknown) => Promise<unknown>) => unknown;
-  type StoredTablePane = QueuePaneState | AccountsPaneState<StoredAccountsStatus>;
   const hooks = new Map<string, Hook>();
   const collect = (event: string, ...args: unknown[]) => {
     const filter = args.length > 1 ? args[0] as { command?: string } : {};
@@ -880,14 +877,14 @@ function tablePaneLifetimeHost() {
     return { catch: () => {} };
   };
   register(collect as On, {});
-  const states = new Map<string, Record<string, StoredTablePane>>();
+  const states = new Map<string, Record<string, QueuePaneState>>();
+  const stateReads: string[] = [];
   const panes = new Set<string>();
   const runs: string[][] = [];
   const timers: { active: boolean; tick: () => void }[] = [];
   let failQueue = false;
   let queueWritten = () => {};
   let stateReadGate = { pending: Promise.resolve(), started: () => {}, armed: false };
-  let accountsGate = { pending: Promise.resolve(), started: () => {} };
   const services = {
     session: sessionFixture,
     env: { get: async () => HOME },
@@ -896,7 +893,6 @@ function tablePaneLifetimeHost() {
       open: async ({ id }: { id: string }) => { panes.add(id); return {}; },
       panes: async () => [...panes].map(id => ({ id })),
     },
-    fs: { stat: async () => ({ mtimeMs: NOW - 1 }) },
     clock: { now: async () => NOW, every: (_ms: number, tick: () => void) => {
       const timer = { active: true, tick };
       timers.push(timer);
@@ -904,6 +900,7 @@ function tablePaneLifetimeHost() {
     } },
     state: {
       get: async ({ key }: { key: string }) => {
+        stateReads.push(key);
         const value = states.get(key);
         if (stateReadGate.armed) {
           stateReadGate.armed = false;
@@ -912,26 +909,21 @@ function tablePaneLifetimeHost() {
         }
         return { value };
       },
-      set: async ({ key }: { key: string }, value: Record<string, StoredTablePane>) => {
+      set: async ({ key }: { key: string }, value: Record<string, QueuePaneState>) => {
         states.set(key, value);
         if (key === 'queuePanes' && ['queue', 'failed'].includes(value['build-queue']?.kind ?? '')) queueWritten();
       },
     },
     process: { run: async (argv: string[]) => {
       runs.push(argv);
-      const accounts = argv.includes(`${HOME}/.claude/scripts/accounts/accounts.py`);
-      if (accounts) {
-        accountsGate.started();
-        await accountsGate.pending;
-      }
-      const exitCode = !accounts && failQueue ? 1 : 0;
-      if (!accounts) failQueue = false;
-      return { exitCode, stdout: JSON.stringify(accounts ? { board: { columns: [], rows: [], stale_at: '2026-10-17T04:00:00+00:00' }, problems: [] } : snapshot()),
+      const exitCode = failQueue ? 1 : 0;
+      failQueue = false;
+      return { exitCode, stdout: JSON.stringify(snapshot()),
         stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
     } },
   } as unknown as EngineInterface;
   const dispatch = async (event: string, input: unknown) => hooks.get(event)!(services, input, async value => value);
-  return { states, panes, runs, timers, dispatch,
+  return { states, stateReads, panes, runs, timers, dispatch,
     failNextQueue: () => { failQueue = true; },
     tick: async () => {
       const written = new Promise<void>(resolve => { queueWritten = resolve; });
@@ -945,53 +937,43 @@ function tablePaneLifetimeHost() {
       stateReadGate.armed = true;
       return { started, finish };
     },
-    pauseAccountsRead: () => {
-      let finish = () => {};
-      const started = new Promise<void>(resolve => { accountsGate.started = resolve; });
-      accountsGate.pending = new Promise<void>(resolve => { finish = resolve; });
-      return { started, finish };
-    },
   };
 }
 
-for (const pane of [
-  { id: 'build-queue', command: 'build:queue', key: 'queuePanes', ready: 'queue' },
-  { id: 'accounts', command: 'showrunner:accounts', key: 'accountsPanes', ready: 'accounts' },
-]) {
-  test(`${pane.id}: an older close cannot erase state written by a reopened pane`, async () => {
-    const host = tablePaneLifetimeHost();
-    const open = () => host.dispatch(`command.run:${pane.command}`, { ...command(), command: pane.command });
-    await open();
-    const held = host.pauseStateRead();
-    const closing = host.dispatch('ui.close', { id: pane.id, origin: { kind: 'person' } });
-    await held.started;
-    try {
-      await open();
-      expect(host.states.get(pane.key)?.[pane.id]?.kind).toBe(pane.ready);
-    } finally { held.finish(); }
-    await closing;
-    expect(host.states.get(pane.key)?.[pane.id]?.kind).toBe(pane.ready);
-    expect(host.timers.filter(timer => timer.active).length).toBe(1);
-  });
-}
-
-test('reload reads and schedules the queue while the resumed accounts read is held', async () => {
-  const host = tablePaneLifetimeHost();
-  host.panes.add('accounts');
-  host.panes.add('build-queue');
-  const held = host.pauseAccountsRead();
-  const resuming = host.dispatch('session.start', start);
+test('an older close cannot erase state written by a reopened queue pane', async () => {
+  const host = queuePaneLifetimeHost();
+  const open = () => host.dispatch('command.run:build:queue', command());
+  await open();
+  const held = host.pauseStateRead();
+  const closing = host.dispatch('ui.close', { id: 'build-queue', origin: { kind: 'person' } });
   await held.started;
   try {
-    expect(host.runs).toContainEqual(READ);
-    expect(host.timers.filter(timer => timer.active).length).toBe(2);
+    await open();
+    expect(host.states.get('queuePanes')?.['build-queue']?.kind).toBe('queue');
   } finally { held.finish(); }
-  await resuming;
+  await closing;
   expect(host.states.get('queuePanes')?.['build-queue']?.kind).toBe('queue');
+  expect(host.timers.filter(timer => timer.active).length).toBe(1);
+});
+
+test('reload ignores saved Accounts state and schedules only the queue', async () => {
+  const host = queuePaneLifetimeHost();
+  const legacy = { accounts: { kind: 'accounts', data: null } };
+  host.states.set('accountsPanes', legacy as unknown as Record<string, QueuePaneState>);
+  host.panes.add('accounts');
+  host.panes.add('build-queue');
+  await host.dispatch('session.start', start);
+  expect(host.runs).toContainEqual(READ);
+  expect(host.timers.filter(timer => timer.active).length).toBe(1);
+  expect(host.states.get('queuePanes')?.['build-queue']?.kind).toBe('queue');
+  await host.tick();
+  expect(host.runs).toEqual([READ, READ]);
+  expect(host.stateReads.every(key => key === 'queuePanes')).toBe(true);
+  expect(host.states.get('accountsPanes')).toEqual(legacy);
 });
 
 test('a saved table pane without a selector resumes the whole queue', async () => {
-  const host = tablePaneLifetimeHost();
+  const host = queuePaneLifetimeHost();
   // Persisted input from the previous producer deliberately predates QueueLines.
   const legacy = { kind: 'queue', data: {
     running_header: [], running: [], waiting_header: [], waiting: [],
@@ -1007,7 +989,7 @@ test('a saved table pane without a selector resumes the whole queue', async () =
 
 for (const savedSelector of ['4', null] as const) {
   test(`legacy saved selector ${savedSelector} converts once and survives refresh and reload`, async () => {
-    const host = tablePaneLifetimeHost();
+    const host = queuePaneLifetimeHost();
     const legacy = { kind: 'queue', data: snapshot(), selector: savedSelector };
     host.states.set('queuePanes', { 'build-queue': legacy as unknown as QueuePaneState });
     host.panes.add('build-queue');
@@ -1023,7 +1005,7 @@ for (const savedSelector of ['4', null] as const) {
 }
 
 test('a failed card read retains its selector through a fresh module reload', async ($, on) => {
-  const host = tablePaneLifetimeHost();
+  const host = queuePaneLifetimeHost();
   host.failNextQueue();
   await host.dispatch('command.run:build:queue', command('4'));
   expect(host.states.get('queuePanes')?.['build-queue']?.kind).toBe('failed');
@@ -1046,7 +1028,7 @@ test('a failed card read retains its selector through a fresh module reload', as
 });
 
 test('an older reload cannot replace a card selected while its saved-state read is held', async () => {
-  const host = tablePaneLifetimeHost();
+  const host = queuePaneLifetimeHost();
   host.states.set('queuePanes', { 'build-queue': { kind: 'queue', data: snapshot(), selection: { kind: 'view' } } });
   host.panes.add('build-queue');
   const held = host.pauseStateRead();
