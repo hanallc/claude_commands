@@ -226,24 +226,29 @@ class MemoryHoverTests(unittest.TestCase):
         assert module_counter["kind"] == "RowProgress"
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
-        for name, counter, ordering_note in (
-            ("merge-gate", module_counter, True),
-            ("merge gate", module_counter, True),
-            ("fixture-project merge gate", module_counter, True),
-            ("merge-gate", test_counter, False),
+        for name, counter, ordering_note, used, parts in (
+            ("merge-gate", module_counter, True, 1, None),
+            ("merge gate", module_counter, True, 1, None),
+            ("fixture-project merge gate", module_counter, True, 1, None),
+            ("merge-gate", test_counter, False, 1, None),
+            ("merge-gate", test_counter, False, 4.7, list[dict[str, object]]()),
         ):
-            with self.subTest(name=name, unit=counter["unit"]):
-                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"read_at": 400, "walk": [{
+            with self.subTest(name=name, unit=counter["unit"], used=used, parts=parts):
+                data = {"read_at": 400, "walk": [{
                     "name": name, "unit": "fixture", "showrunner": "fixture-production", "started_at": 100,
-                    "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": "",
-                    "need": memory_feed.gib(hold.memory.need), "need_part": True, "progress": counter}]}))
+                    "used": used, "reserved": 0.5, "counted": used + 0.5, "queued": True, "keep_text": "",
+                    "need": memory_feed.gib(hold.memory.need), "need_part": True, "progress": counter,
+                    **({"parts": parts} if parts is not None else {})}]}
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", data))
                 self.assertEqual(hover[0], f"fixture · {name}  running 5 min")
-                lines = ["Showrunner  fixture-production", "Runs on  natedev", "Uses  1.0 GiB",
-                         "+ Build reserved  0.5 GiB", "= In queue cap  1.5 GiB",
+                lines = ["Showrunner  fixture-production", "Runs on  natedev", f"Uses  {used:.1f} GiB",
+                         "+ Build reserved  0.5 GiB", f"= In queue cap  {used + 0.5:.1f} GiB",
                          f"Testing  8 of 10 {counter['unit']}", "Done  80.0%"]
                 if ordering_note:
                     lines.append("Order  slowest first")
                 self.assertEqual(hover[1], "\n".join(lines))
+                label = self.page_expression("memoryAmount(shownReading(data).walk[0].used)", data)
+                self.assertEqual(label, f"{used:.1f} GiB")
         for row, expected in (({"between_steps": True, "used": 1, "reserved": 2}, "between steps"),
                               ({"used": {"kind": "RunUseUnavailable", "reason": "private memory.stat is missing"}, "reserved": 2}, "unavailable"),
                               ({"used": 1, "reserved": 0, "started_at": 100}, "running 5 min")):

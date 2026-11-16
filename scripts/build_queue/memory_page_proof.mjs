@@ -10,6 +10,7 @@
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Add --unadmitted after the output folder for one dark desktop app image.
+// Add --uses after the output folder for the queued build memory image.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdir} from 'node:fs/promises';
@@ -79,6 +80,7 @@ const folder = callerFolder ? resolve(callerFolder) : process.env.BUILD_FOLDER;
   const waitTipComparison = process.argv[4] === '--wait-tip';
   const macrouteComparison = process.argv[4] === '--macroute';
   const unadmittedProof = process.argv.includes('--unadmitted');
+  const usesProof = process.argv.includes('--uses');
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const now = Date.now() / 1000;
   for (const reading of Object.values(readings)) {
@@ -281,6 +283,52 @@ const folder = callerFolder ? resolve(callerFolder) : process.env.BUILD_FOLDER;
           return true;
         };
         proofModes: {
+        if (usesProof) {
+          await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
+          const reading = structuredClone(base);
+          const gib = 1024 ** 3;
+          reading.walk = [{...reading.walk.find(row => row.queued), name:'hana nextest',
+            used:4.7, reserved:0.5, counted:5.2, parts:[], started_at:now-120}];
+          reading.waiters = [];
+          reading.ram = {...JSON.parse(await readFile(join(folder,'legend_ram.json'),'utf8')),
+            queued_builds_bytes:4.7*gib, ci_bytes:0, build_target_bytes:0.5*gib,
+            build_covered_bytes:0.5*gib, build_missing_bytes:0, available_bytes:24.5*gib,
+            total_bytes:58.2*gib, cap_bytes:25.2*gib};
+          Object.assign(reading,{total:58.2,cap:25.2,taken:7.2});
+          await show(reading);
+          const proof = await evaluate(`(() => {
+            const row = document.querySelector('.wrow[data-run="0"]');
+            row.scrollIntoView({block:'center'});
+            const rowBox = row.getBoundingClientRect();
+            const tableBox = document.querySelector('tr[data-tip="row:0"]').getBoundingClientRect();
+            showTip('row:0', rowBox.right, rowBox.top - 8);
+            const tip = document.querySelector('#tip');
+            const tipBox = tip.getBoundingClientRect();
+            const left = Math.max(0, Math.floor(Math.min(rowBox.left,tableBox.left,tipBox.left)) - 12);
+            const top = Math.max(0, Math.floor(Math.min(rowBox.top,tableBox.top,tipBox.top)) - 12);
+            const right = Math.ceil(Math.max(rowBox.right,tableBox.right,tipBox.right)) + 12;
+            const bottom = Math.ceil(Math.max(rowBox.bottom,tableBox.bottom,tipBox.bottom)) + 12;
+            return {rows:tooltipRows('row:0',latest), label:row.querySelector('.used-amount').textContent,
+              barWidth:row.querySelector('.seg-used').getBoundingClientRect().width,
+              visible:tip.classList.contains('on'),
+              clipped:tipBox.left<0 || tipBox.right>innerWidth || tipBox.top<0 || tipBox.bottom>innerHeight,
+              clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+          })()`);
+          const amounts = Object.fromEntries(proof.rows.map(row => [row.label,row.value]));
+          assert.equal(amounts.Uses,'4.7 GiB');
+          assert.equal(amounts['+ Build reserved'],'0.5 GiB');
+          assert.equal(amounts['= In queue cap'],'5.2 GiB');
+          assert.equal(proof.label,'4.7 GiB');
+          assert.ok(proof.barWidth>0);
+          assert.equal(proof.visible,true);
+          assert.equal(proof.clipped,false);
+          const imagePath = join(folder,'uses-dark-desktop.png');
+          const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:proof.clip});
+          await writeFile(imagePath,Buffer.from(shot.data,'base64'));
+          await writeFile(join(folder,'uses-proof.json'),JSON.stringify({pass:true,theme:'dark',width:1400,...proof},null,2)+'\n');
+          console.log(JSON.stringify({pass:true,mode:'uses',images:[imagePath]}));
+          break proofModes;
+        }
         if (unadmittedProof) {
           await call('Emulation.setDeviceMetricsOverride', {width:1400,height:1200,deviceScaleFactor:1,mobile:false});
           await show(readings.unadmitted);

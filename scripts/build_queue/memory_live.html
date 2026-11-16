@@ -559,7 +559,7 @@ function shownReading(data) {
   ram.total_bytes = recorded(source.total_bytes)
     ? sum([builds,ram.available_bytes,legendBytes(ram,'else')]) : source.total_bytes;
   const rowMemory = row => {
-    const parts = row.parts?.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB}));
+    const parts = row.parts?.length ? row.parts.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB})) : null;
     const used = parts ? sum(parts.map(part => part.gib*GIB))/GIB
       : recorded(row.used) ? leaf(row.used*GIB)/GIB : row.used;
     const reserved = recorded(row.reserved) ? leaf(row.reserved*GIB)/GIB : 0;
