@@ -1901,3 +1901,14 @@ As built:
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
 - Until natedev's polkit rule (nixos 2ed52e5) is live, the reload is refused. The column shows "—", and the header hover says "natedev does not yet let the feed ask steve which build holds each token." CI, Mac and AWS rows always show "—".
 - Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).
+
+### Cap bar — Running bars stop at the cap line · status: done
+
+From builds: the reserved bar ran past the chart into the Stage column. "The bar must stop at the chart edge and show the over-cap state inside the chart."
+
+As built:
+
+- `placeMemoryBars` draws each local bar (build tools, CI, used, reserved, Free) with `capBox`. It cuts the bar at the cap line. A cut bar gets the `over-cap` class: square right corners and a 3px cap-colored end. Mac and cloud rows keep their own scale.
+- With a cap, a wait bar ends at the room end or the cap line, whichever is first. A need larger than the cap stops at the cap line.
+- When taken exceeds the cap, the Running header reads "X of Y GiB taken · Z GiB over cap" in the cap color.
+- Tests: `memory_page_proof.mjs` adds an over-cap reading (build tools grow past the cap, one wait needs cap + 10 GiB). It checks that no local bar ends past the cap line, the cut bar's cap-colored end, and the header text and color. The legend sum check skips this reading, because the legend rows then add to more than the cap total.

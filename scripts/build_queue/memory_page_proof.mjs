@@ -209,7 +209,8 @@ try {
         await navigate('memory_live.html');
 
         const proofs = [];
-        const show = async (reading, clearTip=true) => {
+        // An over-cap reading takes more than the cap total, so its legend rows exceed that total.
+        const show = async (reading, clearTip=true, legendSums=true) => {
           const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
@@ -228,7 +229,7 @@ try {
               .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
               .map(row=>row.querySelector('.v').textContent)}));
           })()`);
-          for(const group of totals) {
+          for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
             const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
@@ -793,6 +794,39 @@ try {
               await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
             }
             proof.capLine=capLine;
+            // Builds that take more than the cap stop at the cap line; a cut bar ends in the cap color.
+            const overReading=structuredClone(base), over=overReading.room+1;
+            Object.assign(overReading.ram,{build_tools_bytes:overReading.ram.build_tools_bytes+over*gib,
+              available_bytes:overReading.ram.available_bytes-over*gib,room_bytes:0});
+            overReading.room=0;
+            overReading.taken=overReading.cap+1;
+            // A waiting step that needs more than the cap also stops at the cap line.
+            overReading.waiters.find(row=>row.kind!=='cloud').need=overReading.cap+10;
+            await show(overReading,true,false);
+            if(theme==='dark'&&width===1400) {
+              const overClip=await evaluate(`(()=>{
+                const box=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:Math.floor(box.left),y:Math.floor(box.top+scrollY),width:Math.ceil(box.width)+1,height:Math.ceil(box.height)+1,scale:1};
+              })()`);
+              const overShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:overClip});
+              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(overShot.data,'base64'));
+            }
+            const overCap=await evaluate(`(() => {
+              const edge=document.querySelector('#walk .walk-bud').getBoundingClientRect().left+1;
+              const bars=[...document.querySelectorAll('#walk .wrow .track .b:not(.row-progress):not(.seg-remote)')]
+                .map(bar=>({cls:bar.className,right:bar.getBoundingClientRect().right}));
+              const cut=document.querySelector('#walk .track .b.over-cap');
+              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',sum:document.querySelector('#walk-sum').textContent,
+                sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,
+                cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor};
+            })()`);
+            assert.ok(overCap.bars.length>0,'The over-cap chart draws no bars.');
+            assert.ok(overCap.bars.some(bar=>bar.cls.includes('waitb')),'The over-cap chart draws no wait bar.');
+            for(const bar of overCap.bars) assert.ok(bar.right<=overCap.edge+0.5,'A bar runs past the cap line. '+JSON.stringify({bar,edge:overCap.edge}));
+            assert.ok(overCap.cut.includes(overCap.cap),'A bar cut at the cap has no cap-colored end. '+JSON.stringify(overCap));
+            assert.equal(overCap.sum,overReading.taken.toFixed(1)+' of '+overReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            assert.equal(overCap.sumColor,overCap.cap,'The over-cap total is not in the cap color.');
+            proof.overCap=overCap;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
             cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
