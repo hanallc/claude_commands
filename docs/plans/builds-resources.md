@@ -2637,3 +2637,47 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `scripts/agents/detached_runs.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `scripts/direct/test_verify_tree_cancel_lint.py`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and three as-built docs.
 
 **Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.
+
+### Phase 130 — The cutover deletes each free legacy gate folder after a Git rescue  · status: done
+
+#### As-built
+
+- `scripts/lint/gate_folders_delete.py --root <path> [--dry-run]` is a one-time cutover command. It reads no config key.
+- For each `<root>/<repository>/<gate>` it holds `scratch.removal_lock(gate)`, or `scratch.judgment_lock(gate)` with `--dry-run` (it creates no file). A held lock keeps the gate as busy.
+- Under the lock it keeps a gate that holds its own repository (a `.git` folder), or a linked worktree whose common Git directory lies inside the gate. Otherwise it rescues each linked worktree with `git_rescue.rescue(worktree, f"{name}-{stamp}", generated=[worktree / "target"])`. A `RescueError` keeps the gate.
+- It then deletes the gate and runs `git worktree prune --expire now` once in each source repository. It deletes empty repository folders. Dot-entries, files and symlinks at the root are kept.
+- Each decision prints one line: `deleted|would delete <path>: <n> GiB[; prune failed <source>: <error>]` or `kept <path>: <reason>`. Sizes use `sweep.gib`.
+- A filesystem error keeps that folder, and the run continues. The exit status is 1 when a gate is kept for a rescue failure or a filesystem error, or a prune fails; busy, repository and root-entry keeps give 0.
+- No signal handler, mask or disposition.
+
+**Files:** `scripts/lint/gate_folders_delete.py`, `scripts/lint/test_gate_folders_delete.py` (real Git fixtures under a temporary root).
+
+**Binds later work:** the cutover run on natedev, Thu 11-19, after build-folders Phase 4 is on main:
+1. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates --dry-run`. Read each line.
+2. The same command without `--dry-run`.
+3. Run step 2 again after each busy gate's task ends.
+The cutover removal commit deletes the script after the run.
+
+**Gotchas:** a `.git` file does not prove that the Git store is outside the gate (`git init --separate-git-dir`); resolve the common directory first. Rescue refs stay in each source under `refs/rescue/`.
+
+### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
+**Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
+**Depends on:** build-folders Phase 7 on main (planned Thu 11-19 morning), and devtools' stall watch on held lease owners on main first. Builds owns the order of `test_sweep.py` and `test_tmp_sweep.py` edits: claim them through berth and builds before an edit.
+
+#### Work Order
+
+**Spec:**
+1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
+2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
+3. Retire each competing managed-folder delete path after its legacy users drain.
+4. Keep `~/.cache` out of every root. Add no cleanup tool.
+
+**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+
+### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
+**Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
+
+#### As built
+
+- Removed 2026-11-16 before it reached main: queue's app memory gate (`scripts/build_queue/app_gate.py`) holds each `hana_shot.py launch` app's measured memory in the memory queue, so one way limits app launches. `config/hana_shot.conf` has no `local_app_cap` key.
+- `same_binary` stays: it matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS). A reused pid that runs another program, a path prefix, or a process that exits during the read gives `False`, so `shutdown` signals no reused Mac pid. The `shutdown` test in `LaunchRecordRecoveryTests` covers it.

@@ -577,7 +577,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return held
 
 
-def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold every lease lock below path without following links. False when an owner holds one."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
@@ -587,7 +587,7 @@ def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if not _hold_free_lease(Path(top) / stem, directory, stack):
+                if not _hold_free_lease(Path(top) / stem, directory, stack, wait=wait):
                     return False
     return True
 
@@ -672,13 +672,21 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
-    """Remove a folder and its records when no process holds its lock."""
-    def cleanup() -> None:
+    """Remove a folder and its records when no process holds its lock or a lease below it."""
+    def cleanup() -> bool:
         try:
             allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
-            return
-        _remove_folder(path, directory, allocated)
+            return True
+        with ExitStack() as children:
+            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
+            try:
+                if not _hold_child_leases(path, children, wait=wait):
+                    return False
+            except OSError:
+                return False
+            _remove_folder(path, directory, allocated)
+        return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
 
