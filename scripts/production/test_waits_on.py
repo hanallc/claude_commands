@@ -32,6 +32,43 @@ class WaitsOnTests(unittest.TestCase):
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
+    def test_bulk_phase_merges_keep_the_newest_commit_time_with_one_read(self) -> None:
+        output = ("a" * 40 + "\0" + "200\0Merge builds phase 5 (1234567) into sdlc\n"
+                  + "b" * 40 + "\0" + "100\0Merge builds phase 5 (7654321) into sdlc\n"
+                  + "c" * 40 + "\0" + "300\0Revert Merge builds phase 6 (1234567) into sdlc\n"
+                  + "d" * 40 + "\0" + "400\0Merge other phase 5 (1234567) into sdlc\n"
+                  + "e" * 40 + "\0" + "500\0Merge upper phase 5 (ABCDEF1) into sdlc\n")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.landed_phases(self.repo), {
+                ("builds", "5"): waits_on.PhaseMerge("a" * 40, 200, "1234567"),
+                ("other", "5"): waits_on.PhaseMerge("d" * 40, 400, "1234567"),
+                ("upper", "5"): waits_on.PhaseMerge("e" * 40, 500, "abcdef1")})
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--merges", "--format=%H%x00%ct%x00%s")
+
+    def test_main_commit_identities_use_one_read_and_ignore_bad_records(self) -> None:
+        output = "100\0Checkpoint delivery\n101\0Checkpoint delivery\n100\0Other delivery\nbad\0Invalid time\nmissing separator\n"
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 0, output, "")) as read:
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset({
+                waits_on.CommitIdentity(100, "Checkpoint delivery"), waits_on.CommitIdentity(101, "Checkpoint delivery"),
+                waits_on.CommitIdentity(100, "Other delivery")}))
+        read.assert_called_once_with(self.repo, "log", "origin/main", "--no-merges", "--format=%at%x00%s")
+        with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], 128, output, "unreadable")):
+            self.assertEqual(waits_on.main_commit_identities(self.repo), frozenset())
+
+    def test_copied_commit_requires_both_identity_fields_and_a_readable_commit(self) -> None:
+        identities = frozenset({waits_on.CommitIdentity(100, "Checkpoint delivery")})
+        for output, status, expected in (("100\0Checkpoint delivery\n", 0, True),
+                                         ("101\0Checkpoint delivery\n", 0, False),
+                                         ("100\0Other delivery\n", 0, False),
+                                         ("100\0Checkpoint delivery\n", 128, False), ("", 128, False)):
+            with self.subTest(output=output, status=status):
+                with patch.object(waits_on, "git", return_value=subprocess.CompletedProcess([], status, output, "")) as read:
+                    self.assertEqual(waits_on.copied_on_main(self.repo, "a" * 40, identities), expected)
+                read.assert_called_once_with(self.repo, "show", "-s", "--format=%at%x00%s", "a" * 40)
+        with patch.object(waits_on, "git") as read:
+            self.assertFalse(waits_on.copied_on_main(self.repo, "a" * 40, frozenset()))
+        read.assert_not_called()
+
     def test_each_kind_of_work_has_a_state(self) -> None:
         base = commit_repository(self.repo, "base", allow_empty=True)
         _ = self.git("switch", "-q", "-c", "builds-589")
@@ -147,7 +184,21 @@ class WaitsOnTests(unittest.TestCase):
                 item = unit_queue.QueuedItem("Read delivery", reference)
                 self.assertEqual(unit_phases.queued_text(item, found, view, now=0, zone=ZoneInfo("UTC"),
                     unit="handler", phase_ids=phase_ids).state_text,
-                    f"After {label}; {unit_phases.wait_text(found, view, now=0, zone=ZoneInfo('UTC'))}")
+                    f"After {label}; " + ("not on main yet" if isinstance(found, waits_on.NotFound)
+                        and label.startswith("commit ") else unit_phases.wait_text(found, view, now=0, zone=ZoneInfo('UTC'))))
+
+    def test_missing_commits_wait_for_main_without_a_missing_dependency_claim(self) -> None:
+        view = land_queue.LandView({}, {}, {}, frozenset(), {})
+        for reference, phase_ids, expected in (
+                ("e75b8ec06", (), "After commit e75b8ec06; not on main yet"),
+                ("E75B8EC06" + "A" * 31, (), "After commit E75B8EC06; not on main yet"),
+                ("e75b8ec06", ("e75b8ec06",), "After e75b8ec06; dependency not found locally"),
+                ("other/23", (), "After other phase 23; dependency not found locally"),
+                ("missing-ref", (), "After missing-ref; dependency not found locally")):
+            with self.subTest(reference=reference, phase_ids=phase_ids):
+                entry = unit_phases.queued_text(unit_queue.QueuedItem("Read delivery", reference), waits_on.NotFound(),
+                    view, now=0, zone=ZoneInfo("UTC"), unit="handler", phase_ids=phase_ids)
+                self.assertEqual(entry.state_text, expected)
 
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
@@ -174,7 +225,7 @@ class WaitsOnTests(unittest.TestCase):
             (waits_on.NotOnMain("c" * 40), frozenset(), {"c" * 40: failed},
              "After branch builds/589; 10th in the merge line; last attempt failed at red: test_x red; 13:30"),
             (waits_on.PhaseSent("c" * 40), frozenset({"c" * 9}), {}, "After builds phase 589; merging now"),
-            (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; absent from the local copy of main"),
+            (waits_on.NotOnMain("d" * 40), frozenset(), {}, "After branch builds/589; not on main yet"),
             (waits_on.PhaseOpen(now + 3600), frozenset(), {}, "After builds phase 589; started"),
             (waits_on.PhaseOpen(None), frozenset(), {}, "After builds phase 589; started"),
             (waits_on.PhaseNotStarted(), frozenset(), {}, "After builds phase 589; not started"),
