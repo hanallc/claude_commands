@@ -21,7 +21,7 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Literal, NamedTuple, TypedDict, cast
 from enum import Enum
 
@@ -283,7 +283,7 @@ def status_rows(unit: str, status: str, machine: tuple[str, ...], record: object
 
 def status_table(rows: list[tuple[str, ...]], *, machines: bool, show_plan_eta: bool, columns: int | None) -> str:
     """Render the status table and its Progress legend."""
-    headers: tuple[str, ...] = ("Unit", "Status", *(("Machine",) if machines else ()), "Progress", "Phase",
+    headers: tuple[str, ...] = ("Unit", "Director", *(("Machine",) if machines else ()), "Progress", "Phase",
                                 "ETA Next", "ETA Plan")
     if not show_plan_eta:
         headers = headers[:-1]
@@ -372,7 +372,7 @@ def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo) -> str
         case land_queue.LandRunning():
             return "merging now"
         case land_queue.InLine(place, failed, carried):
-            text = (f"merges with {place.owner}; " if carried else "")
+            text = (f"merges with {place.carrier_name}; " if carried else "")
             text += f"{ordinal(place.number)} in the merge line"
             return f"{text}; last attempt {try_text(failed, now=now, zone=zone)}" if failed else text
         case land_queue.LandEnded(result) if result["landed"]:
@@ -458,7 +458,7 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
-               production: str = "") -> UnitMergeNotes:
+               production: str = "", merged_ids: Collection[str] = ()) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
     titles = dict(phase_titles)
@@ -477,9 +477,9 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
 
     def own(owner: str) -> str:
         phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
-        return "" if helper(phase) else phase
+        return "" if helper(phase) or phase in merged_ids else phase
 
-    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase)}
+    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in merged_ids}
     merging: list[str] = []
     items: dict[int, list[str]] = {}
     for phase, sent in open_sent.items():
@@ -499,23 +499,25 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if (phase := own(place.owner)) and phase not in items.setdefault(place.number, []):
             items[place.number].append(phase)
     queued = {phase for phases in items.values() for phase in phases}
-    newest: dict[str, land_runs.LandResult] = {}
+    newest_results: dict[str, land_runs.LandResult] = {}
     for result in land.results.values():
         phase = result["phase"]
-        if (result["unit"] == unit and not helper(phase)
-                and (phase not in newest or result["time"] > newest[phase]["time"])):
-            newest[phase] = result
+        if result["unit"] != unit or helper(phase) or phase in merged_ids:
+            continue
+        previous_result = newest_results.get(phase)
+        if previous_result is None or result["time"] > previous_result["time"]:
+            newest_results[phase] = result
     wait_targets: set[str] = set()
     holds: dict[str, phase_waits.UnitWait] = {}
     for wait in unit_waits:
-        if helper(wait.target):
+        if helper(wait.target) or wait.target in merged_ids:
             continue
         sent = open_sent.get(wait.target, NoSentWork())
+        result = newest_results.get(wait.target)
         if (wait.target not in done_ids and isinstance(sent, NoSentWork)
-                and wait.target not in queued and wait.target not in merging and wait.target not in newest):
+                and wait.target not in queued and wait.target not in merging and result is None):
             continue
         wait_targets.add(wait.target)
-        result = newest.get(wait.target)
         if (wait.target in queued or wait.target in merging
                 or result is not None and (not isinstance(sent, SentCommit) or result["commit"] == sent.commit)):
             continue
@@ -550,7 +552,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         state = land_queue.land_state(land, sent.commit) if isinstance(sent, SentCommit) else land_queue.LineUnused()
         if phase in holds:
             text = unit_wait_state(holds[phase], now=now, zone=zone)
-        elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine):
+        elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
             when = event_time({"timestamp_epoch": sent.timestamp_epoch}, now=now, zone=zone)
             line = f"{production}'s merge line" if production else "the merge line"
             text = f"Checkpoint {sent.commit[:9]} at {when}; not in {line}"
@@ -562,7 +564,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if isinstance(open_sent.get(phase, NoSentWork()), NoSentWork):
             parts.append(WorkItem(named(phase), unit_wait_state(wait, now=now, zone=zone)))
             pending = True
-    for phase, result in newest.items():
+    for phase, result in newest_results.items():
         if (not result["landed"] and phase not in open_sent and phase not in queued and phase not in merging
                 and not on_main(result["commit"])):
             parts.append(WorkItem(named(phase), merge_state_text(land_queue.LandEnded(result), production or result["production"])))
@@ -582,7 +584,7 @@ def completed_unit_phases(events: Sequence[dict[str, object]]) -> dict[str, Phas
             instances[str(event.get("phase_instance_id", ""))] = phase
             phases[phase] = []
             completed.discard(phase)
-        if phase in phases:
+        if phase in phases and phase not in completed:
             phases[phase].append(event)
             if kind == "phase_finished" and event.get("status") == "completed":
                 completed.add(phase)
@@ -709,10 +711,10 @@ def wait_text(found: waits_on.WaitState, land: land_queue.LandView, *, now: floa
         case waits_on.NotOnMain(commit):
             state = land_queue.land_state(land, commit)
             if isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
-                return "absent from the local copy of main"
+                return "not on main yet"
             if isinstance(state, land_queue.InLine | land_queue.LandRunning):
                 return land_text(state, now=now, zone=zone)
-            return f"absent from the local copy of main; {land_text(state, now=now, zone=zone)}"
+            return f"not on main yet; {land_text(state, now=now, zone=zone)}"
         case waits_on.PhaseOpen():
             return "started"
         case waits_on.PhaseNotStarted():
@@ -732,6 +734,8 @@ def dependency_text(reference: str, unit: str, found: waits_on.WaitState, *, sta
     owner, slash, phase = reference.partition("/")
     hexadecimal = re.fullmatch(r"[0-9a-fA-F]{7,40}", reference) is not None
     if reference not in phase_ids and (isinstance(found, waits_on.OnMain | waits_on.NotOnMain) or hexadecimal):
+        if hexadecimal and isinstance(found, waits_on.NotFound):
+            state = "not on main yet"
         return f"After commit {reference[:9]}; {state}" if hexadecimal else f"After branch {reference}; {state}"
     if not slash or owner == unit:
         target = phase if slash else reference
@@ -1357,12 +1361,29 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
     zone = user_zone() if zone is None else zone
     view = census_view(census_read)
     land = land_queue.land_view(REPOSITORY)
+    phase_merges = waits_on.landed_phases(REPOSITORY)
+    main_identities = waits_on.main_commit_identities(REPOSITORY)
+    merge_times = {key: float(merge.timestamp_epoch) for key, merge in phase_merges.items()}
+    landed_commits: dict[tuple[str, str], set[str]] = {}
+    for result in land.results.values():
+        if result["landed"]:
+            key = (result["unit"], result["phase"])
+            landed_commits.setdefault(key, set()).add(result["commit"].lower())
+            recorded = cast(object, result.get("time"))
+            if not isinstance(recorded, str):
+                continue
+            try:
+                at = datetime.fromisoformat(recorded).timestamp()
+            except ValueError:
+                continue
+            merge_times[key] = max(merge_times.get(key, at), at)
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
     plan_failures: dict[Path, str] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
     wait_states: dict[str, waits_on.WaitState] = {}
     main_states: dict[str, bool] = {}
+    copied_states: dict[str, bool] = {}
 
     def read_run(path: Path) -> list[dict[str, object]]:
         if path not in events:
@@ -1392,6 +1413,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         if commit not in main_states:
             main_states[commit] = waits_on.on_main(REPOSITORY, commit)
         return main_states[commit]
+
+    def copied_on_main(commit: str) -> bool:
+        if commit not in copied_states:
+            copied_states[commit] = waits_on.copied_on_main(REPOSITORY, commit, main_identities)
+        return copied_states[commit]
 
     unit_snapshot = staff.StaffSnapshot(tuple(unit.member for unit in units if isinstance(unit.member, staff.StaffRow)))
     newest = newest_unit_runs(unit_snapshot)
@@ -1450,13 +1476,36 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         open_sent = {phase.phase: phase_sent_work([
             event for event in run_events if event.get("phase_instance_id") == phase.instance_id]) for phase in phases}
         waits = phase_waits.unit_waits(run_events)
-        done = completed_unit_phases(run_events) if waits else {}
+        done = completed_unit_phases(run_events)
+        merged_phases: set[str] = set()
+        for (owner, phase), at in merge_times.items():
+            if owner != unit.unit or phase in open_sent:
+                continue
+            sent = done.get(phase, NoSentWork())
+            if not isinstance(sent, SentCommit):
+                merged_phases.add(phase)
+            elif isinstance(sent.timestamp_epoch, CheckpointTimeUnrecorded):
+                subject = phase_merges.get((owner, phase))
+                if subject is not None and sent.commit.lower().startswith(subject.checkpoint_commit):
+                    merged_phases.add(phase)
+            elif at >= sent.timestamp_epoch:
+                merged_phases.add(phase)
+        for phase, sent in done.items():
+            if phase in open_sent or phase in merged_phases or not isinstance(sent, SentCommit):
+                continue
+            if (sent.commit.lower() in landed_commits.get((unit.unit, phase), ())
+                    or on_main(sent.commit) or copied_on_main(sent.commit)):
+                merged_phases.add(phase)
+            else:
+                open_sent[phase] = sent
+        waits = [wait for wait in waits if wait.target not in merged_phases]
         for wait in waits:
-            if wait.target in done and wait.target not in open_sent:
+            if (wait.target in done and wait.target not in open_sent
+                    and not isinstance(done[wait.target], SentCommit)):
                 open_sent[wait.target] = done[wait.target]
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
-                           production=production_name)
+                           production=production_name, merged_ids=frozenset(merged_phases))
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan, wait_state=wait_state,

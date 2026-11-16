@@ -534,9 +534,9 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         for subject, count in (("checkpoint(alpha): final change", 1), ("queue(7): final change", 2)):
             with self.subTest(subject=subject):
                 _ = self.checkpoint(content=f"draft for {subject}\n",
-                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result")
+                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result | image 012345abcdef")
                 final = self.checkpoint(content=f"final for {subject}\n",
-                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result")
+                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result | image 012345abcdef")
                 with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
                     accepted = self.run_checkpoint(final)
                 self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
