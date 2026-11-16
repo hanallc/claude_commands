@@ -1,6 +1,6 @@
 # Style refill in Rust
 
-Status: proposed design, 2026-11-16. Phases 1–5 are complete. Phases 6–12 are proposed.
+Status: 2026-11-16. Phases 1–6 are complete. Phases 7–12 continue as phases S3–S8 of docs/plans/cargo-style.md, after its move and API phases.
 
 The showrunner selected Rust for selection. SQLite remains the ledger. The user controls the switch to Rust.
 
@@ -621,6 +621,278 @@ Do not exclude proposal commands, reconciliation, cache writes, or retries from 
 A command with many authoritative edits must report those edits and their cost separately.
 Acceptance fixtures include ordinary ticket assignment and declaration-follow publication.
 
+## Selection contract
+
+Phase 6 measures the existing Python `COUNT` calculation.
+It adds no production selector or publication path.
+The native request below defines the boundary for phases 7–12.
+Its schema admission and source triggers remain phase 10 work.
+
+### Request and reply
+
+The capture CLI uses `capture --repo --ledger --unit --folder`.
+The replay CLI uses `replay --folder --workspace --reader python|rust`.
+The measurement CLI uses `measure --folder --workspace --reader rust --stages`.
+A replay creates a new ledger copy and clears only derived tables.
+A measurement creates separate cold and warm worker processes.
+
+| JSON value | Required fields and meaning |
+| --- | --- |
+| Capture manifest | `format: 1`, `repo`, `unit`, `schema`, `schema_version`, `versions`, `revisions`, `references`, `objects`, `files`, `absent_inputs`, `directories`, `worktree_status`, `environment`, `tools`, `board` |
+| Copied file | `source`, relative `copy`, `sha256`, `kind`, `replay`; every copied input has a hash |
+| Source projection | `table`, ordered `columns`, `version_triggers`; an empty trigger list means no direct source-version trigger |
+| Revision observation | Synced commit, unit/main/pushed tips, checkpoint pairs, and explicit `absent` references |
+| Object observation | Object ID to Git type or `missing`; objects remain in the source repository |
+| Replay report | `result_digest`, `external_changes`, `cleared_tables`, `stored`, `stages`, `run` |
+| External change | `source`, `expected`, `actual`; values are SHA-256 hashes, revision IDs, or `missing` |
+| Stage report | `seconds`, `calls`, `counters`, `git_commands`, `repeated_work` |
+| Proposed native request | `protocol`, `mode`, `repository`, `observation`, `build`, `unit`, `families`, `policy`, `external_inputs` |
+| Proposed observation | Ledger identity, schema, version vector, source projections, resolved revisions, and required object availability |
+| Proposed native reply | Observation identity, ordered stage values, counts, ordered candidate tickets, ordered reasons, object requirements, and proposed actions |
+
+The native schema definitions below describe the proposed boundary.
+They do not add validation to production in phase 6.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": ["protocol", "mode", "repository", "observation", "build", "unit", "families", "policy", "external_inputs"],
+      "properties": {
+        "protocol": {"const": 1},
+        "mode": {"enum": ["count", "assign"]},
+        "repository": {"type": "string"},
+        "observation": {"$ref": "#/$defs/observation"},
+        "build": {"type": "object", "additionalProperties": {"type": "string"}},
+        "unit": {"type": "string"},
+        "families": {"type": "array", "items": {"enum": ["names", "types", "values", "modules"]}},
+        "policy": {"type": "object"},
+        "external_inputs": {"type": "array", "items": {"type": "object", "required": ["source", "sha256", "kind"]}}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["database", "schema", "source_versions", "revisions", "source_projection", "object_requirements"],
+      "properties": {
+        "database": {"type": "string"},
+        "schema": {"type": "integer"},
+        "source_versions": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "revisions": {"type": "object", "additionalProperties": {"type": "string"}},
+        "source_projection": {"type": "array", "items": {"type": "object", "required": ["table", "columns"]}},
+        "object_requirements": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "reply": {
+      "type": "object",
+      "required": ["observation_identity", "stages", "counts", "candidates", "reasons", "objects", "actions"],
+      "properties": {
+        "observation_identity": {"type": "string"},
+        "stages": {"type": "array", "items": {"type": "object"}},
+        "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "candidates": {"type": "array", "items": {"type": "object"}},
+        "reasons": {"type": "array", "items": {"type": "object"}},
+        "objects": {"type": "array", "items": {"type": "string"}},
+        "actions": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  }
+}
+```
+
+The current digest covers selection, candidate tickets, cells, and declaration proofs.
+It preserves order, paths, lines, reasons, and refusal types.
+It canonicalizes dictionary keys and explicitly unordered sets.
+It excludes measurements and process identities.
+`COUNT` does not prove assignment, recovery, dispatch, or concurrent publication.
+Phase 9 must compare those behaviors before the native selector replaces them.
+
+### Build identity and external reads
+
+| Identity | Captured fields |
+| --- | --- |
+| Implementation | Git commit, tracked selection diff hash, and hashes of all Python selection files, including new files |
+| Reader | Committed reader source tree ID and installed binary stamp bytes |
+| Tools | Python version, Git version, and complete ripgrep version output |
+| Locale | `LC_ALL`, `LC_CTYPE`, `LANG`; unset values remain unset |
+| Rule interpreter | Captured rule bytes, rule blob IDs in the copied source rows, and implementation identity |
+
+| External input | Capture | Replay |
+| --- | --- | --- |
+| Style configuration | Effective repository and local `*.conf` files | Private `CONF_DIR`; only its reader setting changes |
+| Global rules | Every `rust/*.md` file | `STYLE_HISTORY_NATE_STYLE_DIR` selects captured files |
+| Staff rows | The staff JSON file | `STAFF_FILE` selects the captured file |
+| Staff configuration | Explicit staff configuration, when set | Existing `STAFF_CONFIG` selects the captured file |
+| Lint configuration | Global cargo-mend configuration | Existing `XDG_CONFIG_HOME` selects the captured file |
+| Git XDG configuration | The Git configuration under the original XDG root | Existing `XDG_CONFIG_HOME` selects the captured file |
+| Ripgrep configuration | Configured file and referenced ignore files | Existing `RIPGREP_CONFIG_PATH` selects captured configuration; referenced ignore paths retain hash comparison |
+| Repository rules and manifests | Files from the repository | Original paths; hash comparison |
+| Ignore and attribute files | `.gitignore`, `.ignore`, `.rgignore`, Git excludes and attributes | Original paths; hash comparison |
+| Other Git configuration | Local Git configuration and `~/.gitconfig` | Original paths; hash comparison |
+| Implementation policies | TOML files under `config`, `scripts/style`, and `scripts/production` | Original paths; hash comparison |
+| Ripgrep executable | Executable bytes and complete version output | Original executable; hash comparison |
+| Production document and plans | Production document, unit `.unit.toml` files, and resolved unit plans | Original paths; hash comparison |
+| Proposals | Proposal Markdown files and directory membership | Original paths; file and membership hash comparison |
+| Working files | Tracked and untracked files plus Rust and ignore files from participating worktrees | Original paths; file and Git status comparison |
+| Board | JSON from `cargo-berth board --json`, including a nonzero-status envelope | Read the board again and compare the JSON hash |
+| Revisions | Resolved named references and presence | Resolve again and report changed IDs or presence |
+| Git objects | IDs and availability | Keep the source object store; the existing reader handles missing objects |
+
+Replay compares unconfigured inputs before selection.
+It reports differences and adds no refusal.
+It does not freeze unconfigured inputs during selection.
+The production proof must report those differences beside its digest.
+Phase 9 owns concurrent-change fixtures and stale-publication rejection.
+
+### Mutation boundaries
+
+The following order describes the existing path and the required native publication boundary.
+Only derived cache publication occurs in this phase's private `COUNT` runs.
+
+1. Observe source rows, rules, revisions, approvals, and busy files.
+2. Calculate declaration follows, coverage, footprints, rank, sync waits, and candidate order.
+3. Publish derived facts separately from authoritative ticket changes.
+4. Validate the observation before authoritative publication in phase 9.
+5. Apply existing finding follows, withdrawals, waivers, and decision closures in their existing order.
+6. Allocate or reuse the ticket and record its approved findings and pinned rules.
+7. Assign the ticket and start its proposal documents.
+8. Write the phase document and preserve existing recovery records.
+9. Dispatch the worker through the existing Python adapter.
+
+The native port must preserve each existing transaction and recovery boundary.
+It must not combine document changes with an assumed SQLite transaction.
+
+### Source projection audit
+
+The manifest records every column and trigger name from the admitted schema.
+The table below records schema 47 from the production backup.
+It includes a conservative source superset for selection and later publication checks.
+No missing trigger becomes an implicit warm-reuse guarantee.
+
+| Table | Columns | Direct version trigger |
+| --- | --- | --- |
+| `bulk_refusals` | `finding_id, ticket, reason, at` | missing |
+| `bulk_workspace_tickets` | `ticket, batch` | missing |
+| `finding_needs` | `finding_id, path, recorded_at` | present |
+| `fold_withdrawals` | `finding_id, unfolded_at` | missing |
+| `handoffs` | `checkpoint, state, merge_commit, sent_to, created_at, updated_at` | missing |
+| `held_cell_corrections` | `judgment_id, ticket, rule, path, old_outcome, new_outcome, finding_ids, corrected_at` | present |
+| `held_findings` | `finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, state, proposal, created_at, updated_at, build_ticket, moved_from, withdrawn_by, person_read_by, duplicate_of, unwaived_by, followed_from, followed_from_line, followed_at, declaration_gone_at, waive_provenance, waived_by, built_at, anchor_commit, followed_from_commit` | present |
+| `invalidated_held_judgments` | `judgment_id, recorded_at` | present |
+| `judgments` | `id, rule, rule_blob, input_scope, input_fingerprint, path, commit, verdict, verdict_detail, ticket, worker, recorded_at, declared_scope, read_files, generation` | present |
+| `lint_runs` | `id, tip, tree, tool, scope, config_hash, passed, diagnostics_json, rule_blobs_json` | present |
+| `processed_tips` | `tip, processed_at, reason` | missing |
+| `reconciliation` | `id, branch_point` | missing |
+| `refill_results` | `unit, at, outcome, split_at, ready, changed, structure, other` | missing |
+| `refill_rows` | `source_table, source_key, version, present` | missing |
+| `refill_tables` | `source_table, version, applied_version` | missing |
+| `rename_dispositions` | `finding_id, name, line, text, kind, reason` | present |
+| `rename_outer_binding_blocks` | `finding_id, name, line, text` | present |
+| `rule_body_withdrawals` | `finding_id, rule_blob` | present |
+| `rule_candidates` | `ticket, unit, path, line, idea, created_at` | missing |
+| `rule_generations` | `rule, rule_blob, generation` | present |
+| `rule_texts` | `blob, text` | present |
+| `schema_version` | `version` | missing |
+| `sync` | `id, tip, style_branch, synced_at` | present |
+| `sync_waits` | `unit, since, token` | missing |
+| `ticket_batch_owners` | `ticket, batch` | present |
+| `ticket_counter` | `id, value` | missing |
+| `ticket_predecessors` | `ticket, predecessor` | present |
+| `ticket_proposals` | `ticket, proposal` | present |
+| `ticket_widened_paths` | `ticket, path, reason, widened_by, widened_at` | present |
+| `ticket_yields` | `ticket, path, recorded_at` | present |
+| `tickets` | `id, unit, kind, family, rule, crate, files, sites, rules, rule_blobs, state, branch, checkpoint, created_at, updated_at, base, proposal, cells, finding_ids, reservation_session_dir, reservation_phase` | present |
+
+`refill_tables`, `refill_rows`, and `refill_results` retain source tracking and report state during benchmark resets.
+The reset clears `refill_dependencies`, `refill_candidates`, `refill_cells`, `refill_findings`, `refill_inputs`, `refill_objects`, `listed_sites`, and `listed_rules`.
+The audit does not add triggers or a schema-admission migration.
+Phase 10 must establish both before native warm reuse.
+
+### Stage proof
+
+The wrappers run only inside the measurement worker.
+The wrappers measure exclusive time across instrumented boundaries.
+The reader time includes request lifetime and Python JSON consumption.
+The external time includes rule parsing.
+The encoding time includes derived result encoding and identity encoding.
+SQLite read time includes source reads and derived reads.
+Uninstrumented work and wrapper overhead remain in the wall time.
+Process-tree RSS can count shared pages more than once.
+Each command still runs inside `MemoryMax=2G`, with no swap.
+
+Production capture: `/build/claude/scratch/sdlc-style-impl-7638dd-capture`.
+The capture contains 7,892 files and schema 47.
+It records 31 source tables, including 18 tables with direct version triggers.
+Of 3,257 recorded Git IDs, 3,160 are present and 97 are missing.
+The manifest records each missing ID.
+The existing readers retain their missing-object behavior.
+
+Every replay and both measured runs produced this digest:
+
+`4bda89230904df370397d43172f948c5973d54618911ba775816558f3c1fe92b`
+
+| Replay | Wall seconds | Process-tree peak RSS bytes |
+| --- | ---: | ---: |
+| rust-1 | 350.8289655779954 | 2478026752 |
+| rust-2 | 288.27590806098306 | 2502213632 |
+| python-1 | 346.79425739400904 | 1970212864 |
+| python-2 | 439.91174457300804 | 2149498880 |
+
+| Rust stage | Cold seconds | Warm seconds |
+| --- | ---: | ---: |
+| Python start | 0.9711234039859846 | 0.9197803089919034 |
+| SQLite reads | 17.535391288722167 | 15.345986451604404 |
+| External reads and rule parsing | 6.808229167800164 | 6.164705216069706 |
+| Shared Git boundary | 14.725822237407556 | 3.319966431503417 |
+| Reader requests and consumption | 32.964953131595394 | 7.449806957942201 |
+| Derived and identity encoding | 11.402108143578516 | 2.5921664996421896 |
+| SQLite writes and publication | 8.589815672603436 | 0.025341950939036906 |
+| Instrumented declaration comparisons | 32.43234390389989 | 0.0 |
+| Other work and instrumentation | 147.20881067839218 | 30.24807609830168 |
+| Complete worker wall time | 272.6385976279853 | 66.06582991499454 |
+
+The Git time covers `run_git` calls.
+The subprocess counter also includes Git starts outside that boundary.
+The revision-pair count uses distinct argument pairs for `diff`, `merge-base`, and `rev-list`.
+It does not add resolution calls.
+
+| Counter | Rust cold | Rust warm |
+| --- | ---: | ---: |
+| Filed findings | 14726 | 14726 |
+| Candidate tickets | 256 | 256 |
+| Git subprocess starts | 11052 | 2671 |
+| Reader requests | 689 | 15 |
+| Distinct revision argument pairs | 1188 | 23 |
+| Declaration searches | 21397 | 0 |
+| Declaration comparisons | 1563913 | 0 |
+| Rule catalog loads | 93 | 93 |
+| Rule file loads | 6603 | 6603 |
+| Distinct rule file paths | 82 | 82 |
+
+The cold declaration loop makes 21,397 searches and 1,563,913 item comparisons.
+Its inner work grows with findings and candidate declarations.
+The rule loop makes 93 catalog loads and 6,603 file loads across 82 physical paths.
+Each catalog load scans its selected rule files again.
+Warm reuse removes declaration comparisons but retains repeated rule catalog loads.
+
+The measured cold peak is 2500218880 bytes of summed process-tree RSS.
+The warm peak is 912678912 bytes.
+Shared pages can appear in more than one process's RSS.
+The enforced cgroup limit remains 2 GiB.
+These sequential runs do not establish a speed improvement over phase 5.
+
+The replay reports record board changes and proposal directory membership changes.
+Those unconfigured inputs remain live, as the capture policy requires.
+Digest equality does not prove that those inputs stayed frozen during selection.
+
+All temporary replay and measurement workspaces were removed.
+The capture remains available for the director.
+The full Python suite passed 2,347 tests, with 27 skipped.
+The focused pair passed three tests.
+The four changed Python files passed types with zero errors, warnings, or notes.
+
+
 ## Phases
 
 Estimates are active elapsed hours for one director and a shared pool of two Codex workers.
@@ -636,7 +908,7 @@ Each phase must finish its proof before dependent integration.
 | 3 | done | Python client and reader switch | — | Equal refill results | Complete |
 | 4 | done | Remove Rust blob persistence | — | Equal result, row and time measurements | Complete |
 | 5 | done | Module-scan declarations and crate-root reuse | — | Stage differential proof | Complete |
-| 6 | todo | Observation contract, parity capture, source audit, stage measurements | **Depends on:** 5 | Frozen-input repeatability; complete source inventory; concurrent-write fixtures | 6–10 h |
+| 6 | done | Observation contract, parity capture, source audit, stage measurements | **Depends on:** 5 | Frozen-input repeatability; complete source inventory; concurrent-write fixtures | 6–10 h |
 | 7 | todo | Declaration outcomes, site evidence, rename permission, footprints | **Depends on:** 6 | Ordered stage values and failures equal Python; bounded memory | 20–32 h |
 | 8 | todo | Candidate generators, judgment coverage, scope comparisons | **Depends on:** 6 | Listed sites, cells, verdicts, and ordering equal Python | 16–24 h |
 | 9 | todo | Complete selection and Python publication adapter | **Depends on:** 7, 8 | `COUNT` and assignment traces equal Python; fault and race tests pass | 16–24 h |
@@ -654,9 +926,54 @@ Identify quadratic loops before translating them.
 
 Add capture and replay without changing default selection.
 Audit source triggers and benchmark reset behavior.
-Prove read consistency and stale-publication rejection on tempdir fixtures.
-Define the compatible schema admission release and its migration test.
+Define the compatible schema admission release in this document.
 Revise estimates and budgets from those results.
+
+Director decisions at phase start (2026-11-16):
+
+1. Read consistency and stale-publication fixtures move to phase 9. The Rust observation read and the publication check do not exist before phase 9.
+2. The schema admission release and its migration test move to phase 10. Phase 10 adds the missing triggers, and the migration goes with them.
+3. Phase 6 adds no production code path. Counters and timers run only inside the measure worker.
+
+#### Work Order
+
+**Goal:** A frozen capture of the selection inputs, a repeatable replay, a stage measurement on the capture, and the written contract for phases 7–12.
+
+**Depends on:** Phase 5
+
+**Spec:**
+
+1. Capture. A new command makes a capture folder from a repository, a ledger and a unit. It copies the ledger through a `mode=ro` backup. It records the schema, the `refill_tables` version vector and the resolved revision ids (synced, unit tip, main tip, pushed tip, checkpoints, branch presence). It copies each external input that selection reads: rule files, style configuration, ignore files, proposal files, plans, staff values and board values. It records locale, the ripgrep version, the Python version and the reader binary stamp. A `manifest.json` gives a SHA-256 for each copied file.
+2. Replay. A replay runs the current Python `COUNT` refill on a fresh copy of the captured ledger, with `--reader python|rust`. It reads the captured external inputs where an existing setting can point there. For each read that has no setting, the replay compares the live file hash with the manifest and reports each difference. It adds no refusal. Two replays of one capture give the same digest.
+3. Benchmark reset. `refill_measure.clear_derived` deletes an explicit list of derived tables. It keeps `refill_tables`, `refill_rows` and `refill_results`.
+4. Stage measurement. A measure option times these stages separately: Python start, ledger reads, external file reads, Git subprocess calls, reader child calls, derived-result encoding and writes. It counts unique revision pairs, declaration searches, rule scans, Git subprocesses and reader requests. It reports candidate and finding counts beside the times. It wraps functions only inside the measure worker. Default selection does not change.
+5. Repeated work. The measurement names each loop whose call count grows with the product of two inputs (for example findings times declarations), with the counts.
+6. Contract. Add a `## Selection contract` section to this document. It gives the request and reply JSON schema, the mutation groups and their order, the build identity fields, the source projection list (table, columns, version trigger present or missing) and the external input list from the capture.
+7. Run capture, two replays (python and rust) and the stage measurement on cargo-liner-style. Report the stage table in the summary.
+
+**Files:**
+
+- `scripts/style/selection_capture.py` (new) — capture and replay
+- `scripts/style/refill_measure.py` — reset list, stage option
+- `scripts/style/test_refill_measure.py` — rows for the reset list and the stage option
+- `scripts/style/test_selection_capture.py` (new) — capture and replay on a tempdir repository and ledger
+- `docs/plans/style-refill-rust-store.md` — `## Selection contract`
+
+**Workers:** 1 writer + 1 tester; the code and the contract do not split.
+
+- `impl`: `selection_capture.py`, `refill_measure.py`, the plan section (hub: none)
+- `test`: `test_selection_capture.py` and the rows in `test_refill_measure.py`, from the Spec
+
+**State:** none on the live ledger; captures are private folders.
+
+**Constraints from prior phases:** Phase 5 rust cold 494 s, warm 132 s; python cold 704 s, warm 165 s; digest `2de7c1bdf58dba21` at the then-live ledger. The live ledger opens only with `mode=ro`. `~/rust/cargo-liner-style` is read-only.
+
+**Acceptance gate:**
+
+- Two replays of one capture give one digest, for each reader.
+- `basedpyright` reports 0 errors and 0 warnings on each changed Python file.
+- `python3 -m unittest scripts.style.test_selection_capture scripts.style.test_refill_measure` passes.
+- The plan has the `## Selection contract` section and the stage table.
 
 ### Phases 7 and 8 boundaries
 
@@ -772,3 +1089,10 @@ Do not delete the reference implementation before acceptance completes.
 
 The user still owns the default switch decision.
 Architecture and measurement work can proceed before those process choices are settled.
+
+Answers from the showrunner (2026-11-16):
+
+1. style-unit owns daily Python/Rust parity failures.
+2. Phases 7 and 8 run at the same time, one worker each.
+3. Phase 12 has two days of shadow after phase 11. Rollback is `reader=python`. The phase 12 switch needs the user's go.
+4. Keep the design simple. If a phase finds that the cache or a layer is not necessary for the target, drop it and tell the showrunner.
