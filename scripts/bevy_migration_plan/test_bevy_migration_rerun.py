@@ -9,11 +9,45 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.bevy_migration_plan import bevy_migration_split_guide as splitter
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib import build_folders
+from scripts.lint.memory_test_support import config_environment
 
 GUIDE = "### One\nFirst section.\n### Two\nSecond section.\n"
 
 
 class GuideRerunTests(unittest.TestCase):
+    def test_ensure_clones_through_the_maker_and_retains_the_existing_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            _ = subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+            guides = source / "release-content/migration-guides"
+            _ = splitter.write_sections(splitter.parse_sections(GUIDE), guides)
+            tip = commit_repository(source, "guides")
+            _ = subprocess.run(["git", "-C", str(source), "tag", "v0.18.0"], check=True)
+            bare = root / "origin.git"
+            _ = subprocess.run(["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True)
+            git_config = root / "gitconfig"
+            _ = git_config.write_text(f'[url "{bare.as_uri()}"]\n\tinsteadOf = https://github.com/bevyengine/bevy.git\n')
+            env = {**os.environ, **config_environment(root / "config"), "HOME": str(root / "home"),
+                   "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1", "GIT_ALLOW_PROTOCOL": "file"}
+            destination = Path(env["HOME"]) / "rust/bevy-0.18.0"
+            destination.mkdir(parents=True)
+            _ = (destination / "leftover").write_text("incomplete clone\n")
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    result = subprocess.run(["bash", str(Path(__file__).with_name("bevy_migration_ensure_repo.sh")), "0.18.0"],
+                                            env=env, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), str(destination / "release-content/migration-guides"))
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip(), tip)
+                    if attempt:
+                        self.assertEqual((destination / "notes.txt").read_text(), "retained user notes\n")
+                    else:
+                        _ = (destination / "notes.txt").write_text("retained user notes\n")
+                    self.assertEqual(build_folders.build_folder_state(destination), "free")
+
     def test_split_reruns_after_first_section_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "guides"
