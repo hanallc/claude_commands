@@ -822,9 +822,11 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
    the next status report. The push is never forced. It starts one more CI run on
-   the same sha and leaves the public bevy_hana mirror alone: the mirror
-   updates only when main lands through validate_and_push, whose post-push
-   hook publishes it (user, 2026-10-03).
+   the same sha. Each main push goes through `scripts/lib/land_main.py`, which
+   then runs the repository's `.claude/config/post_push.sh`. So hana's public
+   bevy_hana mirror syncs on each promotion (user, 2026-11-15: "yes every
+   promotion to main may sync to the public mirror"). A failed hook does not
+   stop the promotion; its rerun command goes in the log line.
 5. Only when the doc declares no **Promote:** destination, find the worktree
    on `main` with `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and

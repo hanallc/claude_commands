@@ -972,11 +972,12 @@ INFER_PROFILE_AT_USE = InferProfileAtUse()
 
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
-    from scripts.production import staff
 
     identity = records.waiter_identity(step, worktree)
     if not identity["session_id"] and (reference := os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")):
         # Resolve the recorded staff owner only when the caller has no session identity.
+        from scripts.production import staff
+
         try:
             member = staff.snapshot().by_id(staff.StaffId(reference))
         except staff.StaffUnreadable:

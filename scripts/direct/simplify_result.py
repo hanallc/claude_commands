@@ -36,7 +36,7 @@ def prepare(diff: Path, source: Path, prompt: Path, report: Path, settings: conf
     """Clear the report and write the prompt with the standing instructions."""
     _ = report.write_text("")
     standing = Template((conf.directory() / "review/simplify.md").read_text()).substitute(
-        agents=",".join(settings.words("SIMPLIFY_AGENTS")))
+        agents=", ".join(settings.words("SIMPLIFY_AGENTS")))
     user_words = source.read_text()
     write_text_atomic(prompt, f"/simplify {shlex.quote(str(diff))}\n\n" + standing + "\n\n" + user_words + "\n")
 

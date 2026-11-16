@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import html
 import os
 import re
 import json
@@ -34,7 +35,7 @@ from scripts.production import change_routing, change_review, footer_counts, nex
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve
+from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -129,6 +130,27 @@ class BrowserForms(HTMLParser):
 
 SEND_MESSAGE = change_page.send_message
 
+# The Memory bar record predates structured question parts.
+MEMORY_BAR_ASK = "Memory bar on the Builds page: what name should the new block have?"
+MEMORY_BAR_REVIEWED = MEMORY_BAR_ASK + """
+
+The cap mark is the memory limit for builds that the build queue runs. The block holds:
+- sccache, the compiler cache: 2.2 GiB now, nearly all of the block.
+- rust-analyzer, the editor's Rust checker: 0 GiB now.
+- Other build programs: 0.1 GiB now.
+
+The resources unit named the block 'Build tools'. Nobody approved that name.
+
+'Compiler cache' (recommended): the block shows this name. It fits because nearly all of the block is sccache.
+
+'Build tools': the block keeps the name it has now.
+
+Your own name: the resources unit puts your name on the block."""
+MEMORY_BAR_RAW = (MEMORY_BAR_ASK + " The cap mark is the memory limit for builds that the build queue runs. "
+    + "The resources unit named the block 'Build tools'. Nobody approved that name. "
+    + "Choices: 'Compiler cache': nearly all of the block is sccache. 'Build tools': keep the current name. "
+    + "Your own name: the resources unit puts your name on the block. Recommended: 'Compiler cache', because it names the contents.")
+
 
 @cache
 def repository_seed() -> Path:
@@ -175,10 +197,8 @@ class ReviewTextTests(unittest.TestCase):
 
     def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
         text = '\n First <line> \r\n\r Second & line\u2028Third\n'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</{block}>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</p>')
 
     def test_question_and_answer_show_list_runs_and_text_blocks(self) -> None:
         question = change_page.AnsweredQuestion("q1", "\n  Steps\n continue\n\n  - First\n- Second\n1. Third\n2. Fourth\n\n Done\n", "- Yes\n- No")
@@ -186,14 +206,24 @@ class ReviewTextTests(unittest.TestCase):
             '<h2>Question</h2><p>Steps\ncontinue</p><ul><li>First</li><li>Second</li></ul>'
             + '<ol><li>Third</li><li>Fourth</li></ol><p>Done</p><h2>Answer</h2><ul><li>Yes</li><li>No</li></ul>')
 
+    def test_code_blocks_remove_blank_edges_and_keep_internal_text_line_breaks(self) -> None:
+        for text, before, after in (
+            ('A:\n\n```sh\nx\n```\n\nB.', 'A:', 'B.'),
+            ('\n \t\n A:\nSecond line\n \t\n```sh\nx\n```\n \t\nB. \n\n', ' A:\nSecond line', 'B. '),
+        ):
+            with self.subTest(text=text):
+                rendered = change_page.review_html(text)
+                self.assertEqual(rendered, '<p>' + before + '</p>'
+                                 + '<div class="code-block"><pre><code>x</code></pre>'
+                                 + page_frame.COPY_BUTTON + '</div><p>' + after + '</p>')
+        self.assertEqual(change_page.review_html('\n\nA:\nSecond line\n\n'), '<p>A:\nSecond line</p>')
+
     def test_review_text_escapes_text_blocks_and_each_list_item(self) -> None:
         text = '<script>& "text"\n\n- <a href="x"> & **bold**\n1. `code` | <img>'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>&lt;script&gt;&amp; &quot;text&quot;</{block}>'
-                    + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
-                    + '<ol><li>`code` | &lt;img&gt;</li></ol>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>&lt;script&gt;&amp; &quot;text&quot;</p>'
+                         + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
+                         + '<ol><li>`code` | &lt;img&gt;</li></ol>')
 
     def test_each_numbered_run_starts_at_its_first_number(self) -> None:
         self.assertEqual(change_page.review_text_html('3. Third\n4. Fourth\n\n1. First\n- Bullet\n8. Eighth'),
@@ -212,8 +242,82 @@ class ReviewTextTests(unittest.TestCase):
                          'Run <code>a &lt;b&gt;</code> then see <a href="http://h:1/x" target="_top">http://h:1/x</a>'
                          + ' and <code>http://h:1/y</code>')
         self.assertEqual(change_browser.item_list([" `deploy.py up --x <y>` ", "Run `ls` now", "`a` and `b`"]),
-                         '<h2>Items</h2><ol class="question-items"><li><pre><code>deploy.py up --x &lt;y&gt;</code></pre></li>'
+                         '<h2>Items</h2><ol class="question-items"><li><div class="code-block">'
+                         + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
                          + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
+
+    def test_code_copy_markup_keeps_code_text_separate_from_the_control(self) -> None:
+        code = '  first <tag> & value\tsecond  '
+        rendered = change_browser.item_html('`' + code + '`')
+        self.assertIn('<pre><code>' + html.escape(code) + '</code></pre>' + page_frame.COPY_BUTTON, rendered)
+        self.assertEqual(rendered.count(page_frame.COPY_BUTTON), 1)
+        self.assertIn('type="button" data-copy-code aria-label="Copy code" title="Copy"', rendered)
+        inline = change_page.document(change_page.inline_html('Run `sudo systemctl start session.mount`.')).decode()
+        self.assertNotIn(page_frame.COPY_BUTTON, inline)
+        self.assertIn('<code>sudo systemctl start session.mount</code>', inline)
+        plain = change_page.review_html('Keep this proof text.')
+        self.assertEqual(plain, '<p>Keep this proof text.</p>')
+        self.assertIn(plain, change_page.document(plain).decode())
+        self.assertNotIn(page_frame.COPY_BUTTON, change_page.document(plain).decode())
+
+    def test_question_commands_stay_inside_the_item_that_ends_with_a_colon(self) -> None:
+        for block, code in (("```sh\nprintf '<check>'\n```", "printf '<check>'"),
+                            ("`printf '<check>'`", "printf '<check>'")):
+            for form in ("parts continuation", "parts entry", "one text"):
+                with self.subTest(block=block, form=form):
+                    item = update_registration.OutstandingItem(since="now", text="Check the steps?")
+                    if form.startswith("parts"):
+                        items = (["Read the title.", "Run this:\n\n" + block, "Read the result."]
+                                 if form == "parts continuation" else
+                                 ["Read the title.", "Run this:", block, "Read the result."])
+                        item["parts"] = update_registration.QuestionParts(ask="Check the steps?", context="",
+                            items=items, recommend="", choices=[])
+                    else:
+                        item["question"] = "Check the steps?\n\n1. Read the title.\n2. Run this:\n\n" + block + "\n3. Read the result."
+                    body, _ = change_browser.question_parts(item)
+                    entries = [match.group(1) for match in re.finditer(r"<li>(.*?)</li>", body, re.DOTALL)]
+                    self.assertEqual(len(entries), 3)
+                    self.assertEqual(entries[0], "Read the title.")
+                    self.assertEqual(entries[2], "Read the result.")
+                    self.assertTrue(entries[1].startswith('Run this:<div class="code-block"><pre><code>'))
+                    self.assertIn("<pre><code>" + html.escape(code) + "</code></pre>", entries[1])
+                    self.assertEqual(entries[1].count(page_frame.COPY_BUTTON), 1)
+                    self.assertNotIn("```", body)
+
+    def test_question_item_numbers_and_blank_lines_inside_code_do_not_split_the_list(self) -> None:
+        for block in ("```text\n1. code line\n\n2. code line\n```", "`1. code line 2. code line`"):
+            for final in (False, True):
+                with self.subTest(block=block, final=final):
+                    text = ("1. Read the title.\n2. Run this:\n\n" + block
+                            + ("\n\nContext after the list." if final else "\n3. Read the result."))
+                    lead, items, trailing = change_browser.numbered_run(text)
+                    self.assertEqual(lead, "")
+                    self.assertEqual(len(items), 2 if final else 3)
+                    self.assertEqual(items[1], "Run this:\n\n" + block)
+                    self.assertEqual(trailing, "Context after the list." if final else "")
+                    body, _ = change_browser.text_sections(text)
+                    self.assertEqual(body.count("<li>"), 2 if final else 3)
+                    self.assertEqual(body.count(page_frame.COPY_BUTTON), 1)
+
+    def test_reviewed_question_without_a_question_mark_uses_its_first_sentence_as_the_title(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            reviewed="Check the title. Keep this context once.\n\nCan the later paragraph stay in the body?")
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, "Check the title.")
+        self.assertEqual(context, "Keep this context once.\n\nCan the later paragraph stay in the body?")
+        body, _ = change_browser.question_parts(item)
+        self.assertNotIn(title, body)
+        self.assertEqual(body.count("Keep this context once."), 1)
+        self.assertEqual(body.count("Can the later paragraph stay in the body?"), 1)
+        for reviewed in ("Check the title. keep this context once.", "Check the title! keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed, ""))
+        for reviewed in ("Check the title. Keep this context once.", "Check the title! Keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed[:16], "Keep this context once."))
+        item["reviewed"] = "Keep this question? Keep the present title rule.\n\nContext."
+        self.assertEqual(change_browser.question_text(item),
+                         ("Keep this question? Keep the present title rule.", "Context."))
 
     def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
         parts = update_registration.QuestionParts(
@@ -236,7 +340,70 @@ class ReviewTextTests(unittest.TestCase):
         parts["items"] = parts["choices"] = []
         self.assertEqual(change_browser.question_parts(item), ("", ""))
         del item["parts"]
-        self.assertEqual(change_browser.question_parts(item), ("<p>joined</p>", ""))
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+
+    def test_memory_bar_reviewed_text_keeps_paragraphs_lists_and_three_choice_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="2026-11-15", text=MEMORY_BAR_RAW,
+            question=MEMORY_BAR_RAW, reviewed=MEMORY_BAR_REVIEWED)
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, MEMORY_BAR_ASK)
+        self.assertNotIn(MEMORY_BAR_ASK, context)
+        body, choices = change_browser.question_parts(item)
+        self.assertNotIn(MEMORY_BAR_ASK, body + choices)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertIn("<li>rust-analyzer, the editor&#x27;s Rust checker: 0 GiB now.</li>", body)
+        self.assertIn("<p>The resources unit named the block &#x27;Build tools&#x27;. Nobody approved that name.</p>", body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+        self.assertIn('(recommended)', choices)
+        self.assertNotIn('because it names the contents', body + choices)
+        item["reviewed"] = MEMORY_BAR_REVIEWED + "\n\nRecommended: Keep the compiler cache name."
+        body, choices = change_browser.question_parts(item)
+        self.assertIn('<h2>Recommended</h2><p>Keep the compiler cache name.</p>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+
+    def test_open_question_forms_use_short_titles_and_separate_context(self) -> None:
+        parts = update_registration.QuestionParts(ask="Keep the name?", context="First paragraph.\n\nSecond paragraph.",
+            items=["First item", "Second item"], recommend="Keep it", choices=["Keep it", "Change it"])
+        cases: tuple[tuple[str, update_registration.OutstandingItem, str, int], ...] = (
+            ("parts", update_registration.OutstandingItem(since="now", text="Keep the name?", parts=parts), "Keep the name?", 2),
+            ("reviewed only", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                reviewed=MEMORY_BAR_REVIEWED), MEMORY_BAR_ASK, 3),
+            ("raw one line", update_registration.OutstandingItem(since="now", text="Stored summary",
+                question="Keep the name? First paragraph. Second paragraph."), "Keep the name?", 0),
+            ("raw choices", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                question=MEMORY_BAR_RAW), MEMORY_BAR_ASK, 3),
+        )
+        owner = staff.StaffId("owner")
+        for name, item, title, choices in cases:
+            with self.subTest(form=name):
+                record = update_registration.QuestionRecord(Path("/unused/question.md"), owner, owner, item, "open")
+                question = change_browser.WaitingQuestion("q1", "owner", record, Path("/unused/production.md"), owner, "asker")
+                section = change_browser.question_section(question, change_page.ReviewBrowser("private"), 4)
+                self.assertEqual(section.count(title), 1)
+                self.assertIn(f'<h1>{title}</h1>', section)
+                self.assertEqual(section.count('name="choice"'), choices)
+                if name in ("parts", "raw one line"):
+                    self.assertIn('<p>First paragraph.</p><p>Second paragraph.</p>', section)
+                if name == "raw choices":
+                    self.assertIn('<h2>Recommended</h2><p>&#x27;Compiler cache&#x27;, because it names the contents.</p>', section)
+                    self.assertIn('Your own name: the resources unit puts your name on the block.', section)
+
+    def test_reviewed_presence_and_ambiguous_choices_do_not_restore_raw_text_or_invent_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="Do not show this raw question? Raw text.", reviewed="Reviewed question?\n\nOne paragraph.\n\nAnother paragraph.")
+        self.assertEqual(change_browser.question_parts(item), ('<p>One paragraph.</p><p>Another paragraph.</p>', ""))
+        item["reviewed"] = ""
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+        _ = item.pop("reviewed")
+        item["question"] = "Keep it? Choices: yes = keep; no = drop. Recommended: yes"
+        self.assertEqual(change_browser.question_parts(item),
+            ('<h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul><h2>Recommended</h2><p>yes</p>', ""))
+
+    def test_title_uses_the_first_question_sentence_and_context_keeps_earlier_sentences(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="A change waits. Keep it? use this name. Is that clear?")
+        self.assertEqual(change_browser.question_text(item), ("Keep it?", "A change waits.\n\nuse this name. Is that clear?"))
 
 
     def test_one_text_question_shows_items_choices_and_recommendation_as_sections(self) -> None:
@@ -252,11 +419,11 @@ class ReviewTextTests(unittest.TestCase):
                          + '</fieldset>')
         with self.subTest("choices without numbers show as text"):
             self.assertEqual(change_browser.text_sections("Keep it? Choices: yes = keep; no = drop. Recommended: yes"),
-                             ('<p>Keep it?</p><h2>Choices</h2><p>yes = keep; no = drop.</p>'
+                             ('<p>Keep it?</p><h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul>'
                               + '<h2>Recommended</h2><p>yes</p>', ""))
         with self.subTest("numbers out of order are not items"):
             self.assertEqual(change_browser.text_sections("Phase 2. Then 1) only one item."),
-                             ("<p>Phase 2. Then 1) only one item.</p>", ""))
+                             ("<p>Phase 2.</p><p>Then 1) only one item.</p>", ""))
         with self.subTest("lines: a blank line ends the last item"):
             self.assertEqual(change_browser.text_sections("Pick one.\n\nChoices:\n1. Add it. Then measure.\n2. Keep it.\n\nMeanwhile I port."),
                              ('<p>Pick one.</p><p>Meanwhile I port.</p>',
@@ -304,10 +471,49 @@ class ChangePageTests(unittest.TestCase):
         for content in (change_page.render(self.page, status).decode(),
                         change_browser.render(change_page.ReviewBrowser('token'), status).decode()):
             with self.subTest(page=content[:80]):
-                self.assertIn('<pre>Steps</pre><ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>'
-                              + '<pre>Finish. You see: Result</pre>', content)
+                self.assertIn('<p>Steps</p>', content)
+                self.assertIn('<ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>', content)
+                self.assertIn('<p>Finish. You see: Result</p>', content)
                 self.assertIn('<h2>Question</h2><p>Which steps?</p><ol><li>First</li><li>Second</li></ol>', content)
                 self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
+
+    def test_both_pages_copy_question_feedback_and_answer_code_without_boxing_plain_text(self) -> None:
+        code = 'git -C /etc/nixos status --short\ngit -C /etc/nixos log --oneline -3'
+        fenced = 'Run this in a natedev terminal:\n\n```sh\n' + code + '\n```\n\nRead the result.'
+        status = change_page.DeliveryStatus(self.root)
+        for feedback in (False, True):
+            for answer in (fenced, 'First line\nSecond line'):
+                with self.subTest(feedback=feedback, answer=answer):
+                    row_id = 'C3' if feedback else 'C1'
+                    question = status.ask(self.page, row_id, fenced, kind='feedback' if feedback else 'question')
+                    assert isinstance(question, change_page.QuestionDelivery)
+                    self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
+                    selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (selected, section[1]):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, [code, code] if answer == fenced else [code])
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(blocks))
+                        self.assertEqual(body.count('<pre>'), len(blocks))
+                        if answer != fenced:
+                            prefix = 'Showrunner: ' if feedback else ''
+                            self.assertIn('<p>' + prefix + answer + '</p>', body)
+                    status.write_slots(self.page, row_id, change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
+
+    def test_both_pages_keep_a_plain_two_line_check_in_one_paragraph(self) -> None:
+        item = change_review.Visible('Numbered moves', 'First line\nSecond line', 'Result')
+        _ = change_review.edit_row(self.review_list, 'C1', item, date(2026, 11, 5), self.production)
+        row = change_page.answer_row(self.page, 'C1')
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        change = change_browser.WaitingChange('page-owner/C1', 'page-owner',
+                                             change_routing.UnavailableProduction(self.review_list), row)
+        for body in (selected, change_browser.section(change, 5)):
+            self.assertIn('<p>First line\nSecond line. You see: Result</p>', body)
+            self.assertNotIn('<pre>', body)
+        self.assertIn('p{white-space:pre-wrap;', selected)
 
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -330,12 +536,10 @@ class ChangePageTests(unittest.TestCase):
         row = change_page.answer_row(self.page, 'C1') | {change_review.CHECK: 'Read\n- First\n- Second'}
         change = change_browser.WaitingChange('orphan/C1', 'orphan',
             change_routing.UnavailableProduction(self.review_list), row)
-        self.assertIn('<h2>Proof</h2><pre>Read</pre><ul><li>First</li><li>Second</li></ul>',
+        self.assertIn('<h2>Proof</h2><p>Read</p><ul><li>First</li><li>Second</li></ul>',
                       change_browser.section(change, 5))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
-        from scripts.review_links import review_link
-
         settings = Path(os.environ["CONF_DIR"]) / "change_review.conf"
         original = settings.read_text()
         real_write = atomic_file.write_bytes_atomic
@@ -1187,6 +1391,175 @@ class ChangePageTests(unittest.TestCase):
     def answer(self, row: str = "C1", outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return {"row": row, "outcome": outcome, "feedback": feedback, "token": self.page.token}
 
+    def test_change_image_markup_is_shared_by_both_pages_and_absent_without_an_image(self) -> None:
+        _, _, before = self.browser()
+        self.assertNotIn('class="change-image"', before)
+        shot = self.temporary / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        text, reviewed = self.review_list.read_text().split(change_review.REVIEWED, 1)
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.startswith("| # |"):
+                lines[index] = line.rstrip() + f" {change_review.IMAGE} |\n"
+            elif line.startswith("| ---"):
+                lines[index] = line.rstrip() + " --- |\n"
+            elif line.startswith("| C"):
+                lines[index] = line.rstrip() + (f" {identity} |\n" if line.startswith("| C1 |") else "  |\n")
+        _ = self.review_list.write_text("".join(lines) + change_review.REVIEWED + reviewed)
+        _, _, browser = self.browser()
+        page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertEqual(browser.count(page_frame.MOTION_SCRIPT), 1)
+        self.assertIn("prefers-reduced-motion: reduce", browser)
+        for body in (browser, page):
+            self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
+            self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
+            self.assertIn('data-image-zoom class="change-image"', body)
+            self.assertIn(f'href="/change-images/{identity}/image.png" target="_blank" rel="noopener"', body)
+            self.assertIn('alt="Screenshot: Numbered moves"', body)
+            self.assertIn('class="change-text"', body)
+            self.assertEqual(body.count('class="change-image"'), 1)
+        with patch.object(change_review, "end_row_scratch", return_value=[]):
+            _ = change_page.submit(self.page, urlencode({"token": self.page.token, "row": "C1", "outcome": "works", "feedback": ""}),
+                                   change_page.DeliveryStatus(self.root))
+        self.assertFalse((self.root / image_store.CHANGE_FOLDER / identity).exists())
+
+    def test_code_copy_controls_reach_command_items_and_shared_assets_reach_both_changes_pages(self) -> None:
+        _ = self.file_user_question('Copy the command?', question='Copy the command?\n1. In a terminal:\n2. `git -C /etc/nixos diff`')
+        question = self.browser('questions')[2]
+        changes = self.browser()[2]
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertIn('<pre><code>git -C /etc/nixos diff</code></pre>' + page_frame.COPY_BUTTON, question)
+        self.assertEqual(question.count(page_frame.COPY_BUTTON), 1)
+        for page in (changes, selected):
+            self.assertIn('<p>Run moves list. You see: Each group starts at 1</p>', page)
+            self.assertNotIn(page_frame.COPY_BUTTON, page)
+        for page in (question, changes, selected):
+            with self.subTest(title=page.split('<title>')[1].split('</title>')[0]):
+                self.assertEqual(page.count(page_frame.COPY_SCRIPT), 1)
+                self.assertEqual(page.count(page_frame.COPY_STYLE), 1)
+                self.assertEqual(page.count(page_frame.COPY_BUTTON), page.count('<pre><code>'))
+
+    def test_change_code_blocks_from_the_add_command_copy_exact_text_on_both_pages(self) -> None:
+        code = '  printf \'%s\\n\' "copy check $HOME <tag> & value"\n\techo done | cat\n'
+        before = 'Before:\n- Read the label.\n\n'
+        after = '\n\nAfter:\n- Read the result.'
+        for kind in ('See in action', 'Read only'):
+            for name, block, expected in (
+                ('fenced', '```sh\n' + code + '\n```', [code]),
+                ('backtick line', '`echo "$HOME"`', ['echo "$HOME"']),
+                ('plain', 'Run `echo` without a code block.', []),
+            ):
+                with self.subTest(kind=kind, block=name):
+                    title = f'{kind}: {name}'
+                    result = self.command(change_review, change_review.main, [
+                        'add', '--repo', str(self.repo), '--production', 'page-owner',
+                        '--list', str(self.review_list), '--change', title,
+                        '--check', before + block + after, '--see', 'The command stays exact',
+                    ])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
+                    self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')
+                    _ = change_review.set_row_kind(self.review_list, row['#'], kind, self.production)
+                    selected = change_page.render(replace(self.page, rows=(row['#'],)), change_page.DeliveryStatus(self.root)).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row['#']
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (section[1], selected):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, expected)
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(expected))
+                        self.assertIn(change_page.review_text_html(before.rstrip()), body)
+                        self.assertIn(change_page.review_text_html(after.lstrip() + ' You see: The command stays exact'), body)
+                        if not expected:
+                            self.assertIn(change_page.review_text_html(row[change_review.CHECK]), body)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser behavior')
+    def test_code_copy_handles_results_repeated_clicks_and_new_blocks_inside_an_iframe(self) -> None:
+        text = '  first <tag> & value\n\tsecond\n'
+        content = change_page.document('<input id="answer" value="keep this">'
+                                       + change_browser.item_html('`placeholder`').replace('placeholder', html.escape(text))
+                                       + '<p>Keep <code>inline</code> unchanged.</p>').decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[], copied=[], turns=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ const check=(value,text)=>{if(!value) failures.push(text);};
+ const button=document.querySelector('[data-copy-code]'),code=document.querySelector('pre code');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
+ button.click();await turns(0);
+ check(copied[0]===code.textContent,'The clipboard receives the exact code text.');
+ check(button.title==='Copied' && button.getAttribute('aria-label')==='Copied','Success has an accessible label.');
+ check(getComputedStyle(button.querySelector('[data-copy-icon]')).display==='none'
+  && getComputedStyle(button.querySelector('[data-copied-icon]')).display!=='none','Success shows the check icon.');
+ await turns(1200);button.click();await turns(1000);
+ check(button.title==='Copied','A second click restarts the result time.');
+ await turns(1100);
+ check(button.title==='Copy' && button.getAttribute('aria-label')==='Copy code','The result returns to Copy.');
+ navigator.clipboard.writeText=async()=>{throw new Error('Denied');};
+ button.click();await turns(0);
+ check(button.title==='Copy failed' && getComputedStyle(button.querySelector('[data-copy-icon]')).display!=='none','A failed write keeps the copy icon.');
+ await turns(2100);check(button.title==='Copy','A failure returns to Copy.');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:undefined});
+ const field=document.getElementById('answer');field.focus();field.setSelectionRange(1,4);
+ document.execCommand=command=>{copied.push(document.querySelector('textarea').value);return command==='copy';};
+ button.click();await turns(0);
+ check(copied.at(-1)===code.textContent,'The fallback receives the exact code text.');
+ check(button.title==='Copied' && document.activeElement===field && field.selectionStart===1 && field.selectionEnd===4,'The fallback restores focus and the field selection.');
+ check(!document.querySelector('textarea'),'The fallback removes its textarea.');
+ const fresh=document.querySelector('.code-block').cloneNode(true);document.body.append(fresh);
+ fresh.querySelector('code').textContent='new block\n';fresh.querySelector('button').click();await turns(0);
+ check(copied.at(-1)==='new block\n','A new block works without another listener.');
+ document.execCommand=()=>false;button.click();await turns(0);
+ check(button.title==='Copy failed','A failed fallback reports failure.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>'''
+        content = content.replace('</body>', probe + '</body>')
+        complete = threading.Event()
+        results: list[list[str]] = []
+
+        class CopyProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == '/complete':
+                    if not complete.wait(20):
+                        self.send_error(504)
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body = (content if self.path == '/frame' else
+                        '<iframe src="/frame"></iframe><img src="/complete" hidden alt="">')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                _ = self.wfile.write(body.encode())
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), CopyProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / 'copy-profile'
+                profile.mkdir()
+                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+
     def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
         path = change_page.page_url()
         reply = self.request(path + ("?type=questions" if kind == "questions" else ""), {})
@@ -1224,6 +1597,24 @@ class ChangePageTests(unittest.TestCase):
         filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
         return "question/" + owner.id + "/" + filed.path.name
 
+    def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
+        key = self.file_user_question(MEMORY_BAR_RAW, question=MEMORY_BAR_RAW)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
+                        if item.key == key)
+        update_registration.write_question_record(replace(question.record,
+            item={**question.record.item, "reviewed": MEMORY_BAR_REVIEWED}))
+        before = question.record.path.read_bytes()
+        _, forms, body = self.browser("questions")
+        self.assertIn(key, forms.rows)
+        self.assertIn(f'<h1>{MEMORY_BAR_ASK}</h1>', body)
+        self.assertEqual(body.count(MEMORY_BAR_ASK), 1)
+        self.assertEqual(body.count('name="choice"'), 3)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertNotIn('because it names the contents', body)
+        self.assertEqual(question.record.path.read_bytes(), before)
+
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
@@ -1255,7 +1646,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn('<title>Questions to answer</title>', body)
         self.assertIn('<h1 class="page-title">Questions to answer</h1>', body)
         self.assertIn("Which layout gives each review card enough space for its controls?", body)
-        self.assertEqual(body.count("Choose the layout"), 1)
+        self.assertNotIn("Choose the layout", body)
         self.assertIn("Compact &lt;layout&gt;", body)
         self.assertIn("Asked by builder-unit", body)
         self.assertNotIn("The old and new comments agree with the tests", body)
@@ -1495,8 +1886,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
     def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
@@ -1504,8 +1893,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         status = change_page.DeliveryStatus(self.root)
         delivery = change_page.submit(self.page, urlencode(self.answer(outcome="validate")), status)
         owner = staff.snapshot().by_path("page-owner")
@@ -2050,7 +2437,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
         self.assertEqual(refreshed.outcomes["page-owner/C1"], [])
         self.assertIn("The showrunner will act on this", content)
-        direct = self.request(self.page_path, {}).body.split('<section id="C1">', 1)[1].split('</section>', 1)[0]
+        direct = self.request(self.page_path, {}).body.split('<section id="C1" data-change-card>', 1)[1].split('</section>', 1)[0]
         self.assertIn("The showrunner will act on this", direct)
         self.assertNotIn('<form', direct)
         repeat = self.http_request(path, fields)
@@ -2278,7 +2665,7 @@ class ChangePageTests(unittest.TestCase):
                     self.assertIsInstance(slots.question, change_page.OpenQuestion)
                     assert isinstance(slots.question, change_page.OpenQuestion)
                     self.assertEqual(slots.question.text, normalized)
-                    self.assertIn('<p>\n First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
+                    self.assertIn('<p> First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
                                   self.http_request(path, {}).body)
                 saved = self.review_list.read_bytes()
                 delivery = record.read_bytes() if record.exists() else b""
@@ -2576,7 +2963,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("No changes for this showrunner.", body)
         self.assertIn("No changes to review.", body)
         self.assertIn("current===row && (tab==='' || tab===row.dataset.tab) && navigation===position", body)
-        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});", body)
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
@@ -2618,7 +3005,7 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn('value="feedback">Send feedback</button></div></form>', body)
             self.assertNotIn('secondary-actions', body)
         with self.subTest(navigation="Skip joins the action row"):
-            self.assertIn("current?.querySelector('form:not([hidden]) .answer-actions')", body)
+            self.assertIn("target?.querySelector('form:not([hidden]) .answer-actions')", body)
             self.assertIn('.navigation:empty{display:none}', body)
             self.assertNotIn('position:sticky', body)
         with self.subTest(card="title and metadata"):
@@ -2734,7 +3121,7 @@ class ChangePageTests(unittest.TestCase):
    check(tab==='demo','a page load reads the filter from the URL');
    navigate();
    for(const key of ['page-owner/C1','page-owner/C3']){
-    go(key);const actions=[...current.querySelectorAll('button[name=outcome]')];
+    go(key);await motion.settled();const actions=[...current.querySelectorAll('button[name=outcome]')];
     check(current.dataset.key!== 'page-owner/C3' || current.textContent.includes('Showrunner: The proof has three steps.'),'the feedback note appears above the actions');
     check(getComputedStyle(next.parentElement).position==='static','Skip uses the normal flow');
     check(next.parentElement===actions[0].parentElement && actions.every(button=>button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING),'Skip ends the action row');
@@ -3052,7 +3439,7 @@ class ChangePageTests(unittest.TestCase):
                 reply = self.request(path, {})
                 self.assertEqual(reply.status, 200)
                 for row in ("C1", "C2", "C3"):
-                    self.assertEqual(f'<section id="{row}">' in reply.body, row in rows)
+                    self.assertEqual(f'<section id="{row}" data-change-card>' in reply.body, row in rows)
 
     def test_delivery_failure_keeps_the_saved_answer_and_repeated_saves_send_nothing(self) -> None:
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):

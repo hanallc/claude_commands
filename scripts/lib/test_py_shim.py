@@ -42,6 +42,17 @@ class PythonShimTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).resolve(), ROOT / "scripts/lib/unit_runs.py")
 
+    def test_empty_option_arrays_work_with_nounset(self) -> None:
+        self.assertNotRegex(SHIM.read_text(), r'(?<!\[@\]\+)"\$\{[A-Za-z_]\w*\[@\]\}"')
+        for arguments in ([], ["-c", "print(1)"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    ["bash", "-u", str(SHIM), *arguments], input="print(1)\n", cwd=self.folder,
+                    env=self.environment, capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "1\n")
+
     def test_stdin_ignores_a_local_scripts_folder(self) -> None:
         self.check_import(["-"], stale=False)
 

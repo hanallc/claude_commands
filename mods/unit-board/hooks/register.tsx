@@ -1,7 +1,7 @@
 import type { EngineInterface, Register, Timer } from 'claude-code';
 import type { AccountsPaneState } from '../types';
-import { loadAccounts, refreshIfChanged, resolveUserZone } from './data';
-import type { AccountsLoader, RefreshPaths, UserZoneSettings } from './data';
+import { loadAccounts, refreshIfChanged, validBoard } from './data';
+import type { AccountsLoader, RefreshPaths } from './data';
 import { AccountsView } from './accounts';
 import type { StoredAccountsStatus } from '../types/accounts';
 import { QueueView } from './queue';
@@ -18,12 +18,6 @@ function accountsCalls($: EngineInterface): AccountsLoader {
   return {
     home: () => $.env.get('HOME'), now: () => $.clock.now(),
     stat: path => $.fs.stat(path), run: argv => $.process.run(argv),
-  };
-}
-function zoneSettings($: EngineInterface): UserZoneSettings {
-  return {
-    override: () => $.env.get('USER_ZONE'), config: () => $.env.get('USER_ZONE_CONF'),
-    home: () => $.env.get('HOME'), read: path => $.fs.read(path),
   };
 }
 type TablePaneState<Ready> = { kind: 'loading' } | { kind: 'failed'; reason: string } | Ready;
@@ -46,6 +40,7 @@ interface TablePaneCalls<Ready, Context> {
   open(): Promise<unknown>;
   every(callback: () => void): Timer;
   stat(path: string): Promise<{ mtimeMs: number }>;
+  now(): Promise<number>;
 }
 
 /** One lifecycle for one-shot table readers; closing invalidates every pending await. */
@@ -85,7 +80,7 @@ function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settin
         await read(calls, current);
         return;
       }
-      const regenerated = await refreshIfChanged({ stat: path => calls.stat(path) }, current.paths,
+      const regenerated = await refreshIfChanged({ stat: path => calls.stat(path), now: () => calls.now() }, current.paths,
         () => load(calls, current),
         fresh => calls.put(fresh, isOpen), isOpen);
       if (regenerated || !isOpen()) return;
@@ -139,20 +134,19 @@ function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settin
 }
 
 type AccountsReady = Extract<AccountsPaneState<StoredAccountsStatus>, { kind: 'accounts' }>;
-type AccountsZone = Awaited<ReturnType<typeof resolveUserZone>>;
-function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, AccountsZone> {
+function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, void> {
   return {
     open: () => $.ui.open({ id: ACCOUNTS, title: 'Accounts', closeOnEscape: true }),
     every: callback => $.clock.every(10_000, callback),
+    now: () => $.clock.now(),
     stat: path => $.fs.stat(path),
-    prepare: isOpen => resolveUserZone(zoneSettings($), isOpen),
-    load: async (zone, isOpen, watch) => {
-      if (zone.kind !== 'resolved') throw new Error('Pane closed.');
+    prepare: async () => {},
+    load: async (...[, isOpen, watch]) => {
       const data = await loadAccounts(accountsCalls($), isOpen, watch);
       if (!isOpen()) throw new Error('Pane closed.');
-      return { kind: 'accounts', data, zone: zone.name, now: await $.clock.now() / 1000 };
+      return { kind: 'accounts', data };
     },
-    advance: async state => ({ ...state, now: await $.clock.now() / 1000 }),
+    advance: async state => state,
     read: async () => (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined,
     put: async (state, isOpen) => {
       if (!isOpen()) return;
@@ -216,6 +210,7 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
   return {
     open: () => $.ui.open({ id: QUEUE, title: 'Build queue', closeOnEscape: true }),
     every: callback => $.clock.every(10_000, callback),
+    now: () => $.clock.now(),
     stat: path => $.fs.stat(path),
     prepare: async isOpen => {
       const panes = (await $.state.get(QUEUE_PANES)).value ?? {};
@@ -266,7 +261,7 @@ export const register: Register = on => {
     if (countdownRedraw.kind === 'ticking') countdownRedraw.timer.cancel();
     countdownRedraw = { kind: 'idle' };
   };
-  const accounts = tablePane<AccountsReady, AccountsZone>({ failure: 'Stored accounts status could not be read.', refresh: 'changed' });
+  const accounts = tablePane<AccountsReady, void>({ failure: 'Stored accounts status could not be read.', refresh: 'changed' });
   const queue = tablePane<QueueReady, void>({ failure: 'Build queue could not be read.', refresh: 'always' });
 
   on('session.start', async ($, e, next) => {
@@ -322,9 +317,12 @@ export const register: Register = on => {
     const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="inactive">Loading accounts…</Text>;
+    // A pane saved before the board existed draws as loading until its next read.
+    if (!state || state.kind === 'loading' || (state.kind === 'accounts' && !validBoard(state.data.board))) {
+      return <Text color="inactive">Loading accounts…</Text>;
+    }
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
-    return AccountsView(elements, e.props.bodyColumns, state.data, state.zone, state.now);
+    return AccountsView(elements, e.props.bodyColumns, state.data);
   });
   on('ui.render', { component: 'Pane', requestId: QUEUE }, async ($, e) => {
     const generation = countdownGeneration;

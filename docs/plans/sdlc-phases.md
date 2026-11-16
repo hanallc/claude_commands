@@ -195,7 +195,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
 **Depends on:** Phase 29
 
-**Waits for:** the workers-back notice (showrunner, 2026-11-15), then at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
+**Waits for:** (the workers-back notice is met: 2026-11-15 13:36 EST) at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
 
 #### Work Order
 
@@ -242,6 +242,227 @@ The saved baseline reports inserted phases as about 2% of gaps.
 **Files:**
 - `scripts/direct/simplify_result.py`, `scripts/direct/test_simplify_result.py`
 - `scripts/production/review_regime.py`, `scripts/production/test_review_regime.py`
+
+### Phase 33 — A repair and a checkpoint of the same phase never lose the release record  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `phase_reservation.phase_lock(phase_dir)` holds `phase_baseline.lock`, the lock file the baseline writer already used. `committed`, the repair record (`_repair_record`), `record_active`, `enroll`, `clear`, `reset_for_start` and `_record_baselines` hold it across their read and write.
+- `release_held` takes no lock itself; its final `clear` takes the lock and checks the pending record again.
+- The repair holds the lock during its board check, so a checkpoint can wait up to that check's timeout.
+- Test: `test_a_checkpoint_during_a_repair_keeps_its_pending_release_record` fails with the lock removed and passes with it.
+
+**Files:**
+- `scripts/direct/phase_reservation.py`
+- `scripts/direct/test_phase_reservation.py`
+
+**Gotchas:** flock locks an open file description, so a nested `phase_lock` on the same phase in one process blocks itself. `clear` returns before the lock when no state file exists, so it creates no directory.
+
+### Phase 34 — `remaining` and `ahead` live in note_file.py  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `note_file.ahead(resets, *, now)` and `note_file.remaining(note)` hold the two note helpers. `remaining` takes `note_file.FieldReader`.
+- `quota_alert` calls `note_file.ahead` and `note_file.remaining`. It keeps no copy and no re-export, so a caller of the helpers does not load `quota_alert`.
+- `test_agent_notes.py` reads `note_file.ahead`; no other caller was found.
+
+**Files:**
+- `scripts/whoami/note_file.py` — `ahead`, `remaining`
+- `scripts/whoami/quota_alert.py` — the call sites
+- `scripts/whoami/test_agent_notes.py` — the `ahead` tests
+
+### Phase 35 — The launch account for a Claude task lives in models.conf  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agents_resolve` sets `AGENT_CLAUDE_ACCOUNT` for a claude task from `[<function>.options]`: `claude_account.<subtask>`, then `claude_account`. The value is `workers` (the default) or `caller`; another value stops with `ERROR:` and the allowed values. A codex task gets an empty value.
+- `agent_exec.sh` runs a `caller` task on the caller's own account and every other Claude task on the workers pool. No task-name test is left.
+- `config/models.conf` has `[direct.options] claude_account.simplify=caller`.
+
+**Files:**
+- `scripts/agents/models_config.sh` — `_agents_resolve_claude_account`
+- `scripts/agents/agent_exec.sh` — the account branch
+- `config/models.conf`, `docs/as-built/agent-registry.md` — the key and its description
+- `scripts/agents/test_models_config.sh`, `scripts/agents/test_agent_exec.sh` — each value, and `account_case` on the caller account
+- `scripts/lib/test_nix_env_launches.py` — the `agents_resolve` stub sets `AGENT_CLAUDE_ACCOUNT`
+
+**Gotchas:** `agent_exec.sh` runs under `set -u`, so an `agents_resolve` stub must set every variable the launcher reads.
+
+### Phase 36 — The simplify-follow items still in the tree  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `agent_exec.sh` calls `claude_result.py` at its one call site. The wrapper function is gone; its comment sits above the Claude command line.
+- `simplify_result.py` lists `SIMPLIFY_AGENTS` with `", "`.
+- `account_for_launch` in `add_unit.py` calls `accounts.prepare_claude_launch`; its `try` turns `AccountsError` into `Refusal`.
+- `account_test_support.store_usage(tool, login, usage)` writes one login's readings under the store lock. `stored_room` and `test_accounts.py` `reading` call it.
+- `test_agent_exec.py`, `test_review.py` (two sites) and `add_showrunner_test_support.py` call `create_claude_account`.
+- `agent-registry.md` says every readonly Claude run disables the editing tools.
+
+**Files:**
+- `scripts/agents/agent_exec.sh`, `scripts/direct/simplify_result.py`, `scripts/production/add_unit.py`
+- `scripts/whoami/account_test_support.py` — `store_usage`
+- `scripts/agents/test_agent_exec.py`, `scripts/notify/test_review.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/accounts/test_accounts.py`, `scripts/direct/test_simplify_result.py`
+- `docs/as-built/agent-registry.md`
+
+**Gotchas:** A long `TMPDIR` makes socket tests fail with `AF_UNIX path too long`; run them with a short `TMPDIR`.
+
+### Phase 37 — An Images card can show a before and after pair  · status: done
+**Depends on:** none
+
+#### As-built
+
+User request 11-15 10:24: before and after shots side by side, with one metadata block and one Delete. The user accepted the mockup.
+
+- `images.py register (--image PATH | --before PATH --after PATH)`: a pair is one folder with `before<suffix>` and `after<suffix>`, one record, one id and one image link. The record keeps the after image in `file` and the before image in `before`.
+- A pair card (`article.pair`) shows Before and After side by side in `.image-pair`, each linked to its full size. It has one caption, one details block, one Feedback field, one Send feedback and one Delete, which removes the folder.
+- The feedback message has a `Before:` and an `After:` link for a pair.
+- On a page 1104px or wider, a single card is 680px and a pair card is up to 1376px, both centered. A pair card under 600px stacks its images, before on top (container query).
+- `/show_image`, `docs/as-built/review-links.md` and the proof rule in `docs/production_format.md` say: file before and after shots as one pair.
+
+**Files:**
+- `scripts/review_links/images.py` — `register(before=)`, `shown_files`, `picture`, the pair card, the CSS and the `register` options
+- `scripts/review_links/test_images.py` — `ImagePairTests` and the pair server test
+- `commands/show_image.md`, `docs/as-built/review-links.md`, `docs/production_format.md`
+
+**Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
+
+### Phase 38 — A change-review write holds the lock under 1 s, and one batch writes many rows  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `_commit(paths, what)` in `change_review.py` commits one or more lists of one repository by plumbing only. It runs from the repository top level: `hash-object -w --path` for each list, then `read-tree` of HEAD (or `--empty`), `update-index --cacheinfo` and `write-tree` in a temporary `GIT_INDEX_FILE`. It sets each list's entry in the real index, then runs `commit-tree` and `update-ref HEAD <new> <old HEAD>`. A moved HEAD retries up to 5 times. A tree equal to HEAD's makes no commit. No command refreshes the index, so clean filters on other modified files never run. A write in a repository shaped like hanadocs takes 0.01-0.06 s, down from about 3.1 s.
+- A failure warns "written but not committed: <reason>; the next write commits it" and moves no ref.
+- `change_review.py batch --file <json>` takes an array of `edit` and `verdict` items (`op`, `production`, `row`, optional `list`; `change`, `check`, `see`, `image`, `output` for `edit`; `verdict` for `verdict`). It checks every item and registers images before the lock. All lists must be in one folder, and a row named twice is refused. Under one lock it writes every list, then makes one commit over every target list, changed or not: subject `change-review: batch <N> writes (<owner> <count>, ...)`. Any error exits 1 and names the item index. A rerun after a stopped batch finishes the remaining writes and commits every list.
+- `edit_row` and `record_verdict` share `_edit_write` and `_verdict_write` (a `RowWrite` with `write` and `after`) with `batch`.
+- `add`, `edit` and batch `edit` items accept `--output` like the `image` action; `--image` with `--output` is refused.
+- `show --row <id>` prints that row with `describe`; a row not on the list exits 1.
+- `ACTION_OPTIONS` maps each action to the options it reads. Any other option given a value exits 1 and names the option.
+
+**Files:**
+- `scripts/production/change_review.py` — `_commit`, `_edit_write`, `_verdict_write`, `_register_image`, `batch`, `ACTION_OPTIONS`, `show --row`
+- `scripts/production/test_change_review.py` — plumbing commit, race, unborn HEAD, filter, batch and option tests
+- `commands/change_review.md` — `batch`, the plumbing commit, the option rules
+
+**Gotchas:**
+- `hash-object --path` takes a path relative to the top level, so it must run from the top level, or list attributes do not match.
+- Images a failed batch registered stay unclaimed until `sweep_change_images` removes them.
+
+### Phase 39 — The ten C51 suites pass on the Mac  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/py` writes every array expansion as `${name[@]+"${name[@]}"}` (`shim_parts`, `python_options`, `file_separator`). macOS `/bin/bash` 3.2 runs it under `set -u` with no Python options. Other behavior does not change.
+- `scripts.lib.test_py_shim` refuses a bare `"${name[@]}"` expansion in the file (a text check), and runs the shim under `bash -u` with no options (stdin) and with `-c`.
+- `NativePaneSessionTests` pins `herdr._PLATFORM` to `"linux"` in the three tests that fake `/proc`: `test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread`, `test_codex_native_process_uses_its_resume_argument_or_own_pane_report` and `test_cached_starting_pane_reports_once_in_each_run`. Product code does not change.
+- The account_move preview test sets `CLAUDE_PYTHON=sys.executable`, so `scripts/lib/py` writes no interpreter cache under the test HOME on darwin.
+- Proof: a `mac_queue_run.py` run of the ten C51 suites plus `test_py_shim` at 7d40bfcc5 with this diff ran 826 tests OK; natedev ran 844 tests OK.
+
+**Files:**
+- `scripts/lib/py` — the Python launcher shim
+- `scripts/lib/test_py_shim.py` — shim tests and the bare-expansion check
+- `scripts/herdr/test_herdr.py` — `NativePaneSessionTests` platform pin
+- `scripts/agents/test_account_move.py` — the preview test sets `CLAUDE_PYTHON`
+
+**Gotchas:**
+- Under `set -u`, bash 3.2 treats `"${arr[@]}"` of an empty array as unbound. Bash 4.4 and later do not, so natedev cannot show the failure; the text check stands in for it.
+- On darwin, `scripts/lib/py` writes `$HOME/Library/Caches/claude/python3-x.y` unless `CLAUDE_PYTHON` is set. A test that compares HOME disk state sets `CLAUDE_PYTHON`.
+- A test that fakes Linux `/proc` pins `herdr._PLATFORM` to `"linux"`; on darwin, herdr reads `ps` instead.
+
+**Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
+
+### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/land_main.py` holds `land(checkout, commit, branch="main", *, time_limit=UNLIMITED_GIT) -> Landed(commit, branch, push, hook)` and a CLI (`--checkout`, `--commit`, `--branch`). Under `main_push_lock.main_push_lock(checkout)` it fetches the branch, then:
+  1. Origin at the commit: `AlreadyLanded`; the hook runs unless the record names the commit.
+  2. The commit is a strict ancestor of origin: `AlreadyLanded` with `HookSkipped`. The newer landing owns the hook.
+  3. Origin is an ancestor of the commit: a plain fast-forward push (`Pushed`).
+  4. Otherwise: `NotFastForward(LandError)`, and no hook runs.
+- On the default branch (`refs/remotes/origin/HEAD`, else `main`), it runs `<checkout root>/.claude/config/post_push.sh` with bash, with `LANDED_SHA` and `LANDED_BRANCH`, inside the lock. After exit 0 it writes the commit to `post-push-completed` in the git common dir. An unreadable record counts as no record.
+- Hook outcomes are `HookAbsent`, `HookDone`, `HookSkipped` and `HookFailed(exit_code, rerun_command)`; `hook_report(hook)` gives one line. A failed hook never fails the landing: the CLI prints the rerun command and exits 0. It exits 1 on `LandError`.
+- Every default-branch push calls it: `push_direct.sh`, `push_pr_branch_and_merge.sh`, `restore_unreleased.sh`, `main_publish.push`, `fast_track`, `merge_checkpoint.promote_local_checkout`, `merge_gate.promote`, `production_lifecycle.promote_main`, `models_registry._publish` and `vault_pull.publish_mac` (120 s time limit). `post_push_hook.sh` no longer exists.
+- `main_push_lock.py`'s CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold.
+- Callers report the hook: `main_publish` only when it ran or failed; `merge_checkpoint` as a `post-push` line, `warning` on failure. `commands/showrunner/produce.md` states that each promotion syncs hana's mirror through the hook.
+- Hook interface (agreed with hana-merges): cwd is the landing checkout root, which can be a merge-branch worktree; exit 0 means the sync is done; the hook can run under the main push lock, must not push the default branch, and must be safe to rerun for one `LANDED_SHA`.
+
+**Files:**
+- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — the landing path and its tests
+- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`, `scripts/lib/models_registry.py`, `scripts/buildlog/vault_pull.py` — callers
+- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py` — promotion callers
+- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/release/restore_unreleased.sh` — shell callers of the CLI
+- `docs/as-built/validate-and-push-cancel-prior.md`, `commands/showrunner/produce.md` — docs
+
+**Binds later work:** the release's main push (`restore_unreleased.sh`) runs `post_push.sh`; `test_release.py` installs a hook file and checks `post-push hook: done`.
+
+**Gotchas:**
+- `land` fetches inside the lock even when the caller fetched before; tests that count fetches see two.
+- A test that injects a push failure patches `land_main.land` where the caller looks it up, not `git push`.
+- `systemd-run` expands `${...}` in its arguments; run a gate loop from a script file.
+
+**Ruled out:** a nonzero exit on a hook failure (the landing is done; the rerun line is the remedy).
+
+### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: done
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a rerun of `/release` after a partial failure finishes the release, and the GitHub release goes to `github_release_repo` from `.claude/config/release.toml`, never to a private origin (user, 2026-11-15: "the release has to go to the public natepiano/bevy_Hana").
+
+**Spec:**
+- `scripts/release/create_release_branch.sh`: an existing release branch at `HEAD` is checked out and reused; one at another commit is refused with both commits named.
+- `scripts/release/publish_crate.sh`: a version already on crates.io (`verify_published.sh`'s read) prints `already published` and skips both dry-run and publish.
+- `scripts/release/create_github_release.sh`: a release that exists for the tag on the target repository (`gh release view <tag> --repo <repo>`) prints `already released` and exits 0.
+- The GitHub repository: `commands/release.md` STEP 1 reads `github_release_repo` (`owner/name`) from `release.toml`. With no key, origin's repository is used only when `gh repo view --json isPrivate` says it is public; a private origin with no key stops STEP 1 with the key to add. STEP 8 passes that repository to `create_github_release.sh`. When it is not origin, STEP 8 needs the tag on that repository first (Phase 42's `post_publish` hook makes it for hana); without it, STEP 8 stops and names the missing tag.
+- `commands/release.md` Configuration section documents `github_release_repo`.
+
+**Files:**
+- `scripts/release/create_release_branch.sh`, `scripts/release/publish_crate.sh`, `scripts/release/create_github_release.sh`
+- `scripts/release/test_release.py`
+- `commands/release.md` — the director edits it
+
+**Workers:** 1 writer — `impl` writes the three scripts and the `test_release.py` cases with stub `gh` and `cargo` on `PATH`.
+
+**State:** none
+
+**Constraints from prior phases:** no test publishes or makes a release; stubs only. Phase 40: `restore_unreleased.sh` lands the release's main push through `scripts/lib/land_main.py`, so the repository's `post_push.sh` runs there too; `test_release.py` installs a hook file and checks `post-push hook: done`. Run tests under `systemd-run --user --scope -q -p MemoryMax=2G -E TMPDIR=/tmp`.
+**Acceptance gate:** `scripts.release.test_release` covers each skip and each refusal; `bash -n` on each script; the suite passes on natedev.
+
+### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: todo
+**Depends on:** Phase 40, Phase 41
+
+#### Work Order
+
+**Goal:** `/release hana_clerestory hana_kana hana_lagrange …` releases each named crate in `publish_order` order in one run, with one user yes, and runs hana's `post_publish.sh` after each publish, so mirror tags and GitHub releases need no hand step.
+
+**Spec:**
+- STEP 0 accepts several package tokens. Each token is `<crate>` (takes the run's `patch` or version) or `<crate>@<version>`. One package keeps today's single-package mode exactly.
+- STEP 1 orders the crates by `publish_order` from `release.toml` (an array of crate names); a named crate absent from it stops the run. Without the key, the order is the order given.
+- Before the first public push, the run lists every crate, its version and each public push (crates.io publish, the `post_publish` hook, the GitHub release on its repository). One user yes covers that list; anything outside it needs a new yes. Dry-run lists and asks nothing.
+- The run does the single-package pipeline once for each crate, in order. After STEP 6 publishes a crate and before STEP 8, it runs `scripts/release/post_publish_hook.sh` (new): when `<repo root>/.claude/config/post_publish.sh` exists, it runs it with bash from the repo root with `CRATE`, `VERSION` (no `v`) and `SHA` (the full base-branch commit the release branch was cut from) exported. A nonzero exit stops the run before that crate's GitHub release and names the rerun command.
+- A rerun of the same command skips each crate whose steps are done (Phase 41) and runs the hook again; the hook is safe to rerun (hana-merges' side).
+- A final report lists each crate with its version, tag and release URL.
+
+**Files:**
+- `commands/release.md` — the director edits it
+- `scripts/release/post_publish_hook.sh` — new
+- `scripts/release/test_release.py`
+
+**Workers:** 1 writer — `impl` writes `post_publish_hook.sh` and its tests; the director writes `release.md`.
+
+**State:** none
+
+**Constraints from prior phases:** the hana half (`mirror.py`, `post_push.sh`, `post_publish.sh`, `release.toml` keys) belongs to hana-merges; this phase reads only the agreed keys and env names.
+
+**Acceptance gate:** `scripts.release.test_release` covers the hook runner (absent hook, env names, nonzero exit); a `/release … dry-run` with two hana crates in the hana checkout lists both crates in `publish_order` order with their pushes and changes nothing.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3

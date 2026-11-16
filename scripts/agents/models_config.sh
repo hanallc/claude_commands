@@ -482,7 +482,35 @@ _agents_resolve_in_family_from_table() {
 
     AGENT_FAMILY="$family"
     _agents_validate_pair "$task" "$family" "$pair" || return 1
-    _agents_resolve_service_tier "$task" "$family"
+    _agents_resolve_service_tier "$task" "$family" || return 1
+    _agents_resolve_claude_account "$task" "$family"
+}
+
+# The account a claude launch runs on, read from the function's options section
+# as `claude_account`: `workers` (the default) takes the workers pool, and
+# `caller` keeps the caller's own account. A row's own `claude_account.<subtask>`
+# beats the function's key. A codex task carries none.
+_agents_resolve_claude_account() {
+    _models_registry_read _agents_resolve_claude_account_from_table "$@"
+}
+
+_agents_resolve_claude_account_from_table() {
+    local task="$1" family="$2" function account
+
+    AGENT_CLAUDE_ACCOUNT=""
+    [[ "$family" == "claude" ]] || return 0
+    function="${task%%.*}"
+    account="$(_models_registry_get "$function.options" "claude_account.${task#*.}")"
+    [[ -n "$account" ]] || account="$(_models_registry_get "$function.options" claude_account)"
+    case "$account" in
+        '') AGENT_CLAUDE_ACCOUNT="workers" ;;
+        workers|caller) AGENT_CLAUDE_ACCOUNT="$account" ;;
+        *)
+            echo "ERROR: [$task] claude_account '$account' in [$function.options] is not a launch account." >&2
+            echo "       Allowed values: workers, caller" >&2
+            return 1
+            ;;
+    esac
 }
 
 # The speed tier is a codex setting, read from the function's options section as
