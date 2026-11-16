@@ -684,7 +684,7 @@ class AdmissionFixture(ExitStack):
                 self.clock.advance(spacing.at - self.clock.now())
 
     def advance_idle_spacing(self) -> None:
-        """Skip start spacing without changing the clock when no caller remains live."""
+        """Skip the delay between starts without changing the clock when no caller remains live."""
         if self.skip_idle_spacing and not self.server.caller_live(self.scenery_reservations):
             self.server.spacing = records.ReadyToStart()
 

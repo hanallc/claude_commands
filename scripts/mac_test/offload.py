@@ -96,12 +96,13 @@ ALL_MIRRORS = AllMirrors()
 
 @dataclass(frozen=True)
 class KnownTreeKey:
+    """The value identifies the source tree."""
     value: str
 
 
 @dataclass(frozen=True)
 class UnavailableTreeKey:
-    pass
+    """The source tree key is unavailable."""
 
 
 TreeKey = KnownTreeKey | UnavailableTreeKey
@@ -110,11 +111,13 @@ UNAVAILABLE_TREE_KEY = UnavailableTreeKey()
 
 @dataclass(frozen=True)
 class CopiedTree:
+    """The copied tree retains its source tree key."""
     tree_key: TreeKey
 
 
 @dataclass(frozen=True)
 class TreeCopyFailed:
+    """The detail describes a failed source tree copy."""
     detail: str = ""
 
 
@@ -141,29 +144,32 @@ NO_FETCH = NoFetch()
 
 @dataclass(frozen=True)
 class Fetched:
+    """The fetched result holds its local path and size in KiB."""
     path: Path
     kib: int
 
 
 @dataclass(frozen=True)
 class FetchMissing:
-    pass
+    """The requested remote result folder is missing."""
 
 
 @dataclass(frozen=True)
 class FetchTooLarge:
+    """The remote result size exceeds the configured fetch limit."""
     kib: int
     limit_mib: float
 
 
 @dataclass(frozen=True)
 class FetchFailed:
+    """The reason explains why the result fetch failed."""
     reason: str
 
 
 @dataclass(frozen=True)
 class FetchNotRun:
-    pass
+    """The result fetch did not run."""
 
 
 FetchResult = Fetched | FetchMissing | FetchTooLarge | FetchFailed | FetchNotRun
@@ -215,17 +221,18 @@ class DeclinedMacRun:
 
 @dataclass(frozen=True)
 class KnownMacJob:
+    """The text identifies the job that holds the Mac."""
     what: str
 
 
 @dataclass(frozen=True)
 class LostRunLeftovers:
-    pass
+    """Work from a lost run still holds the Mac."""
 
 
 @dataclass(frozen=True)
 class UnreadableMacHolder:
-    pass
+    """The Mac holder cannot be read."""
 
 
 MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
@@ -233,6 +240,7 @@ MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
 
 @dataclass(frozen=True)
 class BusyMacDecline:
+    """The decline holds the Mac holder and elapsed time."""
     holder: MacHolder
     seconds: float
 
@@ -254,12 +262,14 @@ def holder_value(holder: MacHolder) -> str:
 
 @dataclass(frozen=True)
 class PassedOnTarget:
+    """The remote step passed with this duration and build target directory."""
     seconds: float
     build_target_directory: str = ""
 
 
 @dataclass(frozen=True)
 class FailedOnTarget:
+    """The remote step failed with this exit status and duration."""
     status: int
     seconds: float
 
@@ -336,11 +346,12 @@ NO_PRIOR_MAC_DECLINE = NoPriorMacDecline()
 
 @dataclass(frozen=True)
 class RepositoryWorkingTree:
-    pass
+    """The remote source comes from the repository worktree."""
 
 
 @dataclass(frozen=True)
 class StagedDocSnapshot:
+    """The remote documentation source comes from this staged snapshot root."""
     root: Path
 
 
@@ -354,6 +365,7 @@ class DirectOffloadRequest:
 
 @dataclass(frozen=True)
 class AssignedOffloadRequest:
+    """The remote request holds its placement assignment."""
     assignment: placement.PlacementAssignment
 
 
@@ -384,16 +396,19 @@ class ClaimReleaseConfirmed:
 
 @dataclass(frozen=True)
 class ClaimReleaseUnconfirmed:
+    """The reason explains why claim release is unconfirmed."""
     reason: str
 
 
 @dataclass(frozen=True)
 class StartSettled:
+    """The remote start has settled with this cleanup result."""
     leftovers: LeftoverCheckResult
 
 
 @dataclass(frozen=True)
 class StartUnsettled:
+    """The remote start remains unsettled with a reason and cleanup result."""
     reason: str
     leftovers: LeftoverCheckResult
 
@@ -547,11 +562,13 @@ class LeftoversEnded:
 
 @dataclass(frozen=True)
 class LeftoversRemain:
+    """The cleanup found remaining work with this count or an unresolved count."""
     count: int | UnresolvedLeftoverCount
 
 
 @dataclass(frozen=True)
 class LeftoverCheckFailed:
+    """The reason explains why the cleanup check failed."""
     reason: str
 
 
@@ -727,6 +744,7 @@ class ReportedMacStatus:
 
 @dataclass(frozen=True)
 class ToolVersionMismatch:
+    """The reason describes incompatible local and remote tool versions."""
     reason: str
 
 
@@ -2223,6 +2241,7 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
 
 @dataclass(frozen=True)
 class LeftoverObservation:
+    """The observation holds the cleanup result and original output."""
     result: LeftoverCheckResult
     output: str
 

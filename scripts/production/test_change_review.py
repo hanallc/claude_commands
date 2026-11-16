@@ -211,7 +211,8 @@ class ProducerWriterTests(ProducerFixture):
     def test_image_commands_report_store_errors(self) -> None:
         commands = (("image", "--image", "invalid.txt"),
             ("add", "--repo", str(self.repo), "--production", "top", "--change", "Preview",
-             "--check", "Read", "--see", "The image", "--image", "invalid.txt"))
+             "--check", "Read", "--see", "The image", "--image", "invalid.txt"),
+            ("edit", "--production", "top", "--row", "C1", "--image", "invalid.txt"))
         for arguments in commands:
             for error in (ValueError("invalid image"), subprocess.SubprocessError("image capture failed")):
                 with self.subTest(arguments=arguments, error=error), mock.patch.object(
@@ -219,6 +220,60 @@ class ProducerWriterTests(ProducerFixture):
                     code, _, errors = run(*arguments)
                     self.assertEqual(code, 1)
                     self.assertIn(str(error), errors)
+
+    def test_edit_image_adds_the_image_column_without_changing_other_cells(self) -> None:
+        _ = self.listing.write_text(LIST, encoding="utf-8")
+        before = change_review.pending(self.listing)
+        self.assertNotIn(change_review.IMAGE, before[0])
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        code, _, errors = run("edit", "--production", "top", "--list", str(self.listing),
+                              "--row", "C76", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        after = change_review.pending(self.listing)
+        self.assertEqual([{key: value for key, value in row.items() if key != change_review.IMAGE}
+                          for row in after], before)
+        self.assertTrue(image_store.change_image(self.root / "links", after[0][change_review.IMAGE]))
+        self.assertEqual(after[1][change_review.IMAGE], "")
+
+    def test_edit_image_replaces_the_old_folder_after_the_cell_is_written(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        code, _, errors = run("add", "--repo", str(self.repo), "--production", "top", "--change", "Preview",
+                              "--check", "Read", "--see", "The image", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        before = change_review.pending(self.listing)[0]
+        old = before[change_review.IMAGE]
+        remove = image_store.remove_change
+
+        def remove_written(root: Path, identity: str) -> None:
+            self.assertNotEqual(change_review.pending(self.listing)[0][change_review.IMAGE], identity)
+            remove(root, identity)
+
+        with mock.patch.object(image_store, "remove_change", side_effect=remove_written) as removed:
+            code, _, errors = run("edit", "--production", "top", "--row", "C1", "--image", str(shot))
+        self.assertEqual((code, errors), (0, ""))
+        removed.assert_called_once_with(self.root / "links", old)
+        after = change_review.pending(self.listing)[0]
+        self.assertEqual({**after, change_review.IMAGE: old}, before)
+        self.assertFalse((self.root / "links" / image_store.CHANGE_FOLDER / old).exists())
+        self.assertTrue(image_store.change_image(self.root / "links", after[change_review.IMAGE]))
+
+    def test_edit_image_keeps_text_validation_and_accepts_a_complete_text_edit(self) -> None:
+        _ = self.listing.write_text(LIST, encoding="utf-8")
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        arguments = ("edit", "--production", "top", "--list", str(self.listing),
+                     "--row", "C76", "--image", str(shot), "--change", "New preview")
+        code, _, errors = run(*arguments)
+        self.assertEqual(code, 1)
+        self.assertIn("--check needs one line of words", errors)
+        self.assertEqual(self.listing.read_text(encoding="utf-8"), LIST)
+        code, _, errors = run(*arguments, "--check", "Open", "--see", "The result")
+        self.assertEqual((code, errors), (0, ""))
+        row = change_review.pending(self.listing)[0]
+        self.assertEqual((row["Change"], row[change_review.CHECK]), ("New preview", "Open. You see: The result"))
+        self.assertTrue(image_store.change_image(self.root / "links", row[change_review.IMAGE]))
 
     def test_a_missing_image_does_not_add_an_empty_image_column(self) -> None:
         output = io.StringIO()

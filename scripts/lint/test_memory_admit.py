@@ -5841,7 +5841,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "peak_history_share_percent"):
+                        "peak_history_share_percent", "progress_profile_sweep_seconds"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5862,6 +5862,8 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
+                        elif key == "progress_profile_sweep_seconds":
+                            self.assertEqual(repaired.progress_profile_sweep_seconds, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
 

@@ -828,12 +828,25 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     return NoFreshHistory()
 
 GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
+_GIT_IDENTITIES: dict[tuple[str, str], tuple[Repository, str]] = {}
+
+
+def clear_git_identity_cache() -> None:
+    """Clear identities after a test changes an origin or replaces a repository."""
+    _GIT_IDENTITIES.clear()
 
 
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
-    directory = record.git_directory(argv, cwd)
+    directory = os.path.abspath(record.git_directory(argv, cwd))
+    key = (directory, cwd)
+    if key not in _GIT_IDENTITIES:
+        _GIT_IDENTITIES[key] = _read_git_identity(directory, cwd)
+    return _GIT_IDENTITIES[key]
+
+
+def _read_git_identity(directory: str, cwd: str) -> tuple[Repository, str]:
     facts = record.git_facts(directory)
     worktree = Path(facts["worktree"] or cwd).name
     key = repository.repository_key(directory)

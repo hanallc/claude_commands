@@ -117,7 +117,9 @@ class VerifyLintJudgmentFixture(VerifyLintCacheFixture):
 
 
 class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
-    def invoke_lint_functions(self, *, killed: int = 0) -> subprocess.CompletedProcess[str]:
+    def invoke_lint_functions(
+        self, *, killed: int = 0, held_clippy_failure: bool = False, memory_judgment: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
         """Run the lint sequence with real tools and private state."""
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
@@ -167,13 +169,52 @@ TREE_WATCH_SCRIPT="$HOME/.claude/scripts/direct/tree_watch.py"
 BUILD_FOLDERS_SCRIPT="$HOME/.claude/scripts/lib/build_folders.py"
 GATE_METADATA="$TEST_METADATA"
 trap 'stop_tree_watch' EXIT
-run_lint_sequence
 '''
+        if held_clippy_failure:
+            script += f"TEST_LINT_MEMORY_JUDGMENT={int(memory_judgment)}\n"
+            script += r'''
+LINT_LEFT_QUEUE_STATUS=75
+LINT_MEMORY_JUDGMENT=0
+lint_config_enabled() { return 0; }
+fmt_cargo() { :; }
+load_metadata() { :; }
+workspace_taplo() { :; }
+start_tree_watch() { :; }
+finish_tree_watch() { :; }
+stop_tree_watch() { :; }
+mktemp() { : > "$PACKAGE_ROOT/mend.log"; printf '%s\n' "$PACKAGE_ROOT/mend.log"; }
+invoke_mend() {
+    printf 'mend %s\n' "$*" >> "$PACKAGE_ROOT/held-calls"
+    if [[ "$*" == *--fail-on-warn* ]]; then return 0; fi
+    if [[ "$LINT_MEND_WAIT" == 1 ]]; then
+        LINT_MEMORY_JUDGMENT=$TEST_LINT_MEMORY_JUDGMENT
+        touch "$HOLD_WAIT_DIR/lint-held"
+        return "$LINT_LEFT_QUEUE_STATUS"
+    fi
+    return 99
+}
+invoke_clippy() { printf 'clippy\n' >> "$PACKAGE_ROOT/held-calls"; return 101; }
+'''
+        script += "\nrun_lint_sequence\n"
         return subprocess.run(
             ["bash", "-c", script], cwd=self.root,
             env={**self.environment, "PY": sys.executable, "TEST_RUNNER_KILLED_FLAG": str(killed)},
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def test_mac_clippy_failure_stops_without_another_local_mend(self) -> None:
+        for memory_judgment in (False, True):
+            with self.subTest(memory_judgment=memory_judgment):
+                (self.root / "held-calls").unlink(missing_ok=True)
+                result = self.invoke_lint_functions(held_clippy_failure=True, memory_judgment=memory_judgment)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual((self.root / "held-calls").read_text().splitlines(), [
+                    "mend --workspace --fix",
+                    "mend --workspace --fail-on-warn",
+                    "clippy",
+                ])
+                self.assertFalse((self.root / "mend.log").exists())
+                self.assertFalse((self.root / "hold-wait" / "lint-held").exists())
 
     def test_explicit_clippy_deny_attribute_repairs(self) -> None:
         self.environment.update({

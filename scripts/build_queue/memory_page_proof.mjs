@@ -208,7 +208,8 @@ try {
         await navigate('memory_live.html');
 
         const proofs = [];
-        const show = async (reading, clearTip=true) => evaluate(`(async () => {
+        const show = async (reading, clearTip=true) => {
+          const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
           const data = ${JSON.stringify(reading)};
@@ -218,8 +219,24 @@ try {
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return [...document.querySelectorAll('.legend-group')].map(group=>({
+            name:group.querySelector('.group-head .name').textContent,
+            total:group.querySelector(':scope > .group-head .v,:scope > .row.total .v').textContent,
+            rows:[...group.querySelectorAll(':scope > .row:not(.in):not(.total)')]
+              .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
+              .map(row=>row.querySelector('.v').textContent)}));
+          })()`);
+          for(const group of totals) {
+            if(group.total==='unavailable') continue;
+            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const sum=group.rows.reduce((total,text)=>total+amount(text),0);
+            // Each displayed amount rounds to tenths of a GiB.
+            const tolerance=(group.rows.length+1)*0.05+group.rows.filter(text=>text.startsWith('<')).length*0.05;
+            assert.ok(Math.abs(amount(group.total)-sum)<=tolerance+1e-9,
+              'A legend total differs from its rows: '+JSON.stringify(group));
+          }
           return true;
-        })()`);
+        };
         for (const theme of ['light','dark']) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of [1400,900,390]) {
@@ -276,6 +293,8 @@ try {
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
                 headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                runningSlots:[...table.querySelectorAll('tr[data-tip^="row:"] .slot')].map(cell=>cell.textContent),
+                queuedSlots:table.querySelectorAll('tr[data-tip^="wait:"] .slot,tr.queue-head .slot').length,
                 answer:text('#answer'),
                 queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
@@ -333,7 +352,9 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
+            assert.equal(proof.queuedSlots,0);
             assert.equal(proof.answer,'Free for the next step');
             assert.deepEqual(proof.queueHeaders,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
             assert.equal(proof.queueHeaderHeight,proof.queueSpacerHeight);
@@ -412,6 +433,34 @@ try {
             const point=proof.reportPoints.at(-1);
             checkPixel((point.box.left+point.box.right)/2,(point.box.top+point.box.bottom)/2,point.color,'The report pixels differ.',true);
             proofs.push({theme,width,metrics:proof});
+            const slotReview=structuredClone(base);
+            const running=slotReview.walk.find(row=>row.queued&&!row.ci);
+            slotReview.walk=[
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2},
+              {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
+            ];
+            slotReview.waiters=[];
+            slotReview.ram.build_tools_bytes=0;
+            await show(slotReview);
+            const slotColumn=await evaluate(`(()=>{
+              const table=document.querySelector('.walk-table');
+              const rows=[...table.querySelectorAll('tr[data-tip^="row:"]')];
+              const box=table.getBoundingClientRect();
+              const bottom=rows.at(-1).getBoundingClientRect().bottom;
+              return {slots:rows.map(row=>row.querySelector('.slot').textContent),
+                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
+                overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
+                clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
+            })()`);
+            assert.deepEqual(slotColumn.slots,['2','—']);
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot'],['vcpus','slot']]);
+            assert.equal(slotColumn.overflow,false);
+            if(theme==='dark'&&width===1400) {
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
+              await writeFile(join(folder,'slot-column-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+            }
+            await show(base);
 
             proof.swapRefresh=await evaluate(`(async () => {
               const originalFetch=window.fetch, originalRender=window.render;
@@ -570,7 +619,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.kind==='cloud'),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -629,6 +678,25 @@ try {
               } else assert.equal(alert.height,0,'The clear alert keeps an empty line.');
               proof[name+'Alert']=alert;
             }
+            const signedLegend=structuredClone(base), legendGib=1024**3;
+            Object.assign(signedLegend.ram,{desktop_bytes:2*legendGib,agents_bytes:3*legendGib,
+              other_programs_bytes:legendGib,kernel_bytes:2*legendGib,cache_bytes:2*legendGib,
+              unattributed_bytes:0});
+            await show(signedLegend);
+            const unsignedWidths=await evaluate(`RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)`);
+            signedLegend.ram.unattributed_bytes=-legendGib;
+            await show(signedLegend);
+            const signedProof=await evaluate(`({
+              total:document.querySelector('#v-g-else').textContent,
+              unattributed:document.querySelector('#v-unattributed').textContent,
+              tip:TIPS['g-else'](latest)[0],
+              widths:RAM_BLOCKS.map(([key])=>document.querySelector('#s-'+key).style.width)
+            })`);
+            assert.equal(signedProof.total,'9.0 GiB','The legend total omits the negative reading.');
+            assert.equal(signedProof.unattributed,'-1.0 GiB');
+            assert.equal(signedProof.tip,'Everything else · 9.0 GiB');
+            assert.deepEqual(signedProof.widths,unsignedWidths,'The negative reading changes bar widths.');
+            proof.signedLegend=signedProof;
             await show({...base, ram:{...base.ram, agreement:'disagree'}});
             const disagree=await evaluate(`(() => {
               const note=document.querySelector('#ram-disagree');
@@ -643,13 +711,19 @@ try {
             const gib=1024**3, capReading=structuredClone(base), known=value=>typeof value==='number'?value:0;
             Object.assign(capReading.ram,{build_tools_bytes:capReading.ram.build_tools_bytes+gib,
               sccache_bytes:capReading.ram.sccache_bytes+gib,ci_bytes:known(capReading.ram.ci_bytes)+gib/2,
+              available_bytes:capReading.ram.available_bytes-3*gib/2,
               room_bytes:capReading.ram.room_bytes-3*gib/2});
             capReading.room-=1.5;
+            capReading.taken=capReading.cap-capReading.room;
             await show(capReading);
             const capLine=await evaluate(`(() => {
               const line=document.querySelector('#walk .walk-bud');
               const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
               const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
+              const tools=document.querySelector('#walk .wrow.tools .seg-tools').getBoundingClientRect();
+              const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
+              const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
+              const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
               const box=line?.getBoundingClientRect(), card=document.querySelector('#walk').closest('.card').getBoundingClientRect();
               // The line stops at chart text, so the pixel check reads the longest part of it.
               const drawn=[...(line?.querySelectorAll('.cap-part')||[])];
@@ -657,10 +731,18 @@ try {
                 .sort((a,b)=>b.box.height-a.box.height)[0];
               return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
                 left:box?box.left+1:null,top:part?.box.top,bottom:part?.box.bottom,roomRight:room?room.right:null,
+                tools:{left:tools.left,right:tools.right,width:tools.width,trackLeft:track.left},
+                memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
+                  barLeft:memoryBar.left,capRight:memoryCap.right},
                 expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
                 scrollY,card:{x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1}};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
+            assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
+            assert.ok(Math.abs(capLine.tools.left-capLine.tools.trackLeft)<=1,'Build tools do not start at the chart left edge.');
+            assert.ok(capLine.tools.right<capLine.left,'Build tools extend beyond the chart cap mark.');
+            assert.ok(Math.abs(capLine.memoryTools.left-capLine.memoryTools.barLeft)<=1,'Build tools do not start at the memory bar left edge.');
+            assert.ok(capLine.memoryTools.right<capLine.memoryTools.capRight,'Build tools extend beyond the memory bar cap mark.');
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
             assert.ok(Math.abs(capLine.left-capLine.expected)<=1.5,'The cap line is off the cap value. '+JSON.stringify(capLine));
             assert.ok(Math.abs(capLine.roomRight-capLine.expected)<=1.5,'The room bar does not end at the cap. '+JSON.stringify(capLine));
@@ -671,6 +753,22 @@ try {
             assert.ok(capPixel.every((value,index)=>Math.abs(value-capColor[index])<=1),
               'The cap line pixels differ. '+JSON.stringify({capPixel,capColor}));
             if(width===1400) await writeFile(join(folder,`${theme}-${width}-cap-line.png`),capShot);
+            if(theme==='dark'&&width===1400) {
+              const clip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+              await writeFile(join(folder,'build-tools-inside-cap-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              const legendClip=await evaluate(`(()=>{
+                const box=document.querySelector('.legend-box .legend').getBoundingClientRect();
+                return {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
+                  width:Math.ceil(box.width)+8,height:Math.ceil(box.height)+8,scale:1};
+              })()`);
+              const legendShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:legendClip});
+              await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
+            }
             proof.capLine=capLine;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -772,6 +870,7 @@ try {
                 progress:{kind:'NoProgress',reason:'no admission counter'},ci_runners:[{state:state==='waiting'||state==='unmatched'?'busy':state}]});
               ciReading.ci_ram=0.125;
               ciReading.ram.ci_bytes=known(ciReading.ram.ci_bytes)+gib/8;
+              ciReading.ram.available_bytes-=gib/8;
               ciReading.ram.room_bytes-=gib/8;
               ciReading.room-=0.125;
               ciReading.taken=ciReading.cap-ciReading.room;
@@ -865,14 +964,88 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','start spacing'],['head','behind']]) {
+            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],
+              ['spacing','another step just started; the queue waits a few seconds between starts'],['head','behind']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
+              if(name==='spacing'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]');
+                  row.scrollIntoView({block:'center'});
+                  const box=row.getBoundingClientRect();
+                  showTip('wait:0',(box.left+box.right)/2,box.top);
+                  const tooltip=document.querySelector('#tip');
+                  const tipBox=tooltip.getBoundingClientRect();
+                  const left=Math.min(box.left,tipBox.left)-4,top=Math.min(box.top,tipBox.top)-4;
+                  return {text:tooltip.textContent,clip:{x:left+scrollX,y:top+scrollY,
+                    width:Math.max(box.right,tipBox.right)-left+4,
+                    height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
+                })()`);
+                assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
+                await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
+            for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
+              await show(readings[name]);
+              const headProof=await evaluate(`(() => {
+                const rows=latest.waiters[0].head_room.rows.filter(row=>row.label!=='need'&&!row.label.includes('Held for earlier steps'));
+                const group=document.querySelector('#v-g-free').closest('.legend-group');
+                const legend=Object.fromEntries([...group.querySelectorAll('.row,.group-head')].map(row=>[
+                  row.querySelector('.name').textContent,{
+                    value:row.querySelector('.v').textContent,note:row.querySelector('.note')?.textContent||''}]));
+                return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
+                  values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
+                  hover:tipText('wait:0',latest)[1],room:tipText('room',latest).join('\\n'),legend,
+                  covered:document.querySelector('#v-reserved').textContent,
+                  free:document.querySelector('#v-g-free').textContent,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              assert.ok(headProof.removed,'The removed Head line returns.');
+              for(const [label,value] of Object.entries(headProof.values)) {
+                assert.ok(headProof.hover.includes(label+': '+value),'The head tooltip omits the term: '+label);
+                const row=headProof.legend[label];
+                assert.ok(row,'The legend omits the head term: '+label);
+                assert.ok(row.value===value||row.note.includes('Needs '+value+';'),
+                  'The legend amount differs from the head tooltip: '+label);
+                assert.ok(headProof.room.includes(label+(label==='Free'?' · ':': ')+value),
+                  'The room tooltip differs from the head tooltip: '+label);
+              }
+              assert.equal(headProof.values['Free RAM'],headProof.free);
+              assert.equal(headProof.values['Safety net'],(readings[name].ram.safety_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Swap coming back'],(readings[name].ram.swap_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Build reserved'],(readings[name].ram.build_target_bytes/gib).toFixed(1)+' GiB');
+              assert.notEqual(headProof.values['Build reserved'],headProof.covered,'The fixture has no uncovered build reserve.');
+              if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
+              assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
+              if(name==='head_memory'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+                  const legend=document.querySelector('.legend-box').getBoundingClientRect();
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
+                  showTip('wait:0',card.right-140,row.top);
+                  placeTip(card.right-140,legend.top+document.querySelector('#tip').offsetHeight+50);
+                  const tip=document.querySelector('#tip').getBoundingClientRect();
+                  const groups=[...document.querySelectorAll('.legend-group')];
+                  if(groups.some(group=>group.getBoundingClientRect().right>tip.left)) {
+                    throw new Error('The head tooltip covers a legend group.');
+                  }
+                  return {x:card.left,y:card.top+scrollY,width:card.width,
+                    height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'head-tooltip-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              }
+              proof[name]=headProof;
+            }
+            await show(base);
+            const reserveNotes=await evaluate(`['reserved-note','safety-note','swap-note'].map(id=>document.getElementById(id).textContent)`);
+            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','Empty now; held for swapped memory.']);
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -1059,7 +1232,7 @@ try {
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
               assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
@@ -1387,9 +1560,9 @@ try {
           const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
             pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
           const priority="queue priority: research (the user's bump)";
-          const room={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
-            {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
-            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],
+          const room={rows:[{label:'Free RAM',gib:28.4},{label:'− Safety net',gib:3.0},
+            {label:'− Swap coming back',gib:9.8},{label:'− Build reserved',gib:8.5},
+            {label:'= Free',gib:7.1},{label:'need',gib:16.3}],
             note:'Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
@@ -1493,8 +1666,8 @@ try {
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{rows:[{label:'free RAM',gib:8.5},{label:'− safety net',gib:3.0},
-              {label:'− swap coming back',gib:6.0},{label:'= free',gib:0.0},{label:'needs',gib:1.9}],note:''}}];
+            head_room:{rows:[{label:'Free RAM',gib:8.5},{label:'− Safety net',gib:3.0},
+              {label:'− Swap coming back',gib:6.0},{label:'= Free',gib:0.0},{label:'need',gib:1.9}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {

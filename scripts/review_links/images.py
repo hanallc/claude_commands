@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 from scripts.lib import conf, file_lock
 from scripts.lib.user_zone import shown_time
 from scripts.production import staff
-from scripts.review_links import change_browser, change_page, console, image_store, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, page_frame, review_link
 
 FOLDER = "images"
 PAGE_NAME = "images.html"
@@ -122,10 +122,10 @@ def owner_names(record: staff.StaffSnapshot, identity: str) -> tuple[str, str]:
 
 
 def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
-    """Link one image to its full size; a pair image shows its label above it."""
+    """Link one image to the shared zoom; show its pair label above it."""
     path = html.escape(image_path(record, file), quote=True)
     alt = record["caption"].splitlines()[0]
-    linked = (f'<a href="{path}" target="_blank" rel="noopener"><img src="{path}" '
+    linked = (f'<a data-image-zoom href="{path}" target="_blank" rel="noopener"><img src="{path}" '
               + f'alt="{html.escape(f"{label}: {alt}" if label else alt, quote=True)}" loading="lazy"></a>')
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
@@ -272,7 +272,8 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
-SCRIPT = r"""(() => {
+SCRIPT = page_frame.MOTION_SCRIPT + r"""(() => {
+const motion = createCardMotion();
 const menu = document.getElementById('image-window');
 const empty = document.querySelector('[data-empty]');
 const spans = {day: 86400, week: 604800, all: Infinity};
@@ -306,7 +307,7 @@ function showGroups() {
     link.href = '#' + row.card.id;
     link.addEventListener('click', event => {
       event.preventDefault();
-      row.card.scrollIntoView({block: 'start'});
+      selectImage(row.card);
     });
     const name = row.card.dataset.ownerName;
     [name, String(row.count), row.card.querySelector('time').textContent].forEach((text, index) => {
@@ -327,13 +328,12 @@ function bind(root) {
       status.textContent = 'Enter feedback first.';
       return;
     }
-    // The card leaves at once and the request runs in the background; a failure puts the card back.
+    // The card fades before removal; a failed request restores the card.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
     status.textContent = '';
-    card.remove();
     sending++;
-    apply();
+    await motion.removeCard(card, apply);
     try {
       const response = await fetch(location.pathname, {method: 'POST', body});
       if (!response.ok) {
@@ -363,6 +363,7 @@ async function refresh() {
       return;
     }
     const top = scrollY;
+    motion.finish();
     list.replaceWith(fresh);
     list = fresh;
     bind(list);
@@ -370,26 +371,39 @@ async function refresh() {
     scrollTo({top, behavior: 'instant'});
   } catch (_) {}
 }
+function selectImage(target) {
+  if (target.hidden) {
+    menu.value = 'all';
+    apply();
+  }
+  void motion.scrollCard(target);
+}
+function openImageLink() {
+  const start = new URLSearchParams(location.hash.slice(1));
+  const target = document.getElementById('image-' + start.get('image'));
+  if (target) selectImage(target);
+}
 const start = new URLSearchParams(location.hash.slice(1));
 if (start.get('show') in spans) menu.value = start.get('show');
-// An image link (#image=<id>) opens the page at that image, with a longer period when the image is older.
-const target = document.getElementById('image-' + start.get('image'));
-menu.addEventListener('change', apply);
+menu.addEventListener('change', () => { motion.finish(); apply(); });
+addEventListener('hashchange', openImageLink);
 addEventListener('message', event => {
   if (event.source === parent && event.origin === location.origin && event.data === 'console-shown') refresh();
 });
 document.addEventListener('visibilitychange', refresh);
 bind(list);
+// An image link opens its image with a longer period when the image is older.
+const linkedImage = start.get('image');
 apply();
-if (target) {
-  if (target.hidden) {
-    menu.value = 'all';
-    apply();
+if (linkedImage) {
+  const target = document.getElementById('image-' + linkedImage);
+  if (target) {
+    if (target.hidden) { menu.value = 'all'; apply(); }
+    motion.scroll(target, true);
   }
-  target.scrollIntoView({block: 'start'});
 }
 })();"""
-SCRIPT_VERSION = change_page.script_version(SCRIPT)
+SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
 
 
 def main(arguments: list[str]) -> int:

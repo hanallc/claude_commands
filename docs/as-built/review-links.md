@@ -240,6 +240,8 @@ An empty page shows **No questions to answer.** or **No changes to review.**
 
 Each change can hold one image id in its optional `Image` cell.
 `change_review.py add --image <png>` registers the file and fills that cell.
+`change_review.py edit --row <id> --image <png>` attaches or replaces an image without changing the other cells.
+It adds the `Image` column when needed and deletes the old image after writing the row.
 `change_review.py image --image <png>` registers a screenshot for a checkpoint line.
 `image --output <text file>` renders dark terminal output with headless Chrome in a temporary browser profile.
 The action prints the id for a final ` | image <id>` field, after optional ` | after <step>`.
@@ -249,7 +251,10 @@ The parser accepts twelve lowercase hexadecimal characters.
 Both review pages use `change_page.change_content` and `CHANGE_IMAGE_STYLE` for the thumbnail.
 The thumbnail occupies 280px beside the 680px text column in a main area of at most 1056px.
 It has a 420px height limit and crops from the top left.
-It opens the full image in a new tab.
+A plain click opens the shared image zoom over the page.
+Escape or a click on the zoom closes it and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
 Below 1000px, it moves under the text.
 A row without an image retains its text width and position.
 
@@ -275,12 +280,17 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 - **Recommended**;
 - **Choices** as a list of radio items above the answer box. A choice fills the box; the user can edit the text or write their own.
 A question stored as one text, from before the parts form, shows in sections too:
-- the text up to its first numbered item;
-- **Items**: a run of two or more items marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order;
-- the text after the first sentence of the last item, as its own paragraph;
-- **Choices**: the text after `Choices:`. Numbered choices show as radio items; other choice text shows as text;
-- **Recommended**: the text after `Recommended:`.
-A one-text question without these marks shows its full text by lines, and `- ` or `1. ` lines show as lists.
+
+1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
+2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
+3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+4. A raw question stored on one line shows each context sentence as a separate paragraph.
+5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
+6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
+7. Reviewed text can end with two or more labeled choice paragraphs. These paragraphs use the same radio items.
+8. Choices without clear labels or numbers remain separate text items. The page does not invent answer values.
+9. **Recommended** uses explicit `Recommended:` text. A reviewed choice keeps its `(recommended)` mark without a second section.
+
 In all question text, each `http` or `https` address is a link that opens in the same tab (`target="_top"`), outside the console frame.
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
@@ -351,9 +361,20 @@ Each card shows, in this order:
 
 1. The caption as the card title, in a larger font.
 2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image, as a link to the full size. A pair shows its two images side by side, each under a **Before** or **After** label.
+3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
 4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
 5. The answer buttons: **Approved**, **Not Approved** and **Send Feedback**.
+
+A plain click on a single image or either pair image opens the shared image zoom.
+The zoom centers the full image over a dark backdrop within the page view.
+It fits the view with a 16px margin and never exceeds the image's natural size.
+Escape or a click on the backdrop or image closes it.
+The page keeps its scroll position and returns focus to the image link.
+Shift, Ctrl, Meta and Alt clicks retain the browser's link action.
+Middle clicks and the right-click menu retain the browser's link action.
+`page_frame.ZOOM_STYLE` and `ZOOM_SCRIPT` supply one zoom through `change_page.document`.
+One document click listener handles `data-image-zoom` links, including links from later page updates.
+The modal dialog takes focus and uses the image's alt text as its accessible name.
 
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
@@ -983,3 +1004,27 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+
+Changes, Questions, and Images share one motion helper.
+A different Changes or Questions card fades out for 120ms, then fades in for 180ms with a 4px upward move.
+A new switch completes the active switch first.
+The first load and an update that keeps the same card do not fade.
+A new card above the viewport scrolls into view smoothly.
+Image links scroll smoothly to their image, then reveal it over 180ms with a 4px upward move.
+Other image cards stay visible.
+An image fades before removal, and the cards below close the gap over 180ms.
+Reduced motion disables fades and uses instant scrolling.
+
+Questions and Changes show a Lucide copy button inside the top right of each code block.
+The command item renderer emits the button with the code block.
+Plain proof text keeps its `<pre>` block without a copy button.
+Inline code keeps its current style.
+The button copies the code text without the button or its label.
+The button shows a check and the label “Copied” for two seconds after success.
+A second click starts the two seconds again.
+A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
+The shared script uses the clipboard API when available.
+Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
+The fallback restores focus and the previous selection.
+One document listener also handles code blocks from page updates.

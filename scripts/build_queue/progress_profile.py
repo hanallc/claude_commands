@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 from typing import cast
 
 from scripts.lib.atomic_file import atomic_sample
@@ -24,11 +25,12 @@ class TokenWait:
 
 @dataclass(frozen=True)
 class NoTokenWait:
-    pass
+    """The progress counter has no token wait."""
 
 
 @dataclass(frozen=True)
 class NoCounter:
+    """The reason explains the absent progress counter and any token wait."""
     reason: str = "no current counter"
     # The counter union stays stable for pinned clients; a token wait is this optional field.
     token_wait: TokenWait | NoTokenWait = NoTokenWait()
@@ -49,6 +51,7 @@ def token_wait_line(tokens: int) -> str:
 
 @dataclass(frozen=True)
 class ProgressCounter:
+    """The counter holds a phase and its completed and total work counts."""
     phase: str
     done: int
     total: int
@@ -64,17 +67,18 @@ class ProgressCounter:
 
 @dataclass(frozen=True)
 class NoMatchingProfile:
+    """The reason explains why no memory profile matches."""
     reason: str = "no matching anonymous profile"
 
 
 @dataclass(frozen=True)
 class UnmeasuredBin:
-    pass
+    """This progress bin has no measured memory value."""
 
 
 @dataclass(frozen=True)
 class ConfiguredProfileRank:
-    pass
+    """Profile selection uses the configured rank."""
 
 
 CONFIGURED_PROFILE_RANK = ConfiguredProfileRank()
@@ -86,7 +90,7 @@ def profile_rank(rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK) ->
 
 @dataclass(frozen=True)
 class ConfiguredPeakShare:
-    pass
+    """Peak selection uses the configured share."""
 
 
 CONFIGURED_PEAK_SHARE = ConfiguredPeakShare()
@@ -107,16 +111,19 @@ def ranked_peak(values: list[int], floor: int, *,
 
 @dataclass(frozen=True)
 class ScopeReading:
+    """The memory reading comes from this scope directory."""
     directory: Path
 
 
 @dataclass(frozen=True)
 class ProcessTreeReading:
+    """The memory reading comes from these process identifiers."""
     pids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class ReadingSourceNotRecorded:
+    """The reason explains why the reading source was not recorded."""
     reason: str = "reading source not recorded"
 
 
@@ -125,16 +132,19 @@ ReadingSource = ScopeReading | ProcessTreeReading | ReadingSourceNotRecorded
 
 @dataclass(frozen=True)
 class ProcessCommandUnavailable:
+    """The reason explains why the process command is unavailable."""
     reason: str
 
 
 @dataclass(frozen=True)
 class ProcessRssAnonUnavailable:
+    """The reason explains why the process anonymous resident memory is unavailable."""
     reason: str
 
 
 @dataclass(frozen=True)
 class ProfileProcess:
+    """The process evidence holds its identifier, command, and anonymous resident memory."""
     pid: int
     command: tuple[str, ...] | ProcessCommandUnavailable
     rss_anon: int | ProcessRssAnonUnavailable
@@ -142,11 +152,13 @@ class ProfileProcess:
 
 @dataclass(frozen=True)
 class PeakProcessesNotRecorded:
+    """The reason explains why peak process evidence was not recorded."""
     reason: str = "process evidence not recorded"
 
 
 @dataclass(frozen=True)
 class PeakProcesses:
+    """The peak evidence holds its phase, bin, anonymous bytes, and processes."""
     phase: str
     bin: int
     anonymous_bytes: int
@@ -183,6 +195,7 @@ def _no_peak_processes() -> PeakProcessesNotRecorded:
 
 @dataclass(frozen=True)
 class PhaseProfile:
+    """The phase profile holds measured or unmeasured memory bins."""
     phase: str
     bins: tuple[int | UnmeasuredBin, ...]
 
@@ -193,11 +206,13 @@ class PhaseProfile:
 
 @dataclass(frozen=True)
 class ProgressProfile:
+    """The memory profile holds the ordered phase profiles."""
     phases: tuple[PhaseProfile, ...]
 
 
 @dataclass(frozen=True)
 class WindowPeak:
+    """The window holds a peak byte count and progress lookahead percentage."""
     bytes: int
     lookahead_percent: float
 
@@ -214,6 +229,7 @@ TEST_BAR = re.compile(r"\bRunning\s+\[[^\]]*\].*?\b(\d+)\s*/\s*(\d+)\s*:")
 
 @dataclass
 class CounterParser:
+    """The parser retains counts, the current counter, and incomplete output text."""
     counts: dict[str, int] = field(default_factory=dict)
     current: ProgressCounter | NoCounter = field(default_factory=NoCounter)
     previous_kind: str = ""
@@ -299,6 +315,7 @@ def bin_index(percent: float) -> int:
 
 @dataclass
 class ProfileRecorder:
+    """The recorder holds memory samples by phase and progress bin."""
     phases: dict[str, list[int | UnmeasuredBin]] = field(default_factory=dict)
 
     def observe(self, counter: ProgressCounter | NoCounter, anonymous_bytes: int) -> bool:
@@ -365,6 +382,7 @@ def profile_key(parts: tuple[object, ...]) -> str:
 
 @dataclass(frozen=True)
 class RecordedProfile:
+    """The saved profile holds its time, reading source, and peak process evidence."""
     profile: ProgressProfile
     at: float
     reading_source: ReadingSource = ReadingSourceNotRecorded()
@@ -386,6 +404,30 @@ def read_profile_record(path: Path) -> RecordedProfile | NoMatchingProfile:
             envelope = cast(dict[str, object], raw)
             if envelope.get("measurement") == "attributed_anonymous":
                 return cast(RecordedProfile, parse_snapshot_value(envelope.get("record"), RecordedProfile))
+    except (OSError, ValueError, TypeError):
+        pass
+    return NoMatchingProfile()
+
+
+@dataclass(frozen=True)
+class HistoryEntry:
+    """Keep only what the history merge reads; a peak process list can hold megabytes."""
+    profile: ProgressProfile
+    at: float
+
+
+def read_history_entry(path: Path) -> HistoryEntry | NoMatchingProfile:
+    """Read a record's profile and time without the peak process list."""
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+        if isinstance(raw, dict):
+            envelope = cast(dict[str, object], raw)
+            record = envelope.get("record")
+            if envelope.get("measurement") == "attributed_anonymous" and isinstance(record, dict):
+                fields = cast(dict[str, object], record)
+                if fields.get("kind") == "RecordedProfile":
+                    return HistoryEntry(cast(ProgressProfile, parse_snapshot_value(fields.get("profile"), ProgressProfile)),
+                                        cast(float, parse_snapshot_value(fields.get("at"), float)))
     except (OSError, ValueError, TypeError):
         pass
     return NoMatchingProfile()
@@ -418,6 +460,7 @@ def read_counter(sidecar: Path) -> ProgressCounter | NoCounter:
 
 @dataclass
 class CaptureCursor:
+    """The cursor holds a capture file identity, read offset, parser, and current result."""
     identity: tuple[int, int]
     offset: int = 0
     parser: CounterParser = field(default_factory=CounterParser)
@@ -426,6 +469,7 @@ class CaptureCursor:
 
 @dataclass
 class CaptureReader:
+    """The reader retains capture cursors and paths used during the current pass."""
     root: Path
     touched: set[Path] = field(default_factory=set)
     cursors: dict[Path, CaptureCursor] = field(default_factory=dict)
@@ -498,6 +542,7 @@ class CaptureReader:
 
 @dataclass
 class PendingProfile:
+    """The pending profile holds its path, recorder, changes, and reading evidence."""
     path: Path
     recorder: ProfileRecorder
     dirty: bool = False
@@ -507,6 +552,7 @@ class PendingProfile:
 
 @dataclass(frozen=True)
 class MergedHistory:
+    """The merged history holds its profile, oldest time, rank, and peak share."""
     profile: ProgressProfile | NoMatchingProfile
     oldest: float
     rank: int
@@ -515,14 +561,15 @@ class MergedHistory:
 
 @dataclass
 class ProfileHistory:
+    """The history holds active recorders and cached and merged profiles."""
     root: Path
     recorders: dict[tuple[str, str], PendingProfile] = field(default_factory=dict)
-    cached: dict[Path, RecordedProfile | NoMatchingProfile] = field(default_factory=dict)
+    cached: dict[Path, HistoryEntry | NoMatchingProfile] = field(default_factory=dict)
     merged: dict[str, MergedHistory] = field(default_factory=dict)
 
-    def _record(self, path: Path) -> RecordedProfile | NoMatchingProfile:
+    def _record(self, path: Path) -> HistoryEntry | NoMatchingProfile:
         if path not in self.cached:
-            self.cached[path] = read_profile_record(path)
+            self.cached[path] = read_history_entry(path)
         return self.cached[path]
 
     def _history(self, key: str, cutoff: float, rank: int, share_percent: int) -> MergedHistory:
@@ -533,7 +580,7 @@ class ProfileHistory:
             if path.suffix not in (".json", ".active"):
                 continue
             record = self._record(path)
-            if not isinstance(record, RecordedProfile) or record.at < cutoff:
+            if not isinstance(record, HistoryEntry) or record.at < cutoff:
                 path.unlink(missing_ok=True)
                 _ = self.cached.pop(path, None)
                 continue
@@ -544,16 +591,20 @@ class ProfileHistory:
         self.merged[key] = history
         return history
 
-    def prune(self, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
+    def prune(self, cutoff: float, sweep_seconds: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
               share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE) -> None:
+        """Refresh stale histories until the sweep time ends; a restart reads all records over several passes."""
         selected_rank = profile_rank(rank)
         selected_share = peak_share_percent(share_percent)
+        deadline = time.monotonic() + sweep_seconds
         for directory in self.root.glob("*"):
             if directory.is_dir():
                 history = self.merged.get(directory.name)
                 if (history is None or history.oldest < cutoff or history.rank != selected_rank
                         or history.share_percent != selected_share):
                     _ = self._history(directory.name, cutoff, selected_rank, selected_share)
+                    if time.monotonic() >= deadline:
+                        return
 
     def matching(self, key: str, cutoff: float, *, rank: int | ConfiguredProfileRank = CONFIGURED_PROFILE_RANK,
                  share_percent: int | ConfiguredPeakShare = CONFIGURED_PEAK_SHARE
@@ -610,7 +661,7 @@ class ProfileHistory:
             identity = (episode, key)
             pending = self.recorders.get(identity)
             record = (RecordedProfile(pending.recorder.profile(), at, pending.reading_source, pending.peak_processes)
-                      if pending is not None else self._record(active))
+                      if pending is not None else read_profile_record(active))
             if isinstance(record, RecordedProfile):
                 save_profile(active.with_suffix(".json"), record.profile, at,
                     reading_source=record.reading_source, peak_processes=record.peak_processes)

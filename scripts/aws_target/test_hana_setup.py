@@ -62,12 +62,10 @@ class HanaSetupTests(CostFixture):
         self.assertFalse(settings.enabled)
 
     def base_settings(self) -> DeploymentSettings:
-        return DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gates', 'fixture-type', 'fixture-image',
-            '000000000000', 'fixture-release', 'us-east-2b', 'fixture-vpc', 'fixture-subnet', '', '/dev/xvda',
-            1, 1, 1, 1, hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour,
+        return DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gates', 'fixture-image',
+            '000000000000', 'fixture-release', 'us-east-2b', 'fixture-vpc', 'fixture-subnet', '/dev/xvda',
             1, 2, 3, conf.read(self.workload).whole('aws_timeout_s'),
-            conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler',
-            'https://example.invalid/scripts', 'fixture-commit', 'fixture-hash', self.root / 'bootstrap')
+            conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler')
 
     def test_setup_requires_current_preparation_before_any_aws_call(self) -> None:
         fake = FakeAws(self.clock)

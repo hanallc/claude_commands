@@ -157,6 +157,14 @@ def room_terms(check: admission_records.RoomCheck, room: admission_records.Memor
     return RoomTerms(room.available, room.safety, room.agent_swap_demand, reserved, max(0, ahead))
 
 
+def head_room_values(check: admission_records.RoomCheck, room: admission_records.MemoryRoom) -> tuple[tuple[str, int], ...]:
+    """Use the legend names for the amounts in the room check."""
+    split = room_terms(check, room)
+    values = (("Free RAM", split.available), ("Safety net", split.safety),
+              ("Swap coming back", split.swapped), ("Build reserved", split.reserved))
+    return values + ((("Held for earlier steps", split.ahead),) if split.ahead else ())
+
+
 def head_room_text(check: admission_records.RoomCheck,
                    room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> str:
     """Show the head's room check with the same terms as the cap line, so it never reads as fitting."""
@@ -211,7 +219,7 @@ def release_text(release: gate.HeadAfterEnd, explanation: admission_records.Queu
                     + f"free memory rises {gib(release.freed)})")
         if isinstance(release, gate.HeadStartsAt):
             starts_at = head_facts.clock(release.at, zone, zone_name=True)
-            text += ("; then " if release.ended else "; ") + f"start spacing permits it at {starts_at}"
+            text += ("; then " if release.ended else "; ") + f"the queue waits a few seconds between starts, so it starts at {starts_at}"
     elif isinstance(release, admission_records.EstimateExpired):
         text = estimate_refresh_text(release, zone)
     elif isinstance(release, gate.HeadStillHeld):

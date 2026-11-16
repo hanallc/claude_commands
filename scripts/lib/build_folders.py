@@ -62,6 +62,7 @@ class InheritedTemporaryParent:
 
 @dataclass(frozen=True)
 class ExplicitBuildParent:
+    """The path specifies the parent for a build folder."""
     path: Path
 
 
@@ -80,12 +81,14 @@ BuildFolderParent = InheritedTemporaryParent | ExplicitBuildParent | SystemTempo
 
 @dataclass(frozen=True)
 class UniqueBuildFolder:
+    """The request holds the prefix and parent for a unique build folder."""
     prefix: str
     parent: BuildFolderParent = InheritedTemporaryParent()
 
 
 @dataclass(frozen=True)
 class StableOwnerFolder:
+    """The request holds the name, parent, and mode for an owner folder."""
     name: str
     parent: BuildFolderParent
     mode: int = 0o777
@@ -129,6 +132,7 @@ BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror",
 
 @dataclass(frozen=True)
 class SlotCheckout:
+    """The checkout holds the source repository and required commit for a slot."""
     source: Path
     commit: str
 
@@ -140,6 +144,7 @@ class NoSlotCheckout:
 
 @dataclass(frozen=True, kw_only=True)
 class BuildFolderSpec:
+    """The specification holds the folder kind, parent, name parts, and checkout source."""
     kind: BuildFolderKind
     parent: Path
     suffix_length: int
@@ -363,6 +368,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
 
 @dataclass(frozen=True)
 class _TemporaryFolderRequest:
+    """The temporary folder request retains its cleanup stack."""
     request: UniqueBuildFolder | BuildFolderSpec
     cleanup: ExitStack
 
