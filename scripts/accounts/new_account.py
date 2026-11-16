@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.accounts import accounts  # noqa: E402
-from scripts.lib import conf, conf_reads  # noqa: E402
+from scripts.lib import conf  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -228,34 +228,32 @@ def nightly_review_step(account: NewAccount) -> Step:
 def statusline_color_step(account: NewAccount) -> Step:
     path = accounts.main_config_dir() / "config" / "statusline.conf"
     try:
-        conf_reads.record(path.stem)
         text = path.read_bytes().decode("utf-8")
+        entries = conf.read(path).values()
     except FileNotFoundError:
         return Step(True, f"{account.label} stays uncolored (no status line config {path})")
-    except (OSError, UnicodeError) as error:
+    except (OSError, UnicodeError, conf.Unusable) as error:
         return Step(False, f"could not update {path}: {error}")
 
     lines = text.splitlines(keepends=True)
-    entries: dict[str, str] = {}
-    insertion = len(lines)
-    for index, line in enumerate(lines):
-        content = line.split("#", 1)[0].strip()
-        if "=" not in content:
-            continue
-        key, value = (part.strip() for part in content.split("=", 1))
-        entries[key] = value
-        if key.startswith("account."):
-            insertion = index + 1
+    insertion = max((setting.line + 1 for key, setting in conf.settings(text).items()
+                     if key.startswith("account.")), default=len(lines))
     key = f"account.{account.label}"
     if key in entries:
         return Step(True, f"status line color {entries[key]} for {account.label}")
 
-    palette = [color for color in STATUSLINE_PALETTE if color not in STATUSLINE_EXCLUDED_COLORS]
-    account_colors = {value for key, value in entries.items() if key.startswith("account.")}
-    role_colors = {value for key, value in entries.items() if key.startswith("role.")}
-    color = next((color for color in palette if color not in account_colors | role_colors), "")
+    def visible_colors(prefix: str) -> set[str]:
+        return {color.css.lower() for key, value in entries.items() if key.startswith(prefix)
+                if isinstance(color := accounts.account_color(value), accounts.AccountColor)}
+
+    palette = {name: color.css.lower() for name in STATUSLINE_PALETTE
+               if name not in STATUSLINE_EXCLUDED_COLORS
+               if isinstance(color := accounts.account_color(name), accounts.AccountColor)}
+    account_colors = visible_colors("account.")
+    role_colors = visible_colors("role.")
+    color = next((name for name, visible in palette.items() if visible not in account_colors | role_colors), "")
     if not color:
-        color = next((color for color in palette if color not in account_colors), "")
+        color = next((name for name, visible in palette.items() if visible not in account_colors), "")
     if not color:
         return Step(True, f"{account.label} stays uncolored (no unused status line color)")
 
