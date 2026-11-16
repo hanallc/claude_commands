@@ -2184,6 +2184,25 @@ def stamp_newer(root: str, moment: float) -> bool:
         return False
 
 
+def trim_inside(take: TrimTake, roots: Sequence[str]) -> bool:
+    """Whether every output root of take is inside one of roots."""
+    return all(any(Path(output).is_relative_to(root) for root in roots)
+               for output in take.output_roots or (take.target,))
+
+
+def saved_trim_outside(roots: Sequence[str]) -> str | None:
+    """The first root whose own saved trim has output outside roots; recoverable_trim would finish it."""
+    for root in roots:
+        try:
+            take = read_trim_intent(trim_intent_path(os.path.abspath(root)))
+        except (OSError, ValueError, KeyError):
+            # No intent; or a damaged one, which recoverable_trim sets aside without a removal.
+            continue
+        if not trim_inside(take, roots):
+            return root
+    return None
+
+
 def recover_pending_trims(locked_targets: Sequence[str] = (), *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scope: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM,
@@ -2208,8 +2227,7 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     continue
                 with ExitStack() as guards:
                     roots = take.output_roots or (take.target,)
-                    if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not all(
-                            any(Path(root).is_relative_to(swept) for swept in locked_targets) for root in roots):
+                    if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not trim_inside(take, locked_targets):
                         continue
                     if len(roots) > 1:
                         owners = TargetOwnerIndex(roots)
@@ -2565,6 +2583,12 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
           trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    if trim_recovery is TrimRecovery.INSIDE_SWEPT_ROOTS:
+        outside = saved_trim_outside(roots)
+        if outside is not None:
+            # The workspace sweep that saved it finishes it.
+            print(f"lint sweep: {outside} has a saved trim with output outside it; skipped")
+            return 0
     if not dry_run:
         recover_pending_trims(roots, lint_settings=lint_settings, scope=trim_recovery)
     scan = scan_roots(roots, trees, lint_settings=lint_settings)

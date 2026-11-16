@@ -7642,12 +7642,30 @@ class RunnerTargetDirTests(SweepCase):
         for take in (own, unrelated):
             sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
             take.save()
-        with (redirect_stdout(io.StringIO()),
+        # A live process on the host can claim every target; process use is not this test's subject.
+        with (redirect_stdout(io.StringIO()), mock.patch.object(sweep, "process_uses", return_value={}),
               mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
         self.assertEqual(status, 0)
         self.assertFalse(sweep.trim_intent_path(own.target).exists())
         self.assertTrue(sweep.trim_intent_path(unrelated.target).exists())
+
+    def test_a_target_dir_run_skips_when_its_own_saved_trim_reaches_outside(self) -> None:
+        target = self.target()
+        other = self.target()
+        # A workspace sweep saved this paired take: its output is in two folders.
+        paired = sweep.TrimTake(str(target.root), "budget take", 1, at=time.time() - DAY,
+                                output_roots=(str(target.root), str(other.root)))
+        sweep.trim_intent_path(paired.target).parent.mkdir(parents=True, exist_ok=True)
+        paired.save()
+        output = io.StringIO()
+        with (redirect_stdout(output), mock.patch.object(sweep, "process_uses", return_value={}),
+              mock.patch.object(sweep.TrimTake, "recover", side_effect=AssertionError("finished the paired take")),
+              mock.patch.object(sweep, "hold_floor", side_effect=AssertionError("held the floor"))):
+            status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root)])
+        self.assertEqual(status, 0)
+        self.assertIn(f"lint sweep: {target.root} has a saved trim with output outside it; skipped", output.getvalue())
+        self.assertTrue(sweep.trim_intent_path(paired.target).exists())
 
     def test_a_target_dir_failure_prints_to_the_job_log_and_sends_no_notice(self) -> None:
         target = self.target()
