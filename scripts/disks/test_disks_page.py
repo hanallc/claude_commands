@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.disks import disks_page
 from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame
@@ -45,13 +46,28 @@ class DisksPageTests(unittest.TestCase):
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
 
-    def test_rows_fold_small_folders_and_show_one_small_folder_by_name(self) -> None:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_disks_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
+        assert_status_states(self, page, SETTINGS["poll_seconds"], {"measured_at": 1, "render_seconds": .01,
+                                                                "keep_bytes": KEEP, "drives": [{"mount": "/build", "total": 200 * GIB,
+                                                                 "used": 100 * GIB, "free": 100 * GIB, "floor": 30 * GIB, "tree": TREE}]})
+
+    def test_the_size_filter_names_top_folders_only_and_other_opens_to_list_the_rest(self) -> None:
+        # The user, 11-16: the size filter is for the top level only; the Other row opens.
         rows = self.rows(10 * GIB, ["/build/cargo"])
         self.assertEqual([(row["name"], row["depth"], row["kind"]) for row in rows], [
-            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("Other · 2 folders and files", 1, "other"),
-            ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"), ("Files and small folders", 0, "other")])
-        other = rows[3]
-        self.assertEqual((other["size"], other["parentSize"], other["start"]), (10 * GIB, 60 * GIB, 50 * GIB))
+            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("slot3", 1, "leaf"), ("slot4", 1, "leaf"),
+            ("Files and small folders", 1, "files"), ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"),
+            ("Files and small folders", 0, "files")])
+        rows = self.rows(31 * GIB, ["other:/build", "/build/paths"])
+        self.assertEqual([(row["name"], row["depth"], row["kind"], cast(int, row["size"]) // GIB, cast(int, row["parentSize"]) // GIB,
+                           cast(int, row["start"]) // GIB)
+                          for row in rows], [
+            ("/build/cargo", 0, "shut", 60, 100, 0), ("Other · 2 folders and files", 0, "open", 40, 100, 60),
+            ("/build/paths", 1, "open", 30, 40, 60), ("home", 2, "leaf", 2, 30, 60), ("Files and small folders", 2, "files", 28, 30, 62),
+            ("/build/small", 1, "leaf", 3, 40, 90), ("Files and small folders", 1, "files", 7, 40, 93)])
 
     def test_each_row_starts_where_the_row_before_it_ends_inside_its_parent(self) -> None:
         rows = self.rows(GIB, ["/build/cargo", "/build/cargo/slot1"])
@@ -80,15 +96,14 @@ class DisksPageTests(unittest.TestCase):
         self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
         self.assertEqual(result[5], 10 * GIB)
 
-    def test_the_status_line_names_the_age_then_the_measure_then_a_problem(self) -> None:
-        recent = "statusText(Date.now() / 1000 - 120, Date.now() / 1000, {}).replace(/^Sizes from [^,]+, /, '')"
-        calls = ("statusText(null, 0, true, '', 600)", "statusText(null, 0, false, '', 600)",
-                 "statusText(null, 0, false, 'The measure did not finish.', 600)",
-                 recent.format("false, '', 600"), recent.format("true, 'The measure did not finish.', 600"))
-        self.assertEqual(self.run_page(f"[{', '.join(calls)}]"), [
-            "Measuring the drives. The first measure takes some minutes.", "No sizes yet.", "The measure did not finish.",
-            "2 minutes ago. The page measures again when you open it and the sizes are more than 10 minutes old.",
-            "2 minutes ago. Measuring… The measure did not finish."])
+    def test_the_status_line_uses_the_shared_reader_and_measured_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS).read_text()
+        self.assertIn('</h1><p class="page-status"', page)
+        self.assertIn(page_frame.REFRESH_SCRIPT, page)
+        self.assertIn('createPageRefresh(loadDisks,()=>settings.poll_seconds)', page)
+        self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
+        self.assertIn('throw new Error("The measure did not finish.")', page)
 
     def test_publish_writes_the_page_only_when_its_content_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -172,19 +187,50 @@ class DisksPageTests(unittest.TestCase):
             const rows = () => body().innerHTML.split("<tr").length - 1;
             const shut = rows();
             body().fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
-            const opened = rows();
-            slider.value = "0";
+            const afterToggle = rows();
+            slider.value = "1000";
             slider.fire("input");
             update({...drive, free: 90 * GIB});
             result = {writes: card.writes, sameSlider: card.querySelector("input") === slider, output: card.querySelector("output").textContent,
-                      rows: [shut, opened, rows()]};
+                      rows: [shut, afterToggle, rows()]};
         """))
-        self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "1.0 GiB", "rows": [4, 7, 9]})
+        self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "60 GiB", "rows": [4, 9, 7]})
 
-    def run_drive(self, script: str) -> object:
+    def test_open_rows_stay_open_across_a_reload_until_their_folder_or_repository_is_gone(self) -> None:
+        # The user, 11-16: "disks should start out collapsed and should remember it's collapse points as long as they are
+        # still valid between data updates and page refreshes".
+        load = """
+            const card = new Element();
+            data = {keep_bytes: KEEP, drives: [{mount: "/build", tree: input.tree, total: 200 * GIB, used: 100 * GIB, free: 100 * GIB, floor: null}]};
+            driveView(card)(data.drives[0]);
+            const shown = () => [...card.querySelector("tbody").innerHTML.matchAll(/aria-expanded="true" data-path="([^"]*)"/g)].map(m => m[1]);
+        """
+        first = cast(dict[str, object], self.run_drive(load + """
+            const closed = shown();
+            card.querySelector("tbody").fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
+            toggleOpen(opened.groups, "hana");
+            result = {closed, open: shown(), storage: localStorage.getItem(OPEN_KEY)};
+        """))
+        self.assertEqual((first["closed"], first["open"]), ([], ["/build/cargo"]))
+        second = cast(dict[str, object], self.run_drive(load + """
+            const reloaded = shown();
+            slotReport = {groups: [{repository: "cargo-liner", slots: []}]};
+            data.drives[0].tree = {...input.tree, children: input.tree.children.filter(child => child.name !== "cargo")};
+            forgetGone();
+            result = {reloaded, storage: JSON.parse(localStorage.getItem(OPEN_KEY))};
+        """, storage=cast(str, first["storage"])))
+        self.assertEqual(second, {"reloaded": ["/build/cargo"], "storage": {"folders": [], "groups": []}})
+        # A joined name, a folder named "|other", and a gone folder on a drive inside a drive with no tree.
+        drives = [{"mount": "/", "tree": None},
+                  {"mount": "/build", "tree": folder("/build", 2 * GIB, [folder("cargo/project", GIB), folder("|other", GIB)])}]
+        paths = ["/build/cargo/project", "/build/|other", "other:/build", "/build/gone", "/home/kept", "other:/"]
+        kept = self.run_page(f"[...knownFolders({json.dumps(drives)}, {json.dumps(paths)})]")
+        self.assertEqual(kept, ["/build/cargo/project", "/build/|other", "other:/build", "/home/kept", "other:/"])
+
+    def run_drive(self, script: str, storage: str | None = None) -> object:
         """Run driveView on a fake document: each element counts its innerHTML writes and keeps its listeners."""
         html = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
-        functions = html[html.index("const GIB ="):html.index("function renderStatus")]
+        functions = html[html.index("const GIB ="):html.index("function renderSlots")]
         fake = ("""
             const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
             const KEEP = input.keep;
@@ -201,11 +247,13 @@ class DisksPageTests(unittest.TestCase):
             }
             const document = {activeElement: null, getElementById: () => ({textContent: JSON.stringify(input.settings)})};
             const CSS = {escape: text => text};
+            const saved = new Map(input.storage == null ? [] : [["disks-open", input.storage]]);
+            const localStorage = {getItem: key => saved.has(key) ? saved.get(key) : null, setItem: (key, value) => saved.set(key, value)};
             let result = null;
         """)
         javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP}),
+        completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP, "storage": storage}),
                                    text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         return cast(object, json.loads(completed.stdout))

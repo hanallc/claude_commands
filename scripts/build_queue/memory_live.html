@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Builds</title>
 <style>
+html { overflow-anchor: none; }
 /*__CONSOLE_TOKENS__*/
 :root {
   --used: var(--accent); --cap: var(--error); --block: var(--warning);
@@ -40,11 +41,6 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 .num { font-variant-numeric: tabular-nums; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-#status { flex: 1 1 12rem; min-width: 0; }
-.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
-.dot.stale { background: var(--cap); }
 .paused-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 9; display: inline-flex; gap: 8px; align-items: center;
   padding: 4px 14px; border: 1px solid var(--cap); border-radius: 999px; background: var(--card); color: var(--cap); font-weight: 600; pointer-events: none; }
 .paused-badge[hidden] { display: none; }
@@ -308,7 +304,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
-body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
+body.queue-unavailable .card { display: none; }
 .track { position: relative; height: 18px; cursor: help; overflow: hidden; }
 .track .bud { position: absolute; top: -5px; bottom: -5px; margin-left: -1px; border-left: 2px dashed var(--cap); pointer-events: none; }
 .track .b { position: absolute; top: 0; bottom: 0; border-radius: 3px; overflow: hidden; display: flex; z-index: 1; transition: left 0.6s ease, width 0.6s ease; }
@@ -337,7 +333,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .walk-sum { margin-left: 0; }
   .gauge { grid-template-columns: minmax(0, 1fr); row-gap: 6px; font-size: 0.75rem; }
   .gauge .gt { grid-column: 1 / -1; grid-row: 2; }
-  .status { flex-wrap: wrap; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
   .walk-table table { font-size: 0.78rem; }
@@ -356,27 +351,18 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
-.report-chart { width: 100%; height: auto; display: block; }
-.report-chart text { fill: var(--ink-2); font: 12px system-ui; }
-.report-chart .grid { stroke: var(--line); }
-.report-key { display: flex; gap: 12px; flex-wrap: wrap; font-size: 0.85rem; }
-.report-key span::before { content: ""; display: inline-block; width: 14px; height: 3px; background: var(--series); margin-right: 5px; vertical-align: middle; }
-.report-table { overflow-x: auto; }
-.report-table th, .report-table td { padding: 5px 12px 5px 0; vertical-align: top; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
 .report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
-#history-details { margin-top: 12px; }
-#history-details > summary { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
 <main>
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
-  <h1 class="page-title">Builds</h1>
+  __PAGE_TITLE__
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
-  <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
+  <div class="pressure"><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -485,15 +471,12 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
     <div class="swaprows" id="swaprows"></div>
   </section>
   <section class="card" id="report-charts">
-    <div class="section-head">Build history</div>
+    <div class="section-head">Top 3 costs</div>
     <div id="report-top">
-      <h3>Top 3 costs</h3>
       <p class="report-window" id="cost-window"></p>
       <div id="top-costs">Reading…</div>
       <p class="report-window">Hours are summed over steps that run at the same time, so a day can pass 24 h.</p>
     </div>
-    <p class="report-window" id="history-window"></p>
-    <div id="history-charts">Reading…</div>
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
@@ -815,15 +798,18 @@ function stepTooltip(key, data) {
       const freeTenths = Math.round(free * 10);
       const needTenths = Math.round(row.need * 10);
       const need = [field('Needs', `${(needTenths / 10).toFixed(1)} GiB`)];
-      if (!row.head_room?.rows?.length) {
-        // Free matches the page's Free row. The step's own room differs when the head and held slots
-        // get memory first, or when an earlier step gives back memory it held.
-        const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
-        need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
-        if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
-        if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+      // The queue admits one step at a time, so only the step it admits next shows its room.
+      if (row.first_in_line) {
+        if (!row.head_room?.rows?.length) {
+          // Free matches the page's Free row. The step's own room differs when held slots get memory first,
+          // or when an earlier step gives back memory it held.
+          const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
+          need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
+          if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
+          if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+        }
+        if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
       }
-      if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
       rows.push(...groupRows(need));
     }
   } else {
@@ -849,8 +835,9 @@ function stepTooltip(key, data) {
   return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
 }
 function stepRow(key, data) {
-  const [kind, index] = key.split(':');
-  return kind === 'row' ? data.walk[+index] : kind === 'wait' ? data.waiters[+index] : null;
+  const kind = key.slice(0, key.indexOf(':'));
+  const identity = key.slice(kind.length + 1);
+  return (kind === 'row' ? data.walk : kind === 'wait' ? data.waiters : [])?.find(row => row.key === identity);
 }
 function tipDuration(key, row, data) {
   const since = key.startsWith('wait:') ? row.since : row.started_at;
@@ -982,7 +969,7 @@ document.addEventListener("click", (e) => {
   if (el && tipKey !== el.dataset.tip) showTip(el.dataset.tip, e.clientX, e.clientY); else hideTip();
 });
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
-const STALE = Math.max(15, SECONDS * 5);
+__PAGE_REFRESH_SCRIPT__
 const $ = (id) => document.getElementById(id);
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
@@ -997,11 +984,45 @@ function showQueueError(message) {
   hideTip();
 }
 
+function captureReportView() {
+  const active = document.activeElement;
+  const focus = active?.closest('[data-tip], [data-owner-key], [id]');
+  const selector = element => element?.dataset.tip ? `${element.tagName.toLowerCase()}${element.classList.contains("wrow") ? ".wrow" : ""}[data-tip="${CSS.escape(element.dataset.tip)}"]`
+    : element?.dataset.ownerKey ? `[data-owner-key="${CSS.escape(element.dataset.ownerKey)}"]`
+    : element?.id ? `#${CSS.escape(element.id)}` : '';
+  // An anchor must be on screen: a row out of view that moves must not move the rows the viewer reads.
+  const inView = element => {
+    if (!element || !element.getClientRects().length) return false;
+    const bounds = element.getBoundingClientRect();
+    return bounds.bottom > 0 && bounds.top < innerHeight;
+  };
+  const tipRow = tipKey && document.querySelector(`.wrow[data-tip="${CSS.escape(tipKey)}"]`);
+  const focusedRow = active?.closest('.wrow, tr[data-tip]');
+  const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
+  const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
+  return {anchor: selector(anchor), top: anchor?.getBoundingClientRect().top,
+    focus: active !== document.body ? selector(focus) : '',
+    details: [...document.querySelectorAll('details')].map(element => [selector(element), element.open])};
+}
+function restoreReportView(view) {
+  for (const [selector, open] of view.details) {
+    if (selector) document.querySelector(selector)?.toggleAttribute('open', open);
+  }
+  if (view.focus) document.querySelector(view.focus)?.focus({preventScroll: true});
+  const anchor = view.anchor && document.querySelector(view.anchor);
+  if (anchor) window.scrollBy(0, anchor.getBoundingClientRect().top - view.top);
+  if (tipKey) {
+    if ((tipKey.startsWith('row:') || tipKey.startsWith('wait:')) && !stepRow(tipKey, latest)) {
+      hideTip();
+      tip.replaceChildren();
+    } else tip.innerHTML = tooltipHtml(tipKey, latest);
+  }
+}
 function render(d) {
   if (d.error || !d.ok) {
-    recordReadFailure("The queue did not answer.");
-    return;
+    throw new Error("The queue did not answer.");
   }
+  const view = captureReportView();
   for (const [theme, colors] of Object.entries(d.colors)) {
     document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
     for (const [machine, color] of Object.entries(colors.machines)) {
@@ -1077,11 +1098,11 @@ function render(d) {
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   latest = d;
   setTimeout(fitLabels, 650);
-  if (tipKey) tip.innerHTML = tooltipHtml(tipKey, d);
 
   renderWalk(d);
   renderSwap(d);
   renderLeftovers(d);
+  restoreReportView(view);
 }
 
 const swapView = new Map();
@@ -1155,107 +1176,27 @@ function costRange(row) {
   const [low, high] = row.range.map(hours => hours.toFixed(hours >= 10 ? 0 : 1));
   return `${low === high ? low : `${low}–${high}`} h/day`;
 }
-function sumReportCosts(points) {
-  const values = points.filter(point => point.state !== "no data yet");
-  if (!values.length) return {state: "no data yet"};
-  const missing = values.filter(point => point.state === "unavailable");
-  if (missing.length) return {state: "unavailable", reason: [...new Set(missing.map(point => point.reason))].join("; ")};
-  return {state: values.some(point => point.state === "upper bound") ? "upper bound" : "measured",
-    value: values.reduce((sum, point) => sum + point.value, 0),
-    unknown: values.reduce((sum, point) => sum + (point.unknown || 0), 0)};
-}
-function reportPlot(title, buckets, series, unit) {
-  const colors = ["var(--used)", "var(--testing)", "var(--room)", "var(--cap)", "var(--ink-2)", "var(--building)"];
-  const points = series.flatMap(line => line.values).filter(point => recorded(point.value));
-  const maximum = Math.max(1, ...points.map(point => point.value + (point.unknown || 0)));
-  const x = index => 48 + (buckets.length > 1 ? index / (buckets.length - 1) : 0.5) * 800;
-  const y = value => 180 - value / maximum * 150;
-  const lines = series.map((line, slot) => {
-    const color = colors[slot % colors.length];
-    let path = "", previous = false;
-    const dots = line.values.map((point, index) => {
-      if (!recorded(point.value)) { previous = false; return ""; }
-      path += `${previous ? "L" : "M"}${x(index)},${y(point.value)} `;
-      previous = true;
-      return `<circle cx="${x(index)}" cy="${y(point.value)}" r="3" fill="${color}"><title>${esc(`${buckets[index].label} · ${line.label}: ${reportCost(point, unit)}`)}</title></circle>` +
-        (point.unknown > 0 ? `<line x1="${x(index)}" x2="${x(index)}" y1="${y(point.value)}" y2="${y(point.value + point.unknown)}" stroke="${color}" stroke-dasharray="3 3"/>` : "");
-    }).join("");
-    return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>${dots}`;
-  }).join("");
-  const labels = buckets.map((bucket, index) => `<text x="${x(index)}" y="202" text-anchor="middle">${esc(bucket.label)}</text>`).join("");
-  const table = `<details class="table-view"><summary>Table view: ${esc(title)}</summary><div class="report-table"><table><thead><tr><th>Local day</th>${series.map(line => `<th>${esc(line.label)} (${esc(unit)})</th>`).join("")}</tr></thead><tbody>` + buckets.map((bucket, index) => `<tr><th>${esc(bucket.label)}${bucket.thin ? " · thin" : ""}</th>${series.map(line => `<td>${esc(reportCost(line.values[index], unit))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div></details>`;
-  return `<h3>${esc(title)}</h3><svg class="report-chart" viewBox="0 0 900 220" role="img" aria-label="${esc(title)}"><line class="grid" x1="48" x2="848" y1="180" y2="180"/><line class="grid" x1="48" x2="848" y1="30" y2="30"/><text x="4" y="184">0</text><text x="4" y="34">${maximum.toFixed(1)}</text><text x="48" y="16">${esc(unit)}</text>${lines}${labels}${!points.length ? '<text x="450" y="100" text-anchor="middle">No measured data</text>' : ""}</svg>` +
-    `<div class="report-key">${series.map((line, slot) => `<span style="--series:${colors[slot % colors.length]}">${esc(line.label)}</span>`).join("")}</div>${table}`;
-}
-function phaseTimeHtml(buckets, phases) {
-  const title = "Hana phase time, without waits for the user or the showrunner";
-  if (buckets.some(bucket => bucket.phase.state === "measured")) return reportPlot(title, buckets, phases, "h/phase");
-  const line = buckets.some(bucket => bucket.phase.unrecorded > 0)
-    ? "Shown from the first phase that ends with a wait record. Earlier phases have no wait record."
-    : buckets.some(bucket => bucket.phase.finished > 0) ? "Hana phases ended in this range, but none has a valid start time."
-    : "No Hana phase ended in this range.";
-  return `<h3>${esc(title)}</h3><p class="report-window">${esc(line)}</p>`;
-}
-const reportView = {machine: "", cause: "", unit: "daily", details: false, tables: new Set()};
 let reportStamp = "";
-function captureReportView() {
-  if (!$("history-machine")) return;
-  reportView.machine = $("history-machine").value;
-  reportView.cause = $("history-cause").value;
-  reportView.unit = $("history-unit").value;
-  reportView.details = $("history-details").open;
-  const tables = [...document.querySelectorAll("#history-charts details.table-view")];
-  if (tables.length) reportView.tables = new Set(tables.filter(table => table.open).map(table => table.querySelector("summary").textContent));
-}
 function reportDate(value, zone) {
   return new Date(value).toLocaleDateString("en-US", {timeZone: zone, month: "short", day: "numeric", year: "numeric"});
 }
 function renderReport(report) {
   const stamp = JSON.stringify(report);
   if (stamp === reportStamp) return;
-  captureReportView();
+  const view = captureReportView();
   reportStamp = stamp;
   if (!report || report.kind === "IndexUnavailable") {
     const reason = report?.reason || "Report data unavailable";
-    $("history-charts").textContent = reason;
     $("top-costs").textContent = reason;
-    $("history-window").textContent = "";
     $("cost-window").textContent = "";
+    restoreReportView(view);
     return;
   }
-  const data = report.charts;
-  $("history-window").textContent = `${reportDate(data.start, report.zone)} – ${reportDate(data.end, report.zone)} · ${report.zone}`;
-  const days = Math.round((data.end - data.start) / 86400000);
+  const days = report.days;
   $("cost-window").textContent = `Last ${report.recent_days} days: ${reportDate(report.start, report.zone)} – ${reportDate(report.end, report.zone)} · ${report.zone}`;
   $("top-costs").innerHTML = report.top.length ? report.top.map(row =>
     `<p class="report-top-row"><strong>${esc(row.cause)} on ${esc(row.machine)}: ${esc(costRange(row))}.</strong>${row.window.state === "matches recent" ? "" : ` ${days}-day mean: ${esc(reportCost(row.window))}.`}${row.share ? ` ${esc(row.share)}` : ""}<span class="action">${esc(row.action)}</span></p>`).join("") : "No data yet for this window.";
-  $("history-charts").innerHTML = `<div id="history-phase"></div><details id="history-details"><summary>Details: costs by cause and by machine</summary><div class="report-key"><label>Machine <select id="history-machine"><option value="">All machines</option>${data.machines.map(machine => `<option>${esc(machine)}</option>`).join("")}</select></label><label>Cause <select id="history-cause">${data.causes.map(cause => `<option>${esc(cause)}</option>`).join("")}</select></label><label>Cost unit <select id="history-unit"><option value="daily">h/day</option><option value="perPhase">h/finished phase</option></select></label></div><div id="history-plots"></div><p class="report-window">Costs can overlap. Dashed ranges show unknown costs. Tables name unavailable values.</p></details><div id="history-moments"></div>`;
-  $("history-details").open = reportView.details;
-  if (data.machines.includes(reportView.machine)) $("history-machine").value = reportView.machine;
-  if (data.causes.includes(reportView.cause)) $("history-cause").value = reportView.cause;
-  $("history-unit").value = reportView.unit;
-  const draw = () => {
-    captureReportView();
-    const machine = $("history-machine").value, cause = $("history-cause").value;
-    const unit = $("history-unit").value;
-    const unitText = unit === "daily" ? "h/day" : "h/finished phase";
-    const phases = [["median", "half of phases take up to"], ["p90", "most phases take up to"]].map(([key, label]) => ({label, values: data.buckets.map(bucket =>
-      bucket.phase.state === "measured" ? {state: "measured", value: bucket.phase[key] / 3600}
-        : {state: "unavailable", reason: bucket.phase.reason})}));
-    const causes = data.causes.map(label => ({label, values: data.buckets.map(bucket =>
-      sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
-    const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
-      sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
-    $("history-phase").innerHTML = phaseTimeHtml(data.buckets, phases);
-    $("history-plots").innerHTML = reportPlot("Costs by cause", data.buckets, causes, unitText) +
-      reportPlot("Costs by machine", data.buckets, machines, unitText);
-    for (const table of document.querySelectorAll("#history-charts details.table-view")) {
-      table.open = reportView.tables.has(table.querySelector("summary").textContent);
-    }
-  };
-  for (const id of ["history-machine", "history-cause", "history-unit"]) $(id).addEventListener("change", draw);
-  $("history-moments").textContent = [...data.moments.map(moment => `${moment.local} · ${moment.name}`), ...data.pending].join(" · ");
-  draw();
+  restoreReportView(view);
 }
 
 const LABEL_GAP = 6;
@@ -1294,7 +1235,7 @@ function renderWalk(d) {
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
   const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
-    tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
+    tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
@@ -1303,19 +1244,18 @@ function renderWalk(d) {
       (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
-  const running = d.walk.map((row, index) => ({row, index}));
-  const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
+  const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
     cells("", "Build tools", "", "", null, "", null, "tools", "tools");
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
-  rows.push(...ordered.map(({row: r, index: i}) => {
+  rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r), r.slot, r.tokens);
-    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
-      (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+    return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${rowLabel(r.name, rowOwner(r))}` +
+      (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
   const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
@@ -1332,9 +1272,9 @@ function renderWalk(d) {
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${i}`, `wait${i === 0 ? " wait-first" : ""}`);
-    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${i}">${rowLabel(w.name, rowOwner(w, true))}` +
-      (w.kind === "cloud" ? cloudStatus(w, `wait:${i}`) : rowMemory(`wait:${i}`)) +
+    cells(place, w.name, ago(w.since, d.read_at), ciRow(w) ? rowUnit(w) : w.detail, w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
+    rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="wait:${w.key}">${rowLabel(w.name, rowOwner(w, true))}` +
+      (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
@@ -1533,7 +1473,8 @@ function placeMemoryBars(d) {
   }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
   for (const row of document.querySelectorAll(".wrow[data-run]")) {
-    const index = Number(row.dataset.run), run = d.walk[index], amount = shown.walk[index];
+    const run = d.walk.find(run => run.key === row.dataset.run);
+    const amount = shown.walk.find(run => run.key === row.dataset.run);
     let bars = "";
     const amounts = [];
     if (macRow(run)) {
@@ -1580,7 +1521,7 @@ function placeMemoryBars(d) {
     roomTrack.closest(".wrow").querySelector(".amounts").replaceChildren();
   }
   for (const row of document.querySelectorAll(".wrow.wait")) {
-    const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
+    const waiter = stepRow(row.dataset.tip, d);
     if (waiter.kind === "cloud") continue;
     // A wait bar stops at the room end or the cap line, whichever is first.
     const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
@@ -1588,7 +1529,7 @@ function placeMemoryBars(d) {
     const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
-    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: shown.waiters[Number(row.dataset.tip.split(":")[1])].need}] : []);
+    placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: stepRow(row.dataset.tip, shown).need}] : []);
   }
   const roomRow = roomTrack.closest(".wrow");
   const placeDivider = (row, top) => row.style.setProperty("--divider-top", `${top - row.getBoundingClientRect().top}px`);
@@ -1673,86 +1614,48 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-let lastRead = 0;
-let readingFailure = "";
-function showStatus(text, stale) {
-  $("status").textContent = text;
-  $("dot").classList.toggle("stale", stale || paused);
-  $("status").closest(".status").classList.toggle("is-stale", stale);
-}
-
-function updateReadingStatus(readAt) {
-  if (!readAt) return;
-  const age = Date.now() / 1000 - readAt;
-  const date = new Date(readAt * 1000);
-  const time = [date.getHours(), date.getMinutes(), date.getSeconds()].map(value => String(value).padStart(2, "0")).join(":");
-  const staleText = readingFailure
-    ? `${readingFailure} Showing the reading from ${time}, ${Math.round(age)} s old.`
-    : `Last reading ${time}, ${Math.round(age)} s old. The feed has stopped.`;
-  if (paused) { showStatus(`Paused · read at ${time}`, false); return; }
-  showStatus(age > STALE ? staleText : `Live · read at ${time}`, age > STALE);
-  if (age > STALE) {
-    $("pill").className = "pill neutral as-of";
-    $("pill-t").textContent = `as of ${time}`;
-  } else {
-    const lv = level(latest);
-    $("pill").className = `pill ${lv}`;
-    $("pill-t").textContent = ({ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded"})[lv];
-  }
-}
-
-function recordReadFailure(message) {
-  readingFailure = message;
-  if (lastRead) updateReadingStatus(lastRead);
-  else showQueueError(message.replace(/\.$/, ""));
-}
-
 const consoleHidden = () => window.frameElement?.hidden === true;
-// The user, 11-16: space pauses every update so tooltips can be read on a still page; space again resumes.
+// Space pauses the reads and keeps the page controls active.
 let paused = false;
 function setPaused(on) {
   paused = on;
   $("paused").hidden = !on;
-  if (on) updateReadingStatus(lastRead);
-  else { tick(); reloadWhenPageChanges(); }
+  pageRefresh.abandon();
+  pageRefresh.restart();
+  if (!on) { void pageRefresh.refresh(true); void reloadWhenPageChanges(); }
 }
 addEventListener("keydown", event => {
   if (event.code !== "Space" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
-  // Space keeps its own job on a control: it presses a button and opens the legend.
+  // Space activates a focused control.
   if (event.target.closest?.("input, textarea, select, button, summary, [contenteditable]")) return;
   event.preventDefault();
   setPaused(!paused);
 });
-
-async function tick() {
+async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  try {
-    const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-    // A reading that arrives after a pause waits; the next tick after resume shows it.
-    if (paused) return;
-    if (d.ok && !d.error) {
-      render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
-      if (d.report_version !== reportVersion) await loadReport(d.report_version);
-    }
-    else { recordReadFailure("The queue did not answer."); return; }
-  } catch (e) {
-    if (paused) return;
-    recordReadFailure(`Cannot load the reading: ${e.message}.`);
-    return;
-  }
-  updateReadingStatus(lastRead);
+  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const d = await r.json();
+  if (!current() || paused) return;
+  if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
+  render(d);
+  if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
+  if (!current() || paused) return;
+  const lv=level(latest);
+  $("pill").className=`pill ${lv}`;
+  $("pill-t").textContent=({ok:"no memory pressure",warn:"memory pressure near limit",
+    hold:"pressure: queue holds",neutral:"stall not recorded"})[lv];
+  return {readAt:d.read_at,renderSeconds:d.render_seconds,failure:d.read_error ? "The queue did not answer." : ""};
 }
-// The charts are large, so the page reads report.json only when memory.json names a new version.
+// Read the costs only when the feed names a new report version.
 let reportVersion = null;
-async function loadReport(version) {
+async function loadReport(version,current) {
   try {
     const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
     if (!r.ok) return;
     const report = await r.json();
-    // A paused page keeps its charts; the first reading after resume loads this version again.
-    if (paused) return;
+    // A paused page keeps its costs until the next reading after resume.
+    if (!current() || paused) return;
     renderReport(report);
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
@@ -1768,13 +1671,12 @@ async function reloadWhenPageChanges() {
     pageStamp = stamp || pageStamp;
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
-tick();
-setInterval(tick, SECONDS * 1000);
+const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
+void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
 addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
-    tick();
     reloadWhenPageChanges();
   }
   if (event.source === parent && event.origin === location.origin && event.data === "console-space") setPaused(!paused);
