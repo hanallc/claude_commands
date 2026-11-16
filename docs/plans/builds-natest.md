@@ -4444,3 +4444,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The ordinary lint path checks only, as before.
 - `test_verify_lint_taplo` checks each lint path with a misformatted `.claude/config/release.toml`.
 - Commit 27e978424.
+
+### Phase 313 — test_mac_run checks the task-end and scratch-clone cases with one full run each  · status: done
+**Depends on:** Phase 312
+**Owner:** natest (builds gave a go on 11-16 at 06:15 EST).
+
+#### As-built
+
+- `test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout` keeps one full `mac_run.sh` run for the success case. The two kept-checkout cases call `cleanup_mac_run` through `shell_functions` with `on_mac` stubbed.
+- The scratch-clone loop stays: no function exposes its purpose and owner words.
+- Paired natedev CPU: 35.5/32.0/33.6 to 29.5/34.0/28.1 s (median saving 5.5 s). Commit c8599345f.
