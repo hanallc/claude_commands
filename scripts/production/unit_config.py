@@ -7,7 +7,6 @@ import re
 import os
 import socket
 from subprocess import run as run_taplo
-import tempfile
 import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -17,6 +16,7 @@ from pathlib import Path
 from threading import RLock
 from typing import cast
 
+from scripts.lib import build_folders
 from scripts.lib import atomic_file, conf, git_exclude
 from scripts.production.staff import StaffId
 from scripts.production import staff
@@ -388,7 +388,7 @@ def _formatted(config: UnitConfig, worktree: Path | NoFormattingWorktree,
                formatting: RepositoryTaploConfig | DefaultTaploConfig) -> bytes:
     """Run taplo with explicit configuration and a repository-relative input path."""
     try:
-        with tempfile.TemporaryDirectory(prefix="unit-taplo-") as directory:
+        with build_folders.tool_folder("unit-taplo") as directory:
             root = worktree if isinstance(worktree, Path) and worktree.is_dir() else Path(directory)
             options: list[str] = []
             if isinstance(formatting, RepositoryTaploConfig):
@@ -407,7 +407,8 @@ def _formatted(config: UnitConfig, worktree: Path | NoFormattingWorktree,
             environment = dict(os.environ)
             _ = environment.pop("TAPLO_CONFIG", None)
             result = run_taplo(command, input=_text(config).encode("utf-8"),
-                               capture_output=True, check=False, cwd=root, env=environment)
+                               capture_output=True, check=False, cwd=root, env=environment,
+                               pass_fds=(build_folders.build_folder_lock_fd(directory),))
     except (OSError, UnicodeError) as error:
         raise ConfigRefused(f"{worktree}: cannot format configuration with taplo: {error}") from error
     if result.returncode:

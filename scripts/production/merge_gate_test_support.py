@@ -51,7 +51,9 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 
 def install_test_runner(checkout: Path) -> Path:
     """Install the runner, its bootstrap, and its descendant helper in the copy."""
-    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py", "scripts/lib/conf_reads.py"):
+    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py", "scripts/lib/conf_reads.py",
+                     "scripts/lib/build_folders.py", "scripts/lib/boot_identity.py", "scripts/lib/conf.py",
+                     "config/build_folders.conf"):
         destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copyfile(SCRIPT.parents[2] / relative, destination)
