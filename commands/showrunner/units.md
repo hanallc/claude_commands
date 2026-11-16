@@ -98,6 +98,8 @@ With no current task, the first blocked pending task supplies Now with its own W
 Next and Later contain only the remaining tasks, so they do not repeat that wait.
 A stopped attempt shows a Stopped row until a later completed attempt has the same plan scope and phase ID.
 Then the board shows no row for that stopped attempt.
+A dropped attempt shows no row.
+Directors record a drop with `progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>`.
 The board does not infer replacements from equal titles.
 
 Recorded unit waits retain their actor, condition, and target.

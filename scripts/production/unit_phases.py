@@ -50,7 +50,7 @@ RunEventsReader = Callable[[Path], list[dict[str, object]]]
 
 
 WORK_EVENT = re.compile(r'"event_type"\s*:\s*"([^"\\]+)"')
-WORK_EVENTS = frozenset(("run_started", "reopened", "phase_started", "phase_finished", "run_finished", "pass_started", "pass_finished",
+WORK_EVENTS = frozenset(("run_started", "reopened", "phase_started", "phase_finished", "phase_dropped", "run_finished", "pass_started", "pass_finished",
                          "activity_started", "activity_finished", "eta_stated", "wait_started", "wait_finished",
                          "wait_unclosed", "wait_holder_seen", "checkpoint"))
 
@@ -457,9 +457,10 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
-               production: str = "", merged_ids: Collection[str] = ()) -> UnitMergeNotes:
+               production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = ()) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
+    hidden = set(merged_ids) | set(dropped_ids)
     titles = dict(phase_titles)
     phase_ids = set(titles) | set(open_sent)
     phase_ids.update(result["phase"] for result in land.results.values() if result["unit"] == unit)
@@ -476,9 +477,9 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
 
     def own(owner: str) -> str:
         phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
-        return "" if helper(phase) or phase in merged_ids else phase
+        return "" if helper(phase) or phase in hidden else phase
 
-    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in merged_ids}
+    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in hidden}
     merging: list[str] = []
     items: dict[int, list[str]] = {}
     for phase, sent in open_sent.items():
@@ -501,7 +502,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     newest_results: dict[str, land_runs.LandResult] = {}
     for result in land.results.values():
         phase = result["phase"]
-        if result["unit"] != unit or helper(phase) or phase in merged_ids:
+        if result["unit"] != unit or helper(phase) or phase in hidden:
             continue
         previous_result = newest_results.get(phase)
         if previous_result is None or result["time"] > previous_result["time"]:
@@ -509,7 +510,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     wait_targets: set[str] = set()
     holds: dict[str, phase_waits.UnitWait] = {}
     for wait in unit_waits:
-        if helper(wait.target) or wait.target in merged_ids:
+        if helper(wait.target) or wait.target in hidden:
             continue
         sent = open_sent.get(wait.target, NoSentWork())
         result = newest_results.get(wait.target)
@@ -827,7 +828,7 @@ class TaskAttempt(NamedTuple):
     scope: str
     title: str
     instance: str
-    outcome: Literal["current", "stopped", "completed"]
+    outcome: Literal["current", "stopped", "completed", "dropped"]
     reason: str
 
 
@@ -850,7 +851,7 @@ def task_facts(record: object, events: Sequence[dict[str, object]]) -> UnitTaskF
         kind = event.get("event_type")
         if kind == "run_started":
             scope = str(event.get("project_plan_doc") or event.get("plan_doc") or "")
-        if kind not in ("phase_started", "phase_finished"):
+        if kind not in ("phase_started", "phase_finished", "phase_dropped"):
             continue
         instance = str(event.get("phase_instance_id") or event.get("phase_id") or "")
         previous = attempts.get(instance)
@@ -859,10 +860,11 @@ def task_facts(record: object, events: Sequence[dict[str, object]]) -> UnitTaskF
             continue
         title = str(event.get("phase_title") or (previous.title if previous is not None else ""))
         task_scope = str(event.get("plan_doc") or event.get("project_plan_doc") or scope)
-        outcome: Literal["current", "stopped", "completed"] = (
-            "current" if kind == "phase_started" else "completed" if event.get("status") == "completed" else "stopped")
+        outcome: Literal["current", "stopped", "completed", "dropped"] = (
+            "dropped" if kind == "phase_dropped" else "current" if kind == "phase_started"
+            else "completed" if event.get("status") == "completed" else "stopped")
         attempts[instance] = TaskAttempt(phase, task_scope, title, instance, outcome,
-                                        single_spaced(str(event.get("reason") or event.get("stop_reason") or "")))
+                                        single_spaced(str(event.get("reason") or "")))
     return UnitTaskFacts(source, rows, tuple(attempts.values()))
 
 
@@ -1475,6 +1477,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         table_rows.extend(rows)
         show_plan_eta = show_plan_eta or plan_eta
         facts = task_facts(record, run_events)
+        latest_attempts = {attempt.phase: attempt for attempt in facts.attempts}
+        dropped = {phase for phase, attempt in latest_attempts.items() if attempt.outcome == "dropped"}
         titles = {row.get("phase", ""): row.get("title", "") for row in facts.plan_rows}
         for attempt in facts.attempts:
             if attempt.phase not in titles or not titles[attempt.phase]:
@@ -1482,9 +1486,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         owner = snapshot.parent_of(member) if isinstance(member, staff.StaffRow) else None
         production_name = owner.name if owner is not None else ""
         open_sent = {phase.phase: phase_sent_work([
-            event for event in run_events if event.get("phase_instance_id") == phase.instance_id]) for phase in phases}
-        waits = phase_waits.unit_waits(run_events)
-        done = completed_unit_phases(run_events)
+            event for event in run_events if event.get("phase_instance_id") == phase.instance_id])
+                     for phase in phases if phase.phase not in dropped}
+        waits = [wait for wait in phase_waits.unit_waits(run_events) if wait.target not in dropped]
+        done = {phase: sent for phase, sent in completed_unit_phases(run_events).items() if phase not in dropped}
         merged_phases: set[str] = set()
         for (owner, phase), at in merge_times.items():
             if owner != unit.unit or phase in open_sent:
@@ -1513,7 +1518,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_sent[wait.target] = done[wait.target]
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
-                           production=production_name, merged_ids=frozenset(merged_phases))
+                           production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped)
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan, wait_state=wait_state,
