@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import html
 import secrets
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -84,13 +85,14 @@ def card(item: investigation.Investigation, root: Path, members: staff.StaffSnap
 
 
 def render(root: Path) -> bytes:
+    started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     items = records()
     owners = {item.owner: owner_name(members, item.owner) for item in items}
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}">{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
     seconds = conf.read("review_links").number("page_refresh_seconds")
-    content = (STYLE + '<h1 class="page-title">Investigations</h1>'
+    content = (STYLE + page_frame.title("Investigations", "investigations")
                + f'<div data-investigations data-refresh-seconds="{seconds}">'
                + '<div data-filters><label for="investigation-owner">Owner:</label>'
                + f'<select id="investigation-owner"><option value="">All</option>{options}</select>'
@@ -100,7 +102,7 @@ def render(root: Path) -> bytes:
                + '</select></div><div data-cards>' + ''.join(card(item, root, members) for item in items)
                + '</div><p data-empty hidden>No investigations in this view.</p></div>'
                + '<script>' + SCRIPT + '</script>')
-    return change_page.document(content, "Investigations")
+    return page_frame.rendered(change_page.document(content, "Investigations"), started, read_at)
 
 
 def submit(root: Path, body: str) -> None:
@@ -125,7 +127,7 @@ STYLE = '''<style>[hidden]{display:none!important}
 </style>'''
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r'''(() => {
-let content=document.querySelector('[data-investigations]'), sending=0, active=0, generation=0;
+let content=document.querySelector('[data-investigations]'), sending=0, active=false, generation=0;
 const start=new URLSearchParams(location.hash.slice(1));
 let owner=start.get('owner') || '', show=start.get('show') || 'not-read';
 if(!['not-read','answer ready','open','read','all'].includes(show)) show='not-read';
@@ -147,38 +149,40 @@ function bind(){
  content.querySelector('#investigation-show').addEventListener('change',event=>{show=event.target.value;apply();});
  content.querySelectorAll('[data-read-form]').forEach(form=>form.addEventListener('submit',async event=>{
   event.preventDefault();if(form.dataset.sending) return;
-  form.dataset.sending='true';sending++;generation++;
+  form.dataset.sending='true';sending++;generation++;active=false;pageRefresh.abandon();
   const status=form.querySelector('[data-save-status]'), button=form.querySelector('button');
-  button.disabled=true;status.textContent='';
+  button.disabled=true;status.textContent='';let saved=false;
   try{
    const response=await fetch(location.pathname,{method:'POST',body:new URLSearchParams(new FormData(form))});
    if(!response.ok){const body=await response.json();throw new Error(body.reason || 'HTTP '+response.status);}
    const card=form.closest('article'), list=card.parentNode;
    card.dataset.state='read';form.remove();
    const firstRead=[...list.children].find(other=>other!==card && other.dataset.state==='read');
-   list.insertBefore(card,firstRead || null);apply();
+   list.insertBefore(card,firstRead || null);apply();saved=true;
   }catch(error){status.textContent='Not saved: '+error.message;button.disabled=false;}
-  finally{delete form.dataset.sending;sending--;}
+  finally{delete form.dataset.sending;sending--;if(saved) void pageRefresh.refresh(true);}
  }));
 }
-async function refresh(supersede=false){
+async function refresh(supersede=false,current=()=>true){
  if(sending || (active && !supersede)) return;
- const request=++generation;active++;
+ const request=++generation;active=true;
  try{
   const response=await fetch(location.pathname,{cache:'no-store'});
-  if(!response.ok) return;
-  const fresh=new DOMParser().parseFromString(await response.text(),'text/html').querySelector('[data-investigations]');
-  if(!fresh || sending || request!==generation) return;
+  if(!response.ok) throw new Error('HTTP '+response.status);
+  const page=new DOMParser().parseFromString(await response.text(),'text/html');
+  const fresh=page.querySelector('[data-investigations]');
+  if(sending || request!==generation || !current()) return;
+  if(!fresh) throw new Error('The page has no investigation list.');
   const top=scrollY, focus=document.activeElement?.id;
   content.replaceWith(fresh);content=fresh;bind();apply();
   if(focus) document.getElementById(focus)?.focus({preventScroll:true});
-  scrollTo({top,behavior:'instant'});
- }catch(error){}finally{active--;}
+  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
+ }finally{if(request===generation) active=false;}
 }
 bind();apply();
 window.addEventListener('hashchange',()=>{
  const place=new URLSearchParams(location.hash.slice(1));
  owner=place.get('owner') || '';show=place.get('show') || 'not-read';apply();
 });
-createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

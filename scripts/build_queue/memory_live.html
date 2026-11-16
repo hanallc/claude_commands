@@ -41,11 +41,6 @@ html { overflow-anchor: none; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 .num { font-variant-numeric: tabular-nums; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-#status { flex: 1 1 12rem; min-width: 0; }
-.status.is-stale { position: sticky; top: 0; z-index: 5; background: var(--bg); }
-.dot.stale { background: var(--cap); }
 .paused-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 9; display: inline-flex; gap: 8px; align-items: center;
   padding: 4px 14px; border: 1px solid var(--cap); border-radius: 999px; background: var(--card); color: var(--cap); font-weight: 600; pointer-events: none; }
 .paused-badge[hidden] { display: none; }
@@ -309,7 +304,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
-body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
+body.queue-unavailable .card { display: none; }
 .track { position: relative; height: 18px; cursor: help; overflow: hidden; }
 .track .bud { position: absolute; top: -5px; bottom: -5px; margin-left: -1px; border-left: 2px dashed var(--cap); pointer-events: none; }
 .track .b { position: absolute; top: 0; bottom: 0; border-radius: 3px; overflow: hidden; display: flex; z-index: 1; transition: left 0.6s ease, width 0.6s ease; }
@@ -338,7 +333,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .walk-sum { margin-left: 0; }
   .gauge { grid-template-columns: minmax(0, 1fr); row-gap: 6px; font-size: 0.75rem; }
   .gauge .gt { grid-column: 1 / -1; grid-row: 2; }
-  .status { flex-wrap: wrap; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
   .walk-table table { font-size: 0.78rem; }
@@ -365,10 +359,10 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <body>
 <main>
   <p class="error" id="mac-idle-alert" role="status" hidden></p>
-  <h1 class="page-title">Builds</h1>
+  __PAGE_TITLE__
   <div class="queue-error" id="queue-error" role="status"></div>
   <div class="paused-badge" id="paused" role="status" hidden><span class="pb"></span>Paused · press space to resume</div>
-  <div class="status"><span class="dot" id="dot"></span><span id="status">Reading…</span><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
+  <div class="pressure"><a class="pill" id="pill" href="#swap" data-tip="pill"><span class="pd"></span><span id="pill-t">pressure –</span></a></div>
 
   <section class="card targets" id="targets" aria-label="Target availability" hidden></section>
 
@@ -975,7 +969,7 @@ document.addEventListener("click", (e) => {
   if (el && tipKey !== el.dataset.tip) showTip(el.dataset.tip, e.clientX, e.clientY); else hideTip();
 });
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
-const STALE = Math.max(15, SECONDS * 5);
+__PAGE_REFRESH_SCRIPT__
 const $ = (id) => document.getElementById(id);
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
 const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
@@ -1026,8 +1020,7 @@ function restoreReportView(view) {
 }
 function render(d) {
   if (d.error || !d.ok) {
-    recordReadFailure("The queue did not answer.");
-    return;
+    throw new Error("The queue did not answer.");
   }
   const view = captureReportView();
   for (const [theme, colors] of Object.entries(d.colors)) {
@@ -1621,86 +1614,48 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-let lastRead = 0;
-let readingFailure = "";
-function showStatus(text, stale) {
-  $("status").textContent = text;
-  $("dot").classList.toggle("stale", stale || paused);
-  $("status").closest(".status").classList.toggle("is-stale", stale);
-}
-
-function updateReadingStatus(readAt) {
-  if (!readAt) return;
-  const age = Date.now() / 1000 - readAt;
-  const date = new Date(readAt * 1000);
-  const time = [date.getHours(), date.getMinutes(), date.getSeconds()].map(value => String(value).padStart(2, "0")).join(":");
-  const staleText = readingFailure
-    ? `${readingFailure} Showing the reading from ${time}, ${Math.round(age)} s old.`
-    : `Last reading ${time}, ${Math.round(age)} s old. The feed has stopped.`;
-  if (paused) { showStatus(`Paused · read at ${time}`, false); return; }
-  showStatus(age > STALE ? staleText : `Live · read at ${time}`, age > STALE);
-  if (age > STALE) {
-    $("pill").className = "pill neutral as-of";
-    $("pill-t").textContent = `as of ${time}`;
-  } else {
-    const lv = level(latest);
-    $("pill").className = `pill ${lv}`;
-    $("pill-t").textContent = ({ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded"})[lv];
-  }
-}
-
-function recordReadFailure(message) {
-  readingFailure = message;
-  if (lastRead) updateReadingStatus(lastRead);
-  else showQueueError(message.replace(/\.$/, ""));
-}
-
 const consoleHidden = () => window.frameElement?.hidden === true;
-// The user, 11-16: space pauses every update so tooltips can be read on a still page; space again resumes.
+// Space pauses the reads and keeps the page controls active.
 let paused = false;
 function setPaused(on) {
   paused = on;
   $("paused").hidden = !on;
-  if (on) updateReadingStatus(lastRead);
-  else { tick(); reloadWhenPageChanges(); }
+  pageRefresh.abandon();
+  pageRefresh.restart();
+  if (!on) { void pageRefresh.refresh(true); void reloadWhenPageChanges(); }
 }
 addEventListener("keydown", event => {
   if (event.code !== "Space" || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
-  // Space keeps its own job on a control: it presses a button and opens the legend.
+  // Space activates a focused control.
   if (event.target.closest?.("input, textarea, select, button, summary, [contenteditable]")) return;
   event.preventDefault();
   setPaused(!paused);
 });
-
-async function tick() {
+async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  try {
-    const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-    // A reading that arrives after a pause waits; the next tick after resume shows it.
-    if (paused) return;
-    if (d.ok && !d.error) {
-      render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
-      if (d.report_version !== reportVersion) await loadReport(d.report_version);
-    }
-    else { recordReadFailure("The queue did not answer."); return; }
-  } catch (e) {
-    if (paused) return;
-    recordReadFailure(`Cannot load the reading: ${e.message}.`);
-    return;
-  }
-  updateReadingStatus(lastRead);
+  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const d = await r.json();
+  if (!current() || paused) return;
+  if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
+  render(d);
+  if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
+  if (!current() || paused) return;
+  const lv=level(latest);
+  $("pill").className=`pill ${lv}`;
+  $("pill-t").textContent=({ok:"no memory pressure",warn:"memory pressure near limit",
+    hold:"pressure: queue holds",neutral:"stall not recorded"})[lv];
+  return {readAt:d.read_at,renderSeconds:d.render_seconds,failure:d.read_error ? "The queue did not answer." : ""};
 }
 // Read the costs only when the feed names a new report version.
 let reportVersion = null;
-async function loadReport(version) {
+async function loadReport(version,current) {
   try {
     const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
     if (!r.ok) return;
     const report = await r.json();
     // A paused page keeps its costs until the next reading after resume.
-    if (paused) return;
+    if (!current() || paused) return;
     renderReport(report);
     reportVersion = version;
   } catch (e) { /* The next reading tries again. */ }
@@ -1716,13 +1671,12 @@ async function reloadWhenPageChanges() {
     pageStamp = stamp || pageStamp;
   } catch (e) { /* The reading status already reports a lost server. */ }
 }
-tick();
-setInterval(tick, SECONDS * 1000);
+const pageRefresh=createPageRefresh(tick,()=>paused ? 0 : SECONDS,()=>paused ? 'Press space to resume.' : '');
+void pageRefresh.refresh();
 reloadWhenPageChanges();
 setInterval(reloadWhenPageChanges, 30000);
 addEventListener("message", event => {
   if (event.source === parent && event.origin === location.origin && event.data === "console-shown") {
-    tick();
     reloadWhenPageChanges();
   }
   if (event.source === parent && event.origin === location.origin && event.data === "console-space") setPaused(!paused);

@@ -9,6 +9,7 @@ from decimal import Decimal
 from io import StringIO
 import fcntl
 import json
+import shutil
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
@@ -469,7 +471,9 @@ class ControlTests(CostFixture):
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual(data, aws_page.page_data(tables, data["spend"], int(self.clock.now)))
+        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now))
+        self.assertGreater(data["render_seconds"], 0)
+        self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
@@ -491,6 +495,14 @@ class ControlTests(CostFixture):
         self.assertEqual([line['text'] for line in data['snapshot']], [text for _region, text in tables.snapshot_rows])
         summaries = [entry['estimates'][0]['summary'] if entry['estimates'] else entry['no_estimate'] for entry in data['runs']]
         self.assertEqual(summaries, [costs.summary_of(costs.cheapest) for costs in tables.runs])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_aws_loader(self) -> None:
+        _ = self.snapshot()
+        folder = self.root / 'page'
+        page = aws_page.publish(self.state, int(self.clock.now), folder, settings_path=self.settings)
+        source = page.read_text()
+        assert_status_states(self, source, 0)
 
     def test_region_filter_sorts_each_group_alphabetically_in_the_group_order(self) -> None:
         regions = ('us-west-2', 'sa-east-1', 'me-south-1', 'ap-south-1', 'eu-west-1', 'ca-central-1',
