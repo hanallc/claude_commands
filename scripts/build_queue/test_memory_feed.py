@@ -169,7 +169,11 @@ class MemoryFeedTests(unittest.TestCase):
                     memory_feed.notify_unplaced_mac_runs(reading, notified)
                     self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
-                    self.assertIn(label, row["name"])
+                    if label.startswith("placement "):
+                        self.assertNotIn("placement", row["name"])
+                        self.assertEqual(row["gate_label"], label)
+                    else:
+                        self.assertIn(label, row["name"])
                     if label == "unplaced":
                         self.assertIn("pid 710001", str(send.call_args))
                         self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])

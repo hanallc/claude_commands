@@ -18,8 +18,34 @@ from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_va
 
 
 @dataclass(frozen=True)
+class TokenWait:
+    """A test step built its tests and waits for jobserver tokens to run them."""
+    tokens: int
+
+
+@dataclass(frozen=True)
+class NoTokenWait:
+    pass
+
+
+@dataclass(frozen=True)
 class NoCounter:
     reason: str = "no current counter"
+    # The counter union stays stable for pinned clients; a token wait is this optional field.
+    token_wait: TokenWait | NoTokenWait = NoTokenWait()
+
+
+TOKEN_WAIT_REASON = "waiting for jobserver tokens"
+TOKEN_WAIT_LINE = re.compile(r"\bnextest: waiting for (\d+) more jobserver tokens\b")
+
+
+def token_wait(counter: ProgressCounter | NoCounter) -> TokenWait | NoTokenWait:
+    return counter.token_wait if isinstance(counter, NoCounter) else NoTokenWait()
+
+
+def token_wait_line(tokens: int) -> str:
+    """Print the wait line that CounterParser reads as a token wait."""
+    return f"nextest: waiting for {tokens} more jobserver tokens"
 
 
 @dataclass(frozen=True)
@@ -209,7 +235,12 @@ class CounterParser:
                 match = TEST_START.search(frame)
                 starting = True
             if match is None:
-                if PHASE_END.search(frame):
+                wait = TOKEN_WAIT_LINE.search(frame)
+                if wait is not None:
+                    self.current = NoCounter(TOKEN_WAIT_REASON, TokenWait(int(wait[1])))
+                    self.previous_kind = ""
+                elif PHASE_END.search(frame) or frame.strip() and isinstance(token_wait(self.current), TokenWait):
+                    # The first line after the wait line reports the tokens taken.
                     self.current = NoCounter("phase ended or waiting")
                     self.previous_kind = ""
                 continue
