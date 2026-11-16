@@ -99,7 +99,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         _ = self.child_production()
-        checkpoint = self.dated_checkpoint("checkpoint(alpha): handoff\n\nChange-Review: Child ready | Read | Listed")
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): handoff\n\nChange-Review: Child ready | Read | Listed | image 012345abcdef")
         self.assertEqual(self.run_handoff(checkpoint).returncode, 0)
         self.assertEqual([row["Change"] for row in change_review.pending(review)], ["Child ready"])
         written = review.read_bytes()
@@ -200,7 +200,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
         _ = self.child_production()
-        checkpoint = self.dated_checkpoint("checkpoint(alpha): recovered handoff\n\nChange-Review: Recovered | Read | Listed")
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): recovered handoff\n\nChange-Review: Recovered | Read | Listed | image 012345abcdef")
         _ = self.git("merge", "--no-ff", "-m",
                      f"Merge example-style hand-off ({checkpoint[:7]}) into production", checkpoint)
         merge = self.git("rev-parse", "HEAD")
