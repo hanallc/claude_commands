@@ -230,6 +230,8 @@ Own what a build may use and when it starts: memory admission and the memory que
    Cover `release_records_for_change()`, `complete_release_record()` and `set_aside_damaged_record()` through that capability.
    Do not take the same flock again inside a helper. Keep hold status read-only.
    Refuse mixed private and real directories before either real directory changes.
+   Guard the hold stop: `hold_enforcer.stop_waiting_run()` (`scripts/build_hold/hold_enforcer.py:358`) stops live runs and writes their run record through `detached_runs.stop_with_reason()` (`scripts/agents/detached_runs.py:198`) outside `release_lock()`.
+   Refuse an imported call from a non-installed copy before any signal or record write. Keep the command-group stop and the supervisor's result delivery (Phase 129).
    `read_cycle()` (`build_hold.py:1016`) returns `HoldCycle | None`, and `cycle_path()` (`build_hold.py:1005`) returns `Path | None`, for the same no-current-cycle state.
    Return the existing `NoCycle` (`build_hold.py:73`) from both in place of `None`. Add no second type for this state.
    Update `read_cycle_for_change()` and its test callers.
@@ -271,6 +273,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `scripts/lint/memory_admit.py`, `scripts/lint/memory_gate.sh`, `scripts/lint/invoke.sh` — caller routing.
 - `scripts/lint/test_memory_admit.py`, `scripts/lint/test_invoke_scope.py` — caller tests.
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/build_hold.py` — shared guard and hold mutation boundary.
+- `scripts/build_hold/hold_enforcer.py` — the hold stop guard; its imported-call refusal test goes in `scripts/build_hold/test_hold_enforcer.py`.
 - `scripts/build_hold/test_override_guard.py`, `scripts/build_hold/test_build_hold.py` — guard and hold recovery tests.
 - `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_targets/test_build_targets.py`, `scripts/direct/test_verify_mac_lifecycle.py`, `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/verify_hold_wait_test_support.py` — `read_cycle()` callers that narrow to `HoldCycle`.
 - `scripts/build_queue/queue_view.py`, `scripts/build_queue/queue_card.py` — separate repository and step displays.
@@ -285,14 +288,12 @@ Own what a build may use and when it starts: memory admission and the memory que
 - `test` owns the listed test files, routing fixtures and display goldens.
 
 **Acceptance gate:**
-- Preserve these existing tests unchanged:
-  1. `test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history` in `scripts/build_queue/test_queue_view.py`.
-  2. `test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row` in `scripts/build_queue/test_queue_view.py`.
-  3. `test_priority_override_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
-  4. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
-  5. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
-  6. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
-  7. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
+- Preserve these existing tests unchanged. builds-queue 3ef82d3ab (`/build:bump`) removed the two earlier `test_queue_view.py` tests this list named; do not restore them.
+  1. `test_priority_and_frozen_release_keep_the_resolved_head` in `scripts/build_queue/test_admission_service.py`.
+  2. `test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits` in `scripts/build_queue/test_admission_service.py`.
+  3. `test_view_release_and_admit_pass_capture_the_same_continuation_slot` in `scripts/build_queue/test_admission_service.py`.
+  4. `test_a_younger_run_cannot_take_the_room_protected_for_the_head` in `scripts/build_queue/test_admission_service.py`.
+  5. `test_an_oversized_head_starts_alone_but_unreadable_host_or_pressure_holds_it` in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_restart_retries_an_interrupted_cancellation_with_its_original_time` unchanged in `scripts/build_queue/test_admission_service.py`.
 - Preserve `test_full_queue_holds_gate_until_the_running_charge_is_released` and `test_admission_error_refuses_before_any_module_starts` unchanged.
   Both tests are in `scripts/production/test_merge_gate_suites_admission.py`.
@@ -2666,13 +2667,25 @@ The cutover removal commit deletes the script after the run.
 
 #### Work Order
 
+**Goal:** the automatic disk-floor sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path.
+
 **Spec:**
 1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
+   `tmp_sweep.py --apply` (`apply_cleanup_plan()`, which deletes through `remove_entry()` at `scripts/lint/tmp_sweep.py:1456`) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Files:**
+- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only floor callers and the explicit cleanup route.
+- `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` — alarm, explicit cleanup and saved-plan rows (claim through berth and builds first).
+- `docs/as-built/build-memory-admission.md` — the alarm-only floor rule beside its `tmp_sweep` lines.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
+- `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
+
+**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
@@ -2683,30 +2696,14 @@ The cutover removal commit deletes the script after the run.
 - `same_binary` stays: it matches the recorded binary as one whole argument of the pid (`/proc/<pid>/cmdline` on Linux, `ps -ww -p <pid> -o command=` on macOS). A reused pid that runs another program, a path prefix, or a process that exits during the read gives `False`, so `shutdown` signals no reused Mac pid. The `shutdown` test in `LaunchRecordRecoveryTests` covers it.
 
 ### Phase 133 — Each gate slot lease names the work it gates  · status: done
-**Source:** builds showrunner 2026-11-16 08:5x, for the cargo-liner showrunner's cargo-tile: every `/build/slot/*.lease.json` reads `"work": "gate", "purpose": "gate"` (for example `/build/slot/hana-slot1.lease.json`), so cargo-tile cannot say which work holds a slot.
 
-#### Work Order
+#### As-built
 
-**Goal:** a gate's slot lease names the gated work in `purpose`, for example `gate · handler phase 27 · census --json bound`.
+- `copies.gate_purpose(subject)` names the gated work: a `<kind>(<slug>): phase <N> — <title>` subject gives `gate · <slug> phase <N> · <title>`, any other subject gives `gate · <subject>`, and an empty subject gives `gate`.
+- `copies.standing` reads the subject of `base` with one `git log -1 --format=%s` in the slot source and passes it as the slot lease `purpose`. A failed read gives `gate`. The lease keeps the staff id in `unit` and `gate` in `work`. The `ACTIVE_GATES` reuse path takes no slot and is unchanged.
+- A `MergeRevision` gate also names `base`: in `waiting.scratch_test`, `merge.revision` is the production merge branch, not the gated work.
+- `build_folders.build_folder_path` checks only `repository` for a slot path (`<repository>-slot<N>`). The other slot fields are lease labels, so a subject with a `/` is a valid purpose. Other folder kinds keep the full component check.
+- The Disks page "Used by" column shows the purpose (`scripts/disks/slots.py`).
+- No signal handler, mask or disposition.
 
-**Spec:**
-1. `copies.standing` (`scripts/copies/copies.py:996`) calls `build_slots.take_slot(..., work="gate", purpose="gate", ...)` at `copies.py:1028`. Keep `work="gate"`. Pass a specific `purpose` instead of `"gate"`.
-2. Take the purpose from the gated commit's own record, not from a new caller argument: the subject of the gated source revision `base`. With `MergeRevision`, `base` is still the gated work: `merge.revision` is the production merge branch it merges onto (`waiting.scratch_test`), so it does not name the work.
-3. Format: a subject `<kind>(<slug>): phase <N> — <title>` gives `gate · <slug> phase <N> · <title>`. Any other subject gives `gate · <subject>`. A subject that Git cannot read gives `gate`.
-4. Keep the staff id in `unit` and the field name `purpose`. `scripts/disks/slots.py` and cargo-tile do not change.
-5. The identical nested proof reuse path (`ACTIVE_GATES`) does not take a slot and does not change.
-6. Add no signal handler, mask or disposition.
-
-**Files:**
-- `scripts/copies/copies.py` — the purpose from the gated commit's subject.
-- `scripts/copies/test_copies.py` — rows in the existing lease test (`self.lease(tree)["unit"]`, near line 188).
-- `docs/as-built/copies.md` — the lease purpose rule.
-- `scripts/lib/build_folders.py` — a slot path checks only its path components; the lease labels (`purpose` can hold a `/`) are not path components (review finding, round 1).
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/copies/copies.py`, `docs/as-built/copies.md`.
-- `test` — `scripts/copies/test_copies.py`, from the Spec alone.
-
-**State:** the lease file field `purpose` for gate slots. No config key.
-
-**Acceptance gate:** rows in the existing lease test: a `checkpoint(<slug>): phase <N> — <title>` commit gives `gate · <slug> phase <N> · <title>`; a plain subject gives `gate · <subject>`; a `MergeRevision` gate names the source revision's subject, not the merge branch's; `unit` stays the staff id and `work` stays `gate`. Run `scripts.copies.test_copies`, `scripts.lib.test_build_slots` and `scripts.disks.test_slots` if it exists; basedpyright 0/0 on the changed files.
+**Files:** `scripts/copies/copies.py`, `scripts/lib/build_folders.py`, `scripts/copies/test_copies.py` (StandingTests lease rows), `docs/as-built/copies.md`.
