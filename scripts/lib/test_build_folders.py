@@ -24,6 +24,7 @@ from typing import ContextManager
 from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import commit_repository
 
 
 def _release_folder(path: Path) -> None:
@@ -49,6 +50,274 @@ class BuildFolderTests(unittest.TestCase):
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
+
+    def editable_source(self) -> tuple[Path, str, Path]:
+        source = self.root / "source"
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, capture_output=True)
+        _ = (source / "source.txt").write_text("committed source\n")
+        tip = commit_repository(source, "source")
+        bare = self.root / "origin.git"
+        _ = subprocess.run(["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True)
+        return source, tip, bare
+
+    def test_editable_worktrees_keep_new_and_existing_branches(self) -> None:
+        source, tip, bare = self.editable_source()
+        del bare
+        for cli in (False, True):
+            for new in (False, True):
+                with self.subTest(cli=cli, new=new):
+                    branch = f"review-{cli}-{new}"
+                    path = self.root / f"editable path {branch}"
+                    if not new:
+                        _ = subprocess.run(["git", "-C", str(source), "branch", branch, tip], check=True)
+                    if cli:
+                        flags = (["--new-branch", branch, "--start-point", tip] if new
+                                 else ["--existing-branch", branch])
+                        result = self.command("editable-repository", "--path", str(path), "--source", str(source), *flags)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), str(path))
+                    else:
+                        selection = folders.NewWorktreeBranch(branch, tip) if new else folders.ExistingWorktreeBranch(branch)
+                        self.assertEqual(folders.create_build_folder(folders.LinkedEditableRepository(path, source, selection)), path)
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "branch", "--show-current"], text=True).strip(), branch)
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
+                    self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                    self.assertEqual(folders.build_folder_state(path), "free")
+
+    def test_remote_editable_clones_keep_the_ref_and_depth(self) -> None:
+        source, tip, bare = self.editable_source()
+        _ = (source / "source.txt").write_text("later source\n")
+        _ = commit_repository(source, "later")
+        _ = subprocess.run(["git", "-C", str(source), "push", str(bare), "main"], check=True, capture_output=True)
+        for cli in (False, True):
+            with self.subTest(cli=cli):
+                path = self.root / f"clone {cli}"
+                if cli:
+                    result = self.command("editable-repository", "--path", str(path), "--url", bare.as_uri(),
+                                          "--ref", "main", "--depth", "1")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), str(path))
+                else:
+                    _ = folders.create_build_folder(folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1))
+                self.assertEqual((path / "source.txt").read_text(), "later source\n")
+                self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-list", "--count", "HEAD"], text=True).strip(), "1")
+                self.assertNotEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
+                self.assertEqual(folders.build_folder_state(path), "free")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_editable_git_children_do_not_inherit_the_lease(self) -> None:
+        source, tip, bare = self.editable_source()
+        real_git = shutil.which("git")
+        assert real_git is not None
+        commands = self.root / "commands"
+        commands.mkdir()
+        fake_git = commands / "git"
+        _ = fake_git.write_text(f"#!{sys.executable}\n" + """import os, pathlib, signal, sys
+arguments = sys.argv[1:]
+if arguments[:1] == ['clone'] or arguments[2:4] == ['worktree', 'add']:
+    child = os.fork()
+    if child == 0:
+        sink = os.open(os.devnull, os.O_RDWR)
+        for descriptor in (0, 1, 2):
+            os.dup2(sink, descriptor)
+        os.close(sink)
+        signal.pause()
+        os._exit(0)
+    pathlib.Path(os.environ['EDITABLE_GIT_CHILD_PID']).write_text(str(child))
+os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arguments])
+""")
+        fake_git.chmod(0o755)
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                path = self.root / f"editable-child-{remote}"
+                pid_file = self.root / f"git-child-{remote}.pid"
+                request: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("child-lease", tip)))
+                try:
+                    with mock.patch.dict(os.environ, {
+                        "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+                        "EDITABLE_REAL_GIT": real_git, "EDITABLE_GIT_CHILD_PID": str(pid_file),
+                    }):
+                        self.assertEqual(folders.create_build_folder(request), path)
+                    self.assertTrue(pid_file.is_file())
+                    os.kill(int(pid_file.read_text()), 0)
+                    self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                    self.assertEqual(folders.build_folder_state(path), "free")
+                finally:
+                    if pid_file.exists():
+                        try:
+                            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_new_worktree_request_keeps_a_branch_created_by_another_request(self) -> None:
+        source, tip, _ = self.editable_source()
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        for scenario in ("before", "during"):
+            with self.subTest(scenario=scenario):
+                branch = f"other-request-{scenario}"
+                path = self.root / branch
+                if scenario == "before":
+                    _ = run(["git", "-C", str(source), "branch", "--", branch, tip], check=True)
+                injected: list[str] = []
+
+                def create_other_branch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    creates_branch = command[:4] == ["git", "-C", str(source), "branch"]
+                    adds_worktree = command[:5] == ["git", "-C", str(source), "worktree", "add"]
+                    if scenario == "during" and not injected and (creates_branch or adds_worktree):
+                        _ = run(["git", "-C", str(source), "branch", "--", branch, tip], check=True)
+                        injected.append(branch)
+                    return run(command, **options)
+
+                request = folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch(branch, tip))
+                with mock.patch.object(subprocess, "run", side_effect=create_other_branch):
+                    with self.assertRaisesRegex(OSError, branch):
+                        _ = folders.create_build_folder(request)
+                if scenario == "during":
+                    self.assertEqual(injected, [branch])
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertEqual(subprocess.check_output(["git", "-C", str(source), "rev-parse", "--verify",
+                                                         f"refs/heads/{branch}"], text=True).strip(), tip)
+
+    def test_editable_creation_refuses_an_occupied_checkout_without_changes(self) -> None:
+        source, tip, bare = self.editable_source()
+        _ = (source / "source.txt").write_text("keep edits\n")
+        _ = (source / "untracked.txt").write_text("keep untracked work\n")
+        before = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"])
+        requests: tuple[folders.EditableRepositoryRequest, ...] = (
+            folders.LinkedEditableRepository(source, source, folders.NewWorktreeBranch("refused", tip)),
+            folders.RemoteEditableRepository(source, bare.as_uri(), "main", 1),
+        )
+        for request in requests:
+            with self.subTest(request=type(request).__name__):
+                with self.assertRaisesRegex(FileExistsError, "occupied"):
+                    _ = folders.create_build_folder(request)
+                self.assertEqual(subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"]), before)
+                self.assertEqual((source / "source.txt").read_text(), "keep edits\n")
+                self.assertEqual((source / "untracked.txt").read_text(), "keep untracked work\n")
+                self.assertEqual(folders.build_folder_state(source), "free")
+
+    def test_failed_editable_git_releases_the_path_for_a_retry(self) -> None:
+        source, tip, bare = self.editable_source()
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                path = self.root / f"failed {remote}"
+                failed: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "missing-ref", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("retry", "missing-ref")))
+                with self.assertRaisesRegex(OSError, str(path)) as caught:
+                    _ = folders.create_build_folder(failed)
+                self.assertIn("missing-ref", str(caught.exception))
+                self.assertFalse(path.exists())
+                self.assertEqual(folders.build_folder_state(path), "free")
+                retry: folders.EditableRepositoryRequest = (
+                    folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1) if remote else
+                    folders.LinkedEditableRepository(path, source, folders.NewWorktreeBranch("retry", tip)))
+                _ = folders.create_build_folder(retry)
+                self.assertEqual((path / "source.txt").read_text(), "committed source\n")
+                self.assertEqual(folders.build_folder_state(path), "free")
+
+        template = self.root / "template"
+        hook = template / "hooks/post-checkout"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text("#!/bin/sh\nprintf 'interrupted checkout work' > recovery.txt\nexit 1\n")
+        hook.chmod(0o755)
+        path = self.root / "interrupted-clone"
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "init.templateDir",
+                                          "GIT_CONFIG_VALUE_0": str(template)}):
+            with self.assertRaisesRegex(OSError, str(path)):
+                _ = folders.create_build_folder(folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1))
+        self.assertFalse(path.exists())
+        self.assertEqual(folders.build_folder_state(path), "free")
+        recovery = path.with_name(path.name + "-rescues.git")
+        self.assertFalse(recovery.exists())
+        self.assertFalse(recovery.with_name(recovery.name + ".lock").exists())
+        self.assertFalse(recovery.with_name(recovery.name + ".lease.json").exists())
+
+    def test_failed_worktree_creation_removes_only_its_unchanged_new_branch(self) -> None:
+        source, tip, _ = self.editable_source()
+        _ = (source / "source.txt").write_text("later source\n")
+        later = commit_repository(source, "later")
+        hook = source / ".git/hooks/post-checkout"
+        for scenario in ("new", "existing", "occupied-branch", "moved"):
+            with self.subTest(scenario=scenario):
+                branch = f"retry-{scenario}"
+                path = self.root / branch
+                if scenario in ("existing", "occupied-branch"):
+                    _ = subprocess.run(["git", "-C", str(source), "branch", branch, tip], check=True)
+                move = f"git update-ref refs/heads/{branch} {later}\n" if scenario == "moved" else ""
+                _ = hook.write_text("#!/bin/sh\n" + move + "printf 'checkout failed' >&2\nexit 1\n")
+                hook.chmod(0o755)
+                selection = (folders.ExistingWorktreeBranch(branch) if scenario == "existing"
+                             else folders.NewWorktreeBranch(branch, tip))
+                request = folders.LinkedEditableRepository(path, source, selection)
+                with self.assertRaisesRegex(OSError, str(path)):
+                    _ = folders.create_build_folder(request)
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                trees = subprocess.check_output(["git", "-C", str(source), "worktree", "list", "--porcelain"], text=True)
+                self.assertNotIn(str(path), trees)
+                actual = subprocess.run(["git", "-C", str(source), "show-ref", "--verify", f"refs/heads/{branch}"],
+                                        capture_output=True, text=True)
+                if scenario == "new":
+                    self.assertNotEqual(actual.returncode, 0)
+                    hook.unlink()
+                    self.assertEqual(folders.create_build_folder(request), path)
+                    self.assertEqual(subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip(), tip)
+                else:
+                    self.assertEqual(actual.returncode, 0, actual.stderr)
+                    self.assertEqual(actual.stdout.split()[0], later if scenario == "moved" else tip)
+
+    def test_failed_clone_without_head_removes_its_folder_and_preserves_the_git_error(self) -> None:
+        _, _, bare = self.editable_source()
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                path = self.root / f"incomplete-clone-{timeout}"
+                failure = (subprocess.TimeoutExpired(["git", "clone"], 1, stderr=b"clone interrupted") if timeout else
+                           subprocess.CalledProcessError(1, ["git", "clone"], stderr="clone interrupted"))
+
+                def interrupt(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    if command[:2] == ["git", "clone"]:
+                        _ = run(["git", "init", "-q", str(path)], check=True, capture_output=True, text=True)
+                        raise failure
+                    return run(command, **options)
+
+                request = folders.RemoteEditableRepository(path, bare.as_uri(), "main", 1)
+                with mock.patch.object(subprocess, "run", side_effect=interrupt):
+                    with self.assertRaisesRegex(OSError, "clone interrupted") as caught:
+                        _ = folders.create_build_folder(request)
+                self.assertIs(caught.exception.__cause__, failure)
+                self.assertIn(str(path), str(caught.exception))
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lock").exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                self.assertFalse(path.with_name(path.name + "-rescues.git").exists())
+                self.assertEqual(folders.create_build_folder(request), path)
+
+    def test_existing_worktree_branch_rejects_commits_tags_and_missing_names_before_allocation(self) -> None:
+        source, tip, _ = self.editable_source()
+        _ = subprocess.run(["git", "-C", str(source), "tag", "saved", tip], check=True)
+        for name in (tip, "saved", "missing"):
+            for cli in (False, True):
+                with self.subTest(name=name, cli=cli):
+                    path = self.root / f"refused-{name}-{cli}"
+                    if cli:
+                        result = self.command("editable-repository", "--path", str(path), "--source", str(source),
+                                              "--existing-branch", name)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(name, result.stderr)
+                    else:
+                        request = folders.LinkedEditableRepository(path, source, folders.ExistingWorktreeBranch(name))
+                        with self.assertRaisesRegex(ValueError, name):
+                            _ = folders.create_build_folder(request)
+                    self.assertFalse(path.exists())
+                    self.assertFalse(path.with_name(path.name + ".lock").exists())
+                    self.assertFalse(path.with_name(path.name + ".lease.json").exists())
 
     def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
