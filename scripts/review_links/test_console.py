@@ -16,9 +16,9 @@ from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
-from scripts.production import staff
+from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, review_link
+from scripts.review_links import change_browser, change_page, console, investigations_page, review_link
 
 
 class ConsoleMarkup(HTMLParser):
@@ -50,7 +50,8 @@ class ConsoleTests(unittest.TestCase):
                                 self.configuration / f"{stem}.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.configuration), "REVIEW_LINKS_ROOT": str(self.root / "snapshots"),
-            "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json")})))
+            "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json"),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "state")})))
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         with (patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True),
@@ -62,12 +63,12 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
         markup = ConsoleMarkup()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "changes", "disks", "images", "questions"])
+        self.assertEqual(markup.pages, ["accounts", "aws", "builds", "changes", "disks", "images", "investigations", "questions"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 19)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 8)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 7)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 21)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 9)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 8)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
@@ -77,6 +78,8 @@ class ConsoleTests(unittest.TestCase):
         changes = f"{base}/{change_page.PAGE_NAME}"
         self.assertIn(f'data-url="{changes}" data-title="Changes"', source)
         self.assertIn(f'data-url="{changes}?type=questions" data-title="Questions"', source)
+        self.assertIn('data-url="/console/investigations.html" data-title="Investigations"', source)
+        self.assertIn('class="lucide lucide-search"', source)
         self.assertIn(f'data-url="{base}/{change_page.REBUILDS_NAME}" data-title="Rebuilds needed" hidden>', source)
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
@@ -131,13 +134,13 @@ class ConsoleTests(unittest.TestCase):
         _ = (self.configuration / "console.conf").write_text("\n\n".join(reversed(blocks)))
         with patch.object(memory_feed, "page_url", side_effect=FileNotFoundError("fixture page absent"), create=True):
             pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["questions", "images", "disks", "changes", "builds", "aws", "accounts"])
-        self.assertIsInstance(pages[1].destination, console.AvailablePage)
-        self.assertIsInstance(pages[4].destination, console.UnavailablePage)
+        self.assertEqual([page.identity for page in pages], ["questions", "investigations", "images", "disks", "changes", "builds", "aws", "accounts"])
+        self.assertIsInstance(pages[2].destination, console.AvailablePage)
+        self.assertIsInstance(pages[5].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
         markup.feed(source)
-        self.assertEqual(markup.pages, ["questions", "images", "disks", "changes", "builds", "aws", "accounts"])
+        self.assertEqual(markup.pages, ["questions", "investigations", "images", "disks", "changes", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
         self.assertIn('aria-label="Builds — Not available"', source)
         self.assertNotIn("fixture page absent", source)
@@ -149,7 +152,7 @@ class ConsoleTests(unittest.TestCase):
             "python:scripts.build_queue.memory_feed:fixture_page_url_absent")
         _ = configuration.write_text(source)
         pages = console.read_pages()
-        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "changes", "disks", "images", "questions"])
+        self.assertEqual([page.identity for page in pages], ["accounts", "aws", "builds", "changes", "disks", "images", "investigations", "questions"])
         self.assertIsInstance(pages[2].destination, console.UnavailablePage)
         self.assertIsInstance(pages[3].destination, console.AvailablePage)
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
@@ -165,6 +168,22 @@ class ConsoleTests(unittest.TestCase):
         with (patch.object(change_browser, "waiting_changes", return_value=frozenset(changes)),
               patch.object(change_browser, "waiting_questions", return_value=frozenset(questions))):
             return console.read_pages()
+
+    def test_ready_investigation_answers_mark_the_page_until_a_visit(self) -> None:
+        pages = tuple(page for page in console.read_pages() if page.identity == "investigations")
+        root = self.root / "snapshots"
+        owner = staff.StaffId("orphan-owner")
+        self.assertEqual(console.news(root, pages, "changes"), ())
+        item = investigation.file(owner, "Find the cause", "Why?")
+        self.assertEqual(console.news(root, pages, "changes"), ())
+        ready = investigation.answer(owner, item.id, "Found it.")
+        self.assertEqual(investigations_page.waiting_investigations(console.NewsRequest(root)),
+                         frozenset({f"{owner}/{item.id}/{ready.answered}"}))
+        self.assertEqual(console.news(root, pages, "changes"), ("investigations",))
+        self.assertEqual(console.news(root, pages, "investigations"), ())
+        self.assertEqual(console.news(root, pages, "changes"), ())
+        _ = investigation.mark_read(owner, item.id)
+        self.assertEqual(investigations_page.waiting_investigations(console.NewsRequest(root)), frozenset())
 
     def test_a_page_is_new_when_an_item_arrives_after_its_last_open(self) -> None:
         root = self.root / "snapshots"

@@ -519,6 +519,15 @@ def change_details(row: dict[str, str], key: str) -> str:
             + "</dl>")
 
 
+def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
+    """Include the parent showrunner in a unit's source line."""
+    member = members.by_id(owner)
+    if member is None:
+        return str(owner)
+    parent = members.parent_of(member) if member.kind == "unit" else None
+    return f"{parent.name} · {member.name}" if parent is not None else member.name
+
+
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
@@ -1082,7 +1091,9 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 page = UserQuestionPage(Path(saved["source"]), Path(saved["production"]),
                                         (Path(saved["source"]).stem,), "", saved)
                 identities = update_registration.QuestionStaff.read()
-                question = next((item for item in update_registration.question_records_for_document(page.production, identities)
+                owner = identities.record.by_id(staff.StaffId(saved["owner"]))
+                source = owner if owner is not None and owner.kind == "producer" else page.production
+                question = next((item for item in update_registration.question_records_for_document(source, identities)
                                  if item.path == page.review_list), None)
                 # An answer closes its question; a follow-up or a skip leaves it open.
                 if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):

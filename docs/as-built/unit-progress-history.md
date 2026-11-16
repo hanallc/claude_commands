@@ -330,6 +330,7 @@ progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
 progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
 progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
+progress_history.py drop-phase --session-dir <dir> --phase-id <id> --reason <text>
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
 progress_history.py timeline --session-dir <dir> [--phase <id>]
@@ -339,6 +340,11 @@ progress_history.py aggregate [--percent <N>]
 
 `review-trial` reports code, UX, and simplify counts and review times for one phase instance.
 [Review regime records](review-regime-trial.md) define its sources, output, and checkpoint parser.
+
+`drop-phase` closes an open phase as stopped and records `phase_dropped` with the newest finished instance ID and reason.
+It refuses an unknown phase, a completed newest instance, or an empty reason.
+A repeat with the same reason changes nothing; a different reason adds a new event.
+The board shows no row for the dropped attempt.
 
 Phases can be open together. State holds the most recently started open phase
 under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
