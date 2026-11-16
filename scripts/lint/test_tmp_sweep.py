@@ -1157,6 +1157,39 @@ class LogTests(TmpSweepCase):
 
         self.assertEqual(self.log(), [*records[1:], current])
 
+    def log_settings(self, sample: int, max_mib: int) -> conf.ConfigRead:
+        return conf.read(write(self.state / "log-settings.conf",
+            f"# whole: 0..\ntmp_sweep_log_sample={sample}\n# whole: 1..\ntmp_sweep_log_max_mib={max_mib}\n"))
+
+    def test_log_line_keeps_each_count_and_a_sample_of_the_paths(self) -> None:
+        result = tmp_sweep.Sweep()
+        for number in range(5):
+            result.keep(f"/tmp/claude/busy-{number}", tmp_sweep.IN_USE)
+        result.keep("/tmp/claude/fresh", tmp_sweep.RECENT)
+
+        entry = tmp_sweep.record(result, False, self.now, lint_settings=self.log_settings(2, 1))
+
+        self.assertEqual(entry["kept"], {tmp_sweep.IN_USE: 5, tmp_sweep.RECENT: 1})
+        self.assertEqual(entry["kept_paths"], {tmp_sweep.IN_USE: ["/tmp/claude/busy-0", "/tmp/claude/busy-1"]})
+
+    def test_log_drops_the_oldest_lines_beyond_its_size_and_keeps_the_new_line(self) -> None:
+        now = float(int(self.now))
+        filler = "x" * (400 << 10)
+        records = [{"at": datetime.fromtimestamp(now - 60 * (4 - index), UTC).isoformat(), "marker": index, "filler": filler}
+                   for index in range(4)]
+        path = write(self.state / tmp_sweep.LOG_NAME, "".join(json.dumps(record) + "\n" for record in records))
+        settings = self.log_settings(20, 1)
+        current = tmp_sweep.record(tmp_sweep.Sweep(), False, now, lint_settings=settings)
+
+        tmp_sweep.append_log(path, current, now, lint_settings=settings)
+
+        self.assertEqual(self.log(), [*records[2:], current])
+        self.assertLessEqual(path.stat().st_size, 1 << 20)
+        big = tmp_sweep.RunRecord(at=current["at"], dry_run=False, freed_gib=0.0, deleted=[], failed=[],
+                                  kept={tmp_sweep.IN_USE: 1}, kept_paths={tmp_sweep.IN_USE: [filler * 4]})
+        tmp_sweep.append_log(path, big, now, lint_settings=settings)
+        self.assertEqual(self.log(), [big])
+
     def test_each_run_logs_what_went_and_why_the_rest_stayed(self) -> None:
         self.now: float = time.time() + 8 * DAY
         _ = write(self.tmp / "shots" / "1.png")
