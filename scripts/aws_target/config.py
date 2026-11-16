@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Literal, TypeVar, cast
 from collections.abc import Callable
 import os
-from urllib.parse import urlsplit
-import re
 import json
 from zoneinfo import ZoneInfo
 
@@ -217,33 +215,22 @@ class DeploymentSettings:
     region: str
     profile: str
     stack_name: str
-    instance_type: str
     ami_id: str
     ami_owner_id: str
     nixos_release: str
     availability_zone: str
     vpc_id: str
     subnet_id: str
-    existing_data_volume_id: str
     root_device_name: str
-    root_volume_gib: int
-    data_volume_gib: int
-    data_volume_iops: int
-    data_volume_throughput: int
-    spot_max_usd_per_hour: Decimal
     notice_low: int
     notice_high: int
     stop_percent: int
     timeout_s: int
     preflight_max_age_s: int
     scaler_user_name: str
-    scripts_source_url: str
-    scripts_source_commit: str
-    scripts_source_sha256: str
-    bootstrap_template_path: Path
 
 
-def read_deployment_settings(path: Path, directory: Path | None = None) -> DeploymentSettings:
+def read_deployment_settings(path: Path) -> DeploymentSettings:
     """Require current deployment inputs before preparing any resource request."""
     settings = conf.read(path)
     def text(key: str) -> str:
@@ -252,15 +239,8 @@ def read_deployment_settings(path: Path, directory: Path | None = None) -> Deplo
     def whole(key: str) -> int:
         return _live(settings, key, positive_seconds)
 
-    def positive_money(key: str) -> Decimal:
-        value = _live(settings, key, money)
-        if value <= 0:
-            raise ValueError(f'{key}: live positive price is required')
-        return value
-
     region = text('region')
     zone = text('availability_zone')
-    instance_type = text('instance_type')
     if region not in ('us-east-1', 'us-east-2') or not zone.startswith(region):
         raise ValueError('select a supported region and its availability zone')
     owner = text('ami_owner_id')
@@ -270,30 +250,7 @@ def read_deployment_settings(path: Path, directory: Path | None = None) -> Deplo
         'budget_notice_low_percent', 'budget_notice_high_percent', 'budget_stop_percent'))
     if not 0 < low < high < stop:
         raise ValueError('Budget thresholds must increase')
-    source_url = text('scripts_source_url')
-    url = urlsplit(source_url)
-    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
-        raise ValueError('scripts_source_url must contain a public HTTPS URL without credentials')
-    commit, source_hash = text('scripts_source_commit'), text('scripts_source_sha256')
-    if not re.fullmatch(r'[0-9a-f]{40}', commit) or not re.fullmatch(r'sha256-[A-Za-z0-9+/]{43}=', source_hash):
-        raise ValueError('the public scripts need an exact commit and a Nix SHA-256 hash')
-    template = Path(text('bootstrap_template_path')).expanduser()
-    if not template.is_absolute():
-        template = path.parent / template
-    return DeploymentSettings(region, text('deployment_profile'), text('stack_name'), instance_type,
-                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'),
-                              text('subnet_id'), retained_volume(path, directory),
-                              text('root_device_name'), whole('root_volume_gib'), whole('data_volume_gib'),
-                              whole('data_volume_iops'), whole('data_volume_throughput'),
-                              positive_money('spot_max_usd_per_hour'), low, high, stop,
-                              whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'),
-                              source_url, commit, source_hash, template)
-
-
-def retained_volume(path: Path, directory: Path | None = None) -> str:
-    """Keep the saved volume selection until the stack owner changes."""
-    saved = deployment_record(directory)
-    outputs = deployment_outputs(directory)
-    if saved.get('stack') == conf.read(path).text('stack_name'):
-        return outputs.get('ExistingDataInput', '')
-    return outputs.get('DataVolumeId', '')
+    return DeploymentSettings(region, text('deployment_profile'), text('stack_name'),
+                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'), text('subnet_id'),
+                              text('root_device_name'), low, high, stop,
+                              whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'))

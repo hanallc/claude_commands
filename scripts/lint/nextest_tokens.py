@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.build_queue import progress_profile
 from scripts.lib import conf
 from scripts.lint import nextest_budget as budget
 
@@ -174,7 +175,8 @@ def run_with_tokens(run: SizedTestRun, pool_path: Path, floor: int, width_file: 
         wanted = min(floor, run.width)
         pool.take_free(wanted)
         if len(pool.held) < wanted:
-            print(f"nextest: waiting for {wanted - len(pool.held)} more jobserver tokens", flush=True)
+            # The Builds page reads this line as the token wait stage.
+            print(progress_profile.token_wait_line(wanted - len(pool.held)), flush=True)
             pool.take_waiting(wanted)
         pool.take_free(run.width)
         threads = len(pool.held)

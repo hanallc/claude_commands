@@ -57,7 +57,7 @@ from scripts.message import unit_labels
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 if TYPE_CHECKING:
     from scripts.mac_test import claim_state
@@ -239,7 +239,7 @@ def page_link() -> int:
 
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8")
+    source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
     page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
             .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
     write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
@@ -309,6 +309,12 @@ class NoProgress(TypedDict):
     reason: str
 
 
+class TokenWaitProgress(TypedDict):
+    kind: Literal["TokenWaitProgress"]
+    stage: str
+    tokens: int
+
+
 class RowProgress(TypedDict):
     kind: Literal["RowProgress"]
     phase: Literal["building", "testing"]
@@ -358,7 +364,7 @@ class RunRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
-    progress: RowProgress | NoProgress
+    progress: RowProgress | TokenWaitProgress | NoProgress
     state: str
     pid: int | admission_records.PidNotRecorded
     detail: str
@@ -709,14 +715,17 @@ def build_ci_row(used: float, now: float,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
-    """Use the newest step counter from the admission reading."""
+def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | TokenWaitProgress | NoProgress:
+    """Use the newest step counter or token wait from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
         counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
+            if isinstance(counter.token_wait, progress.TokenWait):
+                return {"kind": "TokenWaitProgress", "stage": progress.TOKEN_WAIT_REASON,
+                        "tokens": counter.token_wait.tokens}
             reason = counter.reason
             continue
         if counter.phase == "modules" or counter.phase.startswith("suites"):
@@ -796,8 +805,10 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
+    # A placed run is the normal case, so its name leaves out the placement id; the other labels mark an exception.
+    shown_gate = "" if build.gate_label == queue_view.MacGateLabel.PLACEMENT else gate
     return {"kind": "mac-build",
-            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + gate if gate else ""),
+            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + shown_gate if shown_gate else ""),
             **page_owner_labels(identity, ci_label=label), "gate_label": gate, "repository": build.repository,
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
@@ -1105,14 +1116,13 @@ class RamBlocks(TypedDict):
     safety_missing_bytes: int
     swap_missing_bytes: int
     build_missing_bytes: int
-    builds_bytes: int
     queued_builds_bytes: int
+    build_tools_bytes: int
     rust_analyzer_bytes: int
     sccache_bytes: int
     other_build_tools_bytes: int
-    ci_bytes: RamReading
-    # The queue cap counts the CI working set, file cache included.
-    ci_counted_bytes: int
+    # The CI use that the queue cap counts: swap-backed use.
+    ci_bytes: int
     agents_bytes: RamReading
     desktop_bytes: RamReading
     desktop_protection_bytes: RamReading
@@ -1360,25 +1370,16 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
     return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
 
 
-def ci_program_ram(running: Sequence[admission_records.ExplainedRunningStep]) -> RamReading:
-    """Read the hana CI swap-backed RAM from the capture; its file cache counts in the cache block."""
-    total = 0
-    for reading in gate.ci_readings(entry.step.measured for entry in running):
-        if reading.diagnostic:
-            continue
-        if isinstance(reading.anonymous, admission_records.RunUseUnavailable):
-            return admission_records.ReadingUnavailable(reading.anonymous.reason)
-        total += reading.anonymous.bytes
-    return total
-
-
 def known_bytes(value: RamReading) -> int:
     return value if isinstance(value, int) else 0
 
 
-def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamReading, capture_time: float,
+def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_time: float,
                program_rows: int) -> RamBlocks:
-    """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest."""
+    """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest.
+
+    The queued builds, CI, reservation and room blocks are the queue cap terms; they add to the cap.
+    """
     available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
     safety_covered = min(safety, available)
     swap_covered = min(swap, max(0, available - safety))
@@ -1391,13 +1392,13 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamR
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    builds = room.used + tools.rust_analyzer + tools.sccache + tools.other
+    build_tools = tools.rust_analyzer + tools.sccache + tools.other
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
-    named = (builds + known_bytes(ci) + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
+    named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
              + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
-    readings = ((SWAP_NAMES["ci"], ci), (RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
+    readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
                 (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
     missing = [f"{name}: {value.reason}" for name, value in readings
                if isinstance(value, admission_records.ReadingUnavailable)]
@@ -1409,9 +1410,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, ci: RamR
         "safety_covered_bytes": safety_covered, "swap_covered_bytes": swap_covered, "build_covered_bytes": build_covered,
         "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
         "build_missing_bytes": build - build_covered,
-        "builds_bytes": builds, "queued_builds_bytes": room.used, "rust_analyzer_bytes": tools.rust_analyzer,
-        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": ci,
-        "ci_counted_bytes": room.ci_use,
+        "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
+        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
         "other_programs_bytes": other_programs_bytes,
@@ -1701,7 +1701,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(captured.cap_use) + reserved, "room": gib(captured.room), "room_source": "free", "limit": "room and head protection",
-        "ram": ram_blocks(captured, build_tool_ram(explanation.running, captured.used), ci_program_ram(explanation.running),
+        "ram": ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
                           explanation.now, configuration.other_rows),
         "memory_status": memory_status(explanation, captured, len(by_owner)),
         "ci_name": ci_name, "ci_ram": ci_ram,

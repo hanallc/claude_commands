@@ -49,7 +49,10 @@ class Reservation:
 
 @dataclass(frozen=True)
 class Board:
+    """The reservations; configured is False for a repository that berth does not configure."""
+
     entries: tuple[Reservation, ...]
+    configured: bool = True
 
     def reservations(self) -> tuple[Reservation, ...]:
         return self.entries
@@ -128,7 +131,7 @@ def _parse_board(value: object) -> Board:
     if envelope.get("status") == "ledger_unreadable":
         raise ValueError(envelope.get("message") or "cargo-berth ledger unreadable")
     if envelope.get("status") == "unconfigured" and payload.get("kind") == "no_facts":
-        return Board(())
+        return Board((), configured=False)
     if payload.get("kind") != "board":
         raise ValueError("envelope contains no board facts")
     fields = _object(payload["data"])

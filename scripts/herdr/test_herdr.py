@@ -272,6 +272,7 @@ class NativePaneSessionTests(StaffTestCase):
                 _ = client.codex_launch("w1:p1", arguments)
 
     def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "producer", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
@@ -444,6 +445,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
 
     def test_codex_native_process_uses_its_resume_argument_or_own_pane_report(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         launch = fixture_runtime_id("native-launch-thread")
         current = fixture_runtime_id("native-replaced-thread")
         environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
@@ -541,6 +543,7 @@ class NativePaneSessionTests(StaffTestCase):
 
 
     def test_cached_starting_pane_reports_once_in_each_run(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         with codex_launch_evidence(self.root, ["codex"]) as evidence:
             pane = herdr.json_object(evidence["pane"], "fixture pane")
             pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")

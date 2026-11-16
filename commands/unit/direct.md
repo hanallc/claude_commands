@@ -483,6 +483,20 @@ the row can only say `done`, which reports that the window closed rather than
 what it found. Activities sit beside passes and are invisible to `findings.py`,
 which is why <PassOwnership/> forbids faking a pass for the same purpose.
 
+<WaitRecord>
+Record each wait and hold, so the units board names the reason. User, 2026-11-15.
+
+- **Wait.** When work you could start waits for a person or for other work, record it:
+  `progress_history.py start-wait --session-dir "${SESSION_DIR}" --kind <kind> --target <work> --by <who> --reason "<what lets it continue>"`.
+  `<work>` is a plan phase id or a queue item's leading id. `<who>` is who keeps it waiting: `the user`, a showrunner, a unit.
+  `<kind>` is `WaitingForUser` for a person's answer and `WaitingForSupplier` for other work.
+- **Hold.** When done work is kept from the merge, record the same command with the done phase id as `--target`.
+  `--reason` says until what: `the user checks the review page`. Use the `--kind` of whoever keeps it.
+- Close the record with `progress_history.py finish-wait --session-dir "${SESSION_DIR}" --wait-id <id>` when the reason ends.
+  `start-phase` of the target and the end of the run close it.
+- A wait for a worker, a gate, a build slot or build memory needs no record here; its own tools record it.
+</WaitRecord>
+
 A requested status check — `/unit:report`, or a user or showrunner asking —
 emits <ProgressReport/> immediately, which `~/.claude/commands/unit/report.md`
 defines in full. Read that file and follow it; a report written from memory of an

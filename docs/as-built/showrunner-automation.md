@@ -184,9 +184,12 @@ The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/un
 a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
 else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
 Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
-`unit_phases.queued_text` shows the first item as `ready: <text> (<work> on main)`, or `<text> — after <work>: <state>`.
-A phase checkpoint's state is `done, <land text>`, with `, not on main yet` after a land; a commit's state is its land text, or `not on main` when it is not in the line.
-An open phase is `in work, ETA <time>` or `in work, no ETA`.
+`unit_phases.queued_text` preserves the item text and appends its dependency state.
+Satisfied work says `Ready: <work> is on the local copy of main.`
+Unmet work says `After <work>: <state>.`
+Submitted work without a merge record says `submitted; absent from the merge line; reason not recorded`.
+An open dependency says `started`; an unstarted dependency says `not started`.
+A missing dependency says `dependency not found locally`.
 `done` removes the first item.
 `clear` writes an empty list without reading a damaged old file.
 Writes use the list lock and atomic publication.
@@ -691,20 +694,14 @@ It joins the row's `current_session` to native pane or process evidence.
 An unstaffed session requires an explicit native id and an explicit unit name.
 
 - **Unit phases (`unit_phases.py [--production <showrunner name>]`, `/showrunner:units`, user 2026-10-28).**
-  Each phase table prints one row per open phase of each production staff unit's selected run.
-  A unit without open phases keeps one row; the style table keeps one row per unit.
-  Without `--production`, `showrunners.own_name()` selects the production name.
-  `read_production(name)` reads the document from that showrunner's staff row.
-  A missing owner or document exits 1.
-  Unit shows the unit's staff name (`row.name`), including stopped units and units without a session.
-  All cells escape pipes.
-  The phase tables use `display_cells.wrapped(headers, rows)` before escaping cells.
-  It preserves full cells and omits columns whose cells are all `—`.
-  A table without rows keeps its columns.
-  The command emits one Markdown row per phase, plus continuation rows for cells over the line cap.
-  The renderer sets column widths from the terminal width and wraps text inside each cell.
-  Print the output as Markdown without code fences or `<br>`.
-  Claude Code 2.1.319 displays `<br>` as text.
+  The phase board prints the count line, the status table, then one Markdown block per production staff unit.
+  It includes paused units, stopped units, and units without a session.
+  The style table keeps one row per unit.
+  Without `--production`, `showrunners.own_name()` selects the production.
+  `read_production(name)` reads its staff document; a missing owner or document exits 1.
+  Unit names come from staff.
+  Native Markdown wrapping preserves complete text within each unit block.
+  Print the output without code fences or HTML line breaks.
   The style table uses `display_cells.fitted(headers, rows, *, cuttable, columns, cut_order)` before escaping cells.
   `cuttable` contains original column indexes, so equal header text does not change the selected columns.
   `cut_order` uses `CutOrder.LISTED` by default and accepts `CutOrder.WIDEST_FIRST`.
@@ -717,14 +714,14 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   `WIDEST_FIRST` cuts the widest cuttable column by one character per step and uses the listed order for equal widths.
   A cut adds `…` and never splits a wide character.
   Fixed columns and minimum text widths can exceed a smaller configured width.
-  The command reads terminal metadata, never pane contents.
+  The command never reads pane contents.
   - **One read per command:** `unit_phases.main` takes one `staff.snapshot()` and opens `plan_history.history_snapshot(snapshot)` inside `herdr.observation_snapshot()`.
     Inside that scope, `plan_history.staff_record()`, `run_starts()` and `read_run_events(path)` return the shared staff record, run headers and run events.
     Each run file is read once per command.
     The live-unit reader thread runs `live_units.read_units(name, record=snapshot, ...)` through `copy_context().run`, so it uses the same snapshot.
     A thread started without `copy_context()` does not see the snapshot and reads everything again.
-    On natedev, `--production sdlc` prints in about 2 seconds.
-  - **Status and anomalies:** The phase status table and the style table derive Status through the shared classifier and staff hold fields.
+    Render time depends on the live source reads and machine load.
+  - **Status and anomalies:** The phase board uses census evidence and staff hold fields; the style table keeps the shared status classifier.
     `live_units.read_units(name)` returns `UnitListing(units, anomalies)`.
     `units_of(name)` uses that reader and prints its anomalies on stderr.
     `units_in(name, every)` joins supplied observations and adds each unit's staff status.
@@ -757,174 +754,129 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     `agents resume --production <showrunner name>` resumes the production's units.
     `since` uses the user zone. `by` uses the caller's staff name.
     Staff row copies retain the hold fields.
-  - **Phase productions:** The command prints two tables in the same unit order.
-    The first line shows `in work N · waiting to merge N · waiting on other work N · merged today N`.
-    One empty line separates this summary from the first table.
-    Counts include only units in these phase tables and always show zeros.
-    `in work` counts open phases without a `checkpoint_wait` result.
-    `waiting to merge` counts distinct unit and phase owners from active merges and the merge line.
-    Open rows with a `checkpoint_wait` result add their owner unless the count already includes it.
-    `waiting on other work` counts every queue item with an `after` state other than `waits_on.OnMain`.
-    `merged today` counts distinct unit and phase pairs with successful merge results dated today in the production zone.
-    Queue reads and wait states are reused for the summary, Notes, and Queued.
-    Each open phase of the selected run gets one row in both tables.
-    The staff current run selects the run when present; otherwise, the newest run supplies the rows.
-    Notes, ETA cells, and Workers use that same selected run.
-    Other open runs of the unit supply no rows, Notes, or workers.
-    The latest `run_finished` or `reopened` event determines whether that run is finished.
-    `unit_phases.run_is_finished` supplies the same rule for phase rows and pending promises.
-    Rows follow the configured plan order, then the start order for phases outside that plan.
-    Every row repeats Unit.
-    Only the first row carries Status, Machine, Progress, ETA Plan, and Queued.
-    Later rows use `—` for those unit-wide cells.
-    The status table prints `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] |`.
-    The work table prints `| Unit | Workers | Notes | Non-Phase Work | Queued |`.
-    Workers uses the configured display name.
-    ETA Plan appears for unfinished plan phases or promises for unfinished targets without open rows.
-    Status and Workers come from one `census.read()`, which runs `cargo-handler census --json` within `units_census_seconds`.
-    `unit_phases.main` submits the census to its read pool with the unit and plan reads, so the reads overlap.
-    `census.parse` accepts schema 2 only and returns `Census` with `CensusMachine`, `CensusSession` and `CensusWorker` records, or `CensusFailed(reason)`.
-    It reads the top-level `sessions` list and not the `directors` list.
-    A session carries its `CensusShell(name, started_at)` records from the optional `shells` list; a census without the list gives none.
-    A worker carries `CensusPass(role, phase)` or `NoPass`, and its `CensusRun` records.
-    `census_status` gives the status word of the census session for the unit, or `—` when the word is null.
-    The unit's session is the staff row's `current_session`, or the pane Claude's session when the unit has no staff row.
-    The words are `busy`, `idle`, `paused` and `exited`; the census gives starting and waiting as activities.
-    `session_state.classify` counts the Claude record state `shell` as busy (user, 2026-11-15: units showed idle while a gate ran).
-    Claude Code writes `shell` when the turn has ended and a background command still runs.
-    The handler tiles read the same word through the accounts command, so the tiles and this table agree.
-    A unit whose session is not listed shows `exited` when its machine is a reachable census machine, and `—` otherwise.
-    A failed census gives `—` in Status and Workers and one anomaly line; the table has no other source for these cells.
-    One census takes 2 s to 4 s on natedev and is the longest read of the table.
-    Tests inject a `Census` and never run `cargo-handler`; an installed handler that prints schema 1 fails every census.
-    The style table keeps the [shared session classifier](accounts.md#status-counts-and-notes).
-    The status table and the style table add **Machine** after **Status** only when a row runs on another machine.
-    The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
-    `worker.py list` places the optional machine field after the account field, and takes the machine from the parent's worktree.
-    `worker.py list --json` keeps its existing fields.
-    The phase tables and the style table sort unit names without case distinctions before they select their rows.
-    Progress shows only `🟩` done, `🟨` open, and `⬜` not started.
-    Plans above 20 phases use 20 equal groups, with open before not started before done.
-    The bar has no text cut, and all three characters use the same display width.
-    When the status table keeps Progress, it adds a blank line and `Progress: 🟩 done · 🟨 open · ⬜ not started`.
-    A blank line separates the work table from the legend or the status table.
-    `progress_cell` and `progress_legend` use the same `ProgressState` constants for the squares and labels.
-    A table with no Progress bar in any row has no legend; the style table also has no legend.
-    Phase shows the phase id for an open phase row.
-    Without an open phase, it shows `<done>/<total>` from the plan, or `—` with no phases.
-    Notes starts with `phase <id> — <phase title>`.
-    A matching phase label at the start of the title appears once, regardless of case or dash.
-    The open step belongs to that phase instance in the selected run.
-    A useful step appends ` · <label>: <text>`, or ` · <text>` without a label.
-    `unit_phases.checkpoint_wait` finds a checkpoint after the instance's last phase, pass or activity start; Notes then shows a wait in place of the step (user, 2026-11-15).
-    `table` reads one `land_queue.LandView` (`land_queue.land_view()`): the running land commits, the land line places, and the newest land results.
-    `land_queue.land_state` gives `LandRunning`, `InLine`, `LandEnded`, `NotInLine` or `LineUnused` for a commit; a `Place` names its owner, the batch line's unit and phase, else the item label.
-    A land also takes each ancestor of its commit that is not on `origin/main`; `land_view(repo)` reads them with one `git rev-list` for each listed commit.
-    So a checkpoint that a later checkpoint carries shows that later item's place. The order is: running, its own place, a landed result, carried running, carried place, a failed result.
-    `unit_phases.land_text` says the land state in plain words, and the wait is `done, <land text>` (user, 2026-11-15: a human must understand it).
-    The land text is `merging now` when `land_runs.running_lands()` holds the event's `checkpoint_commit`.
-    Else, at a place in the line, it is `waits to merge, <Nth> in line`, or `waits to merge with <unit> <phase>, <Nth> in line` for a carried commit; a failed newest result adds `; last try <state> at <step> <time>: <first detail line>`.
-    Else the newest result shows: `merged <time>`, or `did not merge: <state> at <step> <time>: <first detail line>`.
-    Else it is `not sent to merge yet`. With no line file, it stays `waits to merge`.
-    `merge_checkpoint.py` writes `$MERGE_GATE_STATE_DIR/lands/<pid>.json` (pid, process start, commits, and the `unit phase` owner of each) while it holds the merge lock, and removes it at exit.
-    `unit_phases.unit_lands` adds to the unit's first Notes row each sent checkpoint that has no open phase row: `merging now: <phases>`,
-    `done, waits to merge: <phase> (1st in line), <phase> + <phase> (2nd in line)` with one entry for each line item,
-    and `<phase> did not merge: <result>` for a newest failed result whose commit is not on `origin/main` (sdlc C1701).
-    A merge conflict result says `merge conflict in <files> <time>`.
-    A record whose process ended is not running; the next read removes it. A short hash in a record, a line item or a result matches its full commit.
-    `merge_checkpoint.record_land` adds one row to `$MERGE_GATE_STATE_DIR/land_results.jsonl` for each item that lands (`finish_checkpoint`) or stops (`report_checkpoint_stop`, and a failed single run).
-    The row has the commit, production, unit, phase, landed, step, state, detail and UTC time. The file keeps the newest 300 rows.
-    `scripts/production/land_queue.py` keeps the land line in `$MERGE_GATE_STATE_DIR/land_queue.json` under a file lock.
-    `add LABEL --batch FILE | --commit HASH [--first | --before LABEL]`, `move`, `remove`, `list`, and `next`; `next` removes the first item and prints its label, or prints nothing when the line is empty.
-    An item's commits are its `--commit` values and the third field of each batch file line, read when the board reads the line.
-    `unit_phases.shell_waits` turns each census shell of the unit's session into `waiting on <name> <elapsed>`, and `with_waits` appends them to the unit's first Notes cell.
-    Queued compares its items with Notes before the waits are added.
-    Empty text, role-only text, and `<label> dispatch` add nothing.
-    Text equal to the title adds nothing; this comparison ignores case and whitespace.
-    Units without open work show `nothing open: <plan reason>, <queue reason>`.
-    The plan reason is `plan done`, `no plan`, or `next plan phase <id> not started`, in plan order.
-    A missing record, an unavailable record, or an empty phase list uses `no plan`.
-    The queue reason is `queue empty`, `queued work waits on <after>`, or `queued work not started`.
-    The first queue item's wait selects the queue reason; a ready item uses `queued work not started`.
-    Sent work and shell waits still append through `with_waits`.
-    Repair rounds append `fix rounds <n>` and `+ 1 running` in Notes when applicable.
-    Each open worker or director wait appends `waiting on <reason> <elapsed>` to Notes.
-    A named holder adds `(held by <holder>)` before the elapsed time.
-    The existing staff snapshot resolves a holder's staff ID or current session ID to its staff name.
-    An unknown holder keeps its recorded name or ID.
-    Reasons that start with `waiting on`, `waiting for`, or either phrase after `blocked:` need no extra wait prefix.
-    `phase_waits.phase_waits(events, instance_id)` reads starts, holder updates, and wait or pass finishes.
-    `PhaseWait` carries the reason, start time, and `NamedWaitHolder` or `UnnamedWaitHolder`.
-    Wait text does not change the census word in Status.
-    Notes, Non-Phase Work, and Queued preserve every word of each displayed item or title.
-    Each phase table calls `display_cells.wrapped` separately.
-    Each table removes columns whose cells are all `—`.
-    `claude_table_layout.py` models the width rule in Claude Code 2.1.319.
-    `unit_phases.py` run as a script reads its pane width once through `herdr.own_pane_columns`.
-    The read sends `pane.layout` for `HERDR_PANE_ID` to `HERDR_SOCKET_PATH`.
-    `units_table_width_read_milliseconds` limits the read; the median is under 1 ms.
-    Without a width, the tables use `units_table_floor_columns` in `config/production.conf` and print no anomaly.
-    Calls to `main` or `table` from tests pass the width or use the floor; they never read a live pane.
-    `units_table_cell_lines` sets the cell line cap, which defaults to four.
-    Cells that exceed the cap continue on rows that repeat Unit and fill one work cell.
-    Item marks take priority over word boundaries when the script splits cells.
-    When the column minimums exceed that width, a space follows a `-`, `/` or `_` inside the longest ID.
-    The mark must join two letters or digits.
-    A word without a mark breaks at the column share only from `units_table_break_columns` columns; shorter words stay whole.
-    When no such word is left and the minimums still exceed the width, the longest word over 3 columns breaks at the share.
-    Unit, Status, Machine, and Progress keep their text.
-    The script fits both tables at that width without changing the style table.
-    Each column can only grow in a wider terminal.
-    The minimums depend on live data: a long unit name or id can put them over the floor.
-    About 6% of width reads meet a herdr wait of about 100 ms; those runs shape for the floor, so a wide window can show break spaces.
-    `:` is no break mark, because it splits times such as `17:24`.
-    A zero-width space cannot replace the break space: Claude Code 2.1.319 wraps only at plain spaces.
-    A renderer change needs a new measure of the width rule.
-    When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its full event history.
-    Notes uses this fallback when it has phase rows; otherwise, it keeps the plan state.
-    The fallback does not change Queued.
-    A finished selected run supplies no fallback.
-    ETA Next uses that phase instance's latest promise from `eta_trail`, never `schedule_end`.
-    Without open work, it uses the next not-started plan phase with a promise.
-    `eta_phase_id` selects the target even when the event carries another active phase instance.
-    Passed promises add `late <elapsed>`; open work without a promise shows `no ETA stated`.
-    With no open work or promised phase, ETA Next shows `—`.
-    ETA Plan shows the predicted plan finish without `ends`.
-    Duration predictions still use the plan's recorded history.
-    The first row also names the latest promises for unfinished targets without open rows.
-    Those promises use `phase <id>: <time>[ · late <elapsed>]`.
-    A later promise for the same target replaces the earlier promise.
-    Any later `phase_finished` event removes that promise, regardless of status.
-    A later `checkpoint` event for the target also removes the promise.
-    A merge result for the same unit and phase removes the promise when its time follows the promise event.
-    A later `phase_started` event opens the phase again; its promise belongs in ETA Next.
-    Without an unfinished plan or such a promise, the cell shows `—`.
-    The finish never precedes any open or not-started plan phase's latest promise, including checkpoint promises.
-    Times use the production zone and a short date outside the current day.
-    `census_workers` selects the census workers whose `parent_staff_id` is the unit.
-    An open phase row keeps only the workers whose open pass names that phase instance.
-    `workers_cell` shows each detached run first: `waiting on run: <label> <elapsed>`, `result queued: <label>`, or `run gone: <label>`.
-    A busy worker without a run shows its live word when `CensusWorker.live_word` is in `SHOWN_ACTIVITIES` (`starting`, `waiting`), else `working`.
-    `live_word` is the text after the last ` · ` of the tile activity, as `waiting` in `impl · waiting`. Idle workers add `+<n> idle`.
-    Its cell keeps every word and wraps in the work table like Notes (user, 2026-11-15).
-    With no running worker, `workers_cell` shows the reason from `NO_WORKER_REASONS`, plus `+<n> idle`.
-    `no_worker_reason` reads `quota_state.no_worker_mode()` once for each table: `no-worker mode`, else `none running`.
-    Only a unit's first row carries the reason. A failed census or an unscanned machine gives `—` (user, 2026-11-15).
-    `display_cells.wrapped(keep=...)` keeps the Workers column when every cell is `—`.
-    The table reads no panes, run records or process table for Workers.
-    Non-Phase Work shows `—` for open phase rows because Notes already describes each phase.
-    Rows without a recorded phase instance name every open phase outside the plan, with its step text, in run order.
-    Non-Phase Work joins entries with ` · `.
-    Queued names every queue item with its wait text, joined with ` · `.
-    The plan part names every phase that is neither done nor open.
-    It shows `plan: phase 30: <title>, then 31, 32`, with the title only for the first phase.
-    It excludes every open phase of the selected run, including phases absent from the configured plan.
-    It excludes each queue item whose text equals Notes in the same row.
-    With no remaining queue item, it shows the plan part or `—`.
-    Each displayed item or title keeps its full text.
+  - **Phase productions:** `table()` builds one `UnitBoardState` per unit and derives its block and summary bucket from that state.
+    Unit blocks sort names without case distinctions.
+    The summary is `working N · waiting to merge N · waiting on other work N · idle N · <total> units`.
+    It adds `unknown N` before the total only when nonzero.
+    Each unit counts once; counts sum to the number of blocks.
+    `status_rows` builds each unit's rows for the status table; `status_table` renders them below the summary.
+    The columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`, with one row per open phase.
+    `display_cells.wrapped` omits all-`—` columns and wraps cells to `display_cells.pane_columns()`.
+    The `Progress:` legend follows the table when any row shows progress. `ETA Plan` shows only while a plan runs.
+    A title is `**<unit>** — <bucket>`.
+    Titles include machines when `display_cells.machine_column` would show them.
+    One blank line separates each title from its `Item | Work | State` table.
+    `Now`, `Also`, and `Merge` use numbered labels only when the field has multiple items.
+    Queue rows always use `Next 1`, `Next 2`, and later numbers.
+    `Plan next` follows queue rows; empty Next and fallback Now rows use Work `—`.
+    Work and State come from separate entry fields; the renderer never splits sentences.
+    `TaskLine(work, state_text, kind)` keeps the task facts and bucket evidence together.
+    `WorkItem(work, state_text)` holds queue, plan, and merge facts.
+    States use short phrases separated by semicolons, an initial capital, and no final period.
+    `display_cells.escaped` escapes each cell.
+    `display_cells.wrapped(..., keep=(0, 1, 2))` uses the status table's width and keeps all columns.
+    Continuation rows preserve complete text without an ellipsis.
+  - **Bucket order:** Executing workers, commands, or director activities select `working` first.
+    A busy director with an unsent open phase also selects `working` unless a recorded task wait explains its activity.
+    A pause or stop then selects `idle`.
+    Readable empty records select `idle` when the director is not busy.
+    An open task wait selects `waiting on other work` before unresolved sent work selects `waiting to merge`.
+    The first next item's recorded dependency then selects `waiting on other work`.
+    A unit wait on done work selects `waiting to merge` at the merge rule.
+    A unit wait on the first next item, or an unmatched target, selects `waiting on other work` at the next-work rule.
+    An open unit wait prevents an otherwise empty unit from counting as idle.
+    Other units select `unknown`.
+    A later queue wait never adds another count.
+  - **Current tasks:** The staff current run takes priority; otherwise, the newest owned run supplies open phases.
+    Configured plan order precedes start order for work outside the plan.
+    A reopened run stays open until a later finish.
+    Work names use the full title and phase id, with a repeated leading id removed.
+    Titles keep their capital letters in Work.
+    Open pass events join `worker_id` to `CensusWorker.staff_id` before the phase assignment fallback.
+    Workers must belong to the displayed unit; finished passes supply no current work.
+    Pass roles supply State, such as `Implementation worker runs it` or `Review worker runs it`.
+    Other roles use the worker's name and `runs it`.
+    Running detached commands say `<Role> runs <label>; waits for the result`.
+    An unread result says `Worker finished; director has not read the result`.
+    An open director activity says `Director <activity>; no worker needed`.
+    A busy director says `Director works on it; no worker runs; step not recorded`.
+    An unexplained task says `Open; nothing runs; reason not recorded`.
+    Executing tasks appear under `Now`; other current tasks appear under `Also` when execution exists.
+  - **Resource waits:** `phase_waits.PhaseWait` retains wait ownership, attribution, kind, resource, holder, and original start.
+    Memory waits say `needs build memory in use by <holder>; since <time>`.
+    Slot waits say `waits for a build slot used by <holder>; since <time>`.
+    Other named resource waits say `waits for <reason>, in use by <holder>`.
+    Unnamed holders retain the reason and say `holder not recorded`.
+    Holder changes preserve the start; finished waits and passes close their waits.
+    A wait for one worker does not hide another worker's execution.
+    `shell_waits` preserves the director's commands and their recorded resource waits.
+    Each promise appears once, on the phase's first displayed task.
+    An overdue promise appends `ETA <time>, late <duration>` to State.
+    Times use the production zone and include a date outside today.
+  - **No current task:** Staff pauses and stops name their actor, reason, and time.
+    Busy directors without tasks say `Director is busy; task not recorded; no worker runs`.
+    Next work names its first wait or says it has not started, with `reason not recorded`.
+    Empty records distinguish a complete plan from no plan or assigned work.
+    Census failure adds a Now row: `Workers unavailable; who runs cannot be determined`.
+    No-worker mode adds a Now row: `Workers cannot start because no-worker mode is on`.
+    Both rows use Work `—`.
+  - **Unit waits and holds:** `start-wait --target WORK --by WHO --reason CONDITION --kind KIND` records one unit wait.
+    `--target` requires both `--by` and `--reason`.
+    The event has `wait_scope: unit`, `target_work`, `wait_by`, and `wait_attribution: {state: UnitTarget}`.
+    It has no phase or pass attribution.
+    `phase_waits.unit_waits` returns `UnitWait(target, by, reason, kind, started, wait_id)` in start order.
+    A newer wait on the same target replaces the earlier reason.
+    `wait_finished`, `wait_unclosed`, target phase start, and run finish close the reader's wait.
+    `start-phase` writes `wait_finished` for every open unit wait on its phase ID.
+    Phase waits and launcher waits keep their existing behavior.
+    Done work uses a Merge row with its ID in Work.
+    State says `Done; <by> keeps it from the merge until <reason>; since <time>`.
+    This row also covers a completed phase with no sent commit.
+    Merge line entries, running merges, results, and local main take priority over hold text.
+    Queue and pending plan rows append `<By> keeps it waiting until <reason>; since <time>` to State.
+    Queue placement takes priority when the same target also names pending plan work.
+    Unmatched targets use Now or Also rows, with the target in Work.
+    Their State says `<By> keeps it waiting until <reason>; since <time>`.
+    With no open phase, the first next wait supplies this text:
+    `Nothing runs; <By> keeps <target> waiting until <reason>`.
+    Actor text stays unchanged in the event; a sentence start uses a capital letter.
+    The board reads unit waits from its cached run events.
+  - **Merge groups:** `phase_sent_work` finds submission after the phase's last work start.
+    Sent phases appear only under `Merge`.
+    `unit_lands` keeps the direct and carried merge groups from the merge-once phase.
+    Active groups precede merge line order; every group appears once, including single open phases.
+    Work contains comma-separated phase IDs.
+    Single phases say `Done; <ordinal> in the merge line` in State.
+    Shared groups say `Done; merge together; <ordinal> in the merge line`.
+    Active merges say `Done; merging now`; carried single commits name their carrier unit and phase.
+    Failures retain their cause and time until local main contains the commit.
+    Submitted work without a line says `Submitted; not in the merge line; reason not recorded`.
+    `LineUnused` says `merge position not recorded`.
+    The command has no daily merge count or daily-result scan.
+  - **Next work:** Unstarted queue items keep their stored order.
+    An exact leading open or sent phase ID followed by `:` identifies started work.
+    `Next` leaves out that item, because `Now` or `Merge` already shows the work.
+    Work contains the text before the first colon, or the full text without a colon.
+    Step text after the colon does not appear.
+    The first unstarted queue item determines the queue wait.
+    Dependencies use the local `origin/main`; the command never fetches.
+    Satisfied or absent dependencies use State `Ready`.
+    Unmet dependencies say `After <dependency>; <short state>`.
+    Another unit's phase uses `handler phase 23`; this unit's own `devtools/acctcolor` uses `acctcolor`.
+    A merge rank uses `25th in the merge line`.
+    A sent dependency without a merge position uses `not in the merge line; reason not recorded`.
+    `waits_on.PhaseSent` includes the dependency phase's open unit wait from the same run read.
+    Without merge evidence, its State says `After <dependency>; done; <by> keeps it from the merge until <reason>`.
+    Pending phases follow in a Plan next row with `<title> (<id>)` in Work.
+    State contains remaining phase IDs, plan waits, and unit waits.
+    The first pending phase preserves its `Waits for:` text and names unmet `Depends on:` phases.
+    `plan_history.plan_phase_details` reads headings and these lines in one cached read per plan path.
     A configured plan with phases takes priority over the selected run's plan.
-    The fallback plan path resolves against the staff worktree.
-    An unreadable queue retains `queue unreadable` and reports its path and cause.
+    Current work with nothing next says `Nothing queued`.
+    Other empty states say `Nothing queued; the plan is complete` or `Nothing queued; no plan is assigned`.
+    Queue failure says `Queue unavailable; next work cannot be determined`.
+    `table()` caches run, plan, queue, dependency, and ancestry reads and uses one merge view.
+    `main()` reads one census beside the other reads within `units_census_seconds`.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
     Other productions use it for units named in their `Style units` table.
     `style_config.has_style_units` detects that table; `style_config.read_config` reads its assignments.

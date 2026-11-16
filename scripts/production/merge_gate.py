@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, main_push_lock, session_folder, waiting_rows
+from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
@@ -1998,7 +1998,11 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             waiting_rows.move_to(main_repo, target)
         except (OSError, UnicodeError) as error:
             raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-        _ = checked_git(main_repo, "push", "origin", "main")
+        try:
+            landed = land_main.land(main_repo, target)
+        except land_main.LandError as error:
+            raise GateRefused(str(error)) from error
+        print(land_main.hook_report(landed.hook), flush=True)
         promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
