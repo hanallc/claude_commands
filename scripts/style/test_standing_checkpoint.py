@@ -37,6 +37,12 @@ from scripts.production import unit_config
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_unit_location, isolated_staff_file, recorded_showrunner
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 SCRIPTS = Path(__file__).resolve().parent
 

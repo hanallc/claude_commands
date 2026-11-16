@@ -654,6 +654,7 @@ The user asked for this layout on 2026-11-14 through builds. Each line shows:
    Times come from `cloud-gate-launches.jsonl` over the last `run_cost_days` days.
 3. Runs: the run count of that time.
    A region without its own runs uses the type's runs in other regions, and the cell says `elsewhere`.
+   A type without runs uses the runs of the types with its vCPU count, and the cell says `same vCPUs`.
 4. The estimate: Spot price times that box time, plus the refusal wait cost.
 5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
 6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
@@ -676,7 +677,7 @@ The AWS page shows the same tables, published by `aws_page.publish`.
 The user renamed it from AWS prices to AWS on 2026-11-15, because it holds spend, prices and quotas.
 The published file stays `aws_prices.html`, so older links still open it.
 A Spend card at the top shows today, yesterday and the month to date, with the month forecast below them.
-`spend.read_spend` and `spend.month_spend` give these numbers; `/aws_spend` reads the same functions, so both show the same values.
+`spend.read_spend` and `spend.month_spend` give these numbers; the buildlog report reads the same functions, so both show the same values. Read the spend on the console AWS page; the `/aws_spend` command was removed on 2026-11-16.
 The day is the UTC day. The hourly buildlog run publishes the page, so the spend is current to the last hour.
 After each push to main, `.claude/config/post_push.sh` publishes it again
 when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
@@ -808,7 +809,10 @@ After the first run in a region, its own median box time replaces the borrowed t
 It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
 Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
-A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
+A region without its own runs uses the type's runs in all regions.
+A type without runs uses the runs of the types with its vCPU count, so m7a.8xlarge uses the c7a.8xlarge runs.
+The user, 2026-11-16: "it should be entirley based on who has the lowest price per run".
+Without runs of that vCPU count, it uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
 The AWS page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
 Its expected cost includes the unmeasured seconds.

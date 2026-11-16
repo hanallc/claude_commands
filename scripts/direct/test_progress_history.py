@@ -15,6 +15,7 @@ from scripts.lib import unit_runs
 from scripts.usage.agents_log import Assignment
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -8236,6 +8237,94 @@ with patch.object(fcntl, "flock", admission):
             self.finish_numbered_phase(session_dir, started_at + 20, "--phase-id", "7")
         self.assertIn("Phase 7 is not open; open phases: 6", cast(str, raised.exception.stderr))
         self.assertEqual(self.open_phase_ids(session_dir), ("6", []))
+
+        before = self.read_events(session_dir.name)
+        for phase, reason, message in (
+                ("7", "No work remains", "no open or finished instance"),
+                ("6", "   ", "--reason is empty")):
+            with self.subTest(phase=phase, reason=reason):
+                result = self.run_failing_command("drop-phase", "--session-dir", str(session_dir),
+                                                  "--phase-id", phase, "--reason", reason, at=started_at + 25)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.read_events(session_dir.name), before)
+
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 30)
+        self.team_slot = ""
+        _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "6",
+                             "--reason", "The user removed this task", at=started_at + 40)
+        finished = self.phase_events(session_dir.name, "phase_finished")[-1]
+        dropped = self.phase_events(session_dir.name, "phase_dropped")[-1]
+        self.assertEqual(finished["status"], "stopped")
+        self.assertEqual((dropped["phase_id"], dropped["phase_instance_id"], dropped["reason"]),
+                         ("6", finished["phase_instance_id"], "The user removed this task"))
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "interrupted")
+        before = self.read_events(session_dir.name)
+        _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "6",
+                             "--reason", "The user removed this task", at=started_at + 50)
+        self.assertEqual(self.read_events(session_dir.name), before)
+        _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "6",
+                             "--reason", "The plan no longer needs this task", at=started_at + 60)
+        self.assertEqual(self.read_events(session_dir.name)[:-1], before)
+        self.assertEqual(self.read_events(session_dir.name)[-1]["reason"], "The plan no longer needs this task")
+        self.assertEqual(len(self.phase_events(session_dir.name, "phase_finished")), 1)
+
+        self.start_numbered_phase(session_dir, "7", started_at + 70)
+        self.finish_numbered_phase(session_dir, started_at + 80, "--phase-id", "7")
+        before = self.read_events(session_dir.name)
+        result = self.run_failing_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "7",
+                                          "--reason", "No work remains", at=started_at + 90)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("the newest instance completed", result.stderr)
+        self.assertEqual(self.read_events(session_dir.name), before)
+
+        self.start_numbered_phase(session_dir, "8", started_at + 100)
+        _ = self.run_command("finish-phase", "--session-dir", str(session_dir), "--phase-id", "8",
+                             "--status", "stopped", at=started_at + 110)
+        before = self.read_events(session_dir.name)
+        _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "8",
+                             "--reason", "The user removed the stopped task", at=started_at + 120)
+        self.assertEqual(self.read_events(session_dir.name)[:-1], before)
+        self.assertEqual(self.read_events(session_dir.name)[-1]["phase_instance_id"], before[-1]["phase_instance_id"])
+
+        session_dir = self.start_run("drop-cleanup", started_at, staff_owned=True)
+        owner = staff.by_current_session(fixture_runtime_id("main-drop-cleanup"))
+        assert owner is not None
+        worker = fixture_worker("drop-impl", owner.id, runtime_id=fixture_runtime_id("drop-impl"))
+        self.start_numbered_phase(session_dir, "9", started_at + 130)
+        self.start_slot_pass(session_dir, "impl", "impl", started_at + 140, "gpt-called", 0,
+                             "--worker-id", worker.id, worker_name=worker.name)
+        self.team_slot = ""
+        append = pass_recorder.append_event
+
+        def fail_drop(state: dict[str, object], event: dict[str, object]) -> None:
+            if event.get("event_type") == "phase_dropped":
+                raise OSError("The drop append failed")
+            append(state, event)
+
+        def close_workers(passes: progress_history.InterruptedWorkerPasses) -> None:
+            with (session_dir / ".progress_history.lock").open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            self.assertEqual(passes.worker_ids, (worker.id,))
+
+        with (patch.object(pass_recorder, "append_event", side_effect=fail_drop),
+              patch.object(progress_history, "_close_interrupted_workers", side_effect=close_workers) as cleanup):
+            with self.assertRaisesRegex(OSError, "The drop append failed"):
+                _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "9",
+                                     "--reason", "The user removed this task", at=started_at + 150)
+        cleanup.assert_called_once()
+        self.assertEqual(self.pass_slots(session_dir)["impl"]["status"], "interrupted")
+        self.assertEqual(self.phase_events(session_dir.name, "phase_finished")[-1]["phase_id"], "9")
+        self.assertNotIn("9", [event["phase_id"] for event in self.phase_events(session_dir.name, "phase_dropped")])
+        before = self.read_events(session_dir.name)
+        _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "9",
+                             "--reason", "The user removed this task", at=started_at + 160)
+        self.assertEqual(self.read_events(session_dir.name)[:-1], before)
+        self.assertEqual(self.read_events(session_dir.name)[-1]["phase_id"], "9")
+        self.assertEqual(self.read_events(session_dir.name)[-1]["phase_instance_id"], before[-1]["phase_instance_id"])
 
     def launch_probe(
         self, session_dir: Path, *extra: str, kind: str = "impl", at: int = 42_530,

@@ -49,3 +49,12 @@ Send design choices and proposed additions to the showrunner.
 ## Question form
 
 @~/.claude/docs/question_template.md
+
+## Investigations
+
+File an investigation when the user wants you to find an answer.
+Use a question when you need the user's answer.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/investigation.py file --title "<one line>" --question "<full question>"
+```

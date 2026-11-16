@@ -53,7 +53,7 @@ RunEventsReader = Callable[[Path], list[dict[str, object]]]
 
 
 WORK_EVENT = re.compile(r'"event_type"\s*:\s*"([^"\\]+)"')
-WORK_EVENTS = frozenset(("run_started", "reopened", "phase_started", "phase_finished", "run_finished", "pass_started", "pass_finished",
+WORK_EVENTS = frozenset(("run_started", "reopened", "phase_started", "phase_finished", "phase_dropped", "run_finished", "pass_started", "pass_finished",
                          "activity_started", "activity_finished", "eta_stated", "wait_started", "wait_finished",
                          "wait_unclosed", "wait_holder_seen", "checkpoint"))
 
@@ -375,10 +375,10 @@ def land_text(state: land_queue.LandState, *, now: float, zone: ZoneInfo) -> str
     match state:
         case land_queue.LandRunning():
             return "merging now"
-        case land_queue.InLine(place, failed, carried):
+        case land_queue.InLine(place, _, carried):
             text = (f"merges with {place.carrier_name}; " if carried else "")
             text += f"{ordinal(place.number)} in the merge line"
-            return f"{text}; last attempt {try_text(failed, now=now, zone=zone)}" if failed else text
+            return text
         case land_queue.LandEnded(result) if result["landed"]:
             return try_text(result, now=now, zone=zone)
         case land_queue.LandEnded(result):
@@ -448,9 +448,7 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
         return f"{actor} merges it now"
     if isinstance(state, land_queue.InLine):
         return f"{ordinal(state.place.number)} in {actor}'s merge line"
-    if isinstance(state, land_queue.LandEnded):
-        if state.result["landed"]:
-            return f"{actor} merged it"
+    if isinstance(state, land_queue.LandEnded) and not state.result["landed"]:
         detail = state.result["detail"].strip()
         conflicts = re.findall(r"Merge conflict in (\S+)", detail)
         cause = ("merge conflict in " + ", ".join(dict.fromkeys(conflicts)) if conflicts else
@@ -462,9 +460,10 @@ def merge_state_text(state: land_queue.LandState, production: str) -> str:
 def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, PhaseSentWork], now: float, zone: ZoneInfo,
                on_main: Callable[[str], bool], unit_waits: Sequence[phase_waits.UnitWait] = (),
                done_ids: tuple[str, ...] = (), phase_titles: tuple[tuple[str, str], ...] = (),
-               production: str = "", merged_ids: Collection[str] = ()) -> UnitMergeNotes:
+               production: str = "", merged_ids: Collection[str] = (), dropped_ids: Collection[str] = ()) -> UnitMergeNotes:
     """Describe each merge group once and retain failed results without open rows."""
     prefix = f"{unit} "
+    hidden = set(merged_ids) | set(dropped_ids)
     titles = dict(phase_titles)
     phase_ids = set(titles) | set(open_sent)
     phase_ids.update(result["phase"] for result in land.results.values() if result["unit"] == unit)
@@ -481,9 +480,9 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
 
     def own(owner: str) -> str:
         phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
-        return "" if helper(phase) or phase in merged_ids else phase
+        return "" if helper(phase) or phase in hidden else phase
 
-    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in merged_ids}
+    open_sent = {phase: sent for phase, sent in open_sent.items() if not helper(phase) and phase not in hidden}
     merging: list[str] = []
     items: dict[int, list[str]] = {}
     for phase, sent in open_sent.items():
@@ -506,7 +505,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     newest_results: dict[str, land_runs.LandResult] = {}
     for result in land.results.values():
         phase = result["phase"]
-        if result["unit"] != unit or helper(phase) or phase in merged_ids:
+        if result["unit"] != unit or helper(phase) or phase in hidden:
             continue
         previous_result = newest_results.get(phase)
         if previous_result is None or result["time"] > previous_result["time"]:
@@ -514,7 +513,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
     wait_targets: set[str] = set()
     holds: dict[str, phase_waits.UnitWait] = {}
     for wait in unit_waits:
-        if helper(wait.target) or wait.target in merged_ids:
+        if helper(wait.target) or wait.target in hidden:
             continue
         sent = open_sent.get(wait.target, NoSentWork())
         result = newest_results.get(wait.target)
@@ -554,6 +553,8 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         if isinstance(sent, NoSentWork) or phase in shown:
             continue
         state = land_queue.land_state(land, sent.commit) if isinstance(sent, SentCommit) else land_queue.LineUnused()
+        if isinstance(state, land_queue.LandEnded) and state.result["landed"]:
+            continue
         if phase in holds:
             text = unit_wait_state(holds[phase], now=now, zone=zone)
         elif isinstance(sent, SentCommit) and isinstance(state, land_queue.NotInLine | land_queue.LineUnused):
@@ -563,7 +564,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         else:
             text = merge_state_text(state, production)
         parts.append(WorkItem(named(phase), text))
-        pending = pending or not (isinstance(state, land_queue.LandEnded) and state.result["landed"])
+        pending = True
     for phase, wait in holds.items():
         if isinstance(open_sent.get(phase, NoSentWork()), NoSentWork):
             parts.append(WorkItem(named(phase), unit_wait_state(wait, now=now, zone=zone)))
@@ -830,8 +831,7 @@ class TaskAttempt(NamedTuple):
     scope: str
     title: str
     instance: str
-    outcome: Literal["current", "stopped", "completed"]
-    finished: datetime | phase_table.PhaseNotFinished
+    outcome: Literal["current", "stopped", "completed", "dropped"]
     reason: str
 
 
@@ -854,7 +854,7 @@ def task_facts(record: object, events: Sequence[dict[str, object]]) -> UnitTaskF
         kind = event.get("event_type")
         if kind == "run_started":
             scope = str(event.get("project_plan_doc") or event.get("plan_doc") or "")
-        if kind not in ("phase_started", "phase_finished"):
+        if kind not in ("phase_started", "phase_finished", "phase_dropped"):
             continue
         instance = str(event.get("phase_instance_id") or event.get("phase_id") or "")
         previous = attempts.get(instance)
@@ -863,39 +863,28 @@ def task_facts(record: object, events: Sequence[dict[str, object]]) -> UnitTaskF
             continue
         title = str(event.get("phase_title") or (previous.title if previous is not None else ""))
         task_scope = str(event.get("plan_doc") or event.get("project_plan_doc") or scope)
-        at = event.get("timestamp_epoch")
-        finished = (datetime.fromtimestamp(at, UTC) if kind == "phase_finished" and isinstance(at, int | float)
-                    else phase_table.PhaseNotFinished())
-        outcome: Literal["current", "stopped", "completed"] = (
-            "current" if kind == "phase_started" else "completed" if event.get("status") == "completed" else "stopped")
-        attempts[instance] = TaskAttempt(phase, task_scope, title, instance, outcome, finished,
-                                        single_spaced(str(event.get("reason") or event.get("stop_reason") or "")))
+        outcome: Literal["current", "stopped", "completed", "dropped"] = (
+            "dropped" if kind == "phase_dropped" else "current" if kind == "phase_started"
+            else "completed" if event.get("status") == "completed" else "stopped")
+        attempts[instance] = TaskAttempt(phase, task_scope, title, instance, outcome,
+                                        single_spaced(str(event.get("reason") or "")))
     return UnitTaskFacts(source, rows, tuple(attempts.values()))
 
 
-def past_tasks(facts: UnitTaskFacts, *, zone: ZoneInfo) -> tuple[tuple[str, WorkItem], ...]:
-    """Resolve stopped attempts only through a later completion of the same scoped task."""
-    rows: list[tuple[str, WorkItem]] = []
+def past_tasks(facts: UnitTaskFacts) -> tuple[WorkItem, ...]:
+    """Retain stopped tasks unless a later completion has the same plan scope and phase ID."""
+    rows: list[WorkItem] = []
     shown: set[tuple[str, str]] = set()
     for index, attempt in enumerate(facts.attempts):
         key = (attempt.scope, attempt.phase)
         if attempt.outcome != "stopped" or key in shown:
             continue
+        if any((other.scope, other.phase) == key and other.outcome == "completed"
+               for other in facts.attempts[index + 1:]):
+            continue
         shown.add(key)
-        later = next((other for other in reversed(facts.attempts[index + 1:])
-                      if (other.scope, other.phase) == key and other.outcome == "completed"), None)
-        if later is not None:
-            owner = re.search(r"\bthe ([\w-]+) unit owns " + re.escape(attempt.phase) + r"\b", later.title)
-            if owner:
-                text = f"The {owner.group(1)} unit finished this work"
-            elif isinstance(later.finished, datetime):
-                text = "A later attempt finished on " + later.finished.astimezone(zone).strftime("%d %b").lstrip("0")
-            else:
-                text = "A later attempt finished; finish date not recorded"
-            rows.append(("Done", WorkItem(work_name(attempt.phase, attempt.title), text)))
-        else:
-            rows.append(("Stopped", WorkItem(work_name(attempt.phase, attempt.title),
-                                             "Stopped; " + (attempt.reason or "reason not recorded"))))
+        rows.append(WorkItem(work_name(attempt.phase, attempt.title),
+                             "Stopped; " + (attempt.reason or "reason not recorded")))
     return tuple(rows)
 
 
@@ -979,7 +968,7 @@ class UnitBoardState(NamedTuple):
     readable: bool
     workers_unavailable: bool
     no_workers: bool
-    past: tuple[tuple[str, WorkItem], ...] = ()
+    stopped: tuple[WorkItem, ...] = ()
     current_work: str = ""
 
     @property
@@ -1361,8 +1350,7 @@ def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
         rows.extend(item_rows("Later", pending[1:]))
     elif not state.nothing_to_do:
         rows.extend(item_rows("Next", (WorkItem("Not recorded", next_item.empty),)))
-    for label in ("Stopped", "Done"):
-        rows.extend((label, entry.work, entry.state_text) for kind, entry in state.past if kind == label)
+    rows.extend(("Stopped", entry.work, entry.state_text) for entry in state.stopped)
     headers, rows = display_cells.wrapped(("Item", "Work", "State"), rows, columns, keep=(0, 1, 2))
     lines = [f"**{state.name}**{machine} — {state.bucket}", "",
              "| " + " | ".join(display_cells.escaped(header) for header in headers) + " |",
@@ -1492,6 +1480,8 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         table_rows.extend(rows)
         show_plan_eta = show_plan_eta or plan_eta
         facts = task_facts(record, run_events)
+        latest_attempts = {attempt.phase: attempt for attempt in facts.attempts}
+        dropped = {phase for phase, attempt in latest_attempts.items() if attempt.outcome == "dropped"}
         titles = {row.get("phase", ""): row.get("title", "") for row in facts.plan_rows}
         for attempt in facts.attempts:
             if attempt.phase not in titles or not titles[attempt.phase]:
@@ -1499,9 +1489,10 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         owner = snapshot.parent_of(member) if isinstance(member, staff.StaffRow) else None
         production_name = owner.name if owner is not None else ""
         open_sent = {phase.phase: phase_sent_work([
-            event for event in run_events if event.get("phase_instance_id") == phase.instance_id]) for phase in phases}
-        waits = phase_waits.unit_waits(run_events)
-        done = completed_unit_phases(run_events)
+            event for event in run_events if event.get("phase_instance_id") == phase.instance_id])
+                     for phase in phases if phase.phase not in dropped}
+        waits = [wait for wait in phase_waits.unit_waits(run_events) if wait.target not in dropped]
+        done = {phase: sent for phase, sent in completed_unit_phases(run_events).items() if phase not in dropped}
         merged_phases: set[str] = set()
         for (owner, phase), at in merge_times.items():
             if owner != unit.unit or phase in open_sent:
@@ -1530,7 +1521,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 open_sent[wait.target] = done[wait.target]
         merge = unit_lands(unit.unit, land, open_sent=open_sent, now=now, zone=zone, on_main=on_main,
                            unit_waits=waits, done_ids=tuple(done), phase_titles=tuple(titles.items()),
-                           production=production_name, merged_ids=frozenset(merged_phases))
+                           production=production_name, merged_ids=frozenset(merged_phases), dropped_ids=dropped)
         open_ids = tuple(dict.fromkeys([*(phase.phase for phase in phases),
                                        *(attempt.phase for attempt in facts.attempts)]))
         next_item = next_work(queue, record, open_ids=open_ids, read_plan=read_plan, wait_state=wait_state,
@@ -1558,7 +1549,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         current_work = work_name(current.phase, current.title) if current is not None else ""
         states.append(UnitBoardState(unit.unit, machines[index] if machines else "", tasks, next_item, merge,
                                      fallback, bool(hold), busy, bool(phases), readable,
-                                     isinstance(view, census.CensusFailed), no_workers, past_tasks(facts, zone=zone), current_work))
+                                     isinstance(view, census.CensusFailed), no_workers, past_tasks(facts), current_work))
     buckets = ("working", "waiting to merge", "waiting on other work", "idle", "unknown")
     counts = {bucket: sum(state.bucket == bucket for state in states) for bucket in buckets}
     summary = " · ".join(f"{bucket} {counts[bucket]}" for bucket in buckets if bucket != "unknown" or counts[bucket])
