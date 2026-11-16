@@ -501,7 +501,8 @@ class NativePaneSessionTests(StaffTestCase):
             (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
         for arguments, starting, cause in pending_launches:
-            with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
+            with (self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence,
+                  patch.object(time, "sleep", side_effect=AssertionError("pane readers must not wait"))):
                 pane = herdr.json_object(evidence["pane"], "fixture pane")
                 pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
                 info = herdr.json_object(evidence["process_info"], "fixture process info")

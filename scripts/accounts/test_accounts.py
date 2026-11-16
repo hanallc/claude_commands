@@ -1309,10 +1309,17 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(fetch_session_counts(), 0)
         fetch.assert_called_once_with(("session-counts-read",), machine=peer)
         self.assertEqual(machine_role_counts((row,), now)[1], ())
+        failed = session_counts_cache().with_name("peer_session_counts_failed.json")
         for failure in (OSError("offline"), subprocess.TimeoutExpired("fixture", 20), ValueError("bad reply")):
             with self.subTest(failure=type(failure).__name__), patch.object(role_map, "ssh_role_map", side_effect=failure):
                 self.assertEqual(fetch_session_counts(), 1)
-            self.assertEqual(len(machine_role_counts((row,), now)[1]), 1)
+            self.assertEqual(session_counts_cache().read_text(), reply)
+            self.assertEqual(machine_role_counts((row,), now)[1], ())
+            self.assertTrue(cast(str, json.loads(failed.read_text())["reason"]).startswith(type(failure).__name__))
+        with patch.object(accounts, "_start_session_counts_fetch", return_value=False):
+            self.assertEqual(machine_role_counts((row,), now)[1], ())
+        late = now + timedelta(seconds=601)
+        self.assertEqual(machine_role_counts((row,), late)[1], (f"{peer} unavailable: counts are {local} only",))
 
     def test_count_fetch_detaches_once_and_transfers_its_lock(self) -> None:
         held: list[int] = []
@@ -5882,7 +5889,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems", "session_inputs", "upcoming_moves"})
+        self.assertEqual(set(document), {"accounts", "board", "problems", "session_inputs", "upcoming_moves"})
         rows = cast(list[dict[str, object]], document["accounts"])
         keys = {"label", "tool", "roles", "selected_roles", "role_counts", "sessions", "role_counts_by_machine", "weekly_left_percent", "resets_at", "login_ends_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}

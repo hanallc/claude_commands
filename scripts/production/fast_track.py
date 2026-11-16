@@ -30,7 +30,7 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-from scripts.lib import main_push_lock
+from scripts.lib import land_main, main_push_lock
 from scripts.lib import process_group
 
 from scripts.copies import copies
@@ -789,17 +789,18 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                         _ = runner.git(copy, "fetch", "origin", "main")
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue
-                        result = runner.run(copy, "push", "origin", "HEAD:main")
+                        landed = land_main.land(copy, commit)
+                        print(land_main.hook_report(landed.hook), flush=True)
                 except checkpoint_gate.Stop as error:
                     raise Refused(str(error)) from error
-                if result.returncode:
+                except land_main.LandError as error:
                     # A writer outside the shared lock can move origin during push.
                     _ = runner.git(copy, "fetch", "origin", "main")
                     if not is_on_main(runner, copy, commit):
                         _ = reconcile(runner, repo, unit, settings_read=settings_read)
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue
-                        raise Refused(failure_detail(result))
+                        raise Refused(str(error)) from error
                 try:
                     _ = reconcile(runner, repo, unit, finish=True, paths=tuple(paths), published_commit=commit, settings_read=settings_read)
                 except (Refused, OSError, ValueError, KeyError) as error:

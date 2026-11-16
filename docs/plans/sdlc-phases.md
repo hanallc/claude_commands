@@ -195,7 +195,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
 **Depends on:** Phase 29
 
-**Waits for:** the workers-back notice (showrunner, 2026-11-15), then at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
+**Waits for:** (the workers-back notice is met: 2026-11-15 13:36 EST) at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
 
 #### Work Order
 
@@ -377,6 +377,79 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
 
+### Phase 40 — Every main push lands through one function, and the post-push hook runs after each one  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/land_main.py` holds `land(checkout, commit, branch="main", *, time_limit=UNLIMITED_GIT) -> Landed(commit, branch, push, hook)` and a CLI (`--checkout`, `--commit`, `--branch`). Under `main_push_lock.main_push_lock(checkout)` it fetches the branch, then:
+  1. Origin at the commit: `AlreadyLanded`; the hook runs unless the record names the commit.
+  2. The commit is a strict ancestor of origin: `AlreadyLanded` with `HookSkipped`. The newer landing owns the hook.
+  3. Origin is an ancestor of the commit: a plain fast-forward push (`Pushed`).
+  4. Otherwise: `NotFastForward(LandError)`, and no hook runs.
+- On the default branch (`refs/remotes/origin/HEAD`, else `main`), it runs `<checkout root>/.claude/config/post_push.sh` with bash, with `LANDED_SHA` and `LANDED_BRANCH`, inside the lock. After exit 0 it writes the commit to `post-push-completed` in the git common dir. An unreadable record counts as no record.
+- Hook outcomes are `HookAbsent`, `HookDone`, `HookSkipped` and `HookFailed(exit_code, rerun_command)`; `hook_report(hook)` gives one line. A failed hook never fails the landing: the CLI prints the rerun command and exits 0. It exits 1 on `LandError`.
+- Every default-branch push calls it: `push_direct.sh`, `push_pr_branch_and_merge.sh`, `restore_unreleased.sh`, `main_publish.push`, `fast_track`, `merge_checkpoint.promote_local_checkout`, `merge_gate.promote`, `production_lifecycle.promote_main`, `models_registry._publish` and `vault_pull.publish_mac` (120 s time limit). `post_push_hook.sh` no longer exists.
+- `main_push_lock.py`'s CLI passes `held_environment(checkout)` to its child, so a nested `land_main.py` reuses the hold.
+- Callers report the hook: `main_publish` only when it ran or failed; `merge_checkpoint` as a `post-push` line, `warning` on failure. `commands/showrunner/produce.md` states that each promotion syncs hana's mirror through the hook.
+- Hook interface (agreed with hana-merges): cwd is the landing checkout root, which can be a merge-branch worktree; exit 0 means the sync is done; the hook can run under the main push lock, must not push the default branch, and must be safe to rerun for one `LANDED_SHA`.
+
+**Files:**
+- `scripts/lib/land_main.py`, `scripts/lib/test_land_main.py` — the landing path and its tests
+- `scripts/lib/main_push_lock.py`, `scripts/lib/main_publish.py`, `scripts/lib/models_registry.py`, `scripts/buildlog/vault_pull.py` — callers
+- `scripts/production/production_lifecycle.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py`, `scripts/production/fast_track.py` — promotion callers
+- `scripts/validate_and_push/push_direct.sh`, `scripts/validate_and_push/push_pr_branch_and_merge.sh`, `scripts/release/restore_unreleased.sh` — shell callers of the CLI
+- `docs/as-built/validate-and-push-cancel-prior.md`, `commands/showrunner/produce.md` — docs
+
+**Binds later work:** the release's main push (`restore_unreleased.sh`) runs `post_push.sh`; `test_release.py` installs a hook file and checks `post-push hook: done`.
+
+**Gotchas:**
+- `land` fetches inside the lock even when the caller fetched before; tests that count fetches see two.
+- A test that injects a push failure patches `land_main.land` where the caller looks it up, not `git push`.
+- `systemd-run` expands `${...}` in its arguments; run a gate loop from a script file.
+
+**Ruled out:** a nonzero exit on a hook failure (the landing is done; the rerun line is the remedy).
+
+### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: done
+**Depends on:** none
+
+#### As-built
+
+- A `/release` rerun after a partial failure finishes the release. STEP 0 reads the version at `HEAD` from the `Cargo.toml` of `${PACKAGE}`, else of the primary crate. When it equals `${VERSION}`, the run resumes: `${RESUME_FLAG}` is `--resume`, STEPs 2–4 are skipped and STEP 5 checks out the release branch. A resume starts from `${BASE_BRANCH}`, or from the hotfix branch in hotfix mode.
+- `validate_version.sh <version> [--resume] <crate>...`: with `--resume`, a published crate prints `<crate>: <version> already published (resume)` and the next crate is checked.
+- `create_release_branch.sh`: a release branch at `HEAD` is checked out (`reusing release branch <branch>`); one at another commit is refused with both commits named.
+- `publish_crate.sh`: reads the package version with `cargo metadata`; when `verify_published.sh` passes it prints `already published: <crate> <version>` and skips the dry-run and the publish.
+- `create_github_release.sh`: `gh release view <tag> --repo <repo>` exit 0 prints `already released: <tag> on <repo>` and exits 0. Before a create it checks `gh api repos/<repo>/git/ref/tags/<tag>`: HTTP 404 prints `ERROR: tag <tag> is not on <repo>; push it there first`; another failure prints gh's error and `ERROR: could not check tag <tag> on <repo>`. Creates use `--verify-tag`; a failed create prints `ERROR: gh release create failed for <tag> on <repo>`.
+- STEP 1 takes the GitHub release repository from `github_release_repo` (`owner/name`) in `.claude/config/release.toml`. With no key, origin is used only when `gh repo view --json isPrivate` is false; else STEP 1 stops and names the key. STEP 8 passes that repository and needs the tag there first.
+
+**Files:**
+- `commands/release.md` — STEP 0 resume, STEP 1 repository choice, STEP 8 tag rule, `github_release_repo` in Configuration
+- `scripts/release/validate_version.sh`, `create_release_branch.sh`, `publish_crate.sh`, `create_github_release.sh` — the skips and refusals
+- `scripts/release/test_release.py` — stub `gh`, `cargo` and `curl` on `PATH`; no test publishes or makes a release
+
+**Binds later work:** Phase 42's per-crate pipeline uses these skips; a crate is done when `verify_published.sh` and `gh release view` both pass.
+
+**Gotchas:** `push_release.sh` and `restore_unreleased.sh` were already safe to rerun.
+
+### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: done
+**Depends on:** Phase 40, Phase 41
+
+#### As-built
+
+- `/release <bump|version> <crate>[@<version>] ...` with more than one package runs Multi-Package Mode in `commands/release.md`. One package keeps single-package mode. Multi-package mode runs only in normal and isolated mode, from `${BASE_BRANCH}`: on a `release-` branch STEP 1 stops, and hotfix mode stops.
+- STEP 1 orders the crates by `publish_order` (an array of crate names) in `.claude/config/release.toml`; a named crate absent from it stops the run. Without the key, the order is the order given. Each crate's version is resolved once.
+- After `git fetch origin ${BASE_BRANCH}`, each crate gets one state: `done` (on crates.io, GitHub release present, and neither `HEAD` nor `origin/${BASE_BRANCH}` holds the release version), `push` (the STEP 11 commit is local only), `resume` (Phase 41 rule) or `new`. A `done` crate is reported and skipped.
+- The plan block lists each crate, its state, version, next dev version and public pushes; one yes covers it and replaces the STEP 6 and STEP 11 confirmations. Dry-run lists and asks nothing. A nonzero patch part counts as a patch release for the next dev version; a resume reads the version from the parent of the version commit.
+- After the yes, a `push` crate runs `git push origin ${BASE_BRANCH}` (dry-run prints `[DRY-RUN] Would push ${BASE_BRANCH}`); other crates run the single-package pipeline. On a failure the run checks out `${BASE_BRANCH}` when the tree is clean and prints `rerun: /release <crate>@<version> ...` with every crate. The final report lists each crate's version, tag and release URL.
+- STEP 7 ends with `scripts/release/post_publish_hook.sh <crate> <version> <sha> [--dry-run]`; `<sha>` is `git merge-base ${BASE_BRANCH} HEAD` (the version commit in hotfix mode, `HEAD` in dry-run). It runs `<repo root>/.claude/config/post_publish.sh` with bash from the repo root, with `CRATE`, `VERSION` and `SHA` exported. It prints `post-publish hook: absent`, `done`, or `failed (exit N)` plus a `rerun:` line on stderr and exits 1; a failure stops before STEP 8. It refuses a version with a leading `v` and a SHA that is not a 40-hex commit.
+
+**Files:**
+- `commands/release.md` — Multi-Package Mode, `publish_order` in Configuration, the STEP 1 stop, the STEP 7 hook
+- `scripts/release/post_publish_hook.sh` — the hook runner
+- `scripts/release/test_release.py` — hook runner tests: absent hook, env names, nonzero exit, bad version, bad SHA
+
+**Gotchas:** hana main has no `publish_order` or `github_release_repo` yet; hana-merges owns those keys and `post_publish.sh`.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
@@ -461,9 +534,9 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 #### As-built
 
 - `<WorkerRuns/>` in `commands/unit/direct.md` holds the run-cancel rule: when a decision makes a running or queued test, lint or build run useless (the phase is parked, the round failed, a newer tree replaces the run's tree, or a result in hand answers the question), cancel it in the same turn to free its memory and its place in the queue. No run finishes only to complete a report.
-- Cancel steps by run kind. A `mesh_runs.py` run: read `pid` from its record in `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log); signal only while `status` is `running` and `ps -p <pid> -o args=` shows `mesh_runs.py supervise` with that record's path, so a reused pid is never signalled; then `kill -TERM -- -<pid>`. A detached `verify.sh` run: the same record and command, because `verify.sh` detaches through `mesh_runs.py` and handles TERM. A run in the memory queue: cancel its owning run; the queue drops dead callers on its next read. The queue has no cancel command of its own (`memory_admit.py release` only releases a reservation); the rule says so and points to `docs/plans/sdlc-run-cancel-design.md`.
+- Cancel steps by run kind. A detached run: run `detached_runs.py stop --reason "<why>" <record>` on its record in `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). The verb checks the supervisor and the command leader, then sends TERM to the command group only; the supervisor delivers the stopped result. A detached `verify.sh` run: the same verb, because `verify.sh` detaches through `detached_runs.py` and handles TERM. A run in the memory queue: cancel its owning run; the queue drops dead callers on its next read. The queue has no cancel command of its own (`memory_admit.py release` only releases a reservation); the rule says so and points to `docs/plans/sdlc-run-cancel-design.md`.
 - The park path and the repair-round path in `direct.md` point to `<WorkerRuns/>`. In `/showrunner:produce`, a ruling that parks, stops or replaces work names the runs to cancel.
-- `docs/direct/write_prompt_contract.md` item 3 (`## Builds and tests`) holds the worker form: cancel a run of your own that a later edit or result makes useless, with the same pid check and `kill -TERM -- -<pid>`.
+- `docs/direct/write_prompt_contract.md` item 3 (`## Builds and tests`) holds the worker form: cancel a run of your own that a later edit or result makes useless, with `detached_runs.py stop --reason "<why>" <record>`.
 
 **Files:**
 - `commands/unit/direct.md` — the `<WorkerRuns/>` rule and its park and repair pointers

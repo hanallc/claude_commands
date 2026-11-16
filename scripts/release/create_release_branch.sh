@@ -27,6 +27,24 @@ else
   BRANCH="release-${VERSION}"
 fi
 
+HEAD_COMMIT=$(git rev-parse HEAD)
+if RELEASE_COMMIT=$(git rev-parse --verify "refs/heads/$BRANCH" 2>/dev/null); then
+  if [[ "$RELEASE_COMMIT" != "$HEAD_COMMIT" ]]; then
+    if [[ -n "$DRY_RUN" ]]; then
+      echo "[DRY-RUN] Would refuse release branch $BRANCH"
+    fi
+    echo "ERROR: release branch $BRANCH is at $RELEASE_COMMIT; HEAD is $HEAD_COMMIT" >&2
+    exit 1
+  fi
+  if [[ -n "$DRY_RUN" ]]; then
+    echo "[DRY-RUN] Would reuse release branch $BRANCH at $HEAD_COMMIT"
+  else
+    git checkout "$BRANCH"
+    echo "reusing release branch $BRANCH"
+  fi
+  exit 0
+fi
+
 if [[ "$DRY_RUN" == "--dry-run" ]]; then
   echo "[DRY-RUN] Would create release branch: $BRANCH"
   echo "[DRY-RUN] Would checkout: $BRANCH"

@@ -5,6 +5,25 @@ from __future__ import annotations
 import html
 import re
 
+REFRESH_SCRIPT = r'''function createPageRefresh(load,seconds=()=>0){
+ const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
+ let timer;
+ function refresh(supersede=false){if(!paused()) return load(supersede);}
+ function restart(){
+  clearInterval(timer);
+  if(!paused() && Number(seconds())>0) timer=setInterval(()=>refresh(),Number(seconds())*1000);
+ }
+ document.addEventListener('visibilitychange',()=>{restart();refresh(true);});
+ window.addEventListener('message',event=>{
+  if(event.source===parent && event.origin===location.origin && event.data==='console-shown'){
+   restart();refresh(true);
+  }
+ });
+ restart();
+ return {restart,refresh};
+}
+'''
+
 CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
                         + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
 
@@ -34,8 +53,8 @@ stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="tru
 <path d="M20 6 9 17l-5-5"/></svg></button>'''
 
 COPY_STYLE = '''
-.code-block{position:relative}
-.code-block pre{padding-right:48px}
+.code-block{position:relative;margin:16px 0}
+.code-block pre{margin:0;padding-right:48px}
 .code-block [data-copy-code]{position:absolute;top:6px;right:6px;display:grid;place-items:center;
 box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
 background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}

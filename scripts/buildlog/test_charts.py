@@ -45,6 +45,7 @@ class PageDataTests(ChartFixture):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": str(self.ZONE)})))
         clock = cast(mock.Mock, self.enterContext(mock.patch.object(charts, "datetime", wraps=datetime)))
         cast(mock.Mock, clock.now).return_value = fixtures.END.astimezone(self.ZONE)
+        self.configure("TOP_COST_RECENT_DAYS", "2")
 
     @property
     def config_file(self) -> Path:

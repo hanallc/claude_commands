@@ -22,6 +22,12 @@ pub(crate) enum ReaderError {
         #[source]
         source: gix::Error,
     },
+    #[error("`{blob}` is not a full query blob id")]
+    QueryBlobId {
+        blob:   String,
+        #[source]
+        source: gix::Error,
+    },
     #[error("cannot read the tree of commit {commit}")]
     Tree {
         commit: String,
@@ -40,6 +46,8 @@ pub(crate) enum ReaderError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("cannot serialize the tree inventory")]
+    TreeSerialize(#[source] serde_json::Error),
     #[error("cannot write the facts to stdout")]
     Write(#[source] std::io::Error),
 }

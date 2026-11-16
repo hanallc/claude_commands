@@ -18,8 +18,8 @@ It inserts `unknown N` before the total only when that count exceeds zero.
 Counts include only units in these blocks.
 
 The status table follows the count line, above the blocks.
-Its columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`.
-- `Status` is the census status of the unit's session.
+Its columns are `Unit | Director | Machine | Progress | Phase | ETA Next | ETA Plan`.
+- `Director` is the census status of the director's session; its values remain `busy`, `idle`, or the recorded session state.
 - `Machine` appears only when a unit uses another machine.
 - `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
 - `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
@@ -28,90 +28,75 @@ Its columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Pla
 The table omits a column whose cells are all `—`.
 It wraps cells to the pane width, or to `units_table_floor_columns` when the width is unknown.
 
-Each title is `**<unit>** — <bucket>`.
-When any unit uses another machine, each title includes its machine in parentheses.
-The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
-Each field is a list item with a bold label.
-`Now` and `Next` always appear.
-`Also`, `Wait`, and `Merge` appear only with facts.
-Multiple items use an indented numbered list.
-Queue items always use a numbered list.
-Native Markdown wrapping preserves full titles, reasons, and queue text inside their blocks.
-The blocks use no pane width and no continuation rows.
+Each unit has a title, a blank line, and an `Item | Work | State` table.
+The table preserves titles, phase IDs, and all wrapped cell text.
+Its rows use the same cached plan and run records as the Progress bar.
 
-The summary uses the first matching rule:
+1. `Now` names the current task and its recorded action, resource wait, or live merge state.
+2. `Also` names each additional current task.
+3. `Next` names the first queue item, or the first unfinished plan phase.
+4. `Later` names every remaining queue item and unfinished plan phase with its own state.
+5. `Stopped` names each unresolved stopped task and its recorded reason.
+6. `Done` explains a stopped task that a later attempt finished while the bar still includes that attempt.
 
-1. `working`: a matched worker, command, director activity, or busy director with an unsent open phase executes.
-2. `idle`: the unit has a pause or stop, or readable records show no remaining work and no busy director.
-3. `waiting on other work`: an open phase or director command has a recorded wait.
-4. `waiting to merge`: sent work waits in the merge line, merges, failed, or has no recorded position.
-5. `waiting on other work`: the first next item has an unmet dependency or recorded plan wait.
-6. `unknown`: the available facts explain no earlier state.
+A busy session does not prove a task.
+Each current task has one row.
+Several actors share its State cell, joined by semicolons; equal states appear once.
+No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
+The open phase supplies Now before any merge task.
+Without current activity, State names the missing step and the latest finished step with its recorded time.
+A queue entry uses `<title after the colon> (<id before the colon>)`.
+With or without a colon, title cleanup removes balanced notes, including nested notes, and clauses after the first semicolon.
+If cleanup leaves no title, the board uses the entry text with single spaces.
+A title that starts with a plain lowercase word gets a capital; file names and IDs stay as written.
+A finished activity that matches the queue ID produces a conflict row; the board does not remove the entry.
+An unknown next task uses `Next | Not recorded | The director has not chosen the next task`.
+Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
+Absent, unreadable, and readable empty plans remain separate facts.
 
-`Now` names each open phase as `<title> (<phase id>)`.
-It removes a repeated phase id from the title's start.
-Inside a sentence, a title's leading article or number word is lowercase; other first words keep their capital.
-Tasks follow plan order, then start order for work outside the plan.
-Executing tasks appear first.
-When a task executes, other open tasks appear under `Also`.
-A recorded pass role supplies the worker's action, such as `The implementation worker writes <work>.`
-The pass's worker id joins the census first; its phase assignment supplies the fallback.
-Finished passes supply no current worker.
-A running detached command says `The <role> runs <label> for <work> and waits for its result.`
-An unread result says `the worker finished; the director has not read its result`.
-A director activity says `No worker is needed for this step.`
-A busy director without a recorded step says `the director's step is not recorded`.
-An unexplained open task says `is open, but nothing runs; reason not recorded`.
+Merge rows name each phase title and its live rank, active merge, or short failure cause.
+A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
+Without a production name, the text ends with `not in the merge line`.
+A finished phase counts as merged when its checkpoint reaches main, its unit and phase have a successful result, or main records its merge.
+A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+An unreadable checkpoint stays unmerged.
+A successful result for the exact checkpoint hash counts, with or without a valid result time.
+Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+The board ignores an invalid result time.
+Merge subjects must start with `Merge <unit> phase <phase> (<hash>)`.
+The board reads these subjects once per render and omits older failures for merged phases.
+The row uses its normal merge state when the checkpoint is in the merge line or currently merges.
+Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+Without a recorded owner, carried work uses `merges with <name>`.
+A second phase in the same merge uses `Merges with <id>`, or `Merges with phase <id>` for a numeric ID.
+The board omits a phase's shrink and repair merge items.
+The phase's live state takes priority over older failures from those items.
+Queue and plan dependencies use `After <dep>; <short state>`.
+A queue dependency on main uses `Ready`; a plan dependency on main or a completed local phase has no wait.
+Dependencies outside the merge line say `not in the merge line`.
+A local dependency uses its ID, with `phase` before a numeric ID.
+An external dependency uses `<unit> phase <id>` without its title.
+A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
+A branch dependency uses `After branch <name>; <short state>`.
+A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
+Recorded unit waits and plan `waits_for` conditions retain their text.
+With no current task, the first blocked pending task supplies Now with its own Work and State.
+Next and Later contain only the remaining tasks, so they do not repeat that wait.
+Stopped attempts resolve only through a later completed attempt with the same plan scope and phase ID.
+An explicit completion title can name the unit that finished the work.
+The board does not infer replacements from equal titles.
 
-A memory wait says `<work> needs build memory in use by <holder>; since <time>.`
-A slot wait says `<work> waits for a build slot used by <holder>; since <time>.`
-Other named resource waits say `waits for <reason>, in use by <holder>`.
-An unnamed holder says `holder not recorded` and preserves the recorded reason.
-A holder change preserves the wait's original start.
-A wait belongs to its task; it does not hide another worker's work.
-Director commands retain their recorded resource waits.
-A promise appears once per phase, on its first displayed task.
-An overdue promise says `Estimated finish <time>, late <duration>.`
-Times use the production zone, with `HH:MM` today and a date on other days.
-
-Without a current task, `Now` states the recorded pause, stop, first next wait, or unexplained delay.
-A missing pause actor uses `The unit is paused`; a missing stop actor uses `The unit is stopped`.
-A missing pause or stop reason uses `reason not recorded`.
-Empty work says `Nothing to do: the plan is complete and the queue is empty.`
-Without a plan, it says `Nothing to do: no plan or queued work.`
-A failed census says `Workers unavailable; who runs cannot be determined.`
-No-worker mode adds `Workers cannot start because no-worker mode is on.`
-
-`Merge` prints each merge group once, with active merges before merge line order.
-A single phase says `<id> is done; waiting to merge, 1st in line.`
-A shared group says `<a> and <b> are done; merge together, 2nd in line.`
-An active merge says `merging now`.
-A carried commit names its carrier unit and phase.
-A failure names its cause and time.
-Submitted work without a position says `absent from the merge line; reason not recorded`.
-A line that has no record says `merge position not recorded`.
-Sent open phases appear only under `Merge`.
-The board has no daily merge count.
-
-`Next` preserves every queue item in stored order.
-An exact leading open or sent phase ID followed by `:` identifies started work.
-`Next` leaves out that item, because `Now` or `Merge` already shows the work.
-The first unstarted queue item determines the queue wait.
-A satisfied dependency appends `Ready: <after> is on the local copy of main.`
-An unmet dependency appends `After <after>: <state>.`
-States distinguish absent local work, started work, submitted work, unstarted phases, and dependencies not found locally.
-The board checks local `origin/main` without a fetch.
-Pending plan work follows the queue: `Plan next: <title> (<id>); then <remaining ids>.`
-The first pending phase preserves its `Waits for:` text and names unmet `Depends on:` phases.
-The configured plan takes priority when it has phases; otherwise, the selected run supplies the plan.
-Empty work distinguishes a complete plan, no assigned plan, and `Nothing queued after the current work.`
-Open phases without plan rows say `Nothing queued after the current work.`
-An unreadable queue says `Queue unavailable; next work cannot be determined.`
-
-One census supplies worker and director evidence.
-Staff, run, queue, dependency, merge, and plan reads share caches within the command.
+Recorded unit waits retain their actor, condition, and target.
+Resource waits retain the resource and holder.
+A resource wait held by the same unit counts as working.
+A resource wait held by another unit, or without a recorded holder, counts as waiting on other work.
+The board preserves phase ETA text and uses the production time zone.
+Staff, run, plan, queue, dependency, ancestry, and merge reads share command caches.
+The board adds no reads to obtain task titles or stopped outcomes.
 The staff current run takes priority over newer unrelated runs.
-A reopened run remains open until its next finish event.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
 `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.

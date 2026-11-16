@@ -30,6 +30,14 @@ if [[ -n "$ALLOW_DIRTY" && -z "$DRY_RUN" ]]; then
   exit 1
 fi
 
+VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r --arg package "$PACKAGE" \
+  '.packages[] | select(.name == $package) | .version')
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if bash "$SCRIPT_DIR/verify_published.sh" "$VERSION" "$PACKAGE" >/dev/null 2>&1; then
+  echo "already published: $PACKAGE $VERSION"
+  exit 0
+fi
+
 echo "=== Publishing $PACKAGE ==="
 
 echo "  Running dry-run..."

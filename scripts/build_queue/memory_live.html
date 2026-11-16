@@ -5,43 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Builds</title>
 <style>
+/*__CONSOLE_TOKENS__*/
 :root {
-  color-scheme: light;
-  --bg: #f6f5f2; --card: #fcfcfb; --line: #dcdad4;
-  --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #66645f;
-  --used: #2a78d6; --res-a: #427caf; --res-b: #6b91b7; --room: #1baf7a;
+  --used: var(--accent); --cap: var(--error); --block: var(--warning);
+  --res-a: #427caf; --res-b: #6b91b7;
   --building: #007e78; --testing: #b00079;
   --remote-memory: var(--remote-memory-light); --machine-natedev: var(--machine-natedev-light);
   --machine-mac: var(--machine-mac-light); --machine-aws: var(--machine-aws-light);
-  --other: #a3a19b; --free: #e7e5df; --floor: #eda100; --cap: #c22d2c; --block: #8a5a00;
+  --other: #a3a19b; --free: #e7e5df; --floor: #eda100;
   --agents: #7f6fc4; --desktop: #78756e;
   --tools: #7a9cc4; --ci: #1c5aa8; --programs: #8796ab; --kernel: #3e4a5c; --cache: #d6d4ce; --unattributed: #b9b7b1;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #121211; --card: #1a1a19; --line: #34332f;
-    --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
-    --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
+    --res-a: #719fd8; --res-b: #567ca8;
     --building: #27c6b8; --testing: #ca458f;
     --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
     --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
+    --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
     --agents: #9585e0; --desktop: #8a877f;
     --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
   }
 }
 :root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #121211; --card: #1a1a19; --line: #34332f;
-  --ink: #f0efec; --ink-2: #c3c2b7; --ink-3: #9a988f;
-  --used: #3987e5; --res-a: #719fd8; --res-b: #567ca8; --room: #199e70;
+  --res-a: #719fd8; --res-b: #567ca8;
   --building: #27c6b8; --testing: #ca458f;
   --remote-memory: var(--remote-memory-dark); --machine-natedev: var(--machine-natedev-dark);
   --machine-mac: var(--machine-mac-dark); --machine-aws: var(--machine-aws-dark);
-    --other: #5c5b57; --free: #2a2a28; --floor: #c98500; --cap: #ef7372; --block: #e3a83f;
-    --agents: #9585e0; --desktop: #8a877f;
-    --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
+  --other: #5c5b57; --free: #2a2a28; --floor: #c98500;
+  --agents: #9585e0; --desktop: #8a877f;
+  --tools: #4a6f99; --ci: #2563b8; --programs: #5a6a80; --kernel: #2b3442; --cache: #3c3c39; --unattributed: #6c6b66;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }

@@ -24,10 +24,19 @@ from scripts.production import staff
 
 class CompletedLintRun(TypedDict):
     exit_code: int
+    status: str
+
+
+class StartedLintRun(TypedDict):
+    command_group: int
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
-    def test_group_term_removes_lint_memory_wait_and_all_verify_processes(self) -> None:
+    def command_group(self) -> int:
+        """Read the command group that the real supervisor saved in the run record."""
+        return cast(StartedLintRun, json.loads((self.control / "lint-run.json").read_text()))["command_group"]
+
+    def test_command_group_term_removes_lint_memory_wait_and_all_verify_processes(self) -> None:
         occupied = self.admission.occupy_host()
         memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = memory.write_text("MemAvailable: 0 kB\n")
@@ -42,7 +51,10 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             group = os.getpgid(pid)
             self.started_groups.add(group)
             self.addCleanup(self.end_group, group)
-        send_process_group(process.pid, signal.SIGTERM)
+        command = self.command_group()
+        self.started_groups.add(command)
+        self.addCleanup(self.end_group, command)
+        send_process_group(command, signal.SIGTERM)
         try:
             output, errors = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
@@ -58,11 +70,12 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             log = (self.control / "lint-run.log").read_text()[-4000:]
             self.fail("lint kept a verify process after its group received SIGTERM: "
                       + json.dumps(surviving) + "\n" + saved + "\n" + log)
-        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
-        self.wait_for_group_exit(process.pid, timeout=5)
+        # The supervisor is outside the command group: it records the status and delivers the result.
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.wait_for_group_exit(command, timeout=5)
         record = cast(CompletedLintRun, json.loads((self.control / "lint-run.json").read_text()))
         log = (self.control / "lint-run.log").read_text()
-        self.assertEqual(record["exit_code"], 143, log)
+        self.assertEqual((record["status"], record["exit_code"]), ("finished", 143), log)
         for group in self.started_groups:
             self.assertEqual(self.live_group_processes(group), [], "lint kept a verify process")
         with self.admission.loop_turn():
@@ -74,13 +87,9 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assert_no_cache_verdict()
         with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
-              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
-              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
-            self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])
-            finished = cast(detached_runs.RunRecord, json.loads((self.control / "lint-run.json").read_text()))
-            self.assertEqual((finished["status"], finished.get("exit_code")), ("finished", 143))
+              patch.object(detached_runs, "deliver", return_value="private fixture") as delivery):
             self.assertEqual(detached_runs.reap_orphans(str(self.board)), [])
-            delivery.assert_called_once()
+            delivery.assert_not_called()
 
     def test_group_term_stops_lint_and_releases_admission(self) -> None:
         for stage in ("mend", "clippy"):
@@ -108,10 +117,15 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()
         _ = (self.control / "cleanup-armed").touch()
+        command = self.command_group()
+        self.started_groups.add(command)
+        self.addCleanup(self.end_group, command)
+        send_process_group(command, signal.SIGTERM)
+        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5)
+        # The supervisor dies while verify cleans up, so the reaper must wait for the command group.
         send_process_group(process.pid, signal.SIGTERM)
         output, errors = process.communicate(timeout=5)
         self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
-        wait_until((self.control / "cleanup-started").exists, self.control, timeout=5)
         path = self.control / "lint-run.json"
         with (patch.object(detached_runs, "_runs_dir", return_value=self.control),
               patch.object(detached_runs, "deliver", return_value="private fixture") as delivery,
@@ -122,7 +136,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             self.assertNotIn("exit_code", pending)
             delivery.assert_not_called()
             _ = release.touch()
-            self.wait_for_group_exit(process.pid, timeout=5)
+            self.wait_for_group_exit(command, timeout=5)
             self.assert_resources_released()
             self.assert_no_cache_verdict()
             self.assertEqual(detached_runs.reap_orphans(str(self.board)), ["lint-run"])

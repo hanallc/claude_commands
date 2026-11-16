@@ -1713,12 +1713,19 @@ def _start_phase(args: argparse.Namespace) -> None:
 
 def _finish_phase_start(session_dir: Path, state: dict[str, object], phase: dict[str, object]) -> None:
     """Publish a saved phase start once, including after a stopped state write."""
+    events = _run_events(state)
     if not any(event.get("event_type") == "phase_started"
-               and event.get("phase_instance_id") == phase.get("instance_id") for event in _run_events(state)):
+               and event.get("phase_instance_id") == phase.get("instance_id") for event in events):
         event = _object_dict(phase.get("start_event"))
         if event is None:
             event = _event(state, "phase_started", _number(phase.get("started_at")), phase_record=phase)
         _append_event(state, event)
+    run_start = next((index + 1 for index in range(len(events) - 1, -1, -1)
+                      if events[index].get("event_type") == "run_finished"), 0)
+    for wait in _waits_by_id(events[run_start:]).values():
+        if (wait.get("event_type") == "wait_started" and wait.get("wait_scope") == "unit"
+                and wait.get("target_work") == phase.get("id")):
+            _end_wait(state, wait, plan_history.now_epoch(), unclosed=False)
     if "start_event" in phase:
         del phase["start_event"]
         _write_state(session_dir, state)
@@ -5892,14 +5899,27 @@ class WaitNotRecorded:
     wait_id: str
 
 
+@dataclass(frozen=True)
+class UnitWaitTarget:
+    """The work and actor named by a unit wait."""
+
+    target: str
+    by: str
+
+
 def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedWait | WaitNotRecorded:
+    target = _optional_arg(args, "target")
+    if hasattr(args, "target"):
+        for option in ("target", "by", "reason"):
+            if not _optional_arg(args, option).strip():
+                raise SystemExit(f"start-wait --target requires --{option}")
     holder = _holder_from_args(args, _arg_string(args, "kind"))
-    resolution = _wait_phase(state, args)
+    resolution = UnitWaitTarget(target, _optional_arg(args, "by")) if target else _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
-    missing_reason = _optional_arg(args, "missing_reason")
+    missing_reason = "" if isinstance(resolution, UnitWaitTarget) else _optional_arg(args, "missing_reason")
     if isinstance(resolution, (WaitPhaseNotRecorded, UnresolvedWaitAttribution)):
         missing_reason = "; ".join(part for part in (missing_reason, resolution.reason) if part)
-    if not owner:
+    if not owner and not isinstance(resolution, UnitWaitTarget):
         missing_reason = "; ".join(part for part in (missing_reason, "wait owner session not recorded") if part)
     now = plan_history.now_epoch()
     # An empty explicit phase prevents _event from borrowing a reporting pass
@@ -5917,7 +5937,10 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedW
         event["declaration_id"] = declaration
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
-    if isinstance(resolution, ResolvedWorkerPass):
+    if isinstance(resolution, UnitWaitTarget):
+        event.update(wait_scope="unit", target_work=resolution.target, wait_by=resolution.by,
+                     wait_attribution={"state": "UnitTarget"})
+    elif isinstance(resolution, ResolvedWorkerPass):
         event.update(pass_instance_id=resolution.pass_instance_id, worker_name=resolution.worker_name,
                      team_slot=resolution.team_slot, wait_attribution={"state": "WorkerPass"})
     elif isinstance(resolution, UnresolvedWaitAttribution):
@@ -5928,7 +5951,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedW
                                      else "UnresolvedAttribution", "candidates": [],
                                      "reason": resolution.reason if isinstance(resolution, WaitPhaseNotRecorded) else "explicit phase attribution"}
     supplier = _object_dict(event.get("expected_supplier")) or {}
-    if event["wait_kind"] == "WaitingForSupplier" and supplier.get("state") == "NoNamedSupplier":
+    if (not isinstance(resolution, UnitWaitTarget) and event["wait_kind"] == "WaitingForSupplier"
+            and supplier.get("state") == "NoNamedSupplier"):
         event["wait_attribution"] = {"state": "UnresolvedSupplier", "reason": supplier.get("reason"),
                                      "candidates": [{key: event[key] for key in
                                                      ("run_id", "phase_id", "phase_instance_id") if key in event}]}
@@ -7067,6 +7091,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = wait_phase.add_argument("--worker-thread-id", default=argparse.SUPPRESS)
     _ = wait_phase.add_argument("--director", action="store_true")
     _ = wait_phase.add_argument("--phase-instance-id", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--target", default=argparse.SUPPRESS)
+    _ = start_wait.add_argument("--by", default="")
     _ = start_wait.add_argument("--missing-reason", default="")
     _ = start_wait.add_argument("--reason", default="")
     _ = start_wait.add_argument("--owner-session", default="")

@@ -8,18 +8,30 @@
 
 mod blob_reader;
 mod constants;
+mod declarations;
 mod error;
 mod facts;
+mod module_scan;
+mod module_sites;
+mod name_sites;
 mod request;
 mod tokenizer;
 mod unicode_tables;
+mod word_syntax;
 
 use std::error::Error;
 use std::process::ExitCode;
 
+use libc::LC_CTYPE;
+
 use crate::request::Request;
 
 fn main() -> ExitCode {
+    // SAFETY: The locale changes before the reader starts any worker threads.
+    unsafe {
+        libc::setlocale(LC_CTYPE, c"".as_ptr());
+    }
+
     match Request::read().and_then(Request::answer) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
