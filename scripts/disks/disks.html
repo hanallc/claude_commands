@@ -28,8 +28,14 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
+__STEP_TIP_STYLE__
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+/* A card title with a definition: the info mark shows that a hover tells what the card holds. */
+h2[data-tip] { cursor: help; }
+h2 .about { display: inline-flex; margin-left: 6px; color: var(--ink-3); vertical-align: -2px; }
+h2 .about svg { width: 15px; height: 15px; }
+#sessions .limit { margin: 10px 0 6px; }
 .status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
 .dot.old { background: var(--ink-3); }
@@ -118,6 +124,7 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
     <section class="card" id="sessions" hidden></section>
   </div>
 </main>
+<div id="tip" role="tooltip"></div>
 <script id="disks-settings" type="application/json">__DISKS_SETTINGS__</script>
 <script>
 const GIB = 1024 ** 3;
@@ -127,6 +134,14 @@ const icon = path => '<svg aria-hidden="true" focusable="false" viewBox="0 0 24 
   + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${path}"/></svg>`;
 const CHEVRON = icon("m9 18 6-6-6-6");
 const FOLDER = icon("M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z");
+// Lucide 0.468.0 "info": the mark on a card title that has a definition.
+const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
+
+// The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
+const stepTip = (() => {
+__STEP_TIP_SCRIPT__
+  return {field, tooltipHtml, tipRowsHtml, hoverTips};
+})();
 
 function size(bytes) {
   const gib = bytes / GIB;
@@ -288,12 +303,27 @@ function esc(text) {
   return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 }
 
+// A slot or session size as text: a size below the measure's least folder shows as below it; no size shows "—".
+function measuredSize(bytes, keepBytes) {
+  return bytes == null ? "—" : keepBytes && bytes < keepBytes ? `< ${size(keepBytes)}` : size(bytes);
+}
+
+function lastUsedText(row, now) {
+  return row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
+}
+
+function slotTotal(rows) {
+  return rows.some(row => row.size != null) ? rows.reduce((sum, row) => sum + (row.size || 0), 0) : null;
+}
+
+function cardTitle(name, about, root) {
+  return `<h2 data-tip="about:${about}">${name}<span class="about">${INFO}</span><span class="path">${esc(root)}</span></h2>`;
+}
+
 // The Slots card: one band per repository; an open band lists its slots with size, last use and holder.
 // A slot below the measure's least folder shows as below it; a slot on no measured drive shows no size.
 function slotsHtml(report, keepBytes, now, opened) {
-  const slotSize = bytes => bytes == null ? "—" : keepBytes && bytes < keepBytes ? `&lt; ${size(keepBytes)}` : size(bytes);
-  const total = rows => rows.some(row => row.size != null) ? rows.reduce((sum, row) => sum + (row.size || 0), 0) : null;
-  const lastUsed = row => row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
+  const slotSize = bytes => esc(measuredSize(bytes, keepBytes));
   const usedBy = row => {
     if (row.used_by) {
       // The work as the Builds page names it, such as "report integrate", then its showrunner.
@@ -304,45 +334,55 @@ function slotsHtml(report, keepBytes, now, opened) {
   };
   const slotRow = row => {
     const use = usedBy(row);
-    return `<tr><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
-      + `<td class="n">${slotSize(row.size)}</td><td>${lastUsed(row)}</td>`
+    return `<tr data-tip="slot:${esc(row.name)}"><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
+      + `<td class="n">${slotSize(row.size)}</td><td>${lastUsedText(row, now)}</td>`
       + (use ? `<td class="use wide">${use}</td>` : '<td class="dim wide">—</td>') + "</tr>";
   };
   const groups = report.groups.map(group => {
     const count = group.maximum ? `${group.slots.length} of ${group.maximum} slots`
       : `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`;
     const open = opened.has(group.repository);
-    return `<tr class="group" tabindex="0" aria-expanded="${open}" data-group="${esc(group.repository)}"><th colspan="4">`
+    return `<tr class="group" tabindex="0" aria-expanded="${open}" data-group="${esc(group.repository)}" data-tip="group:${esc(group.repository)}"><th colspan="4">`
       + `<span class="twist">${CHEVRON}</span><span class="folder">${FOLDER}</span><span class="name">${esc(group.repository)}</span>`
-      + `<span class="sum">${count} · ${slotSize(total(group.slots))}</span></th></tr>` + (open ? group.slots.map(slotRow).join("") : "");
+      + `<span class="sum">${count} · ${slotSize(slotTotal(group.slots))}</span></th></tr>` + (open ? group.slots.map(slotRow).join("") : "");
   }).join("");
   const body = groups ? `<table class="slots"><colgroup><col><col class="size"><col class="used"><col class="use"></colgroup>`
     + `<thead><tr><th>Slot</th><th class="n">Size</th><th>Last used</th><th class="wide">Used by</th></tr></thead><tbody>${groups}</tbody></table>`
     : '<p class="problem">No slots yet.</p>';
-  return `<h2>Slots<span class="path">${esc(report.root)}</span></h2>${body}`;
+  return cardTitle("Slots", "slots", report.root) + body;
 }
 
-// The Sessions card: each session folder, largest first, with its held folders and whether its session runs.
-// The largest folders show by name; one row adds up the rest.
-function sessionsHtml(report, keepBytes, shown) {
-  const folderSize = bytes => bytes == null ? "—" : keepBytes && bytes < keepBytes ? `&lt; ${size(keepBytes)}` : size(bytes);
+// The Sessions card rows: each session folder of at least the limit, largest first, with its held folders and whether
+// its session runs. One row adds up the smaller sessions.
+function sessionRows(report, keepBytes, limit) {
+  const folderSize = bytes => esc(measuredSize(bytes, keepBytes));
   const largest = Math.max(0, ...report.sessions.map(row => row.size || 0));
-  const held = row => row.held.length ? row.held.map(folder => `<span title="${esc(folder.task)}">${esc(folder.name)}</span>`
+  const held = row => row.held.length ? row.held.map(folder => esc(folder.name)
     + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
-  const named = report.sessions.slice(0, shown), rest = report.sessions.slice(shown);
-  const restSize = rest.some(row => row.size != null) ? rest.reduce((sum, row) => sum + (row.size || 0), 0) : null;
-  const more = rest.length ? `<tr><td class="dim">${rest.length} more</td><td class="n dim">${folderSize(restSize)}</td>`
-    + "<td class=\"share\"></td><td></td><td></td></tr>" : "";
-  const body = named.length ? `<table class="sessions"><colgroup><col><col class="size"><col class="share"><col><col class="state"></colgroup>`
-    + `<thead><tr><th>Session</th><th class="n">Size</th><th class="share" aria-label="Share of the largest session"></th>`
-    + `<th>Held folders</th><th>State</th></tr></thead><tbody>${named.map(sessionRow).join("")}${more}</tbody></table>`
-    : '<p class="problem">No session folders yet.</p>';
-  return `<h2>Sessions<span class="path">${esc(report.root)}</span></h2>${body}`;
+  const {shown, smaller} = sessionsAtLeast(report, limit);
+  const rest = smaller.length ? `<tr data-tip="smaller:sessions"><td class="dim">${smaller.length} smaller</td>`
+    + `<td class="n dim">${folderSize(slotTotal(smaller))}</td><td class="share"></td><td></td><td></td></tr>` : "";
+  return shown.map(sessionRow).join("") + rest;
+}
+
+function sessionsAtLeast(report, limit) {
+  return {shown: report.sessions.filter(row => (row.size || 0) >= limit), smaller: report.sessions.filter(row => (row.size || 0) < limit)};
+}
+
+// The size filter of the Sessions card: the lowest step shows every session; the other steps run on a log scale
+// from the measure's least folder to the largest session.
+function sessionRange(report, keepBytes) {
+  const min = Math.max(keepBytes, 1024 ** 2);
+  return {min, max: Math.max(min, ...report.sessions.map(row => row.size || 0))};
+}
+
+function sessionLimitAt(position, range) {
+  return position > 0 ? fromSlider(position, range) : 0;
 }
 
 const settings = JSON.parse(document.getElementById("disks-settings").textContent);
@@ -356,6 +396,9 @@ const driveViews = new Map();
 let data = null;
 let slotReport = null;
 let sessionReport = null;
+// The least session size the Sessions card shows; 0 shows every session.
+let sessionLimit = 0;
+let builds = null;
 let measuring = null;
 let problem = "";
 
@@ -502,6 +545,47 @@ function driveView(card) {
   };
 }
 
+// The Sessions card is built once and kept across new data, so a drag of its size filter goes on.
+function sessionsView(card) {
+  let report = null, keepBytes = 0, range = null, slider = null;
+  const fill = () => {
+    card.querySelector("output").textContent = sessionLimit ? size(sessionLimit) : "any size";
+    card.querySelector("tbody").innerHTML = sessionRows(report, keepBytes, sessionLimit);
+  };
+  const build = () => {
+    card.innerHTML = `<div class="top"></div><div class="limit">Show sessions of at least<span class="range">`
+      + `<span class="end low">any</span><input type="range" min="0" max="${SLIDER_STEPS}" value="0" aria-label="Show sessions of at least">`
+      + `<span class="end high"></span><output></output></span></div>`
+      + `<table class="sessions"><colgroup><col><col class="size"><col class="share"><col><col class="state"></colgroup>`
+      + `<thead><tr><th>Session</th><th class="n">Size</th><th class="share" aria-label="Share of the largest session"></th>`
+      + `<th>Held folders</th><th>State</th></tr></thead><tbody></tbody></table>`;
+    slider = card.querySelector("input");
+    slider.addEventListener("input", () => {
+      sessionLimit = sessionLimitAt(Number(slider.value), range);
+      fill();
+    });
+  };
+  return (next, keep) => {
+    report = next;
+    keepBytes = keep;
+    if (!report.sessions.length) {
+      card.innerHTML = cardTitle("Sessions", "sessions", report.root) + '<p class="problem">No session folders yet.</p>';
+      slider = null;
+      return;
+    }
+    if (!slider) build();
+    card.querySelector(".top").innerHTML = cardTitle("Sessions", "sessions", report.root);
+    range = sessionRange(report, keepBytes);
+    // A filter with no range left shows every session, so no data change can lock it.
+    sessionLimit = range.max <= range.min ? 0 : Math.min(sessionLimit, range.max);
+    card.querySelector(".end.high").textContent = size(range.max);
+    slider.disabled = range.max <= range.min;
+    const position = String(sessionLimit ? toSlider(sessionLimit, range) : 0);
+    if (slider.value !== position) slider.value = position;
+    fill();
+  };
+}
+
 function renderStatus() {
   const now = Date.now() / 1000, dot = document.getElementById("dot");
   dot.hidden = !data;
@@ -521,7 +605,7 @@ function renderCards() {
   renderSlots();
   const card = document.getElementById("sessions");
   card.hidden = !sessionReport;
-  if (sessionReport) card.innerHTML = sessionsHtml(sessionReport, data ? data.keep_bytes : 0, settings.sessions_shown);
+  if (sessionReport) updateSessions(sessionReport, data ? data.keep_bytes : 0);
 }
 
 // New data keeps each drive card, so a refresh does not end a drag; a changed drive list builds the cards again.
@@ -539,6 +623,92 @@ function render() {
   for (const drive of data.drives) driveViews.get(drive.mount)(drive);
   renderCards();
   renderStatus();
+}
+
+// The tooltip of each Disks row and card title. A slot that a Builds page step runs in shows that step's tooltip.
+function tipFor(key) {
+  const at = key.indexOf(":"), kind = key.slice(0, at), name = key.slice(at + 1);
+  const keepBytes = data ? data.keep_bytes : 0;
+  if (kind === "about") return stepTip.tipRowsHtml(name === "slots" ? slotsAbout(slotReport) : SESSIONS_ABOUT);
+  if (kind === "group" && slotReport) {
+    const group = slotReport.groups.find(group => group.repository === name);
+    return group ? stepTip.tipRowsHtml(groupTip(group, keepBytes)) : "";
+  }
+  if (kind === "slot" && slotReport) {
+    for (const group of slotReport.groups) {
+      const slot = group.slots.find(slot => slot.name === name);
+      if (!slot) continue;
+      // Only a held slot shows a Builds step, and only from Builds data that is current.
+      const current = builds && Date.now() / 1000 - builds.read_at <= settings.builds_max_age_seconds;
+      const run = slot.used_by && current
+        ? builds.walk?.find(row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine) : null;
+      return run ? stepTip.tooltipHtml("row:" + run.key, builds)
+        : stepTip.tipRowsHtml(slotTip(slot, group, keepBytes, Date.now() / 1000, slotReport.unused_days));
+    }
+  }
+  if (kind === "session" && sessionReport) {
+    const row = sessionReport.sessions.find(row => row.name === name);
+    return row ? stepTip.tipRowsHtml(sessionTip(row, keepBytes)) : "";
+  }
+  if (kind === "smaller" && sessionReport) return stepTip.tipRowsHtml(smallerTip(sessionsAtLeast(sessionReport, sessionLimit).smaller, sessionLimit, keepBytes));
+  return "";
+}
+
+function slotsAbout(report) {
+  const field = stepTip.field;
+  return [field("Build slots", "", "title"),
+    field("", "A slot is a worktree of one repository that build runs use again.", "long"),
+    field("", "A run takes the lowest free slot, checks out its commit and builds there. The slot keeps the build output, so the next run builds less.", "long"),
+    field("", "Each repository has a slot limit. A run waits when all its slots are in use.", "long"),
+    field("", `The nightly sweep deletes a free slot unused for ${report ? report.unused_days : "some"} days.`, "long"),
+    field("", "Size counts the worktree and its build output. A slot in use shows its step as the Builds page shows it.", "long")];
+}
+
+const SESSIONS_ABOUT = [stepTip.field("Session folders", "", "title"),
+  stepTip.field("", "A session folder holds the temporary files of one Claude session: its TMPDIR, its scratch folders and its run folders.", "long"),
+  stepTip.field("", "The folder has the staff name, so a new conversation of the same staff member uses the same folder.", "long"),
+  stepTip.field("", "A held folder is a scratch folder that a task keeps until the task ends. Unsaved work means that the task ended and the folder keeps its work.", "long"),
+  stepTip.field("", "Running means that a live session uses the folder. Ended means that no live session uses it.", "long")];
+
+function groupTip(group, keepBytes) {
+  const field = stepTip.field, inUse = group.slots.filter(slot => slot.used_by).length;
+  return [field(group.repository, `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`, "title"),
+    field("Size", measuredSize(slotTotal(group.slots), keepBytes)), field("In use", `${inUse} of ${group.slots.length}`),
+    field("Limit", group.maximum ? `${group.maximum} slots` : "not set")];
+}
+
+function slotTip(slot, group, keepBytes, now, unusedDays) {
+  const field = stepTip.field;
+  const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
+    field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
+  if (slot.used_by) rows.push(field("Used by", slot.used_by.name || "—"), field("Showrunner", slot.used_by.showrunner || "—"));
+  if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
+  return rows;
+}
+
+function sessionTip(row, keepBytes) {
+  const field = stepTip.field;
+  const rows = [field(row.name, row.state === "unknown" ? "state unknown" : row.state, "title"), field("Size", measuredSize(row.size, keepBytes))];
+  if (!row.held.length) return [...rows, field("Held folders", "none")];
+  return [...rows, ...row.held.flatMap((folder, index) =>
+    [field(folder.name, folder.ended ? "unsaved work" : "held", "field", index === 0), field("", "Task " + folder.task, "long")])];
+}
+
+function smallerTip(rows, limit, keepBytes) {
+  const field = stepTip.field;
+  return [field(`${rows.length} smaller session${rows.length === 1 ? "" : "s"}`, measuredSize(slotTotal(rows), keepBytes), "title"),
+    field("", `Each is below ${size(limit)}. Move the size filter to the left to show them.`, "long")];
+}
+
+// The Builds page data, read again while the page shows, so a slot in use shows its step as it is now.
+async function readBuilds() {
+  if (document.visibilityState === "hidden") return;
+  try {
+    const response = await fetch(settings.builds_data + "?" + Date.now(), {cache: "no-store"});
+    builds = response.ok ? await response.json() : null;
+  } catch {
+    builds = null;
+  }
 }
 
 async function readData() {
@@ -610,6 +780,10 @@ async function start() {
   await askMeasure();
 }
 
+const updateSessions = sessionsView(document.getElementById("sessions"));
+stepTip.hoverTips(document.getElementById("tip"), tipFor);
+readBuilds();
+setInterval(readBuilds, settings.poll_seconds * 1000);
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   toggleOpen(opened.groups, row.dataset.group);
   renderSlots();

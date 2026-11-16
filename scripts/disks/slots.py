@@ -57,6 +57,10 @@ class SlotGroup(TypedDict):
 
 class SlotReport(TypedDict):
     root: str
+    # The machine of the slots; a Builds page row names the slot folder and machine it runs in.
+    machine: str
+    # A free slot unused this many days goes in the nightly sweep.
+    unused_days: int
     groups: list[SlotGroup]
 
 
@@ -115,7 +119,7 @@ def read_slots(root: Path, cargo_root: Path, settings: conf.ConfigRead, machine:
         except conf.Unusable:
             return None
 
-    return {"root": str(root), "groups": [{"repository": repository, "maximum": maximum(repository),
+    return {"root": str(root), "machine": machine, "unused_days": settings.whole("slots.unused_days"), "groups": [{"repository": repository, "maximum": maximum(repository),
                                            "slots": sorted(rows, key=lambda row: row["number"])}
                                           for repository, rows in sorted(groups.items())]}
 

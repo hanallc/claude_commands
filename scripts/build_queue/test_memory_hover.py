@@ -731,7 +731,7 @@ process.stdout.write(JSON.stringify(steps));
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
+        constants = ""
         if walk:
             functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
             functions += html[html.index("function esc(s)"):html.index("let lastRead =")]

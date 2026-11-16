@@ -112,6 +112,7 @@ __PAGE_FRAME_STYLE__
 .legend .row .name { font-weight: 600; }
 .legend .row .v { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
 .legend .row[data-tip="room"] .name { white-space: nowrap; }
+/* shared:step-tip:start — the Disks page uses these rules too (disks_page.shared_step_tip). */
 #tip { position: fixed; z-index: 10; pointer-events: none; opacity: 0; transition: opacity 0.12s ease; }
 #tip.on { opacity: 1; }
 .tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
@@ -125,6 +126,7 @@ __PAGE_FRAME_STYLE__
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
+/* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
@@ -488,6 +490,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 <div id="tip" role="tooltip"></div>
 <script>
 let latest = null;
+// shared:step-tip:start — the step tooltip rows and their HTML; the Disks page uses this code too (disks_page.shared_step_tip).
 function field(label, value, kind = 'field', group = false) {
   return {kind, label, value: String(value ?? ''), group};
 }
@@ -863,7 +866,10 @@ function tooltipRows(key, data) {
   return rows;
 }
 function tooltipHtml(key, data) {
-  return '<dl class="tip">'+tooltipRows(key, data).map(row => {
+  return tipRowsHtml(tooltipRows(key, data));
+}
+function tipRowsHtml(rows) {
+  return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
     return ['caption','long'].includes(row.kind) ? `<dd${attr}>${esc(row.value)}</dd>`
@@ -950,38 +956,48 @@ function ago(then, now) {
   const h = Math.floor(m / 60);
   return h < 24 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} d ${h % 24} h`;
 }
-const tip = document.getElementById("tip");
-let tipKey = null;
-function showTip(key, x, y) {
-  if (!latest) return;
-  tipKey = key;
-  tip.innerHTML = tooltipHtml(key, latest);
-  tip.classList.add("on");
-  placeTip(x, y);
-}
-function placeTip(x, y) {
+// Put the tooltip above the pointer, or below it near the top, and keep it inside the window.
+function placeTipAt(tip, x, y) {
   const w = tip.offsetWidth, h = tip.offsetHeight;
   const left = Math.min(Math.max(8, x - w / 2), window.innerWidth - w - 8);
   const top = y - h - 14 < 8 ? y + 18 : y - h - 14;
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
 }
-function hideTip() { tipKey = null; tip.classList.remove("on"); }
-document.addEventListener("pointermove", (e) => {
-  const el = e.target.closest("[data-tip]");
-  if (e.pointerType !== "mouse") return;
-  if (el) showTip(el.dataset.tip, e.clientX, e.clientY); else if (tipKey) hideTip();
-});
-document.addEventListener("click", (e) => {
-  const el = e.target.closest("[data-tip]");
-  if (el && tipKey !== el.dataset.tip) showTip(el.dataset.tip, e.clientX, e.clientY); else hideTip();
-});
+const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
+const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
+// Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
+// content(key) gives the tooltip HTML, or "" for no tooltip.
+function hoverTips(tip, content) {
+  let shown = null;
+  const show = (key, x, y) => {
+    const html = content(key);
+    if (!html) return;
+    shown = key;
+    tip.innerHTML = html;
+    tip.classList.add("on");
+    placeTipAt(tip, x, y);
+  };
+  const hide = () => { shown = null; tip.classList.remove("on"); };
+  document.addEventListener("pointermove", (e) => {
+    const el = e.target.closest("[data-tip]");
+    if (e.pointerType !== "mouse") return;
+    if (el) show(el.dataset.tip, e.clientX, e.clientY); else if (shown) hide();
+  });
+  document.addEventListener("click", (e) => {
+    const el = e.target.closest("[data-tip]");
+    if (el && shown !== el.dataset.tip) show(el.dataset.tip, e.clientX, e.clientY); else hide();
+  });
+  return {show, hide, key: () => shown};
+}
+// shared:step-tip:end
+const tip = document.getElementById("tip");
+const tips = hoverTips(tip, key => latest ? tooltipHtml(key, latest) : "");
+const showTip = tips.show, hideTip = tips.hide;
+function placeTip(x, y) { placeTipAt(tip, x, y); }
 const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 const STALE = Math.max(15, SECONDS * 5);
 const $ = (id) => document.getElementById(id);
-const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
-const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
-
 function setSeg(id, value, total) {
   $(id).style.flex = `0 0 ${value / total * 100}%`;
 }
@@ -1004,7 +1020,7 @@ function captureReportView() {
     const bounds = element.getBoundingClientRect();
     return bounds.bottom > 0 && bounds.top < innerHeight;
   };
-  const tipRow = tipKey && document.querySelector(`.wrow[data-tip="${CSS.escape(tipKey)}"]`);
+  const tipRow = tips.key() && document.querySelector(`.wrow[data-tip="${CSS.escape(tips.key())}"]`);
   const focusedRow = active?.closest('.wrow, tr[data-tip]');
   const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
   const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
@@ -1019,6 +1035,7 @@ function restoreReportView(view) {
   if (view.focus) document.querySelector(view.focus)?.focus({preventScroll: true});
   const anchor = view.anchor && document.querySelector(view.anchor);
   if (anchor) window.scrollBy(0, anchor.getBoundingClientRect().top - view.top);
+  const tipKey = tips.key();
   if (tipKey) {
     if ((tipKey.startsWith('row:') || tipKey.startsWith('wait:')) && !stepRow(tipKey, latest)) {
       hideTip();

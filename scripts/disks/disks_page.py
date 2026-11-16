@@ -10,8 +10,9 @@ import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
+from scripts.build_queue import memory_files
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import page_frame, review_link
@@ -22,6 +23,9 @@ LOCK_FILE = "disks.lock"
 # The page posts to this name beside it to ask for a measure.
 MEASURE_NAME = "measure"
 NAME_KEY = "name."
+# The Builds page marks its step tooltip rules and code with these words; the Disks page uses both as they are.
+STEP_TIP_START = "shared:step-tip:start"
+STEP_TIP_END = "shared:step-tip:end"
 REPOSITORY = Path(__file__).resolve().parents[2]
 
 
@@ -37,8 +41,15 @@ class PageSettings(TypedDict):
     cache_seconds: int
     poll_seconds: int
     wait_seconds: int
-    sessions_shown: int
+    # The Builds page data file, relative to this page; a slot in use shows its step tooltip from it.
+    builds_data: str
+    builds_max_age_seconds: int
     names: dict[str, str]
+
+
+class StepTip(NamedTuple):
+    style: str
+    script: str
 
 
 def output_folder() -> Path:
@@ -53,13 +64,36 @@ def page_settings() -> PageSettings:
     return {"slider_min_gib": settings.number("slider.min_gib"), "slider_default_gib": settings.number("slider.default_gib"),
             "cache_seconds": settings.whole("cache_seconds"), "poll_seconds": settings.whole("page.poll_seconds"),
             "wait_seconds": settings.whole("measure.timeout_seconds") * len(drives),
-            "sessions_shown": settings.whole("page.sessions_shown"), "names": names}
+            "builds_data": builds_data_url(), "builds_max_age_seconds": settings.whole("page.builds_max_age_seconds"),
+            "names": names}
+
+
+def builds_data_url() -> str:
+    """The Builds page data file as a link from the Disks page folder; both folders are under the review root."""
+    builds = memory_files.configured_output_folder(conf.read("memory_feed")) / memory_files.DATA_NAME
+    return Path(os.path.relpath(builds, output_folder())).as_posix()
+
+
+def shared_step_tip(source: str) -> StepTip:
+    """The Builds page's step tooltip rules and code: the text between each start and end mark, rules first."""
+    parts: list[str] = []
+    at = 0
+    while (start := source.find(STEP_TIP_START, at)) >= 0:
+        body = source.index("\n", start) + 1
+        end = source.index(STEP_TIP_END, body)
+        parts.append(source[body:source.rindex("\n", 0, end) + 1])
+        at = end
+    if len(parts) != 2:
+        raise ValueError(f"the Builds page needs one marked rules part and one marked code part, not {len(parts)}")
+    return StepTip(parts[0], parts[1])
 
 
 def publish(folder: Path, settings: PageSettings) -> Path:
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding="utf-8")
+    tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
     # A '</' in a name must not end the script element.
     page = (source.replace("__PAGE_FRAME_STYLE__", page_frame.STYLE)
+            .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME

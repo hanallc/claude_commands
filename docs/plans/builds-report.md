@@ -1963,6 +1963,22 @@ As built:
 - Director calls: the names use the unit that runs the job ("natemerge integrate"), as the mockup shows. "test affected" has no module count; the Testing row shows it. An unknown command uses its program name as the step.
 - Tests: `test_memory_feed` (each gate command gives its job, description and changes; the feed puts them on running and waiting rows), `test_memory_hover` (the caption and Changes rows follow the title), `test_copies` (the lease names the step), `test_slots` and `test_disks_page` (Used by). `memory_page_proof.mjs` checks the gate tooltip and saves `gate-tooltip-dark-desktop.png`.
 
+#### diskpanels — Slots and Sessions get definitions and row tooltips; Sessions gets a size filter · status: done
+
+From the user (via sdlc and builds, 2026-11-16): "sessions and slots should show a hoverable definition of what they are and how they work / what they contain - every row should contain a tooltip that for slots should be the same tooltip that is shown in the build queue so they share code and data  sessions should show all sessions and have a filter that limits the minimum size - like disks". The showrunner's terms: reuse the Builds page slot tooltip code and data, with no copy; Sessions shows every session (it showed 10, then "24 more") with a minimum-size filter like the drive cards.
+
+As built:
+
+- Shared code: `memory_live.html` marks its tooltip rules and its tooltip code with `shared:step-tip:start` and `shared:step-tip:end`. The code part holds `field`, `tooltipRows`, `tooltipHtml`, a new `tipRowsHtml`, a new `placeTipAt` and a new `hoverTips`, which holds the hover and click handlers. The Builds page now calls `hoverTips`; `showTip`, `hideTip` and `placeTip` stay as names.
+- `disks_page.shared_step_tip` reads both marked parts from the Builds page source at publish. The Disks page puts the rules in its style and the code in one function, so the names of the two pages do not collide.
+- Shared data: each Builds row in a slot carries `slot_folder` and `slot_machine` beside `slot` (`memory_feed.build_slot`). The Disks settings carry `builds_data`, the link from the Disks folder to the Builds `memory.json`. The page reads it at start and at each poll interval while it shows.
+- `scripts/build_queue/memory_files.py` holds the Builds page source, its data file name and its output folder. The Disks publisher reads them without the 0.4 s import of `memory_feed`.
+- A held slot that a Builds step runs in shows that step's tooltip, the same HTML as on the Builds page. The Builds data must be newer than `page.builds_max_age_seconds` (30). Any other slot shows its name and state, repository, size, last use, its user and showrunner, and the nightly sweep note. A repository band shows its slot count, size, slots in use and limit.
+- The Slots and Sessions titles carry an info mark and a definition tooltip. The slot definition takes the sweep age from `slots.unused_days`; the slot report now carries `machine` and `unused_days`.
+- Sessions shows every session. A slider "Show sessions of at least" starts at "any size"; its other steps run on a log scale from the measure's least folder to the largest session. The smaller sessions join one row with its own tooltip. Each session row shows a tooltip with its state, size and held folders with their tasks. The card is built once, so a drag goes on across new data. When new data leaves the slider no range, the filter goes back to "any size".
+- `page.sessions_shown` is deleted from `config/disks.conf`.
+- Tests: `test_disks_page` (the published page holds the marked parts; the filter rows; the sessions card keeps its slider and limit across new data; the tooltip of each row kind, and a slot run tooltip equal to `tooltipHtml` of its Builds row on the right machine), `test_memory_feed` (`slot_folder` and `slot_machine`), `test_memory_hover`. A Chrome check on live data hovers each tooltip, checks that none is cut or outside the window, and saves the dark desktop shot.
+
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
 From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.

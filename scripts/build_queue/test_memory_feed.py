@@ -276,6 +276,9 @@ class MemoryFeedTests(unittest.TestCase):
                 rows = [row for row in page["walk"] if row.get("machine") == machine]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].get("slot"), expected)
+                # A run in a slot names the slot folder and its machine, so the Disks page finds the run.
+                self.assertEqual((rows[0].get("slot_folder"), rows[0].get("slot_machine")),
+                                 (folder.name, mac_machine if machine == "mac" else "natedev") if expected != "—" else (None, None))
                 payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
                 shown_rows = cast(list[dict[str, object]], payload["walk"])
                 self.assertEqual(next(row["slot"] for row in shown_rows if row["machine"] == machine), expected)
@@ -436,10 +439,9 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertEqual(len(ci_keys), 2)
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
-        constants = html[html.index("const f1 ="):html.index("function setSeg(")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
         escape = html[html.index("function esc("):html.index("let lastRead =")]
-        javascript = functions + constants + render + escape + """
+        javascript = functions + render + escape + """
 const elements = new Map();
 const $ = id => {
   if (!elements.has(id)) elements.set(id, {style:{}, classList:{toggle(){}}, innerHTML:""});

@@ -51,6 +51,7 @@ from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import OtherCommand, StepJob, StepNames, command_job, read_step_names
 from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, RunningServiceJob, ScopeProcesses
 from scripts.build_queue import admission_records, target_availability
+from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -175,11 +176,6 @@ class FeedConfiguration:
     stevie_program: Path
 
 
-def configured_output_folder(settings: conf.ConfigRead) -> Path:
-    """Expand the configured page folder."""
-    return Path(os.path.expandvars(settings.text("output_folder"))).expanduser()
-
-
 def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> FeedConfiguration:
     """Read the page settings from one configuration."""
     if isinstance(settings, conf.UseConfiguredValue):
@@ -223,7 +219,7 @@ def page_arguments(argv: Sequence[str]) -> PageArguments:
 def page_url() -> str:
     """Return the configured page URL without publishing a reading."""
     folder = configured_output_folder(conf.read("memory_feed")).resolve()
-    page = folder / "memory_live.html"
+    page = folder / PAGE_NAME
     url = review_link.snapshot_url(review_link.review_root().resolve(), page)
     if not page.is_file():
         raise FileNotFoundError(f"Builds page is not available: {page}")
@@ -243,10 +239,10 @@ def page_link() -> int:
 
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
+    source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
     page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
             .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
-    write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
+    write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
 def gib(value: object) -> float:
@@ -496,6 +492,8 @@ class RunRow(RowQueueNotes):
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     slot: NotRequired[int | Literal["—"]]
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
     tokens: NotRequired[int]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
@@ -651,6 +649,8 @@ class MacBuildRow(RowQueueNotes):
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
     slot: int | Literal["—"]
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
 
 
 class MacReadingUnavailableRow(RowQueueNotes):
@@ -1040,6 +1040,21 @@ def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, ho
     return int(match[1]) if match and run_folder.parent == configured else "—"
 
 
+class SlotNotes(TypedDict):
+    slot: int | Literal["—"]
+    # The slot folder's name and machine; the Disks page finds the run that holds a slot by them.
+    slot_folder: NotRequired[str]
+    slot_machine: NotRequired[str]
+
+
+def build_slot(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> SlotNotes:
+    """A run's slot number, and the slot folder and machine when the run is in a slot."""
+    number = build_slot_number(folder, machine, roots, home=home)
+    if number == "—":
+        return {"slot": number}
+    return {"slot": number, "slot_folder": Path(os.path.normpath(folder)).name, "slot_machine": machine}
+
+
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
                  identity: unit_labels.UnitLabels, *, names: StepNames,
                  slot_roots: Mapping[str, str], slot_machine: str) -> MacBuildRow:
@@ -1054,7 +1069,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
-            "slot": build_slot_number(build.folder, slot_machine, slot_roots, home=reading.home),
+            **build_slot(build.folder, slot_machine, slot_roots, home=reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
@@ -1969,9 +1984,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         walk.append({"name": name, **page_owner_labels(identity, ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
-                     "slot": build_slot_number(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
+                     **(build_slot(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
                         home=slot_homes.get(admission_records.execution_host(metadata, host_name()), ""))
-                        if metadata is not None else "—",
+                        if metadata is not None else SlotNotes(slot="—")),
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
@@ -2000,7 +2015,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
-                "slot": build_slot_number(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
+                **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
             continue
@@ -2255,7 +2270,7 @@ def main(argv: Sequence[str]) -> int:
         return page_link()
     configuration = read_configuration()
     publish_page(configuration)
-    target = configuration.output_folder / "memory.json"
+    target = configuration.output_folder / DATA_NAME
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
     report_version = ""
     next_report_at = 0.0
