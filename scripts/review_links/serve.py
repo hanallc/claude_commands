@@ -7,6 +7,9 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections import deque
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 import html
 import ipaddress
 import json
@@ -36,6 +39,62 @@ from scripts.review_links.review_link import private_name
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
+
+
+@dataclass
+class AccountsPageCache:
+    """Keep the last good page and allow one render at a time."""
+
+    page: bytes = b""
+    recent_times: deque[float] = field(default_factory=lambda: deque(maxlen=10))
+    rendering: bool = False
+    first_render: Future[bytes] = field(default_factory=Future[bytes])
+    condition: threading.Condition = field(default_factory=threading.Condition)
+
+    def get(self) -> bytes:
+        render_first = False
+        with self.condition:
+            if self.page:
+                if not self.rendering:
+                    self.rendering = True
+                    try:
+                        threading.Thread(target=self.replace, daemon=True).start()
+                    except RuntimeError:
+                        self.rendering = False
+                        raise
+                return self.page
+            if not self.rendering:
+                self.first_render = Future[bytes]()
+                self.rendering = True
+                render_first = True
+            attempt = self.first_render
+        if render_first:
+            try:
+                page = self.replace()
+            except BaseException as error:
+                attempt.set_exception(error)
+                raise
+            attempt.set_result(page)
+            return page
+        return attempt.result()
+
+    def replace(self) -> bytes:
+        try:
+            rendered = accounts_page.render_with_facts()
+            with self.condition:
+                self.recent_times.append(rendered.seconds)
+                self.page = rendered.with_recent_times(tuple(self.recent_times))
+                return self.page
+        except (OSError, ValueError) as error:
+            with self.condition:
+                if not self.page:
+                    raise
+                print(f"review-links accounts: {error}", file=sys.stderr)
+                return self.page
+        finally:
+            with self.condition:
+                self.rendering = False
+                self.condition.notify_all()
 
 
 class TailscaleAddressLost(RuntimeError):
@@ -202,7 +261,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return BytesIO(content)
         if route.path == accounts_page.PAGE_PATH:
             try:
-                content = accounts_page.render()
+                content = cast(ReviewLinksServer, self.server).accounts_cache.get()
             except (OSError, ValueError) as error:
                 print(f"review-links accounts: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
@@ -569,6 +628,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
+        self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")

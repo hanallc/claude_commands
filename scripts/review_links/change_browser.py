@@ -681,11 +681,11 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
 const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
-let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
+let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
@@ -786,7 +786,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
   else applyHeldPage();
  }
 }
@@ -820,12 +820,10 @@ function applyHeldPage(){
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
  const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
- window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
+ window.scrollTo({left,top,behavior:'instant'});pageRefresh.restart();
 }
-// A console frame that another page covers is hidden and loads no update.
-const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 async function refreshPage(supersede=false){
- if(paused() || (activeLoads && !supersede)) return;
+ if(activeLoads && !supersede) return;
  const request=++newestRequest;
  activeLoads++;
  try{
@@ -837,15 +835,10 @@ async function refreshPage(supersede=false){
  }catch(error){}
  finally{activeLoads--;}
 }
-function scheduleRefresh(){
- clearInterval(refreshTimer);
- if(document.visibilityState==='visible') refreshTimer=setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000);
-}
+const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds);
 document.addEventListener('input',()=>applyHeldPage());
-document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
-window.addEventListener('message',event=>{if(event.source===parent && event.origin===location.origin && event.data==='console-shown') refreshPage(true);});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
-bindPage();show();scheduleRefresh();
+bindPage();show();
 '''
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
                                           + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)

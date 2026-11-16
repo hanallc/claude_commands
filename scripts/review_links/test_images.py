@@ -185,6 +185,8 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
+        self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
+        self.assertIn("createPageRefresh(refresh);", source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)

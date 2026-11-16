@@ -337,17 +337,32 @@ Answers to questions and changes both post to `changes.html`.
 
 `/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server renders it for each request in a child process (`accounts_page.py`).
+The server keeps the last good page and its render times under one lock.
+The first request waits for a render in a child process (`accounts_page.py`).
+A later request returns the kept page at once and starts one background render.
+A request during a render returns the kept page and starts no second render.
+Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
-A failed or late render gives 503 with **The Accounts page is not available.**
+A failed or late first render gives 503 with **The Accounts page is not available.**
+A failed background render keeps the last good page and writes one line to stderr.
+Failed renders add no render time.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
 - The page reads the stored usage only, as `accounts.py status --stored` does.
 
 The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
-It refreshes when the console shows it again and when the tab becomes visible.
+It refreshes every 15 seconds through `page_refresh_seconds` while the page is visible.
+It also refreshes when the console shows it again and when the tab becomes visible.
+Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
+Images has no interval timer.
+
+The line under the Accounts title shows the data age in whole seconds and the browser wait in seconds.
+It then shows the last render time and the median of at most 10 successful renders.
+The browser computes the data age from the render finish time and clamps negative ages to zero.
+The browser measures the first wait from request start to response end in its navigation entry.
+For a refresh, it measures the wait around `fetch` and the response body read.
 
 ### Images page
 
