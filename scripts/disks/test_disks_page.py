@@ -45,13 +45,20 @@ class DisksPageTests(unittest.TestCase):
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
 
-    def test_rows_fold_small_folders_and_show_one_small_folder_by_name(self) -> None:
+    def test_the_size_filter_names_top_folders_only_and_other_opens_to_list_the_rest(self) -> None:
+        # The user, 11-16: the size filter is for the top level only; the Other row opens.
         rows = self.rows(10 * GIB, ["/build/cargo"])
         self.assertEqual([(row["name"], row["depth"], row["kind"]) for row in rows], [
-            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("Other · 2 folders and files", 1, "other"),
-            ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"), ("Files and small folders", 0, "other")])
-        other = rows[3]
-        self.assertEqual((other["size"], other["parentSize"], other["start"]), (10 * GIB, 60 * GIB, 50 * GIB))
+            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("slot3", 1, "leaf"), ("slot4", 1, "leaf"),
+            ("Files and small folders", 1, "files"), ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"),
+            ("Files and small folders", 0, "files")])
+        rows = self.rows(31 * GIB, ["other:/build", "/build/paths"])
+        self.assertEqual([(row["name"], row["depth"], row["kind"], cast(int, row["size"]) // GIB, cast(int, row["parentSize"]) // GIB,
+                           cast(int, row["start"]) // GIB)
+                          for row in rows], [
+            ("/build/cargo", 0, "shut", 60, 100, 0), ("Other · 2 folders and files", 0, "open", 40, 100, 60),
+            ("/build/paths", 1, "open", 30, 40, 60), ("home", 2, "leaf", 2, 30, 60), ("Files and small folders", 2, "files", 28, 30, 62),
+            ("/build/small", 1, "leaf", 3, 40, 90), ("Files and small folders", 1, "files", 7, 40, 93)])
 
     def test_each_row_starts_where_the_row_before_it_ends_inside_its_parent(self) -> None:
         rows = self.rows(GIB, ["/build/cargo", "/build/cargo/slot1"])
@@ -172,16 +179,47 @@ class DisksPageTests(unittest.TestCase):
             const rows = () => body().innerHTML.split("<tr").length - 1;
             const shut = rows();
             body().fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
-            const opened = rows();
-            slider.value = "0";
+            const afterToggle = rows();
+            slider.value = "1000";
             slider.fire("input");
             update({...drive, free: 90 * GIB});
             result = {writes: card.writes, sameSlider: card.querySelector("input") === slider, output: card.querySelector("output").textContent,
-                      rows: [shut, opened, rows()]};
+                      rows: [shut, afterToggle, rows()]};
         """))
-        self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "1.0 GiB", "rows": [4, 7, 9]})
+        self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "60 GiB", "rows": [4, 9, 7]})
 
-    def run_drive(self, script: str) -> object:
+    def test_open_rows_stay_open_across_a_reload_until_their_folder_or_repository_is_gone(self) -> None:
+        # The user, 11-16: "disks should start out collapsed and should remember it's collapse points as long as they are
+        # still valid between data updates and page refreshes".
+        load = """
+            const card = new Element();
+            data = {keep_bytes: KEEP, drives: [{mount: "/build", tree: input.tree, total: 200 * GIB, used: 100 * GIB, free: 100 * GIB, floor: null}]};
+            driveView(card)(data.drives[0]);
+            const shown = () => [...card.querySelector("tbody").innerHTML.matchAll(/aria-expanded="true" data-path="([^"]*)"/g)].map(m => m[1]);
+        """
+        first = cast(dict[str, object], self.run_drive(load + """
+            const closed = shown();
+            card.querySelector("tbody").fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
+            toggleOpen(opened.groups, "hana");
+            result = {closed, open: shown(), storage: localStorage.getItem(OPEN_KEY)};
+        """))
+        self.assertEqual((first["closed"], first["open"]), ([], ["/build/cargo"]))
+        second = cast(dict[str, object], self.run_drive(load + """
+            const reloaded = shown();
+            slotReport = {groups: [{repository: "cargo-liner", slots: []}]};
+            data.drives[0].tree = {...input.tree, children: input.tree.children.filter(child => child.name !== "cargo")};
+            forgetGone();
+            result = {reloaded, storage: JSON.parse(localStorage.getItem(OPEN_KEY))};
+        """, storage=cast(str, first["storage"])))
+        self.assertEqual(second, {"reloaded": ["/build/cargo"], "storage": {"folders": [], "groups": []}})
+        # A joined name, a folder named "|other", and a gone folder on a drive inside a drive with no tree.
+        drives = [{"mount": "/", "tree": None},
+                  {"mount": "/build", "tree": folder("/build", 2 * GIB, [folder("cargo/project", GIB), folder("|other", GIB)])}]
+        paths = ["/build/cargo/project", "/build/|other", "other:/build", "/build/gone", "/home/kept", "other:/"]
+        kept = self.run_page(f"[...knownFolders({json.dumps(drives)}, {json.dumps(paths)})]")
+        self.assertEqual(kept, ["/build/cargo/project", "/build/|other", "other:/build", "/home/kept", "other:/"])
+
+    def run_drive(self, script: str, storage: str | None = None) -> object:
         """Run driveView on a fake document: each element counts its innerHTML writes and keeps its listeners."""
         html = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
         functions = html[html.index("const GIB ="):html.index("function renderStatus")]
@@ -201,11 +239,13 @@ class DisksPageTests(unittest.TestCase):
             }
             const document = {activeElement: null, getElementById: () => ({textContent: JSON.stringify(input.settings)})};
             const CSS = {escape: text => text};
+            const saved = new Map(input.storage == null ? [] : [["disks-open", input.storage]]);
+            const localStorage = {getItem: key => saved.has(key) ? saved.get(key) : null, setItem: (key, value) => saved.set(key, value)};
             let result = null;
         """)
         javascript = fake + functions + script + "\nprocess.stdout.write(JSON.stringify(result));\n"
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP}),
+        completed = subprocess.run([executable, "-e", javascript], input=json.dumps({"tree": TREE, "settings": SETTINGS, "keep": KEEP, "storage": storage}),
                                    text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         return cast(object, json.loads(completed.stdout))

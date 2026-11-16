@@ -1903,6 +1903,39 @@ As built:
 - A repository band has an accent-tinted background, a bold name and the count and size; its slot rows are indented.
 - Tests: `test_disks_page` runs `driveView` on a fake document and checks one card write, the same slider after a step and new data, and the rows after a toggle and a slider step; it fails on the old page. The slot test checks the folded and open bands. Chrome check: a drag across the slider now ends at its far end; after new data the slider, the focused row and the open band stay.
 
+#### disksmemo — rows start closed and stay as the viewer left them; the filter names top folders only
+
+From the user (via builds, 2026-11-16): "disks should start out collapsed and should remember it's collapse points as long as they are still valid between data updates and page refreshes". Later: "1. the slider doesn't drag - you can only just click on the background - that needs to be fixed 2. the folder of at least size is a filter for the top level only - everything under the top level can always be expanded out 3. the other (now only showing on top level) should also be expandable".
+
+As built:
+
+- Every folder row and every repository band starts closed.
+- `localStorage` key `disks-open` holds the open folder paths and the open repository names. A reload and new data keep them. `forgetGone` drops a folder path that the tree no longer has and a repository that the slot report no longer has. A drive with no tree keeps its paths.
+- The slider names top folders only. An open folder lists every child, and its small files show as one "Files and small folders" row.
+- The top-level Other row opens and lists the top folders under the slider value. Its key is `other:<mount>`; a folder path starts with "/", so no folder has this key.
+- `knownFolders` walks each tree as `folderRows` does, so a joined name such as `cargo/project` stays known. The drive with the longest mount owns a path.
+- Slider: a drag works in Chrome and Firefox, on the page alone and inside the console frame. The user's failure did not show on natedev. These changes guard it: the label is a `div`, so a press on the text does not move the thumb; the ends and the value have fixed widths, so the track does not change size during a drag; the value is written only when it changes.
+- Tests: `test_disks_page` checks that only top folders are filtered and that Other opens, and that open rows stay across a reload until their folder or repository is gone, with rows for a joined name, a folder named `|other` and a drive inside a drive with no tree. Both fail on the old page.
+
+#### gatenames — gate steps get readable names and a description (#108, #109, #97) · status: next
+
+The user approved mockup version 2 at 13:58 EST on 2026-11-16 (`~/rust/hanadocs/morty/gate-tooltip-mockup-v2.png`). Use "integrate" for "land" and "test nightly" for "nightly". Promote gets no step.
+
+| Step name | Description in the tooltip | Changes | Called today as |
+| --- | --- | --- | --- |
+| integrate | Merges the `<unit>` checkpoint into the `<showrunner>` branch, tests every module, then pushes `<showrunner>`. | branch `<showrunner>` | `merge_gate.py --checkpoint` |
+| test all | Tests every module of `<unit>`. | no branch | `merge_gate.py --tests-only --full` |
+| test modules | Tests `<N>` named modules of `<unit>`. | no branch | `merge_gate.py --tests-only --module X` |
+| test affected | Tests the `<N>` modules that the `<unit>` change affects. | no branch | `targeted_test.py` |
+| test nightly | Tests the `<showrunner>` branch each night and records a red result with its owner. | no branch | `merge_gate.py --nightly` |
+
+1. The row name is "`<unit>` `<step>`". The tooltip title is "`<unit>` · `<step>`".
+2. Under the title the tooltip shows the description, then a "Changes" row, then the rows it shows today.
+3. The names and description templates live in config, not in code.
+4. The feed reads the job from the pid's command line. The queue does not change.
+5. A `--promote` run shows integrate only.
+6. Disks "Used by" (#97) uses the same name source: "`<unit>` `<step>`", for example "handler integrate".
+
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
 From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
