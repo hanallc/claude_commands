@@ -236,8 +236,7 @@ NO_MERGE = NoMerge()
 
 def staged_tree(source: Path) -> str:
     """Read the staged tree without changing the source index."""
-    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["copies-index"])) as temporary:
+    with build_folders.tool_folder("copies-index") as temporary:
         index = Path(git(source, "rev-parse", "--path-format=absolute", "--git-path", "index").decode().strip())
         private = temporary / "index"
         if index.exists():

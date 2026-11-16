@@ -22,6 +22,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
@@ -124,7 +125,7 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         self.environment["TEST_FAIL_RECORDER"] = failure
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
-            + shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
                               "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
                               "buildlog_memory_event")
             + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
@@ -352,7 +353,7 @@ exec "$TEST_REAL_PYTHON" "$@"
         recorded_count = len(wait_rows(self.root / "session"))
         script = self.root / "identity-wait.sh"
         _ = script.write_text('set -euo pipefail\n' + shell_functions(
-            VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
+            VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
 PY=$TEST_IDENTITY_ROOT/identity-python
 PHASE_WAIT_SESSION=$TEST_IDENTITY_ROOT/session
 PHASE_WAIT_RECORDER=$1
@@ -518,7 +519,7 @@ class VerifyHoldHolderTests(RecordedHoldWaitFixture):
         script = self.fixture.root / "held-step.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "step_state", "publish_step_state", "phase_wait_holder_flags",
+            + shell_functions(VERIFY, "verify_helper", "step_state", "publish_step_state", "phase_wait_holder_flags",
                               "phase_wait_start", "phase_wait_finish", "build_hold_wait_local") + '''
 PY=$TEST_REAL_PYTHON
 PHASE_WAIT_RECORDER=$2 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
@@ -840,13 +841,12 @@ class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
         def observe(request: wire.Request,
                     connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             if isinstance(request, wire.PlacementRequest):
-                for path in Path(self.fixture.environment["TMPDIR"]).glob(
-                        f"verify-hold.{request.owner.pid}.*/placement-*.json.wait"):
+                holds = tool_folders(Path(self.fixture.environment["TMPDIR"]), "verify", pid=request.owner.pid)
+                for path in (wait for hold in holds for wait in hold.glob("placement-*.json.wait")):
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                     if isinstance(notice.last_reply, wire.Wait):
                         _ = controls.hosts.pop("mac", None)
-                first, = Path(self.fixture.environment["TMPDIR"]).glob(
-                    f"verify-hold.{request.owner.pid}.*/first-queued-at")
+                first, = (hold / "first-queued-at" for hold in holds if (hold / "first-queued-at").exists())
                 with (self.fixture.root / "memory-joins.jsonl").open("a") as output:
                     _ = output.write(json.dumps({"since": str(request.since).removesuffix(".0"),
                         "first": first.read_text()}) + "\n")

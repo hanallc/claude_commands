@@ -94,12 +94,12 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for AWS, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -160,8 +160,8 @@ The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for
 `change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
-The AWS prices entry calls `aws_page.page_url`.
-That function returns the AWS prices page URL without publishing the page.
+The AWS entry calls `aws_page.page_url`.
+That function returns the AWS page URL without publishing the page.
 
 The bottom-left rebuild link shows only while the Rebuilds page names a machine.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
@@ -282,8 +282,8 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 A question stored as one text, from before the parts form, shows in sections too:
 
 1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
-2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
-3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+2. The title uses the first reviewed line when that line contains `?`. Otherwise, it uses that line's first sentence. For raw text, the title uses the first sentence that ends with `?`.
+3. For reviewed text, the body starts with the rest of the first line and excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
 4. A raw question stored on one line shows each context sentence as a separate paragraph.
 5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
 6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
@@ -295,6 +295,9 @@ In all question text, each `http` or `https` address is a link that opens in the
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
 An item that is only one backtick span, such as a command, shows as a code block.
+A fenced block or a backtick-only line after an item ending with `:` stays inside that item.
+The code block gets no separate number in either the parts form or the one-text form.
+Numbers inside code do not affect the item numbers.
 The form of a new question is in `~/.claude/docs/question_template.md`.
 The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
 Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
@@ -1004,3 +1007,29 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+
+Changes, Questions, and Images share one motion helper.
+A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
+A new switch completes the active switch first.
+The first load and an update that keeps the same card do not fade.
+A new card above the viewport scrolls into view smoothly.
+Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
+Other image cards stay visible.
+An image fades before removal, and the cards below close the gap over 270ms.
+Reduced motion disables fades and uses instant scrolling.
+
+Question items and change rows show a Lucide copy button inside the top right of each code block.
+Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
+This applies to the How to check cell and the Proof cell.
+The shared renderer emits each code block with its button.
+Plain proof text keeps its `<pre>` block without a copy button.
+Inline code keeps its current style.
+The button copies the code text without the button or its label.
+The button shows a check and the label “Copied” for two seconds after success.
+A second click starts the two seconds again.
+A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
+The shared script uses the clipboard API when available.
+Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
+The fallback restores focus and the previous selection.
+One document listener also handles code blocks from page updates.

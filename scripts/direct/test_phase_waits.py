@@ -1,4 +1,4 @@
-"""Open waits in a phase instance feed the Units report Notes."""
+"""Open waits keep their task, resource, holder, and start time."""
 from __future__ import annotations
 
 import unittest
@@ -11,6 +11,8 @@ class PhaseWaitsTests(unittest.TestCase):
         events: list[dict[str, object]] = [
             {"event_type": "wait_started", "phase_instance_id": "eight", "pass_instance_id": "repair",
              "wait_id": "worker", "wait_reason": "memory admission", "wait_started_epoch": 1_000,
+             "wait_kind": "memory", "owner_session": "director-session",
+             "wait_attribution": {"actor": "test worker", "command": "release build"},
              "holder": {"state": "HolderNotNamed", "reason": "producer named no holder"}},
             {"event_type": "wait_started", "phase_instance_id": "ten", "wait_id": "unrelated",
              "wait_reason": "build queue", "wait_started_epoch": 900},
@@ -22,6 +24,10 @@ class PhaseWaitsTests(unittest.TestCase):
         waits = phase_waits.phase_waits(events, "eight")
         self.assertEqual([(wait.reason, wait.started) for wait in waits],
                          [("memory admission", 1_000), ("build queue", 1_050)])
+        self.assertEqual((waits[0].wait_kind, waits[0].pass_instance_id, waits[0].owner_session),
+                         ("memory", "repair", "director-session"))
+        self.assertEqual(waits[0].wait_attribution, {"actor": "test worker", "command": "release build"})
+        self.assertEqual((waits[1].resource_kind, waits[1].resource), ("slot", "build"))
         self.assertIsInstance(waits[0].holder, phase_waits.UnnamedWaitHolder)
         self.assertIsInstance(waits[1].holder, phase_waits.NamedWaitHolder)
         assert isinstance(waits[1].holder, phase_waits.NamedWaitHolder)
@@ -33,11 +39,18 @@ class PhaseWaitsTests(unittest.TestCase):
         self.assertIsInstance(waits[0].holder, phase_waits.NamedWaitHolder)
         assert isinstance(waits[0].holder, phase_waits.NamedWaitHolder)
         self.assertIn("builder-session", waits[0].holder.label)
+        self.assertEqual((waits[0].started, waits[0].resource_kind, waits[0].resource), (1_000, "slot", "memory"))
+        self.assertEqual((waits[0].pass_instance_id, waits[0].owner_session), ("repair", "director-session"))
+        self.assertEqual(waits[0].wait_attribution, {"actor": "test worker", "command": "release build"})
         events.extend([
             {"event_type": "wait_finished", "phase_instance_id": "eight", "wait_id": "worker"},
             {"event_type": "wait_unclosed", "phase_instance_id": "eight", "wait_id": "director"},
         ])
         self.assertEqual(phase_waits.phase_waits(events, "eight"), [])
+        for kind, fields in (("pass_finished", {"pass_instance_id": "repair"}),
+                             ("phase_finished", {"phase_instance_id": "eight"}), ("run_finished", {})):
+            with self.subTest(finish=kind):
+                self.assertEqual(phase_waits.phase_waits([events[0], {"event_type": kind, **fields}], "eight"), [])
 
 
 if __name__ == "__main__":

@@ -327,7 +327,7 @@ try {
                 machine:table.querySelector('td.machine')?.textContent,
                 capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
-                reportPoints:[...document.querySelectorAll('#history-charts svg circle')].map(point=>({
+                reportPoints:[...document.querySelectorAll('#history-charts svg circle')].filter(point=>point.getClientRects().length&&!point.closest('details:not([open])')).map(point=>({
                   box:rect(point),color:getComputedStyle(point).fill})),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
@@ -374,11 +374,13 @@ try {
             assert.match(proof.leftover,/pid 46/);
             assert.ok(!/pid (70|80)\b/.test(proof.leftover), 'The leftover list includes a live build or compiler service.');
             assert.equal(proof.historyWindow,'Oct 31, 2026 – Nov 7, 2026 · America/New_York');
-            assert.match(proof.costWindow,/^Nov 4, 2026 – Nov 7, 2026 · America\/New_York/);
+            assert.match(proof.costWindow,/^Last 3 days: Nov 4, 2026 – Nov 7, 2026 · America\/New_York/);
             assert.equal(proof.pressureReason,'Pressure is unreadable: /private/proc/pressure/memory');
             assert.ok(proof.charts > 0, 'The history section has no chart.');
             assert.match(proof.top, /Memory wait/);
-            assert.match(proof.top, /fixture-owner/);
+            assert.match(proof.top, /Memory wait on fixture: /);
+            assert.match(proof.top, /fixture nextest paid 75% of it\./);
+            assert.match(proof.top, /Action: lower the memory peak of fixture nextest\./);
             assert.ok(proof.progress && proof.progress.width > 0, 'The progress line is absent.');
             assert.ok(proof.progress.height <= 3, 'The progress line is too thick.');
             assert.ok(proof.progress.right <= proof.capLine.left + 1, 'The progress line crosses the cap.');
@@ -496,6 +498,7 @@ try {
               document.querySelector('#history-cause').value='Cold rebuilds';
               const unit=document.querySelector('#history-unit');
               unit.value='perPhase';unit.dispatchEvent(new Event('change'));
+              document.querySelector('#history-details').open=true;
               for(const table of document.querySelectorAll('#history-plots details')) table.open=true;
               window.proofControl=unit;
               window.proofTable=document.querySelector('#history-plots details');
@@ -511,12 +514,12 @@ try {
             await show(updatedReport);
             const changedReport=await evaluate(`({machine:document.querySelector('#history-machine').value,
               cause:document.querySelector('#history-cause').value,unit:document.querySelector('#history-unit').value,
-              open:[...document.querySelectorAll('#history-plots details')].every(table=>table.open)})`);
+              open:[...document.querySelectorAll('#history-details, #history-plots details')].every(table=>table.open)})`);
             assert.deepEqual(changedReport,{machine:'fixture',cause:'Cold rebuilds',unit:'perPhase',open:true},
               'New report data loses the report choices or open tables.');
             proof.reportRefresh={sameReport,changedReport};
             await evaluate(`(() => {
-              for(const table of document.querySelectorAll('#history-plots details')) table.open=false;
+              for(const table of document.querySelectorAll('#history-details, #history-plots details')) table.open=false;
               document.querySelector('#history-machine').value='';
               document.querySelector('#history-cause').selectedIndex=0;
               const unit=document.querySelector('#history-unit');unit.value='daily';
@@ -599,6 +602,12 @@ try {
                 machine:running?.querySelector('.machine')?.textContent,
                 place:waiting?.querySelector('.place')?.textContent,
                 waitingMachine:waiting?.querySelector('.machine')?.textContent,
+                localWaiting:(() => {const index=latest.waiters.findIndex(row=>row.kind!=='cloud');
+                  return index<0?null:{shown:table.querySelector('tr[data-tip="wait:'+index+'"] .machine')?.textContent,
+                    targets:(latest.waiters[index].targets||[]).join(' or ')};})(),
+                beside:document.querySelector('#walk').classList.contains('beside'),
+                statusHeight:runningDetails?.querySelector('.amounts')?.getBoundingClientRect().height,
+                statusLine:parseFloat(getComputedStyle(runningDetails?.querySelector('.amounts')||document.body).lineHeight),
                 waitingVcpus:waiting?.querySelector('.vcpus')?.textContent,
                 vcpus:running?.querySelector('.vcpus')?.textContent,
                 cloudCard:!!document.querySelector('#cloud'),
@@ -637,7 +646,13 @@ try {
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
             assert.ok(cloudProof.tipsMatch,'The cloud hover keys differ from the local row keys.');
             assert.equal(cloudProof.place,'cloud');
-            assert.equal(cloudProof.waitingMachine,'');
+            assert.equal(cloudProof.waitingMachine,'aws');
+            // The user, 11-15: a queued row names the machines that can take it in the Target column.
+            assert.ok(cloudProof.localWaiting && cloudProof.localWaiting.targets,'The fixture has no local waiting row with targets.');
+            assert.equal(cloudProof.localWaiting.shown,cloudProof.localWaiting.targets);
+            // The user, 11-15: a cloud status wraps one letter to a line when its room before the cap is narrow.
+            // A stacked chart gives the status the full card width.
+            if(cloudProof.beside) assert.ok(cloudProof.statusHeight<=2*cloudProof.statusLine+1,'The cloud status takes more than two lines: '+cloudProof.statusHeight+' at '+width+' px.');
             assert.equal(cloudProof.waitingVcpus,'');
             assert.match(cloudProof.waiting,/waits for a cloud slot: 1 of 1 in use/);
             assert.match(cloudProof.slots,/can run on: AWS \(natedev only when AWS cannot start the gate\)/);
@@ -1031,10 +1046,14 @@ try {
                   const legend=document.querySelector('.legend-box').getBoundingClientRect();
                   const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
                   showTip('wait:0',card.right-140,row.top);
-                  placeTip(card.right-140,legend.top+document.querySelector('#tip').offsetHeight+50);
-                  const tip=document.querySelector('#tip').getBoundingClientRect();
-                  const groups=[...document.querySelectorAll('.legend-group')];
-                  if(groups.some(group=>group.getBoundingClientRect().right>tip.left)) {
+                  const popup=document.querySelector('#tip');
+                  const groups=[...document.querySelectorAll('.legend-group')].map(group=>group.getBoundingClientRect());
+                  const legendRight=Math.max(...groups.map(group=>group.right));
+                  const beside=card.right-legendRight>=popup.offsetWidth+24;
+                  const top=beside?legend.top+36:Math.max(...groups.map(group=>group.bottom))+18;
+                  placeTip(card.right-popup.offsetWidth/2-8,top+popup.offsetHeight+14);
+                  const tip=popup.getBoundingClientRect();
+                  if(groups.some(group=>group.left<tip.right&&group.right>tip.left&&group.top<tip.bottom&&group.bottom>tip.top)) {
                     throw new Error('The head tooltip covers a legend group.');
                   }
                   return {x:card.left,y:card.top+scrollY,width:card.width,
@@ -1071,6 +1090,14 @@ try {
                 assert.match(state.top,/no data yet/i);
                 assert.match(state.top,/2026/);
               }
+            }
+            for (const [name,line] of [['unrecorded_report',/Shown from the first phase that ends with a wait record\. Earlier phases have no wait record\./],
+                ['startless_report',/Hana phases ended in this range, but none has a valid start time\./]]) {
+              await show(readings[name]);
+              const phaseTime=await evaluate(`({text:document.querySelector('#history-phase').textContent,
+                plots:document.querySelectorAll('#history-phase svg, #history-phase details').length})`);
+              assert.equal(phaseTime.plots,0,'A phase time plot without measured days shows a plot or a table.');
+              assert.match(phaseTime.text,line);
             }
             await show(readings.shrink);
             assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);

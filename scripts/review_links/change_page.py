@@ -452,7 +452,7 @@ section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
 button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + "</script></body></html>").encode("utf-8")
+</style><style>''' + page_frame.COPY_STYLE + '''</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + page_frame.COPY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
@@ -573,6 +573,24 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p", *, inline: boo
     return "".join(content)
 
 
+def check_html(text: str) -> str:
+    """Render check text with copy controls for code blocks."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(review_text_html(before, "pre"))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    if not content:
+        return review_text_html(text, "pre")
+    after = text[start:]
+    if after.strip():
+        content.append(review_text_html(after, "pre"))
+    return "".join(content)
+
+
 def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
     if isinstance(question, NoQuestion):
         return ""
@@ -665,7 +683,7 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
-<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
+<h2>{proof_title}</h2>{check_html(row[change_review.CHECK])}
 {question_html(question)}{answer}
 {change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')

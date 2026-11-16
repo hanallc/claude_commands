@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
 from scripts.production import staff
 from scripts.lib import transcripts, unit_runs  # noqa: E402
@@ -54,6 +54,8 @@ class PlanPhase(TypedDict):
     id: str
     title: str
     done: bool
+    waits_for: NotRequired[str]
+    depends_on: NotRequired[tuple[str, ...]]
 
 
 class EtaBand(NamedTuple):
@@ -74,6 +76,7 @@ class HistorySnapshot:
 
     record: staff.StaffSnapshot
     events: dict[Path, list[dict[str, object]]] = field(default_factory=dict)
+    plans: dict[Path, tuple[list[PlanPhase], list[str]]] = field(default_factory=dict)
 
     @cached_property
     def starts(self) -> list[tuple[Path, dict[str, object]]]:
@@ -162,12 +165,17 @@ def plan_member(plan_path: Path, *, resolver: session_staff.RowResolver | None =
 
 
 def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
+    """Read phase headings and their recorded waits from one plan read."""
+    snapshot = _history_snapshot.get()
+    if isinstance(snapshot, HistorySnapshot) and plan_path in snapshot.plans:
+        return snapshot.plans[plan_path]
     text = plan_path.read_text(encoding="utf-8")
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
-    headings = list(PHASE_HEADING_PATTERN.finditer(text))
-    for match in headings:
+    headings = [match for match in PHASE_HEADING_PATTERN.finditer(text)
+                if PHASE_STATUS_PATTERN.search(match.group("rest")) or PHASE_TITLE_PATTERN.match(match.group("rest"))]
+    for index, match in enumerate(headings):
         rest = match.group("rest")
         status_match = PHASE_STATUS_PATTERN.search(rest)
         # `### Phase 12 Review` and its like are sections, not phases.
@@ -188,13 +196,17 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         # No status marker means the phase was shrunk into its as-built record,
         # which only happens after the phase completed.
         done = status_match is None or status_match.group("status") == "done"
-        phases.append(
-            PlanPhase(
-                id=identifier,
-                title=title,
-                done=done,
-            )
-        )
+        phase = PlanPhase(id=identifier, title=title, done=done)
+        section = text[match.end():headings[index + 1].start() if index + 1 < len(headings) else len(text)]
+        waits = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Waits for:\*\*[ \t]*(.+)$", section)
+        depends = re.search(r"(?im)^[ \t]*(?:[-*][ \t]+)?\*\*Depends on:\*\*[ \t]*(.+)$", section)
+        if waits:
+            phase["waits_for"] = waits.group(1).strip()
+        if depends:
+            phase["depends_on"] = tuple(re.findall(r"\b(\d+[a-z]?)\b", depends.group(1), re.IGNORECASE))
+        phases.append(phase)
+    if isinstance(snapshot, HistorySnapshot):
+        snapshot.plans[plan_path] = (phases, duplicates)
     return phases, duplicates
 
 

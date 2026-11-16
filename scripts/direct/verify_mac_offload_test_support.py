@@ -5,11 +5,13 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lib.build_folders_test_support import tool_folders
 
 import json
 import os
@@ -1124,6 +1126,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
@@ -1630,7 +1633,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         from scripts.build_queue import admission_client
 
         def delivered() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+            for path in (wait for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for wait in hold.glob("placement-*.json.wait")):
                 try:
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                 except (OSError, ValueError):
@@ -1691,7 +1695,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                   for saved in admission.server.assignments.values()),
                         "a settled remote attempt", (process,))
         def delivered_retry_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):

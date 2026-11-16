@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import unittest
-import os
-import tempfile
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
-from typing import cast, override
 
 from scripts.build_queue import target_availability
 from scripts.build_queue.admission_records import PackageNotRecorded
-from scripts.build_targets import build_targets, targets
+from scripts.build_targets import build_targets, targets, target_config
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalTarget, SshTarget
-from scripts.mac_test import eligibility
+from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.message import unit_labels
-from scripts.direct import step_record
 from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
 
 MAC = SshTarget("mac", "macos", Path("/fixture/mac.conf"))
@@ -35,8 +32,28 @@ def held(holder: str, session: str, *, since: datetime | targets.StartNotRecorde
 
 
 def snapshot(target: SshTarget | LocalTarget, *states: targets.TargetState,
-             backoff: eligibility.BackoffState = eligibility.NO_BACKOFF) -> targets.TargetSnapshot:
-    return targets.TargetSnapshot(target, states, (), backoff)
+             backoff: eligibility.BackoffState = eligibility.NO_BACKOFF,
+             claims: tuple[mac_test.HeldClaim, ...] = ()) -> targets.TargetSnapshot:
+    return targets.TargetSnapshot(target, states, claims, backoff)
+
+
+def claim(scope: claim_state.ClaimScope, what: str) -> mac_test.HeldClaim:
+    record: claim_state.ProcessBoundClaim = {
+        "claim_id": "c-" + what, "episode": "e", "attempt": "a", "submitting_session": "s", "pid": 4242,
+        "proc_start": "1", "what": what, "worktree": "/fixture", "since": SINCE.isoformat()}
+    return mac_test.HeldClaim(scope, Path("/fixture/claims") / (what + ".json"), record)
+
+
+def scope_of(scopes: Mapping[str, claim_state.ClaimScope]) -> Callable[[claim_state.StatePaths, str], claim_state.ClaimScope]:
+    def find(_paths: claim_state.StatePaths, folder: str) -> claim_state.ClaimScope:
+        return scopes[folder]
+    return find
+
+
+def live_unless(what: str) -> Callable[[mac_test.RunRecord], bool]:
+    def live(record: mac_test.RunRecord) -> bool:
+        return record["what"] != what
+    return live
 
 
 MAC_BLOCK = held("research", "mac-session", reason="Mac CI restore",
@@ -89,16 +106,52 @@ class AvailabilityRowTests(unittest.TestCase):
 
 
 class MacRouteTests(unittest.TestCase):
-    root: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "VERIFY_STEPS_DIR": str(self.root / "steps"), "VERIFY_PROC_ROOT": str(self.root / "proc")})))
-
     def routes(self, *mac_states: targets.TargetState) -> target_availability.MacRoutes:
         return target_availability.MacRoutes((snapshot(MAC, *mac_states), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
+
+    def test_holds_names_each_mac_state_and_a_free_mac_gives_nothing(self) -> None:
+        cases: tuple[tuple[targets.TargetState, str], ...] = (
+            (MAC_BLOCK, "build hold by research (hana) awaiting unblock; requested expiry was 15:10 UTC — Mac CI restore"),
+            (held("solo", "unknown-session", end=targets.ExpiresAt(LATER), reason=""), "build hold by solo until 15:10 UTC"),
+            (targets.Unreachable("probe failed"), "unreachable, probe failed"),
+            (targets.StateUnreadable("block.json: bad"), "state unreadable, block.json: bad"),
+            (targets.Free(), ""),
+        )
+        for state, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.routes(state).holds("/fixture/hana"), expected)
+        unreadable = target_availability.MacRoutes(target_availability.SnapshotsUnreadable("targets.conf: missing"), {}, UTC)
+        self.assertEqual(unreadable.holds("/r"), "state unreadable, targets.conf: missing")
+        self.assertEqual(target_availability.MacRoutes((snapshot(NATEDEV, targets.Free()),), {}, UTC).holds("/r"), "")
+
+    def test_a_busy_mac_holds_a_repository_only_with_its_own_claims(self) -> None:
+        cargo_liner = claim_state.RepositoryScope("cargo-liner", "github.com/natepiano/cargo-liner")
+        hana = claim_state.RepositoryScope("hana", "github.com/natepiano/hana")
+        organon = claim_state.RepositoryScope("organon", "github.com/natepiano/organon")
+        claims = (claim(hana, "nextest hana"), claim(cargo_liner, "check cargo-handler"))
+        scopes = {"/fixture/cargo-liner-tile": cargo_liner, "/fixture/organon": organon}
+        job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
+        routes = target_availability.MacRoutes(
+            (snapshot(MAC, targets.Running((job,)), claims=claims), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
+        with mock.patch.object(mac_test, "run_is_live", return_value=True), \
+             mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)) as scope:
+            self.assertEqual(routes.holds("/fixture/cargo-liner-tile"), "busy with check cargo-handler")
+            self.assertEqual(routes.holds("/fixture/cargo-liner-tile"), "busy with check cargo-handler")
+            self.assertEqual(routes.holds("/fixture/organon"), "")
+        self.assertEqual(scope.call_count, 2)
+
+    def test_a_whole_mac_claim_or_an_unknown_repository_holds_with_every_live_claim(self) -> None:
+        cargo_liner = claim_state.RepositoryScope("cargo-liner")
+        claims = (claim(claim_state.WHOLE_MAC, "mac setup"), claim(cargo_liner, "check cargo-handler"),
+                  claim(claim_state.RepositoryScope("hana"), "nextest hana"))
+        job = targets.RunningJob("mac setup", SINCE, targets.NotSeenIdle())
+        routes = target_availability.MacRoutes(
+            (snapshot(MAC, targets.Running((job,)), claims=claims), snapshot(NATEDEV, targets.Free())), LABELS, UTC)
+        scopes = {"/fixture/cargo-liner": cargo_liner, "/fixture/outside": claim_state.WHOLE_MAC}
+        with mock.patch.object(mac_test, "run_is_live", side_effect=live_unless("nextest hana")), \
+             mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)):
+            self.assertEqual(routes.holds("/fixture/cargo-liner"), "busy with mac setup; check cargo-handler")
+            self.assertEqual(routes.holds("/fixture/outside"), "busy with mac setup; check cargo-handler")
 
     def test_each_mac_state_gives_its_fit(self) -> None:
         job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
@@ -127,27 +180,20 @@ class MacRouteTests(unittest.TestCase):
                              target_availability.NotAllowed("full gate runs on natedev"))
 
     def test_recorded_route_precedes_the_live_mac_state(self) -> None:
-        process = self.root / "proc/42"
-        process.mkdir(parents=True)
-        _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
-        record = step_record.StepRecord("route", 42, "123", self.root, "build",
-            step_record.NamedPackage("handler"), step_record.AnyTarget(("natedev", "mac"), ("mac",)),
-            step_record.StepState.ON_NATEDEV, "now")
-        waiter = WaitingStep(42, "", "", "build", str(self.root), 0, 0, NeedsMemory())
+        waiter = WaitingStep(42, "", "", "build", "/fixture/handler", 0, 0, NeedsMemory(), package="handler")
         job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
-        cases: tuple[tuple[str, step_record.RunsOn, str, str], ...] = (
-            ("build", record.runs_on, "on_natedev", "Mac: busy with nextest hana"),
-            ("mend", record.runs_on, "writes_tree local_noncompiling", "Mac: no, mend edits this checkout on natedev"),
-            ("build", step_record.NatedevOnly("creates a Linux install"), "on_natedev", "Mac: no, creates a Linux install"),
-            ("test", step_record.NatedevOnly("handler uses Linux namespaces"), "on_natedev", "Mac: no, handler uses Linux namespaces"),
-            ("build", step_record.NatedevOnly("linux_only"), "on_natedev", "Mac: no, handler is Linux only"),
+        cases: tuple[tuple[str, target_config.StepRoute, str], ...] = (
+            ("build", target_config.ANY_ELIGIBLE_TARGET, "Mac: busy with nextest hana"),
+            ("mend", target_config.WRITES_TREE, "Mac: no, mend edits this checkout on natedev"),
+            ("build", target_config.LocalRequired("creates a Linux install"), "Mac: no, creates a Linux install"),
+            ("test", target_config.LocalRequired("handler uses Linux namespaces"), "Mac: no, handler uses Linux namespaces"),
+            ("build", target_config.LocalRequired("linux_only"), "Mac: no, handler is Linux only"),
+            ("build", target_config.PinnedTarget("natedev"), "Mac: no, this step is pinned to natedev"),
         )
-        for step, location, state, expected in cases:
-            with self.subTest(step=step, location=location):
-                step_record.write(replace(record, runs_on=location))
-                _ = step_record.state_path("route").write_text(state + "\n")
-                self.assertEqual(self.routes(targets.Running((job,))).line(replace(waiter, step=step)), expected)
-        step_record.record_path("route").unlink()
+        with mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r")):
+            for step, route, expected in cases:
+                with self.subTest(step=step, route=route):
+                    self.assertEqual(self.routes(targets.Running((job,))).line(replace(waiter, step=step, route=route)), expected)
         self.assertEqual(self.routes(MAC_BLOCK).line(waiter),
                          "Mac: no, a direct cargo command runs where it starts")
 

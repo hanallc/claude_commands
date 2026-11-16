@@ -38,7 +38,7 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
                   f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={cargo}",
                   "patterns.slot={repository}-slot{slot}", "# whole: 1..",
                   f"slots.{machine}.default_max={default_maximum}", "# whole: 1..",
-                  f"slots.unused_days={unused_days}"))
+                  f"slots.unused_days={unused_days}", "# range: 5e-324..", "slots.wait_seconds=30"))
     if isinstance(maximum, int):
         lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")

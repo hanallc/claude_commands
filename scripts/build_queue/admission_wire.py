@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -53,33 +54,37 @@ class UnsupportedVersion(ValueError):
 
 @dataclass(frozen=True)
 class Owner:
+    """The owner identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
 
 @dataclass(frozen=True)
 class RunIdentity:
+    """The run identity holds a process identifier and start time."""
     pid: int
     start_time: str
 
 
 @dataclass(frozen=True)
 class NoRun:
-    pass
+    """The request has no named build run."""
 
 
 @dataclass(frozen=True)
 class LocalPlace:
-    pass
+    """The admission request runs locally."""
 
 
 @dataclass(frozen=True)
 class CloudPlace:
+    """The admission request runs on this cloud target."""
     target: str
 
 
 @dataclass(frozen=True)
 class RunPlace:
+    """The run placement holds its identity, first owner, start time, and unit."""
     run: RunIdentity
     since: float
     first_owner: Owner
@@ -88,6 +93,7 @@ class RunPlace:
 
 @dataclass(frozen=True)
 class Identity:
+    """The caller identity holds its session, step, folder, and unit."""
     session_id: str
     name: str
     step: str
@@ -97,6 +103,7 @@ class Identity:
 
 @dataclass(frozen=True, kw_only=True)
 class CallerCode:
+    """The request carries the caller code version."""
     code_version: str = ""
 
 
@@ -105,6 +112,7 @@ NO_RUN = NoRun()
 
 @dataclass(frozen=True)
 class AdmitRequest(CallerCode):
+    """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
     owner: Owner
     argv: tuple[str, ...]
@@ -182,6 +190,7 @@ class ServiceEstimateRequest(CallerCode):
 
 @dataclass(frozen=True)
 class LaunchRequest(CallerCode):
+    """The launch request holds the episode, owner, caller identity, and memory profile."""
     episode: str
     owner: Owner
     since: float
@@ -191,6 +200,7 @@ class LaunchRequest(CallerCode):
 
 @dataclass(frozen=True)
 class ReleaseRequest(CallerCode):
+    """The request releases a reservation with its final status."""
     request_id: str
     reservation: str
     status: int
@@ -198,6 +208,7 @@ class ReleaseRequest(CallerCode):
 
 @dataclass(frozen=True)
 class WidthRequest(CallerCode):
+    """The request updates the test width of a reservation."""
     request_id: str
     reservation: str
     width: int
@@ -205,26 +216,28 @@ class WidthRequest(CallerCode):
 
 @dataclass(frozen=True)
 class BuildHistoryRequest(CallerCode):
-    pass
+    """The request asks for the build history generation."""
 
 
 @dataclass(frozen=True)
 class ViewRequest(CallerCode):
-    pass
+    """The request asks for the queue view."""
 
 
 @dataclass(frozen=True)
 class ExplainRequest(CallerCode):
-    pass
+    """The request asks for the queue explanation."""
 
 
 @dataclass(frozen=True)
 class MineRequest(CallerCode):
+    """The request asks for the queue reading for this session."""
     session_id: str
 
 
 @dataclass(frozen=True)
 class PrioritySetRequest(CallerCode):
+    """The request sets queue priority for a unit with a reason and actor."""
     request_id: str
     unit: str
     why: str
@@ -233,6 +246,7 @@ class PrioritySetRequest(CallerCode):
 
 @dataclass(frozen=True)
 class PriorityClearRequest(CallerCode):
+    """The request clears queue priority with an actor and optional unit."""
     request_id: str
     actor: str
     unit: str = ""
@@ -240,12 +254,14 @@ class PriorityClearRequest(CallerCode):
 
 @dataclass(frozen=True)
 class TokenWaitRequest(CallerCode):
+    """The request marks a reservation as waiting for the Cargo token."""
     request_id: str
     reservation: str
 
 
 @dataclass(frozen=True)
 class CloudSlotWait:
+    """The cloud wait holds the used slot count and slot limit."""
     used: int
     slots: int
 
@@ -256,6 +272,7 @@ class CloudSlotWait:
 
 @dataclass(frozen=True)
 class Wait:
+    """The wait reply holds its reason, queue position, text, and admission snapshot."""
     reason: records.WaitReason | CloudSlotWait
     position: int
     head: str
@@ -277,6 +294,7 @@ PROTOCOL_ACQUISITION_TIMING = AcquisitionTiming(120.0, 2.0, 300.0)
 
 @dataclass(frozen=True)
 class CleanupTiming:
+    """The timing limits control silence detection and reconnection during cleanup."""
     silence_seconds: float
     reconnect_seconds: float
 
@@ -290,6 +308,7 @@ CLEANUP_STATUS_MAX = 2 ** 63 - 1
 
 @dataclass(frozen=True)
 class Admitted:
+    """The admission grant holds its reservation, memory need, and sampling settings."""
     reservation: str
     need: int
     source: str
@@ -301,6 +320,7 @@ class Admitted:
 
 @dataclass(frozen=True)
 class RunnerExecutionTiming:
+    """The runner timings control program sampling, stop checks, and peak waves."""
     program_sample_seconds: float
     program_stop_seconds: float
     peak_wave_seconds: float
@@ -308,32 +328,37 @@ class RunnerExecutionTiming:
 
 @dataclass(frozen=True)
 class RunnerAdmitted(Admitted):
+    """The runner admission grant includes execution timings."""
     execution: RunnerExecutionTiming = field(kw_only=True)
 
 
 @dataclass(frozen=True)
 class LaunchAdmitted:
+    """The launch grant holds its memory need and estimate source."""
     need: int
     source: str
 
 
 @dataclass(frozen=True)
 class Refused:
+    """The reply gives the reason for refusal."""
     reason: str
 
 
 @dataclass(frozen=True)
 class Ok:
-    pass
+    """The reply confirms that the request succeeded."""
 
 
 @dataclass(frozen=True)
 class BuildHistoryReply:
+    """The reply holds the current build history generation."""
     generation: int
 
 
 @dataclass(frozen=True)
 class LocalAdmissionContext:
+    """The context holds the local command, test width, and admission options."""
     argv: tuple[str, ...]
     cwd: str
     sidecar: str
@@ -345,11 +370,13 @@ class LocalAdmissionContext:
 
 @dataclass(frozen=True)
 class LocalAdmissionUnavailable:
+    """The reason explains why local admission context is unavailable."""
     reason: str
 
 
 @dataclass(frozen=True)
 class PlacementRequest(CallerCode):
+    """The request holds placement constraints, caller identity, and local prerequisites."""
     episode: str
     owner: placement.SubmittingOwner
     since: float
@@ -360,16 +387,20 @@ class PlacementRequest(CallerCode):
     local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
     prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())
     purpose: placement.PlacementPurpose = field(default_factory=lambda: placement.NormalStep())
+    # Where the caller lets the step run. The queue stores it on the waiter for the Builds page.
+    route: target_config.StepRoute = target_config.ANY_ELIGIBLE_TARGET
 
 
 @dataclass(frozen=True)
 class PlacementStatusRequest(CallerCode):
+    """The request asks for the status of an episode and attempt."""
     episode: str
     attempt: str
 
 
 @dataclass(frozen=True)
 class KnownPlacementStatus:
+    """The status holds a known assignment, its state, and provider claim."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
@@ -377,17 +408,20 @@ class KnownPlacementStatus:
 
 @dataclass(frozen=True)
 class UnknownPlacementStatus:
+    """The requested episode and attempt have no known placement status."""
     episode: str
     attempt: str
 
 
 @dataclass(frozen=True)
 class PlacementStatusReply:
+    """The reply holds the known or unknown placement status."""
     status: KnownPlacementStatus | UnknownPlacementStatus
 
 
 @dataclass(frozen=True)
 class PrerequisiteReport(CallerCode):
+    """The report updates local execution prerequisites for an episode and owner."""
     request_id: str
     episode: str
     owner: placement.SubmittingOwner
@@ -396,6 +430,7 @@ class PrerequisiteReport(CallerCode):
 
 @dataclass(frozen=True)
 class CancelPlacement(CallerCode):
+    """The request cancels an episode for its owner with a reason."""
     request_id: str
     episode: str
     owner: placement.SubmittingOwner
@@ -404,6 +439,7 @@ class CancelPlacement(CallerCode):
 
 @dataclass(frozen=True)
 class ClaimFailure(CallerCode):
+    """The report holds an assignment, failed provider claim, and reason."""
     request_id: str
     assignment: placement.PlacementAssignment
     reason: str
@@ -413,6 +449,7 @@ class ClaimFailure(CallerCode):
 
 @dataclass(frozen=True)
 class ConsumePermission(CallerCode):
+    """The request consumes launch permission for an assignment and claim holder."""
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
@@ -422,6 +459,7 @@ class ConsumePermission(CallerCode):
 
 @dataclass(frozen=True)
 class ExecutionReport(CallerCode):
+    """The report holds assignment, claim, execution evidence, outcome, and path state."""
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
@@ -432,11 +470,12 @@ class ExecutionReport(CallerCode):
 
 @dataclass(frozen=True)
 class PlacementEvidenceWait:
-    pass
+    """Placement waits for host evidence."""
 
 
 @dataclass(frozen=True)
 class PlacementResourceWait:
+    """Placement waits for this resource with a reason and holder."""
     resource: str
     reason: str
     holder: placement.ResourceHolder = field(default_factory=lambda: placement.ResourceHolderUnknown())
@@ -444,6 +483,7 @@ class PlacementResourceWait:
 
 @dataclass(frozen=True)
 class PlacementWait:
+    """The wait holds candidate eligibility, queue position, and provider diagnostics."""
     episode: str
     since: float
     position: int
@@ -456,6 +496,7 @@ class PlacementWait:
 
 @dataclass(frozen=True)
 class Assignment:
+    """The reply holds a placement assignment and provider diagnostics."""
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
@@ -463,6 +504,7 @@ class Assignment:
 
 @dataclass(frozen=True)
 class LocalPlacementGranted:
+    """The reply pairs a local assignment with its memory admission grant."""
     assignment: placement.PlacementAssignment
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
@@ -471,12 +513,14 @@ class LocalPlacementGranted:
 
 @dataclass(frozen=True)
 class FirstAuthorization:
+    """The first launch authorization pairs an assignment with its provider claim."""
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference
 
 
 @dataclass(frozen=True)
 class DispatchStatus:
+    """The dispatch status holds assignment state, launch permission, and retry decision."""
     assignment: placement.PlacementAssignment | placement.UnknownAssignment
     state: placement.AssignmentState
     permission: placement.LaunchPermission | placement.NoLaunchPermission

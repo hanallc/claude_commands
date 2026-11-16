@@ -377,8 +377,8 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         attempt = ledger.text(request, 'attempt')
         path = folder / attempt
         runs: list[dict[str, object]] = []
-        if (path / 'remote-result.json').exists():
-            row = cloud_gate.read(path / 'remote-result.json')
+        if (path / cloud_gate.RESULT_FILE).exists():
+            row = cloud_gate.read(path / cloud_gate.RESULT_FILE)
             launch = cloud_gate.read(path / 'launch.json')
             try:
                 validate_paired_result(row, request, ledger.text(launch, 'instance'))

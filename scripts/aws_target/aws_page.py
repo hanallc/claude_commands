@@ -1,4 +1,4 @@
-"""Publish the AWS prices page: the /aws_prices tables as data for the admin console."""
+"""Publish the AWS page: the /aws_spend totals and the spot_table tables as data for the admin console."""
 from __future__ import annotations
 
 import argparse
@@ -6,10 +6,11 @@ import json
 import os
 import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
 
-from scripts.aws_target import spot_table
+from scripts.aws_target import config as aws_config, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import page_frame, review_link
@@ -62,8 +63,23 @@ class RunCostData(TypedDict):
     launched: TableData
 
 
+class SpendTile(TypedDict):
+    label: str
+    usd: str
+    note: str
+
+
+class SpendData(TypedDict):
+    # Empty when the spend is available.
+    unavailable: str
+    # Today, yesterday and the month to date, in that order.
+    tiles: list[SpendTile]
+    forecast: str
+
+
 class PageData(TypedDict):
     read_at: int
+    spend: SpendData
     # Every region a table shows, for the region filter.
     regions: list[str]
     snapshot: list[SnapshotLine]
@@ -90,11 +106,39 @@ def without_prices(table: spot_table.Table) -> spot_table.Table:
                    rows=tuple(tuple(row[index] for index in keep) for row in table.rows))
 
 
-def page_data(tables: spot_table.SpotTables, now: int) -> PageData:
+def day_tile(label: str, day: str, spend: aws_spend.Spend, limit: bool) -> SpendTile:
+    found = next((row for row in spend.days if row.day == day), None)
+    if found is None:
+        return {'label': label, 'usd': '—', 'note': f'UTC {day}: no spend day yet'}
+    source = 'estimate' if found.source != 'AWS bill' else 'provisional bill' if found.provisional_bill else 'bill'
+    of_limit = f' of the ${spend.daily_limit:.2f} daily limit' if limit else ''
+    return {'label': label, 'usd': f'${found.usd:.2f}', 'note': f'UTC {day}, {source}{of_limit}. {found.runs} gate runs.'}
+
+
+def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: int, pace_days: int) -> SpendData:
+    """Today, yesterday and the month to date, as /aws_spend shows them."""
+    if isinstance(spend, aws_config.MeasurementUnavailable):
+        return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [], 'forecast': ''}
+    today = datetime.fromtimestamp(now, UTC).date()
+    tiles = [day_tile('Today', today.isoformat(), spend, True),
+             day_tile('Yesterday', (today - timedelta(days=1)).isoformat(), spend, True)]
+    month = aws_spend.month_spend(spend.days, today, pace_days)
+    if month is None:
+        tiles.append({'label': 'Month to date', 'usd': '—', 'note': f'UTC {today:%Y-%m}: no billed day yet'})
+        return {'unavailable': '', 'tiles': tiles, 'forecast': ''}
+    tiles.append({'label': 'Month to date', 'usd': f'${month.to_date:.2f}',
+                  'note': f'UTC {today:%Y-%m}, of the ${spend.monthly_limit:.2f} monthly limit.'})
+    forecast = (f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last '
+                + f'{month.billed_days} billed days. 32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.')
+    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
+
+
+def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     regions = dict.fromkeys((*(read.region for read in tables.regions), *tables.hours.headers[1:]))
     return {
         'read_at': now,
+        'spend': spend,
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_data(table) for table in tables.prices],
@@ -117,7 +161,11 @@ def output_folder() -> Path:
 
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
-    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), now)
+    configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
+    today = datetime.fromtimestamp(now, UTC).date().isoformat()
+    read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
+    spend = spend_data(read, now, configuration.whole('spend_pace_days'))
+    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now)
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8')
     # A '</' in a cell must not end the script element.
     page = (source.replace('__PAGE_FRAME_STYLE__', page_frame.STYLE)
@@ -141,7 +189,7 @@ def page_url() -> str:
     page = output_folder().resolve() / PAGE_NAME
     url = review_link.snapshot_url(review_link.review_root().resolve(), page)
     if not page.is_file():
-        raise FileNotFoundError(f'AWS prices page is not available: {page}')
+        raise FileNotFoundError(f'AWS page is not available: {page}')
     return url
 
 
@@ -150,7 +198,7 @@ class Arguments(argparse.Namespace):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Publish the AWS prices page, or print its link.')
+    parser = argparse.ArgumentParser(description='Publish the AWS page, or print its link.')
     _ = parser.add_argument('command', choices=('publish', 'link'))
     if parser.parse_args(argv, namespace=Arguments()).command == 'publish':
         _ = publish_configured()
