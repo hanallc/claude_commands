@@ -33,6 +33,7 @@ from scripts.production.checkpoint_gate import report
 from scripts.production import showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
+from scripts.production.record_store import state_root
 from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
@@ -683,7 +684,7 @@ def notifier(arguments: list[str]) -> str:
 def remove_updates(owner: staff.StaffRow) -> None:
     """Remove the generated schedule files and retain reminders and history."""
     _ = notifier(["remove", f"showrunner-{owner.id}"])
-    root = _showrunner_state_root()
+    root = state_root()
     (root / "counts" / owner.id).unlink(missing_ok=True)
 
 
@@ -914,12 +915,8 @@ def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReport
     return ReplaceReports(tuple(reports))
 
 
-def _showrunner_state_root() -> Path:
-    return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-
-
 def outstanding_file(reference: str, *, identities: QuestionStaff | None = None) -> Path:
-    root = _showrunner_state_root()
+    root = state_root()
     identities = identities if identities is not None else QuestionStaff.read()
     member = question_owner(reference, identities.record)
     identity = member.id if member is not None and member.kind == "producer" else showrunner_id(reference, record=identities.record)
@@ -927,7 +924,7 @@ def outstanding_file(reference: str, *, identities: QuestionStaff | None = None)
 
 
 def outstanding_path(production: QuestionScope) -> Path:
-    root = _showrunner_state_root()
+    root = state_root()
     owner = production.owner
     return root / "outstanding" / f"{owner.id}.json"
 
@@ -953,13 +950,13 @@ def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, 
     if isinstance(document, staff.StaffRow):
         if document.kind != "producer":
             raise RegistrationFailure("questions", f"{document.id}: expected a producer")
-        return QuestionFolder(_showrunner_state_root() / document.id / "questions", document.id)
+        return QuestionFolder(state_root() / document.id / "questions", document.id)
     owner = identities.record.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path, lines=lines)
-    root = _showrunner_state_root()
+    root = state_root()
     return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
 
 
@@ -1001,7 +998,7 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
 def unowned_question_records(identities: QuestionStaff) -> list[QuestionRecord]:
     """Read state questions, including producers without production documents."""
     owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
-    paths = sorted(_showrunner_state_root().glob("*/questions/question-*.md"))
+    paths = sorted(state_root().glob("*/questions/question-*.md"))
     return _question_records([Issue(path, frontmatter(path)) for path in paths if path.parent.parent.name not in owners])
 
 
@@ -1220,7 +1217,7 @@ def due(items: list[Outstanding], now: datetime) -> list[Outstanding]:
 
 def read_all_open_fields() -> list[OutstandingItem]:
     """Read local open fields with one staff context and skip unreadable stores."""
-    root = _showrunner_state_root()
+    root = state_root()
     paths = {path.stem: path for path in (root / "outstanding").glob("*.json")}
     fields: list[OutstandingItem] = []
     identities = QuestionStaff.for_record(staff.initial_snapshot())
