@@ -122,9 +122,10 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
         functions = shell_functions(
-            VERIFY, "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
-            "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
+            VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
+            "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
+            "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         functions += shell_functions(SCRIPTS / "lint/invoke.sh", "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend")
         changed_members = VERIFY.read_text(encoding="utf-8").split("CHANGED_MEMBERS_PY='", 1)[1].split("\n'\n", 1)[0]
@@ -164,6 +165,7 @@ mkdir -p "$HOLD_WAIT_DIR"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 VERIFY_METADATA_SCRIPT="$HOME/.claude/scripts/direct/verify_metadata.py"
 TREE_WATCH_SCRIPT="$HOME/.claude/scripts/direct/tree_watch.py"
+FIX_RETURN_SCRIPT="$HOME/.claude/scripts/mac_test/fix_return.py"
 BUILD_FOLDERS_SCRIPT="$HOME/.claude/scripts/lib/build_folders.py"
 GATE_METADATA="$TEST_METADATA"
 trap 'stop_tree_watch' EXIT

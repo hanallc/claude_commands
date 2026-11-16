@@ -12,9 +12,17 @@ from typing import TypedDict
 from scripts.aws_target import spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
+# The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
+REGION_GROUPS = ('us', 'eu', 'ap', 'ca', 'sa')
+
+
+def region_filter_key(region: str) -> tuple[int, str]:
+    """Sort a region into its group, then by name; a region outside the groups comes last."""
+    group = region.split('-', 1)[0]
+    return (REGION_GROUPS.index(group) if group in REGION_GROUPS else len(REGION_GROUPS), region)
 
 
 class TableData(TypedDict):
@@ -87,7 +95,7 @@ def page_data(tables: spot_table.SpotTables, now: int) -> PageData:
     regions = dict.fromkeys((*(read.region for read in tables.regions), *tables.hours.headers[1:]))
     return {
         'read_at': now,
-        'regions': list(regions),
+        'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_data(table) for table in tables.prices],
         'quotas': [table_data(table) for table in tables.quotas],
@@ -110,9 +118,10 @@ def output_folder() -> Path:
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), now)
-    source = Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8')
+    source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
-    page = source.replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
+    page = (source.replace('__PAGE_FRAME_STYLE__', page_frame.STYLE)
+            .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))
     page_path = folder / PAGE_NAME
     folder.mkdir(parents=True, exist_ok=True)
     write_text_atomic(page_path, page, new_file_mode=0o644)

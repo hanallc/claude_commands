@@ -10,14 +10,15 @@ set -euo pipefail
 # settles. This script therefore stops at the push and prints the identifiers
 # the tick loop needs.
 #
-# A repo's post-push hook (see post_push_hook.sh) runs right after the push.
-# Its failure is reported after the CI handoff and becomes this script's exit
-# status, so the handoff block is always printed.
+# land_main runs the repository's post-push hook after landing.
+# A hook failure reports its rerun command and keeps the landing successful.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # PUSH_TARGET_BRANCH (from validate_and_push.sh --to) names the remote branch
 # to push HEAD to; otherwise the current branch is pushed under its own name.
 BRANCH="${PUSH_TARGET_BRANCH:-$(git branch --show-current)}"
+DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
 
 SHA="$(git rev-parse HEAD)"
 PUSHED=true
@@ -63,18 +64,21 @@ publish_branch() {
 
   if [ "$PUSHED" = true ]; then
     echo "Pushing ${BRANCH} to origin..."
+  fi
+  PUSH_STATUS=0
+  if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+    "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/land_main.py" \
+      --checkout "$PWD" --commit "$SHA" --branch "$BRANCH" || PUSH_STATUS=$?
+  elif [ "$PUSHED" = true ]; then
     PUSH_COMMIT=HEAD
-    if [ -n "${CI_VALIDATED_BASE:-}" ]; then
-      PUSH_COMMIT="$SHA"
-    fi
-    PUSH_STATUS=0
+    if [ -n "${CI_VALIDATED_BASE:-}" ]; then PUSH_COMMIT="$SHA"; fi
     git push origin "${PUSH_COMMIT}:refs/heads/${BRANCH}" || PUSH_STATUS=$?
-    if [ "$PUSH_STATUS" -ne 0 ]; then
-      if [ -n "${CI_VALIDATED_BASE:-}" ]; then
-        echo "merge branch moved during validation" >&2
-      fi
-      exit "$PUSH_STATUS"
+  fi
+  if [ "$PUSH_STATUS" -ne 0 ]; then
+    if [ -n "${CI_VALIDATED_BASE:-}" ]; then
+      echo "merge branch moved during validation" >&2
     fi
+    exit "$PUSH_STATUS"
   fi
   if [ "$PUSHED" = true ]; then
     printf '%s pushed\n' "$SHA"
@@ -85,9 +89,9 @@ publish_branch() {
 
 if [ "$FOLLOW_PUBLISHED" = false ]; then
   export -f publish_branch
-  export SHA BRANCH PUSHED
+  export SHA BRANCH PUSHED SCRIPT_DIR DEFAULT_BRANCH
   publish_status=0
-  if [ "$BRANCH" = main ]; then
+  if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
     publication_output="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \
       --checkout "$PWD" -- bash -euo pipefail -c publish_branch)" || publish_status=$?
   else
@@ -109,11 +113,6 @@ if [ "$FOLLOW_PUBLISHED" = false ]; then
   fi
 fi
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
-
-HOOK_STATUS=0
-if [ "$PUSHED" = true ]; then
-  bash "${SCRIPT_DIR}/post_push_hook.sh" "$BRANCH" "$SHA" || HOOK_STATUS=$?
-fi
 
 # `gh run list --commit` requires a full SHA; a short SHA silently returns
 # nothing. The run also does not exist the instant the push lands.
@@ -148,10 +147,6 @@ echo
 echo "Watch this run with a 3-minute ScheduleWakeup tick. Do not block on"
 echo "\`gh run watch\`, and do not sleep-poll in-band."
 
-if [ "$HOOK_STATUS" -ne 0 ]; then
-  echo
-  echo "The post-push hook failed (see above); the push itself succeeded." >&2
-fi
 cancel_prior_runs() {
   local branch sha workflows workflow runs run_id head_sha status live_status
   branch="$BRANCH"
@@ -191,4 +186,4 @@ cancel_prior_runs() {
 if [ "${CANCEL_PRIOR:-false}" = true ]; then
   cancel_prior_runs
 fi
-exit "$HOOK_STATUS"
+exit 0

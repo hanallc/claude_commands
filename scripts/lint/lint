@@ -15,6 +15,9 @@ Usage:
   lint build [args...]            cargo build
   lint check [args...]            cargo check
   lint mend-check [args...]       cargo mend --fail-on-warn
+  lint mend-fix [args...]         cargo mend --fix --fail-on-warn, then clippy
+                                  --all-targets --all-features on the fixed
+                                  tree; the Mac fix pass of direct/verify.sh
   lint mend [args...]             cargo mend --all-targets
   lint clippy [args] [-- lints]   clippy --all-targets, -D warnings
   lint clippy-tests [args] [-- lints]
@@ -89,6 +92,24 @@ resolve_scope() {
     done < <(lint_scope "$@")
 }
 
+# The Mac fix pass of verify.sh. mend fixes the copy, and a finding that
+# remains fails the pass. clippy then judges the fixed copy as the held clippy
+# of verify.sh does: every target and every feature, so --features is dropped.
+mend_fix() {
+    resolve_scope "$@"
+    invoke_mend --fix --fail-on-warn ${SCOPE[@]+"${SCOPE[@]}"} "$@" || return
+    local -a clippy_words=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --features | -F) [[ $# -lt 2 ]] || shift ;;
+            --features=* | -F?*) ;;
+            *) clippy_words+=("$1") ;;
+        esac
+        shift
+    done
+    invoke_clippy ${SCOPE[@]+"${SCOPE[@]}"} ${clippy_words[@]+"${clippy_words[@]}"} --all-targets --all-features
+}
+
 CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
@@ -117,6 +138,7 @@ case "$CMD" in
                 run cargo check ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   mend-check)   resolve_scope "$@"
                 invoke_mend --fail-on-warn ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
+  mend-fix)     mend_fix "$@" ;;
   mend)         resolve_scope "$@"
                 invoke_mend ${SCOPE[@]+"${SCOPE[@]}"} "$@" ;;
   clippy)       resolve_scope "$@"

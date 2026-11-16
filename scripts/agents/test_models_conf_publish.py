@@ -509,14 +509,12 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
                                                 directory_obstruction: bool = False) -> None:
         if accepted_push:
             program = '''
-from scripts.lib import models_registry
-git = models_registry._git
-def interrupted(repo, *arguments, **keywords):
-    result = git(repo, *arguments, **keywords)
-    if arguments[0] == 'push':
-        raise SystemExit(17)
-    return result
-models_registry._git = interrupted
+from scripts.lib import land_main, models_registry
+land = land_main.land
+def interrupted(*arguments, **keywords):
+    _ = land(*arguments, **keywords)
+    raise SystemExit(17)
+models_registry.land_main.land = interrupted
 p = models_registry.registry_path()
 text = p.read_text()
 models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gpt-b:max'), 'row edit')

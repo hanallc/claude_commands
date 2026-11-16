@@ -57,7 +57,7 @@ from scripts.message import unit_labels
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 if TYPE_CHECKING:
     from scripts.mac_test import claim_state
@@ -239,8 +239,9 @@ def page_link() -> int:
 
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
-    source = Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8")
-    page = source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+    source = console_theme.with_theme(Path(__file__).with_name("memory_live.html").read_text(encoding="utf-8"))
+    page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
+            .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
     write_text_atomic(configuration.output_folder / "memory_live.html", page, new_file_mode=0o644)
 
 
@@ -308,6 +309,12 @@ class NoProgress(TypedDict):
     reason: str
 
 
+class TokenWaitProgress(TypedDict):
+    kind: Literal["TokenWaitProgress"]
+    stage: str
+    tokens: int
+
+
 class RowProgress(TypedDict):
     kind: Literal["RowProgress"]
     phase: Literal["building", "testing"]
@@ -357,7 +364,7 @@ class RunRow(RowQueueNotes):
     name: str
     showrunner: str
     unit: str
-    progress: RowProgress | NoProgress
+    progress: RowProgress | TokenWaitProgress | NoProgress
     state: str
     pid: int | admission_records.PidNotRecorded
     detail: str
@@ -708,14 +715,17 @@ def build_ci_row(used: float, now: float,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | NoProgress:
-    """Use the newest step counter from the admission reading."""
+def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | TokenWaitProgress | NoProgress:
+    """Use the newest step counter or token wait from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
     unit: Literal["modules", "units", "tests"]
     for step in sorted(steps, key=lambda step: step.started_at, reverse=True):
         counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
+            if isinstance(counter.token_wait, progress.TokenWait):
+                return {"kind": "TokenWaitProgress", "stage": progress.TOKEN_WAIT_REASON,
+                        "tokens": counter.token_wait.tokens}
             reason = counter.reason
             continue
         if counter.phase == "modules" or counter.phase.startswith("suites"):
@@ -795,8 +805,10 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
+    # A placed run is the normal case, so its name leaves out the placement id; the other labels mark an exception.
+    shown_gate = "" if build.gate_label == queue_view.MacGateLabel.PLACEMENT else gate
     return {"kind": "mac-build",
-            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + gate if gate else ""),
+            "name": queue_view.mac_step_name(build, names=names, identity=identity) + (" · " + shown_gate if shown_gate else ""),
             **page_owner_labels(identity, ci_label=label), "gate_label": gate, "repository": build.repository,
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,

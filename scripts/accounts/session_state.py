@@ -97,11 +97,14 @@ def running_detached_work(record: staff.StaffSnapshot, *, additional_runs: Seque
 def classify(member: staff.StaffRow | UnrecordedStaff,
              activity: LiveActivity | NoLiveSession, *,
              detached: RunningDetachedWork = NO_DETACHED_WORK) -> SessionState:
-    """Staff exit and pause records take precedence; a start or a detached run counts as busy."""
+    """Staff exit and pause records take precedence; a start, a background shell or a detached run counts as busy.
+
+    Claude Code writes `shell` when the turn has ended and a background command still runs.
+    """
     hold = staff_state(member)
     if hold != "active":
         return hold
-    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting"):
+    if isinstance(activity, LiveActivity) and activity.status in ("busy", "starting", "shell"):
         return "busy"
     if isinstance(member, staff.StaffRow) and member.id in detached.staff_ids:
         return "busy"

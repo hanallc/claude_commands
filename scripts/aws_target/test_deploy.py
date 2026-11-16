@@ -149,14 +149,6 @@ elif service == 'cloudformation' and operation == 'describe-stacks':
     reply({'Stacks': [{'StackId': state.get('stack_id'), 'StackStatus': state.get('status', 'UPDATE_COMPLETE'),
         'Parameters': [{'ParameterKey': k, 'ParameterValue': v} for k, v in state.get('parameters', {}).items()], 'Outputs': [
         {'OutputKey': key, 'OutputValue': value} for key, value in state['outputs'].items()]}]})
-elif service == 'cloudformation' and operation == 'update-stack':
-    parameters = json.loads(args[args.index('--parameters') + 1])
-    assert all(p.get('UsePreviousValue') is True for p in parameters if p['ParameterKey'] != 'EnableCompute')
-    assert next(p for p in parameters if p['ParameterKey'] == 'EnableCompute')['ParameterValue'] == 'false'
-    state['outputs'].update(ComputeEnabled='false')
-    state['outputs'].pop('InstanceId', None); state['outputs'].pop('DataVolumeId', None)
-    state['instance_state'] = 'terminated'
-    state_path.write_text(json.dumps(state)); reply({})
 elif service == 'cloudformation' and operation == 'delete-stack':
     state_path.unlink(); (root / 'deleted-stack').touch(); reply({})
 elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set'):
@@ -167,34 +159,24 @@ elif service == 'cloudformation' and operation in ('deploy', 'execute-change-set
     else:
         start = args.index('--parameter-overrides') + 1
         params = dict(word.split('=', 1) for word in args[start:] if '=' in word)
-    if params['EnableCompute'] == 'true' and (root / 'fail-compute').exists():
-        print('Compute deploy failed', file=sys.stderr)
-        sys.exit(1)
     owner = json.loads((root / 'state/deployment.json').read_text())
-    outputs = {'ComputeEnabled': params['EnableCompute'], 'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId'],
-               'ExistingDataInput': params['ExistingDataVolumeId']}
+    outputs = {'BudgetName': params['BudgetName'] or owner['stack'] + '-monthly-' + params['DeploymentId']}
     outputs.update({key: value for key, value in state.get('outputs', {}).items() if key.startswith('Gate')})
     if operation == 'execute-change-set':
         (root / 'live-template.json').write_text(json.dumps(change['Template']))
-    if params['EnableCompute'] == 'true':
-        outputs.update(InstanceId='i-fixture', DataVolumeId=params['ExistingDataVolumeId'] or 'vol-created')
     owner = json.loads((root / 'state/deployment.json').read_text())
     assert owner['account_id'] == ('210987654321' if owner['stack'] == 'aws-build' else '123456789012')
     assert owner['stack_id'] == (root / 'reserved-stack').read_text()
     assert owner['deployment_id'] == params['DeploymentId']
-    if params['EnableCompute'] == 'true' and state.get('outputs', {}).get('InstanceId'):
-        outputs.update({key: state['outputs'][key] for key in ('InstanceId', 'DataVolumeId')})
     state = {'outputs': outputs, 'stack_name': owner['stack'], 'stack_id': owner['stack_id'], 'parameters': params,
-             'instance_state': 'terminated' if params['EnableCompute'] == 'false' else 'stopped'}
+             'instance_state': 'terminated'}
     (root / 'deleted-stack').unlink(missing_ok=True)
     (root / 'deleted-volume').unlink(missing_ok=True)
     (root / 'deleted-budget').unlink(missing_ok=True)
     state_path.write_text(json.dumps(state))
     (root / 'change-set.json').unlink(missing_ok=True)
     (root / 'update-change-set.json').unlink(missing_ok=True)
-    if params['EnableCompute'] == 'true' and not params['ExistingDataVolumeId']:
-        (root / 'volume-owner').write_text(params['DeploymentId'])
-    if params['EnableCompute'] == 'false' and (root / 'slow-foundation').exists():
+    if (root / 'slow-foundation').exists():
         (root / 'clock').write_text(str(clock + 301))
     reply({})
 elif operation == 'create-image':
@@ -379,7 +361,7 @@ class GateImageAws:
         elif operation == 'describe-stacks':
             reply = {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'StackId': 'fixture-stack',
                 'Parameters': [{'ParameterKey': 'GateImage', 'ParameterValue': self.image_parameter},
-                               {'ParameterKey': 'EnableCompute', 'ParameterValue': 'false'}],
+                               {'ParameterKey': 'VpcId', 'ParameterValue': 'vpc-fixture'}],
                 'Outputs': [{'OutputKey': 'GateLaunchVersion', 'OutputValue': str(self.version)}]}]}
         elif operation == 'get-template':
             reply = {'TemplateBody': self.live_template}
@@ -656,11 +638,11 @@ sys.exit(7)
     def test_deployment_step_prints_start_and_elapsed_time(self) -> None:
         output = StringIO()
         with redirect_stdout(output), mock.patch.object(time, 'monotonic', side_effect=[10.0, 12.0]):
-            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+            with deploy.step('up', 'updating the stack', self.settings, hint='can take several minutes'):
                 pass
         self.assertEqual(output.getvalue().splitlines(), [
-            'remove-builder: updating the stack (can take several minutes)',
-            'remove-builder: updating the stack done in 2 s'])
+            'up: updating the stack (can take several minutes)',
+            'up: updating the stack done in 2 s'])
 
     def test_deployment_step_prints_heartbeat_until_completion(self) -> None:
         self.replace('deploy_progress_interval_s', '0.001')
@@ -670,19 +652,19 @@ sys.exit(7)
             @override
             def write(self, text: str) -> int:
                 count = super().write(text)
-                if 'remove-builder: still updating the stack,' in text:
+                if 'up: still updating the stack,' in text:
                     heartbeat.set()
                 return count
 
         output = ProgressOutput()
         with redirect_stdout(output):
-            with deploy.step('remove-builder', 'updating the stack', self.settings, hint='can take several minutes'):
+            with deploy.step('up', 'updating the stack', self.settings, hint='can take several minutes'):
                 self.assertTrue(heartbeat.wait(TEST_HANG_GUARD_SECS))
-        self.assertRegex(output.getvalue(), r'remove-builder: still updating the stack, \d+ min\n')
+        self.assertRegex(output.getvalue(), r'up: still updating the stack, \d+ min\n')
         self.assertEqual(output.getvalue().splitlines()[0],
-                         'remove-builder: updating the stack (can take several minutes)')
-        self.assertRegex(output.getvalue().splitlines()[-1], r'^remove-builder: updating the stack done in \d+ s$')
-        self.assertEqual(self.previous_output(output.getvalue(), 'remove-builder'), '')
+                         'up: updating the stack (can take several minutes)')
+        self.assertRegex(output.getvalue().splitlines()[-1], r'^up: updating the stack done in \d+ s$')
+        self.assertEqual(self.previous_output(output.getvalue(), 'up'), '')
         self.assertFalse(any(worker.name == 'deployment-progress' for worker in threading.enumerate()))
 
     def test_stack_wait_uses_its_own_timeout_through_the_admin_executor(self) -> None:
@@ -829,8 +811,8 @@ sys.exit(7)
                 ledger.mapping(template['Resources'])['GateScalerPolicy'])['Properties'])['PolicyDocument'])
             statements = ledger.rows(image_policy, 'Statement')
             rows = ledger.rows(change, 'Parameters')
-            self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'EnableCompute'),
-                             {'ParameterKey': 'EnableCompute', 'UsePreviousValue': True})
+            self.assertEqual(next(row for row in rows if row['ParameterKey'] == 'VpcId'),
+                             {'ParameterKey': 'VpcId', 'UsePreviousValue': True})
             image_parameter = next(row for row in rows if row['ParameterKey'] == 'GateImage')
             if index == 0:
                 self.assertEqual(statements[-1], {'Sid': 'GateImageTransition', 'Effect': 'Allow',
@@ -920,7 +902,7 @@ sys.exit(7)
             reply: dict[str, object] = {}
             if operation == 'describe-stacks':
                 reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
-                    ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail')]}]}
+                    ('VpcId', 'NotificationEmail')]}]}
             elif operation == 'describe-route-tables':
                 reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                     {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
@@ -1701,7 +1683,7 @@ sys.exit(7)
 
     def test_regional_gate_stack_reuses_home_resources_and_copies_missing_image(self) -> None:
         subject, commands = self.gate_fixture()
-        home_api = subject._api(aws_config.read_deployment_settings(self.settings, self.state))  # pyright: ignore[reportPrivateUsage]
+        home_api = subject._api(aws_config.read_deployment_settings(self.settings))  # pyright: ignore[reportPrivateUsage]
         original = home_api.execute
         copied = False
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
@@ -1726,7 +1708,7 @@ sys.exit(7)
             commands.append(args)
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         home = {'GateProfileArn': 'fixture-profile', 'GateRoleArn': 'fixture-role'}
         result = subject.regional_gate_stack(api, settings, home, {}, subject.regional_network(api, settings, 'us-west-2'))
         self.assertTrue(copied)
@@ -1754,7 +1736,7 @@ sys.exit(7)
 
         stack['deploy'] is 'fails' or 'passes', and the fixture sets it to 'done' after a passing deploy."""
         subject, commands = self.gate_fixture()
-        original = subject._api(aws_config.read_deployment_settings(self.settings, self.state)).execute  # pyright: ignore[reportPrivateUsage]
+        original = subject._api(aws_config.read_deployment_settings(self.settings)).execute  # pyright: ignore[reportPrivateUsage]
         def stamp(at: int) -> str:
             return datetime.fromtimestamp(at, UTC).isoformat()
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
@@ -1796,7 +1778,7 @@ sys.exit(7)
 
     def test_regional_stack_failure_names_the_region_and_the_failed_resources_of_this_run(self) -> None:
         subject, _commands, api = self.regional_stack_fixture({'status': '', 'deploy': 'fails'})
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         with self.assertRaises(aws_target.AwsUnavailable) as raised:
             _ = subject.regional_gate_stack(api, settings, {'GateProfileArn': 'p', 'GateRoleArn': 'r'}, {},
                                             subject.regional_network(api, settings, 'us-west-1'))
@@ -1807,7 +1789,7 @@ sys.exit(7)
     def test_regional_stack_whose_first_create_failed_is_removed_before_the_new_deploy(self) -> None:
         stack = {'status': '', 'deploy': 'passes'}
         subject, commands, api = self.regional_stack_fixture(stack)
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         for status, removed in (('ROLLBACK_COMPLETE', True), ('', False), ('UPDATE_COMPLETE', False)):
             with self.subTest(status=status or 'no stack'):
                 stack.update(status=status, deploy='passes')
@@ -1998,7 +1980,7 @@ sys.exit(7)
         arguments = next(args for args in commands if 'create-change-set' in args)
         parameters = ledger.rows({'rows': cast(object, json.loads(arguments[arguments.index('--parameters') + 1]))}, 'rows')
         by_name = {ledger.text(row, 'ParameterKey'): row for row in parameters}
-        for key in ('EnableCompute', 'InstanceType', 'ExistingDataVolumeId', 'NotificationEmail'):
+        for key in ('VpcId', 'NotificationEmail'):
             self.assertEqual(by_name[key], {'ParameterKey': key, 'UsePreviousValue': True})
         self.assertEqual(by_name['GateInstanceTypes']['ParameterValue'], 'm7a.8xlarge,m7a.4xlarge')
         self.assertEqual(by_name['GateGpuInstanceTypes']['ParameterValue'],
@@ -2117,7 +2099,7 @@ sys.exit(7)
                         (self.root / 'fail-wait-change-set-create-complete').touch()
                     if delete_fails:
                         (self.root / 'fail-down-delete-change-set').touch()
-                    settings = aws_config.read_deployment_settings(self.settings, self.state)
+                    settings = aws_config.read_deployment_settings(self.settings)
                     prepared = subject.prepare()
                     before = len(self.commands('execute-change-set'))
                     with mock.patch.object(subject, '_before_request', side_effect=deploy.DeploymentRefused(cause)):
@@ -2154,7 +2136,7 @@ sys.exit(7)
 
     def test_cleanup_value_and_os_errors_preserve_the_original_refusal(self) -> None:
         subject = self.update_fixture()
-        settings = aws_config.read_deployment_settings(self.settings, self.state)
+        settings = aws_config.read_deployment_settings(self.settings)
         prepared = subject.prepare()
         api = subject._api(settings)  # pyright: ignore[reportPrivateUsage]
         call = api.call
@@ -2273,7 +2255,7 @@ sys.exit(7)
     def test_foundation_apply_never_requests_builder_compute(self) -> None:
         subject = self.update_fixture()
         outputs = subject.apply(approve_resources=True)
-        self.assertEqual(outputs['ComputeEnabled'], 'false')
+        self.assertNotIn('ComputeEnabled', outputs)
         self.assertNotIn('InstanceId', outputs)
         self.assertTrue(outputs['BudgetName'])
         self.assertFalse(self.commands('start-instances'))
@@ -2288,7 +2270,7 @@ sys.exit(7)
         (self.root / 'fail-wait-change-set-create-complete').touch()
         before = len(self.commands('execute-change-set'))
         outputs = subject.apply(approve_resources=True)
-        self.assertEqual(outputs['ComputeEnabled'], 'false')
+        self.assertNotIn('ComputeEnabled', outputs)
         self.assertEqual(len(self.commands('execute-change-set')), before)
         self.assertFalse(ledger.CostLedger(self.state).pending_compute_requests())
         self.assertTrue(self.commands('delete-change-set'))
@@ -2322,27 +2304,12 @@ sys.exit(7)
                 _ = subject.prepare()
 
 
-    def test_parameters_choose_only_an_available_saved_image(self) -> None:
+    def test_saved_image_is_empty_when_its_image_is_gone(self) -> None:
         subject = self.deployment()
-        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
         _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
-        self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-cache')
-        with mock.patch.object(box, 'saved_image', return_value={}):
-            self.assertEqual(subject.prepare().parameters['AmiId'], 'ami-fixture')
         with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
-            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings, self.state)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings)), self.state), {})  # pyright: ignore[reportPrivateUsage]
 
-
-    def test_update_preserves_ami_only_with_a_live_instance(self) -> None:
-        subject = self.update_fixture()
-        prepared = subject.prepare()
-        for live in ({'InstanceId': 'i-fixture'}, {}):
-            with mock.patch.object(subject, '_stack', return_value=live):
-                subject._update_stack(aws_config.read_deployment_settings(self.settings, self.state), prepared.parameters)  # pyright: ignore[reportPrivateUsage]
-            args = cast(list[str], self.commands('create-change-set')[-1]['args'])
-            values = ledger.rows({'values': cast(object, json.loads(args[args.index('--parameters') + 1]))}, 'values')
-            ami = next(row for row in values if row['ParameterKey'] == 'AmiId')
-            self.assertEqual(ami, {'ParameterKey': 'AmiId', **({'UsePreviousValue': True} if live else {'ParameterValue': 'ami-fixture'})})
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:
         _ = self.removal_fixture()
@@ -2492,7 +2459,7 @@ else: raise AssertionError(args)
         subject = self.deployment()
         _ = subject.prepare()
         outputs = subject.apply(approve_resources=True)
-        self.assertEqual(outputs['ComputeEnabled'], 'false')
+        self.assertNotIn('ComputeEnabled', outputs)
         self.assertNotIn('InstanceId', outputs)
         self.assertNotIn('DataVolumeId', outputs)
         saved = remote.read_record(self.state / 'deployment.json')
@@ -2547,157 +2514,13 @@ else: raise AssertionError(args)
         _ = path.write_text(original)
 
     def test_down_dry_run_changes_nothing_and_needs_no_credentials(self) -> None:
-        for action in (self.deployment().down, self.deployment().remove_builder):
-            before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
-            with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
-                self.assertTrue(action())
-            self.assertIn('/home build cache is lost', output.getvalue())
-            self.assertIn('admin.gpg, and the box image', output.getvalue())
-            self.assertIn('--approve-destroy', output.getvalue())
-            self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
-
-    def builder_removal_fixture(self) -> dict[str, object]:
-        devices = self.removal_fixture()
-        stack_path = self.root / 'fake-stack.json'
-        stack = remote.read_record(stack_path)
-        ledger.mapping(stack['outputs']).update(GateBucket='fixture-bucket', GateLaunchTemplate='fixture-template')
-        ledger.mapping(stack['parameters']).update(EnableGates='true', GateImage='ami-gate', GateRootGiB='40')
-        _ = stack_path.write_text(json.dumps(stack))
-        template = remote.read_record(deploy.TEMPLATE)
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            _ = ledger.mapping(ledger.mapping(template['Resources'])[name]).pop('Condition')
-        _ = (self.root / 'live-template.json').write_text(json.dumps(template))
-        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({
-            'bucket': 'fixture-bucket', 'template': 'fixture-template',
-            'deployment_id': aws_config.deployment_record(self.state)['deployment_id']}))
-        self.set_clock(self.now + 1)
-        book = ledger.CostLedger(self.state)
-        book.record_inventory(ledger.ResourceInventory(self.now, book.read_snapshot().inventories[-1].resources + (
-            ledger.PricedResource('gate-shared', Decimal(1)),), 'fixture gate deployment'))
-        book.record_compute_request(ledger.ComputeRequest(self.now, 'fixture-build', 'us-east-1', Decimal('0.5')))
-        self.set_clock(self.now + 1)
-        self.replace('fixed_usd_per_month', '100')
-        return devices
-
-    def test_remove_builder_preserves_gates_and_removes_storage_before_resolving_costs(self) -> None:
-        devices = self.builder_removal_fixture()
-        settings, credentials = self.settings.read_bytes(), self.credentials.read_bytes()
-        gate_manifest = (self.state / 'gate-deployment.json').read_bytes()
-        template = remote.read_record(self.root / 'live-template.json')
-        before_commands = len(self.commands())
-        with redirect_stdout(StringIO()) as output:
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        labels = ['checking the deployment', 'disabling builder routing', 'removing the builder from Tailscale',
-                  'updating the stack', 'deleting builder storage',
-                  'deleting local builder records']
-        plain = ['remove-builder: ' + label for label in labels]
-        starts = [line + ' (can take several minutes)' if label == 'updating the stack' else line
-                  for label, line in zip(labels, plain)]
-        self.assertEqual([line for line in output.getvalue().splitlines() if line in starts], starts)
-        progress = [line for line in output.getvalue().splitlines()
-                    if line in starts or any(line.startswith(start + ' done in ') for start in plain)]
-        self.assertEqual(len(progress), len(starts) * 2)
-        self.assertEqual([line for line in output.getvalue().splitlines()
-                          if line.startswith('remove-builder: ') and not line.startswith('remove-builder: done;')], progress)
-        self.assertEqual(self.previous_output('\n'.join(progress), 'remove-builder'), '')
-        print('\n'.join(progress))
-        private = ('i-fixture', 'vol-', '123456789012', 'arn:', 'device-', 'fixture-bucket',
-                   '100.64.', 'fixture-admin-secret', 'fixture-oauth-secret')
-        for value in private:
-            self.assertNotIn(value, '\n'.join(line for line in output.getvalue().splitlines()
-                                               if line.startswith('remove-builder: ')))
-        self.assertIn('gate-deployment.json kept', output.getvalue())
-        self.assertEqual(self.settings.read_bytes(), settings)
-        self.assertEqual(self.credentials.read_bytes(), credentials)
-        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), gate_manifest)
-        self.assertEqual([row['id'] for row in ledger.rows(devices, 'devices')], ['device-other'])
-        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before_commands:]]
-        self.assertLess(operations.index('execute-change-set'), operations.index('delete-volume'))
-        self.assertFalse({'delete-stack', 'delete-budget', 'delete-access-key'} & set(operations))
-        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
-        parameters = ledger.rows({'rows': cast(object, json.loads(command[command.index('--parameters') + 1]))}, 'rows')
-        for row in parameters:
-            if row['ParameterKey'] == 'EnableCompute':
-                self.assertEqual(row['ParameterValue'], 'false')
-            else:
-                self.assertIs(row['UsePreviousValue'], True)
-        after_template = remote.read_record(self.root / 'live-template.json')
-        expected = ledger.mapping(template['Resources'])
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            ledger.mapping(expected[name])['Condition'] = 'Compute'
-        self.assertEqual(after_template, template)
-        self.assertEqual(after_template, remote.read_record(deploy.TEMPLATE))
-        saved = aws_config.deployment_outputs(self.state)
-        self.assertEqual(saved['GateBucket'], 'fixture-bucket')
-        self.assertNotIn('InstanceId', saved)
-        self.assertNotIn('DataVolumeId', saved)
-        self.assertFalse((self.state / 'up.json').exists())
-        book = ledger.CostLedger(self.state)
-        state = book.read_snapshot()
-        self.assertEqual(state.observations[-1].state, 'terminated')
-        self.assertEqual(book.pending_compute_requests(), ())
-        self.assertTrue(state.inventories[-1].builder_removed)
-        self.assertEqual(state.inventories[-1].resources, (ledger.PricedResource('gate-shared', Decimal(1)),))
-        costs = book.estimate(aws_config.read_settings(self.settings), self.now + 3600)
-        later = [row for row in costs.intervals if row.start >= self.now]
-        self.assertFalse(any(row.kind == 'instance' for row in later))
-        self.assertEqual(sum((row.usd for row in later if row.kind == 'fixed'), Decimal(0)), Decimal(1) / Decimal(744))
-        self.assertEqual(ledger.text(remote.read_record(self.state / 'builder-removal.json'), 'stack'), 'fixture-build')
-
-    def test_remove_builder_preserves_a_live_gate_definition_that_differs_from_repository(self) -> None:
-        _ = self.builder_removal_fixture()
-        path = self.root / 'live-template.json'
-        template = remote.read_record(path)
-        resources = ledger.mapping(template['Resources'])
-        gate = ledger.mapping(resources['GateExpiryFunction'])
-        ledger.mapping(gate['Properties'])['Timeout'] = 17
-        _ = path.write_text(json.dumps(template))
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        command = cast(list[str], self.commands('create-change-set')[-1]['args'])
-        submitted = remote.read_record(Path(command[command.index('--template-body') + 1].removeprefix('file://')))
-        self.assertEqual(ledger.mapping(submitted['Resources'])['GateExpiryFunction'], gate)
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            ledger.mapping(resources[name])['Condition'] = 'Compute'
-        self.assertEqual(submitted, template)
-
-    def test_remove_builder_resumes_after_partial_removal_and_repeats_without_deletion(self) -> None:
-        _ = self.builder_removal_fixture()
-        saved = remote.read_record(self.state / 'deployment.json')
-        stale = {**saved, 'data_volume_id': 'vol-old',
-                 'outputs': {**ledger.mapping(saved['outputs']), 'InstanceId': 'i-old', 'DataVolumeId': 'vol-old'}}
-        _ = (self.state / 'builder-removal.json').write_text(json.dumps(stale))
-        manifest = (self.state / 'gate-deployment.json').read_bytes()
-        executed_before = len(self.commands('execute-change-set'))
-        for operation in ('execute-change-set', 'delete-volume'):
-            with self.subTest(operation=operation):
-                failure = self.root / ('fail-down-' + operation)
-                failure.touch()
-                with self.assertRaises(aws_target.AwsUnavailable), redirect_stdout(StringIO()):
-                    _ = self.deployment().remove_builder(approve_destroy=True)
-                failure.unlink()
-                self.assertFalse(ledger.CostLedger(self.state).read_snapshot().inventories[-1].builder_removed)
-        with (mock.patch.object(ledger.CostLedger, 'record_inventory', side_effect=OSError('fixture ledger failure')),
-              self.assertRaisesRegex(OSError, 'fixture ledger failure'), redirect_stdout(StringIO())):
-            _ = self.deployment().remove_builder(approve_destroy=True)
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        self.assertEqual(len(self.commands('execute-change-set')), executed_before + 1)
-        self.assertEqual(len(self.commands('delete-volume')), 1)
-        receipt = remote.read_record(self.state / 'builder-removal.json')
-        self.assertEqual(receipt['data_volume_id'], saved['data_volume_id'])
-        self.assertEqual(ledger.mapping(receipt['outputs'])['InstanceId'], ledger.mapping(saved['outputs'])['InstanceId'])
-        before = len(self.commands())
-        with redirect_stdout(StringIO()):
-            self.assertTrue(self.deployment().remove_builder(approve_destroy=True))
-        operations = [cast(list[str], row['args'])[5] for row in self.commands()[before:]]
-        self.assertFalse(any(operation.startswith(('delete-', 'execute-', 'create-', 'update-')) for operation in operations))
-        self.assertEqual((self.state / 'gate-deployment.json').read_bytes(), manifest)
-        self.assertFalse((self.root / 'deleted-stack').exists())
-        self.assertFalse((self.root / 'deleted-budget').exists())
-        success, output = self.down_output()
-        self.assertTrue(success, output)
-        self.assertFalse((self.root / 'fake-stack.json').exists())
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        with mock.patch.dict(os.environ, {'AWS_SHARED_CREDENTIALS_FILE': ''}), redirect_stdout(StringIO()) as output:
+            self.assertTrue(self.deployment().down())
+        self.assertIn('/home build cache is lost', output.getvalue())
+        self.assertIn('admin.gpg, and the box image', output.getvalue())
+        self.assertIn('--approve-destroy', output.getvalue())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
 
     def test_down_removes_resources_and_preserves_spend_and_other_profiles(self) -> None:
         devices = self.removal_fixture()
@@ -2732,7 +2555,7 @@ else: raise AssertionError(args)
         self.assertFalse((self.state / 'up.json').exists())
         self.assertTrue((self.root / 'admin.gpg').exists())
         operations = [cast(list[str], row['args'])[5] for row in self.commands()]
-        self.assertLess(operations.index('update-stack'), operations.index('delete-stack'))
+        self.assertNotIn('update-stack', operations)
         self.assertLess(operations.index('delete-stack'), operations.index('delete-volume'))
         before_commands = len(self.commands())
         before_service = (self.root / 'systemctl-commands').read_text()
@@ -2749,7 +2572,7 @@ else: raise AssertionError(args)
         devices = self.removal_fixture()
         self.assertIn('devices', devices)
         failures = (('fail-service', 'routing-off'), ('fail-tailnet', 'tailscale-device'),
-                    ('fail-down-delete-access-key', 'scaler-keys'), ('fail-down-update-stack', 'compute'),
+                    ('fail-down-delete-access-key', 'scaler-keys'),
                     ('fail-down-delete-stack', 'foundation'), ('fail-down-delete-volume', 'retained-resources'),
                     ('fail-down-delete-budget', 'retained-resources'))
         for filename, stage in failures:
@@ -2763,7 +2586,7 @@ else: raise AssertionError(args)
                 (self.root / filename).unlink()
         success, output = self.down_output()
         self.assertTrue(success, output)
-        self.assertEqual(len(self.commands('update-stack')), 1)
+        self.assertEqual(len(self.commands('update-stack')), 0)
         self.assertEqual(len(self.commands('delete-stack')), 1)
         self.assertEqual(len(self.commands('delete-volume')), 1)
 
@@ -2913,22 +2736,6 @@ else: raise AssertionError(args)
         self.assertEqual(args[args.index('--budget-name') + 1], 'fixture-build-monthly-' + str(saved['deployment_id']))
 
 
-    def test_legacy_migration_refuses_a_different_live_instance_without_changes(self) -> None:
-        devices = self.removal_fixture()
-        self.assertIn('devices', devices)
-        path = self.state / 'deployment.json'
-        saved = remote.read_record(path)
-        del saved['stack_id']
-        ledger.mapping(saved['outputs'])['InstanceId'] = 'i-foreign'
-        _ = path.write_text(json.dumps(saved))
-        before = path.read_bytes()
-        requests = len(self.commands())
-        with self.assertRaisesRegex(deploy.DeploymentRefused, 'legacy InstanceId differs'):
-            _ = self.deployment().prepare()
-        self.assertEqual(path.read_bytes(), before)
-        self.assertFalse(any(cast(list[str], row['args'])[5] in ('create-tags', 'deploy') for row in self.commands()[requests:]))
-
-
     def test_review_in_progress_stack_has_no_resources_to_reconcile(self) -> None:
         _ = (self.root / 'review-stack').write_text('empty change set')
         _ = self.update_fixture()
@@ -3014,7 +2821,7 @@ else: raise AssertionError(args)
             _ = subject.apply(approve_resources=True)
         self.assertEqual(self.commands(), [])
 
-    def test_a_limit_change_during_foundation_refuses_compute(self) -> None:
+    def test_a_limit_change_during_the_foundation_deploy_refuses_the_next_change(self) -> None:
         subject = self.deployment()
         _ = subject.prepare()
         execute = subject.execute
@@ -3022,7 +2829,7 @@ else: raise AssertionError(args)
         def change_limit(arguments: Sequence[str], *, capture_output: bool, text: bool,
                          timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
             result = execute(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
-            if 'EnableCompute=false' in arguments:
+            if 'deploy' in arguments:
                 self.replace('monthly_limit_usd', '1')
             return result
 
@@ -3031,7 +2838,6 @@ else: raise AssertionError(args)
             _ = subject.apply(approve_resources=True)
         calls = self.commands('deploy')
         self.assertEqual(len(calls), 1)
-        self.assertIn('EnableCompute=false', cast(list[str], calls[0]['args']))
 
     def test_apply_requires_explicit_user_gate_and_private_credentials(self) -> None:
         subject = self.deployment()
@@ -3054,49 +2860,28 @@ else: raise AssertionError(args)
         self.assertEqual(book.read_snapshot().observations, [ledger.InstanceObservation(self.now - 1, 'stopped', 'fixture')])
 
 
-    def test_template_enforces_budget_tags_retention_network_and_single_instance_policy(self) -> None:
+    def test_template_enforces_budget_retention_and_one_time_gate_boxes(self) -> None:
         template = remote.read_record(deploy.TEMPLATE)
         resources = cast(dict[str, dict[str, object]], template['Resources'])
-        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup'):
-            with self.subTest(compute_resource=name):
-                self.assertEqual(resources[name].get('Condition'), 'Compute')
-        cost_tag = {'Key': {'Ref': 'CostTagKey'}, 'Value': {'Ref': 'CostTagValue'}}
-        for name in ('DataVolume', 'MonthlyBudget'):
-            resource = resources[name]
-            self.assertEqual(resource['DeletionPolicy'], 'Retain')
-            self.assertEqual(resource['UpdateReplacePolicy'], 'Retain')
-        self.assertNotIn('DeletionPolicy', resources['Instance'])
-        self.assertNotIn('UpdateReplacePolicy', resources['Instance'])
-        self.assertNotIn('Tags', cast(dict[str, object], resources['Instance']['Properties']))
-        for name in ('Instance', 'DataVolume', 'LaunchTemplate'):
-            self.assertEqual(resources[name]['DependsOn'], ['BudgetEnforcement'])
-        properties = cast(dict[str, object], resources['DataVolume']['Properties'])
-        self.assertIn(cost_tag, cast(list[object], properties['Tags']))
-        launch = cast(dict[str, object], resources['LaunchTemplate']['Properties'])
+        for name in ('InstanceRole', 'InstanceProfile', 'SecurityGroup', 'LaunchTemplate', 'Instance', 'DataVolume',
+                     'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy'):
+            with self.subTest(retired_builder_resource=name):
+                self.assertNotIn(name, resources)
+        budget_resource = resources['MonthlyBudget']
+        self.assertEqual(budget_resource['DeletionPolicy'], 'Retain')
+        self.assertEqual(budget_resource['UpdateReplacePolicy'], 'Retain')
+        budget = cast(dict[str, object], budget_resource['Properties'])
+        budget_data = cast(dict[str, object], budget['Budget'])
+        self.assertEqual(budget_data['BudgetLimit'], {'Amount': {'Ref': 'MonthlyLimitUsd'}, 'Unit': 'USD'})
+        launch = cast(dict[str, object], resources['GateLaunchTemplate']['Properties'])
         data = cast(dict[str, object], launch['LaunchTemplateData'])
         self.assertEqual(data['InstanceMarketOptions'], {
-            'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'persistent',
-            'InstanceInterruptionBehavior': 'stop', 'MaxPrice': {'Ref': 'SpotMaxPrice'}}})
-        self.assertEqual(data['InstanceInitiatedShutdownBehavior'], 'stop')
+            'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time',
+            'InstanceInterruptionBehavior': 'terminate', 'MaxPrice': {'Ref': 'GateSpotMaxPrice'}}})
+        self.assertEqual(data['InstanceInitiatedShutdownBehavior'], 'terminate')
         mappings = cast(list[dict[str, object]], data['BlockDeviceMappings'])
         self.assertIs(cast(dict[str, object], mappings[0]['Ebs'])['DeleteOnTermination'], True)
         self.assertEqual(cast(dict[str, object], data['MetadataOptions'])['HttpTokens'], 'required')
-        tag_specs = cast(list[dict[str, object]], data['TagSpecifications'])
-        self.assertEqual({row['ResourceType'] for row in tag_specs}, {'instance', 'volume', 'spot-instances-request'})
-        for spec in tag_specs:
-            self.assertIn(cost_tag, cast(list[object], spec['Tags']))
-        budget = cast(dict[str, object], resources['MonthlyBudget']['Properties'])
-        budget_data = cast(dict[str, object], budget['Budget'])
-        self.assertEqual(budget_data['BudgetLimit'], {'Amount': {'Ref': 'MonthlyLimitUsd'}, 'Unit': 'USD'})
-        self.assertIn('AWS_BUILD_DATA_VOLUME_ID', str(data['UserData']))
-        self.assertIn("'Ref': 'DataVolume'", str(data['UserData']))
-        ingress = cast(dict[str, object], resources['SecurityGroup']['Properties'])['SecurityGroupIngress']
-        self.assertEqual(ingress, [{'IpProtocol': 'udp', 'FromPort': 41641, 'ToPort': 41641, 'CidrIp': '0.0.0.0/0'}])
-        policy = cast(dict[str, object], resources['ScalerPolicy']['Properties'])
-        statements = cast(list[dict[str, object]], cast(dict[str, object], policy['PolicyDocument'])['Statement'])
-        self.assertEqual(statements[0]['Action'], ['ec2:StartInstances', 'ec2:StopInstances'])
-        self.assertIn('${Instance}', str(statements[0]['Resource']))
-        self.assertIn('ec2:DescribeSpotInstanceRequests', cast(list[str], statements[1]['Action']))
         self.assertNotIn('AccessKey', json.dumps(template))
         self.assertNotIn('mkfs', json.dumps(template))
 
@@ -3353,15 +3138,10 @@ esac
         self.assertEqual(tuple(ledger.CostLedger(self.state).read_snapshot().reconciliations), readings)
 
 
-    def test_fixed_deployment_values_use_the_source_limits(self) -> None:
-        for key, value, normal in (('data_volume_gib', '501', '500'), ('data_volume_iops', '6001', '6000'),
-                                   ('data_volume_throughput', '501', '500'), ('budget_stop_percent', '99', '100'),
-                                   ('instance_type', 'm7a.8xlarge', 'm7a.4xlarge')):
-            with self.subTest(key=key):
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, normal)
+    def test_budget_stop_percent_uses_its_source_limit(self) -> None:
+        self.replace('budget_stop_percent', '99')
+        with self.assertRaises(ValueError):
+            _ = aws_config.read_deployment_settings(self.settings)
 
     def test_durable_decision_check_rejects_a_superseded_decision(self) -> None:
         subject = self.deployment()
@@ -3386,16 +3166,6 @@ esac
             _ = self.deployment().prepare()
         self.assertEqual(reads, [deploy.TEMPLATE])
         self.assertEqual(ledger.mapping(remote.read_record(self.bundle / 'preflight.json')['decision'])['purpose'], 'deployment')
-
-    def test_deployment_settings_validate_the_public_source_inputs(self) -> None:
-        for key, value in (('scripts_source_url', 'https://user:secret@example.invalid/a'),
-                           ('scripts_source_commit', 'main'), ('scripts_source_sha256', 'unverified')):
-            with self.subTest(key=key):
-                settings = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, value)
-                with self.assertRaises(ValueError):
-                    _ = aws_config.read_deployment_settings(self.settings)
-                self.replace(key, str(cast(object, getattr(settings, key))))
 
     def test_shared_aws_cli_rejects_a_malformed_stack_reply(self) -> None:
         subject = self.deployment()

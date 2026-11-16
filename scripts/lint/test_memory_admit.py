@@ -716,6 +716,29 @@ class HistoryTests(unittest.TestCase):
         self.add_measured(5)
         assert_unfinished_history_ignored(self, self.admission / "anon_peaks.jsonl", self.peak)
 
+    def test_the_history_window_decodes_no_row_that_ended_a_day_before_it(self) -> None:
+        window_start = NOW - timedelta(days=step_estimator.HISTORY_DAYS)
+        self.add_measured(40, at=window_start - timedelta(days=3))
+        self.add_measured(1, at=window_start + timedelta(minutes=10), start_gib=20)
+        # This row came late: it follows a newer row, but it ended before the window.
+        self.add_measured(1, at=window_start - timedelta(hours=5), start_gib=30)
+        self.add_measured(5, at=window_start + timedelta(hours=1), start_gib=3)
+        with patch.object(json, "loads", wraps=json.loads) as decode:
+            history = step_estimator.read_estimate_history(self.root, self.host, ("nextest",), NOW)
+        self.assertEqual(sorted(cast(int, row["anon_peak_bytes"]) // GIB for row in history.rows["nextest"]),
+                         [3, 4, 5, 6, 7, 20])
+        self.assertLess(decode.call_count, 40)
+
+    def test_the_history_window_decodes_no_row_of_another_host_or_step(self) -> None:
+        self.add_measured(30, host="other-host")
+        self.add_measured(5)
+        with patch.object(json, "loads", wraps=json.loads) as decode:
+            history = step_estimator.read_estimate_history(self.root, self.host, ("nextest",), NOW)
+            program = step_estimator.program_peak_estimate("clippy", self.host, NOW, self.root, 1)
+        self.assertEqual(len(history.rows["nextest"]), 5)
+        self.assertEqual(program, admission_records.FirstProgramPeak(1))
+        self.assertLess(decode.call_count, 30)
+
     def test_measured_overrides_index_at_five(self) -> None:
         self.add_index()
         self.add_measured(4)
@@ -3325,10 +3348,11 @@ class BuildFinalizerTests(BuildPromiseFixture):
                 reads_at_expiry = 0
                 history_reader = step_estimator.anonymous_history_rows
                 history_scans = 0
-                def count_history_scans(path: Path) -> Iterator[dict[str, object]]:
+                def count_history_scans(path: Path, window: step_estimator.HistoryWindow | step_estimator.AllHistoryRows = step_estimator.ALL_HISTORY_ROWS
+                                        ) -> Iterator[dict[str, object]]:
                     nonlocal history_scans
                     history_scans += 1
-                    return history_reader(path)
+                    return history_reader(path, window)
                 def observe(reply: wire.Wait) -> None:
                     nonlocal reads_at_expiry
                     replies.append(reply)
@@ -5841,7 +5865,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "build_admission.conf"
             for key in ("estimate_refresh_seconds", "slot_gap_seconds", "program_first_peak_gib.cargo",
-                        "peak_history_share_percent"):
+                        "peak_history_share_percent", "progress_profile_sweep_seconds"):
                 invalid_values = (None, "invalid", "70") if key == "peak_history_share_percent" else (None, "invalid")
                 for bad in invalid_values:
                     with self.subTest(key=key, value=bad), patch.dict(os.environ, {"CONF_DIR": directory}):
@@ -5862,6 +5886,8 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
                             self.assertEqual(repaired.config.policy.timing.slot_gap_seconds, 7)
                         elif key == "peak_history_share_percent":
                             self.assertEqual(repaired.peak_history_share_percent, 7)
+                        elif key == "progress_profile_sweep_seconds":
+                            self.assertEqual(repaired.progress_profile_sweep_seconds, 7)
                         else:
                             self.assertEqual(repaired.config.program_first_peaks["cargo"], 7 * GIB)
 

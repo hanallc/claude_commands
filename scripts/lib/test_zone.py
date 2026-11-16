@@ -301,7 +301,7 @@ class SetTests(unittest.TestCase):
                 mock.patch.object(subprocess, "run", side_effect=run):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
-        self.assertEqual(observed, {"fetch": [10], "push": [10], "ssh": [10, 20]})
+        self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})
 
     def test_a_checkout_off_main_is_refused(self) -> None:
         _ = self.git(self.checkout, "switch", "-q", "-c", "work")

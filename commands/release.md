@@ -20,6 +20,11 @@ Perform a release for any Rust crate or workspace project.
 - `/release <package> X.Y.Z-rc.N` - Release only that crate as an RC
 - `/release <package> X.Y.Z dry-run` - Rehearse a single-package release without mutations
 
+**Releasing several packages in one run** (same workspace rule):
+- `/release patch <package> <package>...` - Patch-bump and release each named crate, in `publish_order` order
+- `/release <package>@X.Y.Z <package>@X.Y.Z...` - Release each crate at its own version
+- `/release X.Y.Z <package> <package>@X.Y.Z dry-run` - Mix both forms; a bare package takes the run's version
+
 The package token is optional and identified by name — any argument that is not `help`, `patch`, `dry-run`, or a version. Argument order does not matter. Without it, the whole workspace releases together (unchanged). In single-package mode the release branch is `release-<package>-<version>` and the tag is `<package>-v<version>`, so single-package releases never collide with whole-workspace ones.
 
 **Releasing from a non-`main` branch**: When the current branch is not `main`, the branch alone can't say whether it's a hotfix or an isolated release, so STEP 1 asks which mode applies:
@@ -44,6 +49,45 @@ In single-package mode the entire pipeline is scoped to the one crate: `${ALL_CR
 
 **Single-package mode is incompatible with `[[publish_phases]]` config.** A workspace that defines publish phases releases its crates together with ordered cross-dependency updates; STEP 1 stops if a package is named there.
 
+## Multi-Package Mode
+
+Two or more package tokens select multi-package mode. Each token is `<crate>` or `<crate>@<version>`. A bare `<crate>` takes the run's version or `patch`; with neither, STEP 0 stops and asks for one. The run does the single-package pipeline once for each crate, with one user yes for all public pushes. The `[[publish_phases]]` guard applies. Multi-package mode runs in normal and isolated mode only. A run and its rerun start on `${BASE_BRANCH}`. On a branch that starts with `release-`, STEP 1 stops: "check out the base branch, then run the command again." In hotfix mode, STEP 1 stops and tells the user to release each crate alone.
+
+**Before the first crate's pipeline** (after STEP 1 discovery):
+1. Check each crate with items 2–3 of STEP 1's single-package scoping.
+2. Order the crates by `publish_order` from `release.toml`. A named crate that is not in `publish_order` stops the run. With no `publish_order`, use the order given.
+3. Resolve each crate's version once: the `@<version>` it names, else the run's version, else `next_patch_version.sh <crate>`. Never resolve a version again in this run.
+4. Set `${RERUN}` to `/release` followed by each crate as `<crate>@<version>`, in run order. A rerun with it never resolves a new patch.
+5. Find each crate's state. Its tag is `<crate>-v<version>`. Run `git fetch origin ${BASE_BRANCH}`. Read the crate's version from its `Cargo.toml` at `HEAD` and at `origin/${BASE_BRANCH}`.
+   - **done**: neither version is the release version, `verify_published.sh <version> <crate>` exits 0, and `gh release view <tag> --repo ${GITHUB_REPO}` exits 0. Its STEP 11 commit is on origin. Report `<crate> <version>: done` and skip its pipeline.
+   - **push**: the `HEAD` version is not the release version, the `origin/${BASE_BRANCH}` version is, and the crate is published and released. Its STEP 11 commit did not reach origin. Its pipeline is only STEP 11's `git push origin ${BASE_BRANCH}`.
+   - **resume**: the `HEAD` version is the release version. Its pipeline resumes per STEP 0.
+   - **new**: any other state. Its pipeline runs from STEP 2.
+6. Find each crate's next dev version with STEP 11's rules. A version with a nonzero patch part is a patch release, whatever token gave it. Its previous dev version is the version at `HEAD`. On a resume, it is the version in the parent of the crate's version commit (`git log -1 --format=%H --grep='^<version>$' -- <its Cargo.toml>`).
+7. Show the plan and ask for one yes:
+   ```
+   RELEASE PLAN — ${GITHUB_REPO}
+   1. <crate> <version> (new | resume | push)  next dev: <next dev version>
+      crates.io publish · origin: release branch and tag <tag> · post-publish hook · GitHub release <tag> · ${BASE_BRANCH} push
+   2. ...
+   done: <crate> <version>
+   rerun after a failure: ${RERUN}
+   ```
+   Name `post-publish hook` only when `.claude/config/post_publish.sh` exists. In dry-run, show the plan and ask nothing. Otherwise: "Type **yes** to run this plan. Each push on it is public and cannot be undone."
+
+**For each crate that is not done, in order:**
+- A crate in the **push** state runs `git push origin ${BASE_BRANCH}` (sandbox off), reports the output, and is then done. In dry-run, it reports `[DRY-RUN] Would push ${BASE_BRANCH}` and pushes nothing.
+- Every other crate runs these steps:
+
+1. Set `${PACKAGE}` and `${VERSION}` to that crate and its version, and apply item 4 of STEP 1's single-package scoping.
+2. Start on `${BASE_BRANCH}`. Run STEP 0's resume detection and version validation for the crate.
+3. Display the progress list with the crate's `Package:` line. Run STEPs 2–11 in single-package mode.
+4. The plan's yes replaces STEP 6's `publish` confirmation and STEP 11's dev-version confirmation when the dev version matches the plan. A different dev version, or a push that is not on the plan, needs a new yes. The STEP 3 and STEP 4 checks still ask.
+
+**On a failure**, stop. Check out `${BASE_BRANCH}` when the working tree is clean; otherwise say which files keep the run on its branch. Report the crate and the step, then print `rerun: ${RERUN}`. The rerun starts on `${BASE_BRANCH}`, skips done crates and resumes the others.
+
+**After the last crate**, report each crate with its version, its tag and its release URL (`https://github.com/${GITHUB_REPO}/releases/tag/<tag>`). Mark the crates that were done before this run.
+
 ## Versioning Strategy
 
 All projects use a **branch-first release model**:
@@ -62,11 +106,21 @@ The command works with **zero config** by convention. It auto-detects:
 - Version files: `{crate_dir}/Cargo.toml`
 - Changelogs: `{crate_dir}/CHANGELOG.md`
 - Published READMEs: determined per-crate from `Cargo.toml` `readme` field or `{crate_dir}/README.md` auto-discovery
-- GitHub repo via `gh repo view`
+- GitHub release repository: `github_release_repo` from `release.toml`, else origin's repository when it is public (STEP 1)
 
 **Optional config** at `.claude/config/release.toml` for projects that need overrides:
 
 ```toml
+# The GitHub repository (owner/name) that gets the GitHub release.
+# Required when origin is private: a release never goes to a private origin.
+# When it is not origin, the release tag must be on it before STEP 8
+# (for hana, its post_publish hook pushes the tag to the public mirror).
+github_release_repo = "natepiano/bevy_hana"
+
+# The order in which a multi-package run releases its crates. Put each crate
+# after the crates it depends on. A run that names a crate not listed here stops.
+publish_order = ["hana_kana", "hana_clerestory"]
+
 # Post-release install verification (binary crates only).
 # In single-package mode the crate released is the crate verified, and this
 # value is only an on-switch — a multi-binary workspace has no one fixed crate.
@@ -126,16 +180,17 @@ All scriptable steps use shell scripts. The agent orchestrates script execution 
 - `validate_version.sh` — format, collision, and gap checking ⊘
 - `next_patch_version.sh` — next patch on the current branch's line, for `/release patch` ⊘
 - `pre_release_checks.sh` — git status, clippy, build, test, fmt ⊘ (deliberately ignores `config/lint.conf`; a check turned off with `/lint_config` still runs here, because a release gate that silently no-ops is worse than a noisy one). Takes an optional `--package <name>` to scope the compile-and-test gate to one crate
-- `create_release_branch.sh` — branch creation
+- `create_release_branch.sh` — branch creation; a rerun reuses a release branch at `HEAD` and refuses one at another commit
 - `bump_versions.sh` — update [package] version fields
 - `resolve_path_pins.sh` — resolve each path-only workspace dep to its latest published version and detect unpublished local changes ⊘
 - `pin_path_deps.sh` — pin path-only workspace deps to published versions for publish; `--restore` undoes an uncommitted dry-run pin
 - `finalize_changelogs.sh` — replace [Unreleased] with version header
-- `publish_crate.sh` — dry-run and publish a single crate ⊘
+- `publish_crate.sh` — dry-run and publish a single crate; a version already on crates.io prints `already published` and is skipped ⊘
 - `update_workspace_deps.sh` — update internal cross-crate versions in root `Cargo.toml` `[workspace.dependencies]`; between publish phases with explicit names ⊘, or with `--edit-only --auto` (self-discovering, no crates.io wait, no commit) when bumping versions in STEP 4 and STEP 11
 - `push_release.sh` — tag, push branch, push tag ⊘
 - `verify_published.sh` — check each crate has the exact version published and not yanked ⊘
-- `create_github_release.sh` — create GitHub release ⊘
+- `post_publish_hook.sh` — run the project's `.claude/config/post_publish.sh` after a publish, with `CRATE`, `VERSION` and `SHA`; absent hook is a pass
+- `create_github_release.sh` — create the GitHub release on `${GITHUB_REPO}` from a tag already there; an existing release prints `already released` ⊘
 - `restore_unreleased.sh` — add [Unreleased] sections back to changelogs
 
 **Project-specific scripts** in each project's `.claude/scripts/release/` — referenced by config `post_script` fields.
@@ -175,7 +230,7 @@ This applies to ALL bash commands and script invocations in this process.
 4. If config has `[[judgment_checks]]`, show them as sub-items under the step whose checkpoint they target
 5. If config has `install_verify`, append it to STEP 9's description
 6. Only show checkpoint sub-items when they have judgment checks or publish phases attached — bare checkpoints with nothing configured are invisible
-7. If `${SINGLE_PACKAGE_MODE}`, add a `Package: ${PACKAGE}` line beneath the `RELEASE ${VERSION}` title
+7. If `${SINGLE_PACKAGE_MODE}`, add a `Package: ${PACKAGE}` line beneath the `RELEASE ${VERSION}` title. In multi-package mode, display one list for each crate when its pipeline starts
 8. Display the full checklist
 
 **Example with no config (e.g., bevy_window_manager):**
@@ -331,10 +386,11 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
 <ArgumentValidation>
 ## STEP 0: Argument Validation
 
-**Parse `$ARGUMENTS`** — it may contain, in any order: an optional package selector, exactly one of a version (`X.Y.Z` / `X.Y.Z-rc.N`) or the literal `patch`, and an optional `dry-run`.
+**Parse `$ARGUMENTS`** — it may contain, in any order: optional package selectors, at most one of a version (`X.Y.Z` / `X.Y.Z-rc.N`) or the literal `patch`, and an optional `dry-run`. Without a package that names its own version, the version or `patch` is required.
 - The token matching `^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$` is the version.
 - `patch` selects patch mode; `dry-run` sets `${DRY_RUN_FLAG}`; `help` or empty shows usage.
-- Any remaining token is the **package selector** — set `${PACKAGE}` to it. It is validated against workspace members in STEP 1 (and rejected there if the workspace uses `[[publish_phases]]`).
+- Any remaining token is a **package selector**: `<crate>` or `<crate>@<version>`. With one selector, set `${PACKAGE}` to it; `<crate>@<version>` also sets the version. It is validated against workspace members in STEP 1 (and rejected there if the workspace uses `[[publish_phases]]`).
+- Two or more selectors select the Multi-Package Mode section: resolve versions there, then run STEP 0's resume detection and validation for each crate in its pipeline.
 
 **If argument is `patch` (with or without `dry-run`):**
 1. Detect the crate name: if `${PACKAGE}` is set, use it; otherwise the primary crate (single crate: from root `Cargo.toml`; workspace: from first `[workspace.members]` entry or first publish phase crate if config exists)
@@ -348,18 +404,26 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
 
 **Otherwise, extract version from `$ARGUMENTS`** (strip `dry-run` if present).
 
+**Detect a resume.** Read the version at `HEAD` from the `Cargo.toml` of `${PACKAGE}` when it is set, else of the primary crate. When it equals `${VERSION}`, STEP 4 already ran, and this run resumes a failed release:
+1. Set `${RESUME_FLAG}` to `--resume`. Otherwise it is empty.
+2. Skip STEPs 2–4. Their work is in the version commit.
+3. In normal and isolated mode, check out the release branch at STEP 5 when it exists. `create_release_branch.sh` then reuses it.
+4. Run every later step. Each one skips work that is done: `publish_crate.sh` prints `already published`, `push_release.sh` reuses its tag, `create_github_release.sh` prints `already released`, and `restore_unreleased.sh` keeps an `[Unreleased]` section that is present.
+
+Start a resume from `${BASE_BRANCH}`, or from the hotfix branch in hotfix mode. STEP 1's stale release-branch warning does not apply to a resume.
+
 **Run version validation** (with `dangerouslyDisableSandbox: true`):
 ```bash
-~/.claude/scripts/release/validate_version.sh ${VERSION} ${ALL_CRATE_NAMES}
+~/.claude/scripts/release/validate_version.sh ${VERSION} ${RESUME_FLAG} ${ALL_CRATE_NAMES}
 ```
 
-→ Report the script output to the user. Stop if validation fails.
+→ Report the script output to the user. Stop if validation fails. With `--resume`, a version already on crates.io passes; without it, that version stops the release.
 </ArgumentValidation>
 
 <ProjectDiscovery>
 ## STEP 1: Project Discovery
 
-**Read optional config** from `.claude/config/release.toml` if it exists. Store any `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, `publish_path_pins`, and `judgment_checks` settings.
+**Read optional config** from `.claude/config/release.toml` if it exists. Store any `github_release_repo`, `publish_order`, `install_verify`, `install_verify_script`, `workspace_publish`, `publish_phases`, `publish_path_pins`, and `judgment_checks` settings.
 
 **If config sets both `workspace_publish = true` and `[[publish_phases]]`**, STOP with a clear error: the two are mutually exclusive — `workspace_publish` is for workspaces whose members publish together with no between-phase scripts or dep rewrites; `[[publish_phases]]` is for ordered chains that need them.
 
@@ -384,17 +448,21 @@ Same sequence as normal mode, but every "on main" step runs on `${BASE_BRANCH}` 
   - Published README: Check `{dir}/Cargo.toml` for explicit `readme` field → resolve path relative to crate dir. Otherwise `{dir}/README.md` if it exists. Only these ship to crates.io.
 - Root README (`README.md`): tracked separately as **project README** — not published to crates.io for workspace projects. Only included in STEP 3 if it contains hardcoded version references.
 
-**Detect GitHub repo**:
-```bash
-git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
-```
+**Choose the GitHub release repository** and set `${GITHUB_REPO}`:
+1. When config sets `github_release_repo` (`owner/name`), use it.
+2. Otherwise read origin's repository:
+   ```bash
+   git remote get-url origin | sed 's|.*github.com[:/]||;s|\.git$||'
+   ```
+   Then run `gh repo view <that repo> --json isPrivate -q .isPrivate` (sandbox off). When it prints `false`, use origin's repository.
+3. When origin is private and config has no `github_release_repo`, STOP with: "origin is private; add `github_release_repo = \"owner/name\"` to `.claude/config/release.toml` to name the public repository for the GitHub release." A GitHub release never goes to a private origin.
 
 **Detect release mode** from current branch:
 ```bash
 git branch --show-current
 ```
 - If branch is `main`: **normal mode**. Set `${BASE_BRANCH}` to `main`.
-- If branch starts with `release-`: **possible stale release branch** — warn the user: "You are on branch `${BRANCH}` which looks like an existing release branch. Are you sure this is a hotfix? Type **yes** to continue in hotfix mode or **no** to abort." Stop if user says no.
+- If branch starts with `release-`: **possible stale release branch** — warn the user: "You are on branch `${BRANCH}` which looks like an existing release branch. Are you sure this is a hotfix? Type **yes** to continue in hotfix mode or **no** to abort." Stop if user says no. In multi-package mode, do not ask: STOP with "check out the base branch, then run the command again."
 - If branch is anything else: **ask which mode applies** — the branch alone can't distinguish a hotfix from an isolated release, so present both with their behavior and let the user choose:
 
   > You're on branch `${BRANCH}`, not `main`. Which kind of release is this?
@@ -652,6 +720,8 @@ Single crate:
 ~/.claude/scripts/release/publish_crate.sh ${PACKAGE_NAME}
 ```
 
+In multi-package mode, the plan's yes is this confirmation; do not ask again.
+
 Workspace:
 For each non-excluded workspace member:
 ```bash
@@ -738,6 +808,12 @@ ${POST_SCRIPT_PATH} ${VERSION}
 ```
 
 → Report the script output to the user. Stop if push fails.
+
+**Run the post-publish hook** (with `dangerouslyDisableSandbox: true`). `${RELEASE_SHA}` is the full `${BASE_BRANCH}` commit that the release branch was cut from: `git merge-base ${BASE_BRANCH} HEAD`. In hotfix mode, it is the version commit: `git log -1 --format=%H --grep='^${VERSION}$'`. In dry-run, it is `git rev-parse HEAD`.
+```bash
+~/.claude/scripts/release/post_publish_hook.sh ${PACKAGE_OR_PROJECT_NAME} ${VERSION} ${RELEASE_SHA} ${DRY_RUN_FLAG}
+```
+`${PACKAGE_OR_PROJECT_NAME}` is `${PACKAGE}` in single-package and multi-package mode, else `${PROJECT_NAME}`. When `.claude/config/post_publish.sh` exists, the script runs it with bash from the repository root, with `CRATE`, `VERSION` (no `v`) and `SHA` exported. It prints `post-publish hook: absent`, `post-publish hook: done`, or `post-publish hook: failed (exit N)` and a `rerun:` command. → Report the output. On a failure, stop before STEP 8; that crate gets no GitHub release. The hook is safe to rerun, so a rerun of the release runs it again.
 </PushReleaseBranch>
 
 <CreateGitHubRelease>
@@ -765,6 +841,8 @@ NOTES_EOF
 ~/.claude/scripts/release/create_github_release.sh ${VERSION} ${GITHUB_REPO} ${PROJECT_NAME} "$NOTES_FILE" ${DRY_RUN_FLAG} ${PACKAGE_FLAG}
 ```
 → This must use `dangerouslyDisableSandbox: true`. Report the script output to the user.
+
+`${GITHUB_REPO}` is the repository STEP 1 chose. The script creates the release only from a tag that is already on that repository (`gh release create --verify-tag`). When `${GITHUB_REPO}` is not origin, the tag gets there from the project's own push (hana's `post_publish` hook). A missing tag stops this step with `ERROR: tag <tag> is not on <repo>`; push the tag to that repository, then run the step again. A release that already exists for the tag prints `already released` and the step passes, so a rerun is safe.
 </CreateGitHubRelease>
 
 <PostReleaseVerification>
@@ -819,7 +897,7 @@ cargo install ${INSTALL_CRATE_NAME} --version "${VERSION}"
 - **Minor/major release** (e.g., `0.18.0`): Next dev is `X.Y+1.0-dev`
 - **RC release** (e.g., `0.18.0-rc.1`): Next dev is `X.Y.Z-dev`
 
-→ **Ask the user**: The dev version will be set to `${NEXT_DEV_VERSION}`. Confirm or provide a different version.
+→ **Ask the user**: The dev version will be set to `${NEXT_DEV_VERSION}`. Confirm or provide a different version. In multi-package mode, the plan's yes is this confirmation when `${NEXT_DEV_VERSION}` matches the plan; do not ask again.
 
 **Run version bump:**
 ```bash

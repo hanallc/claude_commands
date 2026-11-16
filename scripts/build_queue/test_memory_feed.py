@@ -34,7 +34,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
-from scripts.review_links import review_link, test_serve
+from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
@@ -169,7 +169,11 @@ class MemoryFeedTests(unittest.TestCase):
                     memory_feed.notify_unplaced_mac_runs(reading, notified)
                     self.assertEqual(send.call_count, 1 if label == "unplaced" else 0)
                     row = next(row for row in page["walk"] if row["pid"] == build.pid)
-                    self.assertIn(label, row["name"])
+                    if label.startswith("placement "):
+                        self.assertNotIn("placement", row["name"])
+                        self.assertEqual(row["gate_label"], label)
+                    else:
+                        self.assertIn(label, row["name"])
                     if label == "unplaced":
                         self.assertIn("pid 710001", str(send.call_args))
                         self.assertIn("Mac unplaced run: pid 710001", page["mac_idle_alert"])
@@ -194,8 +198,10 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.configuration.write_text(text)
 
     def expected_page(self, seconds: float = 0.125) -> str:
-        return Path(memory_feed.__file__).with_name("memory_live.html").read_text().replace(
-            "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        self.assertIn(console_theme.TOKENS, page)
+        return (page.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+                .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()

@@ -7,6 +7,9 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections import deque
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 import html
 import ipaddress
 import json
@@ -29,13 +32,69 @@ from urllib.parse import parse_qs, unquote, urlsplit
 STARTED_NS = time.time_ns()
 
 from scripts.lib import conf
-from scripts.production import change_routing
-from scripts.review_links import branch_page, change_page, change_browser, console, images
+from scripts.production import change_routing, change_review
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
+
+
+@dataclass
+class AccountsPageCache:
+    """Keep the last good page and allow one render at a time."""
+
+    page: bytes = b""
+    recent_times: deque[float] = field(default_factory=lambda: deque(maxlen=10))
+    rendering: bool = False
+    first_render: Future[bytes] = field(default_factory=Future[bytes])
+    condition: threading.Condition = field(default_factory=threading.Condition)
+
+    def get(self) -> bytes:
+        render_first = False
+        with self.condition:
+            if self.page:
+                if not self.rendering:
+                    self.rendering = True
+                    try:
+                        threading.Thread(target=self.replace, daemon=True).start()
+                    except RuntimeError:
+                        self.rendering = False
+                        raise
+                return self.page
+            if not self.rendering:
+                self.first_render = Future[bytes]()
+                self.rendering = True
+                render_first = True
+            attempt = self.first_render
+        if render_first:
+            try:
+                page = self.replace()
+            except BaseException as error:
+                attempt.set_exception(error)
+                raise
+            attempt.set_result(page)
+            return page
+        return attempt.result()
+
+    def replace(self) -> bytes:
+        try:
+            rendered = accounts_page.render_with_facts()
+            with self.condition:
+                self.recent_times.append(rendered.seconds)
+                self.page = rendered.with_recent_times(tuple(self.recent_times))
+                return self.page
+        except (OSError, ValueError) as error:
+            with self.condition:
+                if not self.page:
+                    raise
+                print(f"review-links accounts: {error}", file=sys.stderr)
+                return self.page
+        finally:
+            with self.condition:
+                self.rendering = False
+                self.condition.notify_all()
 
 
 class TailscaleAddressLost(RuntimeError):
@@ -99,7 +158,7 @@ def tailscale_ip() -> str:
 def sweep_snapshots(root: Path, now: float) -> int:
     """Expire flat snapshots and legacy session snapshots without following symlinks."""
     retention = conf.read("review_links").number("snapshot_retention_seconds")
-    removed = 0
+    removed = sweep_change_images(root, now)
     if not root.exists():
         return removed
     try:
@@ -110,7 +169,7 @@ def sweep_snapshots(root: Path, now: float) -> int:
     for entry in entries:
         try:
             # The console folder holds the browser token; the images folder holds registered images until a delete.
-            if entry.name in (change_page.CONSOLE_FOLDER, images.FOLDER) or entry.is_symlink() or not entry.is_dir():
+            if entry.name in (change_page.CONSOLE_FOLDER, image_store.IMAGES_FOLDER, image_store.CHANGE_FOLDER) or entry.is_symlink() or not entry.is_dir():
                 continue
             children = list(entry.iterdir())
             # New snapshots contain regular files. Check symlinks before their
@@ -132,6 +191,33 @@ def sweep_snapshots(root: Path, now: float) -> int:
                 continue
             except OSError as error:
                 print(f"review-links sweep: {folder}: {error}", file=sys.stderr)
+    return removed
+
+
+def sweep_change_images(root: Path, now: float) -> int:
+    """Remove old change images that no To review row names."""
+    folder = root / image_store.CHANGE_FOLDER
+    if folder.is_symlink() or not folder.is_dir():
+        return 0
+    retention = conf.read("review_links").number("change_image_unclaimed_days") * 86400
+    try:
+        claimed = {row.get(change_review.IMAGE, "") for path in change_review.lists_directory().glob(change_review.PREFIX + "*.md")
+                   for row in change_review.pending(path)}
+        entries = list(folder.iterdir())
+    except (OSError, change_review.ChangeReviewError) as error:
+        print(f"review-links sweep: {error}", file=sys.stderr)
+        return 0
+    removed = 0
+    for entry in entries:
+        try:
+            if (image_store.IDENTITY.fullmatch(entry.name) and entry.name not in claimed
+                    and not entry.is_symlink() and entry.is_dir() and entry.stat().st_mtime < now - retention):
+                image_store.remove_change(root, entry.name)
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            print(f"review-links sweep: {entry}: {error}", file=sys.stderr)
     return removed
 
 
@@ -173,6 +259,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                              + "style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'self'; base-uri 'none'")
             self.end_headers()
             return BytesIO(content)
+        if route.path == accounts_page.PAGE_PATH:
+            try:
+                content = cast(ReviewLinksServer, self.server).accounts_cache.get()
+            except (OSError, ValueError) as error:
+                print(f"review-links accounts: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == images.PAGE_PATH:
             try:
                 content = images.render(root)
@@ -330,6 +425,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == images.PAGE_PATH:
             self.image_post()
             return
+        if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
+            self.news_post()
+            return
         try:
             branches = branch_page.page_at(server.root, self.path)
         except FileNotFoundError:
@@ -467,7 +565,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except change_page.AnswerRefused as error:
             self.browser_failure(400, str(error), error)
             return
-        except images.FeedbackNotSent as error:
+        except images.AnswerNotSent as error:
             self.browser_failure(503, f"the owner did not get the message ({error}). Try again.", error)
             return
         except ValueError as error:
@@ -478,11 +576,30 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         self.json_response(200, {"state": "done"})
 
+    def news_post(self) -> None:
+        """Record the page the console shows, and name the other pages that hold new items."""
+        root = cast(ReviewLinksServer, self.server).root
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
+            pages = console.read_pages()
+            # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
+            if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                raise ValueError("name one console page or none")
+            fresh = console.news(root, pages, opened[0])
+        except ValueError as error:
+            self.browser_failure(400, "Name one console page.", error)
+            return
+        except (OSError, ImportError) as error:
+            self.browser_failure(503, "The console is not available.", error)
+            return
+        self.json_response(200, {"new": list(fresh)})
+
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: dict[str, str]) -> None:
+    def json_response(self, status: int, fields: dict[str, str] | dict[str, list[str]]) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -511,6 +628,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
+        self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
