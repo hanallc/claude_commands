@@ -12,6 +12,7 @@ try:
 except FileNotFoundError:
     pass
 
+import hashlib
 import json
 import sys
 import subprocess
@@ -1629,8 +1630,13 @@ def send_anomalies(lines: tuple[str, ...]) -> None:
     if not lines:
         return
     try:
-        target = conf.read("production").text("UNIT_ANOMALIES_TO")
-        done = subprocess.run(session_send.send_argv("--to", target, "--from", "unit_phases.py", "--text", "\n".join(lines),
+        settings = conf.read("production")
+        target = settings.text("UNIT_ANOMALIES_TO")
+        repeat_minutes = settings.number("units_anomaly_repeat_minutes")
+        message = "\n".join(lines)
+        key = "unit-anomalies:" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+        done = subprocess.run(session_send.send_argv("--to", target, "--from", "unit_phases.py", "--text", message,
+                               "--key", key, "--repeat-minutes", f"{repeat_minutes:g}",
                                send_script=showrunners.SEND),
                               capture_output=True, text=True, check=False)
         if done.returncode:

@@ -26,7 +26,7 @@ from unittest.mock import Mock, patch
 
 from scripts.production import census, display_cells, land_queue, land_runs, live_units, unit_queue
 from scripts.accounts import session_state
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.message import sessions
 from scripts.production import showrunners
@@ -1924,7 +1924,43 @@ class UnitPhasesTests(unittest.TestCase):
     def test_failed_anomaly_send_keeps_the_table_and_exit_code_and_adds_one_line(self) -> None:
         self.assert_anomaly_delivery(send_code=1)
 
-    def assert_anomaly_delivery(self, *, send_code: int) -> None:
+    def test_skipped_anomaly_send_keeps_the_table_and_exit_code_without_an_extra_line(self) -> None:
+        self.assert_anomaly_delivery(send_code=0, send_output="SKIPPED: repeat window")
+
+    def test_anomaly_keys_follow_the_joined_text_and_use_the_configured_window(self) -> None:
+        config = self.root / "table-conf/production.conf"
+        _ = config.write_text(config.read_text().replace("units_anomaly_repeat_minutes=60",
+                                                       "units_anomaly_repeat_minutes=2.5"))
+        messages = (("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
+                    ("anomaly: census took longer than 10 s", "anomaly: café unreadable"),
+                    ("anomaly: census took longer than 11 s", "anomaly: café unreadable"))
+        sender = Mock(return_value=subprocess.CompletedProcess(["send.py"], 0, "SKIPPED: repeat window", ""))
+        output = io.StringIO()
+        with (patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            for message in messages:
+                unit_phases.send_anomalies(message)
+        self.assertEqual(sender.call_count, 3)
+        keys: list[str] = []
+        for call, message in zip(sender.call_args_list, messages, strict=True):
+            command = cast(list[str], call.args[0])
+            keys.append(command[command.index("--key") + 1])
+            self.assertEqual(command[command.index("--text") + 1], "\n".join(message))
+            self.assertEqual(command[command.index("--repeat-minutes") + 1], "2.5")
+        self.assertEqual(keys, ["unit-anomalies:b488aba285f2", "unit-anomalies:b488aba285f2",
+                               "unit-anomalies:7d046a634ca9"])
+        self.assertEqual(output.getvalue(), "")
+
+    def test_unreadable_anomaly_repeat_key_reports_one_line_without_a_send(self) -> None:
+        sender = Mock()
+        output = io.StringIO()
+        with (patch.object(conf.ConfigRead, "number", side_effect=conf.Unusable("repeat setting unavailable")) as number,
+              patch.object(unit_phases, "subprocess", SimpleNamespace(run=sender)), contextlib.redirect_stdout(output)):
+            unit_phases.send_anomalies(("anomaly: census unavailable",))
+        number.assert_called_once_with("units_anomaly_repeat_minutes")
+        sender.assert_not_called()
+        self.assertEqual(output.getvalue(), "anomaly: could not send unit anomalies: repeat setting unavailable\n")
+
+    def assert_anomaly_delivery(self, *, send_code: int, send_output: str = "") -> None:
         from scripts.production import session_staff
 
         doc = self.root / "production.md"
@@ -1944,7 +1980,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         sender = Mock(return_value=subprocess.CompletedProcess(
-            ["send.py"], send_code, "fixture delivery detail" if send_code else "",
+            ["send.py"], send_code, "fixture delivery detail" if send_code else send_output,
             "fixture send failed\nfixture failure detail" if send_code else ""))
         with (patch.dict(os.environ, {"CONF_DIR": str(config)}),
               patch.object(unit_lookup, "observed_session_labels", side_effect=observed),
@@ -1976,6 +2012,8 @@ class UnitPhasesTests(unittest.TestCase):
         assert call is not None
         command = cast(list[str], call.args[0])
         self.assertEqual(command[command.index("--to") + 1], "fixture-director")
+        self.assertRegex(command[command.index("--key") + 1], r"^unit-anomalies:[0-9a-f]{12}$")
+        self.assertEqual(command[command.index("--repeat-minutes") + 1], "60")
         message = command[command.index("--text") + 1]
         for line in anomalies:
             self.assertIn(line, message)

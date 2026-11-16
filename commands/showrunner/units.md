@@ -150,6 +150,7 @@ A process without an identity reports an unreadable thread when its pane holds s
 One staff candidate retains its pane placement with unknown status.
 Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
+The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
 Use `agents` to pause, exit, or resume units:
