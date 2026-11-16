@@ -1010,3 +1010,43 @@ Existing configuration values remain unchanged.
 | `aws_timeout_s` | `10` | Bound each provider and receiver request. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
+
+
+## Hana source transport
+
+`hana_transport.SourceSender` captures exact source through `copies.capture_source`.
+The copies private index includes staged, unstaged, deleted, and permitted untracked files.
+`apply_changes` uses the same private tree capture.
+The caller's index and refs remain unchanged.
+The existing tree key and a second private capture detect content and executable mode changes.
+Both capture paths refuse new Git links with `NestedRepository`.
+The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
+It sends no ignored files, HOME, or target output.
+
+A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
+Its JSON fits the receiver's 65536-byte control limit.
+Each repository retains a bounded list of guest-acknowledged commits.
+Each snapshot commit has no parent, so bundles exclude the caller's Git history and deleted credential blobs.
+Later bundles exclude those commits and their reachable objects.
+A typed `MissingBasis` answer clears that repository's basis before a complete bundle retry.
+`retry_complete` retains the captured commit even when the caller changes working files.
+
+`AwsSourceObjects` implements the typed object boundary through the existing provider.
+It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
+The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
+Each AWS call uses `aws_timeout_s`.
+The guest receives no AWS credentials.
+
+`hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
+Curl enforces the total download timeout and maximum file size.
+The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
+The shared maker allocates mirror metadata and temporary bundle files.
+`build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
+The slot API provides rescue before reset, stable Cargo output, and existing capacity refusal.
+The slot's `rust-toolchain.toml` digest must equal the manifest before execution.
+
+The guest must use host name `aws-hana`.
+Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
+Those values remain unset until the user approves them.
+The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
+Phase F2 will deliver manifests and execute commands with inherited slot locks.
