@@ -18,7 +18,6 @@ from scripts.lib.user_zone import shown_time
 from scripts.production import staff
 from scripts.review_links import change_browser, change_page, console, image_store, page_frame, review_link
 
-FOLDER = "images"
 PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
 LOCK = ".review-link-images.lock"
@@ -35,7 +34,7 @@ class AnswerNotSent(Exception):
 
 
 def images_root(root: Path) -> Path:
-    return root / FOLDER
+    return root / image_store.IMAGES_FOLDER
 
 
 def page_url() -> str:
@@ -45,7 +44,7 @@ def page_url() -> str:
 
 
 def image_path(record: image_store.ImageRecord, file: str = "") -> str:
-    return f"/{FOLDER}/{record['id']}/{file or record['file']}"
+    return f"/{image_store.IMAGES_FOLDER}/{record['id']}/{file or record['file']}"
 
 
 def shown_files(record: image_store.ImageRecord) -> tuple[tuple[str, str], ...]:
