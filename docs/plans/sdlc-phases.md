@@ -195,7 +195,7 @@ The saved baseline reports inserted phases as about 2% of gaps.
 ### Phase 30 — Measure cheap A again on worker-mode phases  · status: todo
 **Depends on:** Phase 29
 
-**Waits for:** the workers-back notice (showrunner, 2026-11-15), then at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
+**Waits for:** (the workers-back notice is met: 2026-11-15 13:36 EST) at least 20 eligible `AfterChange` phases with a recorded worker model from at least two before-sample units, after Phase 29 reaches main.
 
 #### Work Order
 
