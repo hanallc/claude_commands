@@ -19,7 +19,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folders, build_slots, git_rescue
+from scripts.lib import build_folders, build_slots, copy_record, git_rescue
 from scripts.copies import copies
 from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -111,7 +111,14 @@ class BuildSlotsTests(unittest.TestCase):
         source, commit = self.clone_source()
         with self.take() as first:
             path = first.path
-        reference = f"refs/build-slots/{path.name}"
+        reference = "refs/build-slots/"
+
+        def imported_commit() -> str:
+            refs = self.git(self.source, "for-each-ref", "--format=%(refname)", reference).splitlines()
+            self.assertEqual(len(refs), 1)
+            self.assertTrue(refs[0].startswith(reference + "take-"))
+            return self.git(self.source, "rev-parse", refs[0])
+
         for ending in ("release", "caller failure", "checkout failure", "fetch failure"):
             with self.subTest(ending=ending):
                 # Restore the slot's HEAD so every row starts from the pool's history.
@@ -135,11 +142,11 @@ class BuildSlotsTests(unittest.TestCase):
                     elif ending == "caller failure":
                         with self.assertRaisesRegex(RuntimeError, "caller failed"):
                             with self.take_clone(source, commit):
-                                self.assertEqual(self.git(path, "rev-parse", reference), commit)
+                                self.assertEqual(imported_commit(), commit)
                                 raise RuntimeError("caller failed")
                     else:
                         with self.take_clone(source, commit):
-                            self.assertEqual(self.git(path, "rev-parse", reference), commit)
+                            self.assertEqual(imported_commit(), commit)
                 self.assertEqual(self.git(self.source, "for-each-ref", reference), "")
                 self.assertEqual(build_folders.build_folder_state(path), "free")
 
@@ -154,12 +161,18 @@ class BuildSlotsTests(unittest.TestCase):
         before = self.git(path, "status", "--porcelain=v2")
         original = cast(Callable[..., str], getattr(build_slots, "_git"))
         fetched: list[str] = []
+        references: list[str] = []
+        comparisons: list[tuple[str, ...]] = []
 
         def observe_git(folder: Path, *arguments: str, pass_fds: Sequence[int] = (),
                         accepted: tuple[int, ...] = (0,)) -> str:
             result = original(folder, *arguments, pass_fds=pass_fds, accepted=accepted)
             if "fetch" in arguments:
-                fetched.append(self.git(path, "rev-parse", f"refs/build-slots/{path.name}"))
+                reference = arguments[-1].partition(":")[2]
+                references.append(reference)
+                fetched.append(self.git(folder, "rev-parse", reference))
+            if arguments[:1] == ("merge-base",):
+                comparisons.append(arguments)
             return result
 
         with mock.patch.object(build_slots, "_git", side_effect=observe_git):
@@ -167,6 +180,7 @@ class BuildSlotsTests(unittest.TestCase):
                 with self.take_clone(source, commit):
                     self.fail("the unrelated repository received a slot")
         self.assertEqual(fetched, [commit])
+        self.assertEqual(comparisons, [("merge-base", references[0], self.base)])
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(path, "status", "--porcelain=v2"), before)
         self.assertEqual(self.git(self.source, "for-each-ref", "refs/build-slots/"), "")
@@ -181,10 +195,73 @@ class BuildSlotsTests(unittest.TestCase):
             path = slot.path
             self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
+            self.assertEqual(self.lease(path)["commit"], commit)
+        self.assertEqual(self.lease(path)["commit"], commit)
         shutil.rmtree(source)
         with self.take() as reused:
             self.assertEqual(reused.path, path)
             self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
+
+    def test_established_pool_owns_new_slots_from_an_unregistered_clone(self) -> None:
+        source, commit = self.clone_source()
+        (source / copy_record.RECORD).unlink()
+        with self.take() as first:
+            with self.take_clone(source, commit) as second:
+                path = second.path
+                self.assertEqual(second.number, 2)
+                self.assertEqual(self.git(path, "rev-parse", "--git-common-dir"), str(self.source / ".git"))
+                self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
+            shutil.rmtree(source)
+            with self.take() as reused:
+                self.assertEqual(reused.path, path)
+                self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
+            self.assertEqual(build_folders.build_folder_state(first.path), "held")
+
+    def test_stale_or_cyclic_copy_records_do_not_block_existing_slots(self) -> None:
+        with self.take() as first:
+            path = first.path
+        for outcome in ("stale", "cyclic"):
+            with self.subTest(outcome=outcome):
+                source, commit = self.clone_source()
+                record = source / copy_record.RECORD
+                fields = cast(dict[str, object], json.loads(record.read_text()))
+                fields["source_path"] = str(self.root / "missing" if outcome == "stale" else source)
+                _ = record.write_text(json.dumps(fields))
+                with self.take_clone(source, commit) as reused:
+                    self.assertEqual(reused.path, path)
+                    self.assertEqual(self.git(path, "rev-parse", "HEAD"), commit)
+
+    def test_empty_pool_refuses_stale_or_cyclic_copy_records(self) -> None:
+        for outcome in ("stale", "cyclic"):
+            with self.subTest(outcome=outcome):
+                source, commit = self.clone_source()
+                record = source / copy_record.RECORD
+                fields = cast(dict[str, object], json.loads(record.read_text()))
+                fields["source_path"] = str(self.root / "missing" if outcome == "stale" else source)
+                _ = record.write_text(json.dumps(fields))
+                reason = "no available persistent source" if outcome == "stale" else "copy sources form a cycle"
+                with self.assertRaisesRegex(build_slots.SlotGitFailure, reason):
+                    with self.take_clone(source, commit):
+                        self.fail("The invalid copy record created a slot.")
+
+    def test_unregistered_clone_owns_an_empty_pool(self) -> None:
+        source, commit = self.clone_source()
+        (source / copy_record.RECORD).unlink()
+        with self.take_clone(source, commit) as slot:
+            self.assertEqual(self.git(slot.path, "rev-parse", "--git-common-dir"), str(source / ".git"))
+            self.assertEqual(self.git(slot.path, "rev-parse", "HEAD"), commit)
+
+    def test_overlapping_clone_takes_keep_separate_refs_until_release(self) -> None:
+        source, commit = self.clone_source()
+        with self.take_clone(source, commit):
+            first = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/").splitlines()
+            self.assertEqual(len(first), 1)
+            with self.take_clone(source, commit):
+                refs = self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/").splitlines()
+                self.assertEqual(len(refs), 2)
+                self.assertIn(first[0], refs)
+            self.assertEqual(self.git(self.source, "for-each-ref", "--format=%(refname)", "refs/build-slots/"), first[0])
+        self.assertEqual(self.git(self.source, "for-each-ref", "refs/build-slots/"), "")
 
     def test_lowest_free_number_grows_to_the_limit_and_reads_a_changed_limit(self) -> None:
         with self.take() as first:
