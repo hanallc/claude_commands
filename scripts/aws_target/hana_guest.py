@@ -403,9 +403,11 @@ if __name__ == '__main__':
     return program
 
 
-def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path) -> tuple[GuestFile, ...]:
+def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path | None = None) -> tuple[GuestFile, ...]:
     """Return guest files without installing units or touching deployment state."""
     for path in (device, tool_setup):
+        if path is None:
+            continue
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('Expected an absolute device or setup path')
     prefix = f'{SYSTEM_BIN}/python3 {CONTROL}/safety.py'
@@ -475,8 +477,10 @@ Description=Hana command resource bounds
 CPUQuota={settings.step_cpu_limit * 100}%
 MemoryMax={settings.step_memory_gib * 1024**3}
 '''
-    units = {'hana-guard.service': guard, 'hana-watchdog.service': watchdog,
-             'var-lib-hana.mount': mount, 'hana-tools.service': tools, WORK_SLICE: work_slice}
+    units = {'hana-guard.service': guard, 'hana-watchdog.service': watchdog, 'var-lib-hana.mount': mount}
+    if tool_setup is not None:
+        units['hana-tools.service'] = tools
+    units[WORK_SLICE] = work_slice
     return (GuestFile(CONTROL / 'safety.py', guest_program(), 0o600),
             GuestFile(CONTROL / 'safety.json', json.dumps(asdict(settings)) + '\n', 0o600),
             *(GuestFile(Path('/etc/systemd/system') / name, content, 0o644) for name, content in units.items()))
