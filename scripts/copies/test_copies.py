@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator, Mapping
 from contextvars import copy_context
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+import fcntl
 import io
 import json
 import os
@@ -30,11 +31,12 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, scratch
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.lint import folder_audit, tmp_sweep
+from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
 from textwrap import dedent
 from scripts.mac_test import floor_claims
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.production import staff
@@ -189,6 +191,25 @@ class StandingTests(unittest.TestCase):
                 removed = self.cli("remove")
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 self.assertTrue(tree.exists())
+
+        for subject, merging, purpose in (
+            ("checkpoint(handler): phase 27 — census --json bound", False,
+             "gate · handler phase 27 · census --json bound"),
+            ("Repair the census output", False, "gate · Repair the census output"),
+            ("Repair src/lib.rs", False, "gate · Repair src/lib.rs"),
+            ("checkpoint(resources): phase 133 — name the gated work", True,
+             "gate · resources phase 133 · name the gated work"),
+        ):
+            with self.subTest(subject=subject, merging=merging):
+                _ = self.git(self.source, "commit", "--allow-empty", "-qm", subject)
+                revision = self.git(self.source, "rev-parse", "HEAD")
+                _ = self.git(self.source, "commit", "--allow-empty", "-qm", "Later source work")
+                merge = copies.MergeRevision(self.git(self.source, "rev-parse", "HEAD")) if merging else copies.NO_MERGE
+                with copies.standing(self.owner_id, self.source, copies.CommittedSource(revision), merge=merge) as tree:
+                    lease = self.lease(tree)
+                    self.assertEqual(lease["unit"], self.owner_id)
+                    self.assertEqual(lease["work"], "gate")
+                    self.assertEqual(lease["purpose"], purpose)
 
     def test_a_renamed_unit_reuses_and_removes_its_copy_without_changing_the_folder(self) -> None:
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
@@ -656,6 +677,197 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:end-trust"), [checkout])
         self.assert_clone_project_removed(checkout, paths)
 
+    def test_mirror_metadata_allows_task_cleanup_but_user_changes_keep_the_clone(self) -> None:
+        for state in ("untracked", "tracked"):
+            with self.subTest(state=state):
+                task = f"gate:mirror-work-{state}"
+                checkout = copies.clone(self.source, task)
+                copies.mark_mirror(checkout, "clone-owner", "hana", "fixture")
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+                for name in floor_claims.MIRROR_METADATA:
+                    self.assertTrue((checkout / name).is_file())
+                work = checkout / ("new-work.txt" if state == "untracked" else "tracked.txt")
+                original = work.read_text() if work.exists() else ""
+                _ = work.write_text("user work in a registered mirror")
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    code = scratch.main(["end", "--task", task])
+                self.assertNotEqual(code, 0)
+                self.assertEqual(work.read_text(), "user work in a registered mirror")
+                self.assertIn("uncommitted changes", error.getvalue())
+                self.assertNotIn(f"removed {checkout}", output.getvalue())
+                if state == "untracked":
+                    work.unlink()
+                else:
+                    _ = work.write_text(original)
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(scratch.main(["end", "--task", task]), 0)
+                self.assertFalse(checkout.exists())
+
+    def test_old_mirror_cleanup_checks_user_work_without_metadata_exclusions(self) -> None:
+        for state in ("clean", "untracked", "tracked", "tracked-metadata", "invalid-record", "wrong-session"):
+            with self.subTest(state=state):
+                task = f"gate:old-mirror-{state}"
+                checkout = copies.clone(self.source, task)
+                copies.mark_mirror(checkout, "clone-owner", "hana", "fixture")
+                exclude = checkout / ".git/info/exclude"
+                patterns = {f"/{name}" for name in floor_claims.MIRROR_METADATA}
+                _ = exclude.write_text("\n".join(line for line in exclude.read_text().splitlines()
+                                               if line not in patterns) + "\n")
+                status = self.git(checkout, "status", "--porcelain").splitlines()
+                self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
+                work = checkout / "new-work.txt"
+                if state == "tracked":
+                    work = checkout / "tracked.txt"
+                elif state in ("tracked-metadata", "invalid-record"):
+                    work = checkout / floor_claims.MIRROR_RECORD
+                elif state == "wrong-session":
+                    work = checkout / floor_claims.MIRROR_SESSION
+                if state == "tracked-metadata":
+                    _ = self.git(checkout, "add", "--", work.name)
+                    _ = self.git(checkout, "commit", "-qm", "Track the mirror record")
+                    fields = cast(dict[str, object], json.loads(work.read_text()))
+                    _ = work.write_text(json.dumps({**fields, "user_note": "keep this work"}))
+                elif state != "clean":
+                    _ = work.write_text("keep this work")
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    code = scratch.main(["end", "--task", task])
+                if state == "clean":
+                    self.assertEqual(code, 0, error.getvalue())
+                    self.assertFalse(checkout.exists())
+                    self.assertIn(f"removed {checkout}", output.getvalue())
+                else:
+                    self.assertNotEqual(code, 0)
+                    self.assertTrue(checkout.is_dir())
+                    self.assertIn("uncommitted changes", error.getvalue())
+                    self.assertNotIn(f"removed {checkout}", output.getvalue())
+                    self.assertIn("keep this work", work.read_text())
+                    self.assertFalse(scratch.removal_mark(checkout).exists())
+
+    def test_task_end_retains_the_clone_when_a_read_only_account_denies_trust_removal(self) -> None:
+        paths = self.clone_trust_files()
+        checkout = copies.clone(self.source, "gate:denied-trust")
+        _ = self.enterContext(fake_cargo_output_roots(CargoOutputRoots(checkout, checkout / "target", checkout / "target")))
+        blocked = paths[1]
+        blocked.chmod(0o444)
+        blocked.parent.chmod(0o555)
+        try:
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                code = scratch.main(["end", "--task", "gate:denied-trust"])
+            self.assertNotEqual(code, 0)
+            self.assertTrue(checkout.is_dir())
+            self.assertFalse(scratch.removal_mark(checkout).exists())
+            self.assertIn(f"kept {checkout}", error.getvalue())
+            self.assertIn(str(blocked), error.getvalue())
+            self.assertIn("PermissionError", error.getvalue())
+            self.assertIn(str(checkout.resolve()), self.trust_projects(blocked))
+            self.assertNotIn(f"removed {checkout}", output.getvalue())
+        finally:
+            blocked.parent.chmod(0o755)
+            blocked.chmod(0o640)
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            code = scratch.main(["end", "--task", "gate:denied-trust"])
+        self.assertEqual((code, error.getvalue()), (0, ""))
+        self.assertFalse(checkout.exists())
+        self.assertFalse(scratch.removal_mark(checkout).exists())
+        for path in paths:
+            self.assertNotIn(str(checkout.resolve()), self.trust_projects(path))
+
+    def test_task_end_rechecks_unsaved_work_after_a_denied_trust_write(self) -> None:
+        paths = self.clone_trust_files()
+        task = "gate:retry-unsaved"
+        checkout = copies.clone(self.source, task)
+        _ = self.enterContext(fake_cargo_output_roots(CargoOutputRoots(checkout, checkout / "target", checkout / "target")))
+        blocked = paths[1]
+        blocked.chmod(0o444)
+        blocked.parent.chmod(0o555)
+        work = checkout / "new-work.txt"
+        try:
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                code = scratch.main(["end", "--task", task])
+            self.assertNotEqual(code, 0)
+            self.assertTrue(checkout.is_dir())
+            self.assertIn("PermissionError", error.getvalue())
+            record = scratch.task_of(checkout)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.fields["claude_trust_folder"], str(checkout.resolve()))
+            _ = work.write_text("work written after the failed trust update")
+        finally:
+            blocked.parent.chmod(0o755)
+            blocked.chmod(0o640)
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            code = scratch.main(["end", "--task", task])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(work.read_text(), "work written after the failed trust update")
+        self.assertIn(f"kept {checkout}", error.getvalue())
+        self.assertIn("uncommitted changes", error.getvalue())
+        self.assertNotIn(f"removed {checkout}", output.getvalue())
+        self.assertFalse(scratch.removal_mark(checkout).exists())
+        self.assertIn(str(checkout.resolve()), self.trust_projects(blocked))
+        work.unlink()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(scratch.main(["end", "--task", task]), 0)
+        self.assertFalse(checkout.exists())
+        for path in paths:
+            self.assertNotIn(str(checkout.resolve()), self.trust_projects(path))
+
+    def test_task_end_rechecks_unsaved_work_after_cargo_output_cleanup_refuses(self) -> None:
+        task = "gate:retry-cargo-cleanup"
+        checkout = copies.clone(self.source, task)
+        cache = self.base / "external-cargo-output"
+        cache.mkdir()
+        _ = (cache / "output").write_text("saved build output")
+        roots = CargoOutputRoots(checkout, checkout / "target", cache)
+        _ = self.enterContext(fake_cargo_output_roots(roots))
+        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.base / "cargo-state")}))
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
+
+        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            self.assertEqual(saved[0].roots, roots)
+            folder_audit.clean_checkout_cargo_output(path)
+
+        with (mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
+              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])),
+              mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean)):
+            with (cache / ".cargo-lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                output, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(error):
+                    code = scratch.main(["end", "--task", task])
+                self.assertNotEqual(code, 0)
+                self.assertIn("Cargo output is locked", error.getvalue())
+                self.assertTrue(checkout.is_dir())
+                self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+                work = checkout / "new-work.txt"
+                _ = work.write_text("work written after Cargo cleanup refused")
+
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                code = scratch.main(["end", "--task", task])
+            self.assertNotEqual(code, 0)
+            self.assertTrue(work.is_file(), "The retry must retain work written after the refusal.")
+            self.assertEqual(work.read_text(), "work written after Cargo cleanup refused")
+            self.assertIn(f"kept {checkout}", error.getvalue())
+            self.assertIn("uncommitted changes", error.getvalue())
+            self.assertNotIn(f"removed {checkout}", output.getvalue())
+            self.assertFalse(scratch.removal_mark(checkout).exists())
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            self.assertEqual((cache / "output").read_text(), "saved build output")
+
+            work.unlink()
+            output, error = io.StringIO(), io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                self.assertEqual(scratch.main(["end", "--task", task]), 0, error.getvalue())
+        self.assertFalse(checkout.exists())
+        self.assertFalse(cache.exists())
+        self.assertFalse(scratch.removal_mark(checkout).exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
+
     def test_removal_retries_with_only_the_external_mark_and_changes_no_account_file(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:retry-trust")
@@ -691,7 +903,7 @@ class StandingTests(unittest.TestCase):
     def test_removal_without_a_recorded_trust_key_keeps_account_trust(self) -> None:
         paths = self.clone_trust_files(())
         checkout = copies.clone(self.source, "gate:no-trust-field")
-        accounts.set_claude_folder_trust(checkout, trusted=True)
+        self.assertIsInstance(accounts.set_claude_folder_trust(checkout, trusted=True), accounts.FolderTrustComplete)
         before = {path: path.read_bytes() for path in paths}
         self.assertEqual(scratch.end("gate:no-trust-field"), [checkout])
         self.assertEqual({path: path.read_bytes() for path in paths}, before)

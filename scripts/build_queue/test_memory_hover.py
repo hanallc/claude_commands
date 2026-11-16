@@ -481,9 +481,17 @@ class MemoryHoverTests(unittest.TestCase):
                 {"name": "second", "need": 1.06, "free": 1.04},
                 {"name": "head", "need": 1.06, "free": 1.04, "head_room": {"rows": [
                     {"label": "Queue cap", "gib": 5.2}, {"label": "− Builds", "gib": 3.12},
-                    {"label": "− Build reserved", "gib": 1.04}, {"label": "= Free", "gib": 1.04}]}}]}
+                    {"label": "− Build reserved", "gib": 1.04}, {"label": "= Free", "gib": 1.04}]}},
+                # The user, 11-16: a step behind the head showed Free 0.0 GiB while the Free row showed free memory.
+                {"name": "behind", "need": 1.06, "free": 0},
+                {"name": "after a slot", "need": 1.5, "free": 2.0}]}
         tips = cast(list[list[dict[str, object]]], self.page_expression(
-            "['g-builds','row:0','wait:0','wait:1','wait:2'].map(key => tooltipRows(key, data))", data))
+            "['g-builds','row:0','wait:0','wait:1','wait:2','wait:3','wait:4'].map(key => tooltipRows(key, data))", data))
+        given = {str(row["label"]): str(row["value"]) for row in tips.pop()}
+        self.assertEqual((given["Free"], given["+ Given back by other steps"]), ("1.0 GiB", "1.0 GiB"))
+        self.assertNotIn("Short by", given)
+        behind = {str(row["label"]): str(row["value"]) for row in tips.pop()}
+        self.assertEqual((behind["Free"], behind["− Kept for other steps"], behind["Short by"]), ("1.0 GiB", "1.0 GiB", "1.1 GiB"))
         self.assertEqual([row["value"] for row in tips[0] if row["kind"] != "caption"],
                          ["3.0 GiB", "1.0 GiB", "1.0 GiB", "1.0 GiB"])
         run = {str(row["label"]): str(row["value"]) for row in tips[1]}
@@ -501,6 +509,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(head["Queue cap"] - head["− Builds"] - head["− Build reserved"], head["= Free"])
         cap = cast(list[dict[str, object]], self.page_expression("tooltipRows('cap', data)", data))
         cap_fields = {str(row["label"]): str(row["value"]) for row in cap}
+        self.assertEqual(behind["Free"], cap_fields["+ Free"])
         for head_name, cap_name in (("Queue cap", "Queue cap"), ("− Builds", "Builds"),
                                    ("− Build reserved", "+ Build reserved"), ("= Free", "+ Free")):
             self.assertEqual(str(next(row["value"] for row in tips[-1] if row["label"] == head_name)), cap_fields[cap_name])
@@ -643,6 +652,54 @@ process.stdout.write(JSON.stringify([loaded, foreign, calls.length, calls.slice(
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 
+    def test_space_pauses_every_read_and_space_again_resumes(self) -> None:
+        html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        self.assertIn('<div class="paused-badge" id="paused" role="status" hidden>', html)
+        loop = html[html.index("const consoleHidden ="):html.index("</script>")]
+        javascript = """
+const calls = [];
+const handlers = {};
+const parent = {name: "console"};
+const location = {origin: "http://natedev:8080", pathname: "/memory_live.html"};
+const window = {frameElement: null};
+const SECONDS = 5;
+const fetch = url => { calls.push(String(url).split("?")[0]); return new Promise(() => {}); };
+const setInterval = () => 0;
+const badge = {hidden: true};
+const $ = () => badge;
+const lastRead = null;
+function updateReadingStatus() {}
+const addEventListener = (kind, handler) => { handlers[kind] = handler; };
+""" + loop + """
+const steps = [];
+const record = label => steps.push([label, calls.length, badge.hidden]);
+const outside = {closest: () => null};
+const press = (target, extra) => handlers.keydown({code: "Space", repeat: false, target, preventDefault() {}, ...extra});
+record("loaded");
+press(outside, {});
+tick();
+reloadWhenPageChanges();
+record("paused");
+const typed = [];
+press({closest: selector => { typed.push(selector); return {}; }}, {});
+press(outside, {repeat: true});
+press(outside, {ctrlKey: true});
+record("ignored");
+handlers.message({source: {}, origin: location.origin, data: "console-space"});
+record("foreign");
+handlers.message({source: parent, origin: location.origin, data: "console-space"});
+record("resumed");
+steps.push(typed);
+process.stdout.write(JSON.stringify(steps));
+"""
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        result = subprocess.run([executable, "-e", javascript], text=True, capture_output=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), [["loaded", 2, True], ["paused", 2, False],
+            ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
+            ["input, textarea, select, button, summary, [contenteditable]"]])
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]
@@ -716,7 +773,7 @@ function fitLabels() {}
         builds, free, other = ["tools", "queued", "ci"], ["reserved", "room", "safety", "swap"], [
             "desktop", "agents", "programs", "kernel", "cache", "unattributed"]
         bar = page[page.index('<div class="bar-wrap'):page.index('<div class="scale')]
-        legend = page[page.index('<div class="legend">'):page.index('<details class="room-explainer">')]
+        legend = page[page.index('<div class="legend">'):page.index('</details>', page.index('<div class="legend">'))]
         self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], [*builds, *free, *other])
         # The user, 11-15: each legend group sits under its own heading, so the legend ties to the bar.
         self.assertEqual([part.split('"')[0] for part in legend.split('data-tip="')[1:]], [
@@ -726,7 +783,10 @@ function fitLabels() {}
         walk_card = page[page.index('<div class="walk" id="walk">'):page.index('<section class="card" id="leftovers"')]
         key = walk_card[walk_card.index('<div class="walk-key">'):]
         self.assertEqual([part.split('"')[0] for part in key.split('data-tip="')[1:]], ["waiting", "progress"])
-        self.assertIn('<details class="legend-box" open>', page)
+        # The user, 11-16: the legend starts collapsed; a click opens it.
+        self.assertIn('<details class="legend-box">', page)
+        # The user, 11-16: the free tooltip explains free, so the legend has no "How free is worked out" section.
+        self.assertNotIn("How free is worked out", page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],
                          ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap"])

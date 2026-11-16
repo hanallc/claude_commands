@@ -16,6 +16,12 @@ from scripts.style import order_waste
 from scripts.style import style_ledger
 from scripts.style.order_waste import AnalysisOrder, FamilyRead, RuleFix
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 ALPHA = """pub fn alpha_configuration_value() -> u32 {
     let selected_mode_number = 1;
     selected_mode_number + 1

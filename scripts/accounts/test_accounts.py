@@ -2965,7 +2965,10 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 output = io.StringIO()
                 with (patch.object(Path, "read_bytes", new=unreadable),
                       redirect_stderr(errors), redirect_stdout(output)):
-                    accounts.set_claude_folder_trust(folder, trusted=trusted)
+                    result = accounts.set_claude_folder_trust(folder, trusted=trusted)
+                    self.assertIsInstance(result, accounts.FolderTrustFailed)
+                    if isinstance(result, accounts.FolderTrustFailed):
+                        result.report()
                 self.assertEqual(output.getvalue(), "")
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
                 self.assertTrue(errors.getvalue().startswith("accounts: anomaly:"))
@@ -2982,11 +2985,36 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         output = io.StringIO()
         with redirect_stderr(errors), redirect_stdout(output):
             self.assertFalse(accounts.source_has_claude_trust(self.home / "source"))
-            accounts.set_claude_folder_trust(self.home / "clone", trusted=True)
-            accounts.set_claude_folder_trust(self.home / "clone", trusted=False)
+            self.assertIsInstance(accounts.set_claude_folder_trust(self.home / "clone", trusted=True), accounts.FolderTrustComplete)
+            self.assertIsInstance(accounts.set_claude_folder_trust(self.home / "clone", trusted=False), accounts.FolderTrustComplete)
         self.assertEqual((errors.getvalue(), output.getvalue()), ("", ""))
         self.assertTrue(all(not path.exists() for path in paths))
         self.assertTrue(all(not path.with_name(path.name + ".lock").exists() for path in paths))
+
+    def test_folder_trust_returns_the_account_that_denies_a_real_write(self) -> None:
+        paths = self.write_trust_fixture()
+        folder = self.home / "denied-clone"
+        blocked = paths[1]
+        for trusted in (True, False):
+            with self.subTest(trusted=trusted):
+                self.assertIsInstance(accounts.set_claude_folder_trust(folder, trusted=not trusted), accounts.FolderTrustComplete)
+                before = blocked.read_bytes()
+                blocked.chmod(0o444)
+                blocked.parent.chmod(0o555)
+                try:
+                    result = accounts.set_claude_folder_trust(folder, trusted=trusted)
+                    self.assertIsInstance(result, accounts.FolderTrustFailed)
+                    assert isinstance(result, accounts.FolderTrustFailed)
+                    self.assertEqual(len(result.reasons), 1)
+                    self.assertIn(str(blocked), result.reasons[0])
+                    self.assertIn("PermissionError", result.reasons[0])
+                    self.assertEqual(blocked.read_bytes(), before)
+                    for path in (paths[0], paths[2]):
+                        projects = cast(dict[str, object], accounts.read_json_object(path)["projects"])
+                        self.assertEqual(str(folder.resolve()) in projects, trusted)
+                finally:
+                    blocked.parent.chmod(0o755)
+                    blocked.chmod(0o640)
 
     def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
         write_account_settings(self.trust_config, folders=("~/configured root",))

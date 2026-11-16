@@ -1325,6 +1325,34 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.assertFalse(scratch.exists())
         self.assertIn(f"Hana on port {self.port} shut down", diagnostics)
 
+        sleep_binary = shutil.which("sleep")
+        if sleep_binary is None:
+            self.fail("The sleep command is required for the process identity rows.")
+        live = subprocess.Popen([sleep_binary, "300"])
+        self.addCleanup(live.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(live.kill)
+        dead = subprocess.Popen([sleep_binary, "0"])
+        self.addCleanup(dead.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(dead.kill)
+        _ = dead.wait(timeout=TEST_HANG_GUARD_SECS)
+        for platform in ("linux", "darwin"):
+            if platform == "linux" and not Path("/proc/self/cmdline").exists():
+                continue
+            for case, pid, binary, expected in (
+                ("live", live.pid, sleep_binary, True),
+                ("prefix", live.pid, sleep_binary[:-1], False),
+                ("dead", dead.pid, sleep_binary, False),
+            ):
+                with self.subTest(platform=platform, case=case), mock.patch.object(sys, "platform", platform):
+                    self.assertEqual(hana_shot.same_binary(pid, binary), expected)
+        for error in (FileNotFoundError, ProcessLookupError):
+            with (
+                self.subTest(read_error=error.__name__),
+                mock.patch.object(sys, "platform", "linux"),
+                mock.patch.object(Path, "read_bytes", side_effect=error),
+            ):
+                self.assertFalse(hana_shot.same_binary(live.pid, sleep_binary))
+
     def test_shutdown_without_launch_or_listener_reports_no_answer_and_allows_relaunch(self) -> None:
         self.stop_fake_listener()
 

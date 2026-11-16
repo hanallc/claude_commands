@@ -632,6 +632,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                                         suffix_length=0, suffix=destination.name)
     with build_folders.leased_build_folder(spec) as path:
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
+        if scratch.in_session_folder(path):
+            _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
         _ = scratch.update_record(path, lambda record: {
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "test_hana_clone": True, "source_path": str(source.resolve()),
@@ -651,7 +653,9 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                         **(record.fields if isinstance(record, copy_record.Registered) else {}),
                         "claude_trust_folder": str(path.resolve()),
                     }, scratch_settings=scratch_settings)
-                    accounts.set_claude_folder_trust(path, trusted=True)
+                    trust = accounts.set_claude_folder_trust(path, trusted=True)
+                    if isinstance(trust, accounts.FolderTrustFailed):
+                        trust.report()
                 source_commit = git(path, "rev-parse", "HEAD").decode().strip()
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -992,6 +996,15 @@ def _slot_preparation() -> Generator[None]:
         raise CopyError(str(error)) from error
 
 
+def gate_purpose(subject: str) -> str:
+    """Name the gated work from its commit subject."""
+    phase = re.fullmatch(r"[^()\s]+\(([^()]+)\): phase ([0-9]+) — (.+)", subject)
+    if phase is not None:
+        slug, number, title = phase.groups()
+        return f"gate · {slug} phase {number} · {title}"
+    return f"gate · {subject}" if subject else "gate"
+
+
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
              merge: MergePolicy = NO_MERGE) -> Generator[Path]:
@@ -1011,6 +1024,11 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
+    try:
+        subject = git(canonical, "log", "-1", "--format=%s", base).decode(errors="replace").strip()
+        purpose = gate_purpose(subject)
+    except (CopyError, OSError):
+        purpose = "gate"
     unit = owner
     showrunner = owner_name(copy_owner(owner))
     try:
@@ -1025,7 +1043,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     with ExitStack() as held_slot:
         with _slot_preparation():
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work="gate", purpose="gate", report=lambda line: print(line, file=sys.stderr)))
+                work="gate", purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))
@@ -1552,6 +1570,7 @@ def mirror_probe_setup(path: str) -> str:
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
     """Publish mirror metadata before removal authority can disappear."""
+    scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
     write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
         "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
     }) + "\n")

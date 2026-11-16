@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -505,7 +504,9 @@ class CommandTests(PrivateReleaseBroadcastTest):
 
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
         audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"clear", "drain", "status", "audit"} else []
-        return invoke_hold([*args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
+        eta_args = (["--release-eta", "23:59", "--zone", "Etc/GMT+12"]
+                    if args[0] in {"clear", "drain"} and "--release-eta" not in args else [])
+        return invoke_hold([*args, *eta_args, *audit_args], {**os.environ, "BUILD_HOLD_DIR": str(folder)})
 
     def damage_record(self, kind: str, scratch: Path, *, two_holders: bool = False) -> tuple[Path, bytes]:
         folder = scratch / "holders"
@@ -830,15 +831,20 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 fields = cast(dict[str, object], json.loads(path.read_text()))
                 self.assertEqual(fields["holder"], "slot one")
                 self.assertEqual(fields["for"], "the focused test")
-                self.assertEqual(fields["release_eta"], "unknown")
+                self.assertTrue(cast(str, fields["release_eta"]).endswith("T23:59:00-12:00"))
                 self.assertIsNotNone(datetime.fromisoformat(cast(str, fields["since"])).tzinfo)
                 if action == "drain":
                     self.assertEqual(result.stdout.splitlines()[-1], "drained; natedev stays held until release")
+                _ = build_hold.start_hold(folder, build_hold.HolderIdentity("slot-one", "slot one"),
+                                          "the focused test", build_hold.NoReleaseEta(), datetime.now(timezone.utc))
+                fields = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(fields["release_eta"], "unknown")
                 status = self.run_cli(folder, "status")
                 self.assertEqual(status.returncode, 0, status.stderr)
                 self.assertIn("slot one", status.stdout)
                 self.assertIn("the focused test", status.stdout)
                 self.assertIn("unknown", status.stdout)
+                self.assertIn("release eta unknown", build_hold.holder_text(build_hold.read_holder(path)))
 
     def test_hold_message_tells_recipient_verify_waits_without_registering(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -966,15 +972,37 @@ class CommandTests(PrivateReleaseBroadcastTest):
             self.assertTrue(other.exists())
 
     def test_hold_rejects_a_past_eta(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            now = datetime.now(ZoneInfo("America/New_York"))
-            if now.hour == 0 and now.minute == 0:
-                self.skipTest("the local day has no earlier HH:MM yet")
-            past = "00:00"
-            result = self.run_cli(folder, "clear", "--holder", "slot", "--for", "the test", "--release-eta", past, "--zone", "America/New_York")
-            self.assertEqual(result.returncode, 1)
-            self.assertFalse((folder / "slot").exists())
+        now = datetime(2026, 10, 4, 21, tzinfo=timezone.utc)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return now
+
+        for action in ("clear", "drain"):
+            for eta, expected in (((), 2),
+                                  (("--release-eta", "20:59", "--zone", "UTC"), 1),
+                                  (("--release-eta", "21:00", "--zone", "UTC"), 1),
+                                  (("--release-eta", "2026-10-04T20:59", "--zone", "UTC"), 1)):
+                with self.subTest(action=action, eta=eta), tempfile.TemporaryDirectory() as scratch:
+                    folder = Path(scratch) / "holders"
+                    with mock.patch.object(build_hold, "datetime", FixedDatetime), \
+                         mock.patch.object(hold_enforcer, "start") as start:
+                        result = invoke_hold([action, "--holder", "slot", "--for", "the test", *eta],
+                                             {**os.environ, "BUILD_HOLD_DIR": str(folder),
+                                              "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
+                                              "BUILD_HOLD_ENFORCER_DIR": str(Path(scratch) / "enforcer")})
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertFalse((folder / "slot").exists())
+                    start.assert_not_called()
+                    self.assertEqual(list((Path(scratch) / "enforcer").rglob("*")), [])
+                    if not eta:
+                        lines = (result.stdout + result.stderr).splitlines()
+                        self.assertEqual(len(lines), 1)
+                        self.assertIn("--release-eta HH:MM --zone <IANA zone>", lines[0])
+                    else:
+                        self.assertEqual(result.stderr.strip(), "build_hold: release ETA has already passed")
 
     def test_release_eta_uses_offset_at_release_wall_time(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -992,20 +1020,26 @@ class CommandTests(PrivateReleaseBroadcastTest):
             def now(cls, tz: tzinfo | None = None) -> datetime:
                 return datetime.fromisoformat("2026-10-04T21:00:00-04:00")
 
-        with tempfile.TemporaryDirectory() as scratch:
-            folder = Path(scratch)
-            output = io.StringIO()
-            errors = io.StringIO()
-            try:
-                with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York", "BUILD_HOLD_DIR": str(folder)}):
-                    time.tzset()
-                    with mock.patch.object(build_hold, "datetime", FixedDatetime), redirect_stdout(output), redirect_stderr(errors):
-                        result = build_hold.main(["clear", "--holder", "slot", "--for", "the test", "--release-eta", "22:00", "--zone", "America/Los_Angeles"])
-            finally:
-                time.tzset()
-            self.assertEqual(result, 0, errors.getvalue())
-            fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
-            self.assertEqual(fields["release_eta"], "2026-10-04T22:00:00-07:00")
+        for action in ("clear", "drain"):
+            for eta, expected in (("22:00", "2026-10-04T22:00:00-07:00"),
+                                  ("2026-10-05T00:30", "2026-10-05T00:30:00-07:00")):
+                with self.subTest(action=action, eta=eta), tempfile.TemporaryDirectory() as scratch:
+                    folder = Path(scratch)
+                    output = io.StringIO()
+                    errors = io.StringIO()
+                    try:
+                        with mock.patch.dict(os.environ, {"TZ": "America/New_York", "USER_ZONE": "America/New_York",
+                                                          "BUILD_HOLD_DIR": str(folder)}):
+                            time.tzset()
+                            with mock.patch.object(build_hold, "datetime", FixedDatetime), \
+                                 redirect_stdout(output), redirect_stderr(errors):
+                                result = build_hold.main([action, "--holder", "slot", "--for", "the test",
+                                                          "--release-eta", eta, "--zone", "America/Los_Angeles"])
+                    finally:
+                        time.tzset()
+                    self.assertEqual(result, 0, errors.getvalue())
+                    fields = cast(dict[str, object], json.loads((folder / "slot").read_text()))
+                    self.assertEqual(fields["release_eta"], expected)
 
     def test_release_eta_requires_zone(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -1246,7 +1280,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
             try:
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "clear", "--holder", "alice", "--for", "render checks",
-                     "--proc-root", str(self.scratch / "proc")],
+                     "--release-eta", "23:59", "--zone", "Etc/GMT+12", "--proc-root", str(self.scratch / "proc")],
                     env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
@@ -1350,15 +1384,36 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
     def test_status_shows_holder_since_and_release_eta_in_user_zone(self) -> None:
         folder = self.scratch / "holders"
         folder.mkdir()
-        _ = write_holder(folder, "holder", "2026-10-12T16:00:00+00:00", "render checks", "2026-10-12T17:00:00+00:00")
-        output = io.StringIO()
-        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "America/New_York"}), redirect_stdout(output):
-            try:
-                time.tzset()
-                self.assertEqual(build_hold.main(["status"]), 0)
-            finally:
-                time.tzset()
-        self.assertIn("holder since 12:00 EDT, for render checks - release eta: 13:00 EDT", output.getvalue())
+
+        class FixedDatetime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return datetime.fromisoformat(now)
+
+        for now, release, suffix in (
+            ("2026-10-12T16:59:00+00:00", "2026-10-12T17:00:00+00:00", "13:00 EDT"),
+            ("2026-10-12T17:00:00+00:00", "2026-10-12T17:00:00+00:00", "13:00 EDT, overdue"),
+            ("2026-10-12T17:01:00+00:00", "2026-10-12T17:00:00+00:00", "13:00 EDT, overdue"),
+            ("2026-10-12T17:01:00+00:00", "unknown", "unknown"),
+        ):
+            with self.subTest(now=now, release=release):
+                path = write_holder(folder, "holder", "2026-10-12T16:00:00+00:00", "render checks", release)
+                before = path.read_bytes()
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "America/New_York"}), \
+                     mock.patch.object(build_hold, "datetime", FixedDatetime), redirect_stdout(output):
+                    try:
+                        time.tzset()
+                        self.assertEqual(build_hold.main(["status"]), 0)
+                    finally:
+                        time.tzset()
+                    holder = build_hold.read_holder(path)
+                    self.assertEqual(build_hold.holder_text(holder), f"holder (for render checks, release eta {suffix})")
+                if release != "unknown":
+                    self.assertIn("holder since 12:00 EDT, for render checks - release eta: 13:00 EDT", output.getvalue())
+                self.assertIn(f"release eta: {suffix} - held", output.getvalue())
+                self.assertEqual(path.read_bytes(), before)
 
     @process_boundary
     def test_event_write_failure_keeps_the_hold_notice_and_file(self) -> None:
@@ -2469,8 +2524,10 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         with redirect_stdout(output):
             for pid in (10, 20):
                 self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+                                                 "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                                  "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
             self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "app test",
+                                             "--release-eta", "23:59", "--zone", "Etc/GMT+12",
                                              "--proc-root", str(self.proc), "--keep", "999"]), 1)
         holder, = build_hold.natedev_holds(self.holders).in_force
         self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
@@ -2485,7 +2542,8 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                               ("audit", "import"), ("audit", "__main__")):
             args = [action, "--proc-root", str(self.proc)]
             if action == "clear":
-                args.extend(["--holder", "holder", "--for", "app test"])
+                args.extend(["--holder", "holder", "--for", "app test",
+                             "--release-eta", "23:59", "--zone", "Etc/GMT+12"])
             output = io.StringIO()
             if entry == "__main__":
                 program = """import runpy, sys
@@ -2518,7 +2576,8 @@ with mock.patch("sys.exit", side_effect=exit_code):
 
     def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:
         missing_proc = self.scratch / "missing-proc"
-        for args in (["clear", "--holder", "holder", "--for", "app test"], ["status"]):
+        for args in (["clear", "--holder", "holder", "--for", "app test",
+                      "--release-eta", "23:59", "--zone", "Etc/GMT+12"], ["status"]):
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)

@@ -12,6 +12,12 @@ from unittest import mock
 from scripts.style import bulk_constants as bulk
 from scripts.style import style_footprint as rust
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 @dataclass(frozen=True)
 class Finding:

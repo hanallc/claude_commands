@@ -46,11 +46,11 @@ export TZ="${zone:-America/New_York}"
 
 counts=
 payload=$(cat)
-# One jq start reads the unit row of the payload's current session, as assignment.py matches it.
-# With no unit row, it reads the showrunner ids. A bad payload matches no unit row.
+# Select the unit or producer of the payload's current session.
+# Otherwise, read the showrunner ids.
 owners=$(jq -r --arg payload "$payload" '
   (try ($payload | fromjson | .session_id) catch null) as $session
-  | first(.rows[]? | select(.kind == "unit" and (.current_session // .id) == $session)
+  | first(.rows[]? | select((.kind == "unit" or .kind == "producer") and (.current_session // .id) == $session)
           | "unit \(.id) \($session)")
     // (.rows[]? | select(.kind == "showrunner") | .id)' "$staff" 2>/dev/null)
 unit_session=

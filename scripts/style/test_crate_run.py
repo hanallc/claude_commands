@@ -36,6 +36,8 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import build_folders, copy_record, scratch
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
+from scripts.style.style_reader_test_support import oracle_reader
+
 
 class Commands:
     def __init__(self) -> None:
@@ -202,6 +204,7 @@ class CrateRunTests(CargoProjectTests):
         _ = shutil.copytree(seed, self.root, symlinks=True)
         self.repo: Path = self.root / "project"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(oracle_reader())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
         # Each test has fixed copies settings and keeps its own settings dictionary.

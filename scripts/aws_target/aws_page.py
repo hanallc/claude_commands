@@ -1,4 +1,4 @@
-"""Publish the AWS page: the /aws_spend totals and the spot_table tables as data for the admin console."""
+"""Publish the AWS page: the spend totals and the spot_table tables as data for the admin console."""
 from __future__ import annotations
 
 import argparse
@@ -116,7 +116,7 @@ def day_tile(label: str, day: str, spend: aws_spend.Spend, limit: bool) -> Spend
 
 
 def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: int, pace_days: int) -> SpendData:
-    """Today, yesterday and the month to date, as /aws_spend shows them."""
+    """Today, yesterday and the month to date, as the buildlog report shows them."""
     if isinstance(spend, aws_config.MeasurementUnavailable):
         return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [], 'forecast': ''}
     today = datetime.fromtimestamp(now, UTC).date()

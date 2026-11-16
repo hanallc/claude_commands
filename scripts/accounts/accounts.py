@@ -1008,15 +1008,31 @@ def source_has_claude_trust(source: Path) -> bool:
     return False
 
 
-def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
-    """Trust a folder or remove its project entry in every existing account file. Report each failed home independently."""
+@dataclass(frozen=True)
+class FolderTrustComplete:
+    """Every existing account file has the requested folder trust state."""
+
+
+@dataclass(frozen=True)
+class FolderTrustFailed:
+    """One or more account files could not receive the requested folder trust state."""
+
+    reasons: tuple[str, ...]
+
+    def report(self) -> None:
+        for reason in self.reasons:
+            print(reason, file=sys.stderr)
+
+
+def set_claude_folder_trust(folder: Path, *, trusted: bool) -> FolderTrustComplete | FolderTrustFailed:
+    """Set folder trust in each existing account file and return all failures."""
     try:
         key = str(folder.resolve())
         files = _account_trust_files()
     except (OSError, ValueError) as error:
-        print(f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__})", file=sys.stderr)
-        return
+        return FolderTrustFailed((f"accounts: anomaly: cannot prepare folder trust ({type(error).__name__}): {error}",))
     change = with_trusted_folders if trusted else without_project_entries
+    failures: list[str] = []
     for account_file in files:
         try:
             _ = account_file.path.stat()
@@ -1024,7 +1040,8 @@ def set_claude_folder_trust(folder: Path, *, trusted: bool) -> None:
         except FileNotFoundError:
             continue
         except (OSError, ValueError) as error:
-            print(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__})", file=sys.stderr)
+            failures.append(f"accounts: anomaly: {account_file.path}: cannot change trust ({type(error).__name__}): {error}")
+    return FolderTrustFailed(tuple(failures)) if failures else FolderTrustComplete()
 
 
 def trust_accounts() -> int:
