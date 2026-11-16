@@ -33,11 +33,27 @@ pub(crate) struct Token {
     pub(crate) start: usize,
 }
 
+/// One complete comment and its position among the code tokens.
+pub(crate) struct CommentSpan {
+    pub(crate) start:          usize,
+    pub(crate) end:            usize,
+    pub(crate) token_position: usize,
+}
+
+/// The code tokens and complete comments from one lexical reading.
+#[derive(Default)]
+pub(crate) struct TokenReading {
+    pub(crate) tokens:   Vec<Token>,
+    pub(crate) comments: Vec<CommentSpan>,
+}
+
 /// What the reader does at the cursor.
 #[derive(Clone, Copy)]
 enum Step {
     /// Move the cursor to end with no token: space or a comment.
     Skip { end: usize },
+    /// Record a complete comment and move the cursor to its end.
+    Comment { end: usize },
     /// Push the text from the cursor to end as one token.
     Token { end: usize, kind: TokenKind },
     /// A block comment has no end: push one unknown token at the end of the text.
@@ -52,13 +68,14 @@ struct UnchangedStep {
 
 /// Reads the tokens of one source text and records the line and start of each.
 struct Tokenizer<'a> {
-    text:    &'a [char],
-    reused:  &'a [UnchangedStep],
-    cursor:  usize,
+    text:     &'a [char],
+    reused:   &'a [UnchangedStep],
+    cursor:   usize,
     // The offset where `line` was last brought up to date.
-    counted: usize,
-    line:    usize,
-    tokens:  Vec<Token>,
+    counted:  usize,
+    line:     usize,
+    tokens:   Vec<Token>,
+    comments: Vec<CommentSpan>,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -70,13 +87,24 @@ impl<'a> Tokenizer<'a> {
             counted: 0,
             line: 1,
             tokens: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
-    fn run(mut self) -> Vec<Token> {
+    fn run(self) -> Vec<Token> { self.read().tokens }
+
+    fn read(mut self) -> TokenReading {
         while self.cursor < self.text.len() {
             match self.next_step() {
                 Step::Skip { end } => self.cursor = end,
+                Step::Comment { end } => {
+                    self.comments.push(CommentSpan {
+                        start: self.cursor,
+                        end,
+                        token_position: self.tokens.len(),
+                    });
+                    self.cursor = end;
+                },
                 Step::Token { end, kind } => {
                     let value = self.text[self.cursor..end].iter().collect();
                     self.push(value, kind);
@@ -88,7 +116,10 @@ impl<'a> Tokenizer<'a> {
                 },
             }
         }
-        self.tokens
+        TokenReading {
+            tokens:   self.tokens,
+            comments: self.comments,
+        }
     }
 
     /// The Python reader tries each pattern in this order; a character no pattern reads is an
@@ -141,7 +172,7 @@ impl<'a> Tokenizer<'a> {
     /// A line comment ends before its newline.
     fn line_comment(&self) -> Option<Step> {
         self.starts_with(self.cursor, &['/', '/'])
-            .then(|| Step::Skip {
+            .then(|| Step::Comment {
                 end: self.find(self.cursor, &['\n']).unwrap_or(self.text.len()),
             })
     }
@@ -169,7 +200,7 @@ impl<'a> Tokenizer<'a> {
         Some(if depth > 0 {
             Step::UnterminatedComment
         } else {
-            Step::Skip { end: index }
+            Step::Comment { end: index }
         })
     }
 
@@ -372,7 +403,11 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// Read tokens and comments without a second scan of the comment bodies.
+pub(crate) fn read_with_comments(text: &[char]) -> TokenReading { Tokenizer::new(text).read() }
+
 /// Python `tokenized_text`: the code tokens of text.
+#[cfg(test)]
 pub(crate) fn tokenize(text: &[char]) -> Vec<Token> { Tokenizer::new(text).run() }
 
 /// Reuse unchanged tokens and gaps; read changed regions until their token boundaries align.
@@ -462,6 +497,7 @@ pub(crate) fn in_table(table: &[(u32, u32)], character: char) -> bool {
 mod tests {
     use super::Token;
     use super::TokenKind;
+    use super::read_with_comments;
     use super::tokenize;
     use crate::constants::UNTERMINATED_COMMENT;
 
@@ -497,6 +533,19 @@ mod tests {
                 token("a", TokenKind::Identifier, 1, 0),
                 token("e", TokenKind::Identifier, 2, 23),
             ]
+        );
+        let text: Vec<_> = "a // b\n/* c /* d */ */ e".chars().collect();
+        let reading = read_with_comments(&text);
+        assert_eq!(
+            reading
+                .comments
+                .iter()
+                .map(|comment| (
+                    comment.token_position,
+                    text[comment.start..comment.end].iter().collect::<String>()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, "// b".to_owned()), (1, "/* c /* d */ */".to_owned())]
         );
     }
 

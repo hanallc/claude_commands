@@ -2943,6 +2943,9 @@ class Ledger:
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
         self._rust_codes: dict[str, RustCode | NotTokenized] = {}
+        self._reader_blob_facts: dict[str, style_reader.BlobFacts | style_reader.UnreadableFact] = {}
+        self._reader_prepared_commits: set[str] = set()
+        self._reader_name_sites: dict[str, tuple[declarations.NameSites | declarations.UnreadableBody, ...]] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
@@ -3128,11 +3131,35 @@ class Ledger:
                 self._tips[commit] = (_tip(self.repo, commit, reader_source=self._reader_source) if self._reader_source == style_config.ReaderSource.RUST
                                       else _read_tip(self.repo, commit))
             tip = self._tips[commit]
+        if self.reader_source == style_config.ReaderSource.RUST and tip.commit not in self._reader_prepared_commits:
+            self.prepare_blob_facts(tuple(blob for path, blob in tip.blobs.items() if path.endswith(".rs")))
+            self._reader_prepared_commits.add(tip.commit)
         if self._maintaining_cell:
             self._judgment_reads.update(tip.read_objects)
         if self._maintaining_findings:
             self._finding_objects.add(self._tip_group(tip))
         return tip
+
+    def prepare_blob_facts(self, blobs: Sequence[str]) -> None:
+        """Read all missing Rust facts in one request for this ledger."""
+        if self.reader_source != style_config.ReaderSource.RUST:
+            return
+        unread = tuple(dict.fromkeys(blob for blob in blobs if blob not in self._reader_blob_facts))
+        if unread:
+            with _reader_prerequisite():
+                readings = style_reader.read_blob_facts(self.repo, unread)
+                self._reader_blob_facts.update(
+                    (blob, reading) for blob, reading in readings.items()
+                    if not isinstance(reading, style_reader.UnreadableFact)
+                    or reading.reason != style_reader.UnreadableReason.MISSING_BLOB)
+
+    def blob_facts(self, blob: str) -> style_reader.BlobFacts:
+        """Return a prepared blob reading or report an unavailable prerequisite."""
+        self.prepare_blob_facts((blob,))
+        reading = self._reader_blob_facts.get(blob, style_reader.UnreadableFact(style_reader.UnreadableReason.MISSING_BLOB))
+        if isinstance(reading, style_reader.UnreadableFact):
+            raise CheckCouldNotRun(f"reader blob {blob}: {reading.reason.value}")
+        return reading
 
     def _tip_group(self, tip: RepositoryTip) -> str:
         """Name the commit, trees and inputs that a tip read, stored once."""
@@ -3364,6 +3391,9 @@ class Ledger:
         self._judgment_reads.add(blob)
         if self._maintaining_findings:
             self._finding_objects.add(blob)
+        if self.reader_source == style_config.ReaderSource.RUST:
+            code = self.blob_facts(blob).code
+            return RustCode(code.digest) if isinstance(code, style_reader.CodeIdentity) else NOT_TOKENIZED
         facts = self._judgment_facts() if self._maintaining_cell else None
         if facts is not None and self._judgment_objects_available((blob,)):
             stored = facts.input_fact("rust_code", blob, JUDGMENT_READER_VERSION)
@@ -6336,7 +6366,11 @@ class Ledger:
         """Keep compact parsing by blob until the declaration step ends."""
         parsed = self._declared_blobs.get(blob)
         if parsed is None:
-            parsed = read_declarations(source)
+            if self.reader_source == style_config.ReaderSource.RUST and blob:
+                with _reader_prerequisite():
+                    parsed = self.blob_facts(blob).declared_file(source)
+            else:
+                parsed = read_declarations(source)
             self._declared_blobs[blob] = parsed
         self._active_declarations[blob] = parsed
         return parsed
@@ -6368,7 +6402,7 @@ class Ledger:
             self._finding_metadata.add(key)
         if key not in self._declared_files:
             blob = self._tip(commit).blobs.get(path, "")
-            if self._maintaining_findings and blob:
+            if self._maintaining_findings and blob and self.reader_source == style_config.ReaderSource.PYTHON:
                 self._finding_objects.add(blob)
                 if not self._judgment_objects_available((blob,)):
                     _ = _git_bytes(self.repo, "cat-file", "blob", blob)
@@ -6770,7 +6804,15 @@ class Ledger:
         """An old body is tokenized once for every candidate it is compared with."""
         key = (commit, path, item)
         if key not in self._name_sites:
-            self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
+            if self.reader_source == style_config.ReaderSource.RUST:
+                blob = self._tip(commit).blobs[path]
+                file = self._declared_file(commit, path)
+                if blob not in self._reader_name_sites:
+                    with _reader_prerequisite():
+                        self._reader_name_sites[blob] = self.blob_facts(blob).name_sites(file)
+                self._name_sites[key] = self._reader_name_sites[blob][file.declared_items.index(item)]
+            else:
+                self._name_sites[key] = declarations.name_sites(body, item.declaration.name)
         return self._name_sites[key]
 
     def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
@@ -7996,7 +8038,7 @@ class Ledger:
             self._finding_anchors[finding] = anchor
             for path, blob in metadata:
                 # Findings in one file share its declarations at this tip; read and decode them once.
-                if (tip.commit, path) in self._declared_files:
+                if self.reader_source == style_config.ReaderSource.RUST or (tip.commit, path) in self._declared_files:
                     continue
                 items = results.facts.input_fact("finding_declarations", blob, 1)
                 if not isinstance(items, UnstoredFact):
@@ -8017,6 +8059,8 @@ class Ledger:
                 outcomes[finding.finding_id] = outcome
                 if self._judgment_objects_available(objects):
                     for path, blob in metadata:
+                        if self.reader_source == style_config.ReaderSource.RUST:
+                            continue
                         if isinstance(results.facts.input_fact("finding_declarations", blob, 1), UnstoredFact):
                             results.facts.publish_input("finding_declarations", blob, 1,
                                                         encode_proof(self._declared_files[(tip.commit, path)]))
@@ -8594,7 +8638,7 @@ class Ledger:
             self._refill_object_store = _git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         facts = RefillFacts(self._connection, self._refill_object_store, catalog)
         with self._connection:
-            inputs = RefillInputs(self.repo, tip.tree, facts)
+            inputs = RefillInputs(self.repo, tip.tree, facts, reader_source=self.reader_source)
             ignored: list[str] = []
             for config in (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml"):
                 if config in tip.blobs:
