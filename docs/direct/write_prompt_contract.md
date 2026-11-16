@@ -50,13 +50,12 @@ Codex review prompts also include section 3's command block.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
    When a later edit or result makes a run of yours useless, cancel it in
-   the same turn: take `pid` from the run's record (the `.json` beside its
-   log), check that `ps -p <pid> -o args=` still shows
-   `detached_runs.py supervise` with that record's path, then run
-   `kill -TERM -- -<pid>`.
-   The command shares the supervisor's process group, including through the systemd scope prefix.
-   The supervisor installs no signal handler.
-   After a group stop, the next start or worker restore reaps the record and delivers its result.
+   the same turn: run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>`,
+   where `<record>` is the run's `.json` beside its log.
+   The command checks the supervisor and the command identity, then stops the command's process group.
+   The supervisor stays alive and delivers the stopped result with your reason.
+   If the supervisor dies, the next start or worker restore reaps the record and delivers its result.
    To recover it directly, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py reap --session-dir <run>`.
    ```
