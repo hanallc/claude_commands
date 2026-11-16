@@ -2707,3 +2707,51 @@ The cutover removal commit deletes the script after the run.
 - No signal handler, mask or disposition.
 
 **Files:** `scripts/copies/copies.py`, `scripts/lib/build_folders.py`, `scripts/copies/test_copies.py` (StandingTests lease rows), `docs/as-built/copies.md`.
+
+### Phase 134 — A natedev hold names its release time and reports when it is overdue  · status: todo
+**Source:** the user via natedev and builds, 2026-11-16 10:2x: efficiency item 2026-10-19 (build holds), open part. The check and lint part is done (9e17ab0ca routes them to the Mac).
+
+#### Work Order
+
+**Goal:** every natedev `drain` and `clear` names a release time; after that time, build status shows the hold as overdue and the holder gets one message; the hold stays in force until an explicit release.
+
+**Spec:**
+1. `build_hold.py drain` and `build_hold.py clear` on natedev refuse without `--release-eta`. The refusal is exit 2, prints one line that names `--release-eta HH:MM --zone <IANA zone>`, and writes no hold file, cutoff or enforcer start. The Mac and SSH `clear` paths are unchanged: they keep their own block expiry and still refuse `--release-eta`.
+2. `--release-eta` takes `HH:MM` (later today, as now) or `YYYY-MM-DDTHH:MM` (any later instant), both in `--zone`. A time at or before now is refused as now. Reason: a required ETA must not make a hold across midnight impossible.
+3. Keep the `NoReleaseEta` request type and the stored `"unknown"` value for the library and existing hold files; only the CLI requires the flag. A hold file with `"unknown"` still reads and shows `release eta unknown`.
+4. One rule decides overdue: a `KnownReleaseEta` whose instant is at or before now. Put it in `build_hold.py` as one function and use it in every renderer below; no renderer compares times itself.
+5. Build status shows overdue:
+   - `targets.py`: add a `HoldEnd` variant for an overdue release (`ReleaseOverdue(when)`); `local_hold_states` picks it from the rule in item 4. `end_text` gives `release overdue since HH:MM <zone>`. The Builds page uses `end_text` through `target_availability.py`, so it follows without its own change.
+   - `build_targets.py status` line: ` release overdue since HH:MM <zone>` in place of ` release expected HH:MM <zone>`.
+   - `build_hold.py status` line and `holder_text`: `release eta HH:MM <zone>, overdue` when overdue.
+6. The hold enforcer run loop (`hold_enforcer.run`, the one process that runs while a hold is in force) sends the overdue message:
+   - When a hold in force becomes overdue, send one message to `holder_address(holder.key)`: the hold's purpose, its release time, that the hold stays in force, and the two ways to end the overdue state: `/build:hold release`, or a new `clear` or `drain` with a later `--release-eta`.
+   - Mark each sent message on disk under the enforcer state directory, keyed by holder key, `since` and release instant (the `clear_cutoff_path` hash pattern), written atomically after a send that exits 0 (delivered) or 1 (queued). A marker that exists means no second message, across enforcer restarts. The send comes before the marker: a crash between them can send the message twice, never zero times. A marker write that fails after a sent message keeps that hold marked in memory for the rest of the run.
+   - A new `clear` or `drain` resets `since` and the release time, so that hold gets its own message when it becomes overdue.
+   - A failed send prints one stderr line and writes no marker; the loop tries again no sooner than 60 seconds later within one enforcer run; a restart may try at once. A send never stops or slows enforcement for longer than the send timeout.
+   - Use the send timeout `hold_sender_timeout_seconds` from `config/build_targets.conf` (an existing key; read it, do not change it).
+   - When the run loop ends because no hold is in force, it removes the marker folder.
+7. One send path: move the holder-message send of `build_targets.tell_wait_holder` into one `build_hold` function that returns a typed sent or failed result. `tell_wait_holder` and the overdue message both use it.
+8. The hold never ends by itself. Nothing in this phase releases, expires or changes a hold.
+9. Docs: `commands/build/hold.md` (clear and drain steps name the required ETA and the overdue message), `commands/build/status.md` (`held` names the overdue text), `commands/showrunner/bump.md` (its `/build:hold clear` example carries an ETA), `docs/as-built/build-targets.md` and `docs/as-built/build-memory-admission.md` (the CLI table, the holder-file line, and the overdue message).
+10. No signal handler, mask or disposition, in code or tests. No new config key is needed.
+
+**Files:**
+- `scripts/build_hold/build_hold.py` — the required flag, the dated ETA form, the overdue rule, the status text and the shared holder send.
+- `scripts/build_hold/hold_enforcer.py` — the overdue message and its markers in the run loop.
+- `scripts/build_targets/targets.py`, `scripts/build_targets/build_targets.py` — the overdue `HoldEnd` and status text; `tell_wait_holder` uses the shared send.
+- `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/test_hold_enforcer.py`, `scripts/build_hold/test_target_hold.py`, `scripts/build_targets/test_targets.py` — new rows and existing `clear`/`drain` calls updated with an ETA.
+- `commands/build/hold.md`, `commands/build/status.md`, `commands/showrunner/bump.md`, `docs/as-built/build-targets.md`, `docs/as-built/build-memory-admission.md` — the required ETA and the overdue state.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` owns the four source modules and the docs.
+- `test` owns the four test modules.
+
+**State:** the enforcer writes one overdue-notice marker per hold under its state directory (`~/.local/state/build-hold-enforcer/overdue-notices/`) and removes the folder when no hold is in force. Hold files keep their current shape.
+
+**Acceptance gate:**
+- `drain` and `clear` without `--release-eta` exit 2 and leave no hold file; with an `HH:MM` or a dated ETA they hold as before; a past time is refused.
+- With a fixture clock past the release time, `build_targets.py status`, `end_text` and `build_hold.py status` show overdue; before it, they show the expected time; an `"unknown"` file still reads.
+- The enforcer run loop with a stub sender sends exactly one message for an overdue hold across repeated passes and a restart; a second hold with a new `since` gets its own; a failed send retries after 60 seconds and not before; the hold file is unchanged after the message.
+- `tell_wait_holder` keeps its current lines.
+- Run `test_build_hold`, `test_hold_enforcer`, `test_target_hold`, `test_hold_shortcut`, `test_hold_applies`, `scripts.build_targets.test_targets` and the `build_queue` target availability tests; basedpyright clean on each changed file.

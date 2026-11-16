@@ -30,7 +30,7 @@ it changes, and say so in one line.
 
    After the merge and push, start the demo build: the Mac run of
    <CIPoint/> on the pushed sha, or the build the production's rules name. If
-   natedev lacks memory, run `/build:hold clear bump: demo build of <unit>`.
+   natedev lacks memory, run `/build:hold clear bump: demo build of <unit> --release-eta HH:MM --zone <IANA zone>`.
    Release the hold when the build ends.
    A merge unit dispatches the demo build through a worker under `commands/unit/merge.md`.
 4. **Full suite after.** `--bump` starts the checkpoint gate on the pushed
