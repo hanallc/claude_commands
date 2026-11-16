@@ -16,6 +16,7 @@ from scripts.lib import atomic_file
 from scripts.production import change_routing
 
 CHANGE_FOLDER = "change-images"
+IMAGES_FOLDER = "images"
 RECORD = ".review-link-image.json"
 DRAFT_PREFIX = ".review-link-draft-"
 SUFFIXES = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp"))
@@ -100,19 +101,37 @@ def register_change(image: Path) -> str:
     return register_file(image, change_routing.review_root().resolve() / CHANGE_FOLDER)["id"]
 
 
-def change_image(root: Path, identity: str) -> str:
-    """Return the public path of a registered change image, or an empty string."""
-    if not IDENTITY.fullmatch(identity):
-        return ""
-    folder = root / CHANGE_FOLDER / identity
+def _checked_image_file(folder: Path) -> Path | None:
+    """Return the checked image file of a store folder, or None."""
     try:
         record = read_record(folder)
         file = folder / record["file"]
         if file.name != record["file"] or file.suffix not in SUFFIXES or file.is_symlink() or not file.is_file():
-            return ""
+            return None
+    except (OSError, ValueError):
+        return None
+    return file
+
+
+def change_image(root: Path, identity: str) -> str:
+    """Return the public path of a registered change image, or an empty string."""
+    if not IDENTITY.fullmatch(identity):
+        return ""
+    file = _checked_image_file(root / CHANGE_FOLDER / identity)
+    return f"/{CHANGE_FOLDER}/{identity}/{file.name}" if file is not None else ""
+
+
+def copy_page_image(identity: str) -> str:
+    """Copy an Images page file into the change store and return its new id, or an empty string."""
+    if not IDENTITY.fullmatch(identity):
+        return ""
+    file = _checked_image_file(change_routing.review_root() / IMAGES_FOLDER / identity)
+    if file is None:
+        return ""
+    try:
+        return register_change(file)
     except (OSError, ValueError):
         return ""
-    return f"/{CHANGE_FOLDER}/{identity}/{record['file']}"
 
 
 def remove_change(root: Path, identity: str) -> None:

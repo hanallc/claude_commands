@@ -110,7 +110,7 @@ def sweep_snapshots(root: Path, now: float) -> int:
     for entry in entries:
         try:
             # The console folder holds the browser token; the images folder holds registered images until a delete.
-            if entry.name in (change_page.CONSOLE_FOLDER, images.FOLDER, image_store.CHANGE_FOLDER) or entry.is_symlink() or not entry.is_dir():
+            if entry.name in (change_page.CONSOLE_FOLDER, image_store.IMAGES_FOLDER, image_store.CHANGE_FOLDER) or entry.is_symlink() or not entry.is_dir():
                 continue
             children = list(entry.iterdir())
             # New snapshots contain regular files. Check symlinks before their

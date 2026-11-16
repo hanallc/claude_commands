@@ -262,6 +262,9 @@ A row without an image retains its text width and position.
 It stores a single image or a before and after pair with one record.
 `image_store.read_record` checks the optional `before` and `feedback_at` fields.
 Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`| image <id>` accepts an id from either store.
+`change_review._row_image` copies an Images page file into the change store and puts the new id in the row.
+It copies the after image for a pair. The source stays in the Images page store until its owner deletes it.
 `change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
 The snapshot sweep skips both image stores during normal snapshot deletion.
 It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.

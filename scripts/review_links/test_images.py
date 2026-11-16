@@ -133,7 +133,7 @@ class ChangeImageTests(ImagesFixture):
 class ImagesTests(ImagesFixture):
     def test_register_copies_the_image_into_a_folder_that_the_record_owns(self) -> None:
         record = self.register()
-        folder = self.root / images.FOLDER / record["id"]
+        folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         self.assertEqual(sorted(path.name for path in folder.iterdir()), [image_store.RECORD, "image.png"])
         self.assertEqual((folder / "image.png").read_bytes(), PNG)
         self.assertEqual(image_store.read_record(folder), record)
@@ -154,7 +154,7 @@ class ImagesTests(ImagesFixture):
         for image, caption, owner, reason in cases:
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 _ = images.register(image, caption, owner, "Change sdlc/C1")
-        self.assertEqual(list((self.root / images.FOLDER).glob("*")) if (self.root / images.FOLDER).exists() else [], [])
+        self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).glob("*")) if (self.root / image_store.IMAGES_FOLDER).exists() else [], [])
 
     def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
         output = StringIO()
@@ -178,7 +178,7 @@ class ImagesTests(ImagesFixture):
 
     def test_page_lists_oldest_first_with_owner_subject_group_links_and_signed_forms(self) -> None:
         older, newer = self.register("Older shot"), self.register("Newer shot")
-        older_folder = self.root / images.FOLDER / older["id"]
+        older_folder = self.root / image_store.IMAGES_FOLDER / older["id"]
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
         source = images.render(self.root).decode()
@@ -339,7 +339,7 @@ class ImagesTests(ImagesFixture):
     def test_card_shows_the_caption_details_image_feedback_field_and_the_answer_buttons(self) -> None:
         record = self.register("Look at <the> cards")
         record["registered_at"] = "2026-11-15T03:09:00+00:00"
-        image_store.write_record(self.root / images.FOLDER / record["id"], record)
+        image_store.write_record(self.root / image_store.IMAGES_FOLDER / record["id"], record)
         card = images.card(record, "token", staff.snapshot(), 3)
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
@@ -367,7 +367,7 @@ class ImagesTests(ImagesFixture):
         body = urlencode({"image": record["id"],
                           "token": images.request_token(images.console_token(self.root), record["id"])})
         images.submit(self.root, body)
-        self.assertFalse((self.root / images.FOLDER / record["id"]).exists())
+        self.assertFalse((self.root / image_store.IMAGES_FOLDER / record["id"]).exists())
         self.assertEqual(images.records(self.root), [kept])
         self.assertEqual(self.sent, [])
         with self.assertRaisesRegex(change_page.AnswerRefused, f"no image {record['id']}"):
@@ -386,7 +386,7 @@ class ImagesTests(ImagesFixture):
 
     def test_an_old_record_with_a_delete_request_reads_and_shows_the_answer_buttons(self) -> None:
         record = self.register()
-        folder = self.root / images.FOLDER / record["id"]
+        folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         stored = cast(dict[str, object], json.loads((folder / image_store.RECORD).read_text()))
         stored["delete_request"] = {"state": "sent", "requested_at": record["registered_at"], "error": ""}
         _ = (folder / image_store.RECORD).write_text(json.dumps(stored))
@@ -413,7 +413,7 @@ class ImagesTests(ImagesFixture):
                     "Caption: After: the panel.", "For: Phase console-images",
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
-                self.assertIn("feedback_at", image_store.read_record(self.root / images.FOLDER / record["id"]))
+                self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.root).decode())
 
     def test_feedback_goes_to_the_owner_session_and_hides_the_image_but_keeps_it(self) -> None:
@@ -431,7 +431,7 @@ class ImagesTests(ImagesFixture):
             "For: Phase console-images",
             "After you act on it, delete the image: "
             + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}")))
-        folder = self.root / images.FOLDER / record["id"]
+        folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         self.assertTrue((folder / "image.png").is_file())
         self.assertIn("feedback_at", image_store.read_record(folder))
         self.assertNotIn(record["id"], images.render(self.root).decode())
@@ -465,7 +465,7 @@ class ImagePairTests(ImagesFixture):
 
     def test_a_pair_is_one_record_in_one_folder_and_one_delete_removes_both(self) -> None:
         record = self.register_pair()
-        folder = self.root / images.FOLDER / record["id"]
+        folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         self.assertEqual(sorted(path.name for path in folder.iterdir()), [image_store.RECORD, "after.webp", "before.png"])
         self.assertEqual(((folder / "before.png").read_bytes(), (folder / "after.webp").read_bytes()), (PNG, PNG[::-1]))
         self.assertEqual((record["file"], record.get("before")), ("after.webp", "before.png"))
@@ -486,7 +486,7 @@ class ImagePairTests(ImagesFixture):
         with patch("scripts.review_links.image_store.shutil.copyfile", side_effect=copy_image), \
                 self.assertRaisesRegex(OSError, "the after image cannot be copied"):
             _ = images.register(after, "caption", self.owner_id(), "Phase image-pairs", before=self.shot)
-        self.assertEqual(list((self.root / images.FOLDER).iterdir()), [])
+        self.assertEqual(list((self.root / image_store.IMAGES_FOLDER).iterdir()), [])
         self.assertEqual(images.records(self.root), [])
 
     def test_a_pair_with_a_bad_before_image_leaves_no_folder(self) -> None:
@@ -495,11 +495,11 @@ class ImagePairTests(ImagesFixture):
         for before, reason in ((text, "use one of"), (self.temporary / "absent.png", "no such image file")):
             with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
                 _ = images.register(self.shot, "caption", self.owner_id(), "Phase image-pairs", before=before)
-        self.assertFalse((self.root / images.FOLDER).exists())
+        self.assertFalse((self.root / image_store.IMAGES_FOLDER).exists())
 
     def test_a_record_whose_before_is_not_text_stays_off_the_page(self) -> None:
         record = self.register_pair()
-        folder = self.root / images.FOLDER / record["id"]
+        folder = self.root / image_store.IMAGES_FOLDER / record["id"]
         stored = cast(dict[str, object], json.loads((folder / image_store.RECORD).read_text()))
         stored["before"] = 7
         _ = (folder / image_store.RECORD).write_text(json.dumps(stored))
@@ -597,7 +597,7 @@ class ImagesServerTests(ImagesFixture):
         self.assertIn(record["id"], body.decode())
         status, kind, body = self.http("GET", images.image_path(record))
         self.assertEqual((status, kind, body), (200, "image/png", PNG))
-        status, _, _ = self.http("GET", f"/{images.FOLDER}/{record['id']}/{image_store.RECORD}")
+        status, _, _ = self.http("GET", f"/{image_store.IMAGES_FOLDER}/{record['id']}/{image_store.RECORD}")
         self.assertEqual(status, 404)
 
     def test_server_serves_both_images_of_a_pair(self) -> None:
@@ -636,7 +636,7 @@ class ImagesServerTests(ImagesFixture):
 
     def test_sweep_keeps_old_images(self) -> None:
         record = self.register()
-        folder = self.root / images.FOLDER
+        folder = self.root / image_store.IMAGES_FOLDER
         os.utime(folder, (0, 0))
         _ = serve.sweep_snapshots(self.root, datetime.now(UTC).timestamp())
         self.assertTrue((folder / record["id"] / "image.png").is_file())
