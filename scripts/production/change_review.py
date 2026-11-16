@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
+from functools import cached_property
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -343,12 +344,13 @@ def visible(commits: list[Commit]) -> list[Visible]:
     return [item for _, item in _checkpoint_entries(commits)]
 
 
-def _line_value(doc: Path, *, sources: list[Path] | None = None) -> str | None:
+def _line_value(doc: Path, *, sources: list[Path] | None = None,
+                lines: list[str] | None = None) -> str | None:
     """The path the doc's Change review line names: its first `quoted` part, else the words before
     any ` — ` note. None when the doc has no line."""
     if sources is not None:
         sources.append(doc)
-    for line in doc.read_text(encoding="utf-8").splitlines():
+    for line in doc.read_text(encoding="utf-8").splitlines() if lines is None else lines:
         if line.startswith(LIST_HEADER):
             value = line.removeprefix(LIST_HEADER).strip()
             quoted = re.match(r"`([^`]+)`", value)
@@ -881,16 +883,24 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 
 def scope_list(doc: Path, *, record: staff.StaffSnapshot | None = None,
-               sources: list[Path] | None = None) -> Path:
+               sources: list[Path] | None = None, prepared: PreparedChangeLists | None = None) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
 
-    if doc.is_file() and (value := _line_value(doc, sources=sources)):
+    if prepared is not None:
+        record = prepared.routing.record
+    lines = prepared.routing.document_lines.get(doc, []) if prepared is not None else None
+    if doc.is_file() and (value := _line_value(doc, sources=sources, lines=lines)):
         return Path(value).expanduser()
     record = staff.snapshot() if record is None else record
     name = unit_lookup.doc_owner(doc, record).name
     if not doc.is_file():
         return list_file(name, sources=sources)
     root = showrunner_tree.root_of(name, record=record)
+    if prepared is not None:
+        for owner in (name, root):
+            if owner in prepared.routing.list_paths:
+                return prepared.routing.list_paths[owner]
+        raise ChangeReviewError(f"{doc} has no `{LIST_HEADER}` line")
     try:
         return (production_list(name, record=record) if sources is None
                 else production_list(name, record=record, sources=sources))
@@ -912,6 +922,20 @@ class ScopedReviewEntry:
     review_list: ProductionReviewList
     entry: urgency.Entry[dict[str, str]]
     owner: change_routing.ChangeOwner
+
+
+@dataclass(frozen=True)
+class PreparedChangeLists:
+    """Share the page's list reads and staff routing with the change queues."""
+
+    snapshots: dict[Path, ReviewListSnapshot]
+    routing: change_routing.StaffRouting
+
+    @cached_property
+    def routed(self) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+        names = {path.name for path in change_routing.review_root().glob(".review-link-delivery-*")}
+        lists = {path: ProductionReviewList(path, _owner(path)) for path in self.snapshots}
+        return _route_review_snapshots(lists, self.snapshots, self.routing, names)
 
 
 def scope_lists(path: Path, doc: Path, below: bool = False, *,
@@ -953,6 +977,13 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
     routing = change_routing.StaffRouting(record, documents, sources=sources)
     names = {path.name for path in issues.source_paths(
         change_routing.review_root(sources=sources), ".review-link-delivery-*", sources=sources)}
+    return _route_review_snapshots(listed, snapshots, routing, names, sources=sources)
+
+
+def _route_review_snapshots(listed: dict[Path, ProductionReviewList], snapshots: dict[Path, ReviewListSnapshot],
+                            routing: change_routing.StaffRouting, names: set[str], *,
+                            sources: list[Path] | None = None) -> list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]:
+    """Route waiting rows from one set of list reads."""
     routed: list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]] = []
     for source, snapshot in snapshots.items():
         rows = change_routing.waiting_rows(source, snapshot.pending, names, sources=sources)
@@ -976,13 +1007,23 @@ def review_scope(doc: Path, below: bool, record: staff.StaffSnapshot) -> set[str
     return scope
 
 
-def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
+def scoped_review_entries(path: Path, doc: Path, below: bool = False, *,
+                          prepared: PreparedChangeLists | None = None) -> list[ScopedReviewEntry]:
     """Use the same staff tab as the change page."""
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     scope = review_scope(doc, below, record)
     grouped: dict[Path, tuple[ProductionReviewList, list[dict[str, str]]]] = {}
     owners: dict[tuple[Path, str], change_routing.ChangeOwner] = {}
-    for review_list, owner, row in _routed_review_entries(path, doc, below, record):
+    if prepared is None:
+        routed = _routed_review_entries(path, doc, below, record)
+    else:
+        lists = dict.fromkeys(item.path.absolute() for item in scope_lists(path, doc, below, record=record))
+        lists.update(dict.fromkeys(source.absolute() for source in prepared.snapshots))
+        by_list: dict[Path, list[tuple[ProductionReviewList, change_routing.ChangeOwner, dict[str, str]]]] = {}
+        for item in prepared.routed:
+            by_list.setdefault(item[0].path.absolute(), []).append(item)
+        routed = [item for source in lists for item in by_list.get(source, [])]
+    for review_list, owner, row in routed:
         if owner.tab in scope:
             if review_list.path not in grouped:
                 grouped[review_list.path] = (review_list, [])
@@ -1006,10 +1047,11 @@ def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str
     return [row.entry.item for row in scoped_review_entries(path, doc, below)]
 
 
-def scope_entries(path: Path, doc: Path, below: bool = False) -> list[urgency.Entry[dict[str, str]]]:
+def scope_entries(path: Path, doc: Path, below: bool = False, *,
+                  prepared: PreparedChangeLists | None = None) -> list[urgency.Entry[dict[str, str]]]:
     """Show the responsible showrunner while retaining list-based queue keys and prerequisites."""
     entries: list[urgency.Entry[dict[str, str]]] = []
-    for scoped in scoped_review_entries(path, doc, below):
+    for scoped in scoped_review_entries(path, doc, below, prepared=prepared):
         entry = scoped.entry
         prefix = (f"{_owner(scoped.review_list.path)}/"
                   if scoped.review_list.path.absolute() != path.absolute() else "")
@@ -1034,7 +1076,8 @@ class ChangeQueue:
     entries: list[urgency.Entry[dict[str, str]]]
 
 
-def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
+def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False, *,
+                 prepared: PreparedChangeLists | None = None) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         routing = review_routing((path,))
@@ -1043,10 +1086,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
             "#": display_id(entry.item, routing.owner(entry.item, path).tab)},
             after=prerequisite_key(entry.after, path, path)) for entry in entries])
 
-    record = staff.snapshot()
+    record = staff.snapshot() if prepared is None else prepared.routing.record
     name = unit_lookup.doc_owner(scope, record).name
     name = queue(path) if name == showrunner_tree.root_of(name, record=record) else f"{queue(path)}-{name}"
-    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
+    return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below, prepared=prepared))
 
 
 def row_production(production: Path, record: staff.StaffSnapshot) -> str:
