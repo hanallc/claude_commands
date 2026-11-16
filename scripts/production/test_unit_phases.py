@@ -808,12 +808,12 @@ class UnitPhasesTests(unittest.TestCase):
             (land_queue.LandView({}, second, {"c" * 40: landed}, frozenset(), {}), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {"c" * 12: failed}, frozenset(), {}),
              "sdlc cannot merge it: test_cards red"),
-            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), {}), "sdlc merged it"),
+            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), {}), ""),
             (land_queue.LandView({"c" * 40: "shells images"}, second, {"c" * 40: failed}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({}, {}, {}, frozenset(), carrier), "3rd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {"c" * 40: failed}, frozenset(), carrier),
              "3rd in sdlc's merge line"),
-            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), carrier), "sdlc merged it"),
+            (land_queue.LandView({}, {}, {"c" * 40: landed}, frozenset(), carrier), ""),
             (land_queue.LandView({}, second, {}, frozenset(), carrier), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, {}, {}, frozenset({"c" * 40}), {}), "sdlc merges it now"),
         ]
@@ -821,6 +821,16 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(merge=expected):
                 result = unit_phases.unit_lands("shells", view, open_sent={"images": unit_phases.phase_sent_work(events)},
                     now=now, zone=ZoneInfo("UTC"), on_main=lambda _commit: False, production="sdlc")
+                if not expected:
+                    self.assertEqual(result.entries, ())
+                    self.assertFalse(result.pending)
+                    _ = self.write_run(member, "landed-open", [("images", "Images")], [
+                        self.phase_event("checkpoint", "images", checkpoint_commit="c" * 40)])
+                    with patch.object(land_queue, "land_view", return_value=view):
+                        rendered = self.blocks([member], {})
+                    self.assertNotIn("Images (images)", [row.work for row in detail_rows(rendered, member.name)])
+                    self.assertNotIn("merged it", rendered)
+                    continue
                 matching = [entry for entry in result.entries
                             if entry.work == "Images" and expected.casefold() in entry.state_text.casefold()]
                 self.assertTrue(matching, result.entries)
@@ -1663,7 +1673,7 @@ class UnitPhasesTests(unittest.TestCase):
                 if open_phase:
                     self.assertIn(("Now", "Current delivery (open)", "Director's current step not recorded"), rows)
 
-    def test_stopped_attempts_and_later_results_share_the_progress_history(self) -> None:
+    def test_stopped_attempts_disappear_after_later_completed_attempts_in_the_same_scope(self) -> None:
         member = self.member("admin-console")
         stopped = [
             ("unknown-reservation-repair", "Repair accepts a reservation the board no longer knows"),
@@ -1715,9 +1725,10 @@ class UnitPhasesTests(unittest.TestCase):
             DetailRow("Next", "Not recorded", "The director has not chosen the next task"),
             *(DetailRow("Stopped", f"{title} ({phase})", "Stopped; reason not recorded")
               for phase, title in stopped[:3]),
-            DetailRow("Done", stopped[3][1] + " (gate-time-limit)", "A later attempt finished on 14 Nov"),
-            DetailRow("Done", stopped[4][1] + " (image-pairs)", "The phases unit finished this work"),
         ])
+        self.assertNotIn("Done", [row.item for row in rows])
+        for phase, title in stopped[3:]:
+            self.assertNotIn(f"{title} ({phase})", [row.work for row in rows])
         self.assertIn("🟨", rendered.split("**admin-console**", 1)[0])
         self.assertIn("⬜", rendered.split("**admin-console**", 1)[0])
         self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
@@ -1745,6 +1756,77 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertTrue(any(row.item.startswith("Also") and row.work == answer[1] + " (answer-copy)"
                             and row.state == "sdlc cannot merge it: chart tests also fail on main" for row in rows))
         self.assertNotIn("Stopped", [row.item for row in rows if row.work == stopped[3][1] + " (gate-time-limit)"])
+        self.assertNotIn("Done", [row.item for row in rows])
+        self.assertNotIn(stopped[4][1] + " (image-pairs)", [row.work for row in rows])
+
+        with path.open("a") as stream:
+            _ = stream.write(json.dumps({
+                "event_type": "phase_finished", "phase_id": "gate-time-limit", "phase_instance_id": "gate-new",
+                "status": "stopped", "reason": "The user stopped the later attempt",
+                "timestamp_epoch": finished + 360, "phase_elapsed_seconds": 60,
+            }) + "\n")
+        with patch.object(land_queue, "land_view", return_value=merge):
+            rendered = self.blocks([member], {})
+        rows = detail_rows(rendered, member.name)
+        self.assertEqual([row for row in rows if row.item == "Stopped"
+                          and row.work == stopped[3][1] + " (gate-time-limit)"], [
+            DetailRow("Stopped", stopped[3][1] + " (gate-time-limit)",
+                      "Stopped; The user stopped the later attempt"),
+        ])
+
+        with path.open("a") as stream:
+            for phase in (stopped[0][0], "gate-time-limit"):
+                _ = stream.write(json.dumps(self.phase_event(
+                    "phase_dropped", phase, reason="The user removed this task")) + "\n")
+        with patch.object(land_queue, "land_view", return_value=merge):
+            rendered = self.blocks([member], {})
+        self.assertEqual([row for row in detail_rows(rendered, member.name) if row.item == "Stopped"], [
+            *(DetailRow("Stopped", f"{title} ({phase})", "Stopped; reason not recorded")
+              for phase, title in stopped[1:3]),
+            DetailRow("Stopped", stopped[3][1] + " (gate-time-limit)",
+                      "Stopped; The user stopped the later attempt"),
+        ])
+
+        with path.open("a") as stream:
+            for event in (
+                self.phase_event("phase_finished", answer[0], status="stopped"),
+                self.phase_event("phase_dropped", answer[0], reason="The user removed this task"),
+                {"event_type": "wait_started", "wait_scope": "unit", "wait_id": "old-hold",
+                 "target_work": answer[0], "wait_by": "the user", "wait_reason": "old approval",
+                 "wait_kind": "WaitingForUser", "wait_started_epoch": finished + 400},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        dropped_views = (merge, land_queue.LandView({}, {}, {}, frozenset(), {}),
+                         land_queue.LandView({"c" * 40: member.name + " " + answer[0]}, {}, {}, frozenset(), {}))
+        for dropped_view in dropped_views:
+            with (self.subTest(land=dropped_view),
+                  patch.object(land_queue, "land_view", return_value=dropped_view),
+                  patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                rendered = self.blocks([member], {})
+            self.assertNotIn(answer[1] + " (answer-copy)", [row.work for row in detail_rows(rendered, member.name)])
+            self.assertNotIn("old approval", rendered)
+            self.assertNotIn("chart tests also fail", rendered)
+            self.assertIn("waiting to merge 0", rendered.splitlines()[0])
+            self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+        with path.open("a") as stream:
+            for event in (
+                {"event_type": "phase_started", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "phase_title": answer[1], "phase_started_at": finished + 500},
+                {"event_type": "checkpoint", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "checkpoint_commit": "d" * 40},
+                {"event_type": "phase_finished", "phase_id": answer[0], "phase_instance_id": "answer-later",
+                 "status": "completed", "timestamp_epoch": finished + 560, "phase_elapsed_seconds": 60},
+            ):
+                _ = stream.write(json.dumps(event) + "\n")
+        later_failed: land_runs.LandResult = {**failed, "commit": "d" * 40, "detail": "new failed merge",
+                                              "time": "2026-11-15T18:00:00+00:00"}
+        later_merge = merge._replace(results={"c" * 40: failed, "d" * 40: later_failed})
+        with patch.object(land_queue, "land_view", return_value=later_merge):
+            rendered = self.blocks([member], {})
+        self.assertIn(("Now", answer[1] + " (answer-copy)", "sdlc cannot merge it: new failed merge"),
+                      detail_rows(rendered, member.name))
+        self.assertIn("waiting to merge 1", rendered.splitlines()[0])
 
     def test_summary_counts_units_once_by_the_first_matching_rule(self) -> None:
         working, merging, waiting, idle, unknown = [self.member(name) for name in

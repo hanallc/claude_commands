@@ -12,6 +12,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from unittest import mock
 
 from scripts.production import change_review
 from scripts.lib import copy_record
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -1387,6 +1389,72 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited words"])
         self.assertEqual(self.listing.read_bytes(), written)
 
+    def test_an_edited_row_covers_only_its_units_checkpoint_in_a_shared_merge(self) -> None:
+        other = self.branch_unit("other", "other-unit", "other-branch", "other-plan.md")
+        _ = self.git("checkout", "-b", "old-branch")
+        for branch, words in (("other-branch", "Other change"), ("old-branch", "Original words")):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({branch}): visible change\n\nChange-Review: {words} | Read | Result")
+            self.record_unit_commit(self.git("rev-parse", "HEAD"), branch)
+        _ = self.git("checkout", "integration")
+        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge both units into integration")
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "origin", "integration")
+        self.promote()
+        _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
+        code, output, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["Change"], row["Producer"]) for row in change_review.pending(self.listing)],
+                         [("Edited words", self.unit.id), ("Other change", other.id)])
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_positional_pairing_orders_ready_and_held_changes_for_each_producer(self) -> None:
+        other = staff.StaffId("other-producer")
+        for second_step in ("restart", "deploy"):
+            with self.subTest(second_step=second_step):
+                changes = [change_review.PublicationChange(item, change_review.UnresolvedSource(), producer, "checkpoint", "")
+                           for producer, item in (
+                               (self.unit.id, Visible("First held", "Read", "Result", change_review.AfterStep("restart"))),
+                               (other, Visible("Other held", "Read", "Result", change_review.AfterStep("deploy"))),
+                               (self.unit.id, Visible("First ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second held", "Read", "Result", change_review.AfterStep(second_step))),
+                           )]
+                self.listing.unlink(missing_ok=True)
+                edited = [Visible(f"Edited words {index}", "Read", "Result") for index in range(4)]
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, edited, date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[other, self.unit.id, self.unit.id, self.unit.id], record=record)
+                _ = change_review.append_rows(self.listing, changes, date(2026, 11, 7), "abcdef123456", self.doc,
+                                              record=record, repo=self.repo, merge_changes=changes)
+                expected = ["Second held"] if second_step == "restart" else ["First held", "Second held"]
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 [item.change for item in edited] + expected)
+
+    def test_positional_pairing_requires_known_producers_but_text_matching_does_not(self) -> None:
+        for producer, row_producer in ((self.unit.id, ""), (change_review.UnknownProducer(), self.unit.id),
+                                      (change_review.UnknownProducer(), "")):
+            with self.subTest(producer=producer, row_producer=row_producer):
+                change = change_review.PublicationChange(Visible("Original words", "Read", "Result"),
+                    change_review.UnresolvedSource(), producer, "checkpoint", "")
+                self.listing.unlink(missing_ok=True)
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                              date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[staff.StaffId(row_producer)], record=record)
+                added = change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                  record=record, repo=self.repo, merge_changes=[change])
+                self.assertEqual(len(added), 1)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 ["Edited words", "Original words"])
+                self.assertEqual(change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                          record=record, repo=self.repo, merge_changes=[change]), [])
+
     def test_text_matching_reserves_its_row_before_an_edited_row_covers_another_change(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result")
@@ -1404,7 +1472,8 @@ class ReadyListTests(ProducerFixture):
                                    + "Change-Review: Second | Read | Second result")
         self.promote()
         _ = change_review.append_rows(self.listing, [Visible("First", "Read", "First result")],
-                                      date(2026, 11, 7), merged[:8], self.doc, record=staff.snapshot())
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
                                    date(2026, 11, 7), self.doc)
         code, output, error = self.ready()
@@ -2565,6 +2634,34 @@ class CommitTest(unittest.TestCase):
         return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
 
     def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
+        tools = self.repo.parent / "lease-git"
+        tools.mkdir()
+        log = self.repo.parent / "index-leases"
+        binary = shutil.which("git")
+        assert binary is not None
+        write_python_tool(tools / "git", """import fcntl, os, sys
+from pathlib import Path
+from scripts.lib import build_folders
+index = os.environ.get("GIT_INDEX_FILE", "")
+if index and Path(index).parent.name.startswith("change-review-index"):
+    folder = Path(index).parent
+    lock = folder.with_name(folder.name + ".lock").stat()
+    inherited = []
+    for entry in Path("/dev/fd").iterdir():
+        try:
+            if os.path.samestat(os.fstat(int(entry.name)), lock):
+                inherited.append(int(entry.name))
+        except OSError:
+            pass
+    assert inherited, "The Git child has no folder lease"
+    fcntl.flock(inherited[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with open(""" + repr(str(log)) + """, "a") as output:
+        output.write(build_folders.build_folder_state(folder) + "\\n")
+os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
+""")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "TMPDIR": str(self.repo.parent), "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+        }))
         source, *commits = origin_commits(self.repo.parent)
         merged = commits[-1][:8]
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
@@ -2575,6 +2672,7 @@ class CommitTest(unittest.TestCase):
         _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION, record=staff.snapshot())
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(set(log.read_text().splitlines()), {"held"})
 
     def test_a_verdict_commits_the_list(self) -> None:
         for row, held in (("C1", False), ("C2", True)):
@@ -2701,14 +2799,15 @@ class CommitTest(unittest.TestCase):
         competing: list[str] = []
 
         def move_head(command: list[str], *, capture_output: bool = False, text: bool = False,
-                      check: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                      check: bool = False, env: dict[str, str] | None = None,
+                      pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             if "update-ref" in command and not competing:
                 commit = real_run(["git", "-C", str(self.repo), "commit-tree", tree, "-p", previous,
                                    "-m", "Timer commit"], capture_output=True, text=True, check=True).stdout.strip()
                 _ = real_run(["git", "-C", str(self.repo), "update-ref", "HEAD", commit, previous],
                              capture_output=True, text=True, check=True)
                 competing.append(commit)
-            return real_run(command, capture_output=capture_output, text=text, check=check, env=env)
+            return real_run(command, capture_output=capture_output, text=text, check=check, env=env, pass_fds=pass_fds)
 
         with mock.patch.object(subprocess, "run", side_effect=move_head):
             result = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1",

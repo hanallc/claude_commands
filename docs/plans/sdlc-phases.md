@@ -450,13 +450,39 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Gotchas:** hana main has no `publish_order` or `github_release_repo` yet; hana-merges owns those keys and `post_publish.sh`.
 
+### Phase 43 — `hana_shot locate` prints where to click a named target  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `hana_shot.py locate --port N --target <selector> [--json]` reads the current camera (it waits with `Session.settle` while the camera moves) and prints `<selector> <x> <y> <width> <height> <cx> <cy> scale <s>`, then `clipped` and `occluded` when set. Values are window logical pixels (physical / the camera's `scale_factor`), the space brp_extras `move_mouse`, `click_mouse` and `drag_mouse` take; the scale prints unrounded. `--json` prints `selector`, `entity`, `rect`, `click`, `scale_factor`, `window`, `clipped`, `occluded`. It never moves the camera, takes no shot and writes no timing line.
+- One shared projection (`project_bounds`) serves locate and `--crop entity`; the crop output is unchanged. A corner behind the camera is dropped and a rectangle past a window edge is cut; both mark `clipped`. A camera with a viewport is refused.
+- Click point: rays from the camera (`inverse_projection`, `window_ray`) through a `locate_grid` x `locate_grid` grid hit each visible `Aabb` in its `GlobalTransform` with a slab test (`box_hit_distance`); `ray_owner` gives each ray to the nearest hit. The click point is the target-owned point nearest the rectangle centre; `occluded` marks a centre owned by another entity.
+- Rays follow bevy_picking: a mesh whose `Pickable` has `should_block_lower: false` never covers unless it is a target member, and a box that holds the ray origin is not hit unless it carries `RayCastBackfaces`.
+- Exit 1 prints one stderr line: `off screen`, `behind the camera`, `covered by <name or entity:id>`, `no clear click point on <selector>` (no ray hits a box), or the no-visible-mesh-bounds failure with its parent hint. Exit 2 is a refused request.
+- Selectors: `<outer>/<inner>` keeps inner matches under the one outer match; a missing outer prints `<scoped>: outer X found nothing`. A Show scope also reaches the entities whose `DrawnByShow` names it, plus their descendants; a Hana that does not reflect `DrawnByShow` reaches only the Show's children, and the failure text says so. `tool:<Kind>#-n` counts from the newest tool of that kind.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `locate`, `project_bounds`, the ray and box hit test, scoped and `#-n` selectors
+- `scripts/hana_shot/test_hana_shot.py` — locate tests on the `Fake` BRP
+- `config/hana_shot.conf` — `locate_grid=9`
+- `commands/hana_shot.md` — the selector list and the locate item
+
+**Gotchas:**
+- The hit test uses each mesh's box, not its triangles, so a point near a round edge can miss.
+- `covered by` means a click hits the cover. A cable drag can still land on a covered jack, because Hana's drop rule picks the nearest jack under the hit's root; locate does not model that rule. The Show's rear jack reads `covered by Tool Visual Root` for this reason.
+- The default scene holds its own Shapes and Shows, so a new tool is `#-1`, not `#1`.
+- A beamed part is not a child of its Show; it carries `DrawnByShow` (`hana_mimesis_tools::show::DrawnByShow`), reflected from Hana 5593161498.
+
+**Ruled out:** a triangle hit test; moving the camera to make a target clear.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
 #### As-built
 
 - `progress_history.py start-wait --kind <kind> [--reason <text>]` prints a wait id, and `finish-wait --wait-id <id>` closes that one wait. Events (`wait_started`, `wait_finished`, `unclosed`) carry the phase instance id, the display phase id, unit, owner session and UTC times. Kinds: `WaitingForQuotaRefusal` (a provider refusal only, never a quota reading), `WaitingForMemoryOrSlot`, `WaitingForMergeGate`, `WaitingForUser`, `WaitingForSupplier`, `ReadyWithoutCapacity`. A probe session writes no wait. An open wait at `finish-phase` closes as `unclosed` with its start and no end.
-- Emit points: `verify.sh` (memory admission, cargo token, build hold); `codex_mesh.py` (provider refusal, ready dispatch held for room); `merge_checkpoint.py` (merge gate); the Stop hook starts a user wait on a `decision:`/`gate:` turn and a supplier wait on a `blocked:` turn, and the UserPromptSubmit hook closes it through `turn_wait.json`.
+- Emit points: `verify.sh` (memory admission, cargo token, build hold); `merge_checkpoint.py` (merge gate); the Stop hook starts a user wait on a `decision:`/`gate:` turn and a supplier wait on a `blocked:` turn, and the UserPromptSubmit hook closes it through `turn_wait.json`.
 - The `waits` verb returns waits for `[since, until)` with `covered_n` and `missing_n`. `start-phase` marks the instance as covered; a covered phase with no wait reads as covered zero, and a phase from a run with no wait history reads `HistoryNotRecorded`, never 0.
 - Each pushed merge on both paths (checkpoint and child handoff) appends one receipt to `merge_receipts.jsonl` under the history root: project (from `Repository`), issue or plan phase, merge commit, source checkpoint, target branch, UTC time. A retry writes no second receipt; a rolled-back merge writes none. The `receipts` verb names a merge commit with no receipt `ReceiptMissing`.
 - `phase_process.py baseline`'s trial section reports median and p90 phase time per unit, with n, over the same eligible trial phases as its three measures. `history.py` and `rounds.py` still read old run files.
@@ -465,13 +491,12 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 **Files:**
 - `scripts/direct/progress_history.py` — the recorder, the `waits` and `receipts` verbs; every emit point calls it
 - `scripts/direct/phase_process.py` — trial phase time
-- `scripts/direct/verify.sh`, `scripts/agents/codex_mesh.py`, `scripts/production/merge_checkpoint.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py` — emit points and receipts
+- `scripts/direct/verify.sh`, `scripts/production/merge_checkpoint.py`, `scripts/hooks/stop-direct-continue.py`, `scripts/hooks/user-prompt-submit-conversation-pause.py` — emit points and receipts
 - `scripts/hooks/test_direct_turn_wait_hooks.py`, `scripts/production/test_merge_checkpoint.py` — hook wait and receipt tests
 
 **Binds later work:** the wait event shape, the six kinds, `HistoryNotRecorded` versus covered zero, and the receipt fields go to hierarchies-unit as a schema handoff; no script in this tree reads wait events yet. The baseline freeze records trial phase time from `phase_process.py baseline`.
 
 **Gotchas:**
-- `codex_mesh` runs one app-server per run, so a launcher's exported variables (`UNIT_PHASE_ID`, `UNIT_TEAM_ROLE`) are fixed at server start. Only `CODEX_THREAD_ID` is per thread.
 - A unit finishes its phase before the showrunner merges it, so a merge-time record resolves a finished phase instance.
 - A new import in a shared script breaks the fixture copy lists in `test_review_launcher.py` and `test_update_registration.py`.
 - `phase_reservation.py` committed does not run in a repository that is not enrolled.
@@ -483,7 +508,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 #### As-built
 
-- Worker waits: `verify.sh` gives `CODEX_THREAD_ID` to the recorder, and `codex_mesh.py`'s controller passes the worker name, run directory and thread id explicitly (it reads no environment identity). Both call one resolver, `resolve_worker_pass`, which maps the thread to exactly one `mesh_roster.json` worker and that worker to exactly one active pass. It returns `ResolvedWorkerPass` or `UnresolvedWaitAttribution` with its reason and candidates. Start and finish events carry `pass_instance_id` and `worker_name`. A director-run `verify.sh` wait is owned by the director (`--director` plus `CLAUDE_CODE_SESSION_ID`).
+- Historical worker waits (2026-10-29): `verify.sh` supplied `CODEX_THREAD_ID`. The mesh controller supplied the worker name, run directory and thread id. `resolve_worker_pass` mapped the thread through `mesh_roster.json` to one active pass. Commit `ce529466f` removed the mesh controller on 2026-11-08. The deployment record in Phase 4 identifies the earlier revisions.
 - Merge-gate waits: `<CheckpointCommit/>` runs `progress_history.py checkpoint --session-dir <S> --phase <id> --commit <hash>` after each commit, in every repository. `merge_checkpoint.py` turns the notice's hash into the full id (`git rev-parse --verify <commit>^{commit}`) and finds that event across the run files under the history root, this worktree's phases included. One match attributes the wait. Zero or several matches read as uncertain coverage for each candidate, never covered zero. A child handoff records a production-level handoff wait with no phase.
 - User and supplier waits: the UserPromptSubmit hook ends `WaitingForUser` on typed input, or on a `From the user (via the showrunner):` relay from the expected showrunner address. It ends `WaitingForSupplier` only on a message from the supplier's current address. The production comes from the plan header through `resolve_production_unit`, which reads metadata only and accepts both header forms. Timers, task notices and other peers leave both open. The duplicate check compares the supplier too. Waits a phase leaves open close as `Unclosed` at phase completion, external waits included, under a shared lock.
 - `waits` JSON reports `covered_n`, `attribution_miss_n`, `uncertain_phase_n`, `missing_n`, `production_handoff_n` and the handoffs, each miss with its reason and candidates.
@@ -495,7 +520,6 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `scripts/direct/progress_history.py` — resolver, attribution types, checkpoint verb, supplier identity, uncertain coverage, `waits` JSON
 - `scripts/hooks/user-prompt-submit-conversation-pause.py` — sender-matched completion and the showrunner relay
 - `scripts/direct/verify.sh`, `scripts/lint/memory_gate.sh` — thread attribution and the shared memory line
-- `scripts/agents/codex_mesh.py` — explicit controller context
 - `scripts/production/merge_checkpoint.py` — full-hash checkpoint lookup and the child handoff wait
 - `commands/unit/checkpoint.md` — the checkpoint verb line
 - `scripts/direct/workers.py`, `scripts/direct/phase_process.py`
@@ -589,7 +613,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `scripts/direct/progress_history.py` — holder types and flags, `wait-holder`, the `holders` output, the wait-without-id count, phase source metadata
 - `scripts/direct/test_progress_history.py` — CLI tests for each case
 
-**Binds later work:** the producers are other units' files and have hand-offs: `verify.sh`'s `phase_wait_start` (builds) passes the board token owner for a slot wait, the memory reservation owner for a memory wait and the build hold's holder for a hold wait, and calls `wait-holder` when the holder changes; `codex_mesh.py`'s `_mesh_phase_wait` (models-unit) passes the account label for quota and capacity waits. hierarchies-unit reads the holder field shape.
+**Binds later work:** `verify.sh` passes the resource holder to the wait recorder and calls `wait-holder` when the holder changes. The holder identifies the slot owner, memory reservation owner or build hold owner. hierarchies-unit reads the holder field shape. The deleted mesh producer requires no further change.
 
 **Gotchas:** most plan headers name the production with no unit part, so the production reader accepts both header forms.
 
@@ -696,7 +720,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `scripts/lib/process_start.py` — the shared reader and `OwnerCheck`; `scripts/lib/test_process_start.py`.
 - `scripts/lib/process_start_test_support.py` — the one fake stat helper for tests (`write_stat`, `process_start_probe`, `stored_start_probe`).
 - `scripts/direct/assign.py`, `findings.py`, `verify.sh`, `end_session.sh` — the five rerun fixes; tests in `test_assign_launcher.py`, `test_findings.py`, `test_verify_hold_lint.py`, `test_verify_hold_wait.py`, `test_end_session.py`.
-- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/agents/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
+- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/agents/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
 
 **Binds later work:**
 - Any code that reads a process start or decides a process is stale calls `scripts.lib.process_start` (`check_owner`, `check_group_leader`). Only GONE and REPLACED reclaim. Only ALIVE signals. UNKNOWN keeps the record.
@@ -707,7 +731,6 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - A Mac start time is `ps -o lstart=` text, read with `LC_ALL=C` and `TZ=UTC`. A host without /proc gives UNKNOWN on a date mismatch, never REPLACED.
 - A test that patches a per-script start reader breaks, because those readers are gone. Patch `scripts.lib.process_start`.
 - A stop inside `phase_wait_start` still leaves an open wait with no wait file. "A stopped verify.sh wait is found and closed on a rerun" closes it.
-- A mesh inbox race in `codex_mesh.py` stays open; models-unit owns that file.
 
 ### Phase 18 — The Stop hook lets a full-context stop through only when something live will wake the session  · status: done
 **Depends on:** none (showrunner fix, 2026-10-29: ahead of other work)
@@ -756,12 +779,11 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 - `scripts/mac_test/copy_watch.py` — result publication needs the pre-created hold folder and never recreates it
 - `scripts/direct/verify_hold_wait_test_support.py`, `test_verify_hold_wait.py`, `test_progress_history.py` — stop-and-resume interleaving regressions on the shared fixture
 
-**Binds later work:** every wait publisher calls `publish_wait`; there is no second wait-file writer or id format. Work that freezes the recorder, launchers and wait records between a before and an after sample depends on models-unit's move of `codex_mesh.py` `_mesh_phase_wait` onto `publish_wait`: if that move lands after the before sample, a new before sample is frozen after it.
+**Binds later work:** every wait publisher calls `publish_wait`. There is no second wait-file writer or id format. Freeze the recorder, launchers and wait records before each comparison sample. The deleted mesh producer creates no remaining dependency.
 
 **Gotchas:**
 - Deleting a folder by its original path is never safe while a publisher knows that path; only a rename under the lock makes a late publisher fail.
 - A shared writer that creates a missing parent reopens the late-publication race; publishers into a hold folder pass `create_parent=False`.
-- `codex_mesh.py` `_mesh_phase_wait` still appends its event before its marker, so a killed codex_mesh can leave an open wait with no file; models-unit owns its move to `publish_wait`.
 
 ### Phase 21 — repair frees a phase record whose reservation a sibling's checkpoint released  · status: done
 

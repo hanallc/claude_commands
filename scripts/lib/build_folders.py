@@ -94,7 +94,38 @@ class StableOwnerFolder:
     mode: int = 0o777
 
 
-BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder
+@dataclass(frozen=True)
+class NewWorktreeBranch:
+    """Create the named branch from its start point."""
+    name: str
+    start_point: str
+
+
+@dataclass(frozen=True)
+class ExistingWorktreeBranch:
+    """Use an existing branch without resetting it."""
+    name: str
+
+
+@dataclass(frozen=True)
+class LinkedEditableRepository:
+    """Create a persistent linked worktree at the exact caller path."""
+    path: Path
+    source: Path
+    branch: NewWorktreeBranch | ExistingWorktreeBranch
+
+
+@dataclass(frozen=True)
+class RemoteEditableRepository:
+    """Clone a remote ref at the exact caller path with the requested depth."""
+    path: Path
+    url: str
+    ref: str
+    depth: int
+
+
+EditableRepositoryRequest = LinkedEditableRepository | RemoteEditableRepository
+BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | EditableRepositoryRequest
 
 
 def inherited_temporary_parent() -> Path:
@@ -201,10 +232,11 @@ def _new_suffix(length: int, settings: ConfigRead) -> str:
 def build_folder_path(spec: BuildFolderSpec) -> Path:
     """Apply the configured name rule without creating a folder."""
     settings = _settings()
+    if spec.kind == "slot":
+        _check_name(spec.repository)
+        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
-    if spec.kind == "slot":
-        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     if spec.suffix_length < 0:
         raise ValueError("a suffix length cannot be negative")
     suffix = spec.suffix
@@ -386,6 +418,11 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         return _request_spec(request.request)
     if isinstance(request, BuildFolderSpec):
         return request
+    if isinstance(request, (LinkedEditableRepository, RemoteEditableRepository)):
+        path = request.path.expanduser().absolute()
+        if isinstance(request, RemoteEditableRepository) and request.depth < 1:
+            raise ValueError("an editable clone needs a positive depth")
+        return BuildFolderSpec(kind="editable", parent=path.parent, purpose=path.name, suffix_length=0)
     else:
         stable = isinstance(request, StableOwnerFolder)
         name = request.name if isinstance(request, StableOwnerFolder) else request.prefix
@@ -404,6 +441,15 @@ def _stable_folder(spec: BuildFolderSpec) -> bool:
 def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
+    if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, ExistingWorktreeBranch):
+        import subprocess
+
+        branch = subprocess.run(["git", "-C", str(original.source), "show-ref", "--verify", "--quiet",
+                                 f"refs/heads/{original.branch.name}"], capture_output=True,
+                                timeout=repository_git_timeout())
+        if branch.returncode:
+            raise ValueError(f"existing worktree branch {original.branch.name!r} does not exist in {original.source}")
+    editable_repository = isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
     spec = _request_spec(original)
     stable = _stable_folder(spec)
     # Only a name with a random part gets a new name on a clash; a tool name is fixed per request.
@@ -416,7 +462,9 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
             while True:
                 allocation = (replace(spec, work=_new_suffix(spec.suffix_length, _settings()))
                               if spec.kind != "slot" and (spec.showrunner or spec.unit) and not spec.work else spec)
-                path = build_folder_path(allocation)
+                path = (original.path.expanduser().absolute()
+                        if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
+                        else build_folder_path(allocation))
                 directory = directories.get(path.parent)
                 if directory is None:
                     directory = parents.enter_context(_folder_parent(path, spec.parent,
@@ -425,8 +473,9 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                 descriptor = _open_lock(path, directory, create=True)
                 made_inode: os.stat_result | None = None
                 new_folder = False
+                new_branch_start = ""
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" else fcntl.LOCK_EX,
+                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" and not editable_repository else fcntl.LOCK_EX,
                                       wait=spec.kind != "slot"):
                         if renamed:
                             continue
@@ -438,6 +487,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     except FileNotFoundError:
                         existing = None
                     if existing is not None:
+                        if editable_repository:
+                            raise FileExistsError(errno.EEXIST, "editable repository destination is occupied", str(path))
                         if not stable:
                             if not renamed:
                                 raise FileExistsError(errno.EEXIST, "build folder already exists", str(path))
@@ -478,11 +529,37 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                             os.mkdir(path.name, mode=mode, dir_fd=directory)
                             made_inode = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                         except FileExistsError:
-                            if not stable:
+                            if not stable or editable_repository:
                                 raise
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository)):
+                        import subprocess
+
+                        if isinstance(original, LinkedEditableRepository):
+                            command = ["git", "-C", str(original.source), "worktree", "add", str(path), original.branch.name]
+                        else:
+                            command = ["git", "clone", "--depth", str(original.depth), "--branch", original.ref,
+                                       "--", original.url, str(path)]
+                        try:
+                            if isinstance(original, LinkedEditableRepository) and isinstance(original.branch, NewWorktreeBranch):
+                                _ = subprocess.run(["git", "-C", str(original.source), "branch", "--",
+                                                    original.branch.name, original.branch.start_point], check=True,
+                                                   capture_output=True, text=True, timeout=repository_git_timeout())
+                                start = subprocess.run(["git", "-C", str(original.source), "rev-parse", "--verify",
+                                                        f"refs/heads/{original.branch.name}"], check=True,
+                                                       capture_output=True, text=True, timeout=repository_git_timeout())
+                                new_branch_start = start.stdout.strip()
+                            _ = subprocess.run(command, check=True, capture_output=True, text=True,
+                                               timeout=repository_git_timeout())
+                        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                            detail: str | bytes = (str(error) if isinstance(error, OSError)
+                                                   else cast(str | bytes, error.stderr or str(error)))
+                            if isinstance(detail, bytes):
+                                detail = detail.decode(errors="replace")
+                            raise OSError(errno.EIO, f"git repository creation failed: {detail.strip()}", str(path)) from error
+                        return path
                     if new_folder and isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
 
@@ -501,6 +578,21 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     _ = _locks.pop(descriptor, None)
                     if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
                         _remove_failed_allocation(path, directory, made_inode)
+                        if isinstance(original, LinkedEditableRepository):
+                            import subprocess
+
+                            cleanup_commands = [["git", "-C", str(original.source), "worktree", "prune", "--expire", "now"]]
+                            if new_branch_start and isinstance(original.branch, NewWorktreeBranch):
+                                # The expected value protects a branch that changed after creation.
+                                cleanup_commands.append(["git", "-C", str(original.source), "update-ref", "-d",
+                                                         f"refs/heads/{original.branch.name}", new_branch_start])
+                            for cleanup_command in cleanup_commands:
+                                try:
+                                    _ = subprocess.run(cleanup_command, capture_output=True,
+                                                       timeout=repository_git_timeout())
+                                except (OSError, subprocess.TimeoutExpired):
+                                    # Keep the creation error when a cleanup command fails.
+                                    pass
                     raise
                 finally:
                     if descriptor not in _locks:
@@ -577,7 +669,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return held
 
 
-def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold every lease lock below path without following links. False when an owner holds one."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
@@ -587,7 +679,7 @@ def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if not _hold_free_lease(Path(top) / stem, directory, stack):
+                if not _hold_free_lease(Path(top) / stem, directory, stack, wait=wait):
                     return False
     return True
 
@@ -672,13 +764,21 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
-    """Remove a folder and its records when no process holds its lock."""
-    def cleanup() -> None:
+    """Remove a folder and its records when no process holds its lock or a lease below it."""
+    def cleanup() -> bool:
         try:
             allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
-            return
-        _remove_folder(path, directory, allocated)
+            return True
+        with ExitStack() as children:
+            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
+            try:
+                if not _hold_child_leases(path, children, wait=wait):
+                    return False
+            except OSError:
+                return False
+            _remove_folder(path, directory, allocated)
+        return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
 
@@ -863,6 +963,17 @@ def main(argv: Sequence[str]) -> int:
     stable_parent = stable.add_mutually_exclusive_group()
     _ = stable_parent.add_argument("--parent", type=Path)
     _ = stable_parent.add_argument("--unit-root", action="store_true")
+    editable = commands.add_parser("editable-repository")
+    _ = editable.add_argument("--path", type=Path, required=True)
+    source = editable.add_mutually_exclusive_group(required=True)
+    _ = source.add_argument("--source", type=Path)
+    _ = source.add_argument("--url")
+    branch = editable.add_mutually_exclusive_group()
+    _ = branch.add_argument("--new-branch")
+    _ = branch.add_argument("--existing-branch")
+    _ = editable.add_argument("--start-point")
+    _ = editable.add_argument("--ref")
+    _ = editable.add_argument("--depth", type=int)
     tool = commands.add_parser("tool")
     _ = tool.add_argument("--tool", required=True)
     _ = tool.add_argument("--parent", type=Path)
@@ -882,6 +993,33 @@ def main(argv: Sequence[str]) -> int:
     request: BuildFolderRequest
     command = cast(str, args.command)
     try:
+        if command == "editable-repository":
+            path = cast(Path, args.path)
+            source_path = cast(Path | None, args.source)
+            new_branch = cast(str | None, args.new_branch)
+            existing_branch = cast(str | None, args.existing_branch)
+            start = cast(str | None, args.start_point)
+            ref = cast(str | None, args.ref)
+            depth = cast(int | None, args.depth)
+            if source_path is not None:
+                if ref is not None or depth is not None:
+                    raise ValueError("a linked worktree does not use --ref or --depth")
+                selection: NewWorktreeBranch | ExistingWorktreeBranch
+                if new_branch is not None and start is not None:
+                    selection = NewWorktreeBranch(new_branch, start)
+                elif existing_branch is not None and start is None:
+                    selection = ExistingWorktreeBranch(existing_branch)
+                else:
+                    raise ValueError("a linked worktree needs --new-branch and --start-point, or --existing-branch")
+                request = LinkedEditableRepository(path, source_path, selection)
+            else:
+                if new_branch is not None or existing_branch is not None or start is not None:
+                    raise ValueError("a remote clone does not use worktree branch flags")
+                if ref is None or depth is None:
+                    raise ValueError("a remote clone needs --ref and --depth")
+                request = RemoteEditableRepository(path, cast(str, args.url), ref, depth)
+            print(create_build_folder(request))
+            return 0
         if command == "run":
             arguments = cast(list[str], args.argv)
             owner = cast(str, args.owner) or cast(str, args.unit)

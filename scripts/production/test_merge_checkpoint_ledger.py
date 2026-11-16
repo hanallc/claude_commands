@@ -11,9 +11,11 @@ from typing import final
 
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
+from scripts.style.style_reader_test_support import oracle_reader
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
     configure_test_environment()
 
 

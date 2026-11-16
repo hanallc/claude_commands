@@ -56,6 +56,8 @@ The fields are state, target, owner, session, claim ID, and reason.
 The owner uses `host:pid:start_time`.
 Absent fields use `-`.
 The command returns 0 for current, 1 for closed or unknown, and 2 for an unreachable service.
+A live service that answers slowly makes it wait, as the placement requests do. A missing socket or a refused connection returns 2 at once.
+The Mac cargo gate runs this check over ssh. A failed check refuses the call with the status and the last error line of the check.
 The check grants no permission and records no caller version.
 The status and replay paths share the same placement lifetime check.
 An ended local reservation or run returns closed even when its saved assignment still says current.
@@ -1124,6 +1126,7 @@ The hourly task can retry the exchange.
 
 **Holder files.** `BUILD_HOLD_DIR` defaults to `~/.local/state/build-hold/`.
 Each holder has one file with one JSON line: `{holder, since, for, release_eta, keep}`.
+`release_eta` stores the release instant; old `"unknown"` values remain readable.
 `keep` holds PID/start-time pairs and defaults to empty for old files.
 Installed scripts refuse directory overrides or a changed `HOME`.
 Unset the override or use a shell with the user's home.
@@ -1132,7 +1135,7 @@ Legacy free text remains readable.
 An unreadable or malformed regular file remains a hold.
 The types include `HolderIdentity(key, name)`, `HoldState = NoHolders | ActiveHolders`, and `Holder(name, since, purpose, release, key, keep)`.
 `ReleaseEta = KnownReleaseEta | UnknownReleaseEta` describes the release time.
-`ReleaseRequest = NoReleaseEta | ClockReleaseEta` describes the request.
+`ReleaseRequest = NoReleaseEta | ClockReleaseEta | DatedReleaseEta` describes the request.
 `write_hold` and `start_hold` take the resolved identity.
 Holder files supply state to status and Rust release checks.
 `natedev_holds(directory) -> NatedevHolds(in_force)` reads holder files once and never reads the cycle.
@@ -1140,7 +1143,7 @@ Every present holder file remains in force, including when the cycle has `releas
 There is no releasing state.
 Only removal ends the holder's hold.
 
-**Drain.** `build_hold.py drain --for '<why>'` keeps the natedev runs that work until they finish.
+**Drain.** `build_hold.py drain --for '<why>' --release-eta HH:MM --zone IANA` keeps the natedev runs that work until they finish.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
@@ -1159,7 +1162,7 @@ The enforcer and the admission service use this same keep list for descendants.
 The lineage reader uses process identity files without reading private environments or command lines.
 New natedev runs wait for explicit release.
 The command stops no process and adds no stored state field.
-It accepts `--keep`, `--release-eta`, and `--zone`, and refuses Mac and SSH targets.
+It accepts `--keep`, requires `--release-eta` and `--zone`, and refuses Mac and SSH targets.
 Each 60 seconds, it prints `draining: N runs remain`.
 Completion prints `drained; natedev stays held until release` and returns 0.
 Ctrl-C returns 130 and retains the hold.
@@ -1176,7 +1179,7 @@ The CI client that nixos pins (bbc8803f4) does not know `NatedevHeld`.
 GPU slot waits use the same shape with a `_gpu_slot` field.
 An existing CI reservation continues when the enforcer cannot stop its account.
 No process permission changes support these checks.
-**Clear.** `build_hold.py clear --for '<why>'` stops existing queued gates and running work outside the hold's allow rules.
+**Clear.** `build_hold.py clear --for '<why>' --release-eta HH:MM --zone IANA` stops existing queued gates and running work outside the hold's allow rules.
 It retains explicit keep entries and their children.
 The command leaves the target held until release.
 `clear` and `drain` accept an optional positional target before their options.
@@ -1276,6 +1279,16 @@ Without systemd-run or a user bus, it starts a detached process.
 `BUILD_HOLD_ENFORCER_DIR` holds the singleton lock.
 No paused record or thaw exists.
 `run` exits when no holder file remains.
+`release_overdue(release, now)` decides whether a known release time has passed.
+Status shows `release overdue since HH:MM <zone>` for that hold.
+The hold status and holder text add `, overdue` after the ETA.
+The enforcer sends one overdue message through `send_holder_message`, which also serves `tell_wait_holder`.
+The message names the purpose, release time, continued hold, and commands to release or set a later ETA.
+An accepted send writes an atomic marker under the enforcer's `overdue-notices/` folder.
+The marker identifies the holder, hold start, and release instant across restarts.
+Failed sends retry after at least 60 seconds and use `hold_sender_timeout_seconds` from `build_targets.conf`.
+When no hold remains, the enforcer removes the marker folder.
+The message never changes a hold file or releases a hold.
 `scan` reads state without changes and prints allowed, kept, or would stop, with the owner, reason, and pass time.
 Status and the hold-start audit print kept runs and `--keep <pid>` for runs that would stop.
 A read-only pass after release on 2026-10-28 took 0.585030 seconds over 1,736 processes.
@@ -1301,7 +1314,8 @@ Those workers may build.
 
 | Command | Behavior |
 | --- | --- |
-| `clear [target] [--holder N] --for TEXT [--keep PID]... [--release-eta HH:MM --zone IANA]` | Default natedev; ETA must be later today. Starts the enforcer, prints its notice, keep list and audit. Every test and build outside the allow rules stops, including runs already started; its session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
+| `clear [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Default natedev. A missing ETA returns exit 2 without changes. Use `HH:MM` for later today or `YYYY-MM-DDTHH:MM` for a later date. Starts the enforcer and prints its notice, keep list, and audit. Stops every test and build outside the allow rules. Each stopped session gets one release notice. Repeated holds add kept PID/start pairs and reset release fields. Other targets return exit 2 without changes. |
+| `drain [target] [--holder N] --for TEXT [--keep PID]... --release-eta HH:MM --zone IANA` | Requires the same future ETA as clear. Keeps existing work and holds new work until explicit release. |
 | `quiet [--max-wait 600]` | Waits for remaining builds; busy while any user's `cargo`, `rustc` or `cargo-nextest` run; counts each command by user (`your builds still running: 7 cargo, 5 rustc; ci-runner: 2 rustc`). Exit 1 when busy. Load does not delay it. Exit 0 prints `builds are quiet: no build runs. 1-minute load <load> is other work: <five heaviest processes>`, with user, command and current CPU percent over about one second, or `none visible`. Only success takes the CPU window: two reads of `/proc/<pid>/stat` user and system ticks divided by elapsed clock ticks; processes that end or use no CPU in the window are skipped. |
 | `wait` | Returns at once through the shared local hold check. Exit 0 permits a build only when no other session’s holder file exists. The sole holder may build. Exit 10 refuses and registers the session for release notice; exit 12 means unreadable state. Cycle release fields never grant permission. Start only on 0; after 10, wait for release and check again. |
 | `record-recipient --session-id --name` | Written by `top_level.py`. |

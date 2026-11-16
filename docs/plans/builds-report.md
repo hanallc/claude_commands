@@ -1891,13 +1891,28 @@ As built:
 - `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
 - Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
 
+#### Disks fold — top level first, a working slider, distinct slot bands
+
+From the user (via builds, 2026-11-16): "disks has issues - the top level should be what shows and the sub level should be dynamically expandable/contractable with useful icons (say from lucide) the slider filters do not seem to be working at all the slot titles should be a little more disticntive from the slot rows for each section"
+
+As built:
+
+- Slider cause: each input event rebuilt the whole card, slider included, so a drag stopped after one step. `driveView` now builds each drive card once and keeps it across new data; a slider step, a toggle or new data changes only the head, the slider ends, the value and the rows. `refill` keeps the focus on the same row. The Slots and Sessions cards are fixed elements too. One `onToggle` listener answers a click, Enter and space.
+- The drive cards start with only the top folders; each folder opens and closes at a click. The Slots card starts with one band per repository; a click opens the band and lists its slots.
+- Icons: the Lucide 0.468.0 `chevron-right` turns down on an open row; the `folder` icon marks a repository. Both are inline SVG in `disks.html`.
+- A repository band has an accent-tinted background, a bold name and the count and size; its slot rows are indented.
+- Tests: `test_disks_page` runs `driveView` on a fake document and checks one card write, the same slider after a step and new data, and the rows after a toggle and a slider step; it fails on the old page. The slot test checks the folded and open bands. Chrome check: a drag across the slider now ends at its far end; after new data the slider, the focused row and the open band stay.
+
 ### Tokens — The Builds page shows the jobserver tokens · status: done
 
 From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
 
 As built:
 
-- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- `memory_feed.token_pool` runs `stevie -a -t -j` (floor MiB, free, total) from the `stevie_program` path in `config/memory_feed.conf`; the feed service PATH does not hold the system programs folder. The pool is paused while the admission's MemAvailable is under the floor.
+- The memory bar legend starts collapsed; the page refresh keeps it open once the user opens it. It has no "How free is worked out" section: the Free tooltip explains free. The missing-readings fault shows under the RAM-disagree line.
+- Space toggles a pause on the Builds page. A paused page reads no data and does not reload; a "Paused" badge shows at the top, and tooltips still open. The console sends a space press outside a control to the open page as `console-space`, so the pause works before a click in the frame.
+- A queued step's tooltip shows Free as the page's Free row. When the step's own admission room differs, a "− Kept for other steps" or "+ Given back by other steps" line shows the difference, and Short by uses the step's room. A step that left to wait for the Cargo token says "Waits for: Cargo token".
 - The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
 - In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
