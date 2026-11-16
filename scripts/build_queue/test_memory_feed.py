@@ -416,7 +416,7 @@ class MemoryFeedTests(unittest.TestCase):
             page = memory_feed.reading()
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         html = self.expected_page()
-        functions = html[html.index("const TIPS ="):html.index("const tip =")]
+        functions = html[html.index("function field("):html.index("const tip =")]
         constants = html[html.index("const f1 ="):html.index("function setSeg(")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
         escape = html[html.index("function esc("):html.index("let lastRead =")]
@@ -480,10 +480,10 @@ process.stdout.write(JSON.stringify({
                     self.assertIn(f'<td class="unit"><span class="cell-text">{unit}</span></td>', cell)
                     self.assertIn(str(row["name"]), text)
                     if row.get("kind") == "cloud":
-                        self.assertIn("No local memory reservation.", text)
-                        self.assertIn(str(row.get("status") or row.get("reason")), text)
+                        self.assertNotIn("Uses  ", text)
+                        self.assertIn(str(row.get("activity")), text) if kind == "row" else self.assertIn("Waits for  AWS slot", text)
                         if kind == "row":
-                            self.assertIn(f"Target: {machine}.", text)
+                            self.assertIn("Runs on  AWS", text)
 
     def test_ci_memory_stays_in_the_taken_total_with_an_idle_or_running_job(self) -> None:
         cgroup = self.root / "ci"
@@ -1449,6 +1449,8 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(admission_client, "view", return_value=reading):
             after = memory_feed.reading()
         row, = after["waiters"]
+        self.assertEqual(row.get("kind"), "repository-slot")
+        self.assertEqual(cast(memory_feed.WaitRow, row)["why"], "build slot")
         self.assertEqual(row["reason"], "waits for a free widget slot (2 of 2 in use)")
         self.assertEqual(row["pid"], slot.owner.pid)
         self.assertEqual(row["since"], slot.since)
@@ -1472,6 +1474,9 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     payload = memory_feed.reading()
                 self.assertEqual(payload["priority_text"], expected)
+                entries = reading.explanation.priority
+                self.assertEqual(payload["unmatched_priority_entries"],
+                    list(entries.entries) if isinstance(entries, admission_records.QueuePriority) else [])
 
     def test_queued_priorities_follow_the_captured_order_and_clear_when_removed(self) -> None:
         base = reservation_reading()
@@ -1504,6 +1509,8 @@ process.stdout.write(JSON.stringify({
                 for row in (*page["walk"], *page["waiters"]):
                     expected = "queue priority: research (the user's bump)" if priority and row["unit"] == "research" else ""
                     self.assertEqual(row.get("priority_text", ""), expected)
+                    self.assertEqual([entry["unit"] for entry in row.get("priority_entries", [])],
+                                     ["research"] if expected else [])
                 self.assertEqual(page["unmatched_priority_text"],
                     "queue priority: research (the user's bump)" if priority and unit == "other" else "")
                 self.assertEqual([row for row in page["waiters"] if "head_room" in row], [])
@@ -1512,15 +1519,15 @@ process.stdout.write(JSON.stringify({
     def test_can_run_on_names_the_mac_only_when_its_routes_allow_the_step(self) -> None:
         for fit, expected in ((target_availability.Allowed("busy with nextest hana"), "natedev or Mac"),
                               (target_availability.NotAllowed("creates a Linux install"), "natedev only"),
-                              (target_availability.FitUnreadable("Mac state unreadable"), "natedev only (Mac state unknown)"),
+                              (target_availability.FitUnreadable("Mac state unreadable"), "natedev only"),
                               (target_availability.NoMacTarget(), "natedev only")):
             with self.subTest(fit=fit):
                 self.assertEqual(memory_feed.local_runs_on(fit).text(), expected)
 
     def test_can_run_on_names_a_route_that_limits_the_step_before_the_mac_routes(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
-        for route, expected in ((target_config.LOCAL_CALLER, "natedev only (the run asks for it)"),
-                                (target_config.WRITES_TREE, "natedev only (step writes the tree)"),
+        for route, expected in ((target_config.LOCAL_CALLER, "natedev only"),
+                                (target_config.WRITES_TREE, "natedev only"),
                                 (target_config.MAC_ONLY, "Mac only"),
                                 (target_config.PinnedTarget("mac"), "Mac only"),
                                 (target_config.PinnedTarget("natedev"), "natedev only")):
@@ -1536,14 +1543,15 @@ process.stdout.write(JSON.stringify({
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
         cases = (
-            (target_config.MAC_ONLY, "Mac only", True),
-            (target_config.PinnedTarget("mac"), "Mac only", True),
-            (target_config.PinnedTarget("natedev"), "natedev only", False),
-            (target_config.LOCAL_CALLER, "natedev only (the run asks for it)", False),
-            (target_config.WRITES_TREE, "natedev only (step writes the tree)", False),
-            (target_config.LocalRequired(reason), f"natedev only ({reason})", False),
+            (target_config.MAC_ONLY, "Mac only", True, "build hold by research (hana) until released"),
+            (target_config.PinnedTarget("mac"), "Mac only", True, "build hold by research (hana) until released"),
+            (target_config.PinnedTarget("natedev"), "natedev only", False, ""),
+            (target_config.LOCAL_CALLER, "natedev only", False, "requested by the caller"),
+            (target_config.WRITES_TREE, "natedev only", False, "edits the tree"),
+            (target_config.LocalRequired(reason), "natedev only", False,
+             "edits the merged checkout on natedev with mend and fmt, and the push goes from there"),
         )
-        for route, runs_on, mac_only in cases:
+        for route, runs_on, mac_only, because in cases:
             with self.subTest(route=route):
                 view, explanation = base.view, base.explanation
                 reading = replace(base, view=replace(view,
@@ -1559,6 +1567,7 @@ process.stdout.write(JSON.stringify({
                 running, = [row for row in page["walk"] if row.get("queued")]
                 waiting, = page["waiters"]
                 for row in (running, waiting):
+                    self.assertEqual(row.get("because"), because)
                     if mac_only:
                         self.assertEqual((row.get("runs_on"), row.get("mac_state")),
                                          ("Mac only", "build hold by research (hana) until released"))
@@ -1571,14 +1580,14 @@ process.stdout.write(JSON.stringify({
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
             self.assertEqual(memory_feed.target_notes(target_config.PinnedTarget("mac"), routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only", "targets": ["mac"], "mac_state": "busy with check cargo-handler",
+                             {"runs_on": "Mac only", "targets": ["mac"], "because": "busy with check cargo-handler", "mac_state": "busy with check cargo-handler",
                               "mac_text": ""})
             self.assertEqual(memory_feed.target_notes(target_config.LOCAL_CALLER, routes, "nextest", "/r", "p"),
-                             {"runs_on": "natedev only (the run asks for it)", "targets": ["natedev"],
+                             {"runs_on": "natedev only", "targets": ["natedev"], "because": "requested by the caller",
                               "mac_text": ""})
         with mock.patch.object(routes, "holds", return_value=""):
             self.assertEqual(memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/r", "p"),
-                             {"runs_on": "Mac only", "targets": ["mac"], "mac_text": "Mac: no block or claim recorded"})
+                             {"runs_on": "Mac only", "targets": ["mac"], "because": "", "mac_text": "Mac: no block or claim recorded"})
 
     def macroute_page(self, *, local_reason: str = "") -> memory_feed.MemoryPage:
         """Build three rows from their recorded placement routes."""
@@ -1624,9 +1633,9 @@ process.stdout.write(JSON.stringify({
                 with mock.patch.object(admission_client, "view", return_value=reading):
                     page = memory_feed.reading()
                 row, = page["waiters"]
-                expected = reason or admission_records.DIRECT_CARGO.reason
-                self.assertEqual(row.get("runs_on"), f"natedev only ({expected})")
+                self.assertEqual(row.get("runs_on"), "natedev only")
                 self.assertEqual(row.get("mac_text"), "")
+                self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
 
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
@@ -1635,45 +1644,54 @@ process.stdout.write(JSON.stringify({
             "",
             ""])
         self.assertEqual([row.get("runs_on") for row in page["waiters"]],
-                         ["natedev or Mac", "natedev only (step writes the tree)",
-                          "natedev only (a direct cargo command runs where it starts)"])
+                         ["natedev or Mac", "natedev only",
+                          "natedev only"])
 
     def test_head_room_rows_are_inside_the_queue_cap_and_add_up(self) -> None:
         gib = admission_records.GIB
         self.ram_fixture()
         tools = memory_feed.BuildToolRam(rust_analyzer=gib, sccache=0, other=0)
-        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 2 * gib, 8 * gib, 7 * gib, 17 * gib, (), agent_swap_demand=10 * gib)
+        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 2 * gib, 8 * gib, 7 * gib, 20 * gib, (),
+                                            ci_use=3 * gib, agent_swap_demand=10 * gib)
         ram = memory_feed.ram_blocks(room, tools, 100.0, 1)
         for ahead in (0, 2):
             with self.subTest(ahead=ahead):
                 check = admission_records.RoomCheck(16 * gib, (7 - ahead) * gib, False, basis=admission_records.DoesNotFit())
                 shown = memory_feed.head_room(check, room, ram)
                 rows = [(row["label"], row["gib"]) for row in shown["rows"]]
-                self.assertEqual(rows, [("Queue cap", 18.0), ("− Builds", 3.0), ("− Build reserved", 8.0),
-                                        *([("− Held for builds ahead in line", 2.0)] if ahead else []),
-                                        ("= Free for builds", 7.0 - ahead)])
-                self.assertEqual(rows[0][1] - sum(amount for _, amount in rows[1:-1]), rows[-1][1])
+                self.assertEqual(rows, [("Queue cap", 21.0), ("− Builds", 6.0), ("− Build reserved", 8.0),
+                                        *([("− Earlier waiters", float(ahead))] if ahead else []), ("= Head room" if ahead else "= Free", 7.0 - ahead)])
+                self.assertEqual(max(0, rows[0][1] - sum(amount for _, amount in rows[1:-1])), rows[-1][1])
                 self.assertEqual(rows[0][1], memory_feed.gib(ram["cap_bytes"]))
-                self.assertEqual((shown["unavailable"], shown["note"]), ("", memory_feed.BUILD_RESERVED_NOTE))
-        short = replace(room, available=16 * gib, signed_room=-5 * gib)
-        check = admission_records.RoomCheck(16 * gib, -5 * gib, False, basis=admission_records.DoesNotFit())
-        shown = memory_feed.head_room(check, short, memory_feed.ram_blocks(short, tools, 100.0, 1))
-        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
-                         [("Queue cap", 6.0), ("− Builds", 3.0), ("− Build reserved", 3.0), ("= Free for builds", 0.0)])
-        self.assertEqual(shown["note"], memory_feed.BUILD_RESERVED_NOTE)
+                self.assertEqual(shown["unavailable"], "")
+                self.assertNotIn("note", shown)
+        for available, build in ((16, 3), (8, 0), (2, 0)):
+            with self.subTest(available=available):
+                short = replace(room, available=available * gib, signed_room=(available - 21) * gib)
+                check = admission_records.RoomCheck(16 * gib, short.signed_room, False,
+                                                   basis=admission_records.DoesNotFit())
+                blocks = memory_feed.ram_blocks(short, tools, 100.0, 1)
+                shown = memory_feed.head_room(check, short, blocks)
+                self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
+                                 [("Queue cap", float(6 + build)), ("− Builds", 6.0), ("− Build reserved", float(build)),
+                                  ("= Free", 0.0)])
+                self.assertEqual(shown["rows"][0]["gib"] - sum(row["gib"] for row in shown["rows"][1:-1]),
+                                 shown["rows"][-1]["gib"])
+                self.assertEqual(shown["rows"][2]["gib"], memory_feed.gib(blocks["build_covered_bytes"]))
+                self.assertNotIn("note", shown)
         run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
         unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
         self.assertEqual((unavailable["unavailable"], unavailable["rows"]),
-                         ("Queue cap unavailable: memory use is unavailable for organon: no cgroup", []))
+                         ("memory use is unavailable for organon: no cgroup", []))
         unread = memory_feed.head_room(check, admission_records.ReadingUnavailable("meminfo is missing"), ram)
-        self.assertEqual((unread["unavailable"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
+        self.assertEqual((unread["unavailable"], unread["rows"]), ("meminfo is missing", []))
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB
         reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
         room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
-        expected_rows = [[("Queue cap", 28.0), ("− Builds", 1.0), ("− Build reserved", 9.0),
-                          ("− Held for builds ahead in line", 3.0), ("= Free for builds", 15.0)]]
+        expected_rows = [[("Queue cap", 28.0), ("− Builds", 1.0),
+                          ("− Build reserved", 9.0), ("− Earlier waiters", 3.0), ("= Head room", 15.0)]]
         states: tuple[tuple[Literal["admit", "hold"], admission_records.HeadCause], ...] = (
             ("admit", admission_records.NeedsMemory()), ("hold", admission_records.NeedsMemory()),
             ("hold", admission_records.StartSpacingWait(110)), ("hold", admission_records.GpuSlotWait(1, 1)))
@@ -1692,37 +1710,28 @@ process.stdout.write(JSON.stringify({
                 self.assertNotIn("admission_check", page)
                 first = page["waiters"][0]
                 self.assertEqual((first.get("place"), first.get("why")),
-                                 (1, "only 15.0 GiB is free for builds. It starts when 20.0 GiB is free."))
+                                 (1, "memory"))
 
     def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
         gib = admission_records.GIB
-        waiting = with_wait_reason(reservation_reading(), admission_records.NeedsMemory()).view.waiting
         decision = admission_records.AdmissionDecision("hold", 0, 0, 0, 0)
         cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
-            (admission_records.NeedsMemory(need=4 * gib, free=gib),
-             "only 1.0 GiB is free for builds. It starts when 4.0 GiB is free."),
-            (admission_records.BehindHead("first", 0, "fixture"), "it is behind the first build in line, which gets memory first."),
-            (admission_records.TokenWaitingWaiter(0), "another build runs in the same work folder. One build at a time can use a folder."),
-            (admission_records.StartSpacingWait(0), "the queue waits a short time between two starts. It starts after that time."),
-            (admission_records.MemoryPressure(1.0), "memory pressure is high. It starts when the pressure goes down."),
-            (admission_records.GpuSlotWait(1, 1), "1 of 1 GPU test slots are in use. It starts when a GPU test ends."),
-            (admission_records.EstimateExpired(0), "its memory estimate expired. The queue reads a new estimate before it starts."),
-            (admission_records.NatedevHeld("research", "a disk walk"), "natedev is held by research for a disk walk. It starts when the hold ends."),
-            (admission_records.ReadingUnavailable("meminfo is missing"),
-             "a memory reading is unavailable: meminfo is missing. It starts when the reading comes back."),
-            (admission_records.PressureUnavailable("PSI is missing"),
-             "a memory reading is unavailable: PSI is missing. It starts when the reading comes back."),
-            (admission_records.ReadyForAdmission(), "nothing. It starts at the next check."),
-            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.ReadyForAdmission()),
-             "the build at number 1 in line starts first."),
-            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.MemoryPressure(1.0)),
-             "memory pressure is high. It starts when the pressure goes down."))
+            (admission_records.NeedsMemory(need=4 * gib, free=gib), "memory"),
+            (admission_records.BehindHead("first", 0, "fixture"), "its turn"),
+            (admission_records.TokenWaitingWaiter(0), "its turn"),
+            (admission_records.StartSpacingWait(0), "its turn"),
+            (admission_records.MemoryPressure(1.0), "memory pressure"),
+            (admission_records.GpuSlotWait(1, 1), "GPU slot"),
+            (admission_records.EstimateExpired(0), "memory"),
+            (admission_records.NatedevHeld("research", "a disk walk"), "build hold"),
+            (admission_records.ReadingUnavailable("meminfo is missing"), "memory"),
+            (admission_records.PressureUnavailable("PSI is missing"), "memory"),
+            (admission_records.ReadyForAdmission(), "its turn"),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.ReadyForAdmission()), "its turn"),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.MemoryPressure(1.0)), "memory pressure"))
         for reason, expected in cases:
             with self.subTest(reason=type(reason).__name__):
-                self.assertEqual(memory_feed.wait_why(reason, waiting, None), expected)
-        check = admission_records.RoomCheck(6 * gib, -2 * gib, False, basis=admission_records.DoesNotFit())
-        self.assertEqual(memory_feed.wait_why(admission_records.NeedsMemory(), waiting, check),
-                         "only 0.0 GiB is free for builds. It starts when 6.0 GiB is free.")
+                self.assertEqual(memory_feed.wait_why(reason), expected)
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)
@@ -2063,6 +2072,17 @@ process.stdout.write(JSON.stringify({
         signed = available - 4 * gib - 6 * gib - 2 * gib
         return admission_records.MemoryRoom(available, 4 * gib, gib, 6 * gib, signed, gib + 2 * gib + available - 6 * gib,
                                             (), total=64 * gib, ci_use=2 * gib, agent_swap_demand=2 * gib)
+
+    def test_swap_share_tracks_the_configured_policy(self) -> None:
+        for share in (20, 65):
+            with self.subTest(share=share):
+                _ = write_config_fixture(self.root / "build_admission.conf", f"agent_swap_share_percent={share}\n")
+                policy = admission_records.read_memory_config(report=False).policy
+                reading = captured_reading()
+                reading = replace(reading, explanation=replace(reading.explanation, policy=policy))
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                self.assertEqual(page["swap"]["reserve_share_percent"], share)
 
     def test_ram_blocks_cover_the_reserves_in_order_and_divide_the_total(self) -> None:
         gib = admission_records.GIB
