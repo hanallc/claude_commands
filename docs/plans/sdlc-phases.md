@@ -410,7 +410,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Ruled out:** a nonzero exit on a hook failure (the landing is done; the rerun line is the remedy).
 
-### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: todo
+### Phase 41 — Each release step skips work that is done, and the GitHub release goes to the configured repository  · status: done
 **Depends on:** none
 
 #### Work Order
