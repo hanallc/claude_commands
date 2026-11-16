@@ -20,7 +20,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
 
@@ -553,6 +553,51 @@ def clear_cutoff_path(key: str, since: datetime) -> Path:
     return state_directory() / "clear-cutoffs" / f"{hold_id}.json"
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def overdue_notice_path(directory: Path, key: str, since: datetime, release: datetime) -> Path:
+    """Identify one notice by its holder, hold start, and release instant."""
+    hold_id = hashlib.sha256(json.dumps([key, since.isoformat(), release.isoformat()]).encode()).hexdigest()
+    return directory / "overdue-notices" / f"{hold_id}.json"
+
+
+def send_overdue_notices(
+    holders: Sequence[build_hold.Holder], directory: Path, retry_after: dict[Path, datetime], *,
+    sent: set[Path],
+    send: Callable[[str, str], build_hold.HolderMessageSent | build_hold.HolderMessageFailed],
+    clock: Callable[[], datetime],
+) -> None:
+    """Attempt at most one overdue notice per pass and retry failures after 60 seconds."""
+    now = clock()
+    for holder in holders:
+        release = holder.release
+        if not build_hold.release_overdue(release, now) or not isinstance(release, build_hold.KnownReleaseEta):
+            continue
+        path = overdue_notice_path(directory, holder.key, holder.since, release.at)
+        if path in sent or path.exists() or (path in retry_after and now < retry_after[path]):
+            continue
+        try:
+            text = (f"Your natedev hold for {holder.purpose} is overdue. "
+                    f"Its release time is {build_hold.release_eta_text(release)}. The hold stays in force. "
+                    "Use /build:hold release, or a new clear or drain with a later --release-eta.")
+            result = send(holder.key, text)
+        except Exception as error:
+            result = build_hold.HolderMessageFailed(str(error))
+        if isinstance(result, build_hold.HolderMessageFailed):
+            retry_after[path] = clock() + timedelta(seconds=60)
+            line = " ".join(f"build_hold: could not tell {holder.name}: {result.reason}".splitlines())
+            print(line, file=sys.stderr, flush=True)
+            return
+        sent.add(path)
+        try:
+            write_text_atomic(path, json.dumps({"sent_at": now.isoformat()}) + "\n")
+        except OSError as error:
+            print(f"build_hold: could not save overdue notice: {error}", file=sys.stderr, flush=True)
+        return
+
+
 def record_clear_cutoff(identity: build_hold.HolderIdentity, since: datetime) -> None:
     """Save the boot-relative cutoff before publishing the clear hold."""
     before = time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK") // 1_000_000_000
@@ -973,6 +1018,8 @@ def run(
     uid: int, enforcer_pid: int,
     stopper: StopBuildsAndTests, sleep: Callable[[float], None] = time.sleep,
     cgroup_root: Path = build_hold.SYSTEM_CGROUP_ROOT,
+    send: Callable[[str, str], build_hold.HolderMessageSent | build_hold.HolderMessageFailed] = build_hold.send_holder_message,
+    clock: Callable[[], datetime] = utc_now,
 ) -> int:
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "run.lock").open("a+") as lock:
@@ -982,10 +1029,14 @@ def run(
             return 0
         claims_unreadable = False
         cleared: set[build_hold.ProcessIdentity] = set()
+        retry_after: dict[Path, datetime] = {}
+        sent: set[Path] = set()
         while True:
             holders = build_hold.natedev_holds(holder_directory).in_force
             if not holders:
+                shutil.rmtree(directory / "overdue-notices", ignore_errors=True)
                 return 0
+            send_overdue_notices(holders, directory, retry_after, sent=sent, send=send, clock=clock)
             processes = read_processes(proc_root, uid, cgroup_root)
             claims = claimed_processes(proc_root)
             if isinstance(claims, build_hold.ClaimsUnreadable):
@@ -1007,6 +1058,7 @@ def run(
                     # Recheck the holder set in case a release or another hold followed the table read.
                     current_holders = build_hold.natedev_holds(holder_directory).in_force
                     if not current_holders:
+                        shutil.rmtree(directory / "overdue-notices", ignore_errors=True)
                         return 0
                     current = decision if current_holders == holders else next(
                         item for item in decide_builds(processes, current_holders, uid, enforcer_pid, claimed)
