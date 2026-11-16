@@ -4,15 +4,17 @@ from __future__ import annotations
 import fcntl
 import io
 import os
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import override
 import unittest
 
 from scripts.lint import gate_folders_delete
+from scripts.lint.sweep import gib
 from scripts.lib import scratch
 
 
@@ -71,10 +73,10 @@ class GateFoldersDeleteTests(unittest.TestCase):
         (self.gates / "reload").mkdir()
         size = len(b"generated output") + len(b'{"fixture": true}\n')
         lines = self.delete()
-        self.assertIn(f"deleted {gate}: {size} bytes", lines)
-        self.assertIn(f"deleted {gate.parent}: 0 bytes", lines)
-        self.assertIn(f"deleted {self.gates / 'checkout'}: 0 bytes", lines)
-        self.assertIn(f"deleted {self.gates / 'reload'}: 0 bytes", lines)
+        self.assertIn(f"deleted {gate}: {gib(size)}", lines)
+        self.assertIn(f"deleted {gate.parent}: {gib(0)}", lines)
+        self.assertIn(f"deleted {self.gates / 'checkout'}: {gib(0)}", lines)
+        self.assertIn(f"deleted {self.gates / 'reload'}: {gib(0)}", lines)
         self.assertEqual(list(self.gates.iterdir()), [])
 
     @unittest.skipIf(os.geteuid() == 0, "Root can remove folders despite the fixture's read-only permissions.")
@@ -169,8 +171,32 @@ class GateFoldersDeleteTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(self.git(source, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
         self.assertTrue(any(line.startswith(f"would delete {gate}: ") for line in lines))
-        self.assertIn(f"would delete {empty}: 0 bytes", lines)
+        self.assertIn(f"would delete {empty}: {gib(0)}", lines)
         self.assertEqual((checkout / "source.txt").read_text(), "edited source\n")
+
+    def test_main_exit_status_reports_gate_errors(self) -> None:
+        for case, expected_status in (("free", 0), ("busy", 0), ("rescue-failure", 1)):
+            with self.subTest(case=case), ExitStack() as contexts:
+                gate = self.gate(case)
+                if case == "busy":
+                    busy = contexts.enter_context((gate / scratch.BUSY).open("w"))
+                    fcntl.flock(busy, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                elif case == "rescue-failure":
+                    source = self.linked_checkout(gate)[0]
+                    shutil.rmtree(source)
+                result = subprocess.run(
+                    [sys.executable, gate_folders_delete.__file__, "--root", str(self.gates)],
+                    capture_output=True, text=True, check=False, timeout=20)
+                self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
+                if case == "free":
+                    size = len(b"generated output") + len(b'{"fixture": true}\n')
+                    self.assertIn(f"deleted {gate}: {gib(size)}", result.stdout.splitlines())
+                elif case == "busy":
+                    self.assertIn(f"kept {gate}: busy", result.stdout.splitlines())
+                    self.assertEqual((gate / "target" / "output").read_bytes(), b"generated output")
+                else:
+                    self.assertIn(f"kept {gate}: rescue failed: ", result.stdout)
+                    self.assertEqual((gate / "checkout" / "source.txt").read_text(), "edited source\n")
 
     def test_remote_mirrors_dot_folders_and_root_files_are_kept(self) -> None:
         entries = {".remote-mirrors": "mirror record", ".claude": "private state", ".other": "other state"}

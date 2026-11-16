@@ -17,8 +17,10 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 
 from scripts.lib import git_files, git_rescue, scratch
+from scripts.lint.sweep import gib
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,7 @@ FolderDecision = (Deleted | WouldDelete | KeptBusy | KeptRepository | KeptRescue
 def decision_line(decision: FolderDecision) -> str:
     if isinstance(decision, (Deleted, WouldDelete)):
         action = "deleted" if isinstance(decision, Deleted) else "would delete"
-        line = f"{action} {decision.path}: {decision.size} bytes"
+        line = f"{action} {decision.path}: {gib(decision.size)}"
         if isinstance(decision, DeletedWithPruneFailures):
             for failure in decision.failures:
                 error = "; ".join(failure.error.splitlines())
@@ -223,12 +225,18 @@ class GateFolderArguments(argparse.Namespace):
     dry_run: bool = False
 
 
+def exit_status(decisions: tuple[FolderDecision, ...]) -> int:
+    return int(any(isinstance(decision, (KeptRescueFailure, KeptFilesystemError, DeletedWithPruneFailures))
+                   for decision in decisions))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--root", required=True, type=Path)
     _ = parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args(namespace=GateFolderArguments())
-    _ = delete_gate_folders(arguments.root, arguments.dry_run)
+    decisions = delete_gate_folders(arguments.root, arguments.dry_run)
+    sys.exit(exit_status(decisions))
 
 
 if __name__ == "__main__":
