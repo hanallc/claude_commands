@@ -58,6 +58,16 @@ td.path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.8
 .tree td:first-child { white-space: normal; overflow-wrap: anywhere; }
 td.dim, .dim { color: var(--ink-3); }
 tbody tr:hover td { background: var(--hover); }
+.slots col.size { width: 80px; } .slots col.used { width: 120px; }
+.slots td:first-child, .slots td.use { white-space: normal; overflow-wrap: break-word; }
+.slots .tag { white-space: nowrap; }
+.slots .narrow { display: none; margin-top: 2px; font-family: system-ui, sans-serif; }
+.slots tr.group th { padding-top: 14px; color: var(--ink); white-space: normal; }
+.slots tr.group th span { color: var(--ink-3); font-weight: 400; margin-left: 8px; }
+.slots tr.group:hover th { background: none; }
+.tag { display: inline-block; padding: 0 7px; border-radius: 9px; font-size: 0.76rem; line-height: 18px; border: 1px solid var(--line); color: var(--ink-2); margin-right: 6px; }
+.tag.run { border-color: transparent; background: color-mix(in srgb, var(--room) 22%, transparent); color: var(--ink); }
+.tag.go { border-color: color-mix(in srgb, var(--floor) 60%, transparent); color: var(--floor); }
 .tree col.place { width: 50%; } .tree col.size { width: 78px; } .tree col.pct { width: 84px; }
 .tree tr[aria-expanded] > td { cursor: pointer; }
 .tree tr[aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -73,6 +83,11 @@ tbody tr:hover td { background: var(--hover); }
   .card { padding: 14px 12px 10px; }
   .tree col.place { width: auto; } .tree col.size { width: 64px; } .tree col.pct { width: 0; } .tree col.walk { width: 64px; }
   .tree .pct { display: none; }
+  /* On a phone the holder goes under the slot name, so each column keeps its width. */
+  .slots col.used { width: 96px; } .slots col.use { width: 0; }
+  .slots td:nth-child(3) { white-space: normal; }
+  .slots .wide { display: none; }
+  .slots .narrow { display: block; }
 }
 </style>
 </head>
@@ -81,6 +96,7 @@ tbody tr:hover td { background: var(--hover); }
   <h1 class="page-title">Disks</h1>
   <div class="status"><span class="dot" id="dot" hidden></span><span id="status">Reading the sizes…</span></div>
   <div class="grid" id="drives"></div>
+  <div class="grid" id="cards"></div>
 </main>
 <script id="disks-settings" type="application/json">__DISKS_SETTINGS__</script>
 <script>
@@ -191,11 +207,44 @@ function esc(text) {
   return String(text).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 }
 
+// The Slots card: each repository's slots with size, last use and holder. A slot below the measure's
+// least folder shows as below it; a slot on no measured drive shows no size.
+function slotsHtml(report, keepBytes, now) {
+  const slotSize = bytes => bytes == null ? "—" : keepBytes && bytes < keepBytes ? `&lt; ${size(keepBytes)}` : size(bytes);
+  const total = rows => rows.some(row => row.size != null) ? rows.reduce((sum, row) => sum + (row.size || 0), 0) : null;
+  const lastUsed = row => row.used_by ? "now" : row.last_used == null ? "—" : age(Math.max(0, now - row.last_used));
+  const usedBy = row => {
+    if (row.used_by) {
+      const who = row.used_by.showrunner ? `${row.used_by.unit} (${row.used_by.showrunner})` : row.used_by.unit;
+      return (row.used_by.purpose ? `<span class="tag run">${esc(row.used_by.purpose)}</span>` : "")
+        + `<span class="dim">${esc(who)}</span>`;
+    }
+    return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
+  };
+  const slotRow = row => {
+    const use = usedBy(row);
+    return `<tr><td class="path">${esc(row.name)}${use ? `<div class="narrow">${use}</div>` : ""}</td>`
+      + `<td class="n">${slotSize(row.size)}</td><td>${lastUsed(row)}</td>`
+      + (use ? `<td class="use wide">${use}</td>` : '<td class="dim wide">—</td>') + "</tr>";
+  };
+  const groups = report.groups.map(group => {
+    const count = group.maximum ? `${group.slots.length} of ${group.maximum} slots`
+      : `${group.slots.length} slot${group.slots.length === 1 ? "" : "s"}`;
+    return `<tr class="group"><th colspan="4">${esc(group.repository)}<span>${count} · ${slotSize(total(group.slots))}</span></th></tr>`
+      + group.slots.map(slotRow).join("");
+  }).join("");
+  const body = groups ? `<table class="slots"><colgroup><col><col class="size"><col class="used"><col class="use"></colgroup>`
+    + `<thead><tr><th>Slot</th><th class="n">Size</th><th>Last used</th><th class="wide">Used by</th></tr></thead><tbody>${groups}</tbody></table>`
+    : '<p class="problem">No slots yet.</p>';
+  return `<h2>Slots<span class="path">${esc(report.root)}</span></h2>${body}`;
+}
+
 const settings = JSON.parse(document.getElementById("disks-settings").textContent);
 const DATA_FILE = "disks.json";
 const MEASURE = "measure";
 const states = new Map();
 let data = null;
+let slotReport = null;
 let measuring = null;
 let problem = "";
 
@@ -280,6 +329,16 @@ function renderStatus() {
     statusText(data ? data.measured_at : null, now, Boolean(measuring), problem, settings.cache_seconds);
 }
 
+function renderCards() {
+  const cards = document.getElementById("cards");
+  cards.replaceChildren();
+  if (!slotReport) return;
+  const card = document.createElement("section");
+  card.className = "card";
+  card.innerHTML = slotsHtml(slotReport, data ? data.keep_bytes : 0, Date.now() / 1000);
+  cards.append(card);
+}
+
 function render() {
   const grid = document.getElementById("drives");
   grid.replaceChildren();
@@ -289,6 +348,7 @@ function render() {
     grid.append(card);
     renderDrive(card, drive);
   }
+  renderCards();
   renderStatus();
 }
 
@@ -301,17 +361,24 @@ async function readData() {
 
 function show(next) {
   data = next;
-  if (data) render(); else renderStatus();
+  if (data) render(); else { renderCards(); renderStatus(); }
 }
 
-// Ask the server for a measure. The page keeps the old sizes and reads the data file again until it changes.
+// Ask the server for a measure and the slots' current use. The server starts a measure only when the sizes
+// are old. The page keeps the old sizes and reads the data file again until it changes.
 async function askMeasure() {
   try {
     const response = await fetch(MEASURE, {method: "POST", body: "",
                                            headers: {"Content-Type": "application/x-www-form-urlencoded"}});
     const answer = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(answer.reason || `the server answered ${response.status}`);
-    if (answer.state === "current") { show(await readData()); return; }
+    slotReport = answer.slots || null;
+    if (answer.state === "current") {
+      // The page's sizes are old only when another measure finished since the page read them.
+      show(!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds ? await readData() : data);
+      return;
+    }
+    renderCards();
     measuring = {since: Date.now() / 1000, before: data ? data.measured_at : null};
     setTimeout(poll, settings.poll_seconds * 1000);
   } catch (error) {
@@ -323,7 +390,13 @@ async function askMeasure() {
 async function poll() {
   try {
     const next = await readData();
-    if (next && next.measured_at !== measuring.before) { measuring = null; show(next); return; }
+    if (next && next.measured_at !== measuring.before) {
+      // A new measure gives new slot sizes, so the page asks once more; the server answers "current".
+      measuring = null;
+      show(next);
+      await askMeasure();
+      return;
+    }
   } catch (error) {
     // A failed read leaves the measure running; the next read tries again.
   }
@@ -344,7 +417,7 @@ async function start() {
     return;
   }
   show(data);
-  if (!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds) await askMeasure();
+  await askMeasure();
 }
 
 start();

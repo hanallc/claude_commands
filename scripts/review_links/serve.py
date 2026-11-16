@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import threading
+from collections.abc import Mapping
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -31,7 +32,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
-from scripts.disks import disks_page
+from scripts.disks import disks_page, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images
@@ -611,19 +612,25 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return False
 
     def disks_measure_post(self) -> None:
-        """Start a Disks page measure in the background and answer at once."""
+        """Start a Disks page measure in the background and answer at once with the slots' current use."""
+        now = time.time()
         try:
-            started = disks_page.start_measure(time.time())
+            started = disks_page.start_measure(now)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
-        self.json_response(200, {"state": started.value})
+        try:
+            report = slots.slot_report(now)
+        except (OSError, ValueError) as error:
+            print(f"review-links disks slots: {error}", file=sys.stderr)
+            report = None
+        self.json_response(200, {"state": started.value, "slots": report})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
         self.json_response(status, {"reason": reason})
 
-    def json_response(self, status: int, fields: dict[str, str] | dict[str, list[str]]) -> None:
+    def json_response(self, status: int, fields: Mapping[str, object]) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

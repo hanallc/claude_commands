@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -87,6 +89,36 @@ class DisksPageTests(unittest.TestCase):
             "Measuring the drives. The first measure takes some minutes.", "No sizes yet.", "The measure did not finish.",
             "2 minutes ago. The page measures again when you open it and the sizes are more than 10 minutes old.",
             "2 minutes ago. Measuring… The measure did not finish."])
+
+    def test_publish_writes_the_page_only_when_its_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS)
+            os.utime(page, (0, 0))
+            _ = disks_page.publish(Path(directory), SETTINGS)
+            self.assertEqual(page.stat().st_mtime, 0)
+            _ = disks_page.publish(Path(directory), {**SETTINGS, "poll_seconds": 6})
+            self.assertNotEqual(page.stat().st_mtime, 0)
+
+    def test_the_slots_card_shows_each_group_and_each_slot_with_its_use(self) -> None:
+        now = 1000 * 86400
+        report = {"root": "/build/slot", "groups": [
+            {"repository": "hana", "maximum": 8, "slots": [
+                {"name": "hana-slot1", "number": 1, "size": 70 * GIB, "last_used": now, "deleted_tonight": False,
+                 "used_by": {"purpose": "fps", "unit": "report", "showrunner": "builds"}},
+                {"name": "hana-slot2", "number": 2, "size": 0, "last_used": now - 9 * 86400, "used_by": None,
+                 "deleted_tonight": True}]},
+            {"repository": "<b>", "maximum": None, "slots": [
+                {"name": "x-slot1", "number": 1, "size": None, "last_used": None, "used_by": None, "deleted_tonight": False}]}]}
+        html = cast(str, self.run_page(f"slotsHtml({json.dumps(report)}, {KEEP}, {now})"))
+        rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
+        cells = ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
+        self.assertEqual(cells, ["hana|2 of 8 slots · 70 GiB", "hana-slot1|70 GiB|now|fps|report (builds)",
+                                 "hana-slot2|&lt; 256 MiB|9 days ago|deleted tonight", "&lt;b&gt;|1 slot · —",
+                                 "x-slot1|—|—|—"])
+        self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
+            '<span class="tag run">fps</span><span class="dim">report (builds)</span>', '<span class="tag go">deleted tonight</span>'])
+        empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now})"))
+        self.assertIn("No slots yet.", empty)
 
     def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
         launches: list[str] = []

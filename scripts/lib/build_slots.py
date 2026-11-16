@@ -25,6 +25,10 @@ from scripts.copies.copies import main_checkout
 from scripts.lib import build_folders, conf, git_files, git_rescue
 
 
+SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
+LEASE_SUFFIX = ".lease.json"
+
+
 @dataclass(frozen=True)
 class Slot:
     path: Path
@@ -83,17 +87,45 @@ def slot_root(values: Mapping[str, str], machine: str) -> str:
     return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
 
 
-def _slot_root(settings: conf.ConfigRead, machine: str) -> Path:
+def slot_folder_root(settings: conf.ConfigRead, machine: str) -> Path:
+    """The machine's slot root as a path. Raise SlotsNotConfigured when the config names none."""
     root = slot_root(settings.values(), machine)
     if not root:
         raise SlotsNotConfigured(machine)
     return Path(os.path.expandvars(root)).expanduser().resolve()
 
 
+def slot_cargo_root(settings: conf.ConfigRead) -> Path:
+    """The folder that holds each slot's build output, named as the slot."""
+    return _root(settings, "roots.slot_cargo")
+
+
+def lease_path(path: Path) -> Path:
+    return path.with_name(path.name + LEASE_SUFFIX)
+
+
+def slot_paths(root: Path) -> list[tuple[Path, str, int]]:
+    """Each slot under root, from its folder or its lease record: the path, the repository and the number."""
+    names = {entry.name.removesuffix(LEASE_SUFFIX) for entry in root.iterdir()}
+    return [(root / name, match[1], int(match[2])) for name in sorted(names)
+            if (match := SLOT_NAME.fullmatch(name)) is not None]
+
+
+def unused(last_use: datetime, settings: conf.ConfigRead, now: datetime) -> bool:
+    """The nightly sweep deletes a free slot whose last use is older than slots.unused_days."""
+    return last_use < now - timedelta(days=settings.whole("slots.unused_days"))
+
+
+def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
+    """The repository's slot limit on the machine, else the machine's default limit."""
+    key = f"slots.{machine}.{repository}.max"
+    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
+
+
 def _pool(source: Path) -> RepositoryPool:
     settings = conf.read_or_repository("build_folders")
     machine = host_name()
-    root = _slot_root(settings, machine)
+    root = slot_folder_root(settings, machine)
     main = main_checkout(source)
     origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
                             capture_output=True, text=True)
@@ -101,15 +133,15 @@ def _pool(source: Path) -> RepositoryPool:
         origin.check_returncode()
     repository = (origin.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
                   if origin.returncode == 0 else main.name)
-    return RepositoryPool(main, repository, machine, root, _root(settings, "roots.slot_cargo"))
+    return RepositoryPool(main, repository, machine, root, slot_cargo_root(settings))
 
 
 def _maximum(pool: RepositoryPool) -> int:
     settings = conf.read_or_repository("build_folders")
     key = f"slots.{pool.machine}.{pool.repository}.max"
+    maximum = configured_maximum(settings, pool.machine, pool.repository)
     if key in settings.values():
-        return settings.whole(key)
-    maximum = settings.whole(f"slots.{pool.machine}.default_max")
+        return maximum
     print(f"slots: {pool.repository} on {pool.machine} has no maximum of its own; it uses {maximum}. "
           + f"Set {key} with /tune.")
     return maximum
@@ -165,33 +197,27 @@ def sweep_slots() -> None:
     machine = host_name()
     settings = conf.read_or_repository("build_folders")
     try:
-        root = _slot_root(settings, machine)
+        root = slot_folder_root(settings, machine)
     except SlotsNotConfigured:
         return
-    cargo_root = _root(settings, "roots.slot_cargo")
+    cargo_root = slot_cargo_root(settings)
     if not root.exists():
         return
-    paths = {entry.with_name(entry.name.removesuffix(".lease.json")) for entry in root.iterdir()
-             if re.fullmatch(r".+-slot[1-9][0-9]*(?:\.lease\.json)?", entry.name)}
-    for path in sorted(paths):
-        match = re.fullmatch(r"(.+)-slot([1-9][0-9]*)", path.name)
-        if match is None:
-            continue
+    for path, repository, _ in slot_paths(root):
         with build_folders.collector_lease(path, wait=False) as free:
             if not free:
                 continue
             settings = conf.read_or_repository("build_folders")
-            lease_path = path.with_name(path.name + ".lease.json")
+            record_path = lease_path(path)
             cargo = cargo_root / path.name
             if not path.exists():
                 if cargo.exists():
                     shutil.rmtree(cargo)
-                lease_path.unlink()
+                record_path.unlink()
                 continue
-            lease = cast(dict[str, object], json.loads(lease_path.read_text()))
+            lease = cast(dict[str, object], json.loads(record_path.read_text()))
             last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
-            cutoff = datetime.now(timezone.utc) - timedelta(days=settings.whole("slots.unused_days"))
-            if last_use < cutoff:
+            if unused(last_use, settings, datetime.now(timezone.utc)):
                 try:
                     _rescue(path)
                 except git_rescue.RescueError as error:
@@ -202,9 +228,9 @@ def sweep_slots() -> None:
                 _ = _git(main_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
                 if cargo.exists():
                     shutil.rmtree(cargo)
-                lease_path.unlink()
+                record_path.unlink()
                 continue
-            key = f"slots.{machine}.{match[1]}.max_bytes"
+            key = f"slots.{machine}.{repository}.max_bytes"
             if key in settings.values():
                 limit = settings.whole(key)
                 size = _size(path) + _size(cargo)

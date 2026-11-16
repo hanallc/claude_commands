@@ -1671,7 +1671,7 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
 
-### Phases 95–99 — The Disks page · status: in progress (95, 96 and 97 done)
+### Phases 95–99 — The Disks page · status: in progress (95 to 98 done)
 
 From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
 1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
@@ -1768,6 +1768,23 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 3. Used by comes from `build_folders.build_folder_state` and the lease record: showrunner, unit and purpose. A free slot shows "—".
 4. "deleted tonight" shows when the last use is older than the nightly delete's day count, read from config. With no such key, the tag does not show.
 5. The slot sizes come from the same measure as the drive cards.
+
+##### Phase 98 as-built
+
+- `scripts/disks/slots.py`:
+  - `slot_report` reads the slot root and the cargo root through `build_slots` (`slot_folder_root`, `slot_cargo_root`). With no slot root it returns nothing, and the page shows no card.
+  - `read_slots` finds the slots with `build_slots.slot_paths`, as the nightly sweep does. It groups the slots by repository, with the maximum from `build_slots.configured_maximum`.
+  - Size: the checkout plus `<slot_cargo>/<name>`, from the last measure's trees (`tree_size`). A folder that the measure does not list is below `measure.keep_bytes`. A path on no measured drive has no size.
+  - Used by: `build_folders.build_folder_state` gives held or free. A held slot shows the lease's purpose, unit and showrunner, and "now" as its last use.
+  - "deleted tonight": a free slot that `build_slots.unused` names, the same rule the sweep in the nightly merge gate uses.
+- `scripts/lib/build_slots.py` (queue's file, by builds' finding): the public readers `slot_folder_root`, `slot_cargo_root`, `lease_path`, `slot_paths`, `unused` and `configured_maximum`. The pool and the sweep use them.
+- `scripts/review_links/serve.py`: the measure answer adds `slots`, read at each POST, so the holders are current. `json_response` takes any JSON mapping.
+- `scripts/disks/disks.html`:
+  - The page now posts on each open; the server starts a measure only when the sizes are old.
+  - After a measure, the page posts once more for the new slot sizes.
+  - The Slots card follows mockup 2: a group row for each repository ("N of M slots · size"), then Slot, Size, Last used and Used by. On a phone, the holder goes under the slot name.
+- `disks_page.publish` writes the page only when its content changes (admin-console's note on phase 97).
+- Tests: `scripts/disks/test_slots.py` (sizes from the trees, groups, use, the nightly delete, no root), the card HTML, the publish, the serve answer. Chrome check with fixture slots: no cut text and no page wider than the window at 1400, 800, 390 and 360 px, light and dark.
 
 #### Phase 99 — Sessions card
 
