@@ -904,6 +904,92 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     self.assertEqual(probe.call_count, 1)
                     self.assertIsInstance(eligibility.read_backoff(time.time(), "linux"), eligibility.ActiveBackoff)
 
+    def test_execution_probe_script_failures_do_not_start_reach_backoff(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+        from scripts.build_targets import build_targets, target_config
+        from scripts.mac_test import claim_state, eligibility, mac_test, offload
+
+        for outcome in ("script", "unreachable", "timeout", "success"):
+            with self.subTest(outcome=outcome), AdmissionFixture() as fixture:
+                settings = fixture.root / "linux.conf"
+                _ = write_config_fixture(settings, "probe_timeout_s=1\nunreachable_backoff_s=30\n", template="mac_test")
+                target = target_config.SshTarget("linux", "linux", settings)
+                request = placement_request(fixture)
+                destination = replace(request.constraints.candidates[0].destination,
+                                      provider="ssh", target="linux", host="private-linux")
+                request = replace(request, constraints=replace(request.constraints, candidates=(
+                    placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings)),)))
+                paths = claim_state.StatePaths(fixture.root / "claims")
+                record: claim_state.RemoteJobClaim = {"claim_id": "retained", "episode": "old", "attempt": "old-attempt",
+                    "submitting_session": "", "pid": request.owner.pid, "proc_start": request.owner.start_time,
+                    "remote_host": destination.host, "what": "busy claim", "worktree": str(fixture.root), "since": "private"}
+                held = claim_state.HeldClaim(destination.scope, paths.run, record)
+                binaries = fixture.root / "bin"
+                binaries.mkdir()
+                calls = fixture.root / "ssh-calls"
+                stub = binaries / "ssh"
+                body = (f"#!{sys.executable}\nfrom pathlib import Path\nimport select, sys\n"
+                        f"with Path({str(calls)!r}).open('a') as calls:\n    _ = calls.write('probe\\n')\n")
+                if outcome == "timeout":
+                    body += "_ = select.select([], [], [])\n"
+                elif outcome == "success":
+                    body += "print('123\\tprivate start')\n"
+                else:
+                    code = 1 if outcome == "script" else 255
+                    body += f"print('private failure\\nsecond detail', file=sys.stderr)\nsys.exit({code})\n"
+                _ = stub.write_text(body)
+                stub.chmod(0o700)
+                journal = io.StringIO()
+                with mock.patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}), \
+                     mock.patch.object(target_config, "read_targets", return_value=(target,)), \
+                     mock.patch.object(build_targets, "ssh_target_eligibility", return_value=target_config.ExcludedTarget(target, "busy")), \
+                     mock.patch.object(claim_state, "state_paths", return_value=paths), \
+                     mock.patch.object(claim_state, "read_claims", return_value=(held,)), \
+                     mock.patch.object(claim_state, "target_claim_scope", return_value=destination.scope), \
+                     mock.patch.object(mac_test, "run_is_live", return_value=False), \
+                     mock.patch.object(eligibility, "repository_identity", return_value=eligibility.KnownRepository("hana")), \
+                     mock.patch.object(offload, "write_backoff", wraps=offload.write_backoff) as backoff, \
+                     redirect_stderr(journal):
+                    key = fixture.server.host_evidence_key(request, destination)
+                    fixture.server.host_requests[key] = request
+                    first = fixture.server.read_provider_evidence(key)
+                    first_journal = journal.getvalue().splitlines()
+                    second = fixture.server.read_provider_evidence(key)
+                    active = eligibility.read_backoff(time.time(), "linux")
+                assert isinstance(first, placement.FreshHostEvidence)
+                assert isinstance(second, placement.FreshHostEvidence)
+                self.assertEqual(second.claims[0].reference.claim_id, "retained")
+                evidence = first.executions[0][1]
+                if outcome == "success":
+                    self.assertIsInstance(evidence, placement.ObservedExecution)
+                    self.assertEqual(first_journal, [])
+                    self.assertEqual(journal.getvalue(), "")
+                else:
+                    assert isinstance(evidence, placement.ExecutionEvidenceUnavailable)
+                    self.assertEqual(len(first_journal), 1)
+                    self.assertIn(destination.target, first_journal[0])
+                    self.assertIn(evidence.reason, first_journal[0])
+                    self.assertNotIn("second detail", journal.getvalue())
+                    if outcome == "timeout":
+                        self.assertIn("timed out", first_journal[0])
+                    else:
+                        code = 1 if outcome == "script" else 255
+                        self.assertIn(f"exit {code}: private failure", first_journal[0])
+                if outcome in ("unreachable", "timeout"):
+                    self.assertIn("reach failure", first_journal[0])
+                    self.assertIsInstance(active, eligibility.ActiveBackoff)
+                    backoff.assert_called_once()
+                    self.assertEqual(journal.getvalue().splitlines(), first_journal)
+                    self.assertEqual(calls.read_text().splitlines(), ["probe"])
+                    self.assertIsInstance(second.executions[0][1], placement.ExecutionEvidenceUnavailable)
+                else:
+                    if outcome == "script":
+                        self.assertIn("script failure", first_journal[0])
+                        self.assertEqual(journal.getvalue().splitlines(), first_journal * 2)
+                    self.assertNotIsInstance(active, eligibility.ActiveBackoff)
+                    backoff.assert_not_called()
+                    self.assertEqual(calls.read_text().splitlines(), ["probe", "probe"])
+
     def test_a_busy_mac_is_a_busy_exclusion_and_a_free_mac_is_allowed(self) -> None:
         from scripts.build_queue import placement
         from scripts.build_queue.test_placement import placement_request

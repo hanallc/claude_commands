@@ -2783,15 +2783,25 @@ done
             result = subprocess.run(["ssh", *offload.ssh_options(config.connection), host, "sh -c " + shlex.quote(script)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 check=False, timeout=config.probe_timeout_s)
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    pid, separator, start = line.partition("\t")
-                    if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
-                        return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
-            else:
-                offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as error:
+            reason = "remote execution reach failure: " + str(error).partition("\n")[0]
+            print(f"memory admission: {destination.target}: {reason}", file=sys.stderr, flush=True)
             offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+            return placement.ExecutionEvidenceUnavailable(reason, self.clock.now())
+        if result.returncode != 0:
+            failure = "reach" if result.returncode == 255 else "script"
+            detail = result.stderr.splitlines()
+            reason = f"remote execution {failure} failure: ssh exit {result.returncode}"
+            if detail:
+                reason += f": {detail[0]}"
+            print(f"memory admission: {destination.target}: {reason}", file=sys.stderr, flush=True)
+            if result.returncode == 255:
+                offload.write_backoff(time.time() + config.unreachable_backoff_s, destination.target)
+            return placement.ExecutionEvidenceUnavailable(reason, self.clock.now())
+        for line in result.stdout.splitlines():
+            pid, separator, start = line.partition("\t")
+            if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
+                return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
         return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
 
     def _prune_ended_placements(self, cutoff: float) -> None:
