@@ -21,7 +21,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
@@ -318,10 +317,14 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        directory = tempfile.TemporaryDirectory(dir=build_folders.tmpfs_temporary_parent(), prefix="merge-gate-test-")
-        cls.addClassCleanup(directory.cleanup)
-        cls.fixture_root = Path(directory.name) / "case"
-        cls.fixture_snapshot = Path(directory.name) / "snapshot"
+        # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
+        parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
+        parent.mkdir(mode=0o700, exist_ok=True)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
+        directory = cls.enterClassContext(build_folders.temporary_build_folder(
+            build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))
+        cls.fixture_root = directory / "case"
+        cls.fixture_snapshot = directory / "snapshot"
         cls.fixture_snapshot.mkdir()
         cls.fixture_seeds = {}
 

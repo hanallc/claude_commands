@@ -28,6 +28,7 @@ from scripts.style import style_sync
 from scripts.style import bulk_rename as bulk
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.build_queue import queue_place
 from scripts.style.style_plan_test_support import unit_staff_id
 from scripts.lib import berth_board, build_folders
@@ -41,6 +42,7 @@ from scripts.style.test_bulk_rename import CargoProjectTests, ScriptedServer, wo
 
 
 def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
     unittest.enterModuleContext(foreign_hostname())
 
 
@@ -124,6 +126,7 @@ class BulkRunFixture(CargoProjectTests):
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
         self.repo: Path = self.root / "project"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
+        _ = self.enterContext(oracle_reader())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
 

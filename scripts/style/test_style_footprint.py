@@ -16,6 +16,12 @@ from typing import final, override
 
 from scripts.style import style_footprint
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 SCRIPT = Path(__file__).with_name("style_footprint.py")
 

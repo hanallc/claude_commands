@@ -154,7 +154,8 @@ Before=hana-tools.service
 Type=simple
 User=root
 UMask=0077
-ExecStart=/run/current-system/sw/bin/python3 {guest.CONTROL}/receiver.py
+Environment=PATH={guest.SYSTEM_BIN}
+ExecStart={guest.SYSTEM_BIN}/python3 {guest.CONTROL}/receiver.py
 Restart=on-failure
 RestartSec={settings.control_poll_seconds}
 

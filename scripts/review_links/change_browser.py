@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from scripts.lib import conf, urgency
 from scripts.lib.user_zone import shown_time
 from scripts.production import change_review, change_routing, next_item, staff, update_registration
-from scripts.production.production_doc import Production, read_production
+from scripts.production.production_doc import Production
 from scripts.production.issues import frontmatter
 from scripts.production.change_routing import UnavailableProduction
 from scripts.review_links import change_page, console, page_frame
@@ -52,7 +52,7 @@ class WaitingQuestion:
     key: str
     tab: str
     record: update_registration.QuestionRecord
-    production: Path | update_registration.QuestionOwnerUnavailable
+    production: Path | staff.StaffRow | update_registration.QuestionOwnerUnavailable
     owner: staff.StaffId
     asker: str
 
@@ -217,17 +217,18 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus, *,
                 continue
             owner = routing.runners.get(question.owner)
             tab = owner.name if owner is not None else "unrouted"
-            asker = routing.record.by_id(question.asker)
             questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
-                tab, question, document, question.owner, asker.name if asker is not None else str(question.asker)))
+                tab, question, document, question.owner, change_page.source_name(routing.record, question.asker)))
     known = {item.record.path for item in questions}
     for question in update_registration.unowned_question_records(identities):
         if question.status != "open" or "followup" in question.item or question.path in known:
             continue
-        asker = routing.record.by_id(question.asker)
+        owner = routing.record.by_id(question.owner)
+        producer = owner is not None and owner.kind == "producer"
         questions.append(WaitingQuestion("question/" + question.owner + "/" + question.path.name,
-            "unrouted", question, update_registration.QuestionOwnerUnavailable(question.path), question.owner,
-            asker.name if asker is not None else str(question.asker)))
+            owner.name if producer and owner is not None else "unrouted", question,
+            owner if producer and owner is not None else update_registration.QuestionOwnerUnavailable(question.path), question.owner,
+            change_page.source_name(routing.record, question.asker)))
     questions = question_order(questions)
     question_tabs = tuple(sorted(set(queues) | {item.tab for item in questions},
                                  key=lambda tab: (not any(item.tab == tab for item in questions), tab)))
@@ -438,6 +439,15 @@ def question_parts(item: update_registration.OutstandingItem) -> tuple[str, str]
 ANSWER_HELP = "A choice fills this. Edit it or write your own. Nothing sends until you press Answer."
 
 
+def question_details(question: WaitingQuestion) -> str:
+    """Show the source and the filed time under the question's buttons."""
+    filed = datetime.fromisoformat(question.record.item["since"])
+    lines = (("source", question.asker), ("date", filed.strftime("%Y-%m-%d")), ("time", filed.strftime("%H:%M")))
+    return ('<dl class="change-details">'
+            + ''.join(f'<dt>{label}:</dt><dd>{html.escape(value)}</dd>' for label, value in lines)
+            + '</dl>')
+
+
 def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback_rows: int) -> str:
     key = html.escape(question.key)
     body, choices = question_parts(question.record.item)
@@ -457,7 +467,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
-<p>Asked by {html.escape(question.asker)}</p><p role="status" data-save-state></p>{form}</section>'''
+<p role="status" data-save-state></p>{form}{question_details(question)}</section>'''
 
 
 @dataclass(frozen=True)
@@ -641,7 +651,7 @@ def question_message(outcome: change_page.QuestionOutcome, production: str, text
     return message
 
 
-def save_outcome(production: Production, question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
+def save_outcome(production: update_registration.QuestionScope, question: WaitingQuestion, outcome: change_page.QuestionOutcome, words: str,
                  identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
     """Answer, send a follow-up or move the question to the end of its queue; return whom the message goes to."""
     text = question.record.item["text"]
@@ -661,16 +671,17 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     if question.tab == "unrouted":
         raise change_page.QuestionAnswerRefused("No showrunner owns this question.")
     identities = update_registration.QuestionStaff.read()
-    production = read_production(question.owner, identities.record)
+    production = update_registration.question_scope(question.owner, identities.record)
     item = question.record.item
     relay = update_registration.answer_relay(production, production.name,
         update_registration.question_asker(item, update_registration.OpenItemWithoutAsker(), identities), identities)
     recipient = relay.recipient if isinstance(relay.recipient, str) else question.owner
     message = question_message(outcome, production.name, item["text"], relay.unit, words)
     answer = words if outcome == "answer" else ""
-    saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(production.doc),
+    document = production.doc if isinstance(production, Production) else question.record.path.parent
+    saved: change_page.StoredUserAnswer = {"saved": False, "source": str(question.record.path), "production": str(document),
         "owner": question.owner, "question": item["text"], "answer": answer, "message": message, "kind": outcome}
-    page = change_page.UserQuestionPage(question.record.path, production.doc, (question.record.path.stem,), "", saved)
+    page = change_page.UserQuestionPage(question.record.path, document, (question.record.path.stem,), "", saved)
     # The delivery lock prevents startup recovery from reading an answer during its save.
     with status.locked():
         if frontmatter(question.record.path).get("status") != ["open"]:

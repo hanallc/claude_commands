@@ -992,6 +992,15 @@ def _slot_preparation() -> Generator[None]:
         raise CopyError(str(error)) from error
 
 
+def gate_purpose(subject: str) -> str:
+    """Name the gated work from its commit subject."""
+    phase = re.fullmatch(r"[^()\s]+\(([^()]+)\): phase ([0-9]+) — (.+)", subject)
+    if phase is not None:
+        slug, number, title = phase.groups()
+        return f"gate · {slug} phase {number} · {title}"
+    return f"gate · {subject}" if subject else "gate"
+
+
 @contextmanager
 def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
              merge: MergePolicy = NO_MERGE) -> Generator[Path]:
@@ -1011,6 +1020,11 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         canonical = slot_source(source)
         if main_checkout(source) != canonical:
             _ = git(canonical, "fetch", "-q", "--", str(source), base)
+    try:
+        subject = git(canonical, "log", "-1", "--format=%s", base).decode(errors="replace").strip()
+        purpose = gate_purpose(subject)
+    except (CopyError, OSError):
+        purpose = "gate"
     unit = owner
     showrunner = owner_name(copy_owner(owner))
     try:
@@ -1025,7 +1039,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     with ExitStack() as held_slot:
         with _slot_preparation():
             slot = held_slot.enter_context(build_slots.take_slot(canonical, base, showrunner=showrunner, unit=unit,
-                work="gate", purpose="gate", report=lambda line: print(line, file=sys.stderr)))
+                work="gate", purpose=purpose, report=lambda line: print(line, file=sys.stderr)))
         tree = slot.path
         descriptor = build_folders.build_folder_lock_fd(tree)
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), descriptor))

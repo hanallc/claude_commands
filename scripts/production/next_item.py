@@ -45,7 +45,7 @@ from scripts.production.footer_counts import efficiency_ledger
 from scripts.production.store_owner import document_id
 from scripts.production import staff
 from scripts.production.production_doc import Refusal, read_production
-from scripts.production.update_registration import QuestionStaff, RegistrationFailure, open_lists, question_queue
+from scripts.production.update_registration import QuestionStaff, ProducerQuestions, RegistrationFailure, open_lists, question_queue
 
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -122,10 +122,11 @@ def read_queue(kind: str, production: Path | None, below: bool = False, *,
                 waiting, _ = proposals_table.waiting_entries(doc, below)
                 return Queue(urgency.scope_queue(proposals_table.queue(doc, record=record), below), _as_text(waiting, proposals_table.proposal_text))
             case "question":
-                doc = _doc(production)
                 identities = QuestionStaff.read() if record is None else QuestionStaff.for_record(record)
-                owner = identities.owner(doc)
-                found = read_production(owner)
+                caller = identities.record.by_current_session(staff.caller_identity()) if production is None else None
+                owner = (caller if caller is not None and caller.kind == "producer"
+                         else identities.owner(_doc(production)))
+                found = ProducerQuestions(owner) if owner.kind == "producer" else read_production(owner)
                 due = open_lists(found, below, identities=identities).due
                 return Queue(question_queue(found, below), _as_text(due, lambda entry: entry.item.line()))
             case _:
