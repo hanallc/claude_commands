@@ -12,7 +12,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import git_rescue
+from scripts.lib import build_folders, git_rescue
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -33,20 +33,36 @@ class GitRescueTests(unittest.TestCase):
             "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
             "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
         }))
-        self.source = self.root / "source"
-        self.source.mkdir()
-        _ = self.git(self.source, "init", "-q", "-b", "trunk")
+        seed = self.enterContext(build_folders.private_clone_slot(build_folders.PrivateCloneSlot(
+            self.root / "sources", "source", 1, build_folders.EmptyRepositorySeed("trunk"))))
+        self.source = seed.checkout
         _ = (self.source / "tracked.txt").write_text("base\n")
         _ = (self.source / ".gitignore").write_text("ignored/\ngenerated/\n")
         self.base = commit_repository(self.source, "base")
         self.slot = self.root / "slot"
-        _ = self.git(self.source, "worktree", "add", "-q", "--detach", str(self.slot), self.base)
+        _ = self.linked_fixture(self.source, self.slot, self.base)
 
     def git(self, folder: Path, *arguments: str) -> str:
         return subprocess.run(
             ["git", "-C", str(folder), *arguments], check=True, capture_output=True,
             text=True, timeout=TEST_HANG_GUARD_SECS,
         ).stdout.strip()
+
+    def linked_fixture(self, source: Path, directory: Path, commit: str) -> Path:
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=directory.parent, purpose=directory.name,
+            suffix_length=0, slot_checkout=build_folders.SlotCheckout(source, commit))
+        with build_folders.leased_build_folder(spec) as path:
+            self.assertEqual(path, directory)
+        return directory
+
+    def empty_repository(self, directory: Path, branch: str = "trunk") -> Path:
+        parent = self.root / "repository-seeds"
+        number = len(list(parent.glob("seed-slot*"))) + 1
+        lease = self.enterContext(build_folders.private_clone_slot(
+            build_folders.PrivateCloneSlot(parent, "seed", number, build_folders.EmptyRepositorySeed(branch))))
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copytree(lease.checkout / ".git", directory / ".git")
+        return directory
 
     def saved(self, name: str, *, generated: tuple[Path, ...] = ()) -> git_rescue.Saved:
         result = git_rescue.rescue(self.slot, name, generated=generated)
@@ -56,7 +72,7 @@ class GitRescueTests(unittest.TestCase):
 
     def restore(self, commit: str, name: str = "restored") -> Path:
         folder = self.root / name
-        _ = self.git(self.source, "worktree", "add", "-q", "--detach", str(folder), commit)
+        _ = self.linked_fixture(self.source, folder, commit)
         return folder
 
     def index_bytes(self) -> bytes:
@@ -231,7 +247,7 @@ class GitRescueTests(unittest.TestCase):
     def test_nested_repository_commit_and_edits_are_recoverable_from_source(self) -> None:
         nested = self.slot / "nested"
         nested.mkdir()
-        _ = self.git(nested, "init", "-q", "-b", "trunk")
+        _ = self.empty_repository(nested)
         _ = (nested / "source.txt").write_text("nested commit\n")
         nested_commit = commit_repository(nested, "nested")
         _ = (nested / "source.txt").write_text("nested edit\n")
@@ -302,7 +318,7 @@ class GitRescueTests(unittest.TestCase):
     def test_nested_repository_keeps_branch_and_peeled_tag_tips(self) -> None:
         nested = self.slot / "nested"
         nested.mkdir()
-        _ = self.git(nested, "init", "-q", "-b", "trunk")
+        _ = self.empty_repository(nested)
         _ = (nested / "source.txt").write_text("nested base\n")
         trunk = commit_repository(nested, "nested base")
         _ = self.git(nested, "checkout", "-q", "-b", "other")
@@ -333,7 +349,7 @@ class GitRescueTests(unittest.TestCase):
     def test_metadata_collision_retains_source_and_creates_no_ref(self) -> None:
         nested = self.slot / "nested"
         nested.mkdir()
-        _ = self.git(nested, "init", "-q", "-b", "trunk")
+        _ = self.empty_repository(nested)
         _ = (nested / "source.txt").write_text("nested source\n")
         _ = commit_repository(nested, "nested")
         _ = (nested / "source.txt").write_text("nested edit\n")
@@ -370,7 +386,7 @@ class GitRescueTests(unittest.TestCase):
     def test_nested_repository_gets_no_ref_when_outer_publication_fails(self) -> None:
         nested = self.slot / "nested"
         nested.mkdir()
-        _ = self.git(nested, "init", "-q", "-b", "trunk")
+        _ = self.empty_repository(nested)
         _ = (nested / "source.txt").write_text("nested source\n")
         _ = commit_repository(nested, "nested")
         _ = (nested / "source.txt").write_text("nested edit\n")

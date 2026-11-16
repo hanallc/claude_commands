@@ -112,7 +112,86 @@ class GitCloneStage:
     pass_fds: tuple[int, ...] = ()
 
 
-BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | GitCloneStage
+@dataclass(frozen=True)
+class EmptyRepositorySeed:
+    """Create an empty repository on the named branch."""
+    initial_branch: str
+
+
+@dataclass(frozen=True)
+class SeedRef:
+    """Copy one source revision to an explicit private ref."""
+    source_revision: str
+    destination_ref: str
+
+
+@dataclass(frozen=True)
+class RepositorySeed:
+    """Copy selected refs without sharing the source object store."""
+    source: Path
+    refs: tuple[SeedRef, ...]
+    head_ref: str
+
+
+@dataclass(frozen=True)
+class PrivateCloneSlot:
+    """Own a private origin and checkout under one exclusive slot lease."""
+    parent: Path
+    repository: str
+    number: int
+    seed: EmptyRepositorySeed | RepositorySeed
+
+
+@dataclass(frozen=True)
+class PrivateCloneLease:
+    """Keep both private repositories alive until the lease ends."""
+    slot: Path
+    origin: Path
+    checkout: Path
+
+
+BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | GitCloneStage | PrivateCloneSlot
+
+
+def _private_clone(request: PrivateCloneSlot, path: Path, descriptor: int) -> None:
+    import subprocess
+
+    timeout = _settings().number("git_timeout_seconds")
+
+    def git(directory: Path, *arguments: str) -> str:
+        return subprocess.run(["git", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+                               "-C", str(directory), *arguments], check=True, capture_output=True,
+                              text=True, pass_fds=(descriptor,), timeout=timeout).stdout.strip()
+
+    seed = request.seed
+    head = "refs/heads/" + seed.initial_branch if isinstance(seed, EmptyRepositorySeed) else seed.head_ref
+    _ = git(path, "check-ref-format", head)
+    if not head.startswith("refs/heads/"):
+        raise ValueError("the private HEAD must name a branch")
+    if isinstance(seed, RepositorySeed):
+        refs = tuple(ref.destination_ref for ref in seed.refs)
+        if head not in refs or len(set(refs)) != len(refs):
+            raise ValueError("the private HEAD needs one selected branch ref")
+        for ref in seed.refs:
+            if not ref.destination_ref.startswith("refs/"):
+                raise ValueError("a seed destination must name an explicit ref")
+            _ = git(path, "check-ref-format", ref.destination_ref)
+    origin = path / "origin.git"
+    _ = git(path, "init", "--bare", "--initial-branch=" + head.removeprefix("refs/heads/"), str(origin))
+    if isinstance(seed, RepositorySeed):
+        # Fetch transfers objects without local hardlinks or alternates.
+        revisions = tuple(SeedRef(git(seed.source, "rev-parse", "--verify", "--end-of-options",
+                                     ref.source_revision), ref.destination_ref) for ref in seed.refs)
+        _ = git(origin, "fetch", "--no-tags", "--no-write-fetch-head", "--", str(seed.source.resolve()),
+                *(f"{ref.source_revision}:{ref.destination_ref}" for ref in revisions))
+    _ = git(path, "clone", "--no-local", "--", str(origin), str(path / "checkout"))
+
+
+@contextmanager
+def private_clone_slot(request: PrivateCloneSlot) -> Generator[PrivateCloneLease]:
+    """Remove both repositories and lease records after every holder releases the slot."""
+    with temporary_build_folder(request) as path:
+        yield PrivateCloneLease(path, path / "origin.git", path / "checkout")
 
 
 def inherited_temporary_parent() -> Path:
@@ -398,7 +477,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
 @dataclass(frozen=True)
 class _TemporaryFolderRequest:
     """The temporary folder request retains its cleanup stack."""
-    request: UniqueBuildFolder | GitCloneStage | BuildFolderSpec
+    request: UniqueBuildFolder | GitCloneStage | PrivateCloneSlot | BuildFolderSpec
     cleanup: ExitStack
 
 
@@ -409,6 +488,12 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         return request
     if isinstance(request, GitCloneStage):
         return _request_spec(UniqueBuildFolder(request.prefix, ExplicitBuildParent(request.parent)))
+    if isinstance(request, PrivateCloneSlot):
+        _check_name(request.repository)
+        if not request.repository or request.number <= 0:
+            raise ValueError("a private slot needs a repository name and a positive number")
+        return BuildFolderSpec(kind="slot", parent=request.parent.expanduser().absolute(), repository=request.repository,
+                               slot=request.number, suffix_length=0)
     else:
         stable = isinstance(request, StableOwnerFolder)
         name = request.name if isinstance(request, StableOwnerFolder) else request.prefix
@@ -461,6 +546,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     except FileNotFoundError:
                         existing = None
                     if existing is not None:
+                        if isinstance(original, PrivateCloneSlot):
+                            raise FileExistsError(errno.EEXIST, "private slot already exists", str(path))
                         if not stable:
                             if not renamed:
                                 raise FileExistsError(errno.EEXIST, "build folder already exists", str(path))
@@ -496,16 +583,19 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     else:
                         _write_lease(path, directory, allocation)
                     if existing is None:
-                        mode = request.mode if isinstance(request, StableOwnerFolder) else 0o777 if stable else 0o700
+                        mode = (0o700 if isinstance(original, PrivateCloneSlot) else
+                                request.mode if isinstance(request, StableOwnerFolder) else 0o777 if stable else 0o700)
                         try:
                             os.mkdir(path.name, mode=mode, dir_fd=directory)
                             made_inode = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                         except FileExistsError:
-                            if not stable:
+                            if not stable or isinstance(original, PrivateCloneSlot):
                                 raise
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, PrivateCloneSlot):
+                        _private_clone(original, path, descriptor)
                     if new_folder and isinstance(spec.slot_checkout, SlotCheckout):
                         import subprocess
 
@@ -526,7 +616,8 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
-                                                     descriptor=descriptor, temporary=not stable)
+                                                     descriptor=descriptor,
+                                                     temporary=not stable or isinstance(original, PrivateCloneSlot))
                     return path
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
@@ -744,7 +835,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True, prefix: st
 
 
 @contextmanager
-def temporary_build_folder(request: UniqueBuildFolder | GitCloneStage | BuildFolderSpec) -> Generator[Path]:
+def temporary_build_folder(request: UniqueBuildFolder | GitCloneStage | PrivateCloneSlot | BuildFolderSpec) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
     with ExitStack() as cleanup:
         yield create_build_folder(_TemporaryFolderRequest(request, cleanup))

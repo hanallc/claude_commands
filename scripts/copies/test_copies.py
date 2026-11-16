@@ -26,6 +26,7 @@ from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_protocol as wire
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, scratch
@@ -82,12 +83,17 @@ class StandingTests(unittest.TestCase):
             "GIT_COMMITTER_EMAIL": "gate-tests@example.invalid",
         })
         with mock.patch.dict(os.environ, environment, clear=True):
-            cls.source_seed = ImmutableGitSeed.create(
-                root, "main", "Gate Tests", "gate-tests@example.invalid",
-                {"Cargo.toml": "[workspace]\n", "tracked.txt": "published\n", "stable.txt": "unchanged\n",
-                 ".gitignore": "target/\nignored.txt\n"},
-            )
+            lease = cls.enterClassContext(build_folders.private_clone_slot(build_folders.PrivateCloneSlot(
+                root, "source", 1, build_folders.EmptyRepositorySeed("main"))))
+            cls.source_seed = ImmutableGitSeed(lease.checkout, lease.origin)
+            _ = write_fixture_git_config(lease.slot)
+            for name, text in {"Cargo.toml": "[workspace]\n", "tracked.txt": "published\n",
+                               "stable.txt": "unchanged\n", ".gitignore": "target/\nignored.txt\n"}.items():
+                _ = (lease.checkout / name).write_text(text)
             builder = cls()
+            _ = builder.git(lease.checkout, "add", ".")
+            _ = builder.git(lease.checkout, "commit", "-m", "initial")
+            _ = builder.git(lease.checkout, "push", "-u", "origin", "main")
             _ = builder.git(cls.source_seed.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
             cls.published = builder.git(cls.source_seed.checkout, "rev-parse", "HEAD")
             _ = (cls.source_seed.checkout / "tracked.txt").write_text("source HEAD\n")
@@ -132,8 +138,15 @@ class StandingTests(unittest.TestCase):
         self.owner_id = str(owner.id)
         os.environ["CODEX_THREAD_ID"] = ""
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
-        self.source = self.base / "checkout"
-        self.source_seed.copy_to(self.source, self.base / "origin.git")
+        lease = self.enterContext(build_folders.private_clone_slot(build_folders.PrivateCloneSlot(
+            self.base / "sources", "source", 1, build_folders.RepositorySeed(self.source_seed.origin,
+                (build_folders.SeedRef("refs/heads/main", "refs/heads/main"),), "refs/heads/main"))))
+        self.source = lease.checkout
+        _ = self.git(self.source, "config", "user.name", "Gate Tests")
+        _ = self.git(self.source, "config", "user.email", "gate-tests@example.invalid")
+        _ = self.git(lease.origin, "remote", "add", "origin", "https://example.invalid/checkout.git")
+        _ = self.git(self.source, "fetch", "--no-tags", str(self.source_seed.checkout), self.head)
+        _ = self.git(self.source, "reset", "--hard", self.head)
         _ = shutil.copyfile(self.source_seed.checkout.parent / "git-config", self.base / "git-config")
         self.gates = slot_configuration.slots
 
@@ -144,6 +157,31 @@ class StandingTests(unittest.TestCase):
             fixture.clock.epoch = time.time()
             with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), fixture.serving():
                 yield fixture
+
+    def linked_fixture(self, source: Path, directory: Path, commit: str) -> Path:
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=directory.parent, purpose=directory.name,
+            suffix_length=0, slot_checkout=build_folders.SlotCheckout(source, commit))
+        with build_folders.leased_build_folder(spec) as path:
+            self.assertEqual(path, directory)
+        return directory
+
+    def clone_fixture(self, source: Path, directory: Path, *, shared: bool = False) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        request = build_folders.GitCloneStage(source, self.base / "fixture-stages", "metadata-",
+                                             "--shared" if shared else "--no-local")
+        with build_folders.temporary_build_folder(request) as stage:
+            _ = shutil.move(str(stage / ".git"), directory / ".git")
+        _ = self.git(directory, "reset", "--hard", "HEAD")
+        return directory
+
+    def bare_fixture(self, source: Path, directory: Path) -> Path:
+        stage = self.base / "bare-stage"
+        _ = self.clone_fixture(source, stage)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.move(str(stage / ".git"), directory)
+        shutil.rmtree(stage)
+        _ = self.git(directory, "config", "core.bare", "true")
+        return directory
 
     def lease_machine(self) -> str:
         from scripts.buildlog.store import host_name
@@ -386,7 +424,7 @@ class StandingTests(unittest.TestCase):
         for source_gone, export_failure in ((False, False), (True, False), (False, True), (True, True)):
             with self.subTest(source_gone=source_gone, export_failure=export_failure):
                 source = self.base / f"rescue-source-{source_gone}-{export_failure}"
-                _ = self.git(self.base, "clone", "-q", str(self.source), str(source))
+                _ = self.clone_fixture(self.source, source)
                 for key in ("user.name", "user.email"):
                     _ = self.git(source, "config", key, self.git(self.source, "config", key))
                 name = f"rescue-{source_gone}-{export_failure}"
@@ -563,7 +601,7 @@ class StandingTests(unittest.TestCase):
     def test_clone_uses_the_main_checkout_trust_for_a_linked_source(self) -> None:
         paths = self.clone_trust_files((2,))
         linked = self.base / "linked-source"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), "HEAD")
+        _ = self.linked_fixture(self.source, linked, "HEAD")
         checkout = copies.clone(linked, "gate:linked-trust")
         self.assert_clone_trust(checkout, paths)
 
@@ -709,7 +747,7 @@ class StandingTests(unittest.TestCase):
 
     def shared_source_commit(self) -> tuple[Path, str]:
         source = self.base / "shared-source"
-        _ = self.git(self.base, "clone", "--shared", "-q", str(self.source), str(source))
+        _ = self.clone_fixture(self.source, source, shared=True)
         for key in ("user.name", "user.email"):
             _ = self.git(source, "config", key, self.git(self.source, "config", key))
         _ = self.git(source, "checkout", "-q", "--detach")
@@ -1099,7 +1137,7 @@ class StandingTests(unittest.TestCase):
 
     def test_linked_source_uses_canonical_repository_folder_name(self) -> None:
         linked = self.base / "linked-worktree"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.published)
+        _ = self.linked_fixture(self.source, linked, self.published)
         with copies.standing(self.owner_id, linked, copies.CommittedSource("HEAD")) as tree:
             self.assertEqual(tree, self.gates / "origin-slot1")
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.published)
@@ -1107,11 +1145,11 @@ class StandingTests(unittest.TestCase):
 
     def test_main_worktree_and_local_clones_share_the_upstream_identity(self) -> None:
         linked = self.base / "worktree"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        _ = self.linked_fixture(self.source, linked, self.head)
         checkout = self.base / "clone/checkout"
         reload = self.base / "clone/reload"
         for path, origin in ((checkout, self.source), (reload, checkout)):
-            _ = self.git(self.base, "clone", "-q", str(origin), str(path))
+            _ = self.clone_fixture(origin, path)
         _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/project.git")
         for source in (self.source, linked, checkout, reload):
             with self.subTest(source=source):
@@ -1122,12 +1160,12 @@ class StandingTests(unittest.TestCase):
     def test_repository_without_origin_uses_main_checkout_name(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
         linked = self.base / "worktree"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        _ = self.linked_fixture(self.source, linked, self.head)
         bare = self.base / "bare.git"
-        _ = self.git(self.base, "clone", "-q", "--bare", str(self.source), str(bare))
+        _ = self.bare_fixture(self.source, bare)
         _ = self.git(bare, "remote", "remove", "origin")
         bare_linked = self.base / "bare-worktree"
-        _ = self.git(bare, "worktree", "add", "--detach", str(bare_linked), self.head)
+        _ = self.linked_fixture(bare, bare_linked, self.head)
         for source, main in ((self.source, self.source), (linked, self.source),
                              (bare, bare), (bare_linked, bare)):
             with self.subTest(source=source):
@@ -1139,7 +1177,7 @@ class StandingTests(unittest.TestCase):
         upstream = self.source.parent / "origin.git"
         _ = self.git(upstream, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
         linked = self.base / "worktrees" / "unit"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.head)
+        _ = self.linked_fixture(self.source, linked, self.head)
         for source in (self.source, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
                 self.assertEqual(tree.name, "origin-slot1")
@@ -1149,13 +1187,15 @@ class StandingTests(unittest.TestCase):
         main = self.base / "widget"
         metadata = self.base / "state" / "widget-index"
         metadata.parent.mkdir()
-        _ = self.git(self.base, "clone", "-q", "--separate-git-dir", str(metadata), str(self.source), str(main))
+        _ = self.clone_fixture(self.source, main)
+        _ = shutil.move(str(main / ".git"), metadata)
+        _ = (main / ".git").write_text(f"gitdir: {metadata}\n")
         _ = self.git(main, "remote", "remove", "origin")
         self.assertEqual(copies.repository_name(main), "widget")
         # Linked worktrees need the main path recorded when Git metadata lives elsewhere.
         _ = self.git(main, "config", "core.worktree", str(main))
         linked = self.base / "separate-worktree"
-        _ = self.git(main, "worktree", "add", "--detach", str(linked), "HEAD")
+        _ = self.linked_fixture(main, linked, "HEAD")
         for source in (main, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
                 self.assertEqual(copies.main_checkout(source), main)
@@ -1165,7 +1205,7 @@ class StandingTests(unittest.TestCase):
     def test_gate_borrows_the_last_store_and_keeps_source_commits_after_clones_are_deleted(self) -> None:
         first, second = self.base / "first", self.base / "second"
         for checkout, source in ((first, self.source), (second, first)):
-            _ = self.git(self.base, "clone", "--shared", "-q", str(source), str(checkout))
+            _ = self.clone_fixture(source, checkout, shared=True)
         # Git resolves a relative alternate from the object store that contains it.
         _ = (second / ".git/objects/info/alternates").write_text(
             os.path.relpath(first / ".git/objects", second / ".git/objects") + "\n")
@@ -1174,7 +1214,7 @@ class StandingTests(unittest.TestCase):
         _ = self.git(second, "commit", "-qm", "source-only commit")
         commit = self.git(second, "rev-parse", "HEAD")
         linked = self.base / "linked"
-        _ = self.git(second, "worktree", "add", "--detach", str(linked), commit)
+        _ = self.linked_fixture(second, linked, commit)
         for source in (second, linked):
             with self.subTest(source=source), copies.standing(self.owner_id, source, copies.CommittedSource(commit)) as tree:
                 self.assertEqual(self.git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"),
@@ -1201,7 +1241,7 @@ class StandingTests(unittest.TestCase):
     def test_gate_copies_a_registered_store_with_multiple_alternates_without_borrowing(self) -> None:
         source = copies.clone(self.source, task="gate:multiple-alternates")
         _ = (source / ".git/objects/info/alternates").write_text(
-            str(self.source / ".git/objects") + "\n" + str(self.base / "origin.git/objects") + "\n")
+            str(self.source / ".git/objects") + "\n" + str(self.source.parent / "origin.git/objects") + "\n")
         with copies.standing(self.owner_id, source, copies.CommittedSource("HEAD")) as tree:
             self.assertFalse((tree / ".git/objects/info/alternates").exists())
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
@@ -1212,7 +1252,7 @@ class StandingTests(unittest.TestCase):
 
     def test_local_origin_cycle_refuses_a_gate(self) -> None:
         other = self.base / "other-clone"
-        _ = self.git(self.base, "clone", "-q", str(self.source), str(other))
+        _ = self.clone_fixture(self.source, other)
         _ = self.git(self.source, "remote", "set-url", "origin", str(other))
         with self.assertRaisesRegex(copies.CopyError, "local origins form a cycle"):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource("HEAD")):
@@ -1221,7 +1261,7 @@ class StandingTests(unittest.TestCase):
     def test_repository_removal_keeps_workspace_identity_after_source_deletion(self) -> None:
         _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
         selector = self.base / "selector"
-        _ = self.git(self.base, "clone", "-q", str(self.source), str(selector))
+        _ = self.clone_fixture(self.source, selector)
         _ = self.git(selector, "remote", "set-url", "origin", "git@example.invalid:team/widget.git")
         with copies.workspace(self.owner_id, self.source, "HEAD", name="worker", branch="worker") as tree:
             pass
@@ -1355,7 +1395,7 @@ class StandingTests(unittest.TestCase):
         tree.mkdir(parents=True)
         copies.initialize_git(tree, self.source)
         _ = self.git(tree, "checkout", "-q", "-B", "worker", self.head)
-        _ = self.git(self.base, "clone", "-q", "--bare", str(self.source), str(tree.parent / "origin.git"))
+        _ = self.bare_fixture(self.source, tree.parent / "origin.git")
         for repo in (self.source, tree):
             _ = self.git(repo, "remote", "set-url", "origin", "../origin.git")
 
@@ -1718,7 +1758,7 @@ class StandingTests(unittest.TestCase):
 
     def test_owner_removal_deletes_an_idle_repository_while_another_gate_is_busy(self) -> None:
         other = self.base / 'other-repository'
-        _ = self.git(self.base, 'clone', '-q', str(self.source), str(other))
+        _ = self.clone_fixture(self.source, other)
         _ = self.git(other, 'remote', 'set-url', 'origin', 'https://example.invalid/other.git')
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as busy:
             with copies.standing(self.owner_id, other, copies.CommittedSource('HEAD')) as idle:
@@ -2114,7 +2154,7 @@ class StandingTests(unittest.TestCase):
             cache = tree / 'target/compiled'
             _ = cache.write_text('warm')
         shutil.rmtree(self.source)
-        _ = self.git(self.base, 'clone', '-q', '--branch', 'main', origin, str(self.source))
+        _ = self.clone_fixture(Path(origin), self.source)
         self.assertEqual(self.git(self.source, 'rev-parse', 'HEAD'), self.published)
         with self.assertRaises(ValueError):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')):

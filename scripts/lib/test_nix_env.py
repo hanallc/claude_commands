@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -235,9 +236,25 @@ class GitNixFixture(NixFixture):
 
     def repository(self, directory: Path) -> Path:
         _ = self.envrc(directory)
-        _ = self.git(directory, "init")
+        seed = self.enterContext(build_folders.private_clone_slot(build_folders.PrivateCloneSlot(
+            self.root / "seeds", "seed", len(list((self.root / "seeds").glob("seed-slot*"))) + 1,
+            build_folders.EmptyRepositorySeed("main"))))
+        self.clone_metadata(seed.origin, directory, "--no-local")
         _ = self.git(directory, "add", ".envrc")
         _ = self.git(directory, "commit", "-m", "fixture")
+        return directory
+
+    def clone_metadata(self, source: Path, directory: Path, mode: Literal["--shared", "--no-local"]) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        request = build_folders.GitCloneStage(source, self.root / "stages", "metadata-", mode)
+        with build_folders.temporary_build_folder(request) as stage:
+            _ = shutil.move(str(stage / ".git"), directory / ".git")
+
+    def linked_fixture(self, source: Path, directory: Path, commit: str) -> Path:
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=directory.parent, purpose=directory.name,
+            suffix_length=0, slot_checkout=build_folders.SlotCheckout(source, commit))
+        with build_folders.leased_build_folder(spec) as path:
+            self.assertEqual(path, directory)
         return directory
 
     def assert_explicit_approval_required(self, directory: Path) -> None:
@@ -254,9 +271,7 @@ class GitNixFixture(NixFixture):
 
 class RegisteredWorktreeTests(GitNixFixture):
     def worktree(self, repository: Path, directory: Path) -> Path:
-        directory.parent.mkdir(parents=True, exist_ok=True)
-        _ = self.git(repository, "worktree", "add", "--detach", str(directory), "HEAD")
-        return directory
+        return self.linked_fixture(repository, directory, "HEAD")
 
     def test_trusted_repository_registered_snapshot_is_automatically_allowed(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -275,7 +290,8 @@ class RegisteredWorktreeTests(GitNixFixture):
         repository = self.repository(self.home / "rust/repo")
         clone = self.root / "tmp/clone"
         clone.parent.mkdir(parents=True)
-        _ = self.git(self.root, "clone", str(repository), str(clone))
+        self.clone_metadata(repository, clone, "--no-local")
+        _ = self.git(clone, "reset", "--hard", "HEAD")
         self.assert_explicit_approval_required(clone)
 
     def test_forged_git_file_cannot_borrow_a_registered_entry(self) -> None:
@@ -345,7 +361,8 @@ class RegisteredCopyTests(GitNixFixture):
     def clone(self, repository: Path) -> Path:
         checkout = copy_record.copies_root() / "pair/copy"
         checkout.parent.mkdir(parents=True)
-        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        self.clone_metadata(repository, checkout, "--shared")
+        _ = self.git(checkout, "reset", "--hard", "HEAD")
         return checkout
 
     def register(self, repository: Path, checkout: Path) -> None:
@@ -506,7 +523,8 @@ class RegisteredCloneTests(GitNixFixture):
         # The task folder is the checkout, as copies.clone makes it.
         checkout = task_folder if task_folder is not None else copy_record.root() / "task"
         checkout.parent.mkdir(parents=True, exist_ok=True)
-        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        self.clone_metadata(repository, checkout, "--shared")
+        _ = self.git(checkout, "reset", "--hard", "HEAD")
         fields = {"task": "gate:nix-env", "test_hana_clone": True,
                   "source_path": str(repository), "source_commit": self.git(checkout, "rev-parse", "HEAD")}
         _ = (checkout / copy_record.RECORD).write_text(json.dumps(fields), encoding="utf-8")

@@ -50,6 +50,142 @@ class BuildFolderTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(Path(folders.__file__)), *arguments],
                               text=True, capture_output=True, timeout=10)
 
+    def private_request(self, name: str = "widget") -> folders.PrivateCloneSlot:
+        return folders.PrivateCloneSlot(self.root, name, 1, folders.EmptyRepositorySeed("trunk"))
+
+    def private_git(self, path: Path, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(path), "-c", "user.name=Fixture",
+                               "-c", "user.email=fixture@example.invalid", *arguments],
+                              check=True, capture_output=True, text=True, timeout=10).stdout.strip()
+
+    def private_seed(self) -> folders.PrivateCloneLease:
+        seed = self.enterContext(folders.private_clone_slot(self.private_request("seed")))
+        _ = (seed.checkout / "source.txt").write_text("source\n")
+        _ = self.private_git(seed.checkout, "add", ".")
+        _ = self.private_git(seed.checkout, "commit", "-m", "seed")
+        return seed
+
+    def seeded_request(self, seed: folders.PrivateCloneLease) -> folders.PrivateCloneSlot:
+        return folders.PrivateCloneSlot(self.root, "copy", 1, folders.RepositorySeed(seed.checkout,
+            (folders.SeedRef("HEAD", "refs/heads/trunk"),), "refs/heads/trunk"))
+
+    def test_private_clone_empty_seed(self) -> None:
+        with folders.private_clone_slot(self.private_request()) as lease:
+            for path in (lease.origin, lease.checkout):
+                self.assertEqual(self.private_git(path, "symbolic-ref", "HEAD"), "refs/heads/trunk")
+                self.assertEqual(self.private_git(path, "for-each-ref"), "")
+            self.assertEqual(self.private_git(lease.origin, "rev-parse", "--is-bare-repository"), "true")
+            self.assertEqual(self.private_git(lease.checkout, "remote", "get-url", "origin"), str(lease.origin))
+            self.assertEqual(folders.build_folder_state(lease.slot), "held")
+
+    def test_private_clone_selected_refs(self) -> None:
+        seed = self.private_seed()
+        _ = self.private_git(seed.checkout, "tag", "-a", "release", "-m", "release")
+        _ = self.private_git(seed.checkout, "branch", "excluded")
+        request = folders.PrivateCloneSlot(self.root, "copy", 1, folders.RepositorySeed(seed.checkout,
+            (folders.SeedRef("HEAD", "refs/heads/trunk"), folders.SeedRef("refs/tags/release", "refs/tags/release"),
+             folders.SeedRef("HEAD", "refs/custom/source")), "refs/heads/trunk"))
+        with folders.private_clone_slot(request) as lease:
+            refs = self.private_git(lease.origin, "for-each-ref", "--format=%(refname)").splitlines()
+            self.assertEqual(set(refs), {"refs/heads/trunk", "refs/tags/release", "refs/custom/source"})
+            self.assertEqual(self.private_git(lease.origin, "rev-parse", "refs/tags/release"),
+                             self.private_git(seed.checkout, "rev-parse", "refs/tags/release"))
+
+    def test_private_clone_independent_storage(self) -> None:
+        seed = self.private_seed()
+        with folders.private_clone_slot(self.seeded_request(seed)) as lease:
+            for store in (lease.origin / "objects", lease.checkout / ".git/objects"):
+                self.assertFalse((store / "info/alternates").exists())
+                self.assertTrue(all(path.stat().st_nlink == 1 for path in store.rglob("*") if path.is_file()))
+            shutil.rmtree(seed.slot)
+            for path in (lease.origin, lease.checkout):
+                self.assertEqual(self.private_git(path, "show", "HEAD:source.txt"), "source")
+                _ = self.private_git(path, "fsck", "--full")
+
+    def test_private_clone_ref_isolation(self) -> None:
+        seed = self.private_seed()
+        before = self.private_git(seed.checkout, "show-ref")
+        with folders.private_clone_slot(self.seeded_request(seed)) as lease:
+            _ = (lease.checkout / "source.txt").write_text("private\n")
+            _ = self.private_git(lease.checkout, "commit", "-am", "private")
+            _ = self.private_git(lease.checkout, "push", "origin", "trunk")
+            self.assertNotEqual(self.private_git(lease.origin, "rev-parse", "HEAD"),
+                                self.private_git(seed.checkout, "rev-parse", "HEAD"))
+            self.assertEqual(self.private_git(seed.checkout, "show-ref"), before)
+
+    def test_private_clone_occupied_slot(self) -> None:
+        request = self.private_request()
+        path = self.root / "widget-slot1"
+        path.mkdir()
+        marker = path / "keep"
+        _ = marker.write_bytes(b"existing")
+        with self.assertRaises(FileExistsError), folders.private_clone_slot(request):
+            self.fail("an occupied slot was allocated")
+        self.assertEqual(marker.read_bytes(), b"existing")
+        marker.unlink()
+        path.rmdir()
+        with folders.private_clone_slot(request):
+            pass
+
+    def test_private_clone_git_failure_and_timeout(self) -> None:
+        request = self.private_request()
+        path = self.root / "widget-slot1"
+        settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        _ = settings.write_text(settings.read_text().replace("git_timeout_seconds=300", "git_timeout_seconds=0.1"))
+        run = subprocess.run
+        for failure in (subprocess.CalledProcessError(1, "git", stderr="fixture failure"),
+                        subprocess.TimeoutExpired("git", 0.1)):
+            with self.subTest(failure=type(failure).__name__):
+                calls: list[tuple[Sequence[str], float]] = []
+
+                def fail_clone(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    calls.append((command, cast(float, options["timeout"])))
+                    if "clone" in command:
+                        raise failure
+                    return run(command, check=True, capture_output=True, text=True,
+                               pass_fds=cast(tuple[int, ...], options["pass_fds"]),
+                               timeout=cast(float, options["timeout"]))
+
+                with mock.patch.object(subprocess, "run", side_effect=fail_clone), self.assertRaises(type(failure)):
+                    with folders.private_clone_slot(request):
+                        self.fail("Git failure reached the caller")
+                self.assertTrue(calls)
+                self.assertTrue(all(timeout == 0.1 for _, timeout in calls))
+                self.assertFalse(path.exists())
+                self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+                with folders.private_clone_slot(request):
+                    pass
+
+    def test_private_clone_live_child_retains_files(self) -> None:
+        context = folders.private_clone_slot(self.private_request())
+        lease = context.__enter__()
+        descriptor = folders.build_folder_lock_fd(lease.slot)
+        child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                 pass_fds=(descriptor,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            assert child.stdout is not None
+            self.assertTrue(select.select([child.stdout], [], [], 3)[0])
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            _ = context.__exit__(None, None, None)
+            self.assertTrue(lease.origin.exists())
+            self.assertTrue(lease.checkout.exists())
+            self.assertEqual(folders.build_folder_state(lease.slot), "held")
+            _ = child.communicate(input="end", timeout=10)
+            folders.sweep_temporary_build_folders(self.root, prefix="widget-slot")
+            self.assertFalse(lease.slot.exists())
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=10)
+            _ = context.__exit__(None, None, None)
+
+    def test_private_clone_normal_release(self) -> None:
+        with folders.private_clone_slot(self.private_request()) as lease:
+            self.assertEqual(lease.slot, self.root / "widget-slot1")
+            self.assertTrue(lease.origin.is_dir())
+            self.assertTrue(lease.checkout.is_dir())
+        self.assertEqual(list(self.root.iterdir()), [])
+
     def test_configured_scratch_root_reads_a_changed_file_at_use(self) -> None:
         settings = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
         lines = [line for line in settings.read_text(encoding="utf-8").splitlines()

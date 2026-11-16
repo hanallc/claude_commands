@@ -47,10 +47,10 @@ class BuildSlotsTests(unittest.TestCase):
         self.cargo_root = configuration.cargo
         self.machine = configuration.machine
         self.enterContext(mock.patch.dict(os.environ, configuration.environment))
-        self.source = self.root / "source-folder"
-        self.source.mkdir()
-        _ = self.git(self.source, "init", "-q", "-b", "trunk")
-        _ = self.git(self.source, "remote", "add", "origin", "git@example.invalid:group/widget.git")
+        seed = self.enterContext(build_folders.private_clone_slot(build_folders.PrivateCloneSlot(
+            self.root / "sources", "widget", 1, build_folders.EmptyRepositorySeed("trunk"))))
+        self.source = seed.checkout
+        _ = self.git(self.source, "remote", "set-url", "origin", "git@example.invalid:group/widget.git")
         _ = (self.source / "same.txt").write_text("unchanged\n")
         _ = (self.source / "change.txt").write_text("first commit\n")
         _ = (self.source / ".gitignore").write_text("target/\n")
@@ -59,6 +59,26 @@ class BuildSlotsTests(unittest.TestCase):
     def git(self, folder: Path, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(folder), *arguments], check=True, capture_output=True,
                               text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+
+    def linked_fixture(self, source: Path, directory: Path, commit: str) -> Path:
+        lease = build_slots.lease_path(directory)
+        previous = lease.read_bytes() if lease.exists() else b""
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=directory.parent, purpose=directory.name,
+            suffix_length=0, slot_checkout=build_folders.SlotCheckout(source, commit))
+        with build_folders.leased_build_folder(spec) as path:
+            self.assertEqual(path, directory)
+        if previous:
+            _ = lease.write_bytes(previous)
+        return directory
+
+    def empty_repository(self, directory: Path, branch: str = "trunk") -> Path:
+        parent = self.root / "repository-seeds"
+        number = len(list(parent.glob("seed-slot*"))) + 1
+        lease = self.enterContext(build_folders.private_clone_slot(
+            build_folders.PrivateCloneSlot(parent, "seed", number, build_folders.EmptyRepositorySeed(branch))))
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copytree(lease.checkout / ".git", directory / ".git")
+        return directory
 
     def take(self, commit: str = "HEAD") -> AbstractContextManager[build_slots.Slot]:
         return build_slots.take_slot(self.source, commit, showrunner="builds", unit="queue",
@@ -196,7 +216,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
     def test_source_without_origin_uses_the_main_checkout_name(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
         linked = self.root / "different-name"
-        _ = self.git(self.source, "worktree", "add", "--detach", str(linked), self.base)
+        _ = self.linked_fixture(self.source, linked, self.base)
         with redirect_stdout(io.StringIO()):
             with build_slots.take_slot(linked, self.base, showrunner="builds", unit="queue",
                                        work="proof", purpose="test") as slot:
@@ -206,7 +226,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
     def test_incomplete_slot_keeps_its_private_git_repository(self) -> None:
         path = self.slot_root / "widget-slot1"
         path.mkdir(parents=True)
-        _ = self.git(path, "init", "-q", "-b", "saved")
+        _ = self.empty_repository(path, "saved")
         _ = (path / "local.txt").write_text("local commit\n")
         tip = commit_repository(path, "private commit")
         _ = (path / "edit.txt").write_text("unfinished edit\n")
@@ -376,7 +396,7 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                 self.assertEqual(len(after - before), 1)
                 saved, = after - before
                 restored = self.root / f"restored-{number}"
-                _ = self.git(self.source, "worktree", "add", "--detach", str(restored), saved)
+                _ = self.linked_fixture(self.source, restored, saved)
                 self.assertEqual((restored / "change.txt").read_text(), "source edit before reset\n")
                 self.assertEqual((restored / "untracked.txt").read_text(), "untracked source\n")
                 backups = tuple(restored.glob(".rescue-index-*"))
@@ -389,10 +409,10 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
         _ = self.git(self.source, "worktree", "remove", str(path))
         other = self.root / "other-repository"
         other.mkdir()
-        _ = self.git(other, "init", "-q", "-b", "trunk")
+        _ = self.empty_repository(other)
         _ = (other / "foreign.txt").write_text("foreign work\n")
         foreign = commit_repository(other, "foreign")
-        _ = self.git(other, "worktree", "add", "--detach", str(path), foreign)
+        _ = self.linked_fixture(other, path, foreign)
 
         with self.assertRaises(build_slots.SlotRepositoryMismatch):
             with self.take():
