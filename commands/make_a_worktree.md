@@ -60,6 +60,8 @@ STOP and wait for user response. If user provides alternative name, use their na
 Mark third todo as in_progress.
 
 **Create Worktree:**
+The wrapper requests a persistent linked worktree from `scripts/lib/build_folders.py`.
+The maker creates the repository under its folder lease and retains the caller's path.
 - Use Bash tool to run `bash ~/.claude/scripts/worktree/make_worktree.sh ../[worktree-name] [branch-name]` to create worktree and branch
 - If command fails, display error message and ask user for guidance
 

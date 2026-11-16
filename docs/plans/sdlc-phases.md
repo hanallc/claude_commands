@@ -450,6 +450,32 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Gotchas:** hana main has no `publish_order` or `github_release_repo` yet; hana-merges owns those keys and `post_publish.sh`.
 
+### Phase 43 — `hana_shot locate` prints where to click a named target  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `hana_shot.py locate --port N --target <selector> [--json]` reads the current camera (it waits with `Session.settle` while the camera moves) and prints `<selector> <x> <y> <width> <height> <cx> <cy> scale <s>`, then `clipped` and `occluded` when set. Values are window logical pixels (physical / the camera's `scale_factor`), the space brp_extras `move_mouse`, `click_mouse` and `drag_mouse` take; the scale prints unrounded. `--json` prints `selector`, `entity`, `rect`, `click`, `scale_factor`, `window`, `clipped`, `occluded`. It never moves the camera, takes no shot and writes no timing line.
+- One shared projection (`project_bounds`) serves locate and `--crop entity`; the crop output is unchanged. A corner behind the camera is dropped and a rectangle past a window edge is cut; both mark `clipped`. A camera with a viewport is refused.
+- Click point: rays from the camera (`inverse_projection`, `window_ray`) through a `locate_grid` x `locate_grid` grid hit each visible `Aabb` in its `GlobalTransform` with a slab test (`box_hit_distance`); `ray_owner` gives each ray to the nearest hit. The click point is the target-owned point nearest the rectangle centre; `occluded` marks a centre owned by another entity.
+- Rays follow bevy_picking: a mesh whose `Pickable` has `should_block_lower: false` never covers unless it is a target member, and a box that holds the ray origin is not hit unless it carries `RayCastBackfaces`.
+- Exit 1 prints one stderr line: `off screen`, `behind the camera`, `covered by <name or entity:id>`, `no clear click point on <selector>` (no ray hits a box), or the no-visible-mesh-bounds failure with its parent hint. Exit 2 is a refused request.
+- Selectors: `<outer>/<inner>` keeps inner matches under the one outer match; a missing outer prints `<scoped>: outer X found nothing`. A Show scope also reaches the entities whose `DrawnByShow` names it, plus their descendants; a Hana that does not reflect `DrawnByShow` reaches only the Show's children, and the failure text says so. `tool:<Kind>#-n` counts from the newest tool of that kind.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `locate`, `project_bounds`, the ray and box hit test, scoped and `#-n` selectors
+- `scripts/hana_shot/test_hana_shot.py` — locate tests on the `Fake` BRP
+- `config/hana_shot.conf` — `locate_grid=9`
+- `commands/hana_shot.md` — the selector list and the locate item
+
+**Gotchas:**
+- The hit test uses each mesh's box, not its triangles, so a point near a round edge can miss.
+- `covered by` means a click hits the cover. A cable drag can still land on a covered jack, because Hana's drop rule picks the nearest jack under the hit's root; locate does not model that rule. The Show's rear jack reads `covered by Tool Visual Root` for this reason.
+- The default scene holds its own Shapes and Shows, so a new tool is `#-1`, not `#1`.
+- A beamed part is not a child of its Show; it carries `DrawnByShow` (`hana_mimesis_tools::show::DrawnByShow`), reflected from Hana 5593161498.
+
+**Ruled out:** a triangle hit test; moving the camera to make a target clear.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 

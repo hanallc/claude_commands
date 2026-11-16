@@ -26,9 +26,10 @@ process_start() {
 label=user
 if (( agent_call )); then
     source ${gate_source:h}/../../lib/conf.sh
+    # A refusal about the placement names the queue route; a failed check names its cause only.
     refuse() {
         local refusal=$(conf_value mac_gate refusal_exit_code) || exit 2
-        print -u2 -r -- "mac cargo gate refused: $1; run it through mac_queue_run.py"
+        print -u2 -r -- "mac cargo gate refused: $1${2-; run it through mac_queue_run.py}"
         exit $refusal
     }
     placement=${MAC_PLACEMENT:-}
@@ -61,9 +62,10 @@ if (( agent_call )); then
         limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
         answer=$state/answer-$$-$EPOCHREALTIME-$RANDOM
         timed_out=$answer.timeout
+        errors=$answer.errors
         # No signal handler: the check and its timer share this process group, so a
         # group signal ends them; a later call removes answer files left past the limit.
-        /bin/zsh -c "$check_command --episode ${(q)episode} --attempt ${(q)attempt}" > "$answer" 2>/dev/null &
+        /bin/zsh -c "$check_command --episode ${(q)episode} --attempt ${(q)attempt}" > "$answer" 2> "$errors" &
         check_pid=$!
         ( zmodload zsh/zselect; zselect -t $(( limit * 100 ));
           print timeout > "$timed_out"; kill -TERM "$check_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
@@ -72,10 +74,16 @@ if (( agent_call )); then
         check_status=$?
         kill -TERM "$timer_pid" 2>/dev/null
         wait "$timer_pid" 2>/dev/null
-        reason=''
+        reason='' timer_fired=0 newline=$'\n'
+        [[ ! -e $timed_out ]] || timer_fired=1
         answer_text=$(< "$answer")
-        rm -f -- "$answer" "$timed_out"
-        parse_answer "$answer_text" "$check_status" || refuse "no answer in ${limit}s"
+        error_text=$(< "$errors")
+        rm -f -- "$answer" "$timed_out" "$errors"
+        if ! parse_answer "$answer_text" "$check_status"; then
+            (( ! timer_fired )) || refuse "no answer in ${limit}s" ''
+            (( check_status > 1 )) || refuse 'invalid placement answer' ''
+            refuse "placement check failed with status $check_status${error_text:+: ${error_text##*$newline}}" ''
+        fi
         [[ -z $reason ]] || refuse "$reason"
         print -r -- "$EPOCHREALTIME"$'\t'"$placement" > "$cache_file.$$"
         mv -f -- "$cache_file.$$" "$cache_file"

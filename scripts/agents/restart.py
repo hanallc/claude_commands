@@ -679,10 +679,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
+            launch_seconds = (max(start_seconds, settings.number("OPENING_PROMPT_SECONDS"))
+                              if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
                 trust_arguments(kind, str(folder), arguments),
                 opening if kind == "claude" else NO_RESTART_MESSAGE,
-                int(operation_deadline.remaining(start_seconds) * 1000), agent=row.name,
+                int(operation_deadline.remaining(launch_seconds) * 1000), agent=row.name,
                 reported_unknown=(current.reason if isinstance(current, herdr.UnknownConversation) else
                                   live.reason if isinstance(live, herdr.UnknownConversation) else ""),
                 codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, client=client)
