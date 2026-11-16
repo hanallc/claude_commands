@@ -312,6 +312,50 @@ with patch, build_slots.take_slot(source, 'HEAD', showrunner='builds', unit='que
                 self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
                 self.assertEqual(build_folders.build_folder_state(path), "free")
 
+    def test_stalled_git_times_out_and_releases_each_slot_lock(self) -> None:
+        real_git = shutil.which("git")
+        assert real_git is not None
+        binary = self.root / "bin"
+        binary.mkdir()
+        fake_git = binary / "git"
+        _ = write_config_fixture(self.settings, "git_timeout_seconds=0.1\n")
+        for action in ("origin", "reset", "recovery", "sweep"):
+            with self.subTest(action=action):
+                with self.take() as slot:
+                    path = slot.path
+                    _ = (path / "change.txt").write_text("keep this source\n")
+                    _ = (slot.cargo_dir / "keep").write_text("cached output\n")
+                self.age_lease(path)
+                if action == "recovery":
+                    lease = self.lease(path)
+                    lease["ready"] = False
+                    _ = build_slots.lease_path(path).write_text(json.dumps(lease))
+                command = "remote" if action == "origin" else "status"
+                _ = fake_git.write_text(
+                    f"#!{sys.executable}\nimport os, sys, time\n"
+                    + f"if {command!r} in sys.argv: time.sleep(1)\n"
+                    + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+                fake_git.chmod(0o755)
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}):
+                    if action == "sweep":
+                        with redirect_stderr(output):
+                            build_slots.sweep_slots()
+                        self.assertIn("timed out after 0.1 s", output.getvalue())
+                        self.assertIn(str(path), output.getvalue())
+                    else:
+                        error_type = build_slots.SlotGitFailure if action == "origin" else git_rescue.RescueError
+                        with self.assertRaises(error_type) as raised:
+                            with self.take():
+                                self.fail("the stalled Git command did not time out")
+                        self.assertIn("timed out after 0.1 s", str(raised.exception))
+                        self.assertIn(str(self.source if action == "origin" else path), str(raised.exception))
+                self.assertEqual((path / "change.txt").read_text(), "keep this source\n")
+                self.assertEqual((slot.cargo_dir / "keep").read_text(), "cached output\n")
+                self.assertEqual(build_folders.build_folder_state(path), "free")
+                with self.take() as reused:
+                    self.assertEqual(reused.path, path)
+
     def test_a_damaged_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
         for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):
             with self.subTest(index=damaged):

@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 from typing import cast, override
 import unittest
@@ -13,6 +15,7 @@ from unittest import mock
 from scripts.lib import git_rescue
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class GitRescueTests(unittest.TestCase):
@@ -69,6 +72,35 @@ class GitRescueTests(unittest.TestCase):
         self.assertIsInstance(result, git_rescue.NothingToSave)
         self.assertEqual(self.git(self.source, "for-each-ref", "refs/rescue/"), "")
         self.assertEqual((generated / "object.o").read_bytes(), b"build output")
+
+    def test_stalled_git_reports_the_command_and_configured_timeout(self) -> None:
+        environment = config_environment(self.root / "config")
+        settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        binary = self.root / "bin"
+        binary.mkdir()
+        fake_git = binary / "git"
+        _ = (self.slot / "tracked.txt").write_text("keep this edit\n")
+        before_index = self.index_bytes()
+        for command, timeout in (("status", 0.1), ("commit-tree", 0.2)):
+            with self.subTest(command=command, timeout=timeout):
+                _ = write_config_fixture(settings, f"git_timeout_seconds={timeout}\n")
+                _ = fake_git.write_text(
+                    f"#!{sys.executable}\nimport os, sys, time\n"
+                    + f"if {command!r} in sys.argv: time.sleep(1)\n"
+                    + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+                fake_git.chmod(0o755)
+                with mock.patch.dict(os.environ, {**environment,
+                        "PATH": str(binary) + os.pathsep + os.environ["PATH"]}):
+                    with self.assertRaises(git_rescue.RescueError) as raised:
+                        _ = git_rescue.rescue(self.slot, "timeout")
+                self.assertIn(command, raised.exception.command)
+                self.assertIn(str(self.slot), str(raised.exception))
+                self.assertEqual(raised.exception.stderr, f"timed out after {timeout:g} s")
+                self.assertEqual((self.slot / "tracked.txt").read_text(), "keep this edit\n")
+                self.assertEqual(self.index_bytes(), before_index)
+                self.assertEqual(self.git(self.source, "for-each-ref", "refs/rescue/timeout"), "")
 
     def test_restore_keeps_local_commit_index_worktree_and_untracked_source(self) -> None:
         _ = (self.slot / "local.txt").write_text("local commit\n")

@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import tempfile
 
-from scripts.lib import git_files, git_index
+from scripts.lib import conf, git_files, git_index
 
 
 _OPERATION_HEAD_FILES = (
@@ -60,9 +60,12 @@ def _git(work_tree: Path, *arguments: str, data: bytes = b"", index: Path | None
     environment = dict(os.environ)
     if index is not None:
         environment["GIT_INDEX_FILE"] = str(index)
+    timeout = conf.read_or_repository("build_folders").number("git_timeout_seconds")
     try:
         result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                env=environment, check=False)
+                                env=environment, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RescueError(command, f"timed out after {timeout:g} s") from error
     except OSError as error:
         raise RescueError(command, str(error)) from error
     if result.returncode not in accepted:

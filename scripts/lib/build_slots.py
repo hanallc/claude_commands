@@ -161,8 +161,12 @@ def _pool(source: Path) -> RepositoryPool:
     machine = host_name()
     root = configured_slot_root()
     main = source_checkout(source)
-    origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
-                            capture_output=True, text=True)
+    timeout = settings.number("git_timeout_seconds")
+    try:
+        origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise SlotGitFailure(f"git remote get-url origin in {main}: timed out after {timeout:g} s") from error
     if origin.returncode not in (0, 2):
         origin.check_returncode()
     repository = (origin.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")

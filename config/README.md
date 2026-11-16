@@ -203,6 +203,14 @@ Mac host and SSH settings remain in `mac_test.conf`.
 | `clone_max_hours` | Maximum idle age of a test clone. |
 
 
+## build_folders.conf
+
+`scripts/lib/build_slots.py` and `scripts/lib/git_rescue.py` read this setting through `scripts/lib/conf.py`.
+
+| Key | Meaning |
+| --- | --- |
+| `git_timeout_seconds` | Maximum seconds for a slot origin query or a rescue Git command. |
+
 ## scratch.conf
 
 `scripts/lib/scratch.py` reads these settings through `scripts/lib/conf.py`.
