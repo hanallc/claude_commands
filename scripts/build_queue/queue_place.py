@@ -209,12 +209,11 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
 
 
 @contextmanager
-def queue_place_folder(prefix: str) -> Generator[Path]:
+def queue_place_folder() -> Generator[Path]:
     """Allocate and remove the folder without installing a signal handler."""
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            path = cleanup.enter_context(build_folders.temporary_build_folder(
-                build_folders.UniqueBuildFolder(prefix=prefix)))
+            path = cleanup.enter_context(build_folders.tool_folder("queue-place"))
         yield path
 
 
@@ -556,9 +555,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     start = admission_records.process_start_time(pid)
     if start is None:
         raise QueuePlaceRefused("owner no longer exists")
-    prefix = f"{build_folders.FOLDER_PREFIXES['queue-place']}{pid}-{start}-"
     # The reservation ends before its folder: the service can read the sidecar until release.
-    with queue_place_folder(prefix) as temporary, ExitStack() as reservation:
+    with queue_place_folder() as temporary, ExitStack() as reservation:
         sidecar = temporary / "program.cgroup"
         atomic_file.atomic_sample(sidecar, "")
         grant: HeldReservation | UnreservedProgram = UnreservedProgram()

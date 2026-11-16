@@ -120,7 +120,7 @@ def pinned_version() -> str | None:
 
 def run_process(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
     with subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, stdin=subprocess.DEVNULL, start_new_session=True) as process:
+                          text=True, stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:

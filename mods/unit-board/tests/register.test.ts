@@ -8,7 +8,7 @@ const start = { cwd: CWD, surface: null, isInteractive: false } as const;
 const turn: TurnCompleteInput = { answer: "work finished", reason: "answer", durationMs: 100,
   isAborted: false, turnId: "test-turn" };
 
-describe("build queue lifecycle", () => {
+describe("unit-board plugin", () => {
   test("startup registers no commands", async ($, on) => {
     mock.env(on, { HOME: "/test-home" });
     const registered: string[] = [];
@@ -22,6 +22,17 @@ describe("build queue lifecycle", () => {
     await $.session.start(start);
     expect(registered).toEqual([]);
   });
+
+  for (const retired of ["build:queue", "showrunner:accounts"]) {
+    test(`the retired ${retired} command does not open a pane`, async ($, on) => {
+      const host = hostEngine(on);
+      on("process.run", () => { throw new Error("A retired command must not run a process."); });
+      on("command.run", () => ({ text: "Command not handled by the mod." }));
+      expect(await $.command.run({ ...command(), command: retired }))
+        .toEqual({ text: "Command not handled by the mod." });
+      expect(host.opened).toEqual([]);
+    });
+  }
 
   test("an unrelated command does not open a pane", async ($, on) => {
     const host = hostEngine(on);

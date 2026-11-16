@@ -347,6 +347,9 @@ Its saved-result key includes `--run-ignored only`.
 `test [<package>] --mac "<why>"` runs only on the Mac. The reason is required and appears only in the first routing line.
 A busy Mac waits in `waiting_mac`. The wait uses a Bash sleep and the current target reservation checks.
 Each poll reads the runner result again. All other declines refuse the call with exit 2 and name the cause.
+A retry backoff does not refuse at once. `build_targets.py probe-backoff --target mac` probes the Mac one time.
+A pass clears the backoff and the failed probe mark, and the call waits for placement.
+A failed probe refuses the call as unreachable. Movable steps skip the Mac during the backoff, as before.
 A Mac-only call never runs on natedev, takes a local build token, enters memory admission, or starts a copy watcher.
 TERM, INT and HUP end the wait and record the caller's signal.
 
@@ -564,7 +567,7 @@ The token boundary, local repair rule, and step records remain in verify.sh.
 
 A failed reach writes `failed_probe` in the target state folder.
 The record has no expiry time.
-A successful `probe_mac` removes it.
+A successful `probe_mac` or a passed Mac-only backoff probe removes it and the retry backoff.
 An unresolved startup or an interrupted target keeps the record unchanged.
 
 A tool version mismatch writes `version-decline-<repository>` in the same folder.

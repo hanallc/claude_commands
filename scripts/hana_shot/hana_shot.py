@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
-from functools import cache
+from functools import cache, cached_property
 import http.client
 import json
 import math
@@ -48,7 +48,10 @@ EDITOR_CAMERA = "hana::camera::editor_camera::EditorCamera"
 GLOBAL_TRANSFORM = "bevy_transform::components::global_transform::GlobalTransform"
 CAMERA = "bevy_camera::camera::Camera"
 AABB = "bevy_camera::primitives::Aabb"
+PICKABLE = "bevy_picking::Pickable"
+RAY_CAST_BACKFACES = "bevy_picking::mesh_picking::ray_cast::RayCastBackfaces"
 CHILD_OF = "bevy_ecs::hierarchy::ChildOf"
+DRAWN_BY_SHOW = "hana_mimesis_tools::show::DrawnByShow"
 NAME = "bevy_ecs::name::Name"
 VIEW_VISIBILITY = "bevy_camera::visibility::ViewVisibility"
 INHERITED_VISIBILITY = "bevy_camera::visibility::InheritedVisibility"
@@ -68,7 +71,8 @@ MODES = ("fit", "pose", "hana-frame", "home")
 FACES = ("+x", "-x", "+y", "-y", "+z", "-z")
 CROPS = ("entity", "none")
 SELECTOR = re.compile(r"(name|marker|tool|entity):(.+)")
-TOOL_INDEX = re.compile(r"(.+)#([1-9][0-9]*)")
+SELECTOR_SCOPE = re.compile(r"/(?=(?:name|marker|tool|entity):)")
+TOOL_INDEX = re.compile(r"(.+)#(-?[1-9][0-9]*)")
 WINDOW_SIZE = re.compile(r"([1-9][0-9]{1,4})x([1-9][0-9]{1,4})")
 VIEW_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -79,7 +83,7 @@ VIEW_KEYS = (
 VIEWS_HEADER = """\
 # Known Hana camera views for hana_shot (~/.claude/scripts/hana_shot/hana_shot.py).
 # `hana_shot.py views add` writes a view; `views check` stamps `verified` on a pass.
-# Prefer fit views: they follow their target. Selectors: name:, marker:, tool:<Kind>[#n].
+# Prefer fit views: they follow their target. Selectors: name:, marker:, tool:<Kind>[#n or #-n].
 # face = "+z" faces the target's local +z side; replaces world yaw/pitch in fit or pose.
 """
 
@@ -502,6 +506,7 @@ class CameraState(NamedTuple):
     size: tuple[int, int]
     viewport_set: bool
     orbit_cam: OrbitCamValue
+    scale_factor: float
 
 
 class Sample(NamedTuple):
@@ -536,10 +541,57 @@ class RemoteFile(NamedTuple):
 
 
 class Bounds(NamedTuple):
-    """The hierarchy data a crop needs: parents by child, and visible boxes by entity."""
+    """The visible hierarchy and its mesh picking rules."""
 
     parents: dict[int, int]
     boxes: dict[int, tuple[list[float], AabbValue]]
+    pass_through: frozenset[int] = frozenset()
+    backfaces: frozenset[int] = frozenset()
+
+
+class ProjectedBounds(NamedTuple):
+    left: float
+    top: float
+    right: float
+    bottom: float
+    behind_camera: bool
+    has_boxes: bool
+
+
+class RayHit(NamedTuple):
+    entity: int
+    distance: float
+
+
+@dataclass(frozen=True)
+class RayMiss:
+    """The ray hits no visible box."""
+
+
+class LogicalPoint(TypedDict):
+    x: float
+    y: float
+
+
+class LogicalRect(LogicalPoint):
+    width: float
+    height: float
+
+
+class LogicalWindow(TypedDict):
+    width: float
+    height: float
+
+
+class LocateReply(TypedDict):
+    selector: str
+    entity: int
+    rect: LogicalRect
+    click: LogicalPoint
+    scale_factor: float
+    window: LogicalWindow
+    clipped: bool
+    occluded: bool
 
 
 @dataclass(frozen=True)
@@ -775,6 +827,7 @@ def camera_state(components: dict[str, object]) -> CameraState:
         (width, height),
         camera["viewport"] is not None,
         orbit_cam,
+        target_info["scale_factor"],
     )
 
 
@@ -791,11 +844,14 @@ class Session:
         self.keep_awake: subprocess.Popen[bytes] | None = None
         self.camera: int = 0
         self.frame_ms: float | None = None
-        self.tool_types: list[str] | None = None
         self.rect_support: bool | None = None
         self.last_move: tuple[object, ...] | None = None
         self.last_state: CameraState | None = None
         self.window_level: WindowLevelPending | WindowLeftAlone | WindowRaised = WindowLevelPending()
+
+    @cached_property
+    def registered_components(self) -> list[str]:
+        return cast(list[str], self.brp.call("world.list_components"))
 
     def start(self) -> CameraState:
         system = None if self.remote is None else worker_pool().submit(remote_system, self.remote, hana_shot_settings=self.settings)
@@ -1007,9 +1063,13 @@ class Selector(NamedTuple):
 
 
 def parse_selector(text: str) -> Selector:
+    parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        _ = parse_selector(parts[0])
+        return parse_selector(parts[1])
     match = SELECTOR.fullmatch(text)
     if match is None:
-        raise Refused(f"selector {text!r} must be name:<Name>, marker:<type path>, tool:<Kind>[#n] or entity:<id>")
+        raise Refused(f"selector {text!r} must be name:<Name>, marker:<type path>, tool:<Kind>[#n or #-n] or entity:<id>")
     kind, value = match.group(1), match.group(2)
     ordinal: int | None = None
     if kind == "tool":
@@ -1035,11 +1095,9 @@ class ToolRow(NamedTuple):
 
 
 def tool_rows(session: Session) -> list[ToolRow]:
-    if session.tool_types is None:
-        registered = cast(list[str], session.brp.call("world.list_components"))
-        session.tool_types = [path for path in registered if path.startswith(TOOL_PREFIX)]
+    tool_types = [path for path in session.registered_components if path.startswith(TOOL_PREFIX)]
     rows = session.brp.query({
-        "data": {"option": [*session.tool_types, NAME, CHILD_OF], "has": [AABB]},
+        "data": {"option": [*tool_types, NAME, CHILD_OF], "has": [AABB]},
         "filter": {"with": [SWITCH_SLIDER]},
     })
     tools: list[ToolRow] = []
@@ -1055,6 +1113,24 @@ def tool_rows(session: Session) -> list[ToolRow]:
 
 def resolve(session: Session, text: str) -> list[Target]:
     """Every entity the selector names right now; ids change on every launch."""
+    parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        outer, inner = parts
+        roots = resolve(session, outer)
+        if not roots:
+            return []
+        try:
+            root = require_one(session, outer, roots)
+        except Failure as exc:
+            raise Failure(f"{text}: outer {exc}") from exc
+        parents = session.brp.query({"data": {"components": [CHILD_OF]}})
+        parent_map = {row["entity"]: cast(int, row["components"][CHILD_OF]) for row in parents}
+        scope = descendants(parent_map, root.entity)
+        if DRAWN_BY_SHOW in session.registered_components:
+            for row in session.brp.query({"data": {"components": [DRAWN_BY_SHOW]}}):
+                if row["components"][DRAWN_BY_SHOW] == root.entity:
+                    scope.update(descendants(parent_map, row["entity"]))
+        return [Target(target.entity, text, target.has_aabb) for target in resolve(session, inner) if target.entity in scope]
     selector = parse_selector(text)
     evidence = session.brp.target_evidence
     evidence.selector_candidates = []
@@ -1090,9 +1166,9 @@ def resolve(session: Session, text: str) -> list[Target]:
         if tool.kind.lower() == wanted or tool.definition.lower() == wanted
     ]
     if selector.ordinal is not None:
-        if selector.ordinal > len(matches):
+        if abs(selector.ordinal) > len(matches):
             return []
-        matches = [matches[selector.ordinal - 1]]
+        matches = [matches[selector.ordinal - 1 if selector.ordinal > 0 else selector.ordinal]]
     return [Target(tool.entity, text, tool.has_aabb) for tool in matches]
 
 
@@ -1111,12 +1187,15 @@ def closest_target_hint(evidence: TargetEvidence, text: str, *,
 
 
 def resolve_one(session: Session, shot: Shot) -> Target | None:
-    hana_shot_settings = session.settings
     if shot.target is None:
         return None
     targets = resolve(session, shot.target)
     if not targets and shot.setup is not None:
         targets = run_setup(session, shot)
+    return require_one(session, shot.target, targets)
+
+
+def require_one(session: Session, text: str, targets: list[Target]) -> Target:
     if len(targets) != 1:
         evidence = session.brp.target_evidence
         found = ", ".join(
@@ -1124,12 +1203,21 @@ def resolve_one(session: Session, shot: Shot) -> Target | None:
         ) or "nothing"
         hint = ""
         if not targets:
-            selector = parse_selector(shot.target)
+            selector = parse_selector(text)
             if selector.kind == "entity":
                 hint = "; entity ids change when Hana restarts; select by name:, tool: or marker: instead"
             else:
-                hint = closest_target_hint(evidence, shot.target, hana_shot_settings=hana_shot_settings)
-        raise Failure(f"{shot.target} must name exactly one entity; found {found}{hint}")
+                hint = closest_target_hint(evidence, text, hana_shot_settings=session.settings)
+            parts = SELECTOR_SCOPE.split(text, maxsplit=1)
+            if len(parts) == 2:
+                roots = resolve(session, parts[0])
+                if not roots:
+                    hint += f"; {text}: outer {parts[0]} found nothing"
+                elif DRAWN_BY_SHOW not in session.registered_components and any(
+                    tool.entity == roots[0].entity and tool.kind == "Show" for tool in tool_rows(session)
+                ):
+                    hint += "; this Hana does not reflect DrawnByShow, so a Show scope reaches only its children"
+        raise Failure(f"{text} must name exactly one entity; found {found}{hint}")
     return targets[0]
 
 
@@ -1160,12 +1248,15 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
 
 
 def start_bounds(session: Session) -> tuple[Future[list[QueryRow]], Future[list[QueryRow]]]:
+    has = [OUTSIDE_FIT_BOUNDS]
+    if RAY_CAST_BACKFACES in session.registered_components:
+        has.append(RAY_CAST_BACKFACES)
     parents = worker_pool().submit(session.brp.query, {"data": {"components": [CHILD_OF]}})
     boxes = worker_pool().submit(session.brp.query, {
         "data": {
             "components": [AABB, GLOBAL_TRANSFORM],
-            "option": [VIEW_VISIBILITY, INHERITED_VISIBILITY],
-            "has": [OUTSIDE_FIT_BOUNDS],
+            "option": [VIEW_VISIBILITY, INHERITED_VISIBILITY, PICKABLE],
+            "has": has,
         },
     })
     return parents, boxes
@@ -1176,6 +1267,8 @@ def finish_bounds(futures: tuple[Future[list[QueryRow]], Future[list[QueryRow]]]
     for row in futures[0].result():
         parents[row["entity"]] = cast(int, row["components"][CHILD_OF])
     boxes: dict[int, tuple[list[float], AabbValue]] = {}
+    pass_through: set[int] = set()
+    backfaces: set[int] = set()
     for row in futures[1].result():
         components = row["components"]
         if row.get("has", {}).get(OUTSIDE_FIT_BOUNDS, False):
@@ -1183,7 +1276,11 @@ def finish_bounds(futures: tuple[Future[list[QueryRow]], Future[list[QueryRow]]]
         if not visible(components.get(VIEW_VISIBILITY), components.get(INHERITED_VISIBILITY)):
             continue
         boxes[row["entity"]] = (cast(list[float], components[GLOBAL_TRANSFORM]), cast(AabbValue, components[AABB]))
-    return Bounds(parents, boxes)
+        if cast(dict[str, object], components.get(PICKABLE, {})).get("should_block_lower") is False:
+            pass_through.add(row["entity"])
+        if row.get("has", {}).get(RAY_CAST_BACKFACES, False):
+            backfaces.add(row["entity"])
+    return Bounds(parents, boxes, frozenset(pass_through), frozenset(backfaces))
 
 
 def visible(view: object, inherited: object) -> bool:
@@ -1284,13 +1381,12 @@ def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | No
     return clip_x / clip_w, clip_y / clip_w
 
 
-def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence) -> Rect:
-    """Pixel rectangle around the visible boxes under root, as the fit measures them."""
-    if state.viewport_set:
-        raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
+def project_bounds(bounds: Bounds, root: int, state: CameraState) -> ProjectedBounds:
+    """Project front-facing corners of visible boxes under the target."""
     width, height = state.size
     left, top, right, bottom = math.inf, math.inf, -math.inf, -math.inf
     any_box = False
+    behind = False
     for entity in descendants(bounds.parents, root):
         entry = bounds.boxes.get(entity)
         if entry is None:
@@ -1304,18 +1400,30 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, 
                     local = (center[0] + sx * half[0], center[1] + sy * half[1], center[2] + sz * half[2])
                     ndc = project(state.clip_from_view, inverse_affine_point(state.transform, affine_point(transform, local)))
                     if ndc is None:
-                        left, top, right, bottom = 0.0, 0.0, float(width), float(height)
+                        behind = True
                         continue
                     px = (ndc[0] + 1) * 0.5 * width
                     py = (1 - ndc[1]) * 0.5 * height
                     left, right = min(left, px), max(right, px)
                     top, bottom = min(top, py), max(bottom, py)
-    if not any_box:
+    return ProjectedBounds(left, top, right, bottom, behind, any_box)
+
+
+def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence) -> Rect:
+    """Pixel rectangle around the visible boxes under root, as the fit measures them."""
+    if state.viewport_set:
+        raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
+    width, height = state.size
+    projected = project_bounds(bounds, root, state)
+    if not projected.has_boxes:
         raise Failure(
             "the target has no visible mesh bounds to crop to"
             + evidence.parent_fit_hint(root)
             + next_step("rerun with --crop none to shoot without a crop")
         )
+    left, top, right, bottom = projected[:4]
+    if projected.behind_camera:
+        left, top, right, bottom = 0.0, 0.0, float(width), float(height)
     x0 = max(0, math.floor(left) - padding)
     y0 = max(0, math.floor(top) - padding)
     x1 = min(width, math.ceil(right) + padding)
@@ -1323,6 +1431,127 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, 
     if x1 - x0 < 2 or y1 - y0 < 2:
         raise Failure("the crop is empty: the target is off screen")
     return Rect(x0, y0, x1 - x0, y1 - y0)
+
+
+def inverse_projection(matrix: list[float]) -> list[list[float]]:
+    """Invert the column-major projection into rows for unprojection."""
+    rows = [[matrix[column * 4 + row] for column in range(4)]
+            + [float(row == column) for column in range(4)] for row in range(4)]
+    for column in range(4):
+        pivot = max(range(column, 4), key=lambda row: abs(rows[row][column]))
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        divisor = rows[column][column]
+        if divisor == 0:
+            raise Failure("the camera projection cannot be inverted")
+        rows[column] = [value / divisor for value in rows[column]]
+        for row in range(4):
+            if row != column:
+                factor = rows[row][column]
+                rows[row] = [value - factor * pivot_value for value, pivot_value in zip(rows[row], rows[column])]
+    return [row[4:] for row in rows]
+
+
+def window_ray(state: CameraState, inverse: list[list[float]], px: float, py: float) -> tuple[Vec3, Vec3]:
+    points: list[Vec3] = []
+    for depth in (1.0, 1e-3):
+        ndc = (2 * px / state.size[0] - 1, 1 - 2 * py / state.size[1], depth, 1.0)
+        view = [sum(value * coordinate for value, coordinate in zip(row, ndc)) for row in inverse]
+        points.append(affine_point(state.transform, (view[0] / view[3], view[1] / view[3], view[2] / view[3])))
+    if state.clip_from_view[15] == 0:
+        points[0] = (state.transform[9], state.transform[10], state.transform[11])
+    return points[0], points[1]
+
+
+def box_hit_distance(origin: Vec3, through: Vec3, transform: list[float], aabb: AabbValue, backfaces: bool) -> float:
+    """Return the ray's entry distance, or infinity when it misses the box."""
+    local_origin = inverse_affine_point(transform, origin)
+    local_through = inverse_affine_point(transform, through)
+    entry, exit_at = 0.0, math.inf
+    inside = True
+    for axis in range(3):
+        low = aabb["center"][axis] - aabb["half_extents"][axis]
+        high = aabb["center"][axis] + aabb["half_extents"][axis]
+        inside = inside and low <= local_origin[axis] <= high
+        direction = local_through[axis] - local_origin[axis]
+        if direction == 0:
+            if not low <= local_origin[axis] <= high:
+                return math.inf
+            continue
+        first, last = sorted(((low - local_origin[axis]) / direction, (high - local_origin[axis]) / direction))
+        entry, exit_at = max(entry, first), min(exit_at, last)
+        if entry > exit_at:
+            return math.inf
+    if inside and not backfaces:
+        return math.inf
+    local_hit = [local_origin[axis] + entry * (local_through[axis] - local_origin[axis]) for axis in range(3)]
+    hit = affine_point(transform, (local_hit[0], local_hit[1], local_hit[2]))
+    return math.dist(origin, hit)
+
+
+def ray_owner(bounds: Bounds, state: CameraState, inverse: list[list[float]], members: set[int], px: float, py: float) -> RayHit | RayMiss:
+    origin, through = window_ray(state, inverse, px, py)
+    nearest: RayHit | RayMiss = RayMiss()
+    for entity, (transform, aabb) in bounds.boxes.items():
+        if entity in bounds.pass_through and entity not in members:
+            continue
+        try:
+            distance = box_hit_distance(origin, through, transform, aabb, entity in bounds.backfaces)
+        except Failure:
+            continue
+        if math.isfinite(distance) and (isinstance(nearest, RayMiss) or distance < nearest.distance):
+            nearest = RayHit(entity, distance)
+    return nearest
+
+
+def locate_target(session: Session, target: Target, state: CameraState, bounds: Bounds) -> LocateReply:
+    if state.viewport_set:
+        raise Refused("the camera has a viewport; locate covers full-window cameras only")
+    projected = project_bounds(bounds, target.entity, state)
+    if not projected.has_boxes:
+        raise Failure("the target has no visible mesh bounds" + session.brp.target_evidence.parent_fit_hint(target.entity))
+    if projected.left == math.inf:
+        raise Failure("behind the camera" if projected.behind_camera else "off screen")
+    width, height = state.size
+    left, top = max(0.0, projected.left), max(0.0, projected.top)
+    right, bottom = min(float(width), projected.right), min(float(height), projected.bottom)
+    if right <= left or bottom <= top:
+        raise Failure("off screen")
+    center = ((left + right) / 2, (top + bottom) / 2)
+    inverse = inverse_projection(state.clip_from_view)
+    members = descendants(bounds.parents, target.entity)
+    owner = ray_owner(bounds, state, inverse, members, *center)
+    candidates: list[tuple[float, float]] = []
+    covered: dict[int, int] = {}
+    if isinstance(owner, RayHit) and owner.entity in members:
+        candidates.append(center)
+    occluded = isinstance(owner, RayHit) and owner.entity not in members
+    grid = session.settings.whole("locate_grid")
+    for column in range(grid):
+        for row in range(grid):
+            point = (left + (column + 0.5) * (right - left) / grid, top + (row + 0.5) * (bottom - top) / grid)
+            hit = ray_owner(bounds, state, inverse, members, *point)
+            if isinstance(hit, RayHit):
+                if hit.entity in members:
+                    candidates.append(point)
+                else:
+                    covered[hit.entity] = covered.get(hit.entity, 0) + 1
+    if not candidates:
+        if not covered:
+            raise Failure(f"no clear click point on {target.label}")
+        entity = max(covered, key=lambda item: covered[item])
+        evidence = session.brp.target_evidence
+        if entity not in evidence.names:
+            _ = session.brp.query({"data": {"components": [NAME]}})
+        raise Failure(f"covered by {evidence.names.get(entity, f'entity:{entity}')}")
+    click = min(candidates, key=lambda point: math.dist(point, center))
+    scale = state.scale_factor
+    return {
+        "selector": target.label, "entity": target.entity,
+        "rect": {"x": left / scale, "y": top / scale, "width": (right - left) / scale, "height": (bottom - top) / scale},
+        "click": {"x": click[0] / scale, "y": click[1] / scale},
+        "scale_factor": scale, "window": {"width": width / scale, "height": height / scale},
+        "clipped": projected.behind_camera or (left, top, right, bottom) != projected[:4], "occluded": occluded,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2463,6 +2692,7 @@ class Arguments(argparse.Namespace):
     from_current: bool = False
     replace: bool = False
     since: str | None = None
+    json: bool = False
 
 
 def parse_focus(text: str) -> Vec3:
@@ -2611,6 +2841,31 @@ def command_pose(args: Arguments, *,
     return 0
 
 
+def command_locate(args: Arguments, *,
+    hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> int:
+    assert args.target is not None
+    _ = parse_selector(args.target)
+    with instance(args.port, False, False, None, None, hana_shot_settings=hana_shot_settings) as brp:
+        session = Session(brp)
+        state = session.start()
+        orbit = state.orbit_cam
+        if (state.update_request != "None" or orbit["orbit"]["current"] != orbit["orbit"]["target"]
+                or orbit["pan"]["current"] != orbit["pan"]["target"] or orbit["zoom"]["current"] != orbit["zoom"]["target"]):
+            state = session.settle(state, 0).state
+        target = require_one(session, args.target, resolve(session, args.target))
+        reply = locate_target(session, target, state, finish_bounds(start_bounds(session)))
+        if args.json:
+            print(json.dumps(reply))
+        else:
+            rect, click = reply["rect"], reply["click"]
+            values = (rect["x"], rect["y"], rect["width"], rect["height"], click["x"], click["y"])
+            flags = (" clipped" if reply["clipped"] else "") + (" occluded" if reply["occluded"] else "")
+            print(f"{args.target} " + " ".join(f"{value:.1f}" for value in values)
+                  + f" scale {reply['scale_factor']}{flags}")
+    return 0
+
+
 def command_targets(args: Arguments, *,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
@@ -2620,7 +2875,7 @@ def command_targets(args: Arguments, *,
         print(f"camera  entity:{session.camera}")
         for tool in tool_rows(session):
             print(f"tool:{tool.kind}  {tool.definition}  id {tool.tool_id}  entity {tool.entity}")
-        registered = cast(list[str], brp.call("world.list_components"))
+        registered = session.registered_components
         for path in sorted(item for item in registered if item.endswith("Shield") and "<" not in item):
             if len(brp.query({"data": {}, "filter": {"with": [path]}})) == 1:
                 print(f"marker:{path}")
@@ -2925,7 +3180,7 @@ def add_shot_flags(parser: argparse.ArgumentParser, *,
 ) -> None:
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
-    _ = parser.add_argument("--target", help="selector: name:<Name>, marker:<type path>, tool:<Kind>[#n], entity:<id>")
+    _ = parser.add_argument("--target", help="selector: name:<Name>, marker:<type path>, tool:<Kind>[#n or #-n], entity:<id>")
     _ = parser.add_argument("--mode", choices=MODES)
     _ = parser.add_argument("--face", choices=FACES, help="target-local side to face in fit or pose; replaces --yaw/--pitch")
     _ = parser.add_argument("--yaw", type=float)
@@ -2997,6 +3252,11 @@ def arguments(argv: list[str], *,
     targets = commands.add_parser("targets", help="list selectors that resolve right now")
     _ = targets.add_argument("--port", type=int, required=True)
 
+    locate = commands.add_parser("locate", help="print a target rectangle and a clear click point")
+    _ = locate.add_argument("--port", type=int, required=True)
+    _ = locate.add_argument("--target", required=True)
+    _ = locate.add_argument("--json", action="store_true")
+
     views = commands.add_parser("views", help="list, show, add or check stored views")
     _ = views.add_argument("action", choices=("list", "show", "add", "check"))
     _ = views.add_argument("name", nargs="?")
@@ -3060,6 +3320,7 @@ def main(argv: list[str]) -> int:
     handlers: dict[str, Callable[[Arguments], int]] = {
         "pose": partial(command_pose, hana_shot_settings=hana_shot_settings),
         "targets": partial(command_targets, hana_shot_settings=hana_shot_settings),
+        "locate": partial(command_locate, hana_shot_settings=hana_shot_settings),
         "stats": command_stats,
         "launch": partial(command_launch, hana_shot_settings=hana_shot_settings),
         "shutdown": partial(command_shutdown, hana_shot_settings=hana_shot_settings),

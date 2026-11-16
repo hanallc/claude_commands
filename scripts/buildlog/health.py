@@ -39,6 +39,7 @@ class Machine(StrEnum):
 
 @dataclass(frozen=True)
 class RecorderHealthSnapshot:
+    """The snapshot holds the machine, creation time, unfinished records, and error times."""
     machine: Machine
     generated_at: float
     unfinished_records: int
@@ -50,16 +51,19 @@ class RecorderHealthSnapshot:
 
 @dataclass(frozen=True)
 class FreshRecorderHealth:
+    """The recorder health snapshot is current."""
     snapshot: RecorderHealthSnapshot
 
 
 @dataclass(frozen=True)
 class StaleRecorderHealth:
+    """The recorder health snapshot is stale."""
     snapshot: RecorderHealthSnapshot
 
 
 @dataclass(frozen=True)
 class RecorderHealthUnavailable:
+    """This machine has no usable recorder health snapshot."""
     machine: Machine
 
 
