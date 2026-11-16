@@ -802,12 +802,17 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
     An open sent phase with a successful final merge state has no merge row and contributes no pending merge.
+    A checkpoint on main has no merge row even when its phase remains open.
     `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
     A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
     Without a production name, the text ends with `not in the merge line`.
     A finished phase counts as merged through checkpoint ancestry, a successful result for its unit and phase, or a matching merge subject.
     A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
     The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+    The production document's `Showrunner checkout` supplies the repository for main and carried-commit checks.
+    A named phase dependency uses its owning production's checkout.
+    The board caches repository evidence and shares copied-checkpoint decisions with dependencies.
+    Exact successful results and matching merge subjects resolve open checkpoints before additional Git checks.
     An unreadable checkpoint stays unmerged.
     A successful result for the exact checkpoint hash counts, with or without a valid result time.
     Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
