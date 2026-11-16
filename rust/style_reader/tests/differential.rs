@@ -1,16 +1,22 @@
 //! Compare every reader fact with the production Python readers.
 
 use std::collections::BTreeMap;
-use std::error::Error;
 use std::io::Write;
 use std::path::Path;
-use std::process::Child;
 use std::process::Command;
-use std::process::Stdio;
 
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
+
+mod support;
+
+use support::ReapedChild;
+use support::TestResult;
+use support::git;
+use support::git_input;
+
+const HEAD_TREE_REVISION: &str = "HEAD^{tree}";
 
 const MODULES: &str = concat!(
     "mod lock;\n",
@@ -58,64 +64,18 @@ const BODIES: &str = concat!(
 );
 const BROKEN: &str = "fn cafe() { let café = 1; }\nfn unfinished() { /* no end";
 
-type TestResult<T> = Result<T, Box<dyn Error>>;
-
-fn git(repository: &Path, arguments: &[&str]) -> TestResult<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .output()?;
-    assert!(
-        output.status.success(),
-        "Git {arguments:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
-/// Reap the reader after an input error or a panic.
-struct ReaderChild(Child);
-
-impl Drop for ReaderChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn output_lines(mut command: Command, request: &Value) -> TestResult<BTreeMap<String, Value>> {
-    let mut child = ReaderChild(
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+fn reader_output(mut command: Command, request: &Value) -> TestResult<std::process::Output> {
+    let mut child = ReapedChild::spawn(&mut command)?;
     {
-        let mut input = child.0.stdin.take().ok_or("the reader has no stdin")?;
+        let mut input = child.input()?;
         serde_json::to_writer(&mut input, request)?;
         input.flush()?;
     }
-    let mut stdout = child.0.stdout.take().ok_or("the reader has no stdout")?;
-    let mut stderr = child.0.stderr.take().ok_or("the reader has no stderr")?;
-    let (stdout, stderr) = std::thread::scope(|scope| {
-        let errors = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut stderr, &mut bytes).map(|_| bytes)
-        });
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut stdout, &mut bytes).inspect_err(|_| {
-            let _ = child.0.kill();
-        })?;
-        let errors = errors.join().map_err(|_| "the stderr reader panicked")??;
-        Ok::<_, Box<dyn Error>>((bytes, errors))
-    })?;
-    let output = std::process::Output {
-        status: child.0.wait()?,
-        stdout,
-        stderr,
-    };
+    child.output()
+}
+
+fn output_lines(command: Command, request: &Value) -> TestResult<BTreeMap<String, Value>> {
+    let output = reader_output(command, request)?;
     assert!(
         output.status.success(),
         "reader failed: {}",
@@ -124,7 +84,10 @@ fn output_lines(mut command: Command, request: &Value) -> TestResult<BTreeMap<St
     let mut lines = BTreeMap::new();
     for line in String::from_utf8(output.stdout)?.lines() {
         let value: Value = serde_json::from_str(line)?;
-        let key = format!("{} {} {}", value["blob"], value["fact"], value["path"]);
+        let key = format!(
+            "{} {} {} {}",
+            value["blob"], value["fact"], value["path"], value["commit"]
+        );
         assert!(
             lines.insert(key.clone(), value).is_none(),
             "duplicate fact: {key}"
@@ -191,7 +154,18 @@ fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -
         std::fs::write(repository.join(name), source)?;
     }
     std::fs::write(repository.join("not_utf8.rs"), b"fn invalid() {}\xff")?;
+    std::fs::write(
+        repository.join("byte_words.md"),
+        b"shared \xff caf\xc3\xa9 under_score 42",
+    )?;
     std::fs::write(repository.join("ignored.txt"), "fn excluded() {}")?;
+    std::fs::write(
+        repository.join("notes.md"),
+        "# naïve_1\nWords in **Markdown**. T² ²shared xⅧ",
+    )?;
+    std::fs::create_dir(repository.join("folder"))?;
+    std::fs::write(repository.join("folder/nested.md"), "nested words")?;
+    std::fs::write(repository.join("folder.c"), "another entry")?;
     git(repository, &["add", "."])?;
     git(repository, &["commit", "-qm", "Add reader fixtures"])?;
     let first = git(repository, &["rev-parse", "HEAD"])?;
@@ -230,5 +204,61 @@ fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -
         "repository":repository, "commits":[first,second],
         "facts":["tokens","lines","names","module_scan","declarations","name_sites"],
         "module_sites":queries
-    }))
+    }))?;
+    let tree = git(repository, &["rev-parse", HEAD_TREE_REVISION])?;
+    compare(&json!({
+        "repository":repository, "commits":[first,second,tree], "trees":true,
+        "extensions":["rs","md"], "facts":["names"]
+    }))?;
+    let markdown = git(repository, &["rev-parse", "HEAD:notes.md"])?;
+    compare(&json!({
+        "repository":repository, "commits":[], "facts":["names"],
+        "blobs":[markdown, "1111111111111111111111111111111111111111"]
+    }))?;
+    compare(&json!({
+        "repository":repository, "commits":[first,second], "facts":["names"],
+        "extensions":["rs","md"], "name_word_class":"ascii"
+    }))?;
+    compare_unreadable_paths(repository)
+}
+
+fn compare_unreadable_paths(repository: &Path) -> TestResult<()> {
+    let blob = git_input(
+        repository,
+        &["hash-object", "-w", "--stdin"],
+        b"fn raw_path_words() {}",
+    )?;
+    let mut entries = Vec::new();
+    for path in [b"notes-\xff.txt".as_slice(), b"source-\xff.rs".as_slice()] {
+        entries.extend_from_slice(format!("100644 blob {blob}\t").as_bytes());
+        entries.extend_from_slice(path);
+        entries.push(0);
+    }
+    let raw_paths = git_input(repository, &["mktree", "-z"], &entries)?;
+    compare(&json!({
+        "repository":repository, "commits":[raw_paths], "facts":["names"]
+    }))?;
+    let request = json!({
+        "repository":repository, "commits":[raw_paths], "facts":[], "trees":true
+    });
+    let rust = reader_output(Command::new(env!("CARGO_BIN_EXE_style_reader")), &request)?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("the repository root is missing")?;
+    let mut python = Command::new("python3");
+    python
+        .current_dir(root)
+        .args(["-m", "scripts.style.style_reader_oracle"]);
+    let expected = reader_output(python, &request)?;
+    assert!(
+        !expected.status.success(),
+        "Python must reject a non-UTF-8 tree path"
+    );
+    assert_eq!(
+        rust.status.success(),
+        expected.status.success(),
+        "tree path decoding"
+    );
+    Ok(())
 }
