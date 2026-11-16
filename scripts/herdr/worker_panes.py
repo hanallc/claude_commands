@@ -297,7 +297,8 @@ def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
         except (BlockingIOError, worker_lifecycle.OperationDeadlineExpired):
             yield Kept("worker creation lock is held" if row is None else "dispatch lock is held")
             return
-        row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        if row is None:
+            row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         hold = WorkerLockHold(parent, name, operations, blocking=blocking)
         try:
             if row is not None:
