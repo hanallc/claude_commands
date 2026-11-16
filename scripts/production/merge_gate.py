@@ -1440,6 +1440,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
+    # Remove the free gate folders that a run ended by a signal left; a held folder costs one lock try.
+    build_folders.sweep_temporary_build_folders(tmpfs, wait=False)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()

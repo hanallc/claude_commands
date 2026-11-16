@@ -139,6 +139,26 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             admission.assert_not_called()
         self.assert_gate_released()
 
+    def test_suites_remove_free_gate_folders_before_admission_and_keep_held_ones(self) -> None:
+        parent = self.root / "gate-tmpfs"
+        parent.mkdir()
+        held = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "merge-gate-test-", build_folders.ExplicitBuildParent(parent)))
+        release = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
+        self.addCleanup(release, held)
+        free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "merge-gate-", build_folders.ExplicitBuildParent(parent)))
+        release(free)
+        with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=parent), \
+             mock.patch.object(merge_gate, "gate_reservation", side_effect=GateRefused("stopped at admission")):
+            with self.assertRaisesRegex(GateRefused, "stopped at admission"):
+                _ = merge_gate.run_suites(self.checkout)
+        self.assertFalse(free.exists())
+        self.assertFalse(free.with_name(free.name + ".lease.json").exists())
+        self.assertTrue(held.is_dir())
+        self.assert_gate_released()
+
     def test_gate_reservation_refuses_unusable_config_before_default_sizing_admission(self) -> None:
         config = self.root / "invalid-config" / "build_admission.conf"
         _ = write_config_fixture(config, "safety_gib=invalid")
