@@ -51,12 +51,16 @@ class Investigation:
     answer: str
 
 
+def state_root() -> Path:
+    """Return the root for all owners' investigation records."""
+    return Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+
+
 def folder(owner: staff.StaffId) -> Path:
     """Return the owner's investigation folder without creating it."""
     if not owner or Path(owner).name != owner or owner in (".", ".."):
         raise InvestigationError("invalid owner staff id")
-    root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
-    return root / owner / "investigations"
+    return state_root() / owner / "investigations"
 
 
 def _path(owner: staff.StaffId, identity: str) -> Path:
@@ -98,6 +102,15 @@ def load(owner: staff.StaffId, identity: str, *, sources: list[Path] | None = No
             raise ValueError("record identity differs from its path")
         if not item.title.strip() or item.title.splitlines() != [item.title]:
             raise ValueError("title must have one line")
+        for name, value, required in (
+                ("filed", item.filed, True),
+                ("answered", item.answered, item.state != InvestigationState.OPEN),
+                ("read", item.read, item.state == InvestigationState.READ)):
+            if required:
+                if datetime.fromisoformat(value).utcoffset() is None:
+                    raise ValueError(f"{name} must have a time zone")
+            elif value:
+                raise ValueError(f"{name} must be empty in state {item.state}")
         return item
     except (ValueError, KeyError) as error:
         raise InvestigationError(f"{identity}: invalid investigation: {error}") from None
