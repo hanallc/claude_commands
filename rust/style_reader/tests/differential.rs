@@ -119,16 +119,31 @@ fn compare(request: &Value) -> TestResult<()> {
     Ok(())
 }
 
-#[test]
-fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -> TestResult<()> {
-    let directory = TempDir::new()?;
-    let repository = directory.path();
-    git(repository, &["init", "-q"])?;
-    git(repository, &["config", "user.name", "Reader Test"])?;
-    git(
-        repository,
-        &["config", "user.email", "reader@example.invalid"],
-    )?;
+fn write_code_identity_fixtures(repository: &Path) -> TestResult<()> {
+    for (name, source) in [
+        (
+            "inner_docs.rs",
+            "//! naïve 😀\n/*! outer /* nested */ doc */\nfn work() {}\n//! end\n",
+        ),
+        (
+            "inner_docs_moved.rs",
+            "fn work() {}\n//! naïve 😀\n/*! outer /* nested */ doc */\n//! end\n",
+        ),
+        (
+            "outer_docs.rs",
+            "/// outer docs\n/* ordinary /*! inner-looking */ comment */\nfn work() {}",
+        ),
+        (
+            "literal_docs.rs",
+            "const TEXT: &str = \"//! text\"; // ordinary\n//! \u{7f}\n",
+        ),
+    ] {
+        std::fs::write(repository.join(name), source)?;
+    }
+    Ok(())
+}
+
+fn write_source_fixtures(repository: &Path) -> TestResult<()> {
     for (name, source) in [
         ("modules.rs", MODULES),
         ("paths.rs", PATHS),
@@ -153,7 +168,34 @@ fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -
     ] {
         std::fs::write(repository.join(name), source)?;
     }
-    std::fs::write(repository.join("not_utf8.rs"), b"fn invalid() {}\xff")?;
+    for (name, source) in [
+        ("not_utf8.rs", b"fn invalid() {}\xff".as_slice()),
+        (
+            "comment_not_utf8.rs",
+            b"fn work() { work(); } // \xff\n".as_slice(),
+        ),
+        (
+            "module_not_utf8.rs",
+            b"mod lock; // \xed\xa0\x80\n".as_slice(),
+        ),
+    ] {
+        std::fs::write(repository.join(name), source)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -> TestResult<()> {
+    let directory = TempDir::new()?;
+    let repository = directory.path();
+    git(repository, &["init", "-q"])?;
+    git(repository, &["config", "user.name", "Reader Test"])?;
+    git(
+        repository,
+        &["config", "user.email", "reader@example.invalid"],
+    )?;
+    write_source_fixtures(repository)?;
+    write_code_identity_fixtures(repository)?;
     std::fs::write(
         repository.join("byte_words.md"),
         b"shared \xff caf\xc3\xa9 under_score 42",
@@ -202,7 +244,7 @@ fn all_facts_match_python_on_declarations_paths_bodies_and_unreadable_source() -
     queries.push(json!({"blob":query_blob, "path":"src/query_only.rs", "moves":moves}));
     compare(&json!({
         "repository":repository, "commits":[first,second],
-        "facts":["tokens","lines","names","module_scan","declarations","name_sites"],
+        "facts":["tokens","lines","names","module_scan","declarations","name_sites","rust_code"],
         "module_sites":queries
     }))?;
     let tree = git(repository, &["rev-parse", HEAD_TREE_REVISION])?;

@@ -14,6 +14,7 @@ from typing import TextIO, cast
 import unittest
 
 from scripts.build_queue import admission_protocol as wire
+from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
@@ -112,8 +113,9 @@ class CargoLifetimeTests(unittest.TestCase):
                 self.assertEqual(ci_cargo_front.building_call(arguments), expected)
 
     def test_packaged_wrapper_selects_the_next_cargo_and_admits_once(self) -> None:
-        for use_shared, explicit in ((False, False), (True, False), (False, True)):
-            with self.subTest(use_shared=use_shared, explicit=explicit), AdmissionFixture() as fixture, fixture.serving():
+        for use_shared, explicit, reason in ((False, False, ""), (True, False, ""), (False, True, ""),
+                (False, False, "it edits the merged checkout on natedev with mend and fmt, and the push goes from there")):
+            with self.subTest(use_shared=use_shared, explicit=explicit, reason=reason), AdmissionFixture() as fixture, fixture.serving():
                 front_dir = fixture.root / "front-bin"
                 cargo_dir = fixture.root / "cargo-bin"
                 devshell_dir = fixture.root / "devshell-bin"
@@ -151,7 +153,8 @@ class CargoLifetimeTests(unittest.TestCase):
                     + ", 'a') as output:\n    output.write('\\n'.join(os.environ[name] for name in"
                     + " ('PATH', 'TMPDIR', 'PYTHONPATH')) + '\\n')\ndescendant = 0"))
                 cargo.chmod(0o755)
-                environment = {**os.environ, "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
+                environment = {**os.environ, "BUILD_QUEUE_LOCAL_REASON": reason,
+                    "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
                     "PATH": os.pathsep.join((str(front_dir), str(devshell_dir), str(shim_dir),
                                               str(cargo_dir), os.environ["PATH"]))}
                 child = subprocess.Popen([str(wrapper), "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -161,6 +164,8 @@ class CargoLifetimeTests(unittest.TestCase):
                 self.supply_front_memory(fixture, child)
                 with fixture.loop_turn():
                     record, = fixture.server.reservations.values()
+                    self.assertEqual(records.waiter_route(record.queue_waiter),
+                                     target_config.LocalRequired(reason) if reason else records.DIRECT_CARGO)
                     self.assertEqual(Path(record.sidecar).parent.parent, shared if use_shared else job_temporary)
                     if use_shared:
                         self.assertTrue(Path(record.sidecar).parent.name.startswith(
