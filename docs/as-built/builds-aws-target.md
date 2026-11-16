@@ -690,9 +690,12 @@ The user asked for these page changes on 2026-11-14 through builds:
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
    The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The lowest and the highest cell of each table have only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes.
-   The user asked for it on 2026-11-15 through builds. A legend line above the cards explains the colors.
-   A legend line under each price card that has a box names both outlines.
+   The cheapest cell of each table is bold on a gold background (`--cheapest`), with dark text.
+   The most expensive cell of each table is bold on a black background (`--dearest`) with white text and a 2 px white outline.
+   Both are the same in both themes, and they replace the scale color and the box of that cell.
+   The user asked for them on 2026-11-15 through builds, because bold alone did not make the cheapest cell stand out.
+   A legend line above the cards explains the colors.
+   A legend line under each price card that has a mark names the box, the gold cell and the black cell.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
    The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
@@ -711,7 +714,7 @@ A region filter at the top of the page shows all regions by default; the user as
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The colors and both outlines use only the chosen regions. `Table.values` holds the number of each cell.
+3. The colors, the box and the table marks use only the chosen regions. `Table.values` holds the number of each cell.
    One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
