@@ -201,10 +201,11 @@ def _new_suffix(length: int, settings: ConfigRead) -> str:
 def build_folder_path(spec: BuildFolderSpec) -> Path:
     """Apply the configured name rule without creating a folder."""
     settings = _settings()
+    if spec.kind == "slot":
+        _check_name(spec.repository)
+        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
-    if spec.kind == "slot":
-        return spec.parent / f"{spec.repository}-slot{spec.slot}"
     if spec.suffix_length < 0:
         raise ValueError("a suffix length cannot be negative")
     suffix = spec.suffix
