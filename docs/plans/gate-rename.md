@@ -1,6 +1,6 @@
 # Gate rename: merge_gate.py becomes gate.py, and targeted_test.py becomes a gate.py mode
 
-> **Status: APPROVED 2026-11-16 — sdlc agreed, and the user gave the go on the plan, the conf rename and "the gate" (through morty and builds). The user gave the go on the trial branch prefix at 15:49. The stored step names (decision 3) and the AWS box user name are NOT approved: they wait for the user's answer through morty, and natest holds those renames until then.** Seven chunks. Each chunk merges alone as a builds item and needs no quiet time.
+> **Status: APPROVED 2026-11-16 — sdlc agreed. The user (through morty and builds) gave the go on the plan, the conf rename and "the gate" (13:47), the trial branch prefix `aws-trial` (15:49), and the stored names `gate` and `test-affected`, the mode `gate.py --affected` and the box user `gate-box` (17:23). natest starts chunk 1 after its phase 315 work.** Seven chunks. Each chunk merges alone as a builds item and needs no quiet time.
 
 > **Request:** #108 part B, the user via morty and builds, 2026-11-16. Plan written by the verify unit.
 
@@ -78,15 +78,15 @@ Other names that carry the old name:
 
 1. **The replacement term for the prose "merge gate" is "the gate"** (plural "gates"; the AWS page label
    "Merge gates" becomes "Gates"). The user confirms this term with the plan.
-2. **The six jobs of `gate.py`:** the checkpoint merge (default), `--tests-only`, `--targeted` (was
-   `targeted_test.py`), `--nightly`, `--promote-only`, and `nightly-assign` / `nightly-assigned`. `--targeted`
+2. **The six jobs of `gate.py`:** the checkpoint merge (default), `--tests-only`, `--affected` (was
+   `targeted_test.py`; the user named it 17:23), `--nightly`, `--promote-only`, and `nightly-assign` / `nightly-assigned`. `--affected`
    follows the existing flag form of `--tests-only` and `--nightly`.
-3. **Stored step names: waits for the user's answer.** Today the records store `merge-gate` and `targeted-test`.
-   The verify unit proposed `gate` and `gate-targeted`; the user did not approve `gate-targeted`. The question to the
-   user (through morty, 2026-11-16 17:15): A. `gate` and `targeted` (the verify unit's recommendation: the same word
-   as the `--targeted` mode); B. `gate` and `gate-targeted`; C. keep `merge-gate` and `targeted-test`. With A or B,
-   old records get a migration once at deploy (chunk 4), and no reader keeps the old names. With C, chunk 4 has no
-   record step.
+3. **Stored step names (the user, 17:23, option D):** `merge-gate` becomes `gate`, and `targeted-test` becomes
+   `test-affected`, the user's job name "test affected" (#109). Old records get a migration once at deploy
+   (chunk 4); no reader keeps the old names. The config keys that hold the step names follow (13 keys on main
+   8416aab51): `program_first_peak_gib.*` and `peak_hold_seconds.*` in `build_admission.conf`, `prefixes.*` in
+   `build_folders.conf`, and `names.*`, `prose.*` and `owned.*` in `build_steps.conf`. Their values do not change.
+   A change of a value (for example the folder prefix `merge-gate-`) needs its own go.
 4. **`gate_modules` and `gate_trial` do not merge into `gate.py`.** See the answer below. `gate_trial.py`
    becomes `aws_trial.py` (chunk 7).
 5. **Matchers use the exact base name.** `gate.py` is short, and a substring match also hits `cloud_gate.py` and
@@ -124,15 +124,15 @@ chunk 2 commit and its own part of chunk 5. aws writes chunk 7.
 ### Chunk 1 — gate.py with the targeted mode, old names as thin entry points · owner: sdlc (scripts/production) · writer: natest
 
 1. `git mv` `merge_gate.py` to `gate.py`.
-2. Add the `--targeted` mode to `gate.py`. It does what `targeted_test.py` does: `run_tests_only` with the
+2. Add the `--affected` mode to `gate.py`. It does what `targeted_test.py` does: `run_tests_only` with the
    targeted suite mode, in a test run folder. `SuiteMode.MERGE_GATE` and `SuiteMode.TARGETED_TEST` become
-   `SuiteMode.GATE` and `SuiteMode.TARGETED`; their stored values change in chunk 4.
+   `SuiteMode.GATE` and `SuiteMode.TEST_AFFECTED`; their stored values change in chunk 4.
 3. `git mv` the two test-support files to `gate_test_support.py` and `gate_suites_test_support.py`, and the 13
-   test modules to `test_gate*.py`. `test_targeted_test.py` becomes `test_gate_targeted.py` and calls
-   `gate.py --targeted`.
+   test modules to `test_gate*.py`. `test_targeted_test.py` becomes `test_gate_affected.py` and calls
+   `gate.py --affected`.
 4. Make `merge_gate.py` a thin entry point: run as a script, it calls `gate.main()`; imported, it is the `gate`
    module (`sys.modules` alias). Make `targeted_test.py` a thin entry point that calls `gate.main()` with
-   `--targeted`.
+   `--affected`.
 5. Switch every caller inside `scripts/production` (`merge_checkpoint.py`, `land_runs.py`, `fast_track.py`,
    `affected_modules.py` and the tests) to the new names.
 6. Add `gate.py` next to the old names in the five process-name matchers (decision 5). This touches `build_queue`
@@ -152,7 +152,7 @@ chunk 2 commit and its own part of chunk 5. aws writes chunk 7.
 | sdlc (writer: devtools) | `hooks/*`, `lib/*` (`suite_runners.py`, `sitecustomize.py`), `maintenance/*`, `message/*`, `commands/*` |
 | natedev (nixos owner, through its showrunner) | `claude-nightly.nix`: `merge_gate.py --nightly` becomes `gate.py --nightly` |
 
-A caller of `targeted_test.py` calls `gate.py --targeted`. Each owner also corrects its own as-built docs that name
+A caller of `targeted_test.py` calls `gate.py --affected`. Each owner also corrects its own as-built docs that name
 the files (21 as-built files). Old plan docs stay.
 
 ### Chunk 3 — names inside the gate · owner: sdlc · writer: natest
@@ -169,7 +169,7 @@ the files (21 as-built files). Old plan docs stay.
    `~/.local/state/gate` in one `rename(2)` (same file system, atomic).
 2. A gate that runs at deploy holds the gate lock, so the step waits for that one gate. That is not a quiet time:
    the land queue holds new gates for that wait only.
-3. If the user's answer to decision 3 changes the names, the same step rewrites the stored step names in the buildlog call records and the admission records.
+3. The same step rewrites the stored step names (decision 3) in the buildlog call records and the admission records.
    report (buildlog) and queue (admission) agree the migration of their records.
 4. All readers use the new path and the new step names in the same commit: `gate.py`, `land_runs.py`, the readers
    that `git grep merge-gate` finds in `scripts/` (24 lines outside tests today), and the step-name readers listed
@@ -212,8 +212,8 @@ lines of 9 files outside old plan docs.
 5. `config/README.md` lines 825–833 name six `gate_trial_*` keys that no conf file or script holds. aws removes
    those lines in the same commit.
 
-Proposal (waits for the user's answer, item 6 of "The user's go"): the AWS box guest user `gate-trial` and its folder `/var/lib/gate-trial` are not part of chunk 7. Every
-AWS gate run uses them, not only the trial. The proposal: they become `gate-box` and `/var/lib/gate-box` in aws's chunk 2 commit,
+The AWS box guest user `gate-trial` and its folder `/var/lib/gate-trial` are not part of chunk 7. Every
+AWS gate run uses them, not only the trial. They become `gate-box` and `/var/lib/gate-box` (the user, 17:23) in aws's chunk 2 commit,
 to match `gate_box.py` and `GATE_BOX_DIR`. The box makes the user at boot, so no image rebuild is needed. The risk
 is one changed path in `config/test_times.conf` (`TOP_AWS_CHECKOUT`), which aws changes in the same commit.
 
@@ -223,16 +223,18 @@ is one changed path in `config/test_times.conf` (`TOP_AWS_CHECKOUT`), which aws 
 2. **The config file rename: `config/merge_gate.conf` becomes `config/gate.conf`** (chunk 3). The keys do not change. Given 2026-11-16.
 3. **The replacement term "the gate"** for the prose "merge gate" (chunk 5): given 2026-11-16.
 4. **The config value change: `trial_branch_prefix` becomes `aws-trial`** in `config/cloud_gate.conf` (chunk 7): given 2026-11-16 15:49 ("1 aws-trial yes").
-5. **The stored step names** (decision 3): NOT given. They wait for the user's answer through morty.
-6. **The AWS box user and folder name `gate-box`** (chunk 2, described under chunk 7): NOT given. It was a verify unit call, and it waits for
-   the user's answer through morty. Until then, the box keeps `gate-trial`.
+5. **The stored step names** (decision 3): `gate` and `test-affected`, and the mode `gate.py --affected`: given 2026-11-16 17:23 ("Name 1 D").
+6. **The AWS box user and folder name `gate-box`** (chunk 2, described under chunk 7): given 2026-11-16 17:23
+   ("Name 2 gate-box").
 
-builds wrote that the verify unit's calls stand. That was not the user's approval, and items 5 and 6 need it.
+The verify unit first wrote items 5 and 6 as approved when builds wrote "your calls stand". The user had not seen
+them; morty then put them to the user. Decisions 5, 6 and 7 (exact matchers, `GATE_*` variables, the state
+folder `~/.local/state/gate`) are unit calls; morty tells the user each one in one line.
 
 ## What sdlc agreed (2026-11-16, through builds)
 
 1. The new names in `scripts/production`: `gate.py`, `gate_test_support.py`, `gate_suites_test_support.py`,
-   `test_gate*.py`. The user's correction later replaced `targeted_tests.py` with the `--targeted` mode.
+   `test_gate*.py`. The user's correction later replaced `targeted_tests.py` with the `--affected` mode.
 2. The thin entry points are a transition only: the removal chunk (now chunk 6) starts as soon as its three checks
    pass, on the same day that the last chunk 2 commit merges.
 3. Exact base-name matchers (decision 5). sdlc had also agreed that the prose stays; the user's correction replaced
