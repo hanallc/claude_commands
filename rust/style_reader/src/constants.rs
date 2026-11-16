@@ -4,8 +4,6 @@
 /// The blobs read in parallel before their lines are written. It bounds the memory that waits
 /// for stdout.
 pub(crate) const BLOB_BATCH_SIZE: usize = 512;
-/// The path suffix of the blobs that the reader reads.
-pub(crate) const RUST_SUFFIX: &[u8] = b".rs";
 
 // lines
 /// The line end that Python reads as one boundary, though both characters are boundaries.
