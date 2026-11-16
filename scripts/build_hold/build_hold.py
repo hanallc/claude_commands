@@ -352,7 +352,13 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class LiveClaims:
+    """Name the processes that a hold must not stop.
+
+    `routed` names the identities that only a step record routed off natedev claims. A drain does not keep them:
+    a later natedev step of that call waits for the release.
+    """
     identities: frozenset[ProcessIdentity]
+    routed: frozenset[ProcessIdentity] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -533,7 +539,6 @@ class HoldEnforcer(Protocol):
     def holds_claim(self, process: AuditProcess, processes: Mapping[int, AuditProcess],
                     claimed: frozenset[ProcessIdentity]) -> bool: ...
     def start(self) -> None: ...
-    def drain(self, holder: Holder, proc_root: Path = PROC_ROOT) -> int: ...
     def clear_queued_runs(self, proc_root: Path) -> None: ...
     def record_clear_cutoff(self, identity: HolderIdentity, since: datetime) -> None: ...
     def drain_identities(self, proc_root: Path, identity: HolderIdentity) -> tuple[ProcessIdentity, ...]: ...

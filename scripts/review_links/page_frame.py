@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+import html
+import re
+
+CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
+                        + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
+
+
+def code_block_html(block: re.Match[str]) -> str:
+    """Build a code block with the shared copy button."""
+    text = block[1] if block[1] is not None else block[2]
+    return ('<div class="code-block"><pre><code>' + html.escape(text)
+            + '</code></pre>' + COPY_BUTTON + '</div>')
+
+
 # Every console page centers its main column in the frame, with the same top
 # gutter, so each page title has the same place and style in its column. A page
 # sets only its own max-width. A page that measures its layout puts
@@ -20,8 +34,8 @@ stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="tru
 <path d="M20 6 9 17l-5-5"/></svg></button>'''
 
 COPY_STYLE = '''
-.code-block{position:relative}
-.code-block pre{padding-right:48px}
+.code-block{position:relative;margin:16px 0}
+.code-block pre{margin:0;padding-right:48px}
 .code-block [data-copy-code]{position:absolute;top:6px;right:6px;display:grid;place-items:center;
 box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
 background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}
@@ -113,7 +127,7 @@ document.addEventListener('click',event=>{
 
 # Both pages use these durations and complete a cancelled motion before the next motion.
 MOTION_SCRIPT = r'''function createCardMotion(){
- const fadeOutMs=120, fadeInMs=180;
+ const fadeOutMs=180, fadeInMs=270;
  const reduced=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  let generation=0, animations=[], commit=()=>{}, pending=Promise.resolve();
  function finish(){

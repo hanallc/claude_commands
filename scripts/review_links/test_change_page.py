@@ -197,10 +197,8 @@ class ReviewTextTests(unittest.TestCase):
 
     def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
         text = '\n First <line> \r\n\r Second & line\u2028Third\n'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</{block}>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</p>')
 
     def test_question_and_answer_show_list_runs_and_text_blocks(self) -> None:
         question = change_page.AnsweredQuestion("q1", "\n  Steps\n continue\n\n  - First\n- Second\n1. Third\n2. Fourth\n\n Done\n", "- Yes\n- No")
@@ -208,14 +206,24 @@ class ReviewTextTests(unittest.TestCase):
             '<h2>Question</h2><p>Steps\ncontinue</p><ul><li>First</li><li>Second</li></ul>'
             + '<ol><li>Third</li><li>Fourth</li></ol><p>Done</p><h2>Answer</h2><ul><li>Yes</li><li>No</li></ul>')
 
+    def test_code_blocks_remove_blank_edges_and_keep_internal_text_line_breaks(self) -> None:
+        for text, before, after in (
+            ('A:\n\n```sh\nx\n```\n\nB.', 'A:', 'B.'),
+            ('\n \t\n A:\nSecond line\n \t\n```sh\nx\n```\n \t\nB. \n\n', ' A:\nSecond line', 'B. '),
+        ):
+            with self.subTest(text=text):
+                rendered = change_page.review_html(text)
+                self.assertEqual(rendered, '<p>' + before + '</p>'
+                                 + '<div class="code-block"><pre><code>x</code></pre>'
+                                 + page_frame.COPY_BUTTON + '</div><p>' + after + '</p>')
+        self.assertEqual(change_page.review_html('\n\nA:\nSecond line\n\n'), '<p>A:\nSecond line</p>')
+
     def test_review_text_escapes_text_blocks_and_each_list_item(self) -> None:
         text = '<script>& "text"\n\n- <a href="x"> & **bold**\n1. `code` | <img>'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>&lt;script&gt;&amp; &quot;text&quot;</{block}>'
-                    + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
-                    + '<ol><li>`code` | &lt;img&gt;</li></ol>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>&lt;script&gt;&amp; &quot;text&quot;</p>'
+                         + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
+                         + '<ol><li>`code` | &lt;img&gt;</li></ol>')
 
     def test_each_numbered_run_starts_at_its_first_number(self) -> None:
         self.assertEqual(change_page.review_text_html('3. Third\n4. Fourth\n\n1. First\n- Bullet\n8. Eighth'),
@@ -247,7 +255,8 @@ class ReviewTextTests(unittest.TestCase):
         inline = change_page.document(change_page.inline_html('Run `sudo systemctl start session.mount`.')).decode()
         self.assertNotIn(page_frame.COPY_BUTTON, inline)
         self.assertIn('<code>sudo systemctl start session.mount</code>', inline)
-        plain = '<pre>Keep this proof text.</pre>'
+        plain = change_page.review_html('Keep this proof text.')
+        self.assertEqual(plain, '<p>Keep this proof text.</p>')
         self.assertIn(plain, change_page.document(plain).decode())
         self.assertNotIn(page_frame.COPY_BUTTON, change_page.document(plain).decode())
 
@@ -462,11 +471,49 @@ class ChangePageTests(unittest.TestCase):
         for content in (change_page.render(self.page, status).decode(),
                         change_browser.render(change_page.ReviewBrowser('token'), status).decode()):
             with self.subTest(page=content[:80]):
-                self.assertIn('<pre>Steps</pre>', content)
+                self.assertIn('<p>Steps</p>', content)
                 self.assertIn('<ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>', content)
-                self.assertIn('<pre>Finish. You see: Result</pre>', content)
+                self.assertIn('<p>Finish. You see: Result</p>', content)
                 self.assertIn('<h2>Question</h2><p>Which steps?</p><ol><li>First</li><li>Second</li></ol>', content)
                 self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
+
+    def test_both_pages_copy_question_feedback_and_answer_code_without_boxing_plain_text(self) -> None:
+        code = 'git -C /etc/nixos status --short\ngit -C /etc/nixos log --oneline -3'
+        fenced = 'Run this in a natedev terminal:\n\n```sh\n' + code + '\n```\n\nRead the result.'
+        status = change_page.DeliveryStatus(self.root)
+        for feedback in (False, True):
+            for answer in (fenced, 'First line\nSecond line'):
+                with self.subTest(feedback=feedback, answer=answer):
+                    row_id = 'C3' if feedback else 'C1'
+                    question = status.ask(self.page, row_id, fenced, kind='feedback' if feedback else 'question')
+                    assert isinstance(question, change_page.QuestionDelivery)
+                    self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
+                    selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (selected, section[1]):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, [code, code] if answer == fenced else [code])
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(blocks))
+                        self.assertEqual(body.count('<pre>'), len(blocks))
+                        if answer != fenced:
+                            prefix = 'Showrunner: ' if feedback else ''
+                            self.assertIn('<p>' + prefix + answer + '</p>', body)
+                    status.write_slots(self.page, row_id, change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
+
+    def test_both_pages_keep_a_plain_two_line_check_in_one_paragraph(self) -> None:
+        item = change_review.Visible('Numbered moves', 'First line\nSecond line', 'Result')
+        _ = change_review.edit_row(self.review_list, 'C1', item, date(2026, 11, 5), self.production)
+        row = change_page.answer_row(self.page, 'C1')
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        change = change_browser.WaitingChange('page-owner/C1', 'page-owner',
+                                             change_routing.UnavailableProduction(self.review_list), row)
+        for body in (selected, change_browser.section(change, 5)):
+            self.assertIn('<p>First line\nSecond line. You see: Result</p>', body)
+            self.assertNotIn('<pre>', body)
+        self.assertIn('p{white-space:pre-wrap;', selected)
 
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -489,7 +536,7 @@ class ChangePageTests(unittest.TestCase):
         row = change_page.answer_row(self.page, 'C1') | {change_review.CHECK: 'Read\n- First\n- Second'}
         change = change_browser.WaitingChange('orphan/C1', 'orphan',
             change_routing.UnavailableProduction(self.review_list), row)
-        self.assertIn('<h2>Proof</h2><pre>Read</pre><ul><li>First</li><li>Second</li></ul>',
+        self.assertIn('<h2>Proof</h2><p>Read</p><ul><li>First</li><li>Second</li></ul>',
                       change_browser.section(change, 5))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
@@ -1385,13 +1432,48 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn('<pre><code>git -C /etc/nixos diff</code></pre>' + page_frame.COPY_BUTTON, question)
         self.assertEqual(question.count(page_frame.COPY_BUTTON), 1)
         for page in (changes, selected):
-            self.assertIn('<pre>Run moves list. You see: Each group starts at 1</pre>', page)
+            self.assertIn('<p>Run moves list. You see: Each group starts at 1</p>', page)
             self.assertNotIn(page_frame.COPY_BUTTON, page)
         for page in (question, changes, selected):
             with self.subTest(title=page.split('<title>')[1].split('</title>')[0]):
                 self.assertEqual(page.count(page_frame.COPY_SCRIPT), 1)
                 self.assertEqual(page.count(page_frame.COPY_STYLE), 1)
                 self.assertEqual(page.count(page_frame.COPY_BUTTON), page.count('<pre><code>'))
+
+    def test_change_code_blocks_from_the_add_command_copy_exact_text_on_both_pages(self) -> None:
+        code = '  printf \'%s\\n\' "copy check $HOME <tag> & value"\n\techo done | cat\n'
+        before = 'Before:\n- Read the label.\n\n'
+        after = '\n\nAfter:\n- Read the result.'
+        for kind in ('See in action', 'Read only'):
+            for name, block, expected in (
+                ('fenced', '```sh\n' + code + '\n```', [code]),
+                ('backtick line', '`echo "$HOME"`', ['echo "$HOME"']),
+                ('plain', 'Run `echo` without a code block.', []),
+            ):
+                with self.subTest(kind=kind, block=name):
+                    title = f'{kind}: {name}'
+                    result = self.command(change_review, change_review.main, [
+                        'add', '--repo', str(self.repo), '--production', 'page-owner',
+                        '--list', str(self.review_list), '--change', title,
+                        '--check', before + block + after, '--see', 'The command stays exact',
+                    ])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
+                    self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')
+                    _ = change_review.set_row_kind(self.review_list, row['#'], kind, self.production)
+                    selected = change_page.render(replace(self.page, rows=(row['#'],)), change_page.DeliveryStatus(self.root)).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row['#']
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (section[1], selected):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, expected)
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(expected))
+                        self.assertIn(change_page.review_text_html(before.rstrip()), body)
+                        self.assertIn(change_page.review_text_html(after.lstrip() + ' You see: The command stays exact'), body)
+                        if not expected:
+                            self.assertIn(change_page.review_text_html(row[change_review.CHECK]), body)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser behavior')
     def test_code_copy_handles_results_repeated_clicks_and_new_blocks_inside_an_iframe(self) -> None:
@@ -2583,7 +2665,7 @@ class ChangePageTests(unittest.TestCase):
                     self.assertIsInstance(slots.question, change_page.OpenQuestion)
                     assert isinstance(slots.question, change_page.OpenQuestion)
                     self.assertEqual(slots.question.text, normalized)
-                    self.assertIn('<p>\n First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
+                    self.assertIn('<p> First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
                                   self.http_request(path, {}).body)
                 saved = self.review_list.read_bytes()
                 delivery = record.read_bytes() if record.exists() else b""

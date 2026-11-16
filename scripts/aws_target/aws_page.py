@@ -13,7 +13,7 @@ from typing import TypedDict
 from scripts.aws_target import config as aws_config, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
 # The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
@@ -166,7 +166,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
     data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now)
-    source = Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8')
+    source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
     page = (source.replace('__PAGE_FRAME_STYLE__', page_frame.STYLE)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))

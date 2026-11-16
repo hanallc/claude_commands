@@ -145,13 +145,27 @@ REMOTE_STEP_STATES = frozenset({step_record.StepState.WAITING_MAC, step_record.S
                                 step_record.StepState.WAITING_SSH, step_record.StepState.ON_SSH})
 
 
-def remote_step_callers() -> frozenset[build_hold.ProcessIdentity]:
+def remote_step_callers() -> frozenset[build_hold.ProcessIdentity] | build_hold.ClaimsUnreadable:
     """Name each verify call whose build waits for or runs on the Mac or AWS.
 
     A step that cannot run on natedev, or that waits for or runs on another target, puts no build on natedev.
+    An unreadable record can name such a call, so it makes every claim unreadable.
     """
-    return frozenset(build_hold.ProcessIdentity(record.pid, record.proc_start) for record in step_record.live_records()
-                     if "natedev" not in record.eligible_targets or record.state in REMOTE_STEP_STATES)
+    callers: set[build_hold.ProcessIdentity] = set()
+    try:
+        paths = sorted(step_record.record_directory().glob("*.json"))
+    except OSError as error:
+        return build_hold.ClaimsUnreadable(f"step records: {error}")
+    for path in paths:
+        match step_record.read(path.stem):
+            case step_record.UnreadableRecord(reason=reason):
+                return build_hold.ClaimsUnreadable(f"{path}: {reason}")
+            case step_record.StepRecord() as record if (
+                    "natedev" not in record.eligible_targets or record.state in REMOTE_STEP_STATES):
+                callers.add(build_hold.ProcessIdentity(record.pid, record.proc_start))
+            case _:
+                pass
+    return frozenset(callers)
 
 
 def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
@@ -162,7 +176,10 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
-    claimed: set[build_hold.ProcessIdentity] = set(remote_step_callers())
+    routed = remote_step_callers()
+    if isinstance(routed, build_hold.ClaimsUnreadable):
+        return routed
+    claimed: set[build_hold.ProcessIdentity] = set()
     try:
         for target in target_config.read_targets():
             if not isinstance(target, target_config.SshTarget):
@@ -176,7 +193,7 @@ def claimed_processes(proc_root: Path = build_hold.PROC_ROOT) -> build_hold.Live
         return build_hold.ClaimsUnreadable(f"{error.path}: {error}")
     except target_config.ConfigError as error:
         return build_hold.ClaimsUnreadable(str(error))
-    return build_hold.LiveClaims(frozenset(claimed))
+    return build_hold.LiveClaims(frozenset(claimed | routed), routed - claimed)
 
 
 def holds_claim(
@@ -221,7 +238,7 @@ def classify_drain_runs(
         reason = ("cargo child" if any(build_hold.audit_command(item) in build_hold.CARGO_COMMANDS
                                         for item in family) else
                   "admission reservation" if identities & admitted else
-                  "Mac or AWS claim" if holds_claim(process, processes, claimed.identities) else "")
+                  "Mac or AWS claim" if holds_claim(process, processes, claimed.identities - claimed.routed) else "")
         if reason:
             runs.append(WorkingRun(process, owner, reason))
         else:
@@ -456,63 +473,6 @@ def stop_queued_runs(
             stopped.add(identity)
         label = "stopped" if isinstance(result, StoppedRun) else "skipped"
         print(f"{label}: pid {identity.pid}", flush=True)
-
-
-def drain(
-    holder: build_hold.Holder, proc_root: Path = build_hold.PROC_ROOT, *,
-    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-) -> int:
-    """Stop waiting gates and wait for working gates while the hold stays active."""
-    attempted: set[build_hold.ProcessIdentity] = set()
-    signalled: set[build_hold.ProcessIdentity] = set()
-    heartbeat = clock()
-    claims_unreadable = False
-    try:
-        while True:
-            processes = build_hold.read_audit_processes(proc_root)
-            claims = claimed_processes(proc_root)
-            runs = classify_drain_runs(processes, admitted_processes(), claims)
-            if isinstance(runs, build_hold.ClaimsUnreadable):
-                if not claims_unreadable:
-                    print(f"claims unreadable: {runs.reason}", file=sys.stderr)
-                claims_unreadable = True
-                sleep(1)
-                continue
-            claims_unreadable = False
-            if not runs:
-                print("drained", flush=True)
-                return 0
-            report = clock() >= heartbeat
-            for run in runs:
-                owner = run.owner.session_id if isinstance(run.owner, OwningSession) else "no session"
-                if isinstance(run, WaitingRun) and run.process.identity not in attempted:
-                    outcome = stop_waiting_run(run, holder, processes, proc_root)
-                    label = "stopped" if isinstance(outcome, StoppedRun) else "skipped: identity changed"
-                    print(f"{label}: {owner}, pid {run.process.identity.pid}", flush=True)
-                    attempted.add(run.process.identity)
-                    if isinstance(outcome, StoppedRun):
-                        signalled.add(run.process.identity)
-                if report:
-                    try:
-                        uptime = float((proc_root / "uptime").read_text().split()[0])
-                    except (OSError, ValueError, IndexError):
-                        uptime = clock()
-                    age = max(0, uptime - int(run.process.identity.start_time) / os.sysconf("SC_CLK_TCK"))
-                    if isinstance(run, WorkingRun):
-                        state = "working"
-                    elif run.process.identity in signalled:
-                        state = "TERM sent; still alive"
-                    else:
-                        state = "skipped: identity changed"
-                    detail = f": {run.reason}" if isinstance(run, WorkingRun) else ""
-                    print(f"{state}: {owner}, pid {run.process.identity.pid}, age {age:.0f}s{detail}", flush=True)
-            if report:
-                print(f"draining: {len(runs)} runs remain", flush=True)
-                heartbeat = clock() + 60
-            sleep(1)
-    except KeyboardInterrupt:
-        print("drain interrupted; the hold remains active", flush=True)
-        return 130
 
 
 @dataclass(frozen=True)

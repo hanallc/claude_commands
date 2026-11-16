@@ -28,7 +28,7 @@ from typing import cast, override
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.production import change_review
-from scripts.review_links import change_browser, change_page, console, serve
+from scripts.review_links import accounts_page, change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -214,6 +214,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
+        with patch.object(accounts_page, "render", return_value=b"<p>board</p>") as render:
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual((reply.status, reply.content_type, reply.body), (200, "text/html; charset=utf-8", b"<p>board</p>"))
+        render.assert_called_once_with()
+        with (patch.object(accounts_page, "render", side_effect=OSError("staff file absent")),
+              redirect_stderr(StringIO()) as error):
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual(reply.status, 503)
+        self.assertIn(b"The Accounts page is not available.", reply.body)
+        self.assertNotIn(b"staff file absent", reply.body)
+        self.assertIn("review-links accounts: staff file absent", error.getvalue())
 
     def test_inaccessible_sweep_entries_do_not_prevent_bind_or_other_links(self) -> None:
         session = self.root / "manual"

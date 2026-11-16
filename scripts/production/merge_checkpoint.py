@@ -32,7 +32,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import change_review, checkpoint_gate, land_runs
 from scripts.worktree import worktrees
-from scripts.lib import mac_wake, main_publish, main_push_lock, scratch, waiting_rows
+from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
@@ -954,8 +954,13 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
                            "promote")
             if foreign:
                 return PromotionNotPushed(tip, True)
+            try:
+                landed = land_main.land(checkout, current)
+            except land_main.LandError as error:
+                raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
+            checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
+                                   land_main.hook_report(landed.hook))
             if unpushed:
-                _ = good(git(checkout, "push", "origin", "main"), "promote")
                 return PromotionOriginPushed(tip)
             return PromotionAlreadyAtTip(tip)
         if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
@@ -975,12 +980,15 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
                 status = git(checkout, "status", "--short").stdout.strip()
                 raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
                            "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
-        unpushed = good(git(checkout, "rev-list", "refs/remotes/origin/main..main"), "promote")
         foreign = good(git(checkout, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
         if foreign:
             return PromotionNotPushed(tip, False)
-        if unpushed:
-            _ = good(git(checkout, "push", "origin", "main"), "promote")
+        try:
+            landed = land_main.land(checkout, "main")
+        except land_main.LandError as error:
+            raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
+        checkpoint_gate.report("post-push", "warning" if isinstance(landed.hook, land_main.HookFailed) else "ok",
+                               land_main.hook_report(landed.hook))
         return PromotionAdvanced(tip)
 
 

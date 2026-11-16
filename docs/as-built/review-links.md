@@ -333,6 +333,22 @@ Recovery clears an intent for an open question.
 For a closed question without `saved: true`, recovery clears the intent and prints `answer save state unknown; not sent`.
 Answers to questions and changes both post to `changes.html`.
 
+### Accounts page
+
+`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+The console lists it as **Accounts**, with the Lucide `users` icon.
+The server renders it for each request in a child process (`accounts_page.py`).
+The child keeps the status read's stderr capture away from the server's request log.
+`accounts_page_seconds` in `config/review_links.conf` limits each render.
+A failed or late render gives 503 with **The Accounts page is not available.**
+
+- The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
+- The upcoming moves and the problems follow the table.
+- The page reads the stored usage only, as `accounts.py status --stored` does.
+
+The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
+It refreshes when the console shows it again and when the tab becomes visible.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
@@ -1010,18 +1026,23 @@ The page, the footer and `/next` use these same folder readers.
 
 
 Changes, Questions, and Images share one motion helper.
-A different Changes or Questions card fades out for 120ms, then fades in for 180ms with a 4px upward move.
+A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.
 A new card above the viewport scrolls into view smoothly.
-Image links scroll smoothly to their image, then reveal it over 180ms with a 4px upward move.
+Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
 Other image cards stay visible.
-An image fades before removal, and the cards below close the gap over 180ms.
+An image fades before removal, and the cards below close the gap over 270ms.
 Reduced motion disables fades and uses instant scrolling.
 
-Questions and Changes show a Lucide copy button inside the top right of each code block.
-The command item renderer emits the button with the code block.
-Plain proof text keeps its `<pre>` block without a copy button.
+Question items and change rows show a Lucide copy button inside the top right of each code block.
+Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
+This applies to How to check, Proof, Question, Feedback, and Answer.
+The shared renderer emits each code block with its button.
+Plain text uses `<p>` blocks without a box or a copy button.
+The paragraph style preserves line breaks, including a two-line check without code.
+The renderer removes blank lines at each text part's edges.
+Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
 The button shows a check and the label “Copied” for two seconds after success.

@@ -1143,7 +1143,9 @@ Only removal ends the holder's hold.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
-`remote_step_callers` names these gates, and clear, drain and the enforcer never stop them.
+`remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
+A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
 Unreadable claims or admission state keep every outermost gate.
@@ -1200,7 +1202,11 @@ The cleanup removes the JSON record, the state file, and this call’s `.step-<c
 The `state` and `remove` Python CLI verbs no longer exist.
 
 `step_record.read` opens the state file before it reads the JSON record.
-It keeps that file open through the join, then closes it on every path before process validation.
+It checks the writer process before it decodes the record, and keeps the state file open until it returns.
+The writer is the record's `pid` and `proc_start`.
+When the JSON is damaged, the writer is the pid in the call id (`v<UTC stamp>-<pid>-<random>`).
+An ended writer, or a pid with another start time, returns `StaleRecord`, even when the record is damaged.
+So a damaged record of a killed gate does not make the hold claims unreadable for good.
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
