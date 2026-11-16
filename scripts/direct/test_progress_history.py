@@ -2789,7 +2789,7 @@ with patch.object(fcntl, "flock", admission):
         holds.mkdir()
         _ = (holds / member.id).write_text(json.dumps({"holder": member.name, "for": "history checks",
             "since": datetime.now(UTC).isoformat(), "release_eta": "unknown"}))
-        script = shell_functions(SCRIPT.with_name("verify.sh"), "phase_wait_holder_flags")
+        script = shell_functions(SCRIPT.with_name("verify.sh"), "verify_helper", "phase_wait_holder_flags")
         script += '\nPY=$1 PHASE_WAIT_RECORDER=$2 BUILD_HOLD_DIR=$3\nphase_wait_holder_flags hold\n'
         environment = {**os.environ, "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
                        "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",

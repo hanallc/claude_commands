@@ -438,7 +438,7 @@ process.stdout.write(JSON.stringify({
                     page = memory_feed.reading()
                 ci, = [row for row in page["walk"] if row.get("ci")]
                 self.assertEqual(ci.get("admitted"), isinstance(state, RunningServiceJob))
-                self.assertIn("start spacing", page["waiters"][0]["reason"])
+                self.assertIn("another step just started; the queue waits a few seconds between starts", page["waiters"][0]["reason"])
                 self.assertEqual(page["taken"], 0.125)
                 self.assertEqual(page["ci_ram"], 0.125)
 
@@ -1212,7 +1212,7 @@ process.stdout.write(JSON.stringify({
     def test_each_wait_state_keeps_its_reason_and_the_other_readings(self) -> None:
         reasons = (
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory"),
-            (admission_records.StartSpacingWait(200_010), "start spacing"),
+            (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts"),
             (admission_records.BehindHead("first", 1, "head-session"), "behind"),
         )
         for reason, expected in reasons:
@@ -1398,29 +1398,33 @@ process.stdout.write(JSON.stringify({
         check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
         shown = memory_feed.head_room(check, room)
         self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
-            ("Free memory now", 28.0), ("− Safety margin", 3.0), ("− Other programs' swap, which can come back", 10.0),
-            ("− Held for running builds", 8.0), ("= Free for builds", 7.0)])
+            ("Free RAM", 28.0), ("− Safety net", 3.0), ("− Swap coming back", 10.0), ("− Build reserved", 8.0),
+            ("= Free", 7.0)])
         self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB
         reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
         room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
-        states: tuple[tuple[Literal["admit", "hold"], list[list[tuple[str, float]]]], ...] = (("admit", []), ("hold", [[
-                ("Free memory now", 30.0), ("− Safety margin", 3.0), ("− Other programs' swap, which can come back", 0.0),
-                ("− Held for running builds", 9.0), ("− Held for builds ahead in line", 3.0), ("= Free for builds", 15.0)]]))
-        for state, expected in states:
+        expected_rows = [[("Free RAM", 30.0), ("− Safety net", 3.0), ("− Swap coming back", 0.0),
+                          ("− Build reserved", 9.0), ("− Held for earlier steps", 3.0),
+                          ("= Free", 15.0)]]
+        states: tuple[tuple[Literal["admit", "hold"], admission_records.HeadCause], ...] = (
+            ("admit", admission_records.NeedsMemory()), ("hold", admission_records.NeedsMemory()),
+            ("hold", admission_records.StartSpacingWait(110)), ("hold", admission_records.GpuSlotWait(1, 1)))
+        for state, cause in states:
             with self.subTest(state=state):
                 head = admission_records.HeadExplanation(reading.view.waiting[0], admission_records.NeedSourceNotRecorded(),
                     admission_records.AdmissionDecision(state, 0, 0, 0, 0), room,
                     admission_records.FreeCheck(30 * gib, 20 * gib, 0, 0, 0, True), False,
-                    cause=admission_records.NeedsMemory())
+                    cause=cause)
                 current = replace(reading, explanation=replace(reading.explanation, head=head))
                 with mock.patch.object(admission_client, "view", return_value=current):
                     page = memory_feed.reading()
                 shown = [[(row["label"], row["gib"]) for row in waiter["head_room"]["rows"]]
                          for waiter in page["waiters"] if "head_room" in waiter]
-                self.assertEqual(shown, expected)
+                self.assertEqual(shown, expected_rows if state == "hold" else [])
+                self.assertNotIn("admission_check", page)
                 first = page["waiters"][0]
                 self.assertEqual((first.get("place"), first.get("why")),
                                  (1, "only 15.0 GiB is free for builds. It starts when 20.0 GiB is free."))
@@ -2134,6 +2138,23 @@ def write_browser_fixture(folder: Path) -> None:
             leftover_step(19 * 60, small=True), leftover_step(2 * 24 * 60, small=True), live, compiler))
         base = gate.queue_read_from(inputs, admission_policy_fixture())
         readings: dict[str, admission_records.QueueRead] = {"good": base}
+        for name, available, swapped in (("head_memory", 8, 0), ("head_shortfall", 2, 0), ("head_swap_shortfall", 4, 6)):
+            held = gate.queue_read_from(replace(inputs, pressure=admission_records.NoPressureHold(),
+                host=admission_records.HostMemory(available * admission_records.GIB, 60 * admission_records.GIB,
+                    8 * admission_records.GIB, (8 - swapped) * admission_records.GIB)),
+                admission_policy_fixture())
+            held = with_wait_reason(held, admission_records.NeedsMemory())
+            held = replace(held, view=replace(held.view,
+                waiting=(replace(held.view.waiting[0], need=20 * admission_records.GIB),)))
+            held_room = held.explanation.room
+            assert isinstance(held_room, admission_records.MemoryRoom)
+            check = admission_records.RoomCheck(20 * admission_records.GIB, held_room.signed_room, False,
+                                               basis=admission_records.DoesNotFit())
+            head = admission_records.HeadExplanation(held.view.waiting[0], admission_records.NeedSourceNotRecorded(),
+                admission_records.AdmissionDecision("hold", 0, 0, 0, 0), check,
+                admission_records.FreeCheck(held_room.available, check.need, 0, 0, 0, False), False,
+                cause=admission_records.NeedsMemory())
+            readings[name] = replace(held, explanation=replace(held.explanation, head=head))
         for name, reason in (
             ("pressure", admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory")),
             ("spacing", admission_records.StartSpacingWait(110)),

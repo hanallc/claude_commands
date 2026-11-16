@@ -8,26 +8,29 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class OwningSession:
+    """The identifier names the session that owns the run."""
     session_id: str
 
 
 @dataclass(frozen=True)
 class NoOwningSession:
-    pass
+    """The run has no identified owning session."""
 
 
 @dataclass(frozen=True)
 class RunOwner:
+    """The staff record identifies this session as the run owner."""
     session_id: str
 
 
 @dataclass(frozen=True)
 class NoRunNamed:
-    pass
+    """The caller has not named a run."""
 
 
 @dataclass(frozen=True)
 class RunNotInStaff:
+    """The named run has no matching staff record."""
     run: Path
 
 

@@ -31,6 +31,7 @@ GIB = 1 << 30
 
 @dataclass(frozen=True)
 class SavedPlacementAssignment:
+    """The saved assignment holds its permission, claim, retry decision, and final report."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
@@ -47,6 +48,7 @@ TestScope = Literal["full", "filtered"]
 
 @dataclass(frozen=True)
 class AdmissionTiming:
+    """The timing limits control admission starts and estimate updates."""
     recovery_start_seconds: int
     estimate_refresh_seconds: int
     slot_gap_seconds: int
@@ -55,12 +57,14 @@ class AdmissionTiming:
 
 @dataclass(frozen=True)
 class PressurePolicy:
+    """The limits define when memory pressure delays admission."""
     full_avg10_limit: float
     some_avg10_limit: float
 
 
 @dataclass(frozen=True)
 class PeakHold:
+    """The durations define how long each step kind retains its peak charge."""
     default_seconds: int
     by_kind: Mapping[str, int] = field(default_factory=dict[str, int])
 
@@ -88,6 +92,7 @@ NO_GPU_TESTS = GpuTestSlots(1, frozenset())
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
+    """The policy holds memory, pressure, timing, and GPU limits for admission."""
     timing: AdmissionTiming
     pressure: PressurePolicy
     peak_hold: PeakHold
@@ -99,6 +104,7 @@ class AdmissionPolicy:
 
 @dataclass(frozen=True)
 class RepositoryIdentity:
+    """The identity holds the repository key and current and legacy names."""
     key: str
     name: str
     legacy_name: str = ""
@@ -106,7 +112,7 @@ class RepositoryIdentity:
 
 @dataclass(frozen=True)
 class UnknownRepository:
-    pass
+    """The repository identity is unknown."""
 
 Repository = RepositoryIdentity | UnknownRepository
 
@@ -117,22 +123,24 @@ NeedSource = str
 
 @dataclass(frozen=True)
 class NoFloor:
-    pass
+    """No failed peak sets a minimum memory estimate."""
 
 
 @dataclass(frozen=True)
 class FailedPeakFloor:
+    """The failed run supplies a minimum peak and its end time."""
     peak: int
     ended_at: str
 
 
 @dataclass(frozen=True)
 class NoHeadroom:
-    pass
+    """The memory estimate has no added headroom."""
 
 
 @dataclass(frozen=True)
 class ReleaseHeadroom:
+    """The factor adds headroom to a release memory estimate."""
     factor: float
 
 
@@ -145,6 +153,7 @@ class LegacyDevMultiplierHeadroom:
 
 @dataclass(frozen=True)
 class DevSizeHeadroom:
+    """The factor and byte margin add headroom to a development memory estimate."""
     factor: float
     margin_bytes: int
 
@@ -153,22 +162,24 @@ HeadroomRule = ReleaseHeadroom | LegacyDevMultiplierHeadroom | DevSizeHeadroom |
 
 @dataclass(frozen=True)
 class CapNotRecorded:
-    pass
+    """The memory cap was not recorded."""
 
 
 @dataclass(frozen=True)
 class UnderBudget:
-    pass
+    """The memory estimate does not require a budget cap."""
 
 
 @dataclass(frozen=True)
 class CappedAtBudget:
+    """The original estimate exceeds the memory budget cap."""
     uncapped: int
     cap: int | CapNotRecorded
 
 
 @dataclass(frozen=True)
 class ShapeRankedPeak:
+    """The estimate uses a ranked shape peak with its floor, headroom, and cap."""
     runs: int
     share_percent: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
@@ -178,6 +189,7 @@ class ShapeRankedPeak:
 
 @dataclass(frozen=True)
 class ShapeLargest:
+    """The estimate uses the largest shape peak with its floor, headroom, and cap."""
     runs: int
     floor: FailedPeakFloor | NoFloor = NoFloor()
     factor: HeadroomRule = NoHeadroom()
@@ -186,6 +198,7 @@ class ShapeLargest:
 
 @dataclass(frozen=True)
 class ShapeFallback:
+    """The shape estimate uses a fallback with its budget cap."""
     cap: CappedAtBudget | UnderBudget = UnderBudget()
 
 ShapeNeedBasis = ShapeRankedPeak | ShapeLargest | ShapeFallback
@@ -195,13 +208,14 @@ NeedBasis = LegacyNeedSource | ShapeNeedBasis
 
 @dataclass(frozen=True)
 class BasisNotRecorded:
-    pass
+    """The basis of the memory estimate was not recorded."""
 
 TestPhaseNeedForm = Literal["same_width", "wider_unscaled", "scaled_up"]
 
 
 @dataclass(frozen=True)
 class TestPhaseNeed:
+    """The test memory estimate holds its widths, sample count, scaling form, and margin."""
     bytes: int
     runs: int
     width: int
@@ -241,6 +255,7 @@ class FinalizationIntent(TypedDict):
 
 @dataclass(frozen=True)
 class RequestedTestWidth:
+    """The caller requests this positive number of test threads."""
     threads: int
 
     def __post_init__(self) -> None:
@@ -250,12 +265,12 @@ class RequestedTestWidth:
 
 @dataclass(frozen=True)
 class UnspecifiedTestWidth:
-    pass
+    """The test command does not specify a thread count."""
 
 
 @dataclass(frozen=True)
 class NoTestWidth:
-    pass
+    """The command has no test thread count."""
 
 TestWidth = RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth
 
@@ -308,6 +323,7 @@ class Reservation(TypedDict):
 
 @dataclass(frozen=True)
 class ExpectedPeak:
+    """The expected memory peak holds its source, sample count, and estimate basis."""
     bytes: int
     source: NeedSource
     count: int
@@ -323,38 +339,42 @@ class ExpectedPeak:
 
 @dataclass(frozen=True)
 class PromisedMemory:
+    """The step promises this number of memory bytes."""
     bytes: int
 
 
 @dataclass(frozen=True)
 class PeakTimeUnknown:
-    pass
+    """The time of the memory peak is unknown."""
 
 
 @dataclass(frozen=True)
 class NoPeakRecorded:
-    pass
+    """The step has no recorded memory peak."""
 
 
 @dataclass(frozen=True)
 class RampPromise:
+    """The memory promise covers the growth toward the step peak."""
     bytes: int
 
 
 @dataclass(frozen=True)
 class LifetimePromise:
+    """The memory promise remains in effect for the step lifetime."""
     bytes: int
 
 
 @dataclass(frozen=True)
 class NoPromise:
-    pass
+    """The step has no memory promise."""
 
 MemoryPromise = RampPromise | LifetimePromise | NoPromise
 
 
 @dataclass(frozen=True)
 class PeakSoFar:
+    """The observed peak holds its size and the times of peak activity."""
     bytes: int
     peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     last_near_peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
@@ -363,6 +383,7 @@ class PeakSoFar:
 
 @dataclass(frozen=True)
 class PeakDecayed:
+    """The reduced memory charge retains the original peak and decay times."""
     bytes: int
     peak_bytes: int
     last_near_peak_at: float
@@ -372,6 +393,7 @@ class PeakDecayed:
 
 @dataclass(frozen=True)
 class TestPhaseStarted:
+    """The test phase holds its start time, prior peak, and memory need."""
     started_at: float
     peak_so_far: int
     need: TestPhaseNeed
@@ -379,6 +401,7 @@ class TestPhaseStarted:
 
 @dataclass(frozen=True)
 class PeakFileUnreadable:
+    """The unreadable peak file retains the promised byte count as a floor."""
     bytes: int
 
 PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable | TestPhaseStarted
@@ -386,7 +409,7 @@ PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable | Te
 
 @dataclass(frozen=True)
 class PidNotRecorded:
-    pass
+    """The process identifier was not recorded."""
 
 
 @dataclass(frozen=True)
@@ -398,22 +421,25 @@ class ProcessAnonymousUse:
 
 @dataclass(frozen=True)
 class ScopeSource:
+    """The memory reading comes from this scope and its process members."""
     directory: Path
     members: frozenset[int]
 
 
 @dataclass(frozen=True)
 class ProcessSource:
+    """The memory reading comes from these individual processes."""
     processes: tuple[ProcessAnonymousUse, ...]
 
 
 @dataclass(frozen=True)
 class NoSource:
-    pass
+    """The memory reading has no recorded source."""
 
 
 @dataclass(frozen=True)
 class MeasuredMemory:
+    """The step holds measured memory, swap, promises, and peak history."""
     bytes: int
     anonymous: AnonymousRunUse | RunUseUnavailable = field(default_factory=lambda: RunUseUnavailable("swap-backed use unavailable"), kw_only=True)
     anonymous_source: ScopeSource | ProcessSource | NoSource = field(default_factory=NoSource, kw_only=True)
@@ -428,6 +454,7 @@ class MeasuredMemory:
 
 @dataclass(frozen=True)
 class ProgressAdjustedMemory(MeasuredMemory):
+    """The measured memory includes progress evidence and the remaining memory need."""
     counter: progress.ProgressCounter | progress.NoCounter = field(kw_only=True)
     window: progress.WindowPeak | progress.NoMatchingProfile = field(kw_only=True)
     remaining_need: int = field(kw_only=True)
@@ -443,11 +470,12 @@ class CompilerServiceMemory(MeasuredMemory):
 
 @dataclass(frozen=True)
 class ServiceJobStateNotRecorded:
-    pass
+    """The service job state was not recorded."""
 
 
 @dataclass(frozen=True)
 class UnownedSliceMemory(MeasuredMemory):
+    """The memory reading describes a scope without an owned reservation."""
     diagnostic: str = ""
     cgroup: str = ""
     owner: str = ""
@@ -470,11 +498,12 @@ def recorded_service_state(memory: CompilerServiceMemory | UnownedSliceMemory) -
 
 @dataclass(frozen=True)
 class GoneMemory:
-    pass
+    """The step no longer has a live memory owner."""
 
 
 @dataclass(frozen=True)
 class RemoteMemoryUnavailable:
+    """The reason explains why remote memory cannot be read."""
     reason: str
 
 
@@ -483,21 +512,23 @@ StepMemory = PromisedMemory | MeasuredMemory | ProgressAdjustedMemory | Compiler
 
 @dataclass(frozen=True)
 class NoPressureHold:
-    pass
+    """Memory pressure does not require an admission hold."""
 
 
 @dataclass(frozen=True)
 class PressureUnavailable:
+    """The reason explains why memory pressure cannot be read."""
     reason: str
 
 
 @dataclass(frozen=True)
 class PressureConditionNotRecorded:
-    pass
+    """The pressure condition was not recorded."""
 
 
 @dataclass(frozen=True)
 class MemoryPressure:
+    """The pressure reading holds averages, swap use, and the next permitted start time."""
     full_avg10: float
     some_avg10: float = 0.0
     swap_used_percent: float = 0.0
@@ -507,11 +538,12 @@ class MemoryPressure:
 
 @dataclass(frozen=True)
 class UnknownHostTotal:
-    pass
+    """The total host memory is unknown."""
 
 
 @dataclass(frozen=True)
 class HostMemory:
+    """The host reading holds available memory, total memory, and swap use."""
     available: int
     total: int | UnknownHostTotal
     swap_total: int = 0
@@ -558,13 +590,14 @@ class Waiter(TypedDict):
 
 @dataclass(frozen=True)
 class PriorityUnit:
+    """The unit holds this position in the priority order."""
     unit: str
     position: int = 0
 
 
 @dataclass(frozen=True)
 class NormalOrder:
-    pass
+    """The waiter follows the normal queue order."""
 
 
 class RankedWaiter(Waiter):
@@ -578,16 +611,18 @@ def waiter_priority(row: Waiter) -> PriorityUnit | NormalOrder:
 
 @dataclass(frozen=True)
 class TokenWaitingWaiter:
+    """The waiter retains the time when it left to wait for the Cargo token."""
     left_at: float
 
 
 @dataclass(frozen=True)
 class SettledPriority:
-    pass
+    """The queue priority has no pending change."""
 
 
 @dataclass(frozen=True)
 class PendingPriorityTransition:
+    """The pending priority change holds its action, time, unit, and actor."""
     id: str
     action: Literal["set", "clear"]
     at: float
@@ -606,6 +641,7 @@ class PriorityEntry(TypedDict):
 
 @dataclass(frozen=True)
 class QueuePriority:
+    """The queue priority holds ordered entries and any pending change."""
     entries: tuple[PriorityEntry, ...]
     transition: SettledPriority | PendingPriorityTransition = SettledPriority()
 
@@ -627,7 +663,7 @@ def upgrade_queue_priority(value: dict[str, object]) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class NoQueuePriority:
-    pass
+    """The queue has no unit priority."""
 
 NO_QUEUE_PRIORITY = NoQueuePriority()
 
@@ -647,7 +683,7 @@ class HeadAdmissionOverride(TypedDict):
 
 @dataclass(frozen=True)
 class NoHeadAdmissionOverride:
-    pass
+    """The queue head has no admission override."""
 
 
 def queue_command_actor() -> str:
@@ -663,11 +699,13 @@ class AnonymousRunUse:
 
 @dataclass(frozen=True)
 class RunUseUnavailable:
+    """The reason explains why the run memory use is unavailable."""
     reason: str
 
 
 @dataclass(frozen=True)
 class BetweenStepsSlot:
+    """The run retains memory between steps until the slot expires."""
     run: LiveBuildRun
     reservation: str
     bytes: int
@@ -676,6 +714,7 @@ class BetweenStepsSlot:
 
 @dataclass(frozen=True)
 class ContinuationSlot:
+    """The owner continues within a memory slot retained between steps."""
     slot: BetweenStepsSlot
     owner: str
 
@@ -684,6 +723,7 @@ RunSlot = BetweenStepsSlot | ContinuationSlot
 
 @dataclass(frozen=True)
 class RunMemory:
+    """The run holds its owner, memory need, measured use, and retained bytes."""
     owner: str
     need: int
     use: AnonymousRunUse | RunUseUnavailable
@@ -693,17 +733,20 @@ class RunMemory:
 
 @dataclass(frozen=True)
 class RunKeepAside:
+    """The run retains this number of bytes for later growth."""
     memory: RunMemory
     bytes: int
 
 
 @dataclass(frozen=True)
 class CapUnavailable:
+    """These runs prevent calculation of the memory cap."""
     runs: tuple[RunMemory, ...]
 
 
 @dataclass(frozen=True)
 class MemoryRoom:
+    """The memory budget holds available bytes, charges, reserves, and remaining room."""
     available: int
     safety: int
     used: int
@@ -731,33 +774,34 @@ class MemoryRoom:
 
 @dataclass(frozen=True)
 class Fits:
-    pass
+    """The memory need fits within the available room."""
 
 
 @dataclass(frozen=True)
 class StartsAlone:
-    pass
+    """The step can start under the rule for a step that runs alone."""
 
 
 @dataclass(frozen=True)
 class WithinSlot:
-    pass
+    """The step fits within its retained memory slot."""
 
 
 @dataclass(frozen=True)
 class OverrideRoom:
-    pass
+    """An explicit override permits the step despite the memory room check."""
 
 
 @dataclass(frozen=True)
 class DoesNotFit:
-    pass
+    """The memory need exceeds the available room."""
 
 StartBasis = Fits | StartsAlone | WithinSlot | OverrideRoom | DoesNotFit
 
 
 @dataclass(frozen=True)
 class RoomCheck:
+    """The check compares memory need with room and records the decision basis."""
     need: int
     room: int
     passes: bool
@@ -766,17 +810,18 @@ class RoomCheck:
 
 @dataclass(frozen=True)
 class NoOrderHold:
-    pass
+    """The queue order does not delay this step."""
 
 
 @dataclass(frozen=True)
 class HeldBehindHead:
+    """This waiter at the queue head delays the step."""
     waiter: Waiter
 
 
 @dataclass(frozen=True)
 class GpuSlotFree:
-    pass
+    """A GPU test slot is available."""
 
 
 @dataclass(frozen=True)
@@ -788,6 +833,7 @@ class GpuSlotWait:
 
 @dataclass(frozen=True)
 class AdmissionDecision:
+    """The decision holds admission state, memory charges, and reasons for a delay."""
     state: Literal["admit", "hold"]
     threshold: int
     promised: int
@@ -805,11 +851,13 @@ class AdmissionDecision:
 
 @dataclass(frozen=True)
 class StartSpacingWait:
+    """The step waits until this start time to preserve spacing."""
     at: float
 
 
 @dataclass(frozen=True)
 class NeedsMemory:
+    """The memory wait holds the need, free bytes, threshold, growth, and reserve."""
     need: int = 0
     free: int = 0
     threshold: int = 0
@@ -819,6 +867,7 @@ class NeedsMemory:
 
 @dataclass(frozen=True)
 class BehindHead:
+    """The waiter holds the identity and join time of the step ahead."""
     head_name: str
     joined_at: float
     head_session_id: str
@@ -826,16 +875,18 @@ class BehindHead:
 
 @dataclass(frozen=True)
 class ReadyForAdmission:
-    pass
+    """The step is ready for the next admission check."""
 
 
 @dataclass(frozen=True)
 class ReadingUnavailable:
+    """The reason explains why the memory reading is unavailable."""
     reason: str = "memory reading unavailable"
 
 
 @dataclass(frozen=True)
 class EstimateExpired:
+    """The estimate has expired since this recorded estimate time."""
     estimated_at: float
 
 
@@ -851,6 +902,7 @@ HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSp
 
 @dataclass(frozen=True)
 class HeadAdmissionStatus:
+    """The queue head status holds its decision, memory need, and cause."""
     decision: AdmissionDecision
     need: int
     available: int
@@ -895,6 +947,7 @@ class PackageNotRecorded:
 
 @dataclass(frozen=True)
 class WaitingStep:
+    """The waiting step holds its caller, memory need, wait reason, and run identity."""
     pid: int
     session_id: str
     session_name: str
@@ -912,6 +965,7 @@ class WaitingStep:
 
 @dataclass(frozen=True)
 class RunningStep:
+    """The running step holds its caller, memory charge, and execution evidence."""
     session_id: str
     session_name: str
     step: str
@@ -951,6 +1005,7 @@ def execution_group(step: RunningStep, fallback: str) -> str:
 
 @dataclass(frozen=True)
 class QueueView:
+    """The queue view holds waiting steps, running steps, and memory totals at one time."""
     waiting: tuple[WaitingStep, ...]
     running: tuple[RunningStep, ...]
     available: int
@@ -961,6 +1016,7 @@ class QueueView:
 
 @dataclass(frozen=True)
 class HostAvailable:
+    """The host summary holds available memory, total memory, reserve, and pressure."""
     available: int
     total: int | UnknownHostTotal
     reserve: int
@@ -969,11 +1025,12 @@ class HostAvailable:
 
 @dataclass(frozen=True)
 class AdmissionTimeNotRecorded:
-    pass
+    """The admission time was not recorded."""
 
 
 @dataclass(frozen=True)
 class ExplainedRunningStep:
+    """The running step explanation holds admission time and promised and charged memory."""
     step: RunningStep
     admitted_at: float | AdmissionTimeNotRecorded
     promise: int
@@ -984,6 +1041,7 @@ class ExplainedRunningStep:
 
 @dataclass(frozen=True)
 class QueueMemoryTotals:
+    """The totals hold charged memory, measured memory, and expected growth."""
     charged: int
     measured: int
     growth: int
@@ -991,16 +1049,17 @@ class QueueMemoryTotals:
 
 @dataclass(frozen=True)
 class WidthNotRecorded:
-    pass
+    """The test thread count was not recorded."""
 
 
 @dataclass(frozen=True)
 class NeedSourceNotRecorded:
-    pass
+    """The source of the memory need was not recorded."""
 
 
 @dataclass(frozen=True)
 class RecordedNeed:
+    """The saved estimate holds its source, history, test selection, width, and basis."""
     source: NeedSource
     runs: int
     history_days: int
@@ -1013,6 +1072,7 @@ class RecordedNeed:
 
 @dataclass(frozen=True)
 class FreeCheck:
+    """The check compares free memory with the need, reserve, growth, and threshold."""
     available: int
     need: int
     reserve: int
@@ -1023,6 +1083,7 @@ class FreeCheck:
 
 @dataclass(frozen=True)
 class HeadExplanation:
+    """The queue head explanation holds its estimate, admission checks, priority, and cause."""
     waiter: WaitingStep
     need_source: RecordedNeed | NeedSourceNotRecorded
     decision: AdmissionDecision
@@ -1034,7 +1095,7 @@ class HeadExplanation:
 
 @dataclass(frozen=True)
 class NoWaiter:
-    pass
+    """The queue has no waiter to explain."""
 
 
 @dataclass(frozen=True)
@@ -1044,6 +1105,7 @@ class TokenWaitersOnly:
 
 @dataclass(frozen=True)
 class LineWaiter:
+    """The waiter holds its admission decision and memory checks for the queue line."""
     waiter: WaitingStep
     fits_now: bool
     decision: AdmissionDecision
@@ -1053,6 +1115,7 @@ class LineWaiter:
 
 @dataclass(frozen=True)
 class WaitingLine:
+    """The line holds waiter checks and summary counts, sizes, and times."""
     steps: tuple[LineWaiter, ...]
     count: int
     fitting: int
@@ -1063,11 +1126,12 @@ class WaitingLine:
 
 @dataclass(frozen=True)
 class ReadyToStart:
-    pass
+    """The start spacing permits a step to start now."""
 
 
 @dataclass(frozen=True)
 class NextStartAt:
+    """The start spacing permits the next step at this time."""
     at: float
 
 StartSpacing = ReadyToStart | NextStartAt
@@ -1075,6 +1139,7 @@ StartSpacing = ReadyToStart | NextStartAt
 
 @dataclass(frozen=True)
 class QueueExplanation:
+    """The explanation holds queue evidence, policy, decisions, and memory checks."""
     now: float
     host: HostAvailable | ReadingUnavailable
     running: tuple[ExplainedRunningStep, ...]
@@ -1117,6 +1182,7 @@ class QueueInputs:
 
 @dataclass(frozen=True)
 class QueueRead:
+    """The queue reading holds its view, explanation, ordered waiters, and diagnostics."""
     view: QueueView
     explanation: QueueExplanation
     ordered: list[tuple[Path, RankedWaiter]]
@@ -1125,16 +1191,18 @@ class QueueRead:
 
 @dataclass(frozen=True)
 class NoBuildHistoryGeneration:
-    pass
+    """The build history generation was not recorded."""
 
 
 @dataclass(frozen=True)
 class BuildHistoryGeneration:
+    """The value identifies the build history generation used for an estimate."""
     value: int
 
 
 @dataclass(frozen=True)
 class StepProfile:
+    """The step profile holds repository identity, memory estimate, and test scope."""
     repo: str
     step: str
     worktree: str
@@ -1147,24 +1215,27 @@ class StepProfile:
 
 @dataclass(frozen=True)
 class InferFromArgv:
-    pass
+    """The caller requests inference from the command arguments."""
 
 INFER_FROM_ARGV = InferFromArgv()
 
 
 @dataclass(frozen=True)
 class MeasuredProgramPeak:
+    """The program peak holds measured bytes and the number of runs."""
     bytes: int
     runs: int
 
 
 @dataclass(frozen=True)
 class FirstProgramPeak:
+    """The first program run uses this initial memory estimate."""
     bytes: int
 
 
 @dataclass(frozen=True)
 class HistoryPeakSizing:
+    """The sizing holds the initial peak, current estimate, and estimate time."""
     first_peak_bytes: int
     estimate: MeasuredProgramPeak | FirstProgramPeak
     estimated_at: float
@@ -1172,6 +1243,7 @@ class HistoryPeakSizing:
 
 @dataclass(frozen=True)
 class ProgramProfile:
+    """The program profile holds its repository, worktree, and memory sizing."""
     program: str
     repo: str
     worktree: str
@@ -1202,6 +1274,7 @@ class ProgramProfile:
 
 @dataclass(frozen=True)
 class ConfigurationDiagnostic:
+    """The diagnostic describes a configuration problem."""
     diagnostic: str
 
 _warned_configuration_diagnostics: set[ConfigurationDiagnostic] = set()
@@ -1218,6 +1291,7 @@ TEST_PHASE_MARGIN_FALLBACK = 1.2
 
 @dataclass(frozen=True)
 class MemoryConfig:
+    """The configuration holds admission policy, service timings, and memory estimate settings."""
     policy: AdmissionPolicy
     ci_memory_slice: str
     ci_label: str = field(kw_only=True)
@@ -1391,7 +1465,7 @@ def stored_waiter(row: Waiter) -> Waiter:
 
 @dataclass(frozen=True)
 class FreshTest:
-    pass
+    """A matching completed test build proves that the test targets are fresh."""
 
 BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
@@ -1426,18 +1500,20 @@ def run_owner(pid: int, start_time: str) -> str:
 
 @dataclass(frozen=True)
 class SessionHolder:
+    """The wait holder is the session with this identifier and name."""
     session_id: str
     session_name: str
 
 
 @dataclass(frozen=True)
 class UnitHolder:
+    """The wait holder is this unit."""
     unit: str
 
 
 @dataclass(frozen=True)
 class NoHolder:
-    pass
+    """The wait has no identified holder."""
 
 
 WaitHolder = SessionHolder | UnitHolder | NoHolder
@@ -1445,6 +1521,7 @@ WaitHolder = SessionHolder | UnitHolder | NoHolder
 
 @dataclass(frozen=True)
 class AdmissionWaitSnapshot:
+    """The wait snapshot holds the decision, estimate, running work, and queue head reason."""
     decision: AdmissionDecision
     peak: ExpectedPeak
     running: tuple[RunningStep, ...]
@@ -1486,7 +1563,7 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
         case PressureUnavailable():
             return reason.reason
         case StartSpacingWait():
-            return "start spacing"
+            return "another step just started; the queue waits a few seconds between starts"
         case NeedsMemory():
             return "free memory"
         case GpuSlotWait():

@@ -986,7 +986,80 @@ try {
               assert.equal(state.list,null,'The removed list remains.');
               assert.ok(state.hover.includes(expected), name+' has no hover reason.');
               assert.ok(state.rows > 0);
+              if(name==='spacing'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]');
+                  row.scrollIntoView({block:'center'});
+                  const box=row.getBoundingClientRect();
+                  showTip('wait:0',(box.left+box.right)/2,box.top);
+                  const tooltip=document.querySelector('#tip');
+                  const tipBox=tooltip.getBoundingClientRect();
+                  const left=Math.min(box.left,tipBox.left)-4,top=Math.min(box.top,tipBox.top)-4;
+                  return {text:tooltip.textContent,clip:{x:left+scrollX,y:top+scrollY,
+                    width:Math.max(box.right,tipBox.right)-left+4,
+                    height:Math.max(box.bottom,tipBox.bottom)-top+4,scale:1}};
+                })()`);
+                assert.ok(clip.text.includes(expected),'The waiting tooltip omits the explanation.');
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:clip.clip});
+                await writeFile(join(folder,'start-spacing-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+                await evaluate("hideTip();window.scrollTo(0,0)");
+              }
             }
+            for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
+              await show(readings[name]);
+              const headProof=await evaluate(`(() => {
+                const rows=latest.waiters[0].head_room.rows.filter(row=>row.label!=='need'&&!row.label.includes('Held for earlier steps'));
+                const group=document.querySelector('#v-g-free').closest('.legend-group');
+                const legend=Object.fromEntries([...group.querySelectorAll('.row,.group-head')].map(row=>[
+                  row.querySelector('.name').textContent,{
+                    value:row.querySelector('.v').textContent,note:row.querySelector('.note')?.textContent||''}]));
+                return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
+                  values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
+                  hover:tipText('wait:0',latest)[1],room:tipText('room',latest).join('\\n'),legend,
+                  covered:document.querySelector('#v-reserved').textContent,
+                  free:document.querySelector('#v-g-free').textContent,
+                  scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
+              })()`);
+              assert.ok(headProof.removed,'The removed Head line returns.');
+              for(const [label,value] of Object.entries(headProof.values)) {
+                assert.ok(headProof.hover.includes(label+': '+value),'The head tooltip omits the term: '+label);
+                const row=headProof.legend[label];
+                assert.ok(row,'The legend omits the head term: '+label);
+                assert.ok(row.value===value||row.note.includes('Needs '+value+';'),
+                  'The legend amount differs from the head tooltip: '+label);
+                assert.ok(headProof.room.includes(label+(label==='Free'?' · ':': ')+value),
+                  'The room tooltip differs from the head tooltip: '+label);
+              }
+              assert.equal(headProof.values['Free RAM'],headProof.free);
+              assert.equal(headProof.values['Safety net'],(readings[name].ram.safety_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Swap coming back'],(readings[name].ram.swap_target_bytes/gib).toFixed(1)+' GiB');
+              assert.equal(headProof.values['Build reserved'],(readings[name].ram.build_target_bytes/gib).toFixed(1)+' GiB');
+              assert.notEqual(headProof.values['Build reserved'],headProof.covered,'The fixture has no uncovered build reserve.');
+              if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
+              assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
+              if(name==='head_memory'&&theme==='dark'&&width===1400) {
+                const clip=await evaluate(`(() => {
+                  const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+                  const legend=document.querySelector('.legend-box').getBoundingClientRect();
+                  const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
+                  showTip('wait:0',card.right-140,row.top);
+                  placeTip(card.right-140,legend.top+document.querySelector('#tip').offsetHeight+50);
+                  const tip=document.querySelector('#tip').getBoundingClientRect();
+                  const groups=[...document.querySelectorAll('.legend-group')];
+                  if(groups.some(group=>group.getBoundingClientRect().right>tip.left)) {
+                    throw new Error('The head tooltip covers a legend group.');
+                  }
+                  return {x:card.left,y:card.top+scrollY,width:card.width,
+                    height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
+                })()`);
+                const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
+                await writeFile(join(folder,'head-tooltip-dark-desktop.png'),Buffer.from(shot.data,'base64'));
+              }
+              proof[name]=headProof;
+            }
+            await show(base);
+            const reserveNotes=await evaluate(`['reserved-note','safety-note','swap-note'].map(id=>document.getElementById(id).textContent)`);
+            assert.deepEqual(reserveNotes,['Running builds grow into it.','A fixed setting.','Empty now; held for swapped memory.']);
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
@@ -1513,9 +1586,9 @@ try {
           const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
             {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
             {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
-          const room={rows:[{label:'Free memory now',gib:28.4},{label:'− Safety margin',gib:3.0},
-            {label:"− Other programs' swap, which can come back",gib:9.8},{label:'− Held for running builds',gib:8.5},
-            {label:'= Free for builds',gib:7.1}],note};
+          const room={rows:[{label:'Free RAM',gib:28.4},{label:'− Safety net',gib:3.0},
+            {label:'− Swap coming back',gib:9.8},{label:'− Build reserved',gib:8.5},
+            {label:'= Free',gib:7.1}],note};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
@@ -1537,7 +1610,7 @@ try {
                   assert.ok(!tooltip.includes('Head'),tooltip);
                   assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
                   assert.ok(tooltip.includes('can run on'),tooltip);
-                  assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
+                  assert.equal(tooltip.includes('= Free'),index===0,tooltip);
                   assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
@@ -1622,9 +1695,8 @@ try {
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
             why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{rows:[{label:'Free memory now',gib:8.5},{label:'− Safety margin',gib:3.0},
-              {label:"− Other programs' swap, which can come back",gib:6.0},{label:'− Held for running builds',gib:0.0},
-              {label:'= Free for builds',gib:0.0}],note:''}}];
+            head_room:{rows:[{label:'Free RAM',gib:8.5},{label:'− Safety net',gib:3.0},
+              {label:'− Swap coming back',gib:6.0},{label:'= Free',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
@@ -1698,7 +1770,7 @@ try {
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of ['= Free for builds',review.priority_text,'Why it waits: '])
+                  for(const value of ['= Free',review.priority_text,'Why it waits: '])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }

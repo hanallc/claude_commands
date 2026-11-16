@@ -2026,6 +2026,8 @@ class CapViewTests(QueueViewFixtureTests):
         for available, text in ((18, "Head: need 7.6 GiB > room 4.0 GiB (free 18.0 GiB − safety 3.0 GiB − 5.0 GiB swapped outside builds"
                                      + " − kept aside 6.0 GiB)"),
                                 (12, "Head: need 7.6 GiB > room 0.0 GiB (free 12.0 GiB − safety 3.0 GiB − 5.0 GiB swapped outside builds"
+                                     + " − kept aside 6.0 GiB)"),
+                                (8, "Head: need 7.6 GiB > room 0.0 GiB (free 8.0 GiB − safety 3.0 GiB − 5.0 GiB swapped outside builds"
                                      + " − kept aside 6.0 GiB)")):
             with self.subTest(available=available):
                 inputs = self.fixture.inputs(policy=admission_policy_fixture())

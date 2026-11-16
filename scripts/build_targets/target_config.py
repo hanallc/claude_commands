@@ -21,12 +21,14 @@ Platform = Literal["linux", "macos"]
 
 @dataclass(frozen=True)
 class LocalTarget:
+    """The local target holds its name and platform."""
     name: str
     platform: Platform
 
 
 @dataclass(frozen=True)
 class SshTarget:
+    """The SSH target holds its name, platform, and settings path."""
     name: str
     platform: Platform
     settings: Path
@@ -42,6 +44,7 @@ class AnyEligibleTarget:
 
 @dataclass(frozen=True)
 class LocalRequired:
+    """The reason requires local execution."""
     reason: str
 
 
@@ -85,11 +88,13 @@ def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool) -
 
 @dataclass(frozen=True)
 class EligibleTarget:
+    """This target is eligible for execution."""
     target: Target
 
 
 @dataclass(frozen=True)
 class ExcludedTarget:
+    """The target is excluded for this reason."""
     target: Target
     reason: str
 
