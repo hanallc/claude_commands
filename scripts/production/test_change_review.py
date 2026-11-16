@@ -1387,6 +1387,72 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual([row["Change"] for row in change_review.pending(self.listing)], ["Edited words"])
         self.assertEqual(self.listing.read_bytes(), written)
 
+    def test_an_edited_row_covers_only_its_units_checkpoint_in_a_shared_merge(self) -> None:
+        other = self.branch_unit("other", "other-unit", "other-branch", "other-plan.md")
+        _ = self.git("checkout", "-b", "old-branch")
+        for branch, words in (("other-branch", "Other change"), ("old-branch", "Original words")):
+            _ = self.git("commit", "--allow-empty", "-m",
+                         f"checkpoint({branch}): visible change\n\nChange-Review: {words} | Read | Result")
+            self.record_unit_commit(self.git("rev-parse", "HEAD"), branch)
+        _ = self.git("checkout", "integration")
+        _ = self.git("merge", "--no-ff", "old-branch", "-m", "Merge both units into integration")
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "origin", "integration")
+        self.promote()
+        _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
+        code, output, error = self.ready()
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("C2", output)
+        self.assertEqual([(row["Change"], row["Producer"]) for row in change_review.pending(self.listing)],
+                         [("Edited words", self.unit.id), ("Other change", other.id)])
+        written = self.listing.read_bytes()
+        self.assertEqual(self.ready(), (0, "", ""))
+        self.assertEqual(self.listing.read_bytes(), written)
+
+    def test_positional_pairing_orders_ready_and_held_changes_for_each_producer(self) -> None:
+        other = staff.StaffId("other-producer")
+        for second_step in ("restart", "deploy"):
+            with self.subTest(second_step=second_step):
+                changes = [change_review.PublicationChange(item, change_review.UnresolvedSource(), producer, "checkpoint", "")
+                           for producer, item in (
+                               (self.unit.id, Visible("First held", "Read", "Result", change_review.AfterStep("restart"))),
+                               (other, Visible("Other held", "Read", "Result", change_review.AfterStep("deploy"))),
+                               (self.unit.id, Visible("First ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second ready", "Read", "Result")),
+                               (self.unit.id, Visible("Second held", "Read", "Result", change_review.AfterStep(second_step))),
+                           )]
+                self.listing.unlink(missing_ok=True)
+                edited = [Visible(f"Edited words {index}", "Read", "Result") for index in range(4)]
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, edited, date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[other, self.unit.id, self.unit.id, self.unit.id], record=record)
+                _ = change_review.append_rows(self.listing, changes, date(2026, 11, 7), "abcdef123456", self.doc,
+                                              record=record, repo=self.repo, merge_changes=changes)
+                expected = ["Second held"] if second_step == "restart" else ["First held", "Second held"]
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 [item.change for item in edited] + expected)
+
+    def test_positional_pairing_requires_known_producers_but_text_matching_does_not(self) -> None:
+        for producer, row_producer in ((self.unit.id, ""), (change_review.UnknownProducer(), self.unit.id),
+                                      (change_review.UnknownProducer(), "")):
+            with self.subTest(producer=producer, row_producer=row_producer):
+                change = change_review.PublicationChange(Visible("Original words", "Read", "Result"),
+                    change_review.UnresolvedSource(), producer, "checkpoint", "")
+                self.listing.unlink(missing_ok=True)
+                record = staff.snapshot()
+                _ = change_review.append_rows(self.listing, [Visible("Edited words", "Read", "Result")],
+                                              date(2026, 11, 7), "abcdef12", self.doc,
+                                              producers=[staff.StaffId(row_producer)], record=record)
+                added = change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                  record=record, repo=self.repo, merge_changes=[change])
+                self.assertEqual(len(added), 1)
+                self.assertEqual([row["Change"] for row in change_review.pending(self.listing)],
+                                 ["Edited words", "Original words"])
+                self.assertEqual(change_review.append_rows(self.listing, [change], date(2026, 11, 7), "abcdef12", self.doc,
+                                                          record=record, repo=self.repo, merge_changes=[change]), [])
+
     def test_text_matching_reserves_its_row_before_an_edited_row_covers_another_change(self) -> None:
         _ = self.merge_change("Change-Review: First | Read | First result\n"
                               + "Change-Review: Second | Read | Second result")
@@ -1404,7 +1470,8 @@ class ReadyListTests(ProducerFixture):
                                    + "Change-Review: Second | Read | Second result")
         self.promote()
         _ = change_review.append_rows(self.listing, [Visible("First", "Read", "First result")],
-                                      date(2026, 11, 7), merged[:8], self.doc, record=staff.snapshot())
+                                      date(2026, 11, 7), merged[:8], self.doc,
+                                      producers=[self.unit.id], record=staff.snapshot())
         _ = change_review.edit_row(self.listing, "C1", Visible("Edited first", "Read", "First result"),
                                    date(2026, 11, 7), self.doc)
         code, output, error = self.ready()
