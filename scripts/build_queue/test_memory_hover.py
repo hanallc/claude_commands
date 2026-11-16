@@ -481,9 +481,17 @@ class MemoryHoverTests(unittest.TestCase):
                 {"name": "second", "need": 1.06, "free": 1.04},
                 {"name": "head", "need": 1.06, "free": 1.04, "head_room": {"rows": [
                     {"label": "Queue cap", "gib": 5.2}, {"label": "− Builds", "gib": 3.12},
-                    {"label": "− Build reserved", "gib": 1.04}, {"label": "= Free", "gib": 1.04}]}}]}
+                    {"label": "− Build reserved", "gib": 1.04}, {"label": "= Free", "gib": 1.04}]}},
+                # The user, 11-16: a step behind the head showed Free 0.0 GiB while the Free row showed free memory.
+                {"name": "behind", "need": 1.06, "free": 0},
+                {"name": "after a slot", "need": 1.5, "free": 2.0}]}
         tips = cast(list[list[dict[str, object]]], self.page_expression(
-            "['g-builds','row:0','wait:0','wait:1','wait:2'].map(key => tooltipRows(key, data))", data))
+            "['g-builds','row:0','wait:0','wait:1','wait:2','wait:3','wait:4'].map(key => tooltipRows(key, data))", data))
+        given = {str(row["label"]): str(row["value"]) for row in tips.pop()}
+        self.assertEqual((given["Free"], given["+ Given back by other steps"]), ("1.0 GiB", "1.0 GiB"))
+        self.assertNotIn("Short by", given)
+        behind = {str(row["label"]): str(row["value"]) for row in tips.pop()}
+        self.assertEqual((behind["Free"], behind["− Kept for other steps"], behind["Short by"]), ("1.0 GiB", "1.0 GiB", "1.1 GiB"))
         self.assertEqual([row["value"] for row in tips[0] if row["kind"] != "caption"],
                          ["3.0 GiB", "1.0 GiB", "1.0 GiB", "1.0 GiB"])
         run = {str(row["label"]): str(row["value"]) for row in tips[1]}
@@ -501,6 +509,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(head["Queue cap"] - head["− Builds"] - head["− Build reserved"], head["= Free"])
         cap = cast(list[dict[str, object]], self.page_expression("tooltipRows('cap', data)", data))
         cap_fields = {str(row["label"]): str(row["value"]) for row in cap}
+        self.assertEqual(behind["Free"], cap_fields["+ Free"])
         for head_name, cap_name in (("Queue cap", "Queue cap"), ("− Builds", "Builds"),
                                    ("− Build reserved", "+ Build reserved"), ("= Free", "+ Free")):
             self.assertEqual(str(next(row["value"] for row in tips[-1] if row["label"] == head_name)), cap_fields[cap_name])

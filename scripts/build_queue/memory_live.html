@@ -812,9 +812,17 @@ function stepTooltip(key, data) {
           ...earlier.map(term => field(term.label, `${(term.tenths / 10).toFixed(1)} GiB`)),
           field(result.label, `${free.toFixed(1)} GiB`, 'sum')]));
       }
-      const needTenths = Math.round(row.need * 10), freeTenths = Math.round(free * 10);
+      const freeTenths = Math.round(free * 10);
+      const needTenths = Math.round(row.need * 10);
       const need = [field('Needs', `${(needTenths / 10).toFixed(1)} GiB`)];
-      if (!row.head_room?.rows?.length) need.push(field('Free', `${(freeTenths / 10).toFixed(1)} GiB`));
+      if (!row.head_room?.rows?.length) {
+        // Free matches the page's Free row. The step's own room differs when the head and held slots
+        // get memory first, or when an earlier step gives back memory it held.
+        const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
+        need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
+        if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
+        if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+      }
       if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
       rows.push(...groupRows(need));
     }
