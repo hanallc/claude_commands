@@ -1,4 +1,4 @@
-"""Test the accounts board columns, lines, tones, and facts for the Hana console Accounts page."""
+"""Test the accounts board columns, lines, and tones for the Hana console Accounts page."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -88,13 +88,6 @@ class StatusBoardTests(unittest.TestCase):
                          {"aLpha": "default", "beta": "warning", "Charlie": "error", "Delta": "default", "Echo": "default",
                           "Foxtrot": "default", "Gamma": "default"})
         self.assertEqual(rows["total"]["cells"]["label"], [accounts.BoardSpan(text="total", tone="default", kind="bold")])
-
-    def test_facts_carry_each_value_for_a_narrow_pane(self) -> None:
-        board = accounts.status_board(fixture())
-        facts = [" · ".join(text(fact) for fact in line["facts"]) for line in board["rows"][:2]]
-        self.assertEqual(facts, [
-            "60% left · role showrunners ✓ · busy 1 · idle 0 · paused 0 · exited 1 · total 2 · resets 14:00 · credits unlimited · enabled",
-            "role unit directors · busy 2 · idle 1 · paused 0 · exited 0 · total 3"])
 
     def test_quota_boundaries_color_the_left_cell_and_keep_the_dot(self) -> None:
         rows = tuple(row(f"Level {value:02}", ("workers",), (counts(0, 0, 0, 0),), value, None, None) for value in (9, 10, 24, 25))

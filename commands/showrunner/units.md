@@ -18,8 +18,8 @@ It inserts `unknown N` before the total only when that count exceeds zero.
 Counts include only units in these blocks.
 
 The status table follows the count line, above the blocks.
-Its columns are `Unit | Status | Machine | Progress | Phase | ETA Next | ETA Plan`.
-- `Status` is the census status of the unit's session.
+Its columns are `Unit | Director | Machine | Progress | Phase | ETA Next | ETA Plan`.
+- `Director` is the census status of the director's session; its values remain `busy`, `idle`, or the recorded session state.
 - `Machine` appears only when a unit uses another machine.
 - `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
 - `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
@@ -40,6 +40,16 @@ Its rows use the same cached plan and run records as the Progress bar.
 6. `Done` explains a stopped task that a later attempt finished while the bar still includes that attempt.
 
 A busy session does not prove a task.
+With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
+The director's busy status does not change this result.
+Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
+Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
+The block has no Next row.
+Only events from an open phase can supply a finished-step fallback.
+Unreadable sources never produce `Nothing to do`.
+A missing plan file in an existing local worktree is an absent plan.
+A missing plan file keeps its unavailable state when the worktree is missing or remote.
+Other plan read errors keep the plan unavailable.
 Each current task has one row.
 Several actors share its State cell, joined by semicolons; equal states appear once.
 No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
@@ -57,6 +67,19 @@ Absent, unreadable, and readable empty plans remain separate facts.
 Merge rows name each phase title and its live rank, active merge, or short failure cause.
 A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
 Without a production name, the text ends with `not in the merge line`.
+A finished phase counts as merged when its checkpoint reaches main, its unit and phase have a successful result, or main records its merge.
+A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+An unreadable checkpoint stays unmerged.
+A successful result for the exact checkpoint hash counts, with or without a valid result time.
+Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+The board ignores an invalid result time.
+Merge subjects must start with `Merge <unit> phase <phase> (<hash>)`.
+The board reads these subjects once per render and omits older failures for merged phases.
+The row uses its normal merge state when the checkpoint is in the merge line or currently merges.
+Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+Without a recorded owner, carried work uses `merges with <name>`.
 A second phase in the same merge uses `Merges with <id>`, or `Merges with phase <id>` for a numeric ID.
 The board omits a phase's shrink and repair merge items.
 The phase's live state takes priority over older failures from those items.
@@ -66,6 +89,7 @@ Dependencies outside the merge line say `not in the merge line`.
 A local dependency uses its ID, with `phase` before a numeric ID.
 An external dependency uses `<unit> phase <id>` without its title.
 A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
 A branch dependency uses `After branch <name>; <short state>`.
 A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
 Recorded unit waits and plan `waits_for` conditions retain their text.
@@ -126,6 +150,7 @@ A process without an identity reports an unreadable thread when its pane holds s
 One staff candidate retains its pane placement with unknown status.
 Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
+The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
 Use `agents` to pause, exit, or resume units:
