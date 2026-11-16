@@ -809,6 +809,8 @@ def image_path(identity: str) -> str:
 def _row_image(identity: str, row: str) -> str:
     if not identity or image_path(identity):
         return identity
+    if copied := image_store.copy_page_image(identity):
+        return copied
     print(f"change review: no image {identity}; row {row} has no image")
     return ""
 

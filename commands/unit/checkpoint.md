@@ -172,6 +172,7 @@ Loop/verbose only:
    Use one dark mode screenshot at desktop width, or `change_review.py image --output <text file>` for a terminal change.
    Register a screenshot with `change_review.py image --image <png>`.
    Add ` | image <id>` last, after ` | after <step>` when present.
+   Use a change image id or an Images page id. A pair supplies its after image.
    The parser still accepts a line without an image.
    Example: `Change-Review: The service shows review links | Open the review page | The links appear | after restart`.
    The session that completes the step runs the printed `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>` command.
