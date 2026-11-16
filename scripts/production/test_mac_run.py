@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
 from typing import TypedDict, cast, final, override
@@ -23,6 +24,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import floor_claims
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -753,7 +755,8 @@ cleanup_mac_run
             return [cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
                     for mirror in copies.remote_mirrors()]
 
-    def assert_clone_records_after_cleanup(self, cleanup_status: int) -> None:
+    def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
+                                           prepare_cleanup: Callable[[Path], None] = lambda _: None) -> None:
         source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
                                          {"source.txt": "content\n"}).checkout
         head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
@@ -789,6 +792,7 @@ cleanup_mac_run
             self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
             self.assertEqual(before_local[0]["host"], "natemccoy@mac")
             self.assertEqual(before_remote[0]["host"], "localhost")
+            prepare_cleanup(Path(str(before_local[0]["path"])))
             send_process_group(process.pid, signal.SIGTERM)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
@@ -811,6 +815,22 @@ cleanup_mac_run
 
     def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
         self.assert_clone_records_after_cleanup(0)
+
+    def test_old_mirror_cleanup_removes_the_clone_and_both_registry_records(self) -> None:
+        checkouts: list[Path] = []
+
+        def remove_exclusions(checkout: Path) -> None:
+            checkouts.append(checkout)
+            exclude = checkout / ".git/info/exclude"
+            patterns = {f"/{name}" for name in floor_claims.MIRROR_METADATA}
+            _ = exclude.write_text("\n".join(line for line in exclude.read_text().splitlines()
+                                           if line not in patterns) + "\n")
+            status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
+            self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
+
+        self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
+        self.assertEqual(len(checkouts), 1)
+        self.assertFalse(checkouts[0].exists())
 
     def test_failed_clone_cleanup_keeps_both_registry_records(self) -> None:
         self.assert_clone_records_after_cleanup(23)

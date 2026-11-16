@@ -2499,6 +2499,14 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
+    def test_row_cleanup_reports_retained_folders(self) -> None:
+        folder = self.path.parent / "retained-copy"
+        result = scratch.TaskCleanup()
+        result.kept.append(scratch.KeptFolder(folder, "it has uncommitted changes"))
+        with mock.patch.object(scratch, "end", return_value=result):
+            lines = change_review.end_row_scratch(self.path, "C76")
+        self.assertEqual(lines, [f"kept {folder}: it has uncommitted changes"])
+
     def attached_lists(self) -> Path:
         earlier = self.path.with_name("change-review - child.md")
         _ = self.path.write_text(LIST.replace("C76", "C9"), encoding="utf-8")

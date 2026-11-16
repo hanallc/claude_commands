@@ -26,17 +26,17 @@ class SlotTestConfiguration:
 
 def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaultMaximum = 2,
                         default_maximum: int = 1, unused_days: int = 7) -> SlotTestConfiguration:
-    """Write a complete private configuration for direct calls and child commands."""
+    """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
     slots = root / "slots"
     cargo = root / "cargo"
     machine = host_name()
     lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.workspace", "slots.", "patterns.slot="))]
+             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.workspace", "roots.session", "slots.", "patterns.slot="))]
     lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={slots}",
                   f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={cargo}",
-                  f"roots.workspace={root / 'workspaces'}",
+                  f"roots.workspace={root / 'workspaces'}", f"roots.session={root / 'session'}",
                   "patterns.slot={repository}-slot{slot}", "# whole: 1..",
                   f"slots.{machine}.default_max={default_maximum}", "# whole: 1..",
                   f"slots.unused_days={unused_days}", "# range: 5e-324..", "slots.wait_seconds=30"))
@@ -52,6 +52,8 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     environment.update({
         "COPIES_CONFIG": str(copies), "SCRATCH_ROOT": str(root / "scratch"),
         "SCRATCH_COPIES_ROOT": str(root / "workspaces"), "SCRATCH_HOLDS": str(root / "holds.json"),
+        "SESSION_TEMP_ROOT": str(root / "session"), "SESSION_FORMER_ROOT": str(root / "former-session"),
+        "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_FOLDER": "",
         "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",

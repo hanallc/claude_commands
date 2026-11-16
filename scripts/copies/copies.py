@@ -666,6 +666,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                                         suffix_length=0, suffix=destination.name)
     with build_folders.leased_build_folder(spec) as path:
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
+        if scratch.in_session_folder(path):
+            _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
         _ = scratch.update_record(path, lambda record: {
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "test_hana_clone": True, "source_path": str(source.resolve()),
@@ -685,7 +687,9 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                         **(record.fields if isinstance(record, copy_record.Registered) else {}),
                         "claude_trust_folder": str(path.resolve()),
                     }, scratch_settings=scratch_settings)
-                    accounts.set_claude_folder_trust(path, trusted=True)
+                    trust = accounts.set_claude_folder_trust(path, trusted=True)
+                    if isinstance(trust, accounts.FolderTrustFailed):
+                        trust.report()
                 source_commit = git(path, "rev-parse", "HEAD").decode().strip()
                 _ = scratch.update_record(path, lambda record: {
                     **(record.fields if isinstance(record, copy_record.Registered) else {}),
@@ -1585,6 +1589,7 @@ def mirror_probe_setup(path: str) -> str:
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
     """Publish mirror metadata before removal authority can disappear."""
+    scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
     write_text_atomic(tree / floor_claims.MIRROR_RECORD, json.dumps({
         "kind": "remote-mirror", "owner": owner, "repo": repo, "session": session, **extra,
     }) + "\n")
