@@ -88,11 +88,11 @@ def transfer(path, key, source):
     if path.suffix == '.zst':
         with open_transcript(path) as stream:
             size = stream.seek(0, 2)
-    same = old.get('inode') == stat.st_ino and old.get('size') == size and old.get('mtime') == stat.st_mtime_ns
+    same = old.get('size') == size and old.get('mtime') == stat.st_mtime_ns
     if same and not old.get('matched'):
         matched = False
         start = 0
-    elif (old.get('matched') and old.get('inode') == stat.st_ino
+    elif (old.get('matched')
           and size >= old.get('cursor', 0)
           and (old.get('mtime') == stat.st_mtime_ns
                or size > old.get('size', size))):
