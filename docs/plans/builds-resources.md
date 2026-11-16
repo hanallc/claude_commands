@@ -2637,3 +2637,43 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `scripts/agents/detached_runs.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `scripts/direct/test_verify_tree_cancel_lint.py`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and three as-built docs.
 
 **Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.
+
+### Phase 130 — The cutover deletes each free legacy gate folder after a Git rescue  · status: todo
+**Source:** builds showrunner 2026-11-15, from the build-folders schedule (queue, `6a828e30c`): "a one-time run on natedev that deletes each ~/worktrees/gates folder whose lock has no holder (309 GiB on the system drive) … make it rescue Git work first, the same as the slot cleanup."
+**Depends on:** build-folders Phase 4 on main (batch656, `e75b8ec06`; it brings `scripts/lib/git_rescue.py`, and no writer uses `~/worktrees/gates` after it). The run is on Thu 11-19, cutover day.
+
+#### Work Order
+
+**Measured (2026-11-15 22:40 EST):** `~/worktrees/gates` holds 46 gate folders in 12 repository folders; `checkout` and `reload` are empty. Each gate folder holds only `.claude-busy`, `.gate.json` and `target`. No `.git` is in the top 6 levels. The root also holds `.remote-mirrors` (copies' remote mirror records) and an empty `.claude`.
+
+**Spec:**
+1. Add one script, `scripts/lint/gate_folders_delete.py`. It takes `--root <path>` (required) and `--dry-run`. It reads no config key: `copies.root` goes at the same cutover.
+2. For each `<root>/<repository>/<gate>` folder, hold `scratch.judgment_lock(folder)`. A held lock keeps the folder and prints `kept <path>: busy`.
+3. Under the lock, find each Git checkout in the folder:
+   - A linked worktree: `git_rescue.rescue(path, name, generated=[path / "target"])`, as `build_slots._rescue` does. A `RescueError` keeps the folder and prints the error.
+   - A repository with its own `.git` folder: keep the folder. A ref inside a deleted repository saves nothing.
+4. Delete the free folder while the lock is held. Then delete an empty repository folder. Print each deleted path and its size.
+5. Keep `.remote-mirrors` and every file at the root. Print them as kept.
+6. `--dry-run` prints each decision and deletes nothing.
+7. Add no signal handler, mask or disposition. The cutover removal commit deletes the script after the run.
+
+**Exact command (natedev, Thu 11-19):**
+1. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates --dry-run`. Read each line.
+2. `~/.claude/scripts/lib/py ~/.claude/scripts/lint/gate_folders_delete.py --root ~/worktrees/gates`.
+3. Run step 2 again after each busy folder's task ends.
+
+**Acceptance gate:** fixture tests: a free folder goes; a held `.claude-busy` keeps its folder; a linked worktree with edits gets a `refs/rescue/` ref in its source before deletion; a rescue failure keeps the folder; a folder with its own repository stays; `--dry-run` deletes nothing; `.remote-mirrors` stays. basedpyright 0/0.
+
+### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
+**Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
+**Depends on:** build-folders Phase 7 on main (planned Thu 11-19 morning), and devtools' stall watch on held lease owners on main first. Builds owns the order of `test_sweep.py` and `test_tmp_sweep.py` edits: claim them through berth and builds before an edit.
+
+#### Work Order
+
+**Spec:**
+1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
+2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
+3. Retire each competing managed-folder delete path after its legacy users drain.
+4. Keep `~/.cache` out of every root. Add no cleanup tool.
+
+**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
