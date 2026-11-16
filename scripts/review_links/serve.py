@@ -35,7 +35,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf
 from scripts.production import change_routing, change_review
-from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page
+from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, image_store, images, investigations_page, list_page
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -288,6 +288,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return None
             self.html_response(200, content)
             return None
+        if route.path == list_page.PAGE_PATH:
+            try:
+                content = list_page.render(root)
+            except (OSError, ValueError) as error:
+                print(f"review-links list: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         if route.path == images.PAGE_PATH:
             try:
                 content = images.render(root)
@@ -448,6 +457,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == investigations_page.PAGE_PATH:
             self.investigation_post()
             return
+        if urlsplit(self.path).path == list_page.PAGE_PATH:
+            self.list_post()
+            return
         if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
             return
@@ -580,6 +592,31 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def list_post(self) -> None:
+        """Save List feedback before the shared sender starts."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 100000:
+                raise ValueError("invalid List request size")
+            body = self.rfile.read(length).decode("utf-8")
+            delivery = list_page.submit(server.root, body)
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except OSError as error:
+            self.browser_failure(503, "The List request could not be saved. Try again.", error)
+            return
+        try:
+            fields = parse_qs(body)
+            self.json_response(200, {"state": "read" if fields["action"] == ["read"] else "sent",
+                **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
+        finally:
+            try:
+                list_page.deliver(delivery)
+            except OSError as error:
+                print(f"review-links delivery status: {error}", file=sys.stderr)
+
     def investigation_post(self) -> None:
         """Save Mark read and return an error for the card when the save fails."""
         root = cast(ReviewLinksServer, self.server).root
@@ -708,7 +745,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
-        threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
+        recover_changes = change_page.recover_pending
+        recover_list = list_page.recover_pending
+        def recover_pending() -> None:
+            recover_changes(self.delivery_status)
+            recover_list()
+        threading.Thread(target=recover_pending, daemon=True).start()
 
     @override
     def server_bind(self) -> None:

@@ -3073,6 +3073,16 @@ class ChangePageTests(unittest.TestCase):
             self.assertIsInstance(restarted.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
             self.assertEqual(restarted.request_attempts, {})
 
+        with self.subTest(answer="deleted question sends nothing"):
+            key = self.file_user_question("Delete this question before recovery")
+            pending_status = change_page.DeliveryStatus(self.root)
+            question = next(item for item in change_browser.prepare(browser, pending_status).questions if item.key == key)
+            _ = change_browser.submit_question(question, "answer", "Do not send this", pending_status)
+            question.record.path.unlink()
+            count = len(self.messages)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            self.assertEqual(len(self.messages), count)
+
     def test_browser_markup_supplies_waiting_rows_and_navigation_after_saves(self) -> None:
         path, forms, body = self.browser()
         del path

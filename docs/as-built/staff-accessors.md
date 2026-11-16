@@ -307,6 +307,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/change_page.py` | read | snapshot; QuestionStaff.read resolves saved question records during delivery recovery; source_name uses by_id and parent_of to name a question or investigation source |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id name each investigation owner on the Investigations page |
+| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |

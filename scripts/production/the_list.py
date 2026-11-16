@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -92,6 +93,19 @@ class ItemChange:
     time: datetime
     what: str
     source: str
+
+
+@dataclass(frozen=True)
+class PageFeedback:
+    request: str
+    words: str
+    state: Literal["pending", "sent", "alerted"] = "pending"
+    alerted_to: str = ""
+
+
+PAGE_SOURCE = "nate via List"
+feedback_claims: set[tuple[Path, str]] = set()
+feedback_claims_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -488,20 +502,112 @@ def mark_read(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
                    "Marked read", source, unread=False)
 
 
+def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
+    """Read the latest delivery state for each request from the item log."""
+    requests: dict[str, PageFeedback] = {}
+    for entry in item.log:
+        if entry.source != PAGE_SOURCE or not entry.what.startswith("Feedback to morty: "):
+            continue
+        value = cast(object, json.loads(entry.what.removeprefix("Feedback to morty: ")))
+        if not isinstance(value, dict):
+            raise ListError("invalid List feedback log")
+        fields = cast(dict[str, object], value)
+        request, words, state = fields.get("request"), fields.get("words"), fields.get("state")
+        if not isinstance(request, str) or not isinstance(words, str) or state not in ("pending", "sent", "alerted"):
+            raise ListError("invalid List feedback log")
+        alerted_to = fields.get("alerted_to", "")
+        if not isinstance(alerted_to, str):
+            raise ListError("invalid List feedback alert")
+        requests[request] = PageFeedback(request, words, state, alerted_to)
+    return requests
+
+
+def _feedback_entry(feedback: PageFeedback, moment: datetime) -> ItemChange:
+    return ItemChange(moment, "Feedback to morty: " + json.dumps({"request": feedback.request,
+        "words": feedback.words, "state": feedback.state, "alerted_to": feedback.alerted_to}, ensure_ascii=False), PAGE_SOURCE)
+
+
+def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
+    """Save the request identity, words, and pending state in one locked write."""
+    if not feedback.request or not feedback.words.strip() or feedback.state != "pending":
+        raise ListError("enter a new request and words for morty")
+    store = _store(keeper)
+    with store.locked():
+        item = load(keeper, identity)
+        previous = feedback_requests(item).get(feedback.request)
+        if previous is not None:
+            if previous.words != feedback.words:
+                raise ListError("this request already has different words")
+            return previous
+        moment = now()
+        changed = replace(item, updated=moment, log=(*item.log, _feedback_entry(feedback, moment)))
+        _validate(changed)
+        _save(store, changed)
+        return feedback
+
+
+def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
+                     send: Callable[[ListItem, PageFeedback], PageFeedback]) -> None:
+    """Claim one request in this process and release the List lock before sending."""
+    store = _store(keeper)
+    claim = store.path(identity), request
+    with feedback_claims_lock:
+        if claim in feedback_claims:
+            return
+        feedback_claims.add(claim)
+    try:
+        with store.locked():
+            item = load(keeper, identity)
+            feedback = feedback_requests(item).get(request)
+        if feedback is None or feedback.state != "pending":
+            return
+        result = send(item, feedback)
+        if result.state == "pending":
+            return
+        with store.locked():
+            current = load(keeper, identity)
+            latest = feedback_requests(current).get(request)
+            if latest is None or latest.state != "pending":
+                return
+            moment = now()
+            changed = replace(current, updated=moment, log=(*current.log, _feedback_entry(result, moment)))
+            _save(store, changed)
+    finally:
+        with feedback_claims_lock:
+            feedback_claims.remove(claim)
+
+
+def sent_to_morty(item: ListItem) -> Timestamp:
+    """Keep the sent notice until the next writer adds a log entry."""
+    for entry in reversed(item.log):
+        if entry.source != PAGE_SOURCE:
+            break
+        if entry.what.startswith("Feedback to morty: "):
+            feedback = next(iter(feedback_requests(replace(item, log=(entry,))).values()))
+            if feedback.state == "pending":
+                return entry.time
+    return NoTimestamp.UNSET
+
+
+def order(item: ListItem) -> tuple[bool, bool, float, int]:
+    """Put user decisions first, unread updates next, and early checks before late checks."""
+    return (item.state != ItemState.WAITING_FOR_NATE, not isinstance(item.unread_since, datetime),
+            item.next_check.timestamp() if isinstance(item.next_check, datetime) else float("inf"), item.number)
+
+
 def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked: bool = False) -> str:
     moment = now()
     items = records(keeper, include_closed=include_closed)
     items = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
-    items.sort(key=lambda item: (item.state != ItemState.WAITING_FOR_NATE, not isinstance(item.unread_since, datetime),
-                                item.next_check.timestamp() if isinstance(item.next_check, datetime) else float("inf"), item.number))
+    items.sort(key=order)
     record = staff.snapshot()
     lines = ["| # | Owner | Item | State | Next step | ETA | Update |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for item in items:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
-        if isinstance(item.next_check, datetime):
+        if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()
-        if isinstance(item.next_check, CheckCondition):
+        if item.state != ItemState.CLOSED and isinstance(item.next_check, CheckCondition):
             state += "; check: " + item.next_check.text
         if isinstance(item.parked_until, datetime) and item.parked_until > moment:
             state += "; parked until " + item.parked_until.isoformat()
