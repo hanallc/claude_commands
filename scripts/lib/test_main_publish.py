@@ -15,7 +15,7 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import main_publish
+from scripts.lib import land_main, main_publish
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -99,8 +99,22 @@ class MainPublishTests(PublicationTestCase):
     def setUp(self) -> None:
         self.enterContext(mock.patch.dict(os.environ, self.repository.env, clear=True))
 
+    def test_publish_reports_only_completed_or_failed_hooks(self) -> None:
+        repo = self.repository
+        for hook, detail in (
+                (land_main.HookAbsent(), "origin has it"),
+                (land_main.HookSkipped(), "origin has it"),
+                (land_main.HookDone(), "origin has it; post-push hook: done"),
+                (land_main.HookFailed(9, "retry"), "origin has it; post-push hook: failed (exit 9); rerun: retry")):
+            with self.subTest(hook=hook), mock.patch.object(land_main, "land", return_value=land_main.Landed(
+                    repo.head(), "main", land_main.AlreadyLanded(), hook)):
+                self.assertEqual(main_publish.push(repo.checkout), (True, detail))
+
     def test_commit_and_push_publish_only_the_named_file_and_preserve_other_staged_work(self) -> None:
         repo = self.repository
+        hook = repo.checkout / ".claude/config/post_push.sh"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text('printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         before = repo.change()
         _ = (repo.checkout / "other.txt").write_text("unrelated staged work\n")
         _ = repo.git(repo.checkout, "add", "other.txt")
@@ -113,7 +127,10 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.git(repo.checkout, "diff", "--cached", "--name-only"), "other.txt")
         pushed, detail = main_publish.push(repo.checkout)
         self.assertTrue(pushed, detail)
+        self.assertIn("post-push hook: done", detail)
         self.assertEqual(repo.remote_tip(), repo.head())
+        expected_hooks = [repo.head()]
+        self.assertEqual((repo.checkout / ".git/hook-runs").read_text().splitlines(), expected_hooks)
 
         for pusher in ("python", "shell"):
             with self.subTest(pusher=pusher, holder="another process"):
@@ -130,6 +147,8 @@ class MainPublishTests(PublicationTestCase):
                                "--publish-only", repo.head()]
                 _ = publish_after_contender(self, repo.checkout, repo.origin, command, repo.env, cwd=repo.checkout)
                 self.assertEqual(repo.remote_tip(), repo.head())
+                expected_hooks.append(repo.head())
+                self.assertEqual((repo.checkout / ".git/hook-runs").read_text().splitlines(), expected_hooks)
 
         for handoff in ("explicit", "plain"):
             with self.subTest(pusher="shell entry", holder="the parent process", handoff=handoff):

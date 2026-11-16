@@ -40,13 +40,15 @@ class ReleaseRerunTests(ScriptRepositoryTestCase):
         self.assertIn("another commit", result.stderr)
 
     def test_restoring_unreleased_finishes_a_failed_commit_or_push_without_duplicate_sections(self) -> None:
+        _ = self.write(self.repo / ".claude/config/post_push.sh",
+                       'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         changelog = self.write(self.repo / "CHANGELOG.md", f"## [1.0] - {date.today()}\n\nrelease\n")
         _ = self.git("add", "CHANGELOG.md")
         _ = self.git("commit", "-m", "release")
         self.fail_git("commit")
         stopped = self.script("release/restore_unreleased.sh", "1.0", "CHANGELOG.md")
         self.assertNotEqual(stopped.returncode, 0)
-        self.fail_git("push")
+        self.fail_git("-C", str(self.repo), "push")
         stopped = self.script("release/restore_unreleased.sh", "1.0", "CHANGELOG.md")
         self.assertNotEqual(stopped.returncode, 0)
         committed = self.git("rev-parse", "HEAD").stdout
@@ -55,6 +57,8 @@ class ReleaseRerunTests(ScriptRepositoryTestCase):
         self.assertEqual(changelog.read_text().count("## [Unreleased]"), 1)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout, committed)
         self.assertEqual(self.git("rev-parse", "origin/main").stdout, committed)
+        self.assertIn("post-push hook: done", finished.stdout)
+        self.assertEqual((self.repo / ".git/hook-runs").read_text().splitlines(), [committed.strip()])
 
     def test_finalizing_multiple_changelogs_resumes_after_the_first_backup_is_removed(self) -> None:
         first = self.write(self.repo / "first.md", "## [Unreleased]\n\nfirst\n")
