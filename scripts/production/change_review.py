@@ -1,7 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
 """Read unit commit trailers and write change review rows.
 
-A visible trailer has three fields, optional after <step>, and optional last image <id>.
+A visible trailer requires three fields and a final image <id>, with optional after <step> before the image.
 An invisible change uses Change-Review: none — <reason>.
 Every supplied review line must parse, whatever the commit subject.
 Only checkpoints that change more than Markdown require a review line.
@@ -69,7 +69,7 @@ IMAGE = "Image"
 KIND = "Kind"
 REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
-FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] [| image <id>]"
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see> [| after <step>] | image <id>"
 SEPARATOR = " | "
 SHORT = 8
 # Commits made before the rule landed carry no line and are not read: 2026-10-15 00:00 EDT.
@@ -208,8 +208,12 @@ def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
         return f"no {TRAILER} line: add `{TRAILER}: {FORM}` or `{TRAILER}: none — <why nothing visible changes>`"
     bad = [item.text for item in found if isinstance(item, Malformed)]
     if bad:
-        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optionally followed by ` | after <step>` and then ` | image <12-hex id>`: "
+        return (f"{TRAILER} line {bad[0]!r} needs three parts split by {SEPARATOR.strip()!r}, optional ` | after <step>`, and required ` | image <12-hex id>`: "
                 + f"`{TRAILER}: {FORM}`, or `{TRAILER}: none — <why nothing visible changes>`")
+    for line, item in zip(_LINE.finditer(message), found):
+        if isinstance(item, Visible) and not item.image:
+            return (f"{TRAILER} line {line.group(0)!r} has no image: register one with change_review.py image --image <png> "
+                    + "(or --output <text file> for terminal output), then end the line with | image <id>")
     return ""
 
 

@@ -366,6 +366,16 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
         self.assertIn(change_review.HELD_NEXT_STEP, result.stderr)
 
+    def test_a_visible_checkpoint_without_an_image_is_refused_before_the_merge(self) -> None:
+        line = "Change-Review: The grid fades | Open Hana | The grid appears"
+        checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n" + line)
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assert_refused_before_gate(result)
+        self.assertIn(checkpoint[:8] + " checkpoint(fixture): grid fades:", result.stderr)
+        self.assertIn("has no image", result.stderr)
+        self.assertIn("change_review.py image --image <png>", result.stderr)
+        self.assertIn(line, result.stderr)
+
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()
         original = review.read_bytes()
@@ -374,7 +384,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         assert member is not None and isinstance(member.parent, staff.ReportsTo)
         production = member.parent.id
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
                                             + "Change-Review: none — the gate script")
         # The row carries today in the user's zone, as the gate reads it; a run across midnight may take either day.
         with mock.patch.dict(os.environ, self.environment, clear=True):
@@ -405,7 +415,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         review, doc = self.review_list()
         _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): date\n\n"
-                                            + "Change-Review: The date follows the user zone | Read | The local date")
+                                            + "Change-Review: The date follows the user zone | Read | The local date | image 012345abcdef")
         instant = datetime(2026, 11, 4, 1, tzinfo=UTC)
 
         def now(zone: tzinfo | None = None) -> datetime:
@@ -427,8 +437,8 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
                    + f"CHECK=bash /scripts/production/production_check.sh {runner.parent.id}\n")
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
-                                            + "Change-Review: The sky dims | Run `hana` in a natedev terminal | The sky turns darker")
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
+                                            + "Change-Review: The sky dims | Run `hana` in a natedev terminal | The sky turns darker | image 012345abcdef")
         result = self.run_gate("--promote", checkpoint=checkpoint, callers_production=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"Change review: 2 row(s) added to {review}: C8–C9", result.stdout)
@@ -439,7 +449,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_gate_that_finds_no_production_is_refused_before_the_merge(self) -> None:
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\n"
-                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away")
+                                            + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef")
         result = self.run_gate(checkpoint=checkpoint, callers_production=True)
         self.assert_refused_before_gate(result)
         self.assertIn("pass --production <name>: the gate adds this merge's change-review rows to its list",

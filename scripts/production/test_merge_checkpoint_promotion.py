@@ -77,7 +77,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
             "checkpoint(alpha): completed hand-off\n\n"
-            + "Change-Review: The completed hand-off stays recorded | Open the fixture | The change is listed")
+            + "Change-Review: The completed hand-off stays recorded | Open the fixture | The change is listed | image 012345abcdef")
         first = self.run_handoff(checkpoint)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         merge_head = self.git("rev-parse", "HEAD")
@@ -116,7 +116,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.child_production()
         checkpoint = self.dated_checkpoint(
             "checkpoint(alpha): publication recovery\n\n"
-            + "Change-Review: The hand-off records recover | Open the fixture | The change is listed")
+            + "Change-Review: The hand-off records recover | Open the fixture | The change is listed | image 012345abcdef")
         first = self.run_handoff(checkpoint)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         merge_head = self.git("rev-parse", "HEAD")
@@ -139,7 +139,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.promotions = str(self.promote)
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
         self.production_doc(change_review=review)
-        checkpoint = self.dated_checkpoint("checkpoint(alpha): published\n\nChange-Review: Published | Read | Ready")
+        checkpoint = self.dated_checkpoint("checkpoint(alpha): published\n\nChange-Review: Published | Read | Ready | image 012345abcdef")
         hook = self.origin / "hooks/pre-receive"
         self.executable(hook, '#!/bin/sh\nwhile read old new ref; do\n'
                         + ' if [ "$ref" = refs/heads/main ]; then exit 1; fi\ndone\n')
@@ -267,7 +267,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             _ = self.child_production()
         checkpoint = self.dated_checkpoint(
             "checkpoint(alpha): publication records\n\n"
-            + "Change-Review: The published change remains recorded | Open the fixture | The change is listed")
+            + "Change-Review: The published change remains recorded | Open the fixture | The change is listed | image 012345abcdef")
 
         def invoke() -> subprocess.CompletedProcess[str]:
             return self.run_handoff(checkpoint) if handoff else self.run_checkpoint(checkpoint).process
