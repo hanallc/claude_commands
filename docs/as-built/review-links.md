@@ -432,7 +432,34 @@ The address retains the owner, view, search, column, and direction.
 
 A row opens to show its latest status, completion condition, evidence, item links, and log.
 The log shows its newest entry first.
-The page has no feedback forms in this phase.
+Each expanded row has Remove, Park with a date, and Tell morty with a Send button.
+Mark read appears only when the item has an unread update.
+Mark read clears the dot and adds a log entry without sending a message.
+Remove, Park, and Tell morty send nate's words and the item number to morty's current session.
+These actions append a log entry without changing the item's state or parking time.
+Only morty changes those fields through `the_list.py`.
+The page can mark an item read or append a feedback request and its delivery state.
+The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
+The List record saves the request ID, words, and pending state in one locked write.
+The List sender uses the shared `change_page` retry and alert helpers.
+A successful send appends the same request ID with the sent state.
+Exhausted tries alert the item owner's showrunner.
+The request becomes alerted only when at least one showrunner receives the alert.
+Failed alerts leave the request pending for repeated POSTs and startup recovery.
+An alerted request shows “not sent; <showrunner> told” until morty writes the item again.
+The server startup hook retries pending List requests separately from change and question recovery.
+A repeated POST retries a pending request without adding another pending log entry.
+Sent and alerted requests do not send again.
+A process claim prevents concurrent sends of one request without holding the List lock during delivery.
+Delivery is at least once; a crash after a send but before its saved result can cause another send.
+The Update cell shows “sent to morty” with its time until the next log entry from morty.
+The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
+An unchanged retry uses its saved request ID and token after a lost response.
+Changed feedback uses the fresh signed request from the page.
+A successful send clears the saved request ID and only the text that the user sent.
+Each successful POST returns a fresh signed request ID for the next action.
+A retry retains its original request ID.
+It shows a save or send notice as soon as the user submits a form.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.

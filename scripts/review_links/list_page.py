@@ -1,13 +1,19 @@
 """Show The List from the producer's numbered records."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
+import re
+import secrets
+import sys
 import time
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
@@ -78,7 +84,32 @@ def item_link(keeper: staff.StaffId, number: int) -> str:
     return '#' + urlencode({"item": f"{keeper}/L{number}"})
 
 
-def details(entry: ListRecord, today: datetime) -> str:
+def signed_token(secret: str, keeper: str, identity: str, request: str) -> str:
+    return hmac.new(secret.encode(), f"list:{keeper}:{identity}:{request}".encode(), hashlib.sha256).hexdigest()
+
+
+def request_token(root: Path, keeper: str, identity: str, request: str) -> str:
+    secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
+    return signed_token(secret, keeper, identity, request)
+
+
+def feedback_form(entry: ListRecord, secret: str) -> str:
+    request = secrets.token_hex(16)
+    token = signed_token(secret, entry.keeper, entry.item.id, request)
+    fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
+    hidden = ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+                     for name, value in fields.items())
+    read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
+    key = html.escape(entry.key.replace('/', '-'), quote=True)
+    return ('<form method="post" data-feedback-form>' + hidden + '<div class="list-actions">' + read
+            + '<button name="action" value="remove">Remove</button>'
+            + f'<label for="park-{key}">Park until</label><input type="date" name="until" id="park-{key}">'
+            + '<button name="action" value="park">Park</button></div>'
+            + f'<label for="words-{key}">Tell morty</label><textarea name="words" id="words-{key}" rows="2" maxlength="10000"></textarea>'
+            + '<button name="action" value="tell">Send</button><span role="status" data-send-status></span></form>')
+
+
+def details(entry: ListRecord, today: datetime, secret: str) -> str:
     item = entry.item
     sections = ''.join('<section><h3>' + heading + '</h3>'
                        + change_browser.question_paragraphs(text or "Not recorded") + '</section>'
@@ -95,10 +126,11 @@ def details(entry: ListRecord, today: datetime) -> str:
     log = ''.join('<li><time datetime="' + change.time.isoformat() + '">' + html.escape(local_time(change.time, today))
                   + '</time><span>' + html.escape(change.what) + ' <small>— ' + html.escape(change.source)
                   + '</small></span></li>' for change in reversed(item.log))
-    return '<div class="list-panel"><div>' + sections + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>'
+    return ('<div class="list-panel"><div>' + sections + feedback_form(entry, secret)
+            + '</div><section><h3>Log · newest first</h3><ol class="list-log">' + log + '</ol></section></div>')
 
 
-def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int) -> str:
+def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, index: int, secret: str) -> str:
     item = entry.item
     owner = owner_name(members, item.owner)
     unread = isinstance(item.unread_since, datetime)
@@ -130,12 +162,108 @@ def item_rows(entry: ListRecord, members: staff.StaffSnapshot, today: datetime, 
     if parked and isinstance(item.parked_until, datetime):
         state += '<small>Parked until ' + html.escape(local_time(item.parked_until, today)) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
+    sent = the_list.sent_to_morty(item)
+    if isinstance(sent, datetime):
+        feedback = tuple(the_list.feedback_requests(item).values())[-1]
+        notice = "sent to morty"
+        if feedback.state == "alerted":
+            notice = "not sent; " + feedback.alerted_to + " told" if feedback.alerted_to else "not sent; no showrunner for alert"
+        update += '<small>' + html.escape(notice + ", " + local_time(sent, today)) + '</small>'
     cells = (number, html.escape(owner), title, state, html.escape(item.next_step or "Not recorded"),
              html.escape(eta_text(item.eta, today)), update)
     row = ''.join(f'<td data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden = ' hidden' if parked or item.state in (the_list.ItemState.DONE, the_list.ItemState.CLOSED) else ''
     return (f'<tbody data-list-item{attrs}{hidden}><tr class="list-row">' + row
-            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="7">' + details(entry, today) + '</td></tr></tbody>')
+            + f'</tr><tr data-detail id="{panel}" hidden><td colspan="7">' + details(entry, today, secret) + '</td></tr></tbody>')
+
+
+@dataclass(frozen=True)
+class ListFeedbackDelivery:
+    keeper: staff.StaffId
+    identity: str
+    request: str
+
+
+def fresh_request(root: Path, keeper: str, identity: str) -> dict[str, str]:
+    request = secrets.token_hex(16)
+    return {"request": request, "token": request_token(root, keeper, identity, request)}
+
+
+def submit(root: Path, body: str) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+    """Accept nate's signed words and leave item changes to morty."""
+    fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
+    if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
+        raise change_page.AnswerRefused("use the form on this page")
+    keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
+    if re.fullmatch(r"[a-f0-9]{32}", request) is None or re.fullmatch(r"L[1-9]\d*", identity) is None:
+        raise change_page.AnswerRefused("the List request does not match this page")
+    expected = request_token(root, keeper, identity, request)
+    if not secrets.compare_digest(fields["token"][0].encode(), expected.encode()):
+        raise change_page.AnswerRefused("the List token does not match this page")
+    morty = staff.snapshot().by_id(staff.StaffId(keeper))
+    if morty is None or morty.kind != "producer" or morty.name != "morty":
+        raise change_page.AnswerRefused("the item has no morty producer")
+    item = the_list.load(morty.id, identity)
+    action, words, until = fields["action"][0], fields["words"][0].strip(), fields["until"][0]
+    if action == "read":
+        _ = the_list.mark_read(morty.id, identity, source=the_list.PAGE_SOURCE)
+        return change_page.NoMessageDelivery()
+    if action == "remove":
+        words = f"Remove {item.number}"
+    elif action == "park":
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until) is None:
+            raise change_page.AnswerRefused("enter a parking date")
+        _ = date.fromisoformat(until)
+        words = f"Park {item.number} until {until}"
+    elif action != "tell" or not words or len(words) > 10000:
+        raise change_page.AnswerRefused("enter words for morty")
+    saved = the_list.save_feedback(morty.id, identity, the_list.PageFeedback(request, words))
+    if saved.state != "pending":
+        return change_page.NoMessageDelivery()
+    return ListFeedbackDelivery(morty.id, identity, request)
+
+
+def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Find the first showrunner above the item owner without session or document reads."""
+    owner = members.by_id(item.owner) if not isinstance(item.owner, the_list.UnassignedOwner) else None
+    visited: set[staff.StaffId] = set()
+    while owner is not None and owner.id not in visited:
+        if owner.kind == "showrunner":
+            return (owner,)
+        visited.add(owner.id)
+        owner = members.parent_of(owner)
+    return ()
+
+
+def deliver(delivery: ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
+    """Send saved List words with the shared retry and alert helpers."""
+    if isinstance(delivery, change_page.NoMessageDelivery):
+        return
+    def send(item: the_list.ListItem, feedback: the_list.PageFeedback) -> the_list.PageFeedback:
+        settings = conf.read("review_links")
+        tries = settings.whole("delivery_tries")
+        message = f"List page: nate's words for item {item.number}\n{feedback.words}"
+        failures = change_page.send_with_retries(change_page.SENDER, (delivery.keeper,), message,
+                                                 tries, settings.number("delivery_pause_seconds"))
+        if not failures:
+            return replace(feedback, state="sent")
+        owners = alert_showrunners(item, staff.snapshot())
+        source = the_list.folder(delivery.keeper) / f"{item.id}.md"
+        reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
+            recipients=tuple(owner.id for owner in owners), title="List feedback needs attention")
+        return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
+    the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+
+
+def recover_pending() -> None:
+    """Retry each pending request once at server start."""
+    for entry in records():
+        for feedback in the_list.feedback_requests(entry.item).values():
+            if feedback.state == "pending":
+                try:
+                    deliver(ListFeedbackDelivery(entry.keeper, entry.item.id, feedback.request))
+                except (OSError, ValueError) as error:
+                    print(f"List feedback recovery {entry.key}: {error}", file=sys.stderr)
 
 
 def change_counts() -> dict[str, int]:
@@ -196,11 +324,12 @@ def counts_strip(members: staff.StaffSnapshot) -> str:
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def render(_root: Path) -> bytes:
+def render(root: Path) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     items = records()
     today = datetime.fromtimestamp(read_at, user_zone())
+    secret = change_browser.browser_manifest(change_page.console_folder(root))[0]
     owners = {str(entry.item.owner): owner_name(members, entry.item.owner) for entry in items}
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}">{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
@@ -218,7 +347,7 @@ def render(_root: Path) -> bytes:
                + '<div class="list-table"><table aria-label="The List"><colgroup><col style="width:5%"><col style="width:8%">'
                + '<col style="width:22%"><col style="width:15%"><col style="width:27%"><col style="width:17%"><col style="width:6%">'
                + '</colgroup><thead><tr>' + headers + '</tr></thead>'
-               + ''.join(item_rows(entry, members, today, index) for index, entry in enumerate(items)) + '</table>'
+               + ''.join(item_rows(entry, members, today, index, secret) for index, entry in enumerate(items)) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>' + counts_strip(members) + '</div><script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
@@ -255,6 +384,13 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}
+[data-feedback-form]{margin-top:20px;border-top:1px solid var(--line);padding-top:16px}
+.list-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+[data-feedback-form] label{font-size:13px;color:var(--ink-2);display:block}
+[data-feedback-form] input,[data-feedback-form] textarea{font:inherit;background:var(--card);color:var(--ink);
+border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width:100%;box-sizing:border-box}
+[data-feedback-form] textarea{display:block;width:100%;resize:vertical;margin:6px 0 8px}
+[data-feedback-form] button{margin:0;min-height:44px}[data-send-status]{margin-left:10px;font-size:13px;color:var(--ink-2)}
 .list-counts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px;color:var(--ink-2);font-size:13px}
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-empty]{padding:16px;margin:0;color:var(--ink-2)}
@@ -278,7 +414,8 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 SCRIPT = page_frame.REFRESH_SCRIPT + r'''(() => {
 let content=document.querySelector('[data-list]');
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
-let owner='',show='open',query='',sort='',direction='asc',opened=new Set();
+let owner='',show='open',query='',sort='',direction='asc',opened=new Set(),saving=0;
+const drafts=new Map();
 function place(){
  const params=new URLSearchParams(location.hash.slice(1));
  owner=params.get('owner') || '';show=params.get('show') || 'open';query=params.get('q') || '';
@@ -348,22 +485,60 @@ function bind(){
   if(opened.has(key)) opened.delete(key);else opened.add(key);
   apply(false);
  }));
+ content.querySelectorAll('[data-feedback-form]').forEach(form=>{
+  const key=form.closest('[data-list-item]').dataset.key;
+  const words=form.elements.words,until=form.elements.until;
+  const fresh={request:form.elements.request.value,token:form.elements.token.value};
+  const draft=drafts.get(key);if(draft){words.value=draft.words;until.value=draft.until;}
+  let attempt=draft?.attempt;
+  const same=action=>attempt && attempt.words===words.value && attempt.until===until.value &&
+   (action===undefined || attempt.action===action);
+  const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
+  const retain=()=>{drafts.set(key,{words:words.value,until:until.value,attempt});identity(same() ? attempt : fresh);};
+  retain();
+  words.addEventListener('input',retain);until.addEventListener('input',retain);
+  form.addEventListener('submit',async event=>{
+   event.preventDefault();if(form.dataset.sending) return;
+   const action=event.submitter?.value || 'tell';identity(same(action) ? attempt : fresh);
+   const data=new URLSearchParams(new FormData(form));data.set('action',action);
+   attempt={words:words.value,until:until.value,action,request:data.get('request'),token:data.get('token')};retain();
+   form.dataset.sending='true';saving++;pageRefresh.abandon();
+   const buttons=[...form.querySelectorAll('button')],notice=form.querySelector('[data-send-status]');
+   buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
+   try{
+    const response=await fetch(location.pathname,{method:'POST',body:data});
+    const result=await response.json();if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+    notice.textContent=action==='read' ? 'Marked read' : 'sent to morty';
+    fresh.request=result.request;fresh.token=result.token;attempt=undefined;
+    if(action==='tell' && words.value===data.get('words')) words.value='';retain();
+    if(action==='read'){
+     const item=form.closest('[data-list-item]');item.dataset.unread='false';
+     item.querySelector('.list-dot')?.remove();form.querySelector('[value="read"]')?.remove();apply(false);
+    }
+   }catch(error){notice.textContent='Not saved: '+error.message;}
+   finally{
+    delete form.dataset.sending;saving--;buttons.forEach(button=>button.disabled=false);
+    void pageRefresh.refresh(true);
+   }
+  });
+ });
 }
 async function refresh(_supersede=false,current=()=>true){
+ if(saving) return;
  const response=await fetch(location.pathname,{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
- if(!current()) return;
+ if(saving || !current()) return;
  const top=scrollY,focus=document.activeElement?.id;
- const search=content.querySelector('#list-search'), start=search.selectionStart, end=search.selectionEnd;
+ const field=document.activeElement,start=field?.selectionStart,end=field?.selectionEnd;
  content.replaceWith(fresh);content=fresh;bind();apply(false);
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
-  if(field===content.querySelector('#list-search') && start!==null && end!==null) field.setSelectionRange(start,end);}
+  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
  scrollTo({top,behavior:'instant'});return pageRefreshFacts(page);
 }
 place();bind();apply();
 addEventListener('hashchange',()=>{place();apply(false);});
-createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 })();'''

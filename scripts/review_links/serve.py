@@ -457,6 +457,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == investigations_page.PAGE_PATH:
             self.investigation_post()
             return
+        if urlsplit(self.path).path == list_page.PAGE_PATH:
+            self.list_post()
+            return
         if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
             return
@@ -589,6 +592,31 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def list_post(self) -> None:
+        """Save List feedback before the shared sender starts."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 100000:
+                raise ValueError("invalid List request size")
+            body = self.rfile.read(length).decode("utf-8")
+            delivery = list_page.submit(server.root, body)
+        except ValueError as error:
+            self.browser_failure(400, str(error), error)
+            return
+        except OSError as error:
+            self.browser_failure(503, "The List request could not be saved. Try again.", error)
+            return
+        try:
+            fields = parse_qs(body)
+            self.json_response(200, {"state": "read" if fields["action"] == ["read"] else "sent",
+                **list_page.fresh_request(server.root, fields["keeper"][0], fields["id"][0])})
+        finally:
+            try:
+                list_page.deliver(delivery)
+            except OSError as error:
+                print(f"review-links delivery status: {error}", file=sys.stderr)
+
     def investigation_post(self) -> None:
         """Save Mark read and return an error for the card when the save fails."""
         root = cast(ReviewLinksServer, self.server).root
@@ -717,7 +745,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
-        threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
+        recover_changes = change_page.recover_pending
+        recover_list = list_page.recover_pending
+        def recover_pending() -> None:
+            recover_changes(self.delivery_status)
+            recover_list()
+        threading.Thread(target=recover_pending, daemon=True).start()
 
     @override
     def server_bind(self) -> None:
