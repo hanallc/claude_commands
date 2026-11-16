@@ -141,7 +141,7 @@ def repository_name(folder: str | None, identity: str | None) -> str:
 
 
 class NoStep(StrEnum):
-    """A CI run pays its cost without a build step."""
+    """A CI run or a gate run pays its cost without a build step."""
     VALUE = "no step"
 
 
@@ -388,7 +388,7 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
         machine = source_machines.get(src) or machine_name(None, Path(src).parent.name, legacy_hosts)
         observations.append(SourceObservation(at, machine))
         if status:
-            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0)))
+            contributions.append(CostContribution(at, machine, "Failed runs", max(0.0, wall or 0.0), NoStep.VALUE))
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
     return CostReading(tuple(contributions), tuple(observations), sweep_idle(timeline, coverage),

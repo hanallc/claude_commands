@@ -245,7 +245,8 @@ class DirectorStopTests(unittest.TestCase):
             self.assert_allowed(fixture.call(last_assistant_message=(
                 "blocked: pause order from the user through the showrunner; only the showrunner restarts this work"
             )))
-            self.assertFalse((fixture.run / "turn_wait.json").exists())
+            # A pause opens a wait, so the paused time leaves active phase time.
+            self.assertTrue((fixture.run / "turn_wait.json").exists())
 
     def test_paused_status_without_a_prefix_above_the_threshold_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:

@@ -1835,9 +1835,11 @@ As built:
 - Cause: `record_turn_wait` recorded no wait for a `blocked:` turn end that
   named no supplier address. A pause relayed by the showrunner counted as
   phase time. Hana phase 14 holds 180 h of such a pause.
-- Every `blocked:` turn end now opens a wait. The supplier is the named
-  address, else the run's showrunner. A run with no showrunner waits on the
-  user. A `peer` block with no address keeps `NoNamedSupplier`.
+- A `blocked: waiting on ...` turn end, or a `blocked:` turn end that names
+  a pause, now opens a wait. Any other `blocked:` turn end opens no wait, so
+  the Stop hook still wakes the director. The supplier is the named address,
+  else the run's showrunner. A run with no showrunner waits on the user. A
+  `peer` block with no address keeps `NoNamedSupplier`.
 - `finish-phase` writes `phase_active_seconds`: the phase time less the union
   of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
   the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.
@@ -1895,7 +1897,7 @@ From builds, relaying the user: "sometime i see the build is waiting for a token
 
 As built:
 
-- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- `memory_feed.token_pool` runs `stevie -a -t -j` (floor MiB, free, total) from the `stevie_program` path in `config/memory_feed.conf`; the feed service PATH does not hold the system programs folder. The pool is paused while the admission's MemAvailable is under the floor.
 - The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
 - In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.

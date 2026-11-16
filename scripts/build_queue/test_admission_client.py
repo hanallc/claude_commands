@@ -1714,6 +1714,39 @@ class ClientTests(unittest.TestCase):
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
 
+    def test_placement_status_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
+        # The Mac gate reads this on each cargo call; a busy service must not refuse the step.
+        from scripts.build_queue import admission_wire as status_wire
+
+        unknown = status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("episode-a", "attempt-a"))
+        cases: tuple[tuple[str, str], ...] = (
+            ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))
+        for service_state, reason in cases:
+            with self.subTest(service=service_state), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=1)
+                response = (Exchange(TimeoutError(), reply_bytes(unknown)) if service_state == "slow" else
+                            Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                            Exchange(connect_error=ConnectionRefusedError()))
+                transport = self.use_transport(fixture, response)
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    result = client.main(["placement-status", "--episode", "episode-a", "--attempt", "attempt-a"])
+                if service_state == "slow":
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+                    self.assertIn("admission service not answering", errors.getvalue())
+                    self.assertGreater(fixture.clock.monotonic(), 0.5)
+                    self.assertEqual(transport.requests, [replace(status_wire.PlacementStatusRequest("episode-a", "attempt-a"),
+                        code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+                else:
+                    self.assertEqual(result, 2)
+                    self.assertEqual(errors.getvalue(), f"admission service unavailable: {reason}\n")
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(fixture.clock.monotonic(), 0)
+                    self.assertFalse(transport.requests)
+                self.assertEqual(len(transport.attempts), 1)
+                self.assertFalse(fixture.clock.sleeps)
+                self.doCleanups()
+
     def test_lint_cancellation_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
         cases: tuple[tuple[str, str], ...] = (
             ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))

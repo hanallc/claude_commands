@@ -112,11 +112,16 @@ def _is_placement_control(request: wire.Request) -> bool:
     return isinstance(request, (wire.ClaimFailure, wire.ConsumePermission, wire.ExecutionReport, wire.CancelPlacement))
 
 
+def _waits_for_live_service(request: wire.Request) -> bool:
+    """A placement call waits while a live service is slow, and fails at once when it is down."""
+    return _is_placement_control(request) or isinstance(request, status_wire.PlacementStatusRequest)
+
+
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
            | wire.CancelPlacement | status_wire.PlacementStatusRequest) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if _is_placement_control(request):
+    if _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
@@ -405,7 +410,7 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
-          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired:
+          ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
         wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -447,9 +452,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
              *, attempt: Callable[[], None], channel: EstimateConnection | None, retry: AcquisitionRetry,
              configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming
-             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired:
+             ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     first = request
-    placement_control = _is_placement_control(first)
+    placement_control = _waits_for_live_service(first)
     leave_interval = (configuration.running_pass_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming))
                       else configuration.reconnect_seconds)
     generation_query = isinstance(first, wire.BuildHistoryRequest)
@@ -554,6 +559,10 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         failed_since = None
                         last_valid = CLOCK.monotonic()
                         continue
+                    if isinstance(first, status_wire.PlacementStatusRequest):
+                        if isinstance(reply, status_wire.PlacementStatusReply):
+                            return reply
+                        raise CheckerFailure("invalid placement status answer")
                     if placement_control:
                         if isinstance(reply, (wire.DispatchStatus, wire.FirstAuthorization, wire.Ok)):
                             return reply
