@@ -209,6 +209,10 @@ try {
           window.proofData = structuredClone(latest);
           window.render = () => {};
           await document.fonts.ready;
+          const legend = document.querySelector('.legend-box');
+          if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
+          // The proof measures the legend, so it opens it as a click does.
+          if (legend) legend.open = true;
           fitLabels();
           })()`);
         };
@@ -841,6 +845,16 @@ try {
               })()`);
               const legendShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:legendClip});
               await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
+              // The user, 11-16: the legend starts collapsed under the memory bar.
+              const closedClip=await evaluate(`(()=>{
+                const legend=document.querySelector('.legend-box');
+                legend.open=false;
+                const card=legend.closest('.card').getBoundingClientRect();
+                return {x:card.left,y:card.top+scrollY,width:card.width,height:card.height,scale:1};
+              })()`);
+              const closedShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:closedClip});
+              await writeFile(join(folder,'legend-closed-dark-desktop.png'),Buffer.from(closedShot.data,'base64'));
+              await evaluate(`document.querySelector('.legend-box').open=true`);
             }
             proof.capLine=capLine;
             // Bars that add to more than the cap stop at the cap line; a cut bar ends in the cap color.

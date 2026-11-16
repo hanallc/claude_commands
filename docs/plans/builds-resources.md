@@ -2531,7 +2531,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `queue_evidence.room_text` puts the swapped term in the cap calculation: `… − safety 3.0 GiB − 12.0 GiB swapped outside builds; kept aside …`.
 - `queue_view.cap_bar` draws the swapped block (`▓`, inactive) between the cap line and safety.
 - `memory_feed.memory_shares` places the swapped share first. The reserved share stops at free − safety − swapped, so on the page the reserved block ends at the cap line.
-- `memory_live.html`: the swapped-memory, shortfall and room-equation text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
+- `memory_live.html`: the swapped-memory and shortfall text say the swapped memory is outside the cap; the legend row for the swapped memory comes before safety.
 
 **Files:**
 - `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py` — `test_swap_outside_the_build_and_ci_slices_is_demand` (cap and room rows, "swapped past the cap").
