@@ -496,6 +496,7 @@ The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<producer staff id
 The default root is `~/.local/state/showrunner`.
 The command requires the current `morty` producer row; its fixed staff ID selects the producer folder.
 The item's `owner` field names its showrunner.
+`nate` and `Not recorded` identify items without an assigned showrunner.
 The store context selects the producer folder; records do not repeat the producer ID.
 `record_store.NumberedRecords` supplies the folder, number allocation, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
@@ -513,6 +514,11 @@ Quoted log values preserve line endings as JSON escapes.
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking sets a time without changing the state.
 ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
+ETA also accepts a text description when a time or status cannot express the estimate.
+The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
+The store validates text descriptions as one nonempty line and never parses them as times or ranges.
+Next check accepts a time or a text condition.
+Unknown opened and updated times remain empty.
 Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
 An empty optional time removes that time.
 
@@ -548,7 +554,16 @@ Future parked items and Closed items remain hidden by default.
 
 `load`, `records`, `table`, and the write functions share this store with future console callers.
 `records` watches the folder and record paths, reports invalid records, and preserves their files.
-The page, feedback delivery, migration, and producer role changes belong to later phases.
+`create_records` validates a complete typed batch before writing into an empty list folder.
+It checks forward references and cycles under the same lock as other writes.
+The one-off converter lives outside the repository and uses this API.
+It preserves item numbers, source sections, and each item's JSON data in Evidence.
+Removed items become Closed records with their recorded removal times and words.
+A completed apply run records source and record hashes; an exact rerun prints `unchanged`.
+A partial apply run refuses another apply run.
+The converter reads question counts but does not create items from them.
+Morty writes items only through `the_list.py`; the old source files remain read-only.
+The page and feedback delivery belong to later phases.
 
 ### Investigations: `investigation.py`
 
