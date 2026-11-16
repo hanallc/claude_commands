@@ -30,3 +30,12 @@ Give both options when that session's family differs from `[producers].brain`.
 The session restarts as brain and receives no prompt.
 After the restart, load this command and read the role documents.
 Read the old conversation with the printed `catch_up.py` command, then run `send.py pending`.
+
+## Investigations
+
+File an investigation when the user wants you to find an answer.
+Use a question when you need the user's answer.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/investigation.py file --title "<one line>" --question "<full question>"
+```

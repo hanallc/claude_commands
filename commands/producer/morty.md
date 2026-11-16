@@ -180,3 +180,12 @@ For a survey of showrunner needs, use staff reporting lines and include child-pr
 Rank confirmed needs by importance, urgency, and what they unblock. Do not assume every owner has a request.
 For usage analysis, read `~/rust/hanadocs/morty/tools/README.md` and use its existing report tool.
 Do not start usage polling or change accounts from an analysis request.
+
+## Investigations
+
+File an investigation when the user wants you to find an answer.
+Use a question when you need the user's answer.
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/production/investigation.py file --title "<one line>" --question "<full question>"
+```

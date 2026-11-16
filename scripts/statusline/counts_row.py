@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
-from scripts.production import staff
+from scripts.production import investigation, staff
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
 
@@ -77,13 +77,19 @@ def row(instance: Path, sources: list[Path], *, identities: QuestionStaff | None
     if member is not None and member.kind == "producer":
         identities = identities if identities is not None else QuestionStaff.for_record(record)
         questions, deadline = question_counts(member, user_zone(), identities, sources)
-        return footer_counts.counts_line(footer_counts.FooterCounts(questions=questions)) or "", deadline
+        count = len(investigation.records(member.id, sources=sources))
+        return footer_counts.counts_line(footer_counts.FooterCounts(questions=questions, investigations=count)) or "", deadline
     doc = showrunner_footer.production_doc(instance)
     if doc is not None:
         sources.append(doc)
     production = showrunner_footer.read_production(instance)
     if production is None:
-        return "", ""
+        if not source:
+            if member is None or member.kind != "showrunner":
+                return "", ""
+            source = member.id
+        count = len(investigation.records(staff.StaffId(source), sources=sources))
+        return footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
     from scripts.production.update_registration import RegistrationFailure
     if identities is None:
         identities = QuestionStaff.read() if read_sources is None else QuestionStaff.read(sources=read_sources)
@@ -147,10 +153,15 @@ def write_unit(identity: str) -> Path:
         owner = (unit if unit is not None and unit.kind == "producer"
                  else identities.record.parent_of(unit) if unit is not None else None)
         if owner is None:
-            raise ValueError(f"{identity}: no parent production")
-        instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
-        sources.append(instance / "conf")
-        line, due = row(instance, sources, identities=identities, source=identity, require_complete=True)
+            if unit is None:
+                raise ValueError(f"{identity}: no staff row")
+            from scripts.production import footer_counts
+            count = len(investigation.records(unit.id, sources=sources))
+            line, due = footer_counts.counts_line(footer_counts.FooterCounts(investigations=count)) or "", ""
+        else:
+            instance = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier") / f"showrunner-{owner.id}"
+            sources.append(instance / "conf")
+            line, due = row(instance, sources, identities=identities, source=identity, require_complete=True)
     except (OSError, ValueError, staff.StaffRefused, showrunner_footer.FooterError):
         line = ""
         due = retry_due(sources)
