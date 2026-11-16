@@ -8,8 +8,9 @@ except FileNotFoundError:
 
 import argparse
 import json
+import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -60,7 +61,24 @@ class EtaRange:
     latest: datetime
 
 
-Eta = datetime | EtaRange | EtaStatus
+@dataclass(frozen=True)
+class EtaDescription:
+    text: str
+
+
+@dataclass(frozen=True)
+class CheckCondition:
+    text: str
+
+
+class UnassignedOwner(StrEnum):
+    NATE = "nate"
+    NOT_RECORDED = "Not recorded"
+
+
+ItemOwner = staff.StaffId | UnassignedOwner
+NextCheck = Timestamp | CheckCondition
+Eta = datetime | EtaRange | EtaStatus | EtaDescription
 
 
 @dataclass(frozen=True)
@@ -80,18 +98,18 @@ class ItemChange:
 class ListItem:
     number: int
     title: str
-    owner: staff.StaffId
+    owner: ItemOwner
     unit: str
     state: ItemState
-    next_check: Timestamp
+    next_check: NextCheck
     eta: Eta
     unread_since: Timestamp
     parked_until: Timestamp
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
     requested_by: RequestedBy
-    opened: datetime
-    updated: datetime
+    opened: Timestamp
+    updated: Timestamp
     closed: Timestamp
     closing_words: str
     next_step: str
@@ -107,10 +125,10 @@ class ListItem:
 
 class ItemChanges(TypedDict, total=False):
     title: str
-    owner: staff.StaffId
+    owner: ItemOwner
     unit: str
     state: ItemState
-    next_check: Timestamp
+    next_check: NextCheck
     eta: Eta
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
@@ -160,16 +178,33 @@ def _time_text(value: Timestamp) -> str:
     return value.isoformat() if isinstance(value, datetime) else ""
 
 
+ISO_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:T[0-9:.+Z-]+)?")
+
+
+def next_check_value(text: str) -> NextCheck:
+    if not text or ISO_TIME.fullmatch(text):
+        return time_value(text)
+    _line(text, "next check")
+    return CheckCondition(text)
+
+
+def next_check_text(value: NextCheck) -> str:
+    return value.text if isinstance(value, CheckCondition) else _time_text(value)
+
+
 def eta_value(text: str) -> Eta:
     if text in EtaStatus:
         return EtaStatus(text)
-    if "/" in text:
-        start, end = text.split("/", 1)
-        value = EtaRange(_required_time(start), _required_time(end))
-        if value.earliest > value.latest:
-            raise ListError("the ETA range ends before it starts")
-        return value
-    return _required_time(text)
+    parts = text.split("/")
+    if len(parts) not in (1, 2) or not all(ISO_TIME.fullmatch(part) for part in parts):
+        _line(text, "ETA")
+        return EtaDescription(text)
+    if len(parts) == 1:
+        return _required_time(text)
+    earliest, latest = (_required_time(part) for part in parts)
+    if earliest > latest:
+        raise ListError("the ETA range ends before it starts")
+    return EtaRange(earliest, latest)
 
 
 def eta_text(value: Eta) -> str:
@@ -177,7 +212,7 @@ def eta_text(value: Eta) -> str:
         return value.isoformat()
     if isinstance(value, EtaRange):
         return f"{value.earliest.isoformat()}/{value.latest.isoformat()}"
-    return value.value
+    return value.text if isinstance(value, EtaDescription) else value.value
 
 
 def _line(value: str, name: str) -> None:
@@ -196,7 +231,11 @@ def _validate(item: ListItem) -> None:
     for moment in (item.opened, item.updated, item.next_check, item.unread_since, item.parked_until, item.closed):
         if isinstance(moment, datetime) and moment.utcoffset() is None:
             raise ListError("a time must have a time zone")
-    _ = eta_value(eta_text(item.eta))
+    if isinstance(item.eta, EtaDescription):
+        _line(item.eta.text, "ETA")
+    else:
+        _ = eta_value(eta_text(item.eta))
+    _ = next_check_value(next_check_text(item.next_check))
     if (item.state == ItemState.CLOSED) != isinstance(item.closed, datetime):
         raise ListError("only a Closed item must have a closed time")
     if item.state == ItemState.CLOSED:
@@ -248,6 +287,8 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
     store = _store(keeper)
     fields, body = store.read(identity, sources=sources)
     try:
+        if fields["eta_kind"] not in ("text", "time or status"):
+            raise ListError("invalid ETA kind")
         marker = "## Next step\n\n"
         if not body.startswith(marker):
             raise ListError("missing Next step section")
@@ -264,11 +305,13 @@ def load(keeper: staff.StaffId, identity: str, *, sources: list[Path] | None = N
             if not line.startswith("- "):
                 raise ListError("invalid log line")
             changes.append(ItemChange(_required_time(date + "T" + clock), what, source))
-        item = ListItem(int(fields["number"]), fields["title"], staff.StaffId(fields["owner"]),
-                        fields["unit"], ItemState(fields["state"]), time_value(fields["next_check"]),
-                        eta_value(fields["eta"]), time_value(fields["unread_since"]), time_value(fields["parked_until"]),
+        item = ListItem(int(fields["number"]), fields["title"],
+                        UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
+                        fields["unit"], ItemState(fields["state"]), next_check_value(fields["next_check"]),
+                        EtaDescription(fields["eta"]) if fields["eta_kind"] == "text" else eta_value(fields["eta"]),
+                        time_value(fields["unread_since"]), time_value(fields["parked_until"]),
                         _dependencies(fields["blocked_by"]), _related(fields["related_to"]), RequestedBy(fields["requested_by"]),
-                        _required_time(fields["opened"]), _required_time(fields["updated"]), time_value(fields["closed"]),
+                        time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
                         fields["closing_words"], texts[0], texts[1], texts[2], texts[3], tuple(changes))
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
@@ -282,11 +325,12 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
     _validate(item)
     fields = {"id": item.id, "number": str(item.number), "title": item.title,
               "owner": item.owner, "unit": item.unit, "state": item.state.value,
-              "next_check": _time_text(item.next_check), "eta": eta_text(item.eta),
+              "next_check": next_check_text(item.next_check), "eta": eta_text(item.eta),
+              "eta_kind": "text" if isinstance(item.eta, EtaDescription) else "time or status",
               "unread_since": _time_text(item.unread_since), "parked_until": _time_text(item.parked_until),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
               "related_to": json.dumps(item.related_to), "requested_by": item.requested_by.value,
-              "opened": item.opened.isoformat(), "updated": item.updated.isoformat(),
+              "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
     body = "## Next step\n\n" + item.next_step
     log = "\n".join(f"- {entry.time.isoformat(sep=' ')} {entry.what} — {entry.source}" for entry in item.log)
@@ -305,9 +349,9 @@ def records(keeper: staff.StaffId, *, include_closed: bool = False,
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
 
 
-def _check_links(keeper: staff.StaffId, number: int, changes: ItemChanges) -> None:
+def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
     for related in changes.get("related_to", ()):
-        _ = load(keeper, f"L{related}")
+        _ = read(related)
     visited: set[int] = set()
 
     def visit(target: int) -> None:
@@ -316,18 +360,41 @@ def _check_links(keeper: staff.StaffId, number: int, changes: ItemChanges) -> No
         if target in visited:
             return
         visited.add(target)
-        for dependency in load(keeper, f"L{target}").blocked_by:
+        for dependency in read(target).blocked_by:
             visit(dependency.number)
 
     for dependency in changes.get("blocked_by", ()):
         visit(dependency.number)
 
 
+def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
+    """Create complete typed records after checking the whole batch under one lock."""
+    store = _store(keeper)
+    with store.locked():
+        if any(store.folder().glob("*.md")):
+            raise ListError("the list folder already holds a record")
+        pending = {item.number: item for item in items}
+        if len(pending) != len(items):
+            raise ListError("item numbers must be unique")
+        def read(number: int) -> ListItem:
+            item = pending.get(number)
+            return item if item is not None else load(keeper, f"L{number}")
+        for item in items:
+            _validate(item)
+            if not item.log:
+                raise ListError("the log must not be empty")
+            if store.path(item.id).exists():
+                raise ListError(f"{item.id}: the item already exists")
+            _check_links(read, item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to})
+        for item in items:
+            _save(store, item)
+
+
 def _change_text(changes: ItemChanges) -> str:
     return "; ".join(f"{key}: {json.dumps(str(value), ensure_ascii=False)}" for key, value in changes.items())
 
 
-def add(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, source: str,
+def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
         number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = RequestedBy.NATE,
         ) -> ListItem:
@@ -349,7 +416,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, source: str,
         initial.update(changes)
         item = replace(item, log=(ItemChange(moment, "Added; " + _change_text(initial), source),))
         _validate(item)
-        _check_links(keeper, item.number, changes)
+        _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
         _save(store, item)
         return item
 
@@ -383,7 +450,7 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
             raise ListError("use close to record closing words and a time")
         changed = replace(item, **changes)
         _validate(changed)
-        _check_links(keeper, changed.number, changes)
+        _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
     what = "Updated " + _change_text(changes)
     return _change(keeper, identity, edit, what, source)
@@ -430,10 +497,12 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
     record = staff.snapshot()
     lines = ["| # | Owner | Item | State | Next step | ETA | Update |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for item in items:
-        owner = record.by_id(item.owner)
+        owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
         if isinstance(item.next_check, datetime):
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()
+        if isinstance(item.next_check, CheckCondition):
+            state += "; check: " + item.next_check.text
         if isinstance(item.parked_until, datetime) and item.parked_until > moment:
             state += "; parked until " + item.parked_until.isoformat()
         cells = (str(item.number), owner.name if owner is not None else item.owner, item.title, state,
@@ -453,15 +522,18 @@ def _cli_changes(args: argparse.Namespace) -> ItemChanges:
             changes[key] = value
     owner_id = options.get("owner")
     if isinstance(owner_id, str):
-        owner = staff.snapshot().by_id(staff.StaffId(owner_id))
-        if owner is None or owner.kind != "showrunner":
-            raise ListError("owner must name a showrunner staff id")
-        changes["owner"] = owner.id
+        if owner_id in UnassignedOwner:
+            changes["owner"] = UnassignedOwner(owner_id)
+        else:
+            owner = staff.snapshot().by_id(staff.StaffId(owner_id))
+            if owner is None or owner.kind != "showrunner":
+                raise ListError("owner must name a showrunner staff id")
+            changes["owner"] = owner.id
     state, next_check, eta, requested = (options.get(key) for key in ("state", "next_check", "eta", "requested_by"))
     if isinstance(state, str):
         changes["state"] = ItemState(state)
     if isinstance(next_check, str):
-        changes["next_check"] = time_value(next_check)
+        changes["next_check"] = next_check_value(next_check)
     if isinstance(eta, str):
         changes["eta"] = eta_value(eta)
     if isinstance(requested, str):

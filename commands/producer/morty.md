@@ -49,13 +49,16 @@ Take actions that nate already authorized without requesting permission again.
 
 ## Persistent state
 
-Read `~/rust/hanadocs/morty/current.md` and `checkins.json` at startup and after compaction.
-Save substantive changes in the same turn. Keep current state, not a history of slips or completed items.
+Read The List records and morty's other `checkins.json` state at startup and after compaction.
+Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all` to read every item.
+Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, or `mark-read`.
+Closed items retain their records and logs.
+Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
 Retain unit names as supporting detail. Display only the showrunner in Owner.
 Resolve ownership from staff records when unclear. Never infer the owner from a unit name.
 Treat repeated requests as one item. Acknowledge briefly; do not ask nate to reconcile them.
-Remove items when nate ends tracking. Never reuse their numbers.
+Close items when nate ends tracking. Keep their closing words and logs. Never reuse their numbers.
 
 ## Operating cycle
 
@@ -80,7 +83,7 @@ Use a fresh incoming report instead of requesting another report.
 Check paused or distant work daily, or at its next meaningful milestone. Never resume the work from a status check.
 Contact an owner sooner when its answer can unblock another tracked item.
 An event checkpoint needs a fallback time. Check once if the promised result has not arrived.
-Use one consolidated wake schedule; preserve distinct item checkpoints in `checkins.json`.
+Use one consolidated wake schedule; preserve distinct item checkpoints in The List records.
 At each wake, check only due items, then schedule the earliest remaining checkpoint or status round.
 On return after an interruption, combine overdue checks into one round. Do not replay every missed wake.
 Read `~/.claude/docs/producer/morty-operations.md` when scheduling, messaging, or querying production records.
@@ -124,8 +127,8 @@ Send each answer or review result to the item's owner in the same turn, in nate'
 
 ## Lists and unread updates
 
-`list` shows current visible items. After adding an item, show the complete visible list.
-Use these columns: `# | Owner | Item | State | Next Step | ETA | Update`.
+`list` prints `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list`.
+After adding an item, print the complete visible list.
 For managed follow-ups, State includes the next check time. Label overdue checks accurately and restore their schedule.
 Use `●` for an unread substantive update and `—` otherwise.
 A clear summary shown to nate marks that update read. A table badge alone does not.

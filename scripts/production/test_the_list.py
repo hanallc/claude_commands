@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
@@ -260,7 +261,7 @@ class TheListTests(unittest.TestCase):
         path = the_list.folder(MORTY.id) / "L1.md"
         before = path.read_text()
         for field, old, new in (("state", "New", "Parked"), ("number", "1", "2"),
-                                ("opened", START.isoformat(), "bad"), ("eta", "Not asked", "Tomorrow"),
+                                ("opened", START.isoformat(), "bad"), ("eta", "Not asked", "Tomorrow\nInvalid"),
                                 ("closed", "", START.isoformat()), ("blocked_by", "[]", "[true]")):
             with self.subTest(field=field):
                 _ = path.write_text(before.replace(f"{field}: {json.dumps(old)}", f"{field}: {json.dumps(new)}"))
@@ -298,6 +299,37 @@ class TheListTests(unittest.TestCase):
             _ = the_list.update(MORTY.id, "L1", {"state": the_list.ItemState.WORKING}, source="morty")
         self.assertEqual({cast(Path, call.args[0]).parent for call in writes.call_args_list},
                          {investigation.folder(MORTY.id), the_list.folder(MORTY.id)})
+        typed = replace(item, number=50, owner=the_list.UnassignedOwner.NATE,
+                        opened=the_list.NoTimestamp.UNSET, updated=the_list.NoTimestamp.UNSET,
+                        eta=the_list.EtaDescription("About November 19; approval required"),
+                        next_check=the_list.CheckCondition("After the owner supplies proof"))
+        dependent = replace(typed, number=51, owner=the_list.UnassignedOwner.NOT_RECORDED,
+                            related_to=(50,), blocked_by=(the_list.ItemDependency(50, "Proof is available"),))
+        the_list.create_records(OTHER.id, [dependent, typed])
+        self.assertEqual(the_list.load(OTHER.id, "L50"), typed)
+        self.assertEqual(the_list.load(OTHER.id, "L51"), dependent)
+        text = the_list.table(OTHER.id)
+        self.assertIn("| nate |", text)
+        self.assertIn("| Not recorded |", text)
+        self.assertIn("About November 19; approval required", text)
+        self.assertIn("check: After the owner supplies proof", text)
+        with self.assertRaises(the_list.ListError):
+            the_list.create_records(OTHER.id, [replace(typed, number=52)])
+        self.assertFalse((the_list.folder(OTHER.id) / "L52.md").exists())
+        with self.assertRaises(the_list.ListError):
+            the_list.create_records(OWNER.id, [typed, replace(dependent, related_to=(999,))])
+        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
+        with self.assertRaises(the_list.ListError):
+            the_list.create_records(OWNER.id, [typed, typed])
+        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
+        for text_eta in ("2026-11-20/2026-11-19", "2026-11-99/2026-11-19", "Paused"):
+            with self.subTest(text_eta=text_eta):
+                changed = the_list.update(OTHER.id, "L50", {"eta": the_list.EtaDescription(text_eta)}, source="morty")
+                self.assertEqual(the_list.load(OTHER.id, "L50"), changed)
+                self.assertIn('eta_kind: "text"', (the_list.folder(OTHER.id) / "L50.md").read_text())
+        for eta in ("2026-11-19 (planned)", "Pending (check 18:00 EST)", "Paused"):
+            with self.subTest(eta=eta):
+                self.assertEqual(the_list.eta_text(the_list.eta_value(eta)), eta)
         with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": ""}):
             self.assertEqual(the_list.folder(MORTY.id), self.root / ".local/state/showrunner" / MORTY.id / "list")
             self.assertEqual(update_registration.outstanding_path(update_registration.ProducerQuestions(MORTY)),
