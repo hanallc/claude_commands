@@ -76,7 +76,7 @@ class TopCost:
     window: WindowValue
     # One value for each whole day of the recent window, oldest first.
     days: tuple[ChartCost, ...]
-    share: cost_actions.LargestShare | None
+    share: cost_actions.LargestShare | cost_actions.NoShare
     action: cost_actions.CostAction
 
 
@@ -175,7 +175,9 @@ def chart_series(reading: costs.CostReading, start: datetime, end: datetime, zon
         daily = costs.CostReading(tuple(contributions[position]), tuple(observations[position]),
                                   tuple(spans[position]), tuple(phases[position]), reading.coverage, reading.first_sources)
         buckets.append(build_bucket(daily, low, high, thin=low != full_low or high != full_high))
-    machines = sorted(set(configured) | set(reading.first_sources))
+    # A source folder with no step in the window is no chart machine: each cloud gate host has its own folder.
+    machines = sorted(set(configured) | {item.machine for item in reading.observations}
+                      | {item.machine for item in reading.contributions})
     if reading.idle_spans and "mac" not in machines:
         machines.append("mac")
     return ChartSet(start, end, str(zone), tuple(buckets), tuple(sorted(machines)), moments.MOMENTS)
@@ -233,6 +235,26 @@ def known_seconds(value: ChartCost) -> float | None:
     if isinstance(value, MacIdleUpperBound):
         return value.known_seconds
     return None
+
+
+@dataclass(frozen=True)
+class DailyRange:
+    """The lowest and highest day of a cost, in hours."""
+    low_hours: float
+    high_hours: float
+
+
+class RangeUnavailable(StrEnum):
+    """A day is not fully measured, so a range would hide the unknown part."""
+    VALUE = "range unavailable"
+
+
+def daily_range(days: tuple[ChartCost, ...]) -> DailyRange | RangeUnavailable:
+    """The range of the days, only when every day is measured."""
+    measured = [day.seconds for day in days if isinstance(day, MeasuredCost)]
+    if not measured or len(measured) != len(days):
+        return RangeUnavailable.VALUE
+    return DailyRange(min(measured) / 3600, max(measured) / 3600)
 
 
 def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: int) -> WindowValue:
@@ -306,12 +328,16 @@ def chart_data(series: ChartSet) -> dict[str, object]:
     buckets: list[dict[str, object]] = []
     for bucket in series.buckets:
         hana = [phase for phase in bucket.costs.phases if moments.hana_name(phase.working_dir) and phase.host == "natedev"]
-        durations = [phase.wall_s for phase in hana if isinstance(phase.wall_s, float)]
-        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations)}
+        durations = [phase.active_s for phase in hana if isinstance(phase.active_s, float)]
+        unrecorded = sum(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
+        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations),
+                                    "unrecorded": unrecorded}
         if durations:
             phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))
         else:
-            phase.update(state="unavailable", reason="no valid durations" if hana else "no finished phases")
+            phase.update(state="unavailable", reason=(
+                "phases ended before waits were recorded" if unrecorded
+                else "no valid durations" if hana else "no finished phases"))
         rows: list[dict[str, object]] = []
         days = (bucket.end-bucket.start).total_seconds()/86400
         for machine in series.machines:

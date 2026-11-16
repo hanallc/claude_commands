@@ -19,14 +19,18 @@ from contextlib import AbstractContextManager, contextmanager, redirect_stderr, 
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
 from typing import cast, override
+from types import TracebackType
 
 import unittest.mock
 
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
+from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.buildlog.store import host_name
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
 from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_send
 
 DAY = 86_400
@@ -79,7 +83,7 @@ class FolderAuditTests(unittest.TestCase):
 
         def recorded_scan(path: str | int | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
             # A descriptor scan (os.fwalk) iterates the real scanner without a with block.
-            return scan(path) if isinstance(path, int) else recorded_path_scan(path)
+            return scan(path) if isinstance(path, int) else RecordedDirectoryScan(path)
 
         @contextmanager
         def recorded_path_scan(path: str | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
@@ -96,6 +100,28 @@ class FolderAuditTests(unittest.TestCase):
                     recorded.append(cast(os.DirEntry[str], fake))
                 yield iter(recorded)
 
+        class RecordedDirectoryScan(AbstractContextManager[Iterator[os.DirEntry[str]]], Iterator[os.DirEntry[str]]):
+            def __init__(self, path: str | os.PathLike[str]) -> None:
+                self.context: AbstractContextManager[Iterator[os.DirEntry[str]]] = recorded_path_scan(path)
+                self.entries: Iterator[os.DirEntry[str]] = self.context.__enter__()
+
+            @override
+            def __iter__(self) -> Iterator[os.DirEntry[str]]:
+                return self
+
+            @override
+            def __next__(self) -> os.DirEntry[str]:
+                return next(self.entries)
+
+            @override
+            def __enter__(self) -> Iterator[os.DirEntry[str]]:
+                return super().__enter__()
+
+            @override
+            def __exit__(self, exception_type: type[BaseException] | None, exception: BaseException | None,
+                         traceback: TracebackType | None) -> None:
+                _ = self.context.__exit__(exception_type, exception, traceback)
+
         _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
@@ -107,7 +133,7 @@ class FolderAuditTests(unittest.TestCase):
                                                                 # An absent session root: a run without the
                                                                 # test-run folder must not reach the live root.
                                                                 session_folder.ROOT_ENV: str(self.root / "session"),
-                                                                **config_environment(self.root / "config")}))
+                                                                **copies_environment(self.root)}))
         _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
         _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
 
@@ -211,58 +237,58 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
     def test_gate_folder_cleanup_removes_its_build_dir_and_the_empty_mirror_folders(self) -> None:
-        session = self.root / "session"
-        session.mkdir()
-        gate = copies.GateCheckoutDirectory(prefix="queue-gate-", dir=session)
-        checkout = Path(gate.name).resolve() / "checkout"
-        (checkout / ".git").mkdir(parents=True)
-        _ = (checkout / "Cargo.toml").write_text("[workspace]\n")
-        mirror = self.root / "paths"
-        build_dir = mirror.joinpath(*checkout.parts[1:])
-        build_dir.mkdir(parents=True)
-        (checkout.parent / ".cargo").mkdir()
-        _ = (checkout.parent / ".cargo" / "config.toml").write_text(f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
-        _ = (build_dir / "output").write_text("build output")
-        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", build_dir)
-        _ = self.enterContext(unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots))
-        _ = self.enterContext(unittest.mock.patch.object(scratch, "cargo_checkout_peers", return_value=()))
-        _ = self.enterContext(unittest.mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])))
-        self.enterContext(unittest.mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "cargo-state")}))
-        index = sweep.cargo_output_cache_path()
-        index.parent.mkdir()
-        _ = index.write_text(json.dumps([{"workspace_root": str(checkout), "target_directory": str(checkout / "target"),
-                                          "build_directory": str(build_dir)}]))
-        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
-            self.assertEqual(saved[0].roots.build_directory, build_dir)
-            folder_audit.clean_checkout_cargo_output(path)
-        with unittest.mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean):
-            gate.cleanup()
-        self.assertFalse(checkout.parent.exists())
-        self.assertFalse(build_dir.exists())
-        self.assertFalse(build_dir.parent.exists())
-        self.assertEqual(list(build_dir.parent.parent.iterdir()), [])
-        self.assertFalse(scratch.cargo_removal_mark(checkout.parent).exists())
+        source = ImmutableGitSeed.create(self.root / "source", "main", "Slot tests", "slot@example.invalid",
+                                        {"Cargo.toml": "[workspace]\n", "source.txt": "saved source\n"}).checkout
+        with unittest.mock.patch.object(scratch, "clean_cargo_outputs", wraps=scratch.clean_cargo_outputs) as clean:
+            with copies.standing("audit-unit", source, copies.CommittedSource("HEAD")) as checkout:
+                mirror = self.root / "paths"
+                build_dir = mirror.joinpath(*checkout.parts[1:])
+                build_dir.mkdir(parents=True)
+                (checkout / ".cargo").mkdir()
+                _ = (checkout / ".cargo/config.toml").write_text(f"[build]\nbuild-dir = {json.dumps(str(build_dir))}\n")
+                _ = (build_dir / "output").write_text("build output")
+                roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", build_dir)
+                _ = self.enterContext(unittest.mock.patch.object(cargo_output, "read_cargo_output_roots", return_value=roots))
+                _ = self.enterContext(unittest.mock.patch.object(scratch, "cargo_checkout_peers", return_value=()))
+                _ = self.enterContext(unittest.mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])))
+                self.enterContext(unittest.mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.root / "cargo-state")}))
+                index = sweep.cargo_output_cache_path()
+                index.parent.mkdir()
+                _ = index.write_text(json.dumps([{"workspace_root": str(checkout), "target_directory": str(checkout / "target"),
+                                                  "build_directory": str(build_dir)}]))
+                self.assertEqual(build_folders.build_folder_state(checkout), "held")
+            clean.assert_not_called()
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual((checkout / "source.txt").read_text(), "saved source\n")
+        self.assertEqual((build_dir / "output").read_text(), "build output")
+        self.assertTrue(build_dir.parent.exists())
+        self.assertEqual(list(build_dir.parent.iterdir()), [build_dir])
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
     def test_gate_folder_cleanup_without_an_outside_build_dir_starts_no_cargo(self) -> None:
         cargo_home = self.root / "cargo-home"
         cargo_home.mkdir()
         _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{cargo-cache-home}/../paths{workspace-root}"\n')
         self.enterContext(unittest.mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home)}))
-        for manifest in ("[workspace]\n", ""):
+        for index, manifest in enumerate(("[workspace]\n", "")):
             with self.subTest(manifest=manifest):
-                gate = copies.GateCheckoutDirectory(prefix="queue-gate-", dir=self.root)
-                checkout = Path(gate.name) / "checkout"
-                (checkout / ".git").mkdir(parents=True)
-                (checkout / "target").mkdir()
+                self.enterContext(unittest.mock.patch.dict(os.environ, copies_environment(self.root / f"settings-{index}")))
+                files = {"source.txt": "saved source\n"}
                 if manifest:
-                    _ = (checkout / "Cargo.toml").write_text(manifest)
+                    files["Cargo.toml"] = manifest
+                source = ImmutableGitSeed.create(self.root / f"source-{index}", "main", "Slot tests", "slot@example.invalid", files).checkout
                 stderr = io.StringIO()
                 with (unittest.mock.patch.object(cargo_output, "read_cargo_output_roots",
                                                  side_effect=AssertionError("cargo metadata started")),
                       redirect_stderr(stderr)):
-                    gate.cleanup()
-                self.assertFalse(checkout.parent.exists())
-                self.assertEqual(stderr.getvalue(), "")
+                    with copies.standing("audit-unit", source, copies.CommittedSource("HEAD")) as checkout:
+                        self.assertEqual(build_folders.build_folder_state(checkout), "held")
+                self.assertTrue(checkout.exists())
+                self.assertTrue((checkout / "target").is_dir())
+                self.assertEqual(build_folders.build_folder_state(checkout), "free")
+                self.assertEqual(stderr.getvalue(),
+                    f"slots: origin on {host_name()} has no maximum of its own; it uses 2. Set slots.{host_name()}.origin.max with /tune.\n")
 
     def test_shared_symlink_output_survives_a_different_cargo_target_setting(self) -> None:
         checkout, cache = self.cargo_checkout()
@@ -712,15 +738,16 @@ class FolderAuditTests(unittest.TestCase):
                                  f"{prefix} must retain its cleanup reader")
 
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
-        import json
-        copy = folder(self.temp / "copies" / "show-maker" / "21-gate", 30)
-        _ = (copy / copy_record.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
-        age(self.temp / "copies", 30)
         proc = self.root / "proc"
         proc.mkdir()
-        _ = folder_audit.audit(self.rust, [self.temp], frozenset[str](), time.time(), files=[],
-                               removing=True, proc=str(proc), sockets=str(self.root / "unix"))
-        self.assertTrue(copy.is_dir())
+        for name in ("copies", "workspaces"):
+            with self.subTest(name=name), unittest.mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.root / name)}):
+                copy = folder(self.temp / name / "show-maker" / "21-gate", 30)
+                _ = (copy / copy_record.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
+                age(self.temp / name, 30)
+                _ = folder_audit.audit(self.rust, [self.temp], frozenset[str](), time.time(), files=[],
+                                       removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+                self.assertTrue(copy.is_dir())
 
     def test_copied_folder_needs_seven_days_since_its_last_metadata_change(self) -> None:
         now = time.time()

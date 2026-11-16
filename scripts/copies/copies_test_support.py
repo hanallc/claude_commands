@@ -7,14 +7,17 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.copies import copies
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import memory_test_support
 
 
-def copies_environment(root: Path) -> dict[str, str]:
-    configuration = root / "copies.conf"
+def copies_environment(root: Path, *, repository: str = "fixture") -> dict[str, str]:
+    private = private_slot_config(root, repository=repository, default_maximum=2)
+    configuration = Path(private.environment["COPIES_CONFIG"])
     _ = memory_test_support.write_config_fixture(configuration,
         f"root={root / 'gates'}\nwait_seconds=0.01\ngit_timeout_seconds=10\nguard_timeout_seconds=10\n")
     return {
+        **private.environment,
         "HOME": str(root), "COPIES_CONFIG": str(configuration),
         "SCRATCH_ROOT": str(root / "scratch"), "SCRATCH_COPIES_ROOT": str(root / "copies"),
         "SCRATCH_HOLDS": str(root / "holds.json"),

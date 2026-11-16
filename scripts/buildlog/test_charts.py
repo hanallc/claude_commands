@@ -160,6 +160,34 @@ class PageDataTests(ChartFixture):
         self.assertEqual(values["cloud", "Failed runs"], cost_actions.FixTest("hana", "tests::flaky", 2))
         self.assertEqual(values["mac", "Failed runs"], cost_actions.FixStep(costs.StepKind("port", "clippy"), 1))
 
+    def test_an_excluded_nextest_failure_names_no_test(self) -> None:
+        failed = {"status": "failed", "duration_s": 1.0, "attempts": 1}
+        with closing(self.fixture.connection(
+            # A verify-mac nextest that exits 4 keeps its raw status without counting as a failure.
+            fixtures.build("excluded", 10, target="mac", repo="hana", caller="verify-mac", status=4, duration_s=600,
+                           tests=[{"binary": "hana", "test": "tests::excluded", **failed}]),
+            fixtures.build("lint", 30, target="mac", repo="port", step="clippy", status=1, duration_s=1800),
+        )):
+            values = {(row.machine, row.cause): row.action for row in self.rows(10)}
+        self.assertEqual(values["mac", "Failed runs"], cost_actions.FixStep(costs.StepKind("port", "clippy"), 1))
+
+    def test_a_range_needs_every_day_measured(self) -> None:
+        measured = charts.MeasuredCost(3600)
+        self.assertEqual(charts.daily_range((measured, charts.MeasuredCost(7200))), charts.DailyRange(1, 2))
+        for unmeasured in (charts.CostUnavailable("1 applicable waits missing"), charts.MacIdleUpperBound(0, 3600),
+                           charts.NoDataYet.VALUE):
+            with self.subTest(unmeasured=unmeasured):
+                self.assertEqual(charts.daily_range((measured, unmeasured)), charts.RangeUnavailable.VALUE)
+        self.assertEqual(charts.daily_range(()), charts.RangeUnavailable.VALUE)
+
+    def test_a_missing_wait_day_has_no_range_or_share(self) -> None:
+        with closing(self.fixture.connection(fixtures.build("unrecorded", 10, mem_wait_s=None, duration_s=600))):
+            row = self.rows(1)[0]
+        self.assertEqual((row.cause, row.recent), ("Memory wait", charts.CostUnavailable("1 applicable waits missing")))
+        self.assertEqual(charts.daily_range(row.days), charts.RangeUnavailable.VALUE)
+        self.assertEqual(row.share, cost_actions.NoShare.VALUE)
+        self.assertEqual(cost_actions.share_text(row.share), "")
+
     def test_a_cost_without_a_named_action_says_so(self) -> None:
         with closing(self.fixture.connection(fixtures.build("cold", 30, target="mac", crates_compiled=50, duration_s=1800))):
             row = self.rows(1)[0]
@@ -325,7 +353,8 @@ class ChartTests(ChartFixture):
     def test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket(self) -> None:
         edge = fixtures.START+timedelta(days=1)
         self.fixture.progress([{"event_type": "phase_finished", "phase_instance_id": "edge", "working_dir": "/r/hana",
-                                "timestamp_epoch": edge.timestamp(), "phase_started_at": edge.timestamp()-60}])
+                                "timestamp_epoch": edge.timestamp(), "phase_started_at": edge.timestamp()-60,
+                                "phase_active_seconds": 60}])
         job = ci_job(1, "build", "cancelled", (edge.isoformat(), edge.isoformat(), (edge+timedelta(hours=1)).isoformat()))
         run = ci_run(1, 1, [job])
         run.update(started_at=edge.isoformat(), created_at=edge.isoformat(), updated_at=(edge+timedelta(hours=1)).isoformat(), conclusion="cancelled")
@@ -349,7 +378,8 @@ class ChartTests(ChartFixture):
         end = datetime(2026, 11, 2, 12, tzinfo=zone).astimezone(UTC)
         edges = charts.bucket_edges(start, end, zone)
         self.assertEqual([(b-a).total_seconds()/3600 for a,b in zip(edges, edges[1:])], [12, 25, 12])
-        reading = costs.CostReading((costs.CostContribution(edges[1].timestamp(), "cloud", "Memory wait", 90000),),
+        reading = costs.CostReading((costs.CostContribution(edges[1].timestamp(), "cloud", "Memory wait", 90000,
+                                                        costs.StepKind("hana", "nextest")),),
                                     (costs.SourceObservation(edges[1].timestamp(), "cloud"),), (), ())
         series = charts.build_series(reading, start, end, zone)
         self.assertEqual([b.thin for b in series.buckets], [True, False, True])
@@ -373,8 +403,8 @@ class ChartTests(ChartFixture):
         with closing(self.fixture.connection(fixtures.build("record", 10, target="natedev", mem_wait_s=3600))) as connection:
             series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
         buckets = cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
-        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "state": "unavailable", "reason": "no valid durations"})
-        self.assertEqual(buckets[1]["phase"], {"finished": 0, "valid": 0, "missing": 0, "state": "unavailable", "reason": "no finished phases"})
+        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "unrecorded": 0, "state": "unavailable", "reason": "no valid durations"})
+        self.assertEqual(buckets[1]["phase"], {"finished": 0, "valid": 0, "missing": 0, "unrecorded": 0, "state": "unavailable", "reason": "no finished phases"})
         self.assertEqual(charts.cost_value(series.buckets[1], "natedev", "Memory wait", per_phase=True),
                          charts.CostUnavailable("no finished phases"))
         self.assertEqual(charts.cost_value(series.buckets[0], "natedev", "Memory wait", per_phase=True), charts.MeasuredCost(3600))
@@ -416,6 +446,27 @@ class ChartTests(ChartFixture):
                 row = next(row for row in rows if row["machine"] == "mac" and row["cause"] == "Memory wait")
                 self.assertEqual(row["daily"], {"state": "unavailable", "reason": "no complete indexed mac monthly log covers this day"})
             path.unlink(missing_ok=True)
+
+    def test_phase_time_leaves_out_recorded_waits_for_the_user_or_a_supplier(self) -> None:
+        start = fixtures.START.timestamp()
+        self.fixture.progress([
+            {"event_type": "phase_finished", "phase_instance_id": "paused", "working_dir": "/r/hana",
+             "timestamp_epoch": start + 7200, "phase_started_at": start, "phase_active_seconds": 1800},
+            # A record from before the active count has wall time that can hold waits.
+            {"event_type": "phase_finished", "phase_instance_id": "old", "working_dir": "/r/hana",
+             "timestamp_epoch": start + 3600, "phase_started_at": start}])
+        times = {event.phase_instance_id: event.active_s for event in moments.progress_events()}
+        self.assertEqual(times, {"paused": 1800.0, "old": moments.WaitsNotRecorded()})
+
+    def test_a_day_of_phases_without_an_active_count_has_no_phase_time(self) -> None:
+        start = fixtures.START.timestamp()
+        self.fixture.progress([{"event_type": "phase_finished", "phase_instance_id": "old", "working_dir": "/r/hana",
+                                "timestamp_epoch": start + 3600, "phase_started_at": start}])
+        with closing(self.fixture.connection(fixtures.build("record", 10, target="natedev"))) as connection:
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        buckets = cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
+        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "unrecorded": 1, "state": "unavailable",
+                                               "reason": "phases ended before waits were recorded"})
 
     def test_bucket_sums_match_shared_costs_and_each_source_reads_once(self) -> None:
         self.fixture.progress([{"event_type":"phase_finished", "phase_instance_id":"one", "working_dir":"/r/hana",
@@ -482,6 +533,17 @@ class ChartTests(ChartFixture):
             with self.subTest(machine=machine):
                 self.assertEqual(charts.cost_value(series.buckets[0], machine, "Memory wait"),
                                  charts.CostUnavailable("no recorded source coverage"))
+
+    def test_a_source_folder_without_steps_is_no_chart_machine(self) -> None:
+        with mock.patch.object(record, "configured_targets", return_value=("natedev",)), \
+             mock.patch.object(costs, "first_source_times", return_value={"natedev": fixtures.START.timestamp()-1,
+                                                                       "gate-host": fixtures.START.timestamp()-1}), \
+             closing(self.fixture.connection(fixtures.build("cloud", 10, host="new-cloud", target="aws-new"))) as connection:
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        self.assertEqual(series.machines, ("aws-new", "natedev"))
+        machines = {cast(str, row["machine"]) for bucket in cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
+                    for row in cast(list[dict[str, object]], bucket["rows"])}
+        self.assertEqual(machines, {"aws-new", "natedev"})
 
     def configured_machine_series(self, *records: Record, targets: tuple[str, ...] = ("natedev", "aws"),
                                   start: datetime = fixtures.START, end: datetime = fixtures.END) -> charts.ChartSet:

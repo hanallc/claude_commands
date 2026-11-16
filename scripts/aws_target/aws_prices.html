@@ -3,13 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AWS prices</title>
+<title>AWS</title>
 <style>
 /*__CONSOLE_THEME__*/
 :root {
   /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
   --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
-  --box: #ffffff; --box-edge: rgb(0 0 0 / 0.45); --extreme: #f5b400;
+  --box: #ffffff; --box-edge: rgb(0 0 0 / 0.45);
+  /* The cheapest and the most expensive cell of a whole table; the same in both themes. */
+  --cheapest: #f5b400; --cheapest-ink: #1a1400; --dearest: #000000; --dearest-ink: #ffffff; --mark-edge: #ffffff;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
@@ -36,9 +38,13 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover td { background: var(--hover); }
 /* A header "name (unit)" shows the unit on a smaller second line. */
 thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-3); white-space: nowrap; }
-/* The cheapest cell of a price table has an outline over its scale color. */
+/* The lowest and the highest cell of each type column have a white box over the scale color. */
 td.end { box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 2px var(--box); }
-td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
+/* The table marks win over the scale color and the row hover. */
+td.cheapest, tbody tr:hover td.cheapest { background: var(--cheapest); color: var(--cheapest-ink); font-weight: 700;
+  box-shadow: inset 0 0 0 2px var(--mark-edge); }
+td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(--dearest-ink); font-weight: 700;
+  box-shadow: inset 0 0 0 2px var(--mark-edge); }
 .ban { width: 14px; height: 14px; vertical-align: -2px; fill: none; stroke: var(--ink-3); stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 /* The Standard and GPU price cards sit side by side, and stack on a narrow screen. */
@@ -50,9 +56,10 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 .swatch.scale { background: linear-gradient(to right, var(--scale-low), var(--scale-mid), var(--scale-high));
   box-shadow: inset 0 0 0 1px var(--line); }
-.swatch.end, .swatch.extreme { width: 18px; background: var(--scale-low); }
+.swatch.end, .swatch.cheapest, .swatch.dearest { width: 18px; background: var(--scale-low); }
 .swatch.end { box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 2px var(--box); }
-.swatch.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
+.swatch.cheapest { background: var(--cheapest); box-shadow: inset 0 0 0 2px var(--mark-edge), 0 0 0 1px var(--box-edge); }
+.swatch.dearest { background: var(--dearest); box-shadow: inset 0 0 0 2px var(--mark-edge), 0 0 0 1px var(--box-edge); }
 .price-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 4px 0 0; }
 .price-bar + .legend { margin: 8px 0 12px; }
 .filter[hidden] { display: none; }
@@ -76,12 +83,27 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 .chips button[aria-pressed="mixed"] { background: color-mix(in srgb, var(--accent) 22%, var(--card)); border-color: var(--accent); color: var(--ink); }
 .chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .chips .all { font-weight: 600; }
+/* The spend tiles sit in one row, and stack on a narrow screen. */
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 10px 0 0; }
+@media (max-width: 760px) { .tiles { grid-template-columns: minmax(0, 1fr); } }
+.tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+.tile-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
+.tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile-note { color: var(--ink-3); font-size: 0.82rem; }
+.section-title { font-size: 1.15rem; margin: 24px 0 4px; }
+#spend .note { margin-top: 12px; }
 </style>
 </head>
 <body>
 <main>
-<h1 class="page-title">AWS prices</h1>
+<h1 class="page-title">AWS</h1>
 <div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
+<section class="card" id="spend">
+  <h2>Spend <span class="unit">(USD)</span></h2>
+  <div class="tiles" id="spend-tiles"></div>
+  <p class="note" id="spend-note"></p>
+</section>
+<h2 class="section-title">Prices</h2>
 <nav class="regions" aria-label="Regions to show">
   <span class="regions-label" id="geographies-label">Geography</span>
   <div class="chips" role="group" aria-labelledby="geographies-label" id="geographies"></div>
@@ -94,6 +116,7 @@ td.extreme { box-shadow: inset 0 0 0 2px var(--extreme); }
 </div>
 <p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span></p>
 <div id="prices"></div>
+<h2 class="section-title">Quotas</h2>
 <div id="quotas"></div>
 <section class="card" id="runs">
   <div class="card-head">
@@ -178,7 +201,8 @@ function scaleColor(value, low, middle, high) {
 function scaleCells(table, cells) {
   const colors = new Map();
   const ends = new Set();
-  const extremes = new Set();
+  const cheapest = new Set();
+  const dearest = new Set();
   const numbered = [];
   for (const column of cells.columns) {
     const columnCells = cells.rows.map(row => [String([row, column]), (table.values[row] || [])[column]])
@@ -197,9 +221,12 @@ function scaleCells(table, cells) {
   const values = numbered.map(([, value]) => value);
   if (new Set(values).size > 1) {
     const [low, high] = [Math.min(...values), Math.max(...values)];
-    for (const [place, value] of numbered) if (value === low || value === high) extremes.add(place);
+    for (const [place, value] of numbered) {
+      if (value === low) cheapest.add(place);
+      if (value === high) dearest.add(place);
+    }
   }
-  return { colors, ends, extremes };
+  return { colors, ends, cheapest, dearest };
 }
 
 // Draw tables with the same headers as one grid, so their columns line up; a titled row starts each table.
@@ -227,7 +254,7 @@ function tableElement(tables, titled) {
       title.scope = "rowgroup";
       body.insertRow().appendChild(title);
     }
-    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), ends: new Set(), extremes: new Set() };
+    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), ends: new Set(), cheapest: new Set(), dearest: new Set() };
     const notSold = new Set((table.not_sold || []).map(String));
     for (const rowIndex of view.rows) {
       const line = body.insertRow();
@@ -239,9 +266,12 @@ function tableElement(tables, titled) {
           cell.title = NOT_SOLD;
           cell.appendChild(banIcon());
         }
-        if (scale.colors.has(place)) cell.style.background = scale.colors.get(place);
-        if (scale.extremes.has(place)) cell.classList.add("extreme");
-        else if (scale.ends.has(place)) cell.classList.add("end");
+        if (scale.cheapest.has(place)) cell.classList.add("cheapest");
+        else if (scale.dearest.has(place)) cell.classList.add("dearest");
+        else {
+          if (scale.colors.has(place)) cell.style.background = scale.colors.get(place);
+          if (scale.ends.has(place)) cell.classList.add("end");
+        }
         line.appendChild(cell);
       }
     }
@@ -280,6 +310,17 @@ function cards(id, tables) {
   return sections;
 }
 
+function drawSpend() {
+  const tiles = data.spend.tiles.map(tile => {
+    const box = element("div", undefined, "tile");
+    box.append(element("div", tile.label, "tile-label"), element("div", tile.usd, "tile-usd"), element("div", tile.note, "tile-note"));
+    return box;
+  });
+  document.getElementById("spend-tiles").replaceChildren(...tiles);
+  document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+}
+drawSpend();
+
 const published = new Date(data.read_at * 1000);
 document.getElementById("published").textContent =
   `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
@@ -298,7 +339,8 @@ const priceScope = document.getElementById("price-scope");
 // One line under a price table that names its two outlines.
 function outlineLegend() {
   const line = element("p", undefined, "legend");
-  for (const [kind, text] of [["end", "Lowest and highest of each type"], ["extreme", "Lowest and highest of the table"]]) {
+  for (const [kind, text] of [["end", "Lowest and highest of each type"], ["cheapest", "Cheapest in the table"],
+                             ["dearest", "Most expensive in the table"]]) {
     const item = element("span");
     item.append(element("span", undefined, `swatch ${kind}`), text);
     item.firstChild.setAttribute("aria-hidden", "true");
@@ -311,7 +353,7 @@ function drawPrices() {
   for (const button of priceView.children) button.setAttribute("aria-pressed", String(button.dataset.view === view));
   priceScope.hidden = view !== "cost";
   const priceCards = cards("prices", view === "cost" ? scopeCosts().prices : data.prices);
-  for (const card of priceCards) if (card.querySelector("td.end, td.extreme")) card.appendChild(outlineLegend());
+  for (const card of priceCards) if (card.querySelector("td.end, td.cheapest, td.dearest")) card.appendChild(outlineLegend());
   const snapshot = element("ul", undefined, "snapshot");
   for (const line of data.snapshot) if (!line.region || shown.has(line.region)) snapshot.appendChild(element("li", line.text));
   priceCards[priceCards.length - 1].appendChild(snapshot);

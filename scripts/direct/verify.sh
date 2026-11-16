@@ -10,7 +10,7 @@
 #   lint [<package>]       repair and format code; check TOML and run Clippy
 #   doc [<package>]        document the staged workspace; deny warnings
 #   example [<package>]    run Clippy on examples on an eligible target
-#   build [<package>]      build binaries on natedev and print their paths
+#   build [<package>]      build binaries on an eligible target; print paths
 #   final [<package>]      check workspace targets; run tests on natedev
 #   help <command>       show details for one command
 #
@@ -139,7 +139,7 @@
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
 #                     [--release] [--features <list>] [--attached]
 #
-# Build binaries on natedev unless --target or --mac pins the step.
+# Build binaries on an eligible target. --target or --mac pins the step.
 # --local pins the step to natedev.
 # --bin selects one binary. --example selects one example.
 # Enable the example's required features when building an example.
@@ -2642,7 +2642,7 @@ placement_once() {
     elif [[ "${STEP_FORCE_MAC:-0}" != 0 ]]; then
         placement_args+=(--target mac)
     fi
-    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only)
+    [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
     [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
     # A builtin wait lets the parent handle TERM during a service outage.

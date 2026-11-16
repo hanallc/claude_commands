@@ -17,7 +17,8 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spot_table
+from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
+from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
@@ -451,7 +452,7 @@ class ControlTests(CostFixture):
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        self.assertEqual(data, aws_page.page_data(tables, int(self.clock.now)))
+        self.assertEqual(data, aws_page.page_data(tables, data["spend"], int(self.clock.now)))
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
                          [('merge-gate', 'Merge gates'), ('targeted-test', 'Targeted runs'), ('both', 'Both')])
         self.assertEqual([table['right'] for table in data['prices']],
@@ -480,6 +481,30 @@ class ControlTests(CostFixture):
         self.assertEqual(sorted(regions, key=aws_page.region_filter_key),
                          ['us-east-2', 'us-west-2', 'eu-central-1', 'eu-west-1', 'ap-northeast-1', 'ap-south-1',
                           'ca-central-1', 'sa-east-1', 'af-south-1', 'me-south-1'])
+
+    def test_spend_card_shows_today_yesterday_and_the_month(self) -> None:
+        def day(name: str, source: str, gate: str, runs: int, provisional: bool = False) -> ledger.DailySpend:
+            return ledger.DailySpend(name, source, (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(gate)),
+                                                    ledger.SpendGroupCost('storage', Decimal('1'))), runs, provisional_bill=provisional)
+        now = int(datetime(2026, 1, 15, 12, tzinfo=UTC).timestamp())
+        read = spend.Spend((day('2026-01-15', 'estimated from the newest bill', '1', 5),
+                            day('2026-01-14', 'AWS bill', '3', 7, True), day('2026-01-13', 'AWS bill', '1', 2)),
+                           Decimal(35), Decimal(400))
+        data = aws_page.spend_data(read, now, 2)
+        self.assertEqual(data['unavailable'], '')
+        self.assertEqual([(tile['label'], tile['usd']) for tile in data['tiles']],
+                         [('Today', '$2.00'), ('Yesterday', '$4.00'), ('Month to date', '$8.00')])
+        self.assertEqual(data['tiles'][0]['note'], 'UTC 2026-01-15, estimate of the $35.00 daily limit. 5 gate runs.')
+        self.assertEqual(data['tiles'][1]['note'], 'UTC 2026-01-14, provisional bill of the $35.00 daily limit. 7 gate runs.')
+        self.assertEqual(data['tiles'][2]['note'], 'UTC 2026-01, of the $400.00 monthly limit.')
+        # The page and /aws_spend share one month calculation.
+        self.assertEqual(data['forecast'], 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days. '
+                         + '32-CPU gate compute is 67% of the spend on those days.')
+        no_bill = aws_page.spend_data(spend.Spend(read.days[:1], Decimal(35), Decimal(400)), now, 2)
+        self.assertEqual([tile['usd'] for tile in no_bill['tiles']], ['$2.00', '—', '—'])
+        self.assertEqual(no_bill['forecast'], '')
+        gone = aws_page.spend_data(aws_config.MeasurementUnavailable('ledger unreadable'), now, 2)
+        self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': ''})
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'

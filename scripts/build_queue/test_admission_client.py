@@ -31,7 +31,8 @@ from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_place as shell_place
-from scripts.build_queue import admission_records as records, admission_service as service, queue_evidence, step_estimator
+from scripts.build_targets import target_config
+from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
@@ -116,19 +117,24 @@ class ClientTests(unittest.TestCase):
                 fixture.release(occupied)
 
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
-        for position, label, expected in (
-            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB"),
-            (2, "compiler · check", "head compiler · check needs 12.3 GiB"),
-            (2, "hana · test", "head hana · test needs 12.3 GiB"),
-            (2, "42 · test", "head 42 · test needs 12.3 GiB"),
-            (1, "hana CI · hana-linux-2 · test", "this build is the queue head"),
+        for position, label, expected, reason in (
+            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
+            (2, "compiler · check", "head compiler · check needs 12.3 GiB", ""),
+            (2, "hana · test", "head hana · test needs 12.3 GiB", ""),
+            (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
+            (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
+            (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
                     snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
                 with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
-                    client.WaitOutput()(waiting)
+                    client.WaitOutput(local_reason=reason)(waiting)
                 self.assertIn(expected, output.getvalue())
+                if reason:
+                    self.assertIn(f"runs on natedev: {reason}", output.getvalue())
+                else:
+                    self.assertNotIn("runs on natedev:", output.getvalue())
                 self.assertNotIn("head  needs", output.getvalue())
                 if position == 1:
                     self.assertNotIn(f"head {label} needs", output.getvalue())
@@ -573,12 +579,18 @@ class ClientTests(unittest.TestCase):
                                         connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
                                     if isinstance(request, wire.PrerequisiteReport):
                                         fixture.free(60 * GIB)
-                                    replies = previous(request, connection)
-                                    if isinstance(request, wire.PlacementRequest):
-                                        observed.extend(replies)
-                                    return replies
+                                    return previous(request, connection)
 
-                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply):
+                                send = cast(Callable[[service.Connection, wire.Reply], None],
+                                    getattr(fixture.server, "_send"))
+
+                                def observe_sent_reply(connection: service.Connection, reply: wire.Reply) -> None:
+                                    if isinstance(connection.request, wire.PlacementRequest):
+                                        observed.append(reply)
+                                    send(connection, reply)
+
+                                with mock.patch.object(fixture.server, "handle_request", side_effect=free_after_first_reply), \
+                                        mock.patch.object(fixture.server, "_send", side_effect=observe_sent_reply):
                                     self.assertEqual(client.main(arguments), 0, errors.getvalue())
                                 self.assertEqual(len(observed), 2, observed)
                                 self.assertIsInstance(observed[0], wire.PlacementWait)
@@ -728,11 +740,14 @@ class ClientTests(unittest.TestCase):
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
-            for unit in ("queue-unit", ""):
-                with self.subTest(unit=unit), mock.patch.dict(os.environ, {records.BUILDLOG_UNIT: unit}):
+            for unit, reason in (("queue-unit", ""), ("", ""),
+                                 ("queue-unit", "it edits the merged checkout")):
+                with self.subTest(unit=unit, reason=reason), mock.patch.dict(os.environ,
+                        {records.BUILDLOG_UNIT: unit, "BUILD_QUEUE_LOCAL_REASON": reason}):
                     request = client.step_request(list(original.argv), original.cwd, original.owner,
                         original.since, original.sidecar, original.episode, original.profile)
                     self.assertEqual(request.identity.unit, unit)
+                    self.assertEqual(request.route, target_config.LocalRequired(reason) if reason else records.DIRECT_CARGO)
                     launch = wire.LaunchRequest(request.episode, request.owner, request.since,
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
@@ -747,7 +762,7 @@ class ClientTests(unittest.TestCase):
     def test_priority_commands_from_any_session_send_the_actor(self) -> None:
         for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
                                       ("", "codex-session", "codex-session"), ("", "", "user")):
-            for argv in (("priority-set", "unit"), ("priority-clear",), ("admit-head", "urgent")):
+            for argv in (("priority-set", "unit"), ("priority-clear",)):
                 with self.subTest(actor=actor, argv=argv), \
                      mock.patch.dict(os.environ), \
                      mock.patch.object(client, "_mutation", return_value=wire.Ok()) as mutation, \
@@ -760,9 +775,9 @@ class ClientTests(unittest.TestCase):
                         os.environ["CODEX_THREAD_ID"] = codex
                     self.assertEqual(client.main(list(argv)), 0)
                     mutation.assert_called_once()
-                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest,
+                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest,
                                    mutation.call_args.args[0])
-                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest))
+                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest))
                     self.assertEqual(request.actor, actor)
 
     def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
@@ -818,9 +833,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(records.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
-            self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
-                             "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
-                             + "condition not recorded by service")
+
 
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
@@ -1152,7 +1165,6 @@ class ClientTests(unittest.TestCase):
         mutations: dict[str, Callable[[], object]] = {
             "release": lambda: client.release("stem", 137, records.read_memory_config()),
             "width": lambda: client.width("stem", 3),
-            "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
             "priority-clear-unit": lambda: client.priority_clear("director", "demo"),
@@ -1978,7 +1990,7 @@ class ClientTests(unittest.TestCase):
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
             lambda: client.release("stem", 137, records.read_memory_config()), lambda: client.width("stem", 3),
-            lambda: client.admit_head("urgent", "director"))
+            lambda: client.priority_set("unit", "urgent", "director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
                 transport = self.use_transport(fixture, Exchange(b""), Exchange(reply_bytes(wire.Ok())))

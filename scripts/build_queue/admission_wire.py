@@ -127,6 +127,50 @@ class AdmitRequest(CallerCode):
     token_back_at: float = 0.0
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+
+
+@dataclass(frozen=True)
+class RepositorySlotRequest(CallerCode):
+    """Wait for one attempt to acquire a repository slot."""
+    episode: str
+    owner: Owner
+    since: float
+    repository: str
+    machine: str
+    root: str
+    maximum: int
+    deadline: float
+    identity: Identity
+
+
+@dataclass(frozen=True)
+class RepositorySlotWaiting:
+    """The repository pool has no free slot for this waiter."""
+    repository: str
+    held: tuple[int, ...]
+    maximum: int
+    maximum_key: str
+
+    @property
+    def text(self) -> str:
+        return f"waits for a free {self.repository} slot ({len(self.held)} of {self.maximum} in use)"
+
+    @property
+    def expired_text(self) -> str:
+        held = ", ".join(f"{self.repository}-slot{number}" for number in self.held) or "none"
+        return f"slots: wait ended for {self.repository}; held slots: {held}; maximum {self.maximum} ({self.maximum_key})"
+
+
+@dataclass(frozen=True)
+class RepositorySlotReady:
+    """The first waiter can attempt to acquire a repository slot."""
+
+
+@dataclass(frozen=True)
+class RepositorySlotExpired:
+    """The repository slot wait ended before capacity became available."""
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -143,6 +187,7 @@ class ServiceEstimateRequest(CallerCode):
     runner: str
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
+    route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -190,14 +235,6 @@ class ExplainRequest(CallerCode):
 class MineRequest(CallerCode):
     """The request asks for the queue reading for this session."""
     session_id: str
-
-
-@dataclass(frozen=True)
-class AdmitHeadRequest(CallerCode):
-    """The request asks to admit the queue head with a reason and actor."""
-    request_id: str
-    why: str
-    actor: str
 
 
 @dataclass(frozen=True)
@@ -493,23 +530,26 @@ class DispatchStatus:
     retry: placement.RetryDecision = field(default_factory=lambda: placement.DoNotRetry("attempt is not settled"))
 
 
-Request = (ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
-           | BuildHistoryRequest | ExplainRequest | MineRequest | AdmitHeadRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
+Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+           | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _REQUESTS: dict[str, type] = {
+    "repository_slot": RepositorySlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
     "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
-    "build_history": BuildHistoryRequest, "mine": MineRequest, "admit_head": AdmitHeadRequest,
+    "build_history": BuildHistoryRequest, "mine": MineRequest,
     "priority_set": PrioritySetRequest, "priority_clear": PriorityClearRequest, "token_wait": TokenWaitRequest,
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
 }
 REPLY_TYPES: dict[str, type] = {
+    "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
+    "repository_slot_expired": RepositorySlotExpired,
     "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
@@ -558,6 +598,9 @@ def _write_wire_record(value: object) -> object:
     if not isinstance(value, dict):
         return value
     record = {key: _write_wire_record(item) for key, item in cast(dict[str, object], value).items()}
+    if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
+            and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
+        del record["route"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"

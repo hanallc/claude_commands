@@ -3,15 +3,17 @@ from __future__ import annotations
 import unittest
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from scripts.build_queue import target_availability
 from scripts.build_queue.admission_records import PackageNotRecorded
-from scripts.build_targets import build_targets, targets
+from scripts.build_targets import build_targets, targets, target_config
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalTarget, SshTarget
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.message import unit_labels
+from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
 
 MAC = SshTarget("mac", "macos", Path("/fixture/mac.conf"))
 NATEDEV = LocalTarget("natedev", "linux")
@@ -174,19 +176,38 @@ class MacRouteTests(unittest.TestCase):
         with mock.patch.object(build_targets, "step_policy", side_effect=AssertionError("no policy read")):
             self.assertEqual(routes.fit("fmt", "/fixture/hana", "hana"),
                              target_availability.NotAllowed("this step kind does not run on the Mac"))
-            self.assertEqual(routes.fit("build", "/fixture/hana", "hana"),
-                             target_availability.NotAllowed("makes natedev artifacts"))
+            self.assertEqual(routes.fit("final", "/fixture/hana", "hana"),
+                             target_availability.NotAllowed("full gate runs on natedev"))
+
+    def test_recorded_route_precedes_the_live_mac_state(self) -> None:
+        waiter = WaitingStep(42, "", "", "build", "/fixture/handler", 0, 0, NeedsMemory(), package="handler")
+        job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
+        cases: tuple[tuple[str, target_config.StepRoute, str], ...] = (
+            ("build", target_config.ANY_ELIGIBLE_TARGET, "Mac: busy with nextest hana"),
+            ("mend", target_config.WRITES_TREE, "Mac: no, mend edits this checkout on natedev"),
+            ("build", target_config.LocalRequired("creates a Linux install"), "Mac: no, creates a Linux install"),
+            ("test", target_config.LocalRequired("handler uses Linux namespaces"), "Mac: no, handler uses Linux namespaces"),
+            ("build", target_config.LocalRequired("linux_only"), "Mac: no, handler is Linux only"),
+            ("build", target_config.PinnedTarget("natedev"), "Mac: no, this step is pinned to natedev"),
+        )
+        with mock.patch.object(build_targets, "step_policy", return_value=eligibility.KnownRepository("handler", "/r")):
+            for step, route, expected in cases:
+                with self.subTest(step=step, route=route):
+                    self.assertEqual(self.routes(targets.Running((job,))).line(replace(waiter, step=step, route=route)), expected)
+        self.assertEqual(self.routes(MAC_BLOCK).line(waiter),
+                         "Mac: no, a direct cargo command runs where it starts")
 
     def test_policy_exclusion_names_its_reason_and_reads_once_for_each_key(self) -> None:
         routes = self.routes(targets.Free())
         excluded = ExcludedTarget(MAC, "linux_only")
-        linux_only = target_availability.NotAllowed("this package runs only on Linux")
+        linux_only = target_availability.NotAllowed("hana is Linux only")
         with mock.patch.object(build_targets, "step_policy", return_value=excluded) as policy:
             self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"), linux_only)
             self.assertEqual(routes.fit("nextest", "/fixture/hana", "hana"), linux_only)
             self.assertEqual(routes.fit("nextest", "/fixture/hana", PackageNotRecorded()),
-                             target_availability.NotAllowed("this package runs only on Linux; package not recorded"))
-            self.assertEqual(routes.fit("nextest", "/fixture/hana", ""), linux_only)
+                             target_availability.NotAllowed("this workspace is Linux only; package not recorded"))
+            self.assertEqual(routes.fit("nextest", "/fixture/hana", ""),
+                             target_availability.NotAllowed("this workspace is Linux only"))
         self.assertEqual(policy.call_count, 3)
         with mock.patch.object(build_targets, "step_policy", return_value=ExcludedTarget(MAC, "disk")):
             self.assertEqual(self.routes(targets.Free()).fit("check", "/fixture/hana", "hana"),

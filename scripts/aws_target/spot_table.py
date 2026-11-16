@@ -1,4 +1,4 @@
-"""Read the local Spot snapshot and the run ledger into tables for the AWS prices page."""
+"""Read the local Spot snapshot and the run ledger into tables for the AWS page."""
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
