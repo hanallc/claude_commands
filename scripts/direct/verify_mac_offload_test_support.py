@@ -1306,7 +1306,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "collect_child", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
-            "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
+            "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
