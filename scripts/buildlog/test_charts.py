@@ -534,6 +534,17 @@ class ChartTests(ChartFixture):
                 self.assertEqual(charts.cost_value(series.buckets[0], machine, "Memory wait"),
                                  charts.CostUnavailable("no recorded source coverage"))
 
+    def test_a_source_folder_without_steps_is_no_chart_machine(self) -> None:
+        with mock.patch.object(record, "configured_targets", return_value=("natedev",)), \
+             mock.patch.object(costs, "first_source_times", return_value={"natedev": fixtures.START.timestamp()-1,
+                                                                       "gate-host": fixtures.START.timestamp()-1}), \
+             closing(self.fixture.connection(fixtures.build("cloud", 10, host="new-cloud", target="aws-new"))) as connection:
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        self.assertEqual(series.machines, ("aws-new", "natedev"))
+        machines = {cast(str, row["machine"]) for bucket in cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
+                    for row in cast(list[dict[str, object]], bucket["rows"])}
+        self.assertEqual(machines, {"aws-new", "natedev"})
+
     def configured_machine_series(self, *records: Record, targets: tuple[str, ...] = ("natedev", "aws"),
                                   start: datetime = fixtures.START, end: datetime = fixtures.END) -> charts.ChartSet:
         self.targets.return_value = targets

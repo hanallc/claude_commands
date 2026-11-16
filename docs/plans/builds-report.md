@@ -1835,9 +1835,11 @@ As built:
 - Cause: `record_turn_wait` recorded no wait for a `blocked:` turn end that
   named no supplier address. A pause relayed by the showrunner counted as
   phase time. Hana phase 14 holds 180 h of such a pause.
-- Every `blocked:` turn end now opens a wait. The supplier is the named
-  address, else the run's showrunner. A run with no showrunner waits on the
-  user. A `peer` block with no address keeps `NoNamedSupplier`.
+- A `blocked: waiting on ...` turn end, or a `blocked:` turn end that names
+  a pause, now opens a wait. Any other `blocked:` turn end opens no wait, so
+  the Stop hook still wakes the director. The supplier is the named address,
+  else the run's showrunner. A run with no showrunner waits on the user. A
+  `peer` block with no address keeps `NoNamedSupplier`.
 - `finish-phase` writes `phase_active_seconds`: the phase time less the union
   of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
   the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.
@@ -1864,12 +1866,54 @@ As built:
 - A waiting build says its place in line, "It needs N GiB to start." and
   "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
   wait reason, in the same form.
-- The waiting build that gets memory next shows the queue cap first. One
-  line says the cap is RAM less the programs that run now, the safety net
-  and the swap coming back. The table then goes "Queue cap", "− Builds",
-  "− Build reserved", "− Held for builds ahead in line" (only above 0) and
-  "= Free for builds". The rows add up. The cap and Builds count the build
-  tools, as the memory bar legend does. The user set what is inside the
-  cap on 2026-11-15; queue gave the words.
+- The waiting build that gets memory next shows a table: "Queue cap",
+  "− Builds", "− Build reserved", "− Held for builds ahead in line" (only
+  above 0) and "= Free for builds". Each row is the memory bar legend's
+  amount, so the rows add up and the cap and Builds count the build tools.
+  One note follows: "Build reserved is memory that running builds used at
+  their next points in earlier runs."
+- The queue cap hover says the cap is RAM less the programs that run now,
+  the safety net and the swap coming back, and that those three are
+  outside the cap. The user set what is inside the cap and where it is
+  explained on 2026-11-15; queue gave the words.
 - An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
 - "can run on" and "Mac" are fields in the running and the waiting boxes.
+
+#### Builds page weight (C1672)
+
+From builds, relaying the user on C1672: the memory and the queue should be always visible and fast.
+
+As built:
+
+- Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
+- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
+- `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
+- Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+### Tokens — The Builds page shows the jobserver tokens · status: done
+
+From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
+
+As built:
+
+- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
+- In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
+- The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
+- steve lists each connected process, holders of 0 included. A local step shows the sum of its lines, 0 included. A step with no line in the dump shows "—". CI, Mac and AWS rows always show "—".
+- The polkit rule (nixos 2ed52e5) is live, so the reload works. When a reload is refused, the column shows "—" and the header hover gives the reason.
+- Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).
+
+### Cap bar — Running bars stop at the cap line · status: done
+
+From builds: the reserved bar ran past the chart into the Stage column. "The bar must stop at the chart edge and show the over-cap state inside the chart."
+
+As built:
+
+- `placeMemoryBars` draws each local bar (build tools, CI, used, reserved, Free) with `capBox`. It cuts the bar at the cap line. A cut bar gets the `over-cap` class: square right corners and a 3px cap-colored end. Mac and cloud rows keep their own scale.
+- With a cap, a wait bar ends at the room end or the cap line, whichever is first. A need larger than the cap stops at the cap line.
+- When build reserves do not fit under the cap (`build_missing_bytes` > 0), the Running header reads "X of Y GiB taken · Z GiB over cap" in the cap color. The feed's taken is cap minus free, so the page adds the uncovered reserve: X counts each full build reserve, so X − Y = Z. The user asked on 2026-11-16 how "28.0 of 28.0 GiB taken" could be 1 GiB over the cap; now it reads "29.0 of 28.0".
+- The header tooltip reads Builds + Build reserved (full) = Taken, then "That is Z GiB over the Y GiB queue cap, so nothing is free."
+- The Queue cap legend stays as it is: the feed defines the cap as Builds + covered Build reserved + Free, so its rows always add to the total. The Shortfall row already names the uncovered reserve.
+- Tests: `memory_page_proof.mjs` adds two readings. In the first, build tools grow past the cap and one wait needs cap + 10 GiB; the proof checks that no local bar ends past the cap line and the cut bar's cap-colored end. The legend sum check skips this reading, because live data cannot produce it. In the second, the running build reserves all of free plus 1 GiB; the proof checks the header text and color, that every number in the header and tooltip adds up within 0.1 GiB, and that the base reading names no over-cap amount.

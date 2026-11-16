@@ -111,9 +111,10 @@ try {
   }
 
   const server = createServer((req, res) => {
-    const isData = req.url.startsWith('/memory.json');
-    res.writeHead(200, {'Content-Type':isData ? 'application/json' : 'text/html; charset=utf-8'});
-    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : req.url === '/before.html' ? beforePage : page);
+    const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
+    res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
+    res.end(isData ? JSON.stringify({...base,read_at:Date.now()/1000}) : isReport ? JSON.stringify(base.report)
+      : req.url === '/before.html' ? beforePage : page);
   });
   try {
     server.listen(0, '127.0.0.1');
@@ -210,7 +211,8 @@ try {
         await navigate('memory_live.html');
 
         const proofs = [];
-        const show = async (reading, clearTip=true) => {
+        // An over-cap reading takes more than the cap total, so its legend rows exceed that total.
+        const show = async (reading, clearTip=true, legendSums=true) => {
           const totals=await evaluate(`(async () => {
           ${clearTip ? "hideTip();" : ""}
           document.body.classList.remove('queue-unavailable');
@@ -218,6 +220,7 @@ try {
           data.read_at = Date.now()/1000;
           latest = data;
           window.renderReading(data);
+          renderReport(data.report);
           fitLabels();
           await document.fonts.ready;
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -228,7 +231,7 @@ try {
               .filter(row=>!row.hidden&&row.dataset.tip!=='shortfall')
               .map(row=>row.querySelector('.v').textContent)}));
           })()`);
-          for(const group of totals) {
+          for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
             const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
@@ -354,7 +357,7 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
             assert.equal(proof.queuedSlots,0);
             assert.equal(proof.answer,'Free for the next step');
@@ -440,9 +443,11 @@ try {
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
             slotReview.walk=[
-              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2},
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2,tokens:6},
               {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
             ];
+            slotReview.tokens={kind:'TokenPool',total:31,free:4,memory_floor_bytes:12*2**30,paused:false};
+            slotReview.token_counts='';
             slotReview.waiters=[];
             slotReview.ram.build_tools_bytes=0;
             await show(slotReview);
@@ -452,13 +457,17 @@ try {
               const box=table.getBoundingClientRect();
               const bottom=rows.at(-1).getBoundingClientRect().bottom;
               return {slots:rows.map(row=>row.querySelector('.slot').textContent),
-                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
+                tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+                pool:document.getElementById('walk-tokens').textContent,
+                lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
             })()`);
             assert.deepEqual(slotColumn.slots,['2','—']);
-            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot'],['vcpus','slot']]);
+            assert.deepEqual(slotColumn.tokens,['6','—']);
+            assert.equal(slotColumn.pool,'Tokens: 31 total, 4 free');
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
             assert.equal(slotColumn.overflow,false);
             if(theme==='dark'&&width===1400) {
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
@@ -630,7 +639,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.kind==='cloud'),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -787,6 +796,65 @@ try {
               await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
             }
             proof.capLine=capLine;
+            // Bars that add to more than the cap stop at the cap line; a cut bar ends in the cap color.
+            const overReading=structuredClone(base), over=overReading.room+1;
+            Object.assign(overReading.ram,{build_tools_bytes:overReading.ram.build_tools_bytes+over*gib,
+              available_bytes:overReading.ram.available_bytes-over*gib,room_bytes:0});
+            overReading.room=0;
+            overReading.taken=overReading.cap+1;
+            // A waiting step that needs more than the cap also stops at the cap line.
+            overReading.waiters.find(row=>row.kind!=='cloud').need=overReading.cap+10;
+            await show(overReading,true,false);
+            const overCap=await evaluate(`(() => {
+              const edge=document.querySelector('#walk .walk-bud').getBoundingClientRect().left+1;
+              const bars=[...document.querySelectorAll('#walk .wrow .track .b:not(.row-progress):not(.seg-remote)')]
+                .map(bar=>({cls:bar.className,right:bar.getBoundingClientRect().right}));
+              const cut=document.querySelector('#walk .track .b.over-cap');
+              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',
+                cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor};
+            })()`);
+            assert.ok(overCap.bars.length>0,'The over-cap chart draws no bars.');
+            assert.ok(overCap.bars.some(bar=>bar.cls.includes('waitb')),'The over-cap chart draws no wait bar.');
+            for(const bar of overCap.bars) assert.ok(bar.right<=overCap.edge+0.5,'A bar runs past the cap line. '+JSON.stringify({bar,edge:overCap.edge}));
+            assert.ok(overCap.cut.includes(overCap.cap),'A bar cut at the cap has no cap-colored end. '+JSON.stringify(overCap));
+            proof.overCap=overCap;
+            // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
+            const shortReading=structuredClone(base);
+            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
+            shortRun.reserved+=shortReading.room+1;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            await show(shortReading);
+            if(theme==='dark'&&width===1400) {
+              const shortClip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
+              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
+            }
+            const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
+              sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],
+              cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
+            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
+            assert.ok(overHeader.hover.includes('= Taken: '+(shortReading.cap+1).toFixed(1)+' GiB.\nThat is 1.0 GiB over the '+shortReading.cap.toFixed(1)+' GiB queue cap, so nothing is free.'),overHeader.hover);
+            // Every number adds up as the user reads it: Taken = Builds + Build reserved, and over cap = Taken - Queue cap.
+            const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
+            const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
+            const tip={builds:number(overHeader.hover,/Builds: ([0-9.]+) GiB/),reserved:number(overHeader.hover,/Build reserved: ([0-9.]+) GiB/),
+              taken:number(overHeader.hover,/= Taken: ([0-9.]+) GiB/),over:number(overHeader.hover,/That is ([0-9.]+) GiB over/),cap:number(overHeader.hover,/over the ([0-9.]+) GiB queue cap/)};
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
+            const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
+            assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
             cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
@@ -1017,7 +1085,7 @@ try {
                 return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
                   values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
                   all:latest.waiters[0].head_room.rows.map(row=>row.gib),
-                  hover:tipText('wait:0',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
+                  hover:tipText('wait:0',latest)[1],capHover:tipText('cap',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
                   covered:document.querySelector('#v-reserved').textContent,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
@@ -1033,14 +1101,13 @@ try {
               const [cap,...terms]=headProof.all;
               assert.ok(Math.abs(cap-terms.slice(0,-1).reduce((a,b)=>a+b,0)-terms.at(-1))<0.3,
                 'The head rows do not add up: '+headProof.all.join(', '));
-              const safety=(readings[name].ram.safety_target_bytes/gib).toFixed(1), swap=(readings[name].ram.swap_target_bytes/gib).toFixed(1);
-              assert.ok(headProof.hover.includes(`the ${safety} GiB safety net and the ${swap} GiB of swap coming back`),
-                'The cap line omits the safety net or the swap: '+headProof.hover);
-              const ram=readings[name].ram, target=(ram.build_target_bytes/gib).toFixed(1), covered=(ram.build_covered_bytes/gib).toFixed(1);
+              const ram=readings[name].ram, covered=(ram.build_covered_bytes/gib).toFixed(1);
+              const safety=(ram.safety_target_bytes/gib).toFixed(1), swap=(ram.swap_target_bytes/gib).toFixed(1);
+              assert.ok(!headProof.hover.includes('outside the cap'),'The head tooltip explains the queue cap: '+headProof.hover);
+              assert.ok(headProof.capHover.includes(`the ${safety} GiB safety net and the ${swap} GiB of swap coming back`),
+                'The queue cap tooltip omits the safety net or the swap: '+headProof.capHover);
               assert.equal(headProof.values['Build reserved'],covered+' GiB');
               assert.ok(ram.build_target_bytes>ram.build_covered_bytes,'The fixture has no uncovered build reserve.');
-              assert.ok(headProof.hover.includes(`Running builds need ${target} GiB reserved. Free RAM covers ${covered} GiB of it.`),
-                'The head tooltip omits the uncovered build reserve: '+headProof.hover);
               if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
               assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
               if(name==='head_memory'&&theme==='dark'&&width===1400) {
@@ -1264,7 +1331,7 @@ try {
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
               assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
@@ -1596,11 +1663,10 @@ try {
           const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
             {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
             {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
-          const room={cap_text:'Queue cap: 17.1 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
-            'and the 9.8 GiB of swap coming back. Those three are outside the cap.',
+          const room={unavailable:'',
             rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
             {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs. '+
-            'Other programs have 9.8 GiB in swap. It can come back into RAM when they run, so it is outside the cap.'};
+            'The queue holds 9.8 GiB for swap coming back. The reserve uses swap-in measured within the recent window.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
           const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
@@ -1623,7 +1689,7 @@ try {
                   assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
                   assert.ok(tooltip.includes('can run on'),tooltip);
                   assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
-                  assert.equal(tooltip.includes('Those three are outside the cap.'),index===0,tooltip);
+                  assert.ok(!tooltip.includes('outside the cap'),tooltip);
                   assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
@@ -1708,8 +1774,7 @@ try {
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
             why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{cap_text:'Queue cap: 0.0 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
-              'and the 6.0 GiB of swap coming back. Those three are outside the cap.',
+            head_room:{unavailable:'',
               rows:[{label:'Queue cap',gib:0.0},{label:'− Builds',gib:0.0},{label:'− Build reserved',gib:0.0},
               {label:'= Free for builds',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;

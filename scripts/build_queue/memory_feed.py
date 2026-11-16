@@ -12,11 +12,11 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never
 
@@ -142,7 +142,7 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
-SWAP_RETURN_NOTE = "It can come back into RAM when they run, so it is outside the cap."
+SWAP_RETURN_NOTE = "The reserve uses swap-in measured within the recent window."
 BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
@@ -173,6 +173,7 @@ class FeedConfiguration:
     report_refresh_seconds: int
     colors: PageColors
     other_rows: int
+    token_dump_seconds: int
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -199,7 +200,8 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
     return FeedConfiguration(configured_output_folder(settings),
                              settings.number("interval_seconds"), settings.whole("history_days"),
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
-                             {"light": theme("light"), "dark": theme("dark")}, settings.whole("other_rows"))
+                             {"light": theme("light"), "dark": theme("dark")}, settings.whole("other_rows"),
+                             settings.whole("token_dump_seconds"))
 
 
 class PageArguments(CodeRootArguments):
@@ -333,7 +335,8 @@ class RoomRow(TypedDict):
 
 class HeadRoom(TypedDict):
     """The first waiting step's room inside the queue cap: the cap, less each term, then the memory free for builds."""
-    cap_text: str
+    # Why the queue cap is unavailable; empty when the rows show.
+    unavailable: str
     rows: list[RoomRow]
     note: str
 
@@ -444,17 +447,14 @@ def head_room(check: admission_records.RoomCheck,
             "It fits in the memory it already holds." if isinstance(check.basis, admission_records.WithinSlot) else
             "")
     if isinstance(room, admission_records.ReadingUnavailable):
-        return {"cap_text": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
+        return {"unavailable": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
     if isinstance(room.cap, admission_records.CapUnavailable):
-        return {"cap_text": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
+        return {"unavailable": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
     cap = ram["cap_bytes"]
     builds = ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"]
     reserved = ram["build_covered_bytes"]
     free = max(0, check.room)
     ahead = cap - builds - reserved - free
-    cap_text = (f"Queue cap: {gib(cap):.1f} GiB. It is RAM less the programs that run now, "
-                f"the {gib(room.safety):.1f} GiB safety net and the {gib(room.agent_swap_demand):.1f} GiB of swap coming back. "
-                "Those three are outside the cap.")
     rows: list[RoomRow] = [{"label": "Queue cap", "gib": gib(cap)}, {"label": "− Builds", "gib": gib(builds)},
                            {"label": "− Build reserved", "gib": gib(reserved)}]
     if ahead > 0:
@@ -463,9 +463,12 @@ def head_room(check: admission_records.RoomCheck,
     uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
                  + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
                  if ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
-    swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB in swap. {SWAP_RETURN_NOTE}"
+    swap = (" ".join(filter(None, (
+        f"Swap coming back needs {gib(ram['swap_target_bytes']):.1f} GiB.",
+        f"Free RAM covers {gib(ram['swap_covered_bytes']):.1f} GiB of it."
+        if ram["swap_target_bytes"] > ram["swap_covered_bytes"] else "", SWAP_RETURN_NOTE)))
             if room.agent_swap_demand else "")
-    return {"cap_text": cap_text, "rows": rows,
+    return {"unavailable": "", "rows": rows,
             "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}
 
 
@@ -495,6 +498,7 @@ class RunRow(RowQueueNotes):
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
     slot: NotRequired[int | Literal["—"]]
+    tokens: NotRequired[int]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
     name: str
@@ -671,8 +675,20 @@ class ReportSections:
     zone: str
 
 
-class ReportNotRead(Enum):
-    VALUE = "not read"
+# The page reads report.json only when this version in memory.json changes.
+REPORT_NAME = "report.json"
+REPORT_VERSION_LENGTH = 16
+
+
+@dataclass(frozen=True)
+class ReportFile:
+    text: str
+    version: str
+
+
+def report_file(report: ReportSections | charts.IndexUnavailable) -> ReportFile:
+    text = json.dumps(codec.snapshot_value(report))
+    return ReportFile(text, hashlib.sha256(text.encode()).hexdigest()[:REPORT_VERSION_LENGTH])
 
 
 class SwapTotals(TypedDict):
@@ -717,9 +733,12 @@ class MemoryPage(TypedDict):
     targets: list[target_availability.TargetRow]
     cloud_slots_used: int
     cloud_slots: int
+    tokens: TokenPool | TokenPoolUnavailable
+    # Empty when the Tokens column holds counts; otherwise why the counts are unknown.
+    token_counts: str
     psi: PressureValues
     limits: PressureLimits
-    report: ReportSections | charts.IndexUnavailable
+    report_version: str
     swap_rows: int
     leftovers: list[LeftoverScope]
 
@@ -862,7 +881,7 @@ def build_ci_row(used: float, now: float,
             "progress": {"kind": "NoProgress", "reason": "no admission counter"}}
 
 
-def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress | TokenWaitProgress | NoProgress:
+def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: str) -> RowProgress | TokenWaitProgress | NoProgress:
     """Use the newest step counter or token wait from the admission reading."""
     reason = "no admission counter"
     phase: Literal["building", "testing"]
@@ -871,7 +890,7 @@ def row_progress(steps: Sequence[admission_records.RunningStep]) -> RowProgress 
         counter = queue_view.step_counter(step)
         if isinstance(counter, progress.NoCounter):
             if isinstance(counter.token_wait, progress.TokenWait):
-                return {"kind": "TokenWaitProgress", "stage": progress.TOKEN_WAIT_REASON,
+                return {"kind": "TokenWaitProgress", "stage": token_stage,
                         "tokens": counter.token_wait.tokens}
             reason = counter.reason
             continue
@@ -1056,6 +1075,165 @@ def read_stalls() -> PressureValues:
                 except ValueError:
                     values[name] = PressureNotRecorded(f"Pressure is unreadable: {path}")
     return values
+
+
+class TokenPool(TypedDict):
+    kind: Literal["TokenPool"]
+    total: int
+    free: int
+    memory_floor_bytes: int
+    paused: bool
+
+
+class TokenPoolUnavailable(TypedDict):
+    kind: Literal["TokenPoolUnavailable"]
+    reason: str
+
+
+# stevie prints one line for each option, in argument order: the memory floor in MiB, free tokens, total tokens.
+STEVIE_POOL_COMMAND = ("stevie", "-a", "-t", "-j")
+STEVIE_TIMEOUT_SECONDS = 0.5
+
+
+def stevie_output() -> str:
+    """Read the natedev jobserver pool; an error returns its reason."""
+    try:
+        result = subprocess.run(STEVIE_POOL_COMMAND, capture_output=True, text=True,
+                                timeout=STEVIE_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(f"stevie did not answer: {error}") from error
+    if result.returncode != 0:
+        raise ValueError(f"stevie exited {result.returncode}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def token_pool(available_bytes: int) -> TokenPool | TokenPoolUnavailable:
+    """The pool gives no token while MemAvailable is under its floor."""
+    try:
+        values = [int(value) for value in stevie_output().split()]
+    except ValueError as error:
+        return {"kind": "TokenPoolUnavailable", "reason": str(error)}
+    if len(values) != len(STEVIE_POOL_COMMAND) - 1 or min(values) < 0:
+        return {"kind": "TokenPoolUnavailable", "reason": f"stevie printed {values}"}
+    floor_mib, free, total = values
+    floor = floor_mib * 1024 ** 2
+    return {"kind": "TokenPool", "total": total, "free": free, "memory_floor_bytes": floor,
+            "paused": available_bytes < floor}
+
+
+@dataclass(frozen=True)
+class TokenHolders:
+    """The tokens each process held in steve's newest state dump."""
+    held: Mapping[int, int]
+
+
+@dataclass(frozen=True)
+class TokenHoldersUnknown:
+    reason: str
+
+
+NO_TOKEN_DUMP_YET = TokenHoldersUnknown("The feed has not read a steve token dump yet.")
+STEVE_UNIT = "steve.service"
+# systemctl must never ask for a password: the polkit rule allows this reload alone.
+STEVE_DUMP_COMMAND = ("systemctl", "--no-ask-password", "reload", STEVE_UNIT)
+STEVE_DUMP_TIMEOUT_SECONDS = 5
+STEVE_DUMP_DENIED = "Access denied"
+STEVE_DUMP_DENIED_REASON = "natedev does not yet let the feed ask steve which build holds each token."
+STEVE_DUMP_HEADER = re.compile(r"steve: currently (\d+) tokens available out of (\d+)")
+STEVE_DUMP_HOLDER = re.compile(r"\s+PID (\d+)(?: \(.*\))? holds (\d+) tokens:")
+STEVE_DUMP_DETAIL = re.compile(r"\s+(job 0x[0-9a-f]+ running for .*|\d+ processes waiting for a job token.*|PID \d+ is .*)")
+
+
+def request_token_dump() -> str:
+    """Ask steve to write its state to the journal; return the reason when it cannot."""
+    try:
+        result = subprocess.run(STEVE_DUMP_COMMAND, capture_output=True, text=True,
+                                timeout=STEVE_DUMP_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"systemctl reload steve did not finish: {error}"
+    if result.returncode == 0:
+        return ""
+    if STEVE_DUMP_DENIED in result.stderr:
+        return STEVE_DUMP_DENIED_REASON
+    message = next(iter(result.stderr.strip().splitlines()), "no message")
+    return f"systemctl reload steve exited {result.returncode}: {message}"
+
+
+def steve_journal(since_seconds: int) -> str:
+    """Read steve's journal lines of the last since_seconds, each with its time."""
+    result = subprocess.run(("journalctl", "--unit", STEVE_UNIT, "--output", "short-unix", "--no-pager", "--quiet",
+                             "--since", f"-{since_seconds}s"), capture_output=True, text=True,
+                            timeout=STEVE_DUMP_TIMEOUT_SECONDS, check=False)
+    if result.returncode != 0:
+        raise OSError(f"journalctl exited {result.returncode}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
+    """Parse the newest complete dump; a dump is the header line and the indented lines after it.
+
+    A dump is complete when its holder lines add up to the tokens its header says are taken.
+    The journal can drop or cut lines, so an incomplete dump gives way to the one before it.
+    """
+    messages = [line.split(": ", 1)[1] for line in journal.splitlines() if ": " in line]
+    starts = [index for index, message in enumerate(messages) if STEVE_DUMP_HEADER.fullmatch(message)]
+    if not starts:
+        return TokenHoldersUnknown("steve wrote no token dump in the journal window.")
+    for start in reversed(starts):
+        header = STEVE_DUMP_HEADER.fullmatch(messages[start])
+        assert header is not None
+        held: dict[int, int] = {}
+        for message in messages[start + 1:]:
+            holder = STEVE_DUMP_HOLDER.fullmatch(message)
+            if holder:
+                held[int(holder[1])] = held.get(int(holder[1]), 0) + int(holder[2])
+            elif not STEVE_DUMP_DETAIL.fullmatch(message):
+                break
+        if sum(held.values()) == int(header[2]) - int(header[1]):
+            return TokenHolders(held)
+    return TokenHoldersUnknown("Each steve token dump in the journal window was incomplete.")
+
+
+def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknown:
+    """Read the dump that the previous request wrote; an older dump is stale."""
+    try:
+        return token_holders(steve_journal(2 * dump_seconds))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return TokenHoldersUnknown(f"The steve journal is unreadable: {error}")
+
+
+def parent_pid(pid: int) -> int:
+    """Read the parent of pid, or 0 when the process is gone."""
+    try:
+        # The command name can hold spaces and parentheses, so read the fields after its last ")".
+        return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+PROCESS_DEPTH_LIMIT = 64
+
+
+def tokens_by_run(holders: TokenHolders, run_pids: set[int]) -> dict[int, int]:
+    """Charge each holder's tokens to its nearest ancestor that is a running step."""
+    counts: dict[int, int] = {}
+    for pid, tokens in holders.held.items():
+        ancestor = pid
+        for _ in range(PROCESS_DEPTH_LIMIT):
+            if ancestor in run_pids:
+                counts[ancestor] = counts.get(ancestor, 0) + tokens
+                break
+            ancestor = parent_pid(ancestor)
+            if ancestor <= 1:
+                break
+    return counts
+
+
+def token_wait_stage(pool: TokenPool | TokenPoolUnavailable) -> str:
+    """Name the memory pause as the cause of a natedev token wait."""
+    if pool["kind"] == "TokenPool" and pool["paused"]:
+        return f"{progress.TOKEN_WAIT_REASON} (memory under {pool['memory_floor_bytes'] / GIB:g} GiB)"
+    return progress.TOKEN_WAIT_REASON
 
 
 def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
@@ -1655,7 +1833,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-            report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE) -> MemoryPage:
+            report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
@@ -1692,6 +1870,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             scope_members = [{"pid": step.pid, "program": activity.program}]
         leftovers.append({"owner": owner, "age": queue_view.leftover_age(age(activity.started_at, explanation.now))
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
+    tokens = token_pool(captured.available)
+    token_stage = token_wait_stage(tokens)
     ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
                      explanation.now, configuration.other_rows)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
@@ -1730,7 +1910,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         if metadata is not None else "—",
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
-                     "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
+                     "progress": row_progress(steps_by_owner.get(hold.memory.owner, ()), token_stage),
                      "queued": True, "keep_text": "", "group": "", "ci": False, "parts": [],
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
@@ -1751,7 +1931,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             remote_row: RunRow = {"name": name, "showrunner": identity.showrunner, "unit": unit,
                 "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
-                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
+                "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
+                "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
                 "slot": build_slot_number(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
@@ -1779,7 +1960,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
                            "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                            "age": queue_view.leftover_age(age(step.started_at, explanation.now)) if step.started_at else "not recorded",
-                           "progress": row_progress((step,)),
+                           "progress": row_progress((step,), token_stage),
                            "queued": False, "keep_text": description, "group": "", "ci": False, "parts": []}
             if service and isinstance(memory, admission_records.UnownedSliceMemory):
                 row = ci_rows[memory.cgroup] if memory.cgroup in ci_rows else build_ci_row(gib(memory.bytes), explanation.now,
@@ -1811,6 +1992,14 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     for row in walk:
         _ = row.setdefault("machine", machine)
         _ = row.setdefault("vcpus", vcpus if vcpus is not None else queue_view.UnknownCpuCount())
+    # steve serves natedev builds; CI uses its own pool, and remote rows use no natedev tokens.
+    token_rows = {row["pid"]: row for row in walk
+                  if row.get("machine") == machine and not row["ci"] and isinstance(row["pid"], int)}
+    if isinstance(holders, TokenHolders):
+        counts = tokens_by_run(holders, set(token_rows))
+        # steve lists each connected process, holders of 0 included; a step with no line keeps the dash.
+        for pid, held in counts.items():
+            token_rows[pid]["tokens"] = held
     waiters: list[MemoryWaitRow] = []
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     if isinstance(explanation.head, admission_records.HeadExplanation):
@@ -1947,8 +2136,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             *(f"Mac unplaced run: pid {run.pid}; {run.command}" for run in mac_reading.unplaced_runs)) if text),
         "targets": target_availability.availability_rows(snapshots, labels, zone),
         "cloud_slots_used": cloud_slots_used, "cloud_slots": cloud_slots,
+        "tokens": tokens,
+        "token_counts": holders.reason if isinstance(holders, TokenHoldersUnknown) else "",
         "limits": {"some": policy.some_avg10_limit, "full": policy.full_avg10_limit},
-        "report": report_reading(configuration.history_days) if isinstance(report, ReportNotRead) else report,
+        "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
 
@@ -1984,17 +2175,23 @@ def main(argv: Sequence[str]) -> int:
     publish_page(configuration)
     target = configuration.output_folder / "memory.json"
     last_good: MemoryPage | NoGoodReading = NoGoodReading()
-    report: ReportSections | charts.IndexUnavailable | ReportNotRead = ReportNotRead.VALUE
+    report_version = ""
     next_report_at = 0.0
     next_mac_at = 0.0
+    holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET
+    next_tokens_at = 0.0
     notified_mac_runs: set[tuple[int, float]] = set()
     while True:
         if installed_feed_code_version(args.code_root) != LOADED_FEED_CODE_VERSION:
             print("The installed feed code changed. Restart the feed.", file=sys.stderr)
             return 1
         now = time.monotonic()
-        if isinstance(report, ReportNotRead) or now >= next_report_at:
-            report = report_reading(configuration.history_days)
+        if now >= next_report_at:
+            report = report_file(report_reading(configuration.history_days))
+            if report.version != report_version:
+                # The report goes first, so memory.json never names a report that is not written.
+                write_text_atomic(configuration.output_folder / REPORT_NAME, report.text, new_file_mode=0o644)
+                report_version = report.version
             next_report_at = now + configuration.report_refresh_seconds
         try:
             if now >= next_mac_at:
@@ -2003,7 +2200,15 @@ def main(argv: Sequence[str]) -> int:
                     # A one-time proof run reads the Mac but sends no alert.
                     notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
-            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report)
+            if now >= next_tokens_at:
+                # Read the dump that the previous request wrote, then ask for the next one.
+                holders = newest_token_holders(configuration.token_dump_seconds)
+                refused = request_token_dump()
+                if refused:
+                    holders = TokenHoldersUnknown(refused)
+                # Count from after the request, so slow reads before it never shorten the interval.
+                next_tokens_at = time.monotonic() + configuration.token_dump_seconds
+            payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             if isinstance(last_good, NoGoodReading):

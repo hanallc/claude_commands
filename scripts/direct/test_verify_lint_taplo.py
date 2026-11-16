@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import shutil
+import subprocess
 import unittest
 from typing import override
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
@@ -98,6 +103,90 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertNotIn("taplo must not run", result.stdout + result.stderr)
         result = self.invoke_workspace_taplo()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def invoke_lint_sequence(
+        self, *, held: bool = False, check: bool = False, copied: Path | None = None,
+        late_hold: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the production sequence with the fixture tools and a controlled copy return."""
+        functions = shell_functions(
+            support.VERIFY, "workspace_taplo", "run_lint_held_sequence", "run_lint_sequence",
+        )
+        script = "set -euo pipefail\n" + functions + r'''
+run() { "$@"; }
+load_metadata() { :; }
+lint_config_enabled() { return 1; }
+lint_config_skip_notice() { :; }
+lint_copy_begin() { :; }
+lint_copy_return() { LINT_COPY_TREE=""; }
+lint_rewrite() { "$@"; }
+fmt_cargo() { cargo +nightly fmt "$@"; HOLD_LINT=$TEST_LATE_HOLD; }
+run_lint_judgment() { cargo clippy --workspace; }
+PKG=""
+RUN_LOG=""
+FEATURE_FLAGS=()
+run_lint_sequence
+'''
+        return subprocess.run(
+            ["bash", "-c", script], cwd=self.root / "src",
+            env={**self.environment, "WORKSPACE_ROOT": str(self.root / "src"),
+                 "HOLD_LINT": str(int(held)), "CHECK_LINT": str(int(check)),
+                 "LINT_COPY_TREE": str(copied) if copied else "",
+                 "TEST_LATE_HOLD": str(int(late_hold))},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def test_dot_folder_toml_outside_the_workspace_gets_a_verdict_on_each_lint_sequence(self) -> None:
+        self.use_real_toml_tools()
+        _ = (self.root / "taplo.toml").write_text(
+            'include = ["**/*.toml"]\n\n[formatting]\nreorder_arrays = true\n', encoding="utf-8",
+        )
+        tracked = self.root / ".claude/config/release.toml"
+        tracked.parent.mkdir(parents=True)
+        original = 'reorder_arrays = ["z", "a"]\n'
+        _ = tracked.write_text(original, encoding="utf-8")
+        self.run_git("add", "--force", "--", ".claude/config/release.toml")
+        copied = self.root / "lint-copy"
+        (copied / ".claude/config").mkdir(parents=True)
+        _ = shutil.copy2(self.root / "Cargo.toml", copied / "Cargo.toml")
+        _ = shutil.copy2(self.root / "taplo.toml", copied / "taplo.toml")
+        copied_toml = copied / ".claude/config/release.toml"
+        formatted = 'reorder_arrays = ["a", "z"]\n'
+        for label, held, check, copy, late_hold in (
+            ("ordinary", False, False, None, False), ("check", False, True, None, False),
+            ("held", True, False, None, False), ("held copy", True, False, copied, False),
+            ("late hold", False, False, None, True),
+        ):
+            with self.subTest(path=label):
+                _ = tracked.write_text(original, encoding="utf-8")
+                _ = copied_toml.write_text(original, encoding="utf-8")
+                result = self.invoke_lint_sequence(held=held, check=check, copied=copy, late_hold=late_hold)
+                if held and copy is None:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(tracked.read_text(encoding="utf-8"), formatted)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("release.toml", result.stdout + result.stderr)
+                    self.assertEqual(tracked.read_text(encoding="utf-8"), original)
+                if copy is not None:
+                    self.assertEqual(copied_toml.read_text(encoding="utf-8"), formatted)
+
+    def test_check_reads_the_worktree_when_a_formatted_copy_is_open(self) -> None:
+        self.use_real_toml_tools()
+        tracked = self.root / ".claude/config/release.toml"
+        tracked.parent.mkdir(parents=True)
+        _ = tracked.write_text("value=1\n", encoding="utf-8")
+        self.run_git("add", "--force", "--", ".claude/config/release.toml")
+        copied = self.root / "lint-copy"
+        (copied / ".claude/config").mkdir(parents=True)
+        _ = shutil.copy2(self.root / "Cargo.toml", copied / "Cargo.toml")
+        _ = shutil.copy2(self.root / "taplo.toml", copied / "taplo.toml")
+        _ = (copied / ".claude/config/release.toml").write_text("value = 1\n", encoding="utf-8")
+        self.environment["LINT_COPY_TREE"] = str(copied)
+        result = self.invoke_taplo_at(self.root / "src", "--check")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(tracked), result.stdout + result.stderr)
+        self.assertEqual(tracked.read_text(encoding="utf-8"), "value=1\n")
 
     def test_taplo_uses_workspace_config_when_lint_starts_in_a_member_directory(self) -> None:
         result = self.invoke_verify("lint", "sample", cwd=self.root / "src")

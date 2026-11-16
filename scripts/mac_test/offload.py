@@ -1614,6 +1614,18 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
     return isinstance(stamp, CommandOutput) and stamp.status == 0
 
 
+def record_reachable(target: str = "mac") -> None:
+    """Clear the failed probe mark and the retry backoff after the target answered."""
+    mark = eligibility.state_directory(target) / "failed_probe"
+    with claim_state.locked(mark.parent / "probe-result.lock"):
+        changed = mark.exists()
+        mark.unlink(missing_ok=True)
+        eligibility.backoff_path(target).unlink(missing_ok=True)
+        if changed:
+            label = "Mac" if target in ("", "mac") else target
+            print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig,
@@ -1634,13 +1646,7 @@ def probe_mac(
         return UNAVAILABLE_PROBE
 
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
-        with claim_state.locked(mark.parent / "probe-result.lock"):
-            changed = mark.exists()
-            mark.unlink(missing_ok=True)
-            eligibility.backoff_path(target).unlink(missing_ok=True)
-            if changed:
-                label = "Mac" if target in ("", "mac") else target
-                print(f"mac_test: the {label} is reachable again", file=sys.stderr, flush=True)
+        record_reachable(target)
         return probe
 
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)

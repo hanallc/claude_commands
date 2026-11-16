@@ -10,7 +10,6 @@ import json
 import os
 import select
 import shutil
-import socket
 from pathlib import Path
 import signal
 import subprocess
@@ -21,6 +20,7 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
@@ -111,7 +111,7 @@ class RemoteCopiesTests(unittest.TestCase):
                                     "localhost", str(checkout), holder.current_session)
         copies.register_remote(local)
         row = next(row for row in self.list_rows() if row["path"] == str(checkout))
-        self.assertEqual(row["host"], socket.gethostname())
+        self.assertEqual(row["host"], host_name())
         self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(local)).host, "localhost")
         shutil.rmtree(checkout.parent)
         with copies.local_mirror_lease(checkout, "missing", create=False):

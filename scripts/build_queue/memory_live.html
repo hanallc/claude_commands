@@ -218,6 +218,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .error { color: var(--cap); font-weight: 600; }
 .walk-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
 .walk-sum { margin-left: auto; color: var(--ink-2); font-size: 0.86rem; }
+.walk-tokens { color: var(--ink-2); font-size: 0.86rem; }
 .walk { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .walk-chart { margin-right: var(--details); }
 .walk-chart { min-width: 0; position: relative; }
@@ -257,10 +258,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
 .walk-table .machine { width: var(--machine); min-width: var(--machine); }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot { font-variant-numeric: tabular-nums; }
-.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot { text-align: right; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { font-variant-numeric: tabular-nums; }
+.walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
-.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot { text-align: left; }
+.walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot, .walk-table th.tokens { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 /* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
 .walk-table .wait-target { display: block; width: 0; min-width: 100%; white-space: normal; }
@@ -285,19 +286,20 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
 /* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
-.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto; column-gap: 12px; width: 100%; }
+.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto auto auto; column-gap: 12px; width: 100%; }
 .walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
 .walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
 .walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
 .walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
-.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 6; contain: inline-size; }
-.walk.compact .walk-table .done { grid-area: 1 / 6; }
+.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 7; contain: inline-size; }
+.walk.compact .walk-table .done { grid-area: 1 / 7; }
 .walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
 .walk.compact .walk-table .unit { grid-area: 2 / 2; }
 .walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
 .walk.compact .walk-table .machine { grid-area: 2 / 4; }
 .walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
 .walk.compact .walk-table .slot { grid-area: 2 / 6; }
+.walk.compact .walk-table .tokens { grid-area: 2 / 7; }
 .walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
 .walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
@@ -319,6 +321,8 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 .track .b.roomb { background: var(--room); }
 .track .b.waitb { background: transparent; border: 2px dashed var(--ink-3); }
 .walk.has-cap .track .b.waitb { border-right: 0; border-radius: 3px 0 0 3px; }
+.track .b.over-cap { border-radius: 3px 0 0 3px; box-shadow: inset -3px 0 0 var(--cap); }
+.walk-sum.over-cap { color: var(--cap); font-weight: 600; }
 .track:hover .b { filter: brightness(1.12); }
 .walk-axis { font-size: 0.75rem; color: var(--ink-2); margin-top: 4px; }
 .walk-axis .ticks { position: relative; height: 16px; }
@@ -459,7 +463,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   </section>
 
   <section class="card">
-    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span></div>
+    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><span class="walk-tokens num" id="walk-tokens" data-tip="tokens"></span></div>
     <div class="walk" id="walk"></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
@@ -531,8 +535,8 @@ const TIPS = {
     "RAM that the desktop session uses, so the mouse and keyboard stay responsive.",
     optional(d.ram.desktop_protection_bytes, `The system never takes back the first ${ramAmount(d.ram.desktop_protection_bytes)}.`))),
   swap: (d) => [`Swap coming back · ${ramAmount(d.ram.swap_covered_bytes)}`, lines(
-    "Empty RAM the queue holds for memory in swap, mostly agents' memory.",
-    "That memory can come back into RAM at any time.",
+    "Empty RAM the queue holds for recent swap-in.",
+    "The reserve uses swap-in within the configured window, limited to swap outside builds and CI.",
     `Swap coming back: ${ramAmount(d.ram.swap_target_bytes)}.`,
     optional(d.ram.swap_missing_bytes, `Free RAM does not cover ${ramAmount(d.ram.swap_missing_bytes)} of it.`))],
   agents: (d) => measuredTip("Agents", d.ram.agents_bytes,
@@ -554,7 +558,9 @@ const TIPS = {
         `Memory with no program name: ${ramAmount(d.ram.unattributed_bytes - d.ram.kernel_no_counter_bytes)}.`))
     : "RAM that the readings do not explain.\nNo program name is available for this amount."],
   cap: (d) => !hasCap(d) ? ["Queue cap · unavailable", d.cap_text] : [`Queue cap · ${f1(d.cap)} GiB`, lines(
-    "What builds may use.", `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`,
+    "What builds may use.",
+    `It is RAM less the programs that run now, the ${ramAmount(d.ram.safety_target_bytes)} safety net and the ` +
+    `${ramAmount(d.ram.swap_target_bytes)} of swap coming back. Those three are outside the cap.`, `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`,
     `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`, `+ Free: ${ramAmount(d.ram.room_bytes)}.`,
     "A step starts when the memory it needs fits in free.")],
   shortfall: (d) => [`Shortfall · ${ramAmount(d.ram.shortfall_bytes)}`, lines("Reserves that free RAM does not cover.",
@@ -586,6 +592,10 @@ function legendBytes(r, group) {
     const bytes = block[2](r);
     return sum + (recorded(bytes) ? bytes : 0);
   }, 0);
+}
+// The Running header shows the natedev jobserver pool beside the memory taken.
+function tokenPoolText(pool) {
+  return pool?.kind === "TokenPool" ? `Tokens: ${pool.total} total, ${pool.free} free` : "Tokens: unavailable";
 }
 function lines(...items) { return items.filter(Boolean).join("\n"); }
 function optional(bytes, text) { return recorded(bytes) && bytes > 0 ? text : ""; }
@@ -662,9 +672,18 @@ function level(d) {
 }
 Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
-  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
-    `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`,
-    `= Taken: ${f1(d.taken)} GiB.`, `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
+  walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(claimedGib(d))} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
+    `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes + overCapBytes(d))}.`,
+    `= Taken: ${f1(claimedGib(d))} GiB.`, overCapBytes(d) > 0
+      ? `That is ${ramAmount(overCapBytes(d))} over the ${f1(d.cap)} GiB queue cap, so nothing is free.`
+      : `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
+  tokens: (d) => d.tokens?.kind !== "TokenPool" ? ["Tokens · unavailable", d.tokens?.reason || "The feed sent no token pool reading."]
+    : [`Tokens · ${d.tokens.total} total, ${d.tokens.free} free`, lines(
+      "A token lets a natedev build run one more job at the same time.",
+      "Every cargo and nextest on natedev shares this pool. hana CI has its own pool.",
+      d.tokens.paused ? `Free RAM is under ${ramAmount(d.tokens.memory_floor_bytes)}, so the pool gives no new token until it is above that again.`
+        : `The pool gives no new token while free RAM is under ${ramAmount(d.tokens.memory_floor_bytes)}.`,
+      d.token_counts ? `The Tokens column shows — because the count for each build is not known now: ${d.token_counts}` : "")],
   walkhead: () => ["Running, in start order", "The build tools row shows RAM that build tools use. Blue shows memory a queued step uses now. Hatching shows reserved. The CI row shows its use and reserved inside the cap. Dashed outlines stop at the cap and show waiting steps. Numbers below bars show use and reserved."],
   ticks: (d) => ["Scale in GiB", `One scale for both charts: 0 to ${f1(d.total)} GiB, all of the RAM. ${!hasCap(d) ? "The queue cap is unavailable." : "The red line is the queue cap."}`],
   swaphead: () => ["Swap and memory pressure", "Swap is disk space the system uses when RAM is short. Swap itself is not a problem. Stalls are the problem: they show the system waits for memory."],
@@ -764,7 +783,7 @@ function waitNotes(w) {
   return [w.mac_text, w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
 }
 function waitTipHtml(w, d) {
-  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.cap_text) +
+  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.unavailable) +
     fieldsHtml(roomFields(w), "numbers") +
     waitNotes(w).map(lineHtml).join("");
 }
@@ -788,6 +807,10 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
+// Build reserves that do not fit under the queue cap; the cap holds only the covered part.
+function overCapBytes(d) { return hasCap(d) && recorded(d.ram.build_missing_bytes) ? Math.max(0, d.ram.build_missing_bytes) : 0; }
+// Taken counts each full build reserve, so over the cap it reads more than the cap.
+function claimedGib(d) { return d.taken + overCapBytes(d) / GIB; }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -870,7 +893,7 @@ function rawTipText(key, d) {
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    const fields = [...waitFields(w).map(([name, value]) => `${name}: ${value}`), w.head_room?.cap_text,
+    const fields = [...waitFields(w).map(([name, value]) => `${name}: ${value}`), w.head_room?.unavailable,
       ...roomFields(w).map(([name, value]) => `${name}: ${value}`)];
     return [`Waits · ${w.name}`, [...waitLines(w), ...fields, ...waitNotes(w)]
       .filter(Boolean).join("\n")];
@@ -1030,7 +1053,6 @@ function render(d) {
   renderWalk(d);
   renderSwap(d);
   renderLeftovers(d);
-  renderReport(d.report);
 }
 
 const swapView = new Map();
@@ -1241,15 +1263,16 @@ function renderWalk(d) {
   const tableRows = [];
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="unit">Unit</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
-    (running ? '<th scope="col" class="slot">Slot</th>' : "");
-  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—") => {
+    (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
+  const cells = (place, name, duration, unit, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
     tableRows.push(`<tr class="${className}" data-tip="${tip}"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="unit"><span class="cell-text">${esc(unit === "—" ? unit : publicText(unit || ""))}</span></td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
         : `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`) + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>`) + '</tr>');
+      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
+        `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const running = d.walk.map((row, index) => ({row, index}));
   const ordered = [...running.filter(({row}) => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...running.filter(({row}) => row.ci && row.admitted)];
@@ -1261,12 +1284,12 @@ function renderWalk(d) {
   rows.push(...ordered.map(({row: r, index: i}) => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r), r.slot);
+      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", idleCI ? "" : rowUnit(r), r.pid, r.machine, r.vcpus, `row:${i}`, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot"];
+  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
@@ -1300,7 +1323,11 @@ function renderWalk(d) {
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable` : `${f1(d.taken)} of ${f1(d.cap)} GiB taken`;
+  const overCap = overCapBytes(d);
+  $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable`
+    : `${f1(claimedGib(d))} of ${f1(d.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
+  $("walk-sum").classList.toggle("over-cap", overCap > 0);
+  $("walk-tokens").textContent = tokenPoolText(d.tokens);
   fitLabels();
 }
 
@@ -1456,6 +1483,12 @@ function placeMemoryBars(d) {
   const end = roomAt + room;
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
+  // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
+  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const capBox = (left, size, className) => {
+    const drawn = Math.min(size, chartEdge - left);
+    return box(left, drawn, drawn < size ? `${className} over-cap` : className);
+  };
   function placeAmounts(row, amounts) {
     const container = row.querySelector(".amounts");
     container.innerHTML = amounts.map(amount => `<span class="bar-amount ${amount.kind}" data-start="${amount.left}" style="left:${amount.left}px">${esc(amount.text || memoryAmount(amount.value))}</span>`).join("");
@@ -1465,7 +1498,7 @@ function placeMemoryBars(d) {
   let usedAt = tools, reservedAt = reserveAt;
   const toolsRow = document.querySelector(".wrow.tools");
   if (toolsRow) {
-    toolsRow.querySelector(".track").innerHTML = box(0, tools, "seg-tools");
+    toolsRow.querySelector(".track").innerHTML = capBox(0, tools, "seg-tools");
     placeAmounts(toolsRow, [{kind: "used-amount", left: 0, value: r.build_tools_bytes / GIB}]);
   }
   const reserveScale = r.build_target_bytes > 0 ? reserved / (r.build_target_bytes / GIB) : 0;
@@ -1482,13 +1515,13 @@ function placeMemoryBars(d) {
     } else if (run.kind === "cloud" && recorded(run.used)) {
       bars = box(0, Math.min(row.querySelector(".track").clientWidth, run.used * unit), "seg-remote");
     } else if (run.ci) {
-      bars = box(used, ciWidth, "seg-ci");
+      bars = capBox(used, ciWidth, "seg-ci");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: used, value: run.used});
     } else if (run.kind !== "cloud") {
       const useWidth = Math.max(0, useValue(run) * unit);
       const reserveWidth = Math.max(0, Math.min(run.reserved * reserveScale, roomAt - reservedAt));
       const drawnUse = useWidth > 0 ? Math.max(3, useWidth) : 0;
-      bars = box(usedAt, drawnUse, "seg-used") + box(reservedAt, reserveWidth, "hatch");
+      bars = capBox(usedAt, drawnUse, "seg-used") + capBox(reservedAt, reserveWidth, "hatch");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: run.used});
       if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: run.reserved});
       usedAt += useWidth;
@@ -1510,7 +1543,7 @@ function placeMemoryBars(d) {
   }
   const roomTrack = document.querySelector(".wrow.room .track");
   if (roomTrack) {
-    roomTrack.innerHTML = box(roomAt, room, "roomb");
+    roomTrack.innerHTML = capBox(roomAt, room, "roomb");
     roomTrack.closest(".wrow").querySelector(".room-value")?.remove();
     roomTrack.closest(".wrow").querySelector(".row-heading").insertAdjacentHTML("beforeend",
       `<span class="room-value">${memoryAmount(d.room)}</span>`);
@@ -1519,8 +1552,10 @@ function placeMemoryBars(d) {
   for (const row of document.querySelectorAll(".wrow.wait")) {
     const waiter = d.waiters[Number(row.dataset.tip.split(":")[1])];
     if (waiter.kind === "cloud") continue;
-    const waitWidth = Math.min(end, waiter.need * unit);
-    const waitAt = !hasCap(d) ? roomAt : end - waitWidth;
+    // With a cap, a wait bar ends at the room end or the cap line, whichever is first, and never passes it.
+    const waitEnd = !hasCap(d) ? end : Math.min(end, chartEdge);
+    const waitWidth = Math.min(waitEnd, waiter.need * unit);
+    const waitAt = !hasCap(d) ? roomAt : waitEnd - waitWidth;
     const drawnWidth = !hasCap(d) ? Math.max(0, Math.min(waitWidth, end - waitAt)) : waitWidth;
     row.querySelector(".track").innerHTML = box(waitAt, drawnWidth, "waitb");
     placeAmounts(row, drawnWidth > 0 ? [{kind: "need-amount", left: waitAt, value: waiter.need}] : []);
@@ -1649,13 +1684,26 @@ async function tick() {
     const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    if (d.ok && !d.error) { render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : ""; }
+    if (d.ok && !d.error) {
+      render(d); lastRead = d.read_at; readingFailure = d.read_error ? "The queue did not answer." : "";
+      if (d.report_version !== reportVersion) await loadReport(d.report_version);
+    }
     else { recordReadFailure("The queue did not answer."); return; }
   } catch (e) {
     recordReadFailure(`Cannot load the reading: ${e.message}.`);
     return;
   }
   updateReadingStatus(lastRead);
+}
+// The charts are large, so the page reads report.json only when memory.json names a new version.
+let reportVersion = null;
+async function loadReport(version) {
+  try {
+    const r = await fetch(`report.json?v=${encodeURIComponent(version)}`, { cache: "no-store" });
+    if (!r.ok) return;
+    renderReport(await r.json());
+    reportVersion = version;
+  } catch (e) { /* The next reading tries again. */ }
 }
 let pageStamp = null;
 async function reloadWhenPageChanges() {
