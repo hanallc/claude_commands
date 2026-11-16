@@ -12,6 +12,7 @@ from io import StringIO
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
@@ -311,7 +312,10 @@ class PairedTrialTests(CostFixture):
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         shipped = Path(__file__).resolve().parents[2]
-        _ = (self.root / 'cloud_gate.conf').write_text((shipped / 'config/cloud_gate.conf').read_text())
+        # The fixture pins its branch prefix, so a tuned live prefix changes no test.
+        _ = (self.root / 'cloud_gate.conf').write_text(re.sub(
+            r'(?m)^trial_branch_prefix=.*$', 'trial_branch_prefix=gate-trial',
+            (shipped / 'config/cloud_gate.conf').read_text()))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
