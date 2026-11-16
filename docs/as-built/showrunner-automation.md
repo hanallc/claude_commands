@@ -771,6 +771,13 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
+    The director's busy status does not change this result.
+    Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
+    Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
+    The block has no Next row.
+    Only events from an open phase can supply a finished-step fallback.
+    Unreadable sources never produce `Nothing to do`.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.

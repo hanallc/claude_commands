@@ -274,8 +274,48 @@ class UnitPhasesTests(unittest.TestCase):
                     "| Unit | Director |", "| --- | --- |", f"| namecheck | {status} |", "",
                     "**namecheck** — idle", "",
                     "| Item | Work | State |", "| --- | --- | --- |",
-                    "| Now | Not recorded | Director's current step not recorded |",
-                    "| Next | Not recorded | The director has not chosen the next task |"])
+                    "| Now | Nothing to do | No plan or queued work |"])
+
+    def test_empty_units_are_idle_for_busy_and_idle_directors_without_a_next_row(self) -> None:
+        member = self.member("empty")
+        path = self.write_run(member, "empty", [])
+        cases: tuple[tuple[object, str], ...] = ((None, "No plan or queued work"),
+            ({"phases": []}, "No plan or queued work"),
+            (typed_record(self.root / "plan.md", "done"), "The plan is complete and the queue is empty"))
+        for status in ("busy", "idle"):
+            for record, expected in cases:
+                with self.subTest(status=status, record=record):
+                    with (patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                          patch.object(unit_queue, "read_items", wraps=unit_queue.read_items) as queues):
+                        rendered = self.blocks([member], {member.name: record}, statuses=[status])
+                    self.assertIn("**empty** — idle", rendered)
+                    self.assertEqual(detail_rows(rendered, member.name), [DetailRow("Now", "Nothing to do", expected)])
+                    self.assertEqual(rendered.splitlines()[0],
+                        "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units")
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+                    self.assertEqual(queues.call_count, 1)
+
+    def test_finished_steps_of_closed_phases_do_not_supply_now(self) -> None:
+        member = self.member("closed")
+        at = datetime(2026, 11, 15, 17, 57, tzinfo=UTC).timestamp()
+        for kind in ("pass", "activity"):
+            for queued in (False, True):
+                with self.subTest(kind=kind, queued=queued):
+                    _ = self.write_run(member, "closed", [("closed", "Closed delivery")], [
+                        self.phase_event(kind + "_started", "closed", pass_kind="impl", pass_instance_id="writer",
+                                         activity_instance_id="check", activity_text="Checks the closed delivery"),
+                        self.phase_event(kind + "_finished", "closed", pass_kind="impl", pass_instance_id="writer",
+                                         activity_instance_id="check", activity_text="Checks the closed delivery", timestamp_epoch=at),
+                        self.phase_event("phase_finished", "closed", status="completed")])
+                    _ = self.queue(member, *([unit_queue.QueuedItem("Next delivery")] if queued else []))
+                    rendered = self.blocks([member], {}, statuses=["busy"])
+                    rows = detail_rows(rendered, member.name)
+                    if queued:
+                        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), rows)
+                        self.assertIn(("Next", "Next delivery", "Ready"), rows)
+                    else:
+                        self.assertEqual(rows, [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                    self.assertNotIn("finished at", rendered)
 
     def test_top_table_names_the_director_and_keeps_its_status_values(self) -> None:
         member = self.member("director")
@@ -336,7 +376,8 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertEqual(rendered.count("\n\n"), 7)
         self.assertEqual(rendered.count("| Item | Work | State |"), 3)
         self.assertEqual(rendered.count("| Now |"), 3)
-        self.assertEqual(rendered.count("| Next |"), 3)
+        self.assertEqual(rendered.count("| Now | Nothing to do | No plan or queued work |"), 3)
+        self.assertNotIn("| Next |", rendered)
         for field in ("Also", "Wait", "Merge"):
             self.assertNotIn(f"| {field} |", rendered)
         self.assertEqual(unit_phases.table([], {}, census_read=LOCAL).strip(),
@@ -344,18 +385,17 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         member = self.member("plan")
-        cases: list[tuple[object, str, DetailRow, DetailRow, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
+        cases: list[tuple[object, str, DetailRow, DetailRow | None, tuple[tuple[str, str], ...], unit_phases.PlanSource]] = [
             (typed_record(self.root / "plan.md", "done", "todo", "todo"), "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Delivery 2 (2)", "Not started"), (), unit_phases.PlanSource.READABLE),
             (typed_record(self.root / "plan.md", "done"), "idle",
-             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "Nothing queued; the plan is complete"), (), unit_phases.PlanSource.READABLE),
+             DetailRow("Now", "Nothing to do", "The plan is complete and the queue is empty"),
+             None, (), unit_phases.PlanSource.READABLE),
             ({"current": None, "phases": []}, "idle",
-             DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.EMPTY),
-            (None, "idle", DetailRow("Now", "Not recorded", "Director's current step not recorded"),
-             DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.ABSENT),
+             DetailRow("Now", "Nothing to do", "No plan or queued work"), None, (), unit_phases.PlanSource.EMPTY),
+            (None, "idle", DetailRow("Now", "Nothing to do", "No plan or queued work"),
+             None, (), unit_phases.PlanSource.ABSENT),
             ({"unavailable": "plan unreadable"}, "unknown",
              DetailRow("Now", "Not recorded", "Director's current step not recorded"),
              DetailRow("Next", "Not recorded", "The director has not chosen the next task"), (), unit_phases.PlanSource.UNAVAILABLE),
@@ -379,7 +419,10 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertIn(f"**plan** — {bucket}", rendered)
                 rows = detail_rows(rendered, "plan")
                 self.assertIn(now, rows)
-                self.assertIn(next_text, rows)
+                if next_text is None:
+                    self.assertEqual(rows, [now])
+                else:
+                    self.assertIn(next_text, rows)
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(seen[0].plan_source, source)
                 if isinstance(record, phase_table.PhaseRecord) and len(record.phases) == 3:
@@ -1685,7 +1728,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn("**holds** — idle", rendered)
                     self.assertIn(("Now", "Not recorded", expected), detail_rows(rendered, "holds"))
         rendered = self.blocks([member], {}, statuses=["busy"])
-        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"),
+        self.assertIn(("Now", "Nothing to do", "No plan or queued work"),
                       detail_rows(rendered, "holds"))
         from scripts.whoami import quota_state
         with patch.object(quota_state, "no_worker_mode", return_value=True):
@@ -1701,6 +1744,7 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = self.blocks([member, other], {})
         self.assertIn("**unreadable** — unknown", rendered)
         self.assertIn(("Next", "Not recorded", "Queue unavailable; next task not recorded"), detail_rows(rendered, "unreadable"))
+        self.assertNotIn("Nothing to do", [row.work for row in detail_rows(rendered, "unreadable")])
         self.assertIn("**other** — idle", rendered)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn(str(path), errors.getvalue())
@@ -1728,7 +1772,7 @@ class UnitPhasesTests(unittest.TestCase):
 
         initial = render()
         self.assertIn("**first** — idle", initial)
-        self.assertIn(("Now", "Not recorded", "Director's current step not recorded"), detail_rows(initial, "first"))
+        self.assertIn(("Now", "Nothing to do", "No plan or queued work"), detail_rows(initial, "first"))
         _ = staff.pause(second.id, "review the change")
         paused = render()
         self.assertIn("**first** — idle", paused)
@@ -1839,8 +1883,7 @@ class UnitPhasesTests(unittest.TestCase):
             "| Unit | Director |", "| --- | --- |", "| member | exited |", "",
             "**member** — idle", "",
             "| Item | Work | State |", "| --- | --- | --- |",
-            "| Now | Not recorded | Director's current step not recorded |",
-            "| Next | Not recorded | The director has not chosen the next task |",
+            "| Now | Nothing to do | No plan or queued work |",
         ])
         anomalies = [line for line in lines if line.startswith("anomaly:")
                      and ("unread-codex" in line or "unread-claude" in line)]
@@ -2131,8 +2174,7 @@ class UnitPhasesTests(unittest.TestCase):
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
                     + "| Unit | Director |\n| --- | --- |\n| a | idle |\n\n"
                     + "**a** — idle\n\n| Item | Work | State |\n| --- | --- | --- |\n"
-                    + "| Now | Not recorded | Director's current step not recorded |\n"
-                    + "| Next | Not recorded | The director has not chosen the next task |\n")
+                    + "| Now | Nothing to do | No plan or queued work |\n")
 
                 unordered = [unit("zulu", live("zulu"))._replace(machine="natedev"),
                              unit("Beta", live("Beta"))._replace(machine="mac"),
