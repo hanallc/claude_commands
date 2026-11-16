@@ -101,8 +101,8 @@ def census_for(units: Sequence[live_units.LiveUnit]) -> census.Census:
                            if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
 
 
-def table_of(units: list[live_units.LiveUnit], records: dict[str, object]) -> str:
-    return unit_phases.table(units, records, columns=1000, census_read=census_for(units))
+def table_of(units: list[live_units.LiveUnit], records: dict[str, object], repository: Path) -> str:
+    return unit_phases.table(units, records, columns=1000, census_read=census_for(units), repository=repository)
 
 
 class DetailRow(NamedTuple):
@@ -161,7 +161,6 @@ class UnitPhasesTests(unittest.TestCase):
                                                     "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate")}))
         _ = self.enterContext(patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(patch.object(census, "read", return_value=LOCAL))
-        _ = self.enterContext(patch.object(unit_phases, "REPOSITORY", self.root))
 
     def test_unit_count_cache_filters_sources_and_retries_failed_reads(self) -> None:
         from scripts.statusline import counts_row
@@ -245,7 +244,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def blocks(self, members: Sequence[staff.StaffRow], records: dict[str, object], *,
                workers: Sequence[census.CensusWorker] = (), statuses: Sequence[str] = (), columns: int = 1000) -> str:
-        return unit_phases.table([unit(row.name, live(row.name)) for row in members], records,
+        return unit_phases.table([unit(row.name, live(row.name)) for row in members], records, repository=self.root,
             now=datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp(), zone=ZoneInfo("UTC"),
             columns=columns,
             census_read=tiles(workers=workers, sessions=[session_of(row, statuses[index] if statuses else "idle")
@@ -268,7 +267,7 @@ class UnitPhasesTests(unittest.TestCase):
         for session in (None, live("another-session"), unit_lookup.ClaudeNotRunning(),
                         unit_lookup.ClaudeUnknown("no records")):
             with self.subTest(session=session):
-                rendered = table_of([unit(member.name, session)], {})
+                rendered = table_of([unit(member.name, session)], {}, self.root)
                 status = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
                 self.assertEqual(rendered.splitlines(), [
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
@@ -371,7 +370,7 @@ class UnitPhasesTests(unittest.TestCase):
         members = [self.member(name) for name in ("zulu", "Beta", "alpha")]
         selected = [unit(row.name, live(row.name)) for row in members]
         selected[1] = selected[1]._replace(machine="mac")
-        rendered = unit_phases.table(selected, {}, census_read=census_for(selected))
+        rendered = unit_phases.table(selected, {}, repository=self.root, census_read=census_for(selected))
         self.assertEqual([line for line in rendered.splitlines() if line.startswith("**")],
                          ["**alpha** (natedev) — idle", "**Beta** (mac) — idle", "**zulu** (natedev) — idle"])
         self.assertEqual(rendered.count("\n\n"), 7)
@@ -381,7 +380,7 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertNotIn("| Next |", rendered)
         for field in ("Also", "Wait", "Merge"):
             self.assertNotIn(f"| {field} |", rendered)
-        self.assertEqual(unit_phases.table([], {}, census_read=LOCAL).strip(),
+        self.assertEqual(unit_phases.table([], {}, repository=self.root, census_read=LOCAL).strip(),
                          "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · 0 units")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
@@ -739,7 +738,7 @@ class UnitPhasesTests(unittest.TestCase):
                         read = tiles(workers=[census_worker("tester", member.id, status="idle")] if worker_wait else [],
                             sessions=[census.CensusSession(member.current_session, "idle",
                                 () if worker_wait else (census.CensusShell("Build delivery", now - 120),))])
-                        rendered = unit_phases.table([unit("style", live("style"))], {}, now=now,
+                        rendered = unit_phases.table([unit("style", live("style"))], {}, repository=self.root, now=now,
                                                      zone=ZoneInfo("UTC"), census_read=read)
                         self.assertIn(f"**style** — {bucket}", rendered)
                         self.assertIn("working 1" if bucket == "working" else "waiting on other work 1", rendered.splitlines()[0])
@@ -754,7 +753,7 @@ class UnitPhasesTests(unittest.TestCase):
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
         read = tiles(sessions=[census.CensusSession(member.current_session, "busy", (
             census.CensusShell("Run the AWS gate", now - 720), census.CensusShell("Watch CI", None)))])
-        rendered = unit_phases.table([unit("shells", live("shells"))], {}, now=now, zone=ZoneInfo("UTC"), census_read=read)
+        rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=read)
         self.assertIn("**shells** — working", rendered)
         self.assertIn(("Now", "Run the AWS gate", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
         self.assertIn(("Also", "Watch CI", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
@@ -776,7 +775,7 @@ class UnitPhasesTests(unittest.TestCase):
                                      wait_reason=reason, wait_started_epoch=now - 120, holder=holder)])
                 read = tiles(sessions=[census.CensusSession(member.current_session, "idle",
                     (census.CensusShell("Build delivery", now - 120),))])
-                rendered = unit_phases.table([unit("shells", live("shells"))], {}, now=now,
+                rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now,
                                              zone=ZoneInfo("UTC"), census_read=read)
                 self.assertIn("**shells** — waiting on other work", rendered)
                 rows = detail_rows(rendered, "shells")
@@ -857,7 +856,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.phase_event("checkpoint", "acctload", checkpoint_commit=commit, timestamp_epoch=recorded)])
                 with (patch.object(land_queue, "land_view", return_value=view),
                       patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
-                    rendered = unit_phases.table([unit(member.name, live(member.name))], {}, now=now,
+                    rendered = unit_phases.table([unit(member.name, live(member.name))], {}, repository=self.root, now=now,
                         zone=ZoneInfo(zone), columns=1000, census_read=tiles(sessions=[session_of(member, "idle")]))
                 self.assertIn(("Now", "Load the account (acctload)",
                                f"Checkpoint e34ccac01 at {expected}; not in sdlc's merge line"),
@@ -938,27 +937,31 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertFalse(waits_on.on_main(self.root, checkpoint))
         phases = [("copied", checkpoint), ("repeated", checkpoint), ("different-time", different_time),
                   ("different-subject", different_subject), ("unreadable", "f" * 40),
-                  ("subject", "a" * 40), ("result", "b" * 40), ("ancestry", base)]
+                  ("subject", "a" * 40), ("result", "b" * 40), ("ancestry", base),
+                  ("open-subject", "a" * 40), ("open-result", "d" * 40)]
         path = self.write_run(member, "copies", [(phase, phase.capitalize() + " delivery") for phase, _ in phases],
             [event for phase, commit in phases for event in (
                 self.phase_event("checkpoint", phase, checkpoint_commit=commit, timestamp_epoch=100),
-                self.phase_event("phase_finished", phase, status="completed"))])
+                self.phase_event("phase_finished", phase, status="completed"))
+             if event["event_type"] == "checkpoint" or not phase.startswith("open-")])
         other_path = self.write_run(other, "shared-copy", [("copied", "Shared delivery")], [
             self.phase_event("checkpoint", "copied", checkpoint_commit=checkpoint),
             self.phase_event("phase_finished", "copied", status="completed")])
         landed: land_runs.LandResult = {"commit": "b" * 40, "production": "sdlc", "unit": member.name,
             "phase": "result", "landed": True, "step": "", "state": "", "detail": "", "time": "1970-01-01T00:03:20+00:00"}
-        view = land_queue.LandView({}, {}, {landed["commit"]: landed}, frozenset(), {})
+        open_landed: land_runs.LandResult = {**landed, "commit": "d" * 40, "phase": "open-result", "time": "bad time"}
+        view = land_queue.LandView({}, {}, {row["commit"]: row for row in (landed, open_landed)}, frozenset(), {})
         with (patch.object(land_queue, "land_view", return_value=view),
               patch.object(waits_on, "landed_phases", return_value={
-                  (member.name, "subject"): waits_on.PhaseMerge("c" * 40, 200, "a" * 9)}),
+                  (member.name, "subject"): waits_on.PhaseMerge("c" * 40, 200, "a" * 9),
+                  (member.name, "open-subject"): waits_on.PhaseMerge("c" * 40, 50, "A" * 9)}),
               patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as main_reads,
               patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as checks,
               patch.object(waits_on, "git", wraps=waits_on.git) as git_reads,
               patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads):
             rendered = self.blocks([member, other], {})
         work = [row.work for row in detail_rows(rendered, member.name)]
-        for phase in ("copied", "repeated", "subject", "result", "ancestry"):
+        for phase in ("copied", "repeated", "subject", "result", "ancestry", "open-subject", "open-result"):
             self.assertNotIn(phase.capitalize() + f" delivery ({phase})", work)
         for phase in ("different-time", "different-subject", "unreadable"):
             self.assertIn(phase.capitalize() + f" delivery ({phase})", work)
@@ -967,9 +970,124 @@ class UnitPhasesTests(unittest.TestCase):
         expected = [checkpoint, different_time, different_subject, "f" * 40]
         self.assertCountEqual([call.args[1] for call in checks.call_args_list], expected)
         self.assertCountEqual([call.args[-1] for call in git_reads.call_args_list if call.args[1] == "show"], expected)
+        self.assertFalse(any(call.args[-1] in ("a" * 40, "b" * 40, "d" * 40)
+                             for call in git_reads.call_args_list))
         self.assertEqual(sum(call.args[1:] == ("log", "origin/main", "--no-merges", "--format=%at%x00%s")
                              for call in git_reads.call_args_list), 1)
         self.assertCountEqual([call.args[0] for call in run_reads.call_args_list], [path, other_path])
+
+    def test_main_reads_merge_evidence_from_the_production_checkout(self) -> None:
+        _ = self.repository()
+        repository = self.root / "cargo-liner"
+        repository.mkdir()
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(repository), *arguments], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        _ = git("init", "-q", "-b", "main")
+        base = commit_repository(repository, "Cargo base", allow_empty=True)
+        _ = git("switch", "-q", "-c", "checkpoint")
+        _ = (repository / "delivery").write_text("delivery\n")
+        checkpoint = commit_repository(repository, "Cargo checkpoint", "delivery")
+        pending = commit_repository(repository, "Cargo pending", allow_empty=True)
+        carrier = commit_repository(repository, "Cargo carrier", allow_empty=True)
+        _ = git("switch", "-q", "main")
+        _ = commit_repository(repository, "Cargo main progress", allow_empty=True)
+        _ = git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "cherry-pick", checkpoint)
+        _ = git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertFalse(waits_on.on_main(repository, checkpoint))
+        self.assertTrue(waits_on.on_main(repository, base))
+        self.assertFalse(waits_on.on_main(self.root, base))
+        doc = self.root / "cargo-production.md"
+        _ = doc.write_text(f"# Production\n- **Merge branch:** main\n"
+                           + f"- **Showrunner checkout:** {repository}\n- **Log:** LOG\n")
+        owner = fixture_member("showrunner", name="cargo-liner", doc=staff.LiveDoc("natedev", doc))
+        members = [fixture_member("unit", name=name, parent=owner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root / name))
+                   for name in ("handler", "port")]
+        for member in members:
+            _ = self.write_run(member, member.name, [("merged", "Merged work"), ("copied", "Copied work"),
+                                                    ("open-merged", "Open merged work"), ("open-copied", "Open copied work"),
+                                                    ("pending", "Pending work")],
+                [event for phase, commit in (("merged", base), ("copied", checkpoint), ("open-merged", base),
+                                            ("open-copied", checkpoint), ("pending", pending))
+                 for event in (self.phase_event("checkpoint", phase, checkpoint_commit=commit),
+                               self.phase_event("phase_finished", phase, status="completed"))
+                 if event["event_type"] == "checkpoint" or not phase.startswith("open-")])
+            _ = self.queue(member, unit_queue.QueuedItem("follow: Review delivery", base))
+        foreign = self.root / "aws"
+        foreign.mkdir()
+        _ = subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True, capture_output=True)
+        foreign_commit = commit_repository(foreign, "AWS spend tool", allow_empty=True)
+        _ = subprocess.run(["git", "-C", str(foreign), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                           check=True, capture_output=True)
+        foreign_doc = self.root / "aws-production.md"
+        _ = foreign_doc.write_text(f"# Production\n- **Merge branch:** main\n"
+                                   + f"- **Showrunner checkout:** {foreign}\n- **Log:** LOG\n")
+        foreign_owner = fixture_member("showrunner", name="aws-owner", doc=staff.LiveDoc("natedev", foreign_doc))
+        targets = [fixture_member("unit", name=name, parent=foreign_owner.id,
+                                  worktree=staff.PresentWorktree("natedev", self.root / name))
+                   for name in ("aws", "aws-other")]
+        for target in targets:
+            _ = self.write_run(target, target.name, [("spendtool", "Spend tool")], [
+                self.phase_event("checkpoint", "spendtool", checkpoint_commit=foreign_commit)])
+        plan = self.root / "dependencies.md"
+        _ = plan.write_text("# Plan\n### Phase later — Later delivery · status: todo\n"
+                            + "Depends on: aws/spendtool, handler/open-copied\n")
+        records: dict[str, object] = {member.name: {"plan": str(plan), "phases": [
+            {"phase": "later", "title": "Later delivery", "status": "todo"}]} for member in members}
+        for member in members:
+            _ = self.queue(member, unit_queue.QueuedItem("follow: Review delivery", base),
+                unit_queue.QueuedItem("copy: Review copy", "handler/open-copied"),
+                unit_queue.QueuedItem("aws: Review AWS", "aws/spendtool"),
+                unit_queue.QueuedItem("other: Review other", "aws-other/spendtool"))
+        listing = live_units.UnitListing([unit(member.name, live(member.name)) for member in members], ())
+        for running in (False, True):
+            with self.subTest(running=running):
+                with land_queue.edited() as items:
+                    items.clear()
+                if not running:
+                    land_queue.add("cargo-liner carrier", batch="", commits=[carrier], first=False, before=None)
+                output = io.StringIO()
+                with (land_runs.landing([carrier] if running else [], ["handler carrier"] if running else []),
+                      patch.object(live_units, "read_units", return_value=listing),
+                      patch.object(unit_phases, "production_records", return_value=records),
+                      patch.object(unit_phases, "send_anomalies"),
+                      patch.object(land_queue, "land_view", wraps=land_queue.land_view) as lands,
+                      patch.object(waits_on, "landed_phases", wraps=waits_on.landed_phases) as merges,
+                      patch.object(waits_on, "main_commit_identities", wraps=waits_on.main_commit_identities) as identities,
+                      patch.object(waits_on, "copied_on_main", wraps=waits_on.copied_on_main) as copies,
+                      patch.object(waits_on, "state", wraps=waits_on.state) as dependencies,
+                      patch.object(unit_phases, "read_production", wraps=read_production) as sources,
+                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as run_reads,
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(unit_phases.main(["--production", owner.name], columns=1000), 0)
+                for member in members:
+                    rows = detail_rows(output.getvalue(), member.name)
+                    work = [row.work for row in rows]
+                    self.assertNotIn("Merged work (merged)", work)
+                    self.assertNotIn("Copied work (copied)", work)
+                    self.assertNotIn("Open merged work (open-merged)", work)
+                    self.assertNotIn("Open copied work (open-copied)", work)
+                    expected = "cargo-liner merges it now" if running else "1st in cargo-liner's merge line"
+                    self.assertTrue(any(row.work == "Pending work (pending)" and row.state == expected for row in rows), rows)
+                    self.assertIn(("Next", "Review delivery (follow)", "Ready"), rows)
+                    for work in ("Review copy (copy)", "Review AWS (aws)", "Review other (other)"):
+                        self.assertTrue(any(row.work == work and row.state == "Ready" for row in rows), rows)
+                    self.assertTrue(any(row.work == "Later delivery (later)" and row.state == "Not started"
+                                        for row in rows), rows)
+                self.assertNotIn("not in cargo-liner's merge line", output.getvalue())
+                for reads in (lands, merges, identities):
+                    self.assertCountEqual([call.args[0] for call in reads.call_args_list], [repository, foreign])
+                self.assertEqual([call.args[0] for call in sources.call_args_list], [owner.name, foreign_owner])
+                self.assertEqual(len(run_reads.call_args_list), 4)
+                self.assertEqual(len({call.args[0] for call in run_reads.call_args_list}), 4)
+                self.assertEqual(sum(call.args[1] == checkpoint for call in copies.call_args_list), 1)
+                self.assertTrue(all(call.args[0] == repository for call in copies.call_args_list))
+                self.assertCountEqual([(call.args[0], call.kwargs["repo"]) for call in dependencies.call_args_list],
+                    [(base, repository), ("handler/open-copied", repository), ("aws/spendtool", foreign),
+                     ("aws-other/spendtool", foreign)])
 
     def test_finished_phases_use_merge_subjects_and_results_with_other_hashes(self) -> None:
         member = self.member("finished")
@@ -1146,7 +1264,7 @@ class UnitPhasesTests(unittest.TestCase):
                     tail.append(self.phase_event("wait_started", "work", pass_instance_id="writer", wait_id="memory",
                         wait_kind="memory", wait_reason="memory admission", wait_started_epoch=now - 120))
                 _ = self.write_run(member, "eta", [("work", "Write delivery")], tail)
-                rendered = unit_phases.table([unit("eta", live("eta"))], {}, now=now, zone=ZoneInfo(zone),
+                rendered = unit_phases.table([unit("eta", live("eta"))], {}, repository=self.root, now=now, zone=ZoneInfo(zone),
                     census_read=tiles(sessions=[session_of(member, "idle")], workers=workers))
                 task_lines = [row.state for row in detail_rows(rendered, "eta") if row.work == "Write delivery (work)"]
                 self.assertEqual(len(task_lines), 1)
@@ -1256,7 +1374,7 @@ class UnitPhasesTests(unittest.TestCase):
                 (False, False, "unknown"), (False, True, "waiting on other work"),
                 (True, False, "waiting to merge"), (True, True, "waiting to merge")):
             with self.subTest(submitted=submitted, blocked_first=blocked_first):
-                tail = [self.phase_event("checkpoint", "1", checkpoint_commit=base)] if submitted else []
+                tail = [self.phase_event("checkpoint", "1", checkpoint_commit=sent)] if submitted else []
                 _ = self.write_run(member, "next", [("1", "Current work")], tail, plan=plan.name)
                 ready = unit_queue.QueuedItem("Clean records")
                 blocked = unit_queue.QueuedItem("Review next", "next/future")
@@ -1882,7 +2000,7 @@ class UnitPhasesTests(unittest.TestCase):
                         exited=staff.Exited("2026-11-15T17:00:00+00:00", by, why)
                                if hold == "exit" else staff.Active())
                     snapshot = staff.StaffSnapshot((held,))
-                    rendered = unit_phases.table([unit("holds", None)._replace(member=held)], {},
+                    rendered = unit_phases.table([unit("holds", None)._replace(member=held)], {}, repository=self.root,
                         now=datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp(), zone=ZoneInfo("UTC"),
                         snapshot=snapshot, census_read=LOCAL)
                     self.assertIn("**holds** — idle", rendered)
@@ -1928,7 +2046,7 @@ class UnitPhasesTests(unittest.TestCase):
                   patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
                       sessionId=first.current_session, pid=1, name="first", status="idle",
                       messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])])):
-                return table_of(live_units.units_in(owner.name, every), {})
+                return table_of(live_units.units_in(owner.name, every), {}, self.root)
 
         initial = render()
         self.assertIn("**first** — idle", initial)
@@ -1990,7 +2108,7 @@ class UnitPhasesTests(unittest.TestCase):
                     units = live_units.units_in(owner.name, listing)
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
-                    output = unit_phases.table(units, {}, snapshot=snapshot,
+                    output = unit_phases.table(units, {}, repository=self.root, snapshot=snapshot,
                                                census_read=tiles(sessions=[session_of(member, expected)]))
                     if machine == "mac":
                         self.assertIn("**first** (mac) — idle", output)
@@ -2179,13 +2297,14 @@ class UnitPhasesTests(unittest.TestCase):
             return {}
 
         def render(_units: list[live_units.LiveUnit], _records: dict[str, object], *, zone: ZoneInfo,
-                   census_read: census.Census | census.CensusFailed, columns: int | None) -> str:
+                   census_read: census.Census | census.CensusFailed, columns: int | None, repository: Path) -> str:
             self.assertIs(plan_history.run_started_event, headers)
             self.assertIs(plan_history.resolve_plan_path, paths)
             self.assertIs(plan_history.plan_runs, scans)
             self.assertIsInstance(zone, ZoneInfo)
             self.assertIs(census_read, LOCAL)
             self.assertIsNone(columns)
+            self.assertEqual(repository, self.root)
             calls.append("table")
             return "phase table"
 
@@ -2347,7 +2466,7 @@ class UnitPhasesTests(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             self.assertEqual(unit_phases.main(["--production", "show"]), 0)
         phases.assert_called_once_with([product_unit], {}, zone=read_production("show").zone,
-                                                 census_read=LOCAL, columns=None)
+                                                 census_read=LOCAL, columns=None, repository=self.root)
         tickets.assert_called_once_with([style_unit], {}, doc=doc, ledger_paths={})
         self.assertEqual(doc.read_bytes(), before)
         self.assertEqual(output.getvalue(), "product table\n\nticket table\n")

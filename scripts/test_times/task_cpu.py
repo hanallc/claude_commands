@@ -64,7 +64,8 @@ def task_ids(pid: int) -> tuple[int, int]:
     return tgid, parent
 
 
-def measure(command: Sequence[str], *, cwd: Path, environment: dict[str, str]) -> TaskCPU:
+def measure(command: Sequence[str], *, cwd: Path, environment: dict[str, str],
+            pass_fds: Sequence[int] = ()) -> TaskCPU:
     """Trace process events without stopping at system calls."""
     libc = ctypes.CDLL(None, use_errno=True)
     ptrace = libc.ptrace
@@ -96,6 +97,8 @@ def measure(command: Sequence[str], *, cwd: Path, environment: dict[str, str]) -
             os.close(writer)
             _ = os.read(reader, 1)
             os.close(reader)
+            for descriptor in pass_fds:
+                os.set_inheritable(descriptor, True)
             os.execvpe(command[0], list(command), environment)
         except BaseException:
             os._exit(127)
