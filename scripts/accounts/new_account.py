@@ -358,7 +358,7 @@ def main(argv: list[str]) -> int:
     for step in steps:
         print(f"{'done' if step.done else 'for you'}: {step.text}")
     if all(step.done for step in steps):
-        print(f"{account.name} is ready; /showrunner:accounts shows its row.")
+        print(f"{account.name} is ready; Hana console, Accounts shows its row.")
         return 0
     print(f"Then run /new_account {account.tool} {account.name} again.")
     return 1
