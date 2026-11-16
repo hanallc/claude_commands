@@ -488,17 +488,17 @@ def _unlink_metadata(path: Path, directory: int) -> None:
             pass
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack) -> bool:
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold path's lease lock when it is free. A missing lock file means no lease."""
     try:
         descriptor = _open_lock(path, directory, create=False)
     except FileNotFoundError:
         return True
     _ = stack.callback(os.close, descriptor)
-    return _take_lock(descriptor, fcntl.LOCK_EX) and _lock_current(path, directory, descriptor)
+    return _take_lock(descriptor, fcntl.LOCK_EX, wait=wait) and _lock_current(path, directory, descriptor)
 
 
-def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
+def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold every lease lock below path without following links. False when an owner holds one."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
@@ -508,7 +508,7 @@ def _hold_child_leases(path: Path, stack: ExitStack) -> bool:
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if not _hold_free_lease(Path(top) / stem, directory, stack):
+                if not _hold_free_lease(Path(top) / stem, directory, stack, wait=wait):
                     return False
     return True
 
@@ -580,12 +580,17 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
             for name in sorted(names):
                 path = parent / name
 
-                def cleanup() -> None:
+                def cleanup() -> bool:
                     try:
                         allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
-                        return
-                    _remove_folder(path, directory, allocated)
+                        return True
+                    with ExitStack() as children:
+                        # A held lease below a free folder keeps the folder.
+                        if not _hold_child_leases(path, children, wait=wait):
+                            return False
+                        _remove_folder(path, directory, allocated)
+                    return True
 
                 _ = remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
     except FileNotFoundError:

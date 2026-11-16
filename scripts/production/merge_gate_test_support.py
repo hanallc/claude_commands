@@ -317,7 +317,8 @@ class MergeGateFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
-        parent = build_folders.tmpfs_temporary_parent()
+        parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
+        parent.mkdir(mode=0o700, exist_ok=True)
         build_folders.sweep_temporary_build_folders(parent, wait=False)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
             build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))

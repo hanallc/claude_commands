@@ -1441,10 +1441,17 @@ os._exit(0)
         self.addCleanup(_release_folder, held)
         free = folders.create_build_folder(folders.UniqueBuildFolder("sweep-free-"))
         _release_folder(free)
+        # A free folder that holds a held lease below it is kept.
+        outer = folders.create_build_folder(folders.UniqueBuildFolder("sweep-outer-"))
+        inner = folders.create_build_folder(folders.UniqueBuildFolder(
+            "sweep-inner-", folders.ExplicitBuildParent(outer)))
+        self.addCleanup(_release_folder, inner)
+        _release_folder(outer)
         with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
             folders.sweep_temporary_build_folders(self.root, wait=False)
         self.assertTrue(held.is_dir())
         self.assertFalse(free.exists())
+        self.assertTrue(inner.is_dir())
 
     def test_a_lock_removed_after_its_open_is_not_current(self) -> None:
         real_open = os.open

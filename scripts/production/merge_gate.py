@@ -1402,6 +1402,14 @@ def module_runner(repo: Path) -> Path:
     return runner
 
 
+def gate_test_parent(tmpfs: Path) -> Path:
+    """The tmpfs parent that holds only the leased folders of merge gate test classes.
+
+    tmpfs (/dev/shm) is shared with other programs, so the sweep runs only on this parent.
+    """
+    return tmpfs / "merge-gate-tests"
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1440,8 +1448,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
-    # Remove the free gate folders that a run ended by a signal left; a held folder costs one lock try.
-    build_folders.sweep_temporary_build_folders(tmpfs, wait=False)
+    # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
+    build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
