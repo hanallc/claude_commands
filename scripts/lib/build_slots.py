@@ -29,6 +29,10 @@ from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, conf, git_files, git_rescue
 
 
+SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
+LEASE_SUFFIX = ".lease.json"
+
+
 @dataclass(frozen=True)
 class Slot:
     path: Path
@@ -115,22 +119,47 @@ def slot_root(values: Mapping[str, str], machine: str) -> str:
     return values.get(f"roots.slots.{machine}", values.get("roots.slots", ""))
 
 
-def _slot_root(settings: conf.ConfigRead, machine: str) -> Path:
+def configured_slot_root() -> Path:
+    """Read the machine's slot root without creating a folder."""
+    settings = conf.read_or_repository("build_folders")
+    machine = host_name()
     root = slot_root(settings.values(), machine)
     if not root:
         raise SlotsNotConfigured(machine)
     return Path(os.path.expandvars(root)).expanduser().resolve()
 
 
-def configured_slot_root() -> Path:
-    """Read the machine's slot root without creating a folder."""
-    return _slot_root(conf.read_or_repository("build_folders"), host_name())
+def slot_cargo_root(settings: conf.ConfigRead) -> Path:
+    """Read the root for each slot's build output."""
+    return _root(settings, "roots.slot_cargo")
+
+
+def lease_path(path: Path) -> Path:
+    return path.with_name(path.name + LEASE_SUFFIX)
+
+
+def slot_paths(root: Path) -> list[tuple[Path, str, int]]:
+    """List each slot's path, repository, and number from its folder or lease record."""
+    names = {entry.name.removesuffix(LEASE_SUFFIX) for entry in root.iterdir()}
+    return [(root / name, match[1], int(match[2])) for name in sorted(names)
+            if (match := SLOT_NAME.fullmatch(name)) is not None]
+
+
+def unused(last_use: datetime, settings: conf.ConfigRead, now: datetime) -> bool:
+    """Check whether the last use exceeds slots.unused_days."""
+    return last_use < now - timedelta(days=settings.whole("slots.unused_days"))
+
+
+def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
+    """Read the repository limit or the machine's default limit."""
+    key = f"slots.{machine}.{repository}.max"
+    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
 
 
 def _pool(source: Path) -> RepositoryPool:
     settings = conf.read_or_repository("build_folders")
     machine = host_name()
-    root = _slot_root(settings, machine)
+    root = configured_slot_root()
     main = source_checkout(source)
     origin = subprocess.run(["git", "-C", str(main), "remote", "get-url", "origin"],
                             capture_output=True, text=True)
@@ -138,15 +167,15 @@ def _pool(source: Path) -> RepositoryPool:
         origin.check_returncode()
     repository = (origin.stdout.strip().rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
                   if origin.returncode == 0 else main.name)
-    return RepositoryPool(main, repository, machine, root, _root(settings, "roots.slot_cargo"))
+    return RepositoryPool(main, repository, machine, root, slot_cargo_root(settings))
 
 
 def _maximum(pool: RepositoryPool, report: Callable[[str], None]) -> int:
     settings = conf.read_or_repository("build_folders")
     key = f"slots.{pool.machine}.{pool.repository}.max"
+    maximum = configured_maximum(settings, pool.machine, pool.repository)
     if key in settings.values():
-        return settings.whole(key)
-    maximum = settings.whole(f"slots.{pool.machine}.default_max")
+        return maximum
     report(f"slots: {pool.repository} on {pool.machine} has no maximum of its own; it uses {maximum}. "
            + f"Set {key} with /tune.")
     return maximum
@@ -261,7 +290,7 @@ def _wait_mac_slot(root: Path, repository: str, maximum: int, deadline: float) -
     script = ("import fcntl, sys\n"
               "with open(sys.argv[1], 'rb') as lock:\n"
               " fcntl.flock(lock, fcntl.LOCK_SH)\n"
-              " print('free', flush=True)\n")
+              " sys.stdout.write('free\\n')\n")
     helpers: list[subprocess.Popen[bytes]] = []
     try:
         with selectors.DefaultSelector() as ready:
@@ -305,7 +334,7 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 if wait_policy is SlotWaitPolicy.REFUSE:
                     raise
                 if sys.platform == "darwin":
-                    print(str(error) + "; waiting for a free slot", file=sys.stderr)
+                    _ = sys.stderr.write(str(error) + "; waiting for a free slot\n")
                     _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
                 else:
                     slot_wait.wait_for_slot(error.repository, error.machine, configured_slot_root(), error.maximum,
@@ -329,53 +358,48 @@ def sweep_slots() -> None:
     machine = host_name()
     settings = conf.read_or_repository("build_folders")
     try:
-        root = _slot_root(settings, machine)
+        root = configured_slot_root()
     except SlotsNotConfigured:
         return
-    cargo_root = _root(settings, "roots.slot_cargo")
+    cargo_root = slot_cargo_root(settings)
     if not root.exists():
         return
-    paths = {entry.with_name(entry.name.removesuffix(".lease.json")) for entry in root.iterdir()
-             if re.fullmatch(r".+-slot[1-9][0-9]*(?:\.lease\.json)?", entry.name)}
-    for path in sorted(paths):
-        match = re.fullmatch(r"(.+)-slot([1-9][0-9]*)", path.name)
-        if match is None:
-            continue
+    for path, repository, _ in slot_paths(root):
         with build_folders.collector_lease(path, wait=False) as free:
             if not free:
                 continue
             settings = conf.read_or_repository("build_folders")
-            lease_path = path.with_name(path.name + ".lease.json")
+            record_path = lease_path(path)
             cargo = cargo_root / path.name
             if not path.exists():
                 if cargo.exists():
                     shutil.rmtree(cargo)
-                lease_path.unlink()
+                record_path.unlink()
                 continue
-            lease = cast(dict[str, object], json.loads(lease_path.read_text()))
+            lease = cast(dict[str, object], json.loads(record_path.read_text()))
             last_use = datetime.fromisoformat(cast(str, lease["last_use"]))
-            cutoff = datetime.now(timezone.utc) - timedelta(days=settings.whole("slots.unused_days"))
-            if last_use < cutoff:
+            if unused(last_use, settings, datetime.now(timezone.utc)):
                 try:
                     _rescue(path)
                 except git_rescue.RescueError as error:
                     detail = " ".join(str(error).splitlines())
-                    print(f"slots: keeps {path.name}: {detail}", file=sys.stderr)
+                    _ = sys.stderr.write(f"slots: keeps {path.name}: {detail}\n")
                     continue
                 descriptor = build_folders.build_folder_lock_fd(path)
                 _ = _git(source_checkout(path), "worktree", "remove", "--force", str(path), pass_fds=(descriptor,))
                 if cargo.exists():
                     shutil.rmtree(cargo)
-                lease_path.unlink()
+                record_path.unlink()
                 continue
-            key = f"slots.{machine}.{match[1]}.max_bytes"
+            key = f"slots.{machine}.{repository}.max_bytes"
             if key in settings.values():
                 limit = settings.whole(key)
                 size = _size(path) + _size(cargo)
                 if size > limit and cargo.exists():
                     shutil.rmtree(cargo)
-                    print(f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
-                          + "its build output is deleted.")
+                    _ = sys.stdout.write(
+                        f"slots: {path.name} was {size / 2**30:g} GiB, over its {limit / 2**30:g} GiB limit; "
+                        + "its build output is deleted.\n")
 
 
 def main(argv: Sequence[str]) -> int:
@@ -407,13 +431,13 @@ def main(argv: Sequence[str]) -> int:
                                                                "BUILD_FOLDER_LOCK_FD": str(descriptor)},
                                                   pass_fds=(descriptor,))
     except (SlotsFull, SlotWaitExpired) as error:
-        print(error, file=sys.stderr)
+        _ = sys.stderr.write(f"{error}\n")
         return 75
     except SlotsNotConfigured as error:
-        print(error, file=sys.stderr)
+        _ = sys.stderr.write(f"{error}\n")
         return 2
     except (SlotGitFailure, subprocess.SubprocessError) as error:
-        print(error, file=sys.stderr)
+        _ = sys.stderr.write(f"{error}\n")
         return 2
 
 

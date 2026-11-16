@@ -2,8 +2,8 @@
 
 The permanent record is JSON lines, one file per host per month, appended and
 never edited: ~/.local/state/buildlog/<host>/<YYYY-MM>.jsonl, with the logs of
-failed steps beside it under <host>/logs/<YYYY-MM>/. CI timings sit in ci/ the
-same way. index.py derives the SQLite index from these lines and can rebuild it
+failed steps beside it under <host>/logs/<YYYY-MM>/ and cloud gate results under
+<host>/results/<YYYY-MM>/. CI timings sit in ci/ the same way. index.py derives the SQLite index from these lines and can rebuild it
 from nothing. BUILDLOG_DIR moves the root, for tests.
 
 Many processes append at once (every lint step on the machine). Each append
@@ -21,7 +21,7 @@ import os
 import socket
 import sys
 import traceback
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
@@ -32,6 +32,7 @@ from typing import BinaryIO, TypedDict, cast
 UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
 LOGS_DIR = "logs"
+RESULTS_DIR = "results"
 ERRORS_NAME = "errors.log"
 SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
@@ -153,12 +154,18 @@ def _whole_row_bytes(handle: BinaryIO, start: int) -> bytearray:
     return contents
 
 
-def _object_rows(contents: bytearray) -> Iterator[dict[str, object]]:
-    """Decode complete object rows and skip invalid rows."""
+def _every_row(_line: bytearray) -> bool:
+    return True
+
+
+def _object_rows(contents: bytearray, may_match: Callable[[bytearray], bool] = _every_row) -> Iterator[dict[str, object]]:
+    """Decode complete object rows and skip invalid rows and rows that cannot match."""
     position = 0
     while (end := contents.find(b"\n", position)) != -1:
         line = contents[position:end]
         position = end + 1
+        if not may_match(line):
+            continue
         try:
             decoded = cast(object, json.loads(line.decode("utf-8")))
         except (UnicodeDecodeError, ValueError):
@@ -185,6 +192,44 @@ def locked_rows(path: Path, start: int = 0) -> Iterator[dict[str, object]]:
     except FileNotFoundError:
         return
     yield from _object_rows(contents)
+
+
+def _first_reached_row(contents: mmap.mmap, end: int, reached: Callable[[dict[str, object]], bool]) -> int:
+    """Search rows appended in order; an unreadable row counts as reached, so the search reads more, never less."""
+    low, high = 0, end
+    while low < high:
+        middle = (low + high) // 2
+        start = contents.rfind(b"\n", 0, middle) + 1
+        stop = contents.find(b"\n", middle, end)
+        try:
+            row = cast(object, json.loads(contents[start:stop]))
+        except ValueError:
+            row = None
+        if not isinstance(row, dict) or reached(cast(dict[str, object], row)):
+            high = start
+        else:
+            low = stop + 1
+    return low
+
+
+def locked_rows_in_order(path: Path, reached: Callable[[dict[str, object]], bool],
+                         may_match: Callable[[bytearray], bool]) -> Iterator[dict[str, object]]:
+    """Decode rows from the first reached row of a file appended in that order.
+
+    A row whose bytes fail `may_match` is skipped before it is decoded.
+    """
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            end = last_whole_row_end(handle)
+            if not end:
+                return
+            with mmap.mmap(handle.fileno(), end, access=mmap.ACCESS_READ) as mapped:
+                start = _first_reached_row(mapped, end, reached)
+            contents = _whole_row_bytes(handle, start)
+    except FileNotFoundError:
+        return
+    yield from _object_rows(contents, may_match)
 
 
 def read_last_whole_row_end(path: Path) -> int:

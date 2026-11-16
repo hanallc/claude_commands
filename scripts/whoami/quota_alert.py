@@ -740,8 +740,14 @@ def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
     return arguments
 
 
-def _start_no_worker_mode(state: State) -> bool:
-    """Enter the mode on the role map host only; workers run there."""
+def _start_no_worker_mode(state: State, readiness: agent_accounts.CodexWorkReadiness,
+                          destination: accounts.PickedAccount | accounts.NoAccountWithRoom) -> bool:
+    """Enter only when the workers account is exhausted and no other account can work."""
+    from scripts.accounts import accounts
+
+    if (not isinstance(readiness, agent_accounts.CodexWorkExhausted)
+            or not isinstance(destination, accounts.NoAccountWithRoom)):
+        return False
     if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
         return False
     state["no_worker_mode"] = True
@@ -1834,7 +1840,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
         chosen = _zero_destination(label, now, prefer_weekly_room=True, included_only=True)
     stamp = now.isoformat(timespec="seconds")
-    move_failed = False
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
             and isinstance(state["fallback"], NoCodexQuotaFallback)):
         move_id = uuid.uuid4().hex
@@ -1855,7 +1860,6 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
                 moves.append_move(moves.FailedMove(kind="failed", at=stamp, tool="codex", subject="workers",
                     move_id=move_id, reason=str(error)))
             values["reason"] = f"Workers could not move to {chosen.label} because {_worker_move_failure_cause(str(error))}."
-            move_failed = True
             if isinstance(credits, agent_accounts.CreditsOn):
                 chosen = accounts.NoAccountWithRoom(accounts.NoResetKnown(), chosen.reasons)
         else:
@@ -1888,9 +1892,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     values["until"] = reset_display(refusals.KnownReset(until))
     note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, hold=CreditsOffHold(until))
-    # The workers stay on an account that cannot pay. An account with room takes them in the restore pass.
-    if move_failed or isinstance(chosen, accounts.NoAccountWithRoom):
-        _ = _start_no_worker_mode(state)
+    _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
         values["outcome"] = "work could not move"
         values["fallback"] = (f"The switch to Claude failed because {_work_routing_failure_cause(switched.cause)}. "
@@ -2320,6 +2322,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                      and not isinstance(readings.workers, NoWorkersHome)
                      and selected.home == readings.workers.home)
         if owns_role and not isinstance(readings.workers, NoWorkersHome):
+            readiness = codex_can_work(selected_codex_report(readings, now), now,
+                                       agent_accounts.codex_credits_setting(readings.workers.label))
             entries = moves.read_moves()
             if (isinstance(reset, refusals.KnownReset) and (pending_head
                     or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
@@ -2338,6 +2342,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             elif pending_head:
                 return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)
             else:
+                if isinstance(readiness, CodexWorkAvailable):
+                    return RoutedRefusal([f"{name} refused work; its allowance or paid credits can still serve workers. Nothing switched to Claude."], outcome)
                 chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
                 if isinstance(chosen, accounts.PickedAccount):
                     move_id = uuid.uuid4().hex
@@ -2369,7 +2375,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                             move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                             if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                     no_room = accounts.no_room_line("codex", chosen)
-                    if _start_no_worker_mode(state):
+                    if _start_no_worker_mode(state, readiness, chosen):
                         outcome = NO_WORKER_MODE_STARTED
         if pending_head and not transition_line:
             return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)

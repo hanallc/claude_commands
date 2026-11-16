@@ -374,6 +374,30 @@ else:
                     self.assertLess(trace.index('upload log'), trace.index('tools shell'))
                     print('Production boot stages: ' + ' -> '.join(stages))
 
+    def test_result_sends_one_job_list_and_leaves_test_times_and_reads_to_the_record(self) -> None:
+        times: gate_record.ModuleTimes = {
+            "wall_s": 2.0, "cpu_s": 1.5, "tests_s": 1.0, "tests_run": 2, "failures": 0, "errors": 0, "skipped": 0,
+            "tests": [{"test": "Fixture.test_slow", "s": 9.0, "status": "pass"},
+                      {"test": "Fixture.test_fast", "s": 0.1, "status": "pass"}],
+            "config_reads": ["config/a.conf"], "folder_scans": ["scripts/fixture"],
+            "content_reads": ["scripts/fixture/data.json"]}
+        job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "ok", cpu_seconds=1.5, times=times,
+                                 wall_clock=gate_record.WallClockSpan(10, 12))
+        run = gate.GateRun((job,), 2, 3, executions=(job,))
+        encoded = gate_box.encode_run(run)
+        self.assertNotIn("executions", encoded)
+        sent = ledger.mapping(ledger.rows(encoded, "jobs")[0]["times"])
+        self.assertEqual(sent, {"wall_s": 2.0, "cpu_s": 1.5, "tests_s": 1.0, "tests_run": 2, "failures": 0,
+                                "errors": 0, "skipped": 0, "tests": []})
+        decoded = gate_box.decode_run(encoded)
+        self.assertEqual(decoded.executions, decoded.jobs)
+        self.assertTrue(decoded.passed)
+        record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+        module, = ledger.rows(record, "modules")
+        self.assertEqual(module["content_reads"], ["scripts/fixture/data.json"])
+        self.assertEqual(module["folder_scans"], ["scripts/fixture"])
+        self.assertEqual([row["test"] for row in ledger.rows(module, "tests")], ["Fixture.test_slow"])
+
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,
                                    wall_clock=gate_record.WallClockSpan(10, 12))

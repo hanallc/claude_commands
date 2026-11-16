@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.build_hold.owning_session import OwningSession
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
-from scripts.build_targets import build_targets, targets
+from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import mac_test
@@ -747,6 +747,19 @@ class ValueTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(targets.end_text(end, timezone.utc), expected)
 
+    def test_step_route_follows_the_placement_client_order(self) -> None:
+        # Each case: local, mac_only, target, writes_tree, then the route.
+        cases: tuple[tuple[bool, bool, str, bool, target_config.StepRoute], ...] = (
+            (True, True, "mac", True, target_config.WRITES_TREE),
+            (True, True, "mac", False, target_config.LOCAL_CALLER),
+            (False, True, "natedev", False, target_config.MAC_ONLY),
+            (False, False, "natedev", False, target_config.PinnedTarget("natedev")),
+            (False, False, "", False, target_config.ANY_ELIGIBLE_TARGET),
+        )
+        for local, mac_only, target, writes_tree, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(target_config.step_route(local=local, mac_only=mac_only, target=target,
+                                                          writes_tree=writes_tree), expected)
 
 if __name__ == "__main__":
     _ = unittest.main()

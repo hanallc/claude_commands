@@ -7,6 +7,7 @@ import math
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -16,7 +17,7 @@ from typing import Literal, cast, get_args
 from scripts.buildlog import ci
 from scripts.buildlog.health import Machine
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import file_lock
+from scripts.lib import file_lock, land_main
 from scripts.lib.process_failure import failure_detail
 from scripts.buildlog import store
 from scripts.buildlog import sync
@@ -268,13 +269,15 @@ def publish_mac(merged: MacMerged) -> PullOutcome:
         target = commit.stdout.strip()
     elif forward.returncode != 0:
         return command_failure(forward)
-    pushed = git("push", "--porcelain", "origin", f"{target}:refs/heads/main")
-    if isinstance(pushed, VaultCommandFailed):
-        return pushed
-    if pushed.returncode != 0:
-        if any(line.startswith("!") and "[rejected]" in line for line in pushed.stdout.splitlines()):
-            return DeferredSync("GitHub main changed; the next hour retries")
-        return command_failure(pushed)
+    try:
+        landed = land_main.land(LOCAL_VAULT, target, "main",
+                                time_limit=land_main.CommandTimeLimit(COMMAND_TIMEOUT_S))
+    except land_main.NotFastForward:
+        return DeferredSync("GitHub main changed; the next hour retries")
+    except land_main.LandError as error:
+        return VaultCommandFailed(str(error))
+    if isinstance(landed.hook, land_main.HookFailed):
+        print(land_main.hook_report(landed.hook), file=sys.stderr)
     return Pulled(merged.commits)
 
 

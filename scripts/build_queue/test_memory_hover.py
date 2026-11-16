@@ -62,7 +62,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertNotEqual(attributes.get("http-equiv", "").lower(), "x-frame-options")
                 self.assertNotIn("frame-ancestors 'none'", attributes.get("content", "").lower())
 
-    def test_time_cells_use_short_times_without_a_wait_prefix(self) -> None:
+    def test_time_cells_and_tooltip_heads_use_short_times_without_a_wait_prefix(self) -> None:
         for elapsed, expected in ((0, "<1 min"), (29, "<1 min"), (30, "1 min"),
                                   (60, "1 min"), (2580, "43 min"), (3600, "1 h 0 min")):
             with self.subTest(elapsed=elapsed):
@@ -75,9 +75,12 @@ class MemoryHoverTests(unittest.TestCase):
                 root = ElementTree.fromstring(f"<root>{rendered}</root>")
                 self.assertEqual(root.findtext(".//tr[@data-tip='row:0']/td[@class='duration']"), expected)
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:0']/td[@class='duration']"), expected)
-                tips = self.page_expression("[tipText('row:0', data), tipText('wait:0', data)]", data)
-                self.assertIn(f"Started {expected} ago.", str(tips))
-                self.assertIn(f"waiting: {expected}\\nreason: free memory", str(tips))
+                for key in ("row:0", "wait:0"):
+                    html = str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                    head = ElementTree.fromstring(f"<root>{html}</root>").find("b")
+                    assert head is not None
+                    self.assertEqual((head.get("class"), [span.text for span in head]), ("tip-head", [head[0].text, expected]))
+                    self.assertNotIn("ago", html)
 
     def test_queued_titles_share_the_header_row_without_moving_the_room_row(self) -> None:
         for units, expected in (([], "Queued, in order of submission"),
@@ -164,7 +167,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(root[-2].tag, "dl")
         self.assertIn("70.0%", "".join(root[-2].itertext()))
 
-    def test_the_memory_page_hover_shows_the_captured_phase_percent_hold_and_reason(self) -> None:
+    def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
@@ -173,13 +176,12 @@ class MemoryHoverTests(unittest.TestCase):
         inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
         room = gate.inputs_room(inputs, admission_policy_fixture())
         assert isinstance(room, admission_records.MemoryRoom)
-        text = memory_feed.run_keep_text(room.runs[0], inputs.running)
-        self.assertIn("suites:1, 80.0% done", text)
-        self.assertIn("0.5 GiB", text)
-        self.assertIn("highest anonymous use in the next 20.0%", text)
+        self.assertTrue(memory_feed.need_in_next_part(inputs.running))
+        self.assertFalse(memory_feed.need_in_next_part(()))
         module_counter = memory_feed.row_progress(inputs.running)
         assert module_counter["kind"] == "RowProgress"
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
+        hold = room.runs[0]
         for name, counter, ordering_note in (
             ("merge-gate", module_counter, True),
             ("merge gate", module_counter, True),
@@ -187,19 +189,30 @@ class MemoryHoverTests(unittest.TestCase):
             ("merge-gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
-                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"walk": [{
-                    "name": name, "unit": "fixture", "showrunner": "fixture-production",
-                    "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": text,
-                    "progress": counter}]}))
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"read_at": 400, "walk": [{
+                    "name": name, "unit": "fixture", "showrunner": "fixture-production", "started_at": 100,
+                    "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": "",
+                    "need": memory_feed.gib(hold.memory.need), "need_part": True, "progress": counter}]}))
                 self.assertEqual(hover[0], name)
-                self.assertNotIn("showrunner:", hover[1])
-                for expected in ("suites:1, 80.0% done", "0.5 GiB", "highest anonymous use in the next 20.0%",
-                                 "The queue holds this memory for the run.",
-                                 f"testing · 8 of 10 {counter['unit']} · 80.0% done"):
-                    with self.subTest(expected=expected):
-                        self.assertIn(expected, hover[1])
-                self.assertEqual("Modules start slowest first, so this reads low early." in hover[1], ordering_note)
-
+                lines = ["Current memory: 1.0 GiB",
+                         f"Historically uses {memory_feed.gib(hold.memory.need):.1f} GiB in the next part of the build.",
+                         "The queue holds 0.5 GiB more for it, so it has room to grow to 1.5 GiB.",
+                         f"Testing: 8 of 10 {counter['unit']} done."]
+                if ordering_note:
+                    lines.append("Modules start slowest first, so this reads low early.")
+                self.assertEqual(hover[1], "\n".join(lines))
+        for row, body in (({"between_steps": True, "used": 1, "reserved": 2},
+                           "Between steps. The queue holds 2.0 GiB for its next step."),
+                          ({"used": {"kind": "RunUseUnavailable", "reason": "private memory.stat is missing"}, "reserved": 2},
+                           "Use unavailable: private memory.stat is missing. The queue holds 2.0 GiB for it."),
+                          ({"used": 1, "reserved": 0, "started_at": 100},
+                           "Current memory: 1.0 GiB\nHistorically uses 4.0 GiB.\n"
+                           + "The queue holds no more memory for it.")):
+            with self.subTest(body=body):
+                hover = cast(list[str], self.page_expression("tipText('row:0', data)", {"read_at": 400, "walk": [{
+                    "name": "merge-gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
+                    "need": 4.0, "need_part": False, **row}]}))
+                self.assertEqual(hover[1], body)
 
     def test_every_running_and_queued_hover_starts_with_who_ran_it(self) -> None:
         owner = {"showrunner": "builds", "unit": "report"}
@@ -224,8 +237,8 @@ class MemoryHoverTests(unittest.TestCase):
                     rendered = cast(str, self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
                     root = ElementTree.fromstring(f"<root>{rendered}</root>")
                     self.assertEqual(root[0].tag, "b")
-                    fields = expected + ([("waiting", "2 min"),
-                        ("reason", "another step just started; the queue waits a few seconds between starts")] if key == "wait:0" else [])
+                    fields = expected + ([("reason", "another step just started; the queue waits a few seconds between starts")]
+                                         if key == "wait:0" else [])
                     if not fields:
                         self.assertIsNone(root.find("dl[@class='identity']"), rendered)
                         self.assertNotIn("not recorded", rendered)
@@ -260,7 +273,8 @@ class MemoryHoverTests(unittest.TestCase):
                     "name": "fixture nextest", "unit": "fixture", "showrunner": "fixture-production", "used": 1,
                     "reserved": 0, "counted": 1, "queued": queued, "keep_text": keep_text, "started_at": 100}]}))
                 self.assertTrue(hover[1].endswith(expected), hover[1])
-                self.assertTrue(hover[1].startswith("Started 5 min ago. " + (keep_text or "It uses")[0].upper()), hover[1])
+                self.assertTrue(hover[1].startswith((keep_text or "It uses")[0].upper()), hover[1])
+                self.assertNotIn("Started", hover[1])
 
     def test_cloud_hover_shows_the_progress_and_reservation(self) -> None:
         for status, counter, expected in (
@@ -429,11 +443,11 @@ class MemoryHoverTests(unittest.TestCase):
                 title = tooltip.find("b")
                 sentence = tooltip.find("span")
                 assert title is not None and sentence is not None
-                self.assertEqual(title.text, "hana nextest · 3.5 GiB")
+                self.assertEqual((title.get("class"), [span.text for span in title]), ("tip-head", ["hana nextest · 3.5 GiB", "2 min"]))
                 self.assertEqual(sentence.text, "Mac memory does not count against natedev.")
                 labels = [cell.text for cell in tooltip.findall("dl/dt")]
                 values = [value for fields in tooltip.findall("dl") for value in field_values(fields)]
-                self.assertEqual(labels, ["showrunner", "unit", "Target", "Started", "Used", "Reading age"])
+                self.assertEqual(labels, ["showrunner", "unit", "Target", "Used", "Reading age"])
                 fields = dict(zip(labels, values, strict=True))
                 self.assertEqual(fields["showrunner"], "hana")
                 self.assertEqual(fields["unit"], "trunk")
@@ -452,48 +466,49 @@ class MemoryHoverTests(unittest.TestCase):
         assert row is not None
         self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
         self.assertEqual(row[4][0].text, "—")
-        self.assertEqual(result[1].count("unavailable"), 4)
+        self.assertEqual(result[1].count("unavailable"), 3)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         priority = "queue priority: port (the user's bump)"
-        swap_note = ("Other programs have 2.0 GiB of memory in swap. "
-                     "It comes back into RAM when they run, so the queue holds RAM for it.")
-        room: memory_feed.HeadRoom = {"rows": [{"label": "Free RAM", "gib": 10.5}, {"label": "− Safety net", "gib": 3.0},
-                         {"label": "− Swap coming back", "gib": 2.0}, {"label": "− Build reserved", "gib": 6.0},
-                         {"label": "= Free", "gib": 0.0}, {"label": "need", "gib": 1.9}], "note": swap_note}
+        cap_text = ("Queue cap: 7.5 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net "
+                    + "and the 2.0 GiB of swap coming back. Those three are outside the cap.")
+        note = (f"{memory_feed.BUILD_RESERVED_NOTE} Other programs have 2.0 GiB in swap. "
+                + "It can come back into RAM when they run, so it is outside the cap.")
+        room: memory_feed.HeadRoom = {"cap_text": cap_text, "rows": [
+            {"label": "Queue cap", "gib": 7.5}, {"label": "− Builds", "gib": 1.5},
+            {"label": "− Build reserved", "gib": 6.0}, {"label": "= Free for builds", "gib": 0.0}], "note": note}
         data = {"read_at": 200, "waiters": [
-            {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100,
+            {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100, "place": 1,
+             "why": "only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
              "reason": "free memory", "head_room": room, "priority_text": priority, "runs_on": "natedev only"},
-            {"name": "trunk nextest", "unit": "trunk", "need": 2, "since": 100,
+            {"name": "trunk nextest", "unit": "trunk", "need": 2, "since": 100, "place": 2,
+             "why": "it is behind the first build in line, which gets memory first.",
              "reason": "behind #1: the first step in line gets memory first",
              "runs_on": "natedev or Mac"},
-            {"name": "fps nextest", "unit": "fps", "need": 2, "since": 100,
+            {"name": "fps nextest", "unit": "fps", "need": 2, "since": 100, "place": 3,
+             "why": "its memory estimate expired. The queue reads a new estimate before it starts.",
              "reason": "estimate expired"}]}
         expected = ("\n".join((
-            "waiting: 2 min", "reason: free memory", "can run on: natedev only", "First in line", "Free RAM: 10.5 GiB",
-            "− Safety net: 3.0 GiB", "− Swap coming back: 2.0 GiB", "− Build reserved: 6.0 GiB", "= Free: 0.0 GiB",
-            "need: 1.9 GiB", swap_note, priority)),
-            "waiting: 2 min\nreason: behind #1: the first step in line gets memory first\ncan run on: natedev or Mac",
-            "waiting: 2 min\nreason: estimate expired")
+            "It is first in line.", "It needs 1.9 GiB to start.",
+            "Why it waits: only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
+            "can run on: natedev only", cap_text, "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
+            "− Build reserved: 6.0 GiB", "= Free for builds: 0.0 GiB", note, priority)),
+            "It is number 2 in line.\nIt needs 2.0 GiB to start.\n"
+            + "Why it waits: it is behind the first build in line, which gets memory first.\ncan run on: natedev or Mac",
+            "It is number 3 in line.\nIt needs 2.0 GiB to start.\n"
+            + "Why it waits: its memory estimate expired. The queue reads a new estimate before it starts.")
         for index, body in enumerate(expected):
             with self.subTest(index=index):
                 hover = cast(list[str], self.page_expression(f"tipText('wait:{index}', data)", data))
                 self.assertEqual(hover[1], body)
                 self.assertNotIn("Head", hover[1])
                 html = str(self.page_expression(f"tooltipHtml('wait:{index}', data)", data, walk=True))
-                self.assertEqual(html.count("First in line"), int(index == 0))
+                self.assertEqual(html.count("= Free for builds"), int(index == 0))
+                self.assertEqual(html.count("Those three are outside the cap."), int(index == 0))
                 self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
             self.assertNotIn(removed, page)
-        ram = {**RAM_FIXTURE, "available_bytes": int(10.5 * GIB), "safety_target_bytes": 3 * GIB,
-               "swap_target_bytes": 2 * GIB, "build_target_bytes": 6 * GIB, "room_bytes": 0}
-        room_tip = str(self.page_expression("tipText('room', data)[1]", {**data, "ram": ram}))
-        head_tip = str(self.page_expression("tipText('wait:0', data)[1]", data))
-        for row in room["rows"][:4]:
-            term = f"{str(row['label']).removeprefix('− ')}: {row['gib']:.1f} GiB"
-            self.assertIn(term, room_tip)
-            self.assertIn(term, head_tip)
         for removed in ("admission-terms", "admission-check-rows", "renderAdmissionRequirements"):
             self.assertNotIn(removed, page)
         for unmatched in ("", priority):
@@ -572,6 +587,16 @@ function fitLabels() {}
                     "name":waiter.step, "unit":"", "showrunner":"", "need":1, "since":waiter.since,
                     "reason":reason_phrase(reason, reading.view.waiting)}]})
                 self.assertIn(expected, str(hover))
+
+    def test_a_mac_only_wait_hover_names_what_holds_the_mac_below_can_run_on(self) -> None:
+        waiter = {"name":"tile nextest", "unit":"", "showrunner":"", "need":1, "since":200_000 - 240,
+                  "reason":"start spacing", "runs_on":"Mac only", "mac_state":"build hold by research (hana) until released — Mac CI restore"}
+        hover = cast(list[str], self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[waiter]}))
+        lines = hover[1].split("\n")
+        self.assertEqual(lines[lines.index("can run on: Mac only") + 1], "Mac: build hold by research (hana) until released — Mac CI restore")
+        del waiter["mac_state"]
+        hover = cast(list[str], self.page_expression("tipText('wait:0', data)", {"read_at":200_000, "waiters":[waiter]}))
+        self.assertNotIn("Mac:", hover[1])
 
     def test_missing_run_use_has_a_page_hover_reason(self) -> None:
         hover = self.page_expression("tipText('row:0', data)", {"read_at":200_000, "walk":[{

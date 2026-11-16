@@ -11,7 +11,7 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.direct import plan_history
+from scripts.direct import phase_waits, plan_history
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.production import land_queue, land_runs, staff, unit_phases, unit_queue, waits_on
 
@@ -79,6 +79,27 @@ class WaitsOnTests(unittest.TestCase):
         self.assertEqual(waits_on.carried(self.repo, main), [])
         self.assertEqual(waits_on.carried(self.repo, "f" * 40), [])
 
+        path = plan_history.run_events_path(run)
+        runs[path].extend([
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "22", "wait_id": "hold",
+             "wait_by": "sdlc", "wait_reason": "the user approves board-reasons", "wait_kind": "WaitingForUser",
+             "wait_started_epoch": 1_794_749_000, "wait_attribution": {"state": "UnitTarget"}},
+            {"event_type": "wait_started", "wait_scope": "unit", "target_work": "23", "wait_id": "other",
+             "wait_by": "builds", "wait_reason": "the build finishes", "wait_kind": "WaitingForSupplier",
+             "wait_started_epoch": 1_794_749_100, "wait_attribution": {"state": "UnitTarget"}}])
+        reads: list[Path] = []
+
+        def read_run(path: Path) -> list[dict[str, object]]:
+            reads.append(path)
+            return runs.get(path, [])
+
+        held = waits_on.state("handler/22", repo=self.repo, snapshot=snapshot, read_run=read_run)
+        self.assertEqual(held, waits_on.PhaseSent(sent, phase_waits.UnitWait(
+            "22", "sdlc", "the user approves board-reasons", "WaitingForUser", 1_794_749_000, "hold")))
+        self.assertEqual(reads, [path])
+        runs[path].append({"event_type": "wait_finished", "wait_id": "hold"})
+        self.assertEqual(state("handler/22"), waits_on.PhaseSent(sent))
+
     def test_the_queued_cell_names_the_wait_and_its_state(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
         failed: land_runs.LandResult = {"commit": "c" * 40, "production": "builds", "unit": "report", "phase": "89",
@@ -88,27 +109,51 @@ class WaitsOnTests(unittest.TestCase):
         item = unit_queue.QueuedItem("acctland", "builds/589")
 
         def text(found: waits_on.WaitState | None, running: frozenset[str] | None = None,
-                 results: dict[str, land_runs.LandResult] | None = None) -> str:
+                 results: dict[str, land_runs.LandResult] | None = None) -> unit_phases.WorkItem:
             view = land_queue.LandView(dict.fromkeys(running or (), ""), line, results or {}, frozenset(), {})
             return unit_phases.queued_text(item, found, view, now=now, zone=utc)
 
-        self.assertEqual(text(waits_on.OnMain("a" * 40)), "ready: acctland (builds/589 on main)")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40)), "acctland — after builds/589: done, waits to merge, 10th in line")
+        self.assertEqual(text(waits_on.OnMain("a" * 40)),
+                         unit_phases.WorkItem("acctland", "Ready"))
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40)),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; 10th in the merge line"))
         self.assertEqual(text(waits_on.NotOnMain("c" * 40), results={"c" * 40: failed}),
-                         "acctland — after builds/589: waits to merge, 10th in line; last try failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})), "acctland — after builds/589: done, merging now")
-        self.assertEqual(text(waits_on.NotOnMain("d" * 40)), "acctland — after builds/589: not on main")
+                         unit_phases.WorkItem("acctland", "After builds phase 589; "
+                         + "10th in the merge line; last attempt failed at red: test_x red; 13:30"))
+        self.assertEqual(text(waits_on.PhaseSent("c" * 40), frozenset({"c" * 9})),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; merging now"))
+        self.assertEqual(text(waits_on.NotOnMain("d" * 40)),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; absent from the local copy of main"))
         self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: {**failed, "commit": "d" * 40}}),
-                         "acctland — after builds/589: did not merge: failed at red 13:30: test_x red")
-        self.assertEqual(text(waits_on.PhaseOpen(now + 3600)), "acctland — after builds/589: in work, ETA 14:40")
-        self.assertEqual(text(waits_on.PhaseOpen(None)), "acctland — after builds/589: in work, no ETA")
-        self.assertEqual(text(waits_on.PhaseNotStarted()), "acctland — after builds/589: not started")
-        self.assertEqual(text(waits_on.NotFound()), "acctland — after builds/589: not found")
+                         unit_phases.WorkItem("acctland", "After builds phase 589; absent from the local copy of main; "
+                         + "did not merge: failed at red: test_x red; 13:30"))
+        for found, expected in ((waits_on.PhaseOpen(now + 3600), "started"),
+                                (waits_on.PhaseOpen(None), "started"),
+                                (waits_on.PhaseNotStarted(), "not started"),
+                                (waits_on.NotFound(), "dependency not found locally"),
+                                (waits_on.PhaseSent("d" * 40),
+                                 "not in the merge line; reason not recorded")):
+            with self.subTest(state=found):
+                self.assertEqual(text(found), unit_phases.WorkItem("acctland", f"After builds phase 589; {expected}"))
         self.assertEqual(unit_phases.queued_text(unit_queue.QueuedItem("plain"), None,
-                                                 land_queue.LandView({}, {}, {}, frozenset(), {}), now=now, zone=utc), "plain")
+                                                 land_queue.LandView({}, {}, {}, frozenset(), {}), now=now, zone=utc),
+                         unit_phases.WorkItem("plain", "Ready"))
         landed: land_runs.LandResult = {**failed, "commit": "d" * 40, "landed": True}
         self.assertEqual(text(waits_on.PhaseSent("d" * 40), results={"d" * 40: landed}),
-                         "acctland — after builds/589: done, merged 13:30, not on main yet")
+                         unit_phases.WorkItem("acctland", "After builds phase 589; merged 13:30"))
+        self.assertEqual(text(waits_on.NotOnMain("d" * 40), results={"d" * 40: landed}),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; absent from the local copy of main; merged 13:30"))
+
+        held = waits_on.PhaseSent("d" * 40, phase_waits.UnitWait(
+            "589", "sdlc", "the user approves board-reasons", "WaitingForUser", now - 600, "hold"))
+        self.assertEqual(text(held),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; done; sdlc keeps it from the merge until the user approves board-reasons"))
+        self.assertEqual(text(held, frozenset({"d" * 40})), unit_phases.WorkItem("acctland", "After builds phase 589; merging now"))
+        self.assertEqual(text(held, results={"d" * 40: landed}), unit_phases.WorkItem("acctland", "After builds phase 589; merged 13:30"))
+        self.assertEqual(text(held, results={"d" * 40: {**failed, "commit": "d" * 40}}),
+                         unit_phases.WorkItem("acctland", "After builds phase 589; did not merge: failed at red: test_x red; 13:30"))
+        held_in_line = waits_on.PhaseSent("c" * 40, held.wait)
+        self.assertEqual(text(held_in_line), unit_phases.WorkItem("acctland", "After builds phase 589; 10th in the merge line"))
 
     def test_the_first_row_names_each_sent_checkpoint_of_the_unit(self) -> None:
         now, utc = 1_794_750_000.0, ZoneInfo("UTC")
@@ -124,15 +169,60 @@ class WaitsOnTests(unittest.TestCase):
         view = land_queue.LandView({"0" * 40: "shelled images-card", "1" * 40: "other 1"}, line,
                                    {"e" * 40: held, "f" * 40: later, "9" * 40: older}, frozenset(), {})
 
-        def lands(skip: tuple[str, ...] = (), on_main: bool = False) -> str:
-            return unit_phases.unit_lands("shelled", view, skip=skip, now=now, zone=utc, on_main=lambda _commit: on_main)
-
-        self.assertEqual(lands(), "merging now: images-card · done, waits to merge: shot-rule (1st in line), "
-                         + "workers-why + land-line (2nd in line) · center-column did not merge: merge conflict in docs/a.md, b.md 13:30 "
-                         + "· images did not merge: merge conflict in docs/a.md, b.md 13:40")
-        self.assertEqual(lands(("images-card", "shot-rule", "land-line", "images"), on_main=True),
-                         "done, waits to merge: workers-why (2nd in line)")
-        self.assertEqual(unit_phases.unit_lands("nobody", view, skip=(), now=now, zone=utc, on_main=lambda _commit: False), "")
+        failures = (
+            unit_phases.WorkItem("center-column", "Did not merge: merge conflict in docs/a.md, b.md; 13:30"),
+            unit_phases.WorkItem("images", "Did not merge: merge conflict in docs/a.md, b.md; 13:40"))
+        running = unit_phases.WorkItem("images-card", "Done; merging now")
+        first = unit_phases.WorkItem("shot-rule", "Done; 1st in the merge line")
+        paired = unit_phases.WorkItem("workers-why, land-line", "Done; merge together; 2nd in the merge line")
+        carried_view = view._replace(carried_line={"7" * 40: line["c" * 40]})
+        running_view = view._replace(running={"0" * 40: "shelled images-card", "8" * 40: "shelled live-owner"},
+                                    carried_running=frozenset({"7" * 40}))
+        cases: list[tuple[str, land_queue.LandView, dict[str, unit_phases.PhaseSentWork], bool,
+                          tuple[unit_phases.WorkItem, ...], frozenset[str]]] = [
+            ("no open rows", view, {}, False, (running, first, paired, *failures), frozenset()),
+            ("open rows before other phases", view,
+             {"images-card": unit_phases.SentCommit("0" * 40), "shot-rule": unit_phases.SentCommit("a" * 40),
+              "land-line": unit_phases.SentCommit("c" * 40), "images": unit_phases.SentCommit("f" * 40)}, True,
+             (running, first, unit_phases.WorkItem("land-line, workers-why", "Done; merge together; 2nd in the merge line"), failures[1]),
+             frozenset({"land-line"})),
+            ("single open row", view, {"shot-rule": unit_phases.SentCommit("a" * 40)}, False,
+             (running, first, paired, *failures), frozenset()),
+            ("carried commit joins its item", carried_view,
+             {"workers-why": unit_phases.SentCommit("b" * 40), "checkpoint-wait": unit_phases.SentCommit("7" * 40),
+              "land-line": unit_phases.SentCommit("c" * 40)}, False,
+             (running, first, unit_phases.WorkItem("workers-why, checkpoint-wait, land-line", "Done; merge together; 2nd in the merge line"), *failures),
+             frozenset({"workers-why", "checkpoint-wait", "land-line"})),
+            ("running direct and carried commits", running_view,
+             {"carried": unit_phases.SentCommit("7" * 40), "images-card": unit_phases.SentCommit("0" * 40)}, False,
+             (unit_phases.WorkItem("carried, images-card, live-owner", "Done; merging now"), first, paired, *failures),
+             frozenset({"carried", "images-card"})),
+            ("single running open row", view, {"images-card": unit_phases.SentCommit("0" * 40)}, False,
+             (running, first, paired, *failures), frozenset()),
+            ("open failed work remains in Merge", view, {"images": unit_phases.SentCommit("f" * 40)}, False,
+             (running, first, paired, failures[1], failures[0]), frozenset()),
+            ("carried phase names its other unit", view._replace(carried_line={
+                "7" * 40: land_queue.Place(4, "builds batch", "builder carrier")}),
+             {"carried": unit_phases.SentCommit("7" * 40)}, False,
+             (running, first, paired, unit_phases.WorkItem("carried", "Done; merges with builder carrier; 4th in the merge line"), *failures), frozenset()),
+            ("submitted work has no line", view,
+             {"absent": unit_phases.SentCommit("6" * 40), "no-hash": unit_phases.SentCommitUnrecorded(),
+              "not-sent": unit_phases.NoSentWork()}, False,
+             (running, first, paired,
+              unit_phases.WorkItem("absent", "Submitted; not in the merge line; reason not recorded"),
+              unit_phases.WorkItem("no-hash", "Submitted; merge position not recorded"), *failures), frozenset()),
+        ]
+        for name, found, open_sent, on_main, expected, grouped in cases:
+            with self.subTest(group=name):
+                result = unit_phases.unit_lands("shelled", found, open_sent=open_sent, now=now, zone=utc,
+                                                on_main=lambda _commit: on_main)
+                self.assertEqual(result.entries, expected)
+                self.assertEqual(result.grouped_phases, grouped)
+                self.assertTrue(result.pending)
+        result = unit_phases.unit_lands("nobody", view, open_sent={}, now=now, zone=utc, on_main=lambda _commit: False)
+        self.assertEqual(result.entries, ())
+        self.assertEqual(result.grouped_phases, frozenset())
+        self.assertFalse(result.pending)
 
 
 if __name__ == "__main__":

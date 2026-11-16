@@ -117,6 +117,8 @@ WAIT_KINDS = (
 )
 
 HOLDER_WAIT_KINDS = ("WaitingForQuotaRefusal", "WaitingForMemoryOrSlot", "ReadyWithoutCapacity")
+# A phase does no work while it waits on the user or a supplier, so active phase time leaves these waits out.
+PAUSE_WAIT_KINDS = ("WaitingForUser", "WaitingForSupplier")
 
 
 class AgentIdentity(TypedDict):
@@ -491,13 +493,6 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
     write_text_atomic(
         _state_path(session_dir), json.dumps(stored, indent=2, sort_keys=True) + "\n",
     )
-
-
-SESSION_ROOTS = tuple(
-    Path(root)
-    for root in (os.environ.get("PROGRESS_SESSION_ROOTS") or "/tmp/claude/unit:/tmp/claude/delegate").split(":")
-    if root
-)
 
 
 def move_run(_history_file: Path, _old: Path, _new: Path, _new_branch: str) -> list[Path]:
@@ -1718,12 +1713,19 @@ def _start_phase(args: argparse.Namespace) -> None:
 
 def _finish_phase_start(session_dir: Path, state: dict[str, object], phase: dict[str, object]) -> None:
     """Publish a saved phase start once, including after a stopped state write."""
+    events = _run_events(state)
     if not any(event.get("event_type") == "phase_started"
-               and event.get("phase_instance_id") == phase.get("instance_id") for event in _run_events(state)):
+               and event.get("phase_instance_id") == phase.get("instance_id") for event in events):
         event = _object_dict(phase.get("start_event"))
         if event is None:
             event = _event(state, "phase_started", _number(phase.get("started_at")), phase_record=phase)
         _append_event(state, event)
+    run_start = next((index + 1 for index in range(len(events) - 1, -1, -1)
+                      if events[index].get("event_type") == "run_finished"), 0)
+    for wait in _waits_by_id(events[run_start:]).values():
+        if (wait.get("event_type") == "wait_started" and wait.get("wait_scope") == "unit"
+                and wait.get("target_work") == phase.get("id")):
+            _end_wait(state, wait, plan_history.now_epoch(), unclosed=False)
     if "start_event" in phase:
         del phase["start_event"]
         _write_state(session_dir, state)
@@ -5897,14 +5899,27 @@ class WaitNotRecorded:
     wait_id: str
 
 
+@dataclass(frozen=True)
+class UnitWaitTarget:
+    """The work and actor named by a unit wait."""
+
+    target: str
+    by: str
+
+
 def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedWait | WaitNotRecorded:
+    target = _optional_arg(args, "target")
+    if hasattr(args, "target"):
+        for option in ("target", "by", "reason"):
+            if not _optional_arg(args, option).strip():
+                raise SystemExit(f"start-wait --target requires --{option}")
     holder = _holder_from_args(args, _arg_string(args, "kind"))
-    resolution = _wait_phase(state, args)
+    resolution = UnitWaitTarget(target, _optional_arg(args, "by")) if target else _wait_phase(state, args)
     owner = _arg_string(args, "owner_session") or _string((_object_dict(state.get("main_agent")) or {}).get("session_id"))
-    missing_reason = _optional_arg(args, "missing_reason")
+    missing_reason = "" if isinstance(resolution, UnitWaitTarget) else _optional_arg(args, "missing_reason")
     if isinstance(resolution, (WaitPhaseNotRecorded, UnresolvedWaitAttribution)):
         missing_reason = "; ".join(part for part in (missing_reason, resolution.reason) if part)
-    if not owner:
+    if not owner and not isinstance(resolution, UnitWaitTarget):
         missing_reason = "; ".join(part for part in (missing_reason, "wait owner session not recorded") if part)
     now = plan_history.now_epoch()
     # An empty explicit phase prevents _event from borrowing a reporting pass
@@ -5922,7 +5937,10 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedW
         event["declaration_id"] = declaration
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
-    if isinstance(resolution, ResolvedWorkerPass):
+    if isinstance(resolution, UnitWaitTarget):
+        event.update(wait_scope="unit", target_work=resolution.target, wait_by=resolution.by,
+                     wait_attribution={"state": "UnitTarget"})
+    elif isinstance(resolution, ResolvedWorkerPass):
         event.update(pass_instance_id=resolution.pass_instance_id, worker_name=resolution.worker_name,
                      team_slot=resolution.team_slot, wait_attribution={"state": "WorkerPass"})
     elif isinstance(resolution, UnresolvedWaitAttribution):
@@ -5933,7 +5951,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> StartedW
                                      else "UnresolvedAttribution", "candidates": [],
                                      "reason": resolution.reason if isinstance(resolution, WaitPhaseNotRecorded) else "explicit phase attribution"}
     supplier = _object_dict(event.get("expected_supplier")) or {}
-    if event["wait_kind"] == "WaitingForSupplier" and supplier.get("state") == "NoNamedSupplier":
+    if (not isinstance(resolution, UnitWaitTarget) and event["wait_kind"] == "WaitingForSupplier"
+            and supplier.get("state") == "NoNamedSupplier"):
         event["wait_attribution"] = {"state": "UnresolvedSupplier", "reason": supplier.get("reason"),
                                      "candidates": [{key: event[key] for key in
                                                      ("run_id", "phase_id", "phase_instance_id") if key in event}]}
@@ -6115,10 +6134,13 @@ def _supplier_fields(supplier: NamedSupplier | NoNamedSupplier) -> dict[str, obj
 
 
 def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoNamedSupplier:
-    if "waiting on the showrunner" in reason.lower():
-        return _showrunner_supplier(state)
+    """The supplier a blocked turn names, else the run's showrunner, which relays pauses and their end."""
     match = re.search(r"blocked: waiting on ((?:claude-|codex-|worker:|session:|codex:|uds:)[^\s,;]+)", reason, re.IGNORECASE)
-    return NamedSupplier(match[1]) if match else NoNamedSupplier("wait names no supplier address")
+    if match:
+        return NamedSupplier(match[1])
+    if re.search(r"\bpeer\b", reason, re.IGNORECASE):
+        return NoNamedSupplier("wait names no supplier address")
+    return _showrunner_supplier(state)
 
 
 def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | None = None) -> NamedSupplier | NoNamedSupplier:
@@ -6344,11 +6366,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
     line = reason.lower()
     if line.startswith(("decision:", "gate:")):
         kind = "WaitingForUser"
-    elif line.startswith("blocked: waiting on ") and (
-        line.startswith("blocked: waiting on the showrunner")
-        or re.search(r"\bpeer\b", line) is not None
-        or re.match(r"blocked: waiting on (?:claude-|codex-|worker:|session:|codex:|uds:)", line) is not None
-    ):
+    elif line.startswith("blocked:"):
         kind = "WaitingForSupplier"
     else:
         return False
@@ -6356,6 +6374,9 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
+        if kind == "WaitingForSupplier" and isinstance(supplier, NoNamedSupplier) and re.search(r"\bpeer\b", line) is None:
+            # A block that names no supplier, in a run with no showrunner, waits on the user.
+            kind = "WaitingForUser"
         supplier_fields = _supplier_fields(supplier)
         marker_path = session_dir / "turn_wait.json"
         try:
@@ -6690,6 +6711,37 @@ def _close_interrupted_workers(passes: InterruptedWorkerPasses) -> None:
         print(f"anomaly: finish-phase: worker {identity}: pane retained: {' '.join(reason.splitlines())}", file=sys.stderr)
 
 
+def _paused_seconds(waits: Iterable[dict[str, object]], instance_id: str,
+                    started_at: float, finished_at: float, now: float) -> float:
+    """The time inside the phase that its user and supplier waits cover, counted once where they overlap.
+
+    An unclosed wait ends when it was marked unclosed; a wait still open ends now.
+    """
+    spans: list[tuple[float, float]] = []
+    for wait in waits:
+        if wait.get("phase_instance_id") != instance_id or wait.get("wait_kind") not in PAUSE_WAIT_KINDS:
+            continue
+        match wait.get("event_type"):
+            case "wait_started":
+                end = now
+            case "wait_finished":
+                end = _number((_object_dict(wait.get("wait_end")) or {}).get("epoch"), _number(wait.get("timestamp_epoch"), now))
+            case "wait_unclosed":
+                end = _number(wait.get("timestamp_epoch"), now)
+            case _:
+                continue
+        begin = max(started_at, _number(wait.get("wait_started_epoch"), end))
+        end = min(finished_at, end)
+        if end > begin:
+            spans.append((begin, end))
+    total, reached = 0.0, started_at
+    for begin, end in sorted(spans):
+        if end > reached:
+            total += end - max(begin, reached)
+            reached = end
+    return total
+
+
 def _finish_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
     # The run lock is already held. External starts use this same history lock,
     # through the cleanup scan and publication of phase_finished.
@@ -6730,12 +6782,15 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
             + f"({_iso_time(started_at)})"
         )
     instance_id = _string(phase.get("instance_id"))
-    for wait in _waits_by_id(_run_events(state)).values():
+    run_waits = list(_waits_by_id(_run_events(state)).values())
+    external_waits = [wait for wait in _waits_by_id(_external_wait_events()).values()
+                      if wait.get("run_id") == state.get("run_id")]
+    paused = _paused_seconds(itertools.chain(run_waits, external_waits), instance_id, started_at, finished_at, now)
+    for wait in run_waits:
         if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait(state, wait, now, unclosed=True)
-    for wait in _waits_by_id(_external_wait_events()).values():
-        if (wait.get("run_id") == state.get("run_id") and wait.get("phase_instance_id") == instance_id
-                and wait.get("event_type") == "wait_started"):
+    for wait in external_waits:
+        if wait.get("phase_instance_id") == instance_id and wait.get("event_type") == "wait_started":
             _end_wait({"history_file": str(_external_wait_file())}, wait, now, unclosed=True)
     # Every window this phase left open, one per team member: the launchers that
     # would have closed them are gone. A pass from before passes carried their
@@ -6756,6 +6811,7 @@ def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerP
     event["contract_revision"] = _contract_revision()
     event["status"] = status
     event["phase_elapsed_seconds"] = max(0, int(finished_at - started_at))
+    event["phase_active_seconds"] = max(0, int(finished_at - started_at - paused))
     if finished_at != now:
         event["recorded_at"] = _iso_time(now)
         event["backfilled"] = True
@@ -7035,6 +7091,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = wait_phase.add_argument("--worker-thread-id", default=argparse.SUPPRESS)
     _ = wait_phase.add_argument("--director", action="store_true")
     _ = wait_phase.add_argument("--phase-instance-id", default=argparse.SUPPRESS)
+    _ = wait_phase.add_argument("--target", default=argparse.SUPPRESS)
+    _ = start_wait.add_argument("--by", default="")
     _ = start_wait.add_argument("--missing-reason", default="")
     _ = start_wait.add_argument("--reason", default="")
     _ = start_wait.add_argument("--owner-session", default="")

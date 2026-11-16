@@ -23,17 +23,19 @@ TASK = re.compile(r"(?P<kind>run|phase|row|gate|until|landed):(?P<name>[A-Za-z0-
 
 @dataclass(frozen=True)
 class Registered:
+    """The copy registration holds its task and saved fields."""
     task: str
     fields: dict[str, object]
 
 
 @dataclass(frozen=True)
 class NotRegistered:
-    pass
+    """The copy has no registration record."""
 
 
 @dataclass(frozen=True)
 class UnreadableRecord:
+    """The reason explains why the copy registration record cannot be read."""
     reason: str
 
 

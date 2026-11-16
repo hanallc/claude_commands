@@ -12,15 +12,15 @@ from datetime import tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, final
 
-from scripts.build_queue.admission_records import PackageNotRecorded, PidNotRecorded, RunningStep, WaitingStep
+from scripts.build_queue.admission_records import PackageNotRecorded, RunningStep, WaitingStep
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget
+from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget, StepRoute, LocalRequired, PinnedTarget, MacOnly
 from scripts.direct import step_record
-from scripts.direct.step_selection import Pinned
 from scripts.message import unit_labels
 
 if TYPE_CHECKING:
     from scripts.mac_test import mac_test
+    from scripts.mac_test.claim_state import ClaimScope
 
 
 class TargetRow(TypedDict):
@@ -119,6 +119,15 @@ class FitUnreadable:
 TargetFit = Allowed | NotAllowed | FitUnreadable
 
 
+def mac_reason(fit: TargetFit | NoMacTarget) -> str:
+    """Format the Mac reason from the same decision as the target list."""
+    if isinstance(fit, Allowed):
+        return "Mac: " + fit.note
+    if isinstance(fit, (NotAllowed, FitUnreadable)):
+        return "Mac: no, " + fit.reason
+    return "Mac: no, no Mac target is configured"
+
+
 @final
 class MacRoutes:
     """Say, for each natedev step, whether it may run on the Mac, and why not."""
@@ -130,38 +139,34 @@ class MacRoutes:
         self.labels: Mapping[str, unit_labels.UnitLabels] = labels
         self.zone: tzinfo = zone
         self.policies: dict[tuple[str, str | PackageNotRecorded, str], TargetFit | None] = {}
-        self.records: dict[int, step_record.StepRecord] = {record.pid: record for record in step_record.live_records()}
+        self.scopes: dict[str, ClaimScope] = {}
 
     def route(self, step: WaitingStep | RunningStep) -> TargetFit | NoMacTarget:
-        """Read the recorded route before the live Mac state."""
-        record = self.records.get(step.pid) if not isinstance(step.pid, PidNotRecorded) else None
-        if record is None:
-            return NotAllowed("a direct cargo command runs where it starts")
-        if isinstance(record.runs_on, step_record.NatedevOnly):
-            reason = record.runs_on.reason
+        """Read the placement route before the live Mac state."""
+        return self.route_fit(step.route, step.step, step.folder, step.package)
+
+    def route_fit(self, route: StepRoute, step: str, folder: str,
+                  package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
+        """Apply the recorded route before the target policy and state."""
+        if isinstance(route, LocalRequired):
+            reason = route.reason
             if reason == "step writes the tree":
-                reason = f"{step.step} edits this checkout on natedev"
+                reason = f"{step} edits this checkout on natedev"
             elif reason == "linux_only":
-                reason = f"{step_record.package_name(record.package) or 'this workspace'} is Linux only"
+                reason = f"{package if isinstance(package, str) and package else 'this workspace'} is Linux only"
             return NotAllowed(reason)
-        if isinstance(record.selection, Pinned) and not record.runs_on.mac_targets:
-            return NotAllowed(f"this step is pinned to {record.selection.target}")
-        if record.runs_on.mac_targets:
+        if isinstance(route, PinnedTarget) and not self.is_mac(route.target):
+            return NotAllowed(f"this step is pinned to {route.target}")
+        if isinstance(route, (MacOnly, PinnedTarget)):
             mac = self.mac
-            fit = (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
-                   else FitUnreadable(mac.reason) if isinstance(mac, SnapshotsUnreadable) else mac)
-        else:
-            fit = self.fit(record.kind, str(record.repo), step_record.package_name(record.package))
-        return fit
+            return (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
+                    else FitUnreadable("Mac state unreadable, " + mac.reason)
+                    if isinstance(mac, SnapshotsUnreadable) else mac)
+        return self.fit(step, folder, package)
 
     def line(self, step: WaitingStep | RunningStep) -> str:
-        """Format the route reason for every page reader."""
-        fit = self.route(step)
-        if isinstance(fit, Allowed):
-            return "Mac: " + fit.note
-        if isinstance(fit, (NotAllowed, FitUnreadable)):
-            return "Mac: no, " + fit.reason
-        return "Mac: no, no Mac target is configured"
+        """Format the recorded route reason."""
+        return mac_reason(self.route(step))
 
     def fit(self, step: str, folder: str, package: str | PackageNotRecorded) -> TargetFit | NoMacTarget:
         mac = self.mac
@@ -202,17 +207,58 @@ class MacRoutes:
             self.policies[key] = fit
         return self.policies[key]
 
+    def is_mac(self, target: str) -> bool:
+        """Say whether a pinned target name is the Mac target."""
+        return isinstance(self.mac, targets.TargetSnapshot) and self.mac.target.name == target
+
     def blocked(self) -> bool:
         """The Mac card shows the block, so the idle alert omits its copy."""
         return isinstance(self.mac, targets.TargetSnapshot) and isinstance(self.mac.states[0], targets.Held)
 
+    def holds(self, folder: str) -> str:
+        """Name only what keeps this folder's repository off the Mac: a block, the Mac state or its own claim.
+
+        A Mac free for this repository gives "".
+        """
+        mac = self.mac
+        if isinstance(mac, SnapshotsUnreadable):
+            return "state unreadable, " + mac.reason
+        if isinstance(mac, NoMacTarget):
+            return ""
+        state = mac.states[0]
+        if isinstance(state, targets.Running):
+            jobs = self.repository_jobs(mac, folder)
+            return "busy with " + "; ".join(job.what for job in jobs) if jobs else ""
+        if isinstance(state, targets.StateUnreadable):
+            return "state unreadable, " + state.reason
+        if isinstance(state, targets.Held):
+            # The user, 2026-11-15: a block is a build hold that a unit put on the Mac, so say so.
+            text = f"build hold by {self.owner(state)} {targets.end_text(state.end, self.zone)}"
+            return text + (f" — {state.reason}" if state.reason else "")
+        fit = self.state_fit(state)
+        return fit.note if isinstance(fit, Allowed) and not isinstance(state, targets.Free) else ""
+
+    def repository_jobs(self, mac: targets.TargetSnapshot, folder: str) -> tuple[targets.RunningJob, ...]:
+        """The live claims that keep this repository off the Mac: its own claim and any whole Mac claim."""
+        from scripts.mac_test import mac_test
+
+        # Cost: target_claim_scope runs git once for each Mac-only waiting folder in each page reading,
+        # and only while the Mac runs a claim. self.scopes keeps one result for each folder in the reading.
+        if folder not in self.scopes:
+            self.scopes[folder] = mac_test.target_claim_scope(mac_test.state_paths(mac.target.name), folder)
+        scope = self.scopes[folder]
+        return tuple(targets.running_job(claim) for claim in mac.claims
+                     if mac_test.run_is_live(claim.record) and same_repository(claim.scope, scope))
+
+    def owner(self, state: targets.Held) -> str:
+        """The unit that holds a target, else its session, with the showrunner when known."""
+        identity = holder_labels(state, self.labels)
+        owner = identity.unit if identity.unit != "—" else identity.session
+        return owner + (f" ({identity.showrunner})" if identity.showrunner != "—" else "")
+
     def state_fit(self, state: targets.TargetState) -> TargetFit:
         if isinstance(state, targets.Held):
-            identity = holder_labels(state, self.labels)
-            owner = identity.unit if identity.unit != "—" else identity.session
-            if identity.showrunner != "—":
-                owner += f" ({identity.showrunner})"
-            return Allowed(f"blocked by {owner} {targets.end_text(state.end, self.zone)}")
+            return Allowed(f"blocked by {self.owner(state)} {targets.end_text(state.end, self.zone)}")
         if isinstance(state, targets.Running):
             return Allowed("busy with " + "; ".join(job.what for job in state.jobs))
         if isinstance(state, targets.Unreachable):
@@ -220,6 +266,17 @@ class MacRoutes:
         if isinstance(state, targets.StateUnreadable):
             return FitUnreadable("Mac state unreadable, " + state.reason)
         return Allowed("no block or claim recorded")
+
+
+def same_repository(claim: ClaimScope, step: ClaimScope) -> bool:
+    """A whole Mac scope matches every repository; a repository matches by key, else by name."""
+    from scripts.mac_test import mac_test
+
+    if not isinstance(claim, mac_test.RepositoryScope) or not isinstance(step, mac_test.RepositoryScope):
+        return True
+    if claim.key and step.key:
+        return claim.key == step.key
+    return claim.name == step.name
 
 
 def mac_claims(snapshots: Snapshots) -> Sequence[mac_test.HeldClaim]:

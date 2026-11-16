@@ -26,7 +26,7 @@ function tablePaneLifetimeHost() {
   let stateReadGate = { pending: Promise.resolve(), started: () => {}, armed: false };
   const services = {
     session: sessionFixture,
-    env: { get: async (name: string) => name === 'USER_ZONE' ? 'UTC' : HOME },
+    env: { get: async () => HOME },
     command: { register: async () => ({}) },
     ui: {
       open: async ({ id }: { id: string }) => { panes.add(id); return {}; },
@@ -54,7 +54,7 @@ function tablePaneLifetimeHost() {
     },
     process: { run: async (argv: string[]) => {
       runs.push(argv);
-      return { exitCode: 0, stdout: JSON.stringify({ accounts: [], problems: [] }),
+      return { exitCode: 0, stdout: JSON.stringify({ board: { columns: [], rows: [], stale_at: '2026-10-17T04:00:00+00:00' }, problems: [] }),
         stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
     } },
   } as unknown as EngineInterface;

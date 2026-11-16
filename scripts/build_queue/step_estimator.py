@@ -66,6 +66,9 @@ ANON_SHARE = 0.65
 
 HISTORY_DAYS = 14
 
+# Rows append when steps end. On 2026-11-15, 7 of 55,899 rows came late, by 19 minutes at most.
+LATE_ROW_MARGIN = timedelta(days=1)
+
 VERIFY_PACKAGE_PREDICATE = r"package\(([A-Za-z0-9_-]+)\)"
 
 VERIFY_NAME_PREDICATE = r"test\([A-Za-z0-9_:]+\)"
@@ -238,9 +241,45 @@ NO_BUILD_SHAPE = NoBuildShape()
 NO_STEP_EVIDENCE = StepEvidence(NO_BUILD_SHAPE, CompileCountUnknown())
 
 
-def anonymous_history_rows(path: Path) -> Iterator[dict[str, object]]:
-    """Read complete anonymous-history rows under a shared lock."""
-    return store.locked_rows(path)
+@dataclass(frozen=True)
+class HistoryWindow:
+    """Rows of one host and one of these names that ended at or after `start`."""
+    host: str
+    names: tuple[str, ...]
+    start: datetime
+
+
+@dataclass(frozen=True)
+class AllHistoryRows:
+    pass
+
+
+ALL_HISTORY_ROWS = AllHistoryRows()
+
+
+def anonymous_history_rows(path: Path, window: HistoryWindow | AllHistoryRows = ALL_HISTORY_ROWS
+                           ) -> Iterator[dict[str, object]]:
+    """Read complete anonymous-history rows under a shared lock; a window decodes only rows that can be in it."""
+    if isinstance(window, AllHistoryRows):
+        return store.locked_rows(path)
+    earliest = window.start - LATE_ROW_MARGIN
+
+    def reached(row: dict[str, object]) -> bool:
+        ended = row.get("ended_at")
+        try:
+            return not isinstance(ended, str) or datetime.fromisoformat(ended) >= earliest
+        except (ValueError, TypeError):
+            return True
+
+    # An ASCII name has one JSON spelling, so a row without it cannot match.
+    host = json.dumps(window.host).encode()
+    names = tuple(json.dumps(name).encode() for name in window.names)
+    exact = window.host.isascii() and all(name.isascii() for name in window.names)
+
+    def may_match(line: bytearray) -> bool:
+        return not exact or (host in line and any(name in line for name in names))
+
+    return store.locked_rows_in_order(path, reached, may_match)
 
 
 def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
@@ -250,7 +289,8 @@ def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
     """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
-    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+    for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl",
+                                      window=HistoryWindow(host, (program,), cutoff)):
         try:
             if row.get("host") != host or row.get("step") != program:
                 continue
@@ -412,7 +452,8 @@ def read_estimate_history(root: Path, host: str, steps: tuple[str, ...], now: da
     cutoff = now - timedelta(days=HISTORY_DAYS)
     rows: dict[str, list[dict[str, object]]] = {step: [] for step in steps}
     try:
-        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl",
+                                           window=HistoryWindow(host, steps, cutoff)):
             step = item.get("step")
             if item.get("host") != host or not isinstance(step, str) or step not in rows:
                 continue
@@ -828,12 +869,25 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     return NoFreshHistory()
 
 GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
+_GIT_IDENTITIES: dict[tuple[str, str], tuple[Repository, str]] = {}
+
+
+def clear_git_identity_cache() -> None:
+    """Clear identities after a test changes an origin or replaces a repository."""
+    _GIT_IDENTITIES.clear()
 
 
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
-    directory = record.git_directory(argv, cwd)
+    directory = os.path.abspath(record.git_directory(argv, cwd))
+    key = (directory, cwd)
+    if key not in _GIT_IDENTITIES:
+        _GIT_IDENTITIES[key] = _read_git_identity(directory, cwd)
+    return _GIT_IDENTITIES[key]
+
+
+def _read_git_identity(directory: str, cwd: str) -> tuple[Repository, str]:
     facts = record.git_facts(directory)
     worktree = Path(facts["worktree"] or cwd).name
     key = repository.repository_key(directory)

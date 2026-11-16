@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.copies import copies
 from scripts.lib.build_slots_test_support import private_slot_config
@@ -149,6 +150,7 @@ class VerifyDocFixture(unittest.TestCase):
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.executable(tools / name, "#!/bin/sh\nexit 99\n")
+        write_unconfigured_berth(tools)
         for name in ("tmp", "state", "cache", "runtime", "target", "session"):
             (self.root / name).mkdir()
         memory_environment = fake_memory_readings(self.root)
