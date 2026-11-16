@@ -76,7 +76,7 @@ class TopCost:
     window: WindowValue
     # One value for each whole day of the recent window, oldest first.
     days: tuple[ChartCost, ...]
-    share: cost_actions.LargestShare | None
+    share: cost_actions.LargestShare | cost_actions.NoShare
     action: cost_actions.CostAction
 
 
@@ -233,6 +233,26 @@ def known_seconds(value: ChartCost) -> float | None:
     if isinstance(value, MacIdleUpperBound):
         return value.known_seconds
     return None
+
+
+@dataclass(frozen=True)
+class DailyRange:
+    """The lowest and highest day of a cost, in hours."""
+    low_hours: float
+    high_hours: float
+
+
+class RangeUnavailable(StrEnum):
+    """A day is not fully measured, so a range would hide the unknown part."""
+    VALUE = "range unavailable"
+
+
+def daily_range(days: tuple[ChartCost, ...]) -> DailyRange | RangeUnavailable:
+    """The range of the days, only when every day is measured."""
+    measured = [day.seconds for day in days if isinstance(day, MeasuredCost)]
+    if not measured or len(measured) != len(days):
+        return RangeUnavailable.VALUE
+    return DailyRange(min(measured) / 3600, max(measured) / 3600)
 
 
 def window_value(recent: ChartCost, window: ChartCost, recent_days: int, days: int) -> WindowValue:

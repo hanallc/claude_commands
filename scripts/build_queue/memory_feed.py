@@ -1009,10 +1009,10 @@ def report_reading(days: int) -> ReportSections | charts.IndexUnavailable:
             for row in top.rows:
                 window: dict[str, object] = ({"state": "matches recent"} if isinstance(row.window, charts.WindowMatchesRecent)
                           else charts.cost_json(row.window.value, 3600))
-                measured = [seconds for seconds in map(charts.known_seconds, row.days) if seconds is not None]
+                span = charts.daily_range(row.days)
                 rows.append({"machine": row.machine, "cause": row.cause,
                              "recent": charts.cost_json(row.recent, 3600 * top.recent_days),
-                             "window": window, "range": list(cost_actions.daily_range(measured) or ()),
+                             "window": window, "range": [] if isinstance(span, charts.RangeUnavailable) else [span.low_hours, span.high_hours],
                              "share": cost_actions.share_text(row.share),
                              "action": cost_actions.action_text(row.action)})
         zone = user_zone()

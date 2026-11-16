@@ -2013,6 +2013,18 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["action"], "Action: lower the memory peak of fixture nextest. It holds the most build memory: "
                                         + "12 GiB·h/day, peak p90 3.0 GiB.")
 
+    def test_an_unmeasured_day_sends_no_range_and_no_share(self) -> None:
+        report = report_fixture()
+        assert not isinstance(report.top.rows, charts.NoDataYet)
+        row = replace(report.top.rows[0], share=cost_actions.NoShare.VALUE,
+                      days=(charts.MeasuredCost(30), charts.CostUnavailable("1 applicable waits missing")))
+        with (mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))),
+              mock.patch.object(admission_client, "view", return_value=captured_reading())):
+            page = memory_feed.reading()
+        sections = page["report"]
+        assert isinstance(sections, memory_feed.ReportSections)
+        self.assertEqual((sections.top[0]["range"], sections.top[0]["share"]), ([], ""))
+
     def test_report_failures_keep_the_queue_reading(self) -> None:
         for failure in (charts.IndexUnavailable("private index is missing"),
                         conf.Unusable("private report configuration is invalid")):

@@ -159,6 +159,34 @@ class PageDataTests(ChartFixture):
         self.assertEqual(values["cloud", "Failed runs"], cost_actions.FixTest("hana", "tests::flaky", 2))
         self.assertEqual(values["mac", "Failed runs"], cost_actions.FixStep(costs.StepKind("port", "clippy"), 1))
 
+    def test_an_excluded_nextest_failure_names_no_test(self) -> None:
+        failed = {"status": "failed", "duration_s": 1.0, "attempts": 1}
+        with closing(self.fixture.connection(
+            # A verify-mac nextest that exits 4 keeps its raw status without counting as a failure.
+            fixtures.build("excluded", 10, target="mac", repo="hana", caller="verify-mac", status=4, duration_s=600,
+                           tests=[{"binary": "hana", "test": "tests::excluded", **failed}]),
+            fixtures.build("lint", 30, target="mac", repo="port", step="clippy", status=1, duration_s=1800),
+        )):
+            values = {(row.machine, row.cause): row.action for row in self.rows(10)}
+        self.assertEqual(values["mac", "Failed runs"], cost_actions.FixStep(costs.StepKind("port", "clippy"), 1))
+
+    def test_a_range_needs_every_day_measured(self) -> None:
+        measured = charts.MeasuredCost(3600)
+        self.assertEqual(charts.daily_range((measured, charts.MeasuredCost(7200))), charts.DailyRange(1, 2))
+        for unmeasured in (charts.CostUnavailable("1 applicable waits missing"), charts.MacIdleUpperBound(0, 3600),
+                           charts.NoDataYet.VALUE):
+            with self.subTest(unmeasured=unmeasured):
+                self.assertEqual(charts.daily_range((measured, unmeasured)), charts.RangeUnavailable.VALUE)
+        self.assertEqual(charts.daily_range(()), charts.RangeUnavailable.VALUE)
+
+    def test_a_missing_wait_day_has_no_range_or_share(self) -> None:
+        with closing(self.fixture.connection(fixtures.build("unrecorded", 10, mem_wait_s=None, duration_s=600))):
+            row = self.rows(1)[0]
+        self.assertEqual((row.cause, row.recent), ("Memory wait", charts.CostUnavailable("1 applicable waits missing")))
+        self.assertEqual(charts.daily_range(row.days), charts.RangeUnavailable.VALUE)
+        self.assertEqual(row.share, cost_actions.NoShare.VALUE)
+        self.assertEqual(cost_actions.share_text(row.share), "")
+
     def test_a_cost_without_a_named_action_says_so(self) -> None:
         with closing(self.fixture.connection(fixtures.build("cold", 30, target="mac", crates_compiled=50, duration_s=1800))):
             row = self.rows(1)[0]
@@ -348,7 +376,8 @@ class ChartTests(ChartFixture):
         end = datetime(2026, 11, 2, 12, tzinfo=zone).astimezone(UTC)
         edges = charts.bucket_edges(start, end, zone)
         self.assertEqual([(b-a).total_seconds()/3600 for a,b in zip(edges, edges[1:])], [12, 25, 12])
-        reading = costs.CostReading((costs.CostContribution(edges[1].timestamp(), "cloud", "Memory wait", 90000),),
+        reading = costs.CostReading((costs.CostContribution(edges[1].timestamp(), "cloud", "Memory wait", 90000,
+                                                        costs.StepKind("hana", "nextest")),),
                                     (costs.SourceObservation(edges[1].timestamp(), "cloud"),), (), ())
         series = charts.build_series(reading, start, end, zone)
         self.assertEqual([b.thin for b in series.buckets], [True, False, True])

@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Literal, cast
 from pathlib import Path
 
@@ -139,14 +140,18 @@ def repository_name(folder: str | None, identity: str | None) -> str:
     return folder or ""
 
 
+class NoStep(StrEnum):
+    """A CI run pays its cost without a build step."""
+    VALUE = "no step"
+
+
 @dataclass(frozen=True)
 class CostContribution:
     at: float
     machine: str
     cause: Cause
     seconds: float | CostUnavailable
-    # The step that paid the cost; a CI run has none.
-    kind: StepKind | None = None
+    kind: StepKind | NoStep
 
 
 @dataclass(frozen=True)
@@ -365,7 +370,8 @@ def read_costs(connection: sqlite3.Connection, start: datetime, end: datetime, *
     for conclusion, seconds, at in ci_rows:
         observations.append(SourceObservation(at, "CI"))
         if conclusion in ("cancelled", "failure"):
-            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds)))
+            contributions.append(CostContribution(at, "CI", "Cancelled CI" if conclusion == "cancelled" else "Failed runs", max(0, seconds),
+                                                 NoStep.VALUE))
     sources = indexed_monthly_sources(connection)
     coverage = source_coverage(sources, observations)
     first_sources = first_source_times(connection, sources)
