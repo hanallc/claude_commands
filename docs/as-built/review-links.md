@@ -94,12 +94,12 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for AWS prices, Builds, Changes, Images and Questions, in alphabetical order.
+The left navigation has icons and labels for AWS, Builds, Changes, Images and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS prices, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
+AWS, Builds, Changes, Images, Questions and Rebuilds put the title in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -160,8 +160,8 @@ The server must not send `X-Frame-Options: DENY` or `frame-ancestors 'none'` for
 `change_page.questions_url` returns the same page with `?type=questions`.
 The Builds entry calls `memory_feed.page_url`.
 That function returns the configured Builds page URL without publishing a reading.
-The AWS prices entry calls `aws_page.page_url`.
-That function returns the AWS prices page URL without publishing the page.
+The AWS entry calls `aws_page.page_url`.
+That function returns the AWS page URL without publishing the page.
 
 The bottom-left rebuild link shows only while the Rebuilds page names a machine.
 `rebuilds.url` in `config/console.conf` names its URL function, `change_page.rebuilds_url`.
@@ -229,7 +229,7 @@ A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and includes every showrunner in the existing item order.
+All is the default and lists each root showrunner's queue in turn.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
@@ -338,7 +338,7 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Accounts page
 
-`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
 The server keeps the last good page and its render times under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
@@ -586,9 +586,17 @@ The selected type tab joins the content panel.
 Its keyboard focus outline stays inside the tab edges.
 Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
-The page keeps row entries during ordering and does not format the text that `/next` prints.
-The existing urgency order, pin, dependencies, and moved rows determine its order.
+Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
+The page shares its list reads and staff routing with `change_review.change_queue`.
+All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
+It keeps each root queue's pin, moved rows, and dependencies.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The server supplies each view's order for the first card, waiting list, and Skip for now.
+The browser uses these orders without sorting rows.
 Queue keys and prerequisites retain their list-based IDs.
 The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.

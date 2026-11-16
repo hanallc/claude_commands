@@ -366,6 +366,17 @@ Phase 142 is complete at `a266766ad`. Its aws pairs measured wait holder at 62.6
   - Completion condition: assess these before calling another module's production work irreducible. Keep source bytes, findings, uncertainty states and error results. Reuse immutable evidence only inside one explicit operation. Require unchanged selections before accepting a selector optimization.
   - Revealed by: architect after Phase 197.
 
+- [ ] **Dataclass creation cost at import.** Owner: natest (measure); queue-unit and the owners of the heavy modules (change). Later candidate (builds, 2026-11-15); no phase now.
+  - Target: fieldless frozen dataclass tags (about 1570 definitions in 257 files; `admission_records.py` 45, `placement.py` 21) and modules that import many dataclasses in short processes (`mac_test/offload.py` imports 83 ms, 75 own dataclasses).
+  - Why needed: Python 3.13 compiles the generated methods of each dataclass in every process: 0.14 ms for a fieldless frozen class, 0.34 ms with six fields; a subclass of one shared base costs 0.004 ms. Over the top 40 aws modules (probe `p307/dc_run.sh`, 2026-11-15): 3185 Python processes, 404.7 CPU s, 34.4 s (8.5%) creating dataclasses, 6.8 s of it fieldless tags. The offload modules spend 19-31% of their Python CPU on it. `admission_records` import is 60 ms, 54 ms dataclass processing; every record type is reachable from the admission_wire types, so lazy imports do not cut place-step.
+  - Candidates: one shared fieldless base for the queue tags (about 17 ms per verify flow, about 12 aws s, queue-owned files); per-program import cuts in the offload commands.
+  - Completion condition: measure each candidate on its callers before a phase; a shared base keeps equality, hash, repr, `is_dataclass` and frozen behavior.
+  - Revealed by: phase 307 design probe (fix 1 of the verify flow cost plan).
+
+- [ ] **copies.py reads each source fact once per operation.** Owner: natest (measure); the unit whose open branch changes `copies.py` (change). Later candidate (builds, 2026-11-15): declined while queue's build-folders phase 4 rewrites `copies.py`.
+  - Why needed: git probe `p312` at `4f1692a05`: a git read whose exact argv repeats on the same repository with no write between is 2,995 of 19,987 git starts in `style/test_crate_run.py` (15%) and 265 of 6,226 in `production/test_fast_track.py` (4%). Sources: `refresh_remotes` reads `origin_url` and source refs again, `commit_at` repeats, and `workspace()` refreshes at entry and exit. About 1 ms per git start; about 2-3 aws s on crate_run.
+  - Completion condition: after queue phase 4 merges, check the new `copies.py` for repeat reads; pass each value down in one operation, never a process-level cache.
+
 ## Floors
 
 Each floor row states its measurement conditions: revision, filesystem roots and bytecode cache (showrunner, 2026-11-09). Compare a gate reading with a floor only under the same conditions. The older rows are wall floors from before 2026-11-06, not CPU floors. A wall floor does not hold a module back when its CPU rank calls it and direct calls were not tried. The `direct/test_verify*` rows go to the batches.

@@ -29,7 +29,11 @@ A task, and what ends it:
     With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
     Old deadline tasks without an id remain valid.
 
-A folder lives in ROOT (build_folders.conf roots.scratch) as `<kind>-<name>-<word>-<suffix>`. An until:
+A folder of a caller with a session folder (scripts/lib/session_folder.py) lives there as `<word>`, else
+`<kind>-<name>` from its task, else `scratch`, with `-2`, `-3` and so on when the name is taken (user
+decision 6, 2026-11-15). Its path is in the HOLDS file with its task, so `end` finds it; an until:
+folder is not held and goes with its session's other content. Any other folder lives in ROOT
+(build_folders.conf roots.scratch) as `<kind>-<name>-<word>-<suffix>`. An until:
 task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its record keeps the time.
 scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
@@ -81,7 +85,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.lib import cargo_output, conf, copy_record, git_files  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
@@ -606,12 +610,43 @@ def target(task: str, word: str, visible: bool, *,
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
-    suffix = random_suffix(scratch_settings)
     # The record keeps an until: task's time, so its folder name holds only the word.
     slug = "" if match["kind"] == "until" else f"{match['kind']}-{match['name'].replace('/', '-')}"
+    folder = session_folder.caller_folder()
+    if folder is not None:
+        return free_name(folder, word or slug or "scratch")
+    suffix = random_suffix(scratch_settings)
     purpose = "-".join(part for part in (slug, word) if part) or "scratch"
     return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=len(suffix),
                                             purpose=purpose, suffix=suffix))
+
+
+def free_name(folder: Path, name: str) -> Path:
+    """The first of `name`, `name-2`, `name-3` ... that is free in the session folder; `run` is never free."""
+    number = 1
+    while True:
+        path = folder / (name if number == 1 else f"{name}-{number}")
+        if path.name != session_folder.RUN and not os.path.lexists(path):
+            return path
+        number += 1
+
+
+def in_session_folder(path: Path) -> bool:
+    root = session_folder.session_root()
+    return root is not None and path.parent.parent == root
+
+
+def held_in_session(path: Path, task: str) -> bool:
+    """Whether a new folder is in a session folder and has a task that ends it there."""
+    return in_session_folder(path) and checked_task(task, False)["kind"] != "until"
+
+
+def index_in_session(path: Path, task: str, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    """Hold a session folder's task folder, so `end` finds it without a scan."""
+    if held_in_session(path, task):
+        _ = hold(path, task, "scratch folder in the session folder", scratch_settings=scratch_settings)
 
 
 def maker() -> str:
@@ -649,11 +684,19 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
         scratch_settings = conf.read("scratch")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
-    path = target(task, word, visible, scratch_settings=scratch_settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.mkdir()
+    while True:
+        path = target(task, word, visible, scratch_settings=scratch_settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir()
+            break
+        except FileExistsError:
+            # Another call took the free name in the session folder first; take the next one.
+            if not in_session_folder(path):
+                raise
     try:
         write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+        index_in_session(path, task, scratch_settings=scratch_settings)
     except BaseException:
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -715,6 +758,7 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = shutil.move(str(source), str(path))
     write_record(path, task, moment, scratch_settings=scratch_settings)
+    index_in_session(path, task, scratch_settings=scratch_settings)
     return path
 
 

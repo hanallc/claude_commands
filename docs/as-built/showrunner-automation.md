@@ -184,10 +184,10 @@ The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/un
 a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
 else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
 Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
-`unit_phases.queued_text` preserves the item text and appends its dependency state.
-Satisfied work says `Ready: <work> is on the local copy of main.`
-Unmet work says `After <work>: <state>.`
-Submitted work without a merge record says `submitted; absent from the merge line; reason not recorded`.
+`unit_phases.queued_text` cleans the title and supplies its dependency state.
+Satisfied work says `Ready`.
+Unmet work says `After <dep>; <short state>`.
+A checkpoint outside the merge line gives the dependency state `not in the merge line`.
 An open dependency says `started`; an unstarted dependency says `not started`.
 A missing dependency says `dependency not found locally`.
 `done` removes the first item.
@@ -768,14 +768,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Now names the current task and its recorded worker, director action, resource wait, or merge state.
     The open phase takes priority over merge tasks for Now.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
-    No row has an empty Work cell.
+    No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
     Every remaining queue entry and plan phase has its own Later row and dependency state.
     Queue text uses the description after its first colon as the title and the prefix as the ID.
-    `queue_title` drops notes in parentheses and each clause after the first semicolon.
+    `queue_title` removes balanced notes, including nested notes, and clauses after the first semicolon, with or without a colon.
+    If cleanup leaves no title, the board uses the entry text with single spaces.
     `capitalized` gives a capital only to a plain lowercase first word; file names and IDs stay as written.
     A matching finished activity produces a queue conflict instead of an unstarted claim.
     Missing next work uses `Not recorded` and `The director has not chosen the next task`.
@@ -789,19 +790,31 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Unresolved attempts say `Stopped; reason not recorded` when the stop event supplies no reason.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
+    `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
+    A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
+    Without a production name, the text ends with `not in the merge line`.
     A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
     A phase's shrink and repair items have no separate rows.
     The phase's live state takes priority over older failures from those items.
     Merge grouping and bucket evidence retain the existing shared merge view.
     Resource waits preserve the resource and holder; unit waits preserve the actor, condition, and target.
+    A resource wait held by the same unit counts as working.
+    A resource wait held by another unit, or without a recorded holder, counts as waiting on other work.
     Phase ETA text retains its first-task placement and the production time zone.
     Dependencies use local `origin/main` without a fetch.
-    Phase titles come from plan and dependency run records already in the command caches.
-    Local dependencies use their IDs, with `phase` before a numeric ID.
-    A local queue dependency adds `to merge`; `phase_reference` builds the ID text.
-    External merge dependencies use `Waits for <unit> to merge: <title>`.
-    Without a title, they use `Waits for <unit> phase <id> to merge`.
-    Other dependencies omit `to merge`.
+    Queue and plan dependencies use `After <dep>; <short state>`.
+    Queue and plan dependencies share `wait_state` and `dependency_state_text`, including main checks and recorded holds.
+    Plan references to this unit lose their unit prefix before the completed-phase filter.
+    A queue dependency on main uses `Ready`; a plan dependency on main has no wait.
+    A dependency outside the merge line says `not in the merge line`.
+    A local dependency uses its ID, with `phase` before a numeric ID.
+    An external dependency uses `<unit> phase <id>` without its title.
+    A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+    A git ref that is not hexadecimal, with or without `/`, uses `After branch <name>; <short state>`.
+    A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
+    Recorded unit waits and plan `waits_for` conditions retain their text.
+    With no current task, the first blocked pending task supplies Now with its own Work and State.
+    Next and Later contain only the remaining tasks, so they do not repeat that wait.
     The board adds no reads for historical outcomes, titles, or finished queue activities.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
     Other productions use it for units named in their `Style units` table.
@@ -853,7 +866,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
 - **Open proposals table (`proposals_table.py [--production <showrunner name>]`, `/showrunner:proposals`, user 2026-10-12).** Prints one Markdown table, `| Proposed by | Proposal | Date | State |`, of every proposal still open for the user. It reads only, and finds the doc as the units table does. Three sources, in this order:
   - **Issues** (2026-10-15, replacing the `proposals/index.md` table and the `docs/plans/proposal-*.md` scan): each `*.md` directly in the issues folder that the optional `- **Proposals:**` line names, of the production doc only (`proposals_folder.scope_docs`; the productions below list their own, user 2026-10-27), a file read once (`issues_folder`; a relative folder is taken from the showrunner checkout; without the line there are no issue rows). Subfolders hold research notes and are not read. `issues.py` reads the frontmatter between the leading `---` lines, a list inline (`[issue, proposal]`) or as `- item` lines, and strips quotes and a wiki link's brackets, keeping its alias over its target (`"[[2026-10-09]]"` reads `2026-10-09`). A row shows while `status` is `open` and `tags` holds `proposal`; rows sort by `date_created`. Proposed by is `proposed_by`, else `—`; the Proposal is the file's name; the Date is `date_created`.
   - **The plan backlog**: each line ending `proposed` or `deferred` of the ledger the `- **Improvement queue:**` line names (`proposals_folder.ledger`), for the doc only (user 2026-10-27); a production with no such line has no backlog rows. A file a line names is beside its ledger. The proposer is the `Proposed <date> by <who>` words of the file the line names, else `plan backlog`. Proposed lines join the issues waiting for review in `/next proposal` and the For-you proposals count; accepted and deferred lines do not count.
-  - **Add-ons**: each top-level entry of `next_items_pending.md` in `/tmp/claude/unit/<run id>/` or `/tmp/claude/delegate/<run id>/`, for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
+  - **Add-ons**: each top-level entry of `next_items_pending.md` in `<run root>/<run id>/` for each run root `unit_runs.run_roots()` reads at use (`/session/<name>/run`, `/tmp/claude/unit`, `/tmp/claude/delegate`), for every run of the unit's plan (`plan_history.plan_runs`), with the list's last change as its date. A plan that has moved to `docs/as-built` is also looked up under `docs/plans`, the path its runs recorded. An entry's text is its `Title:` line, else its bold lead, else the words after its action word, else the first sentence of its `Proposed`, `Need`, `Why needed` or `Why` line. An action word alone (`add`, `change`, `remove`) is never the text (user 2026-10-12, after two rows read `add`).
 
   **State** says what the user can do, never a bare `next` (user 2026-10-12: "next after what?"). An issue that `proposal_issue.proposal_progress` reads as `InProgress` (its approval is recorded, or it has no answer and its `stage` is `active`) reads `in progress by <unit>` (`in progress` with no `unit`); else `waiting for your review`, as does a backlog line marked proposed. The waiting rows (issues and proposed backlog lines) come first in `scripts/lib/urgency.py` order (level from `review_urgency`, value the score of the proposed stars, prerequisite the first `depends_on`), then the in-progress ones, oldest first. A deferred backlog line reads `deferred until you ask for it`. An add-on is the showrunner's to settle (user 2026-10-12, below), so it reads `the showrunner decides: build, save for later, or drop`: the unit sends its add-ons to the showrunner, which answers `current`, `next` or `drop` for each.
 

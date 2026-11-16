@@ -9,6 +9,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
 from scripts.agents import remote
+from scripts.copies.copies_test_support import copies_environment
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -424,7 +425,8 @@ class MergeGateFixture(unittest.TestCase):
         home = self.root / "home"
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
+            "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -448,7 +450,8 @@ class MergeGateFixture(unittest.TestCase):
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
-        self.environment.update(fake_memory_readings(readings))
+        self.environment.update({key: value for key, value in fake_memory_readings(readings).items()
+                                 if key != "CONF_DIR"})
         self.environment.update({
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),

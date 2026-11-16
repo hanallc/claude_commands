@@ -175,6 +175,7 @@ class SnapshotCodecTests(unittest.TestCase):
             explanation=replace(reading.explanation, running=tuple(
                 records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0)
                 for step in (local, remote))))
+        self.assertFalse(hasattr(reading.explanation.decided_from, "override"))
         waiting = wait_reply(records.NeedsMemory())
         waiting = replace(waiting, snapshot=replace(waiting.snapshot, running=(local, remote)))
         replies = (wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading), waiting)

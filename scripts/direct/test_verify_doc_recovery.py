@@ -6,12 +6,14 @@ from pathlib import Path
 import unittest
 
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VerifyDocFixture
+from scripts.lib import build_folders
 
 
 class VerifyDocRecoveryTests(VerifyDocFixture):
     def test_doc_replaces_a_checkout_with_a_missing_or_damaged_private_index(self) -> None:
         probe = '''
-    index = Path(".git/index")
+    index = Path(subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-path", "index"],
+                                capture_output=True, text=True, check=True).stdout.strip())
     assert index.is_file()
     damage = os.environ.get("TEST_DOC_INDEX_DAMAGE")
     if damage:
@@ -30,13 +32,15 @@ class VerifyDocRecoveryTests(VerifyDocFixture):
                 before = self.verify()
                 self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
                 checkout = Path(self.cargo_calls()[-1]["cwd"])
-                self.assertFalse(checkout.exists())
+                self.assertTrue(checkout.exists())
+                self.assertEqual(build_folders.build_folder_state(checkout), "free")
                 del self.environment["TEST_DOC_INDEX_DAMAGE"]
                 result = self.verify()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 call = self.cargo_calls()[-1]
-                self.assertNotEqual(call["cwd"], str(checkout))
-                self.assertFalse(Path(call["cwd"]).exists())
+                self.assertEqual(call["cwd"], str(checkout))
+                self.assertTrue(Path(call["cwd"]).exists())
+                self.assertEqual(build_folders.build_folder_state(Path(call["cwd"])), "free")
                 self.assertEqual(call["sources"]["beta/src/lib.rs"], "pub fn value() {}\n")
 
 

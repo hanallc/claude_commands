@@ -76,7 +76,6 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
         # Only the message transport uses a private fixture.
         with patch.dict(os.environ, environment, clear=True), \
                 isolated_staff_file(fixture.root / "staff.json", environment), \
-                patch.object(detached_runs, "RUN_ROOTS", (fixture.root,)), \
                 patch.object(subprocess, "Popen", side_effect=capture), \
                 contextlib.chdir(fixture.workspace), contextlib.redirect_stdout(io.StringIO()) as output:
             parent = unit_membership("fixture", identity)

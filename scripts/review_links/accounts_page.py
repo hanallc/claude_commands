@@ -1,4 +1,4 @@
-"""Render the console's Accounts page: the accounts board that /showrunner:accounts shows."""
+"""Render the accounts board on the Hana console Accounts page."""
 from __future__ import annotations
 
 from dataclasses import dataclass

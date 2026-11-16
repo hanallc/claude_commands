@@ -16,7 +16,7 @@ Omit the package for the whole workspace. Give at most one positional word after
 | phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
 | staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
 | example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
-| build a binary or example | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
+| build a binary or example on any eligible target | `bash ~/.claude/scripts/direct/verify.sh build [<package>] [--bin <name> \| --example <name>]` |
 | final gate | `bash ~/.claude/scripts/direct/verify.sh final [<package>]` |
 | read a saved workspace gate pass | `bash ~/.claude/scripts/direct/verify.sh final --saved [--tree <tree>]` |
 
@@ -34,8 +34,9 @@ With `--name` and no package, the example's member supplies its required feature
 `final` checks the whole workspace. A named package limits its nextest run and
 prevents a saved pass. `--tree` requires `--saved`.
 
-Use `--local` only for a test that cannot pass on macOS. A reservation reason
-is refused. Use `/build:mac block <why>` for a Mac hold.
+Builds can run on any eligible target. A remote build prints `binary: <target>:<path>`.
+Use `--local "<why>"` for a Linux-only test or a binary that must run on natedev.
+Name the Linux requirement or the local launch. A reservation reason is refused. Use `/build:mac block <why>` for a Mac hold.
 Before CI, either machine can answer a test, including merge gates.
 
 Rules:

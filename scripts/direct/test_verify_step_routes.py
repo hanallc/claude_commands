@@ -29,7 +29,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
     def test_natedev_only_waits_for_release_before_running(self) -> None:
         # A check is natedev_only only through --local; linux_only never keeps a check off the Mac.
         self.fixture.environment["TEST_MAC_ALLOWED"] = "0"
-        result = self.run_verify("check", "sample", "--local", "makes natedev artifacts")
+        result = self.run_verify("check", "sample", "--local", "creates a Linux install")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [cast(dict[str, object], json.loads(line))["command"] for line in self.events.read_text().splitlines()]
         self.assertTrue(self.fixture.local_waits)

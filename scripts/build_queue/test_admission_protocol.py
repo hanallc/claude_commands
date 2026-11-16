@@ -20,12 +20,10 @@ import sys
 import unittest
 from typing import Literal, cast
 from unittest import mock
-from zoneinfo import ZoneInfo
 
-from scripts.lib.build_steps import read_step_names
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
@@ -360,10 +358,9 @@ class ProtocolTests(unittest.TestCase):
                 parsed = wire.parse_reply(wire.encode_reply(reply))
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
-                shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
-                self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
-                self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
+                current = parsed.reading.view.running[0].measured
+                self.assertEqual(current, memory)
+
 
     def test_main_display_fields_and_diagnostics_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
@@ -462,7 +459,6 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
-                wire.AdmitHeadRequest("head", "urgent", "actor"),
                 wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
@@ -588,15 +584,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation, local)
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), records.EstimateExpired)
-            zone = ZoneInfo("UTC")
-            names = read_step_names()
-            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
-            self.assertEqual(shown,
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
-            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, records.HeadExplanation)
             assert isinstance(local.head.cause, records.EstimateExpired)
             assert isinstance(parsed.explanation.head, records.HeadExplanation)
             assert isinstance(parsed.explanation.head.cause, records.EstimateExpired)
-            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.cause, zone),
-                             queue_evidence.estimate_refresh_text(local.head.cause, zone))
+            self.assertEqual(parsed.explanation.head.cause, local.head.cause)

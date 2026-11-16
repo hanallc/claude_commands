@@ -11,6 +11,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lib.build_folders_test_support import tool_folders
 
 import json
 import os
@@ -1257,7 +1258,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
+        private = copies_environment(self.root)
+        configuration = Path(self.environment["CONF_DIR"])
+        if configuration != Path(private["CONF_DIR"]):
+            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
@@ -1632,7 +1637,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         from scripts.build_queue import admission_client
 
         def delivered() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+            for path in (wait for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for wait in hold.glob("placement-*.json.wait")):
                 try:
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                 except (OSError, ValueError):
@@ -1693,7 +1699,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                   for saved in admission.server.assignments.values()),
                         "a settled remote attempt", (process,))
         def delivered_retry_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):

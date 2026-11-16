@@ -42,12 +42,12 @@ Its rows use the same cached plan and run records as the Progress bar.
 A busy session does not prove a task.
 Each current task has one row.
 Several actors share its State cell, joined by semicolons; equal states appear once.
-No row has an empty Work cell.
+No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
 The open phase supplies Now before any merge task.
 Without current activity, State names the missing step and the latest finished step with its recorded time.
 A queue entry uses `<title after the colon> (<id before the colon>)`.
-A queue entry without a colon keeps its full text.
-A queue title drops its notes in parentheses and each clause after its first semicolon.
+With or without a colon, title cleanup removes balanced notes, including nested notes, and clauses after the first semicolon.
+If cleanup leaves no title, the board uses the entry text with single spaces.
 A title that starts with a plain lowercase word gets a capital; file names and IDs stay as written.
 A finished activity that matches the queue ID produces a conflict row; the board does not remove the entry.
 An unknown next task uses `Next | Not recorded | The director has not chosen the next task`.
@@ -55,20 +55,30 @@ Only a readable plan with every phase done permits `Nothing queued; the plan is 
 Absent, unreadable, and readable empty plans remain separate facts.
 
 Merge rows name each phase title and its live rank, active merge, or short failure cause.
+A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
+Without a production name, the text ends with `not in the merge line`.
 A second phase in the same merge uses `Merges with <id>`, or `Merges with phase <id>` for a numeric ID.
 The board omits a phase's shrink and repair merge items.
 The phase's live state takes priority over older failures from those items.
-Local dependencies use `Waits for <id>`, or `Waits for phase <id>` for a numeric ID.
-A queue dependency is a merge condition, so a local queue dependency adds `to merge`.
-External merge dependencies use `Waits for <unit> to merge: <title>`.
-Without a title, they use `Waits for <unit> phase <id> to merge`.
-Other dependencies omit `to merge`.
+Queue and plan dependencies use `After <dep>; <short state>`.
+A queue dependency on main uses `Ready`; a plan dependency on main or a completed local phase has no wait.
+Dependencies outside the merge line say `not in the merge line`.
+A local dependency uses its ID, with `phase` before a numeric ID.
+An external dependency uses `<unit> phase <id>` without its title.
+A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+A branch dependency uses `After branch <name>; <short state>`.
+A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
+Recorded unit waits and plan `waits_for` conditions retain their text.
+With no current task, the first blocked pending task supplies Now with its own Work and State.
+Next and Later contain only the remaining tasks, so they do not repeat that wait.
 Stopped attempts resolve only through a later completed attempt with the same plan scope and phase ID.
 An explicit completion title can name the unit that finished the work.
 The board does not infer replacements from equal titles.
 
 Recorded unit waits retain their actor, condition, and target.
 Resource waits retain the resource and holder.
+A resource wait held by the same unit counts as working.
+A resource wait held by another unit, or without a recorded holder, counts as waiting on other work.
 The board preserves phase ETA text and uses the production time zone.
 Staff, run, plan, queue, dependency, ancestry, and merge reads share command caches.
 The board adds no reads to obtain task titles or stopped outcomes.

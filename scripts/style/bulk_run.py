@@ -57,7 +57,7 @@ class Runner(Protocol):
 
 def run_command(repo: Path, arguments: Sequence[str]) -> CommandResult:
     result = (bulk.cargo_output(repo, arguments) if arguments and Path(arguments[0]).name == "cargo"
-              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False))
+              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get()))
     return CommandResult(result.returncode, result.stdout, result.stderr)
 
 

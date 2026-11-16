@@ -300,6 +300,7 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(rendered.count("| Unit |"), 1)
                 self.assertIn("**wide** — working\n\n| Item | Work | State |\n", blocks)
                 self.assertGreater(sum(line.startswith("| Now |") for line in blocks.splitlines()), 1)
+                self.assertTrue(any(line.startswith("| Now |  | ") for line in blocks.splitlines()))
                 for text in ("in work", "merged today", "fix rounds", "Non-Phase Work", "nothing open",
                              "Workers |", "…"):
                     self.assertNotIn(text, rendered)
@@ -466,6 +467,10 @@ class UnitPhasesTests(unittest.TestCase):
             ("acctchooser: swatch and picker popup on the console Accounts page (Try, Save, Cancel); Save through tune.change",
              "Swatch and picker popup on the console Accounts page (acctchooser)"),
             ("Review delivery", "Review delivery"),
+            ("(note)", "(note)"),
+            ("  (only   note)  ", "(only note)"),
+            ("task (outer (inner) note); extra", "Task"),
+            ("queue: task (outer (inner) note); extra", "Task (queue)"),
         ]
         for text, work in cases:
             with self.subTest(text=text):
@@ -473,6 +478,7 @@ class UnitPhasesTests(unittest.TestCase):
                 item = unit_phases.queued_text(unit_queue.QueuedItem(text), None, land,
                                                now=0, zone=ZoneInfo("America/New_York"))
                 self.assertEqual(item, unit_phases.WorkItem(work, "Ready"))
+                self.assertTrue(item.work)
 
     def test_no_task_is_shown_once_its_step_or_phase_has_closed(self) -> None:
         member = self.member("closed")
@@ -570,6 +576,37 @@ class UnitPhasesTests(unittest.TestCase):
                 view = unit_phases.census_view(read)
                 self.assertEqual(unit_phases.census_status(view, selected), expected)
 
+    def test_resource_waits_held_by_the_same_unit_count_as_working(self) -> None:
+        member = self.member("style")
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        for resource in ("memory", "slot"):
+            for worker_wait in (False, True):
+                for holder, bucket, label in (
+                        ({"state": "UnitHolder", "unit": "style"}, "working", "style"),
+                        ({"state": "SessionHolder", "session_id": member.current_session}, "working", "style"),
+                        ({"state": "UnitHolder", "unit": "builder"}, "waiting on other work", "builder"),
+                        ({}, "waiting on other work", "")):
+                    with self.subTest(resource=resource, worker=worker_wait, holder=holder):
+                        tail = [self.phase_event("pass_started", "work", pass_instance_id="test",
+                                                 pass_kind="test", worker_id="tester-id")] if worker_wait else []
+                        tail.append(self.phase_event("wait_started", "work", wait_id="resource", wait_kind=resource,
+                            wait_reason="memory admission" if resource == "memory" else "build queue",
+                            pass_instance_id="test" if worker_wait else "", wait_started_epoch=now - 120,
+                            holder={"state": "NamedHolder", "resource_kind": resource, "resource": "build", "holder": holder}))
+                        _ = self.write_run(member, "resource-wait", [("work", "Check delivery")], tail)
+                        read = tiles(workers=[census_worker("tester", member.id, status="idle")] if worker_wait else [],
+                            sessions=[census.CensusSession(member.current_session, "idle",
+                                () if worker_wait else (census.CensusShell("Build delivery", now - 120),))])
+                        rendered = unit_phases.table([unit("style", live("style"))], {}, now=now,
+                                                     zone=ZoneInfo("UTC"), census_read=read)
+                        self.assertIn(f"**style** — {bucket}", rendered)
+                        self.assertIn("working 1" if bucket == "working" else "waiting on other work 1", rendered.splitlines()[0])
+                        state = (f"Needs build memory in use by {label}" if resource == "memory"
+                                 else f"Waits for a build slot used by {label}") if label else (
+                                     "Waits for memory admission; holder not recorded" if resource == "memory"
+                                     else "Waits for build queue; holder not recorded")
+                        self.assertIn(("Now", "Check delivery (work)", state + "; since 17:58"), detail_rows(rendered, "style"))
+
     def test_notes_name_background_commands_and_a_sent_checkpoint(self) -> None:
         member = self.member("shells")
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
@@ -621,7 +658,7 @@ class UnitPhasesTests(unittest.TestCase):
             (land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {}), "Merge position not recorded"),
             (land_queue.LandView({"c" * 9: "shells images"}, {}, {}, frozenset(), {}), "sdlc merges it now"),
             (land_queue.LandView({"d" * 40: "other first"}, {}, {}, frozenset(), {}),
-             "Merge submission not in the merge line; reason not recorded"),
+             "Checkpoint ccccccccc at time not recorded; not in sdlc's merge line"),
             (land_queue.LandView({}, second, {}, frozenset(), {}), "2nd in sdlc's merge line"),
             (land_queue.LandView({}, second, {"c" * 40: failed}, frozenset(), {}),
              "2nd in sdlc's merge line"),
@@ -651,6 +688,36 @@ class UnitPhasesTests(unittest.TestCase):
             with self.subTest(restarted=kind):
                 self.assertIsInstance(unit_phases.phase_sent_work([*events, {"event_type": kind}]), unit_phases.NoSentWork)
         self.assertIsInstance(unit_phases.phase_sent_work(events[:2]), unit_phases.NoSentWork)
+
+    def test_checkpoint_outside_the_merge_line_names_its_hash_and_recorded_time(self) -> None:
+        member = self.member("devtools")
+        commit = "e34ccac01" + "2" * 31
+        now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
+        at = datetime(2026, 11, 15, 17, 20, tzinfo=UTC).timestamp()
+        view = land_queue.LandView({}, {}, {}, frozenset(), {})
+        for zone, recorded, expected in (
+                ("UTC", at, "17:20"), ("America/New_York", at, "12:20"),
+                ("America/New_York", at - 14 * 3600, "2026-11-14 22:20")):
+            with self.subTest(zone=zone, recorded=recorded):
+                path = self.write_run(member, "checkpoint", [("acctload", "Load the account")], [
+                    self.phase_event("checkpoint", "acctload", checkpoint_commit="a" * 40, timestamp_epoch=at - 86400),
+                    self.phase_event("checkpoint", "acctload", checkpoint_commit=commit, timestamp_epoch=recorded)])
+                with (patch.object(land_queue, "land_view", return_value=view),
+                      patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads):
+                    rendered = unit_phases.table([unit(member.name, live(member.name))], {}, now=now,
+                        zone=ZoneInfo(zone), columns=1000, census_read=tiles(sessions=[session_of(member, "idle")]))
+                self.assertIn(("Now", "Load the account (acctload)",
+                               f"Checkpoint e34ccac01 at {expected}; not in sdlc's merge line"),
+                              detail_rows(rendered, member.name))
+                self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+                self.assertNotIn("Merge submission", rendered)
+        sent = unit_phases.phase_sent_work([
+            {"event_type": "checkpoint", "checkpoint_commit": commit, "timestamp_epoch": at}])
+        self.assertEqual(sent, unit_phases.SentCommit(commit, at))
+        result = unit_phases.unit_lands("devtools", view, open_sent={"acctload": sent},
+                                       now=now, zone=ZoneInfo("UTC"), on_main=lambda _: False)
+        self.assertEqual(result.entries, (unit_phases.WorkItem("Acctload",
+                         "Checkpoint e34ccac01 at 17:20; not in the merge line"),))
 
     def test_eta_uses_the_latest_promise_and_local_calendar_time(self) -> None:
         member = self.member("eta")
@@ -766,20 +833,20 @@ class UnitPhasesTests(unittest.TestCase):
               patch.object(waits_on, "state", wraps=waits_on.state) as dependencies):
             rendered = self.blocks([member], {})
         rows = detail_rows(rendered, "next")
-        self.assertIn(("Next", "Review next", "Waits for future to merge"), rows)
+        self.assertIn(("Next", "Review next", "After future; not started"), rows)
         self.assertIn(("Later 1", "Clean records", "Ready"), rows)
         self.assertIn(("Later 2", "Ready work", "Ready"), rows)
-        self.assertIn(("Later 3", "After submission", "Waits for dependency to merge: Submitted work"), rows)
-        self.assertIn(("Later 4", "After open work", "Waits for dependency to merge: Open work"), rows)
-        self.assertIn(("Later 5", "After unknown work", "Waits for missing-ref to merge"), rows)
-        self.assertIn(("Later 6", "After branch", "Waits for pending-branch to merge"), rows)
-        self.assertIn(("Later 7", "Later work (2)", "Waits for phase 1"), rows)
+        self.assertIn(("Later 3", "After submission", "After dependency phase sent; not in the merge line"), rows)
+        self.assertIn(("Later 4", "After open work", "After dependency phase open; started"), rows)
+        self.assertIn(("Later 5", "After unknown work", "After missing-ref; dependency not found locally"), rows)
+        self.assertIn(("Later 6", "After branch", "After branch pending-branch; absent from the local copy of main"), rows)
+        self.assertIn(("Later 7", "Later work (2)", "After phase 1; started"), rows)
         self.assertIn(("Later 8", "Last work (3)", "Waits for " + waiting.strip()), rows)
         self.assertNotIn("Then 3", rendered)
         self.assertEqual([row.work for row in rows if row.item.startswith("Later")][-2:],
                          ["Later work (2)", "Last work (3)"])
         self.assertEqual(queues.call_count, 1)
-        self.assertEqual(dependencies.call_count, 6)
+        self.assertEqual(dependencies.call_count, 7)
         self.assertEqual(sum(call.args[0] == plan for call in opened.call_args_list), 1)
 
         for submitted, blocked_first, bucket in (
@@ -804,10 +871,10 @@ class UnitPhasesTests(unittest.TestCase):
                 queued = [row for row in rows if row.work not in ("Later work (2)", "Last work (3)")
                           and row.item.split()[0] in ("Next", "Later")]
                 self.assertEqual(queued, [
-                    ("Next", "Review next", "Waits for future to merge"), ("Later 1", "Clean records", "Ready"),
+                    ("Next", "Review next", "After future; not started"), ("Later 1", "Clean records", "Ready"),
                     ("Later 2", "Preserve this text (Review 1)", "Ready"),
                     ("Later 3", "Preserve this different id (10)", "Ready")] if blocked_first else [
-                    ("Next", "Clean records", "Ready"), ("Later 1", "Review next", "Waits for future to merge"),
+                    ("Next", "Clean records", "Ready"), ("Later 1", "Review next", "After future; not started"),
                     ("Later 2", "Preserve this text (Review 1)", "Ready"),
                     ("Later 3", "Preserve this different id (10)", "Ready")])
                 self.assertIn("**next** — " + bucket, rendered)
@@ -815,7 +882,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn("Current work (1)", [row.work for row in rows if row.item == "Now"])
                 self.assertIn("Later work (2)", [row.work for row in rows if row.item.startswith("Later")])
                 self.assertEqual(queues.call_count, 1)
-                self.assertEqual([call.args[0] for call in dependencies.call_args_list], ["next/future"])
+                self.assertEqual([call.args[0] for call in dependencies.call_args_list], ["next/future", "next/1"])
 
         _ = self.write_run(member, "next", [("1", "Current work"), ("2", "Later work"), ("3", "Last work")],
                            plan=plan.name)
@@ -838,21 +905,60 @@ class UnitPhasesTests(unittest.TestCase):
             rendered = self.blocks([dependency, member], {})
         self.assertIn("**next** — waiting on other work", rendered)
         approval = "Sdlc keeps it waiting until the user approves board-reasons; since 17:50"
-        self.assertIn(("Next", "Merge delivery", approval), detail_rows(rendered, "next"))
-        self.assertIn(("Later", "Read delivery", approval), detail_rows(rendered, "next"))
+        self.assertIn(("Now", "Merge delivery", approval), detail_rows(rendered, "next"))
+        self.assertIn(("Next", "Read delivery", approval), detail_rows(rendered, "next"))
         self.assertCountEqual([call.args[0] for call in reads.call_args_list], [dependency_path, member_path])
         self.assertEqual(dependencies.call_count, 1)
 
         handler = self.member("handler")
         _ = self.write_run(handler, "handler", [("23", "Check the handler")])
-        for reference, expected in (("next/41", "Waits for phase 41 to merge"),
-                                    ("next/acctcolor", "Waits for acctcolor to merge"),
-                                    ("handler/23", "Waits for handler to merge: Check the handler"),
-                                    ("handler/24", "Waits for handler phase 24 to merge")):
+        for reference, expected in (("next/41", "After phase 41; not started"),
+                                    ("next/acctcolor", "After acctcolor; not started"),
+                                    ("handler/23", "After handler phase 23; started"),
+                                    ("handler/24", "After handler phase 24; not started")):
             with self.subTest(reference=reference):
                 _ = self.queue(member, unit_queue.QueuedItem("Read delivery", reference))
                 rendered = self.blocks([member], {})
-                self.assertIn(("Next", "Read delivery", expected), detail_rows(rendered, "next"))
+                self.assertIn(("Now", "Read delivery", expected), detail_rows(rendered, "next"))
+
+    def test_queue_and_plan_dependencies_share_short_states_without_external_titles(self) -> None:
+        member = self.member("next")
+        handler = self.member("handler")
+        _ = self.repository()
+        plan = self.root / "plan.md"
+        _ = plan.write_text("# Plan\n")
+        member_path = self.write_run(member, "next", [("41", "Current work")], plan=plan.name)
+        handler_path = self.write_run(handler, "handler", [("23", "An external title that the dependency must omit")])
+        _ = self.queue(member, unit_queue.QueuedItem("Review the current work", "next/41"),
+                       unit_queue.QueuedItem("Check the colors", "next/acctcolor"),
+                       unit_queue.QueuedItem("Check the handler", "handler/23"))
+        record: dict[str, object] = {"plan": str(plan), "phases": [
+            {"phase": "41", "title": "Current work", "status": "running"},
+            {"phase": "acctcolor", "title": "Add colors", "status": "todo"},
+            {"phase": "42", "title": "Release the changes", "status": "todo"},
+            {"phase": "43", "title": "Publish the report", "status": "todo"}]}
+        details: list[plan_history.PlanPhase] = [
+            {"id": "41", "title": "Current work", "done": False},
+            {"id": "acctcolor", "title": "Add colors", "done": False},
+            {"id": "42", "title": "Release the changes", "done": False,
+             "depends_on": ("41", "next/acctcolor", "handler/23")},
+            {"id": "43", "title": "Publish the report", "done": False, "depends_on": ("handler/23",)}]
+        with (patch.object(plan_history, "plan_phases", return_value=details) as plans,
+              patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+              patch.object(waits_on, "state", wraps=waits_on.state) as dependencies):
+            rendered = self.blocks([member], {"next": record})
+        rows = detail_rows(rendered, "next")
+        self.assertIn(("Next", "Review the current work", "After phase 41; started"), rows)
+        self.assertIn(("Later 1", "Check the colors", "After acctcolor; not started"), rows)
+        self.assertIn(("Later 2", "Check the handler", "After handler phase 23; started"), rows)
+        self.assertIn(("Later 4", "Release the changes (42)",
+                       "After phase 41; started; after acctcolor; not started; after handler phase 23; started"), rows)
+        self.assertIn(("Later 5", "Publish the report (43)", "After handler phase 23; started"), rows)
+        self.assertNotIn("An external title", rendered)
+        self.assertNotIn("Waits for", rendered)
+        self.assertCountEqual([call.args[0] for call in reads.call_args_list], [member_path, handler_path])
+        self.assertEqual([call.args[0] for call in dependencies.call_args_list], ["next/41", "next/acctcolor", "handler/23"])
+        self.assertEqual(plans.call_count, 1)
 
     def test_plan_waits_control_the_unit_with_no_current_task(self) -> None:
         member = self.member("waiting")
@@ -862,9 +968,9 @@ class UnitPhasesTests(unittest.TestCase):
                                        "Waits for twenty eligible phases"),
                                       ("**Waits for:** twenty eligible phases (from two units)",
                                        "Waits for twenty eligible phases (from two units)"),
-                                      ("**Depends on:** 1", "Waits for phase 1"),
-                                      ("**Depends on:** 41", "Waits for phase 41"),
-                                      ("**Depends on:** acctcolor", "Waits for acctcolor")):
+                                      ("**Depends on:** 1", "After phase 1; not started"),
+                                      ("**Depends on:** 41", "After phase 41; not started"),
+                                      ("**Depends on:** acctcolor", "After acctcolor; not started")):
             with self.subTest(metadata=metadata):
                 _ = plan.write_text("# Plan\n### Phase 1 — First work · status: todo\n"
                     + "### Phase 2 — Next work · status: todo\n" + metadata + "\n")
@@ -880,9 +986,79 @@ class UnitPhasesTests(unittest.TestCase):
                     rendered = self.blocks([member], {"waiting": record})
                 self.assertIn("**waiting** — waiting on other work", rendered)
                 now, = [row for row in detail_rows(rendered, "waiting") if row[0] == "Now"]
-                self.assertEqual(now.work, "Not recorded")
+                self.assertEqual(now.work, "Next work (2)")
                 self.assertEqual(now.state, explanation)
-                self.assertIn(("Next", "Next work (2)", explanation), detail_rows(rendered, "waiting"))
+                self.assertIn(("Next", "Not recorded", "The director has not chosen the next task"),
+                              detail_rows(rendered, "waiting"))
+
+    def test_plan_dependencies_share_main_and_hold_checks_with_the_queue(self) -> None:
+        member = self.member("local")
+        base = self.repository()
+        sent = commit_repository(self.root, "Delivery", allow_empty=True)
+        plan = self.root / "plan.md"
+        _ = plan.write_text("# Plan\n")
+        since = datetime(2026, 11, 15, 17, 50, tzinfo=UTC).timestamp()
+        approval = "Sdlc keeps it waiting until the user approves delivery; since 17:50"
+        for reference in ("1", "local/1"):
+            for state in ("main", "held", "done"):
+                with self.subTest(reference=reference, state=state):
+                    tail = [self.phase_event("checkpoint", "1", checkpoint_commit=sent if state == "held" else base)]
+                    if state == "held":
+                        tail.append({"event_type": "wait_started", "wait_scope": "unit", "target_work": "1",
+                            "wait_id": "approval", "wait_by": "sdlc", "wait_reason": "the user approves delivery",
+                            "wait_kind": "WaitingForUser", "wait_started_epoch": since,
+                            "wait_attribution": {"state": "UnitTarget"}})
+                    if state == "done":
+                        tail.append(self.phase_event("phase_finished", "1", status="completed", timestamp_epoch=since))
+                    path = self.write_run(member, "local", [("1", "Delivery")], tail, plan=plan.name)
+                    _ = self.queue(member, unit_queue.QueuedItem("Review delivery", "" if state == "done" else "local/1"))
+                    record: dict[str, object] = {"plan": str(plan), "phases": [
+                        {"phase": "1", "title": "Delivery", "status": "done" if state == "done" else "running"},
+                        {"phase": "2", "title": "Publish delivery", "status": "todo"}]}
+                    details: list[plan_history.PlanPhase] = [
+                        {"id": "1", "title": "Delivery", "done": state == "done"},
+                        {"id": "2", "title": "Publish delivery", "done": False, "depends_on": (reference,)}]
+                    with (patch.object(plan_history, "plan_phases", return_value=details),
+                          patch.object(land_queue, "land_view", return_value=land_queue.LandView({}, {}, {}, frozenset(), {})),
+                          patch.object(plan_history, "read_run_events", wraps=plan_history.read_run_events) as reads,
+                          patch.object(waits_on, "state", wraps=waits_on.state) as dependencies):
+                        rendered = self.blocks([member], {"local": record})
+                    rows = detail_rows(rendered, "local")
+                    self.assertIn(("Next", "Review delivery", approval if state == "held" else "Ready"), rows)
+                    self.assertIn(("Later", "Publish delivery (2)", approval if state == "held" else "Not started"), rows)
+                    self.assertEqual([call.args[0] for call in dependencies.call_args_list],
+                                     [] if state == "done" else ["local/1"])
+                    self.assertEqual([call.args[0] for call in reads.call_args_list], [path])
+
+    def test_first_blocked_pending_task_supplies_now_without_a_repeated_wait(self) -> None:
+        member = self.member("waiting")
+        plan = self.root / "plan.md"
+        for source in ("plan", "queue"):
+            for remaining in (0, 1, 2):
+                with self.subTest(source=source, remaining=remaining):
+                    _ = plan.write_text("# Plan\n### Phase 1 — Wait for delivery · status: todo\n"
+                        + "**Waits for:** approval\n"
+                        + ("### Phase 2 — Next delivery · status: todo\n" if remaining else "")
+                        + ("### Phase 3 — Last delivery · status: todo\n" if remaining == 2 else ""))
+                    _ = self.write_run(member, "waiting", [], plan=plan.name if source == "plan" else "")
+                    queued = ([unit_queue.QueuedItem("blocked: Wait for delivery", "waiting/future")]
+                              + ([unit_queue.QueuedItem("Next delivery")] if remaining else [])
+                              + ([unit_queue.QueuedItem("Last delivery")] if remaining == 2 else []))
+                    _ = self.queue(member, *(queued if source == "queue" else []))
+                    rendered = self.blocks([member], {})
+                    rows = detail_rows(rendered, "waiting")
+                    wait = "Waits for approval" if source == "plan" else "After future; not started"
+                    work = "Wait for delivery (1)" if source == "plan" else "Wait for delivery (blocked)"
+                    self.assertEqual(rows[0], DetailRow("Now", work, wait))
+                    self.assertEqual(sum(row.state == wait for row in rows), 1)
+                    if remaining:
+                        self.assertIn(("Next", "Next delivery (2)" if source == "plan" else "Next delivery",
+                                       "Not started" if source == "plan" else "Ready"), rows)
+                    else:
+                        self.assertIn(("Next", "Not recorded", "The director has not chosen the next task"), rows)
+                    if remaining == 2:
+                        self.assertIn(("Later", "Last delivery (3)" if source == "plan" else "Last delivery",
+                                       "Not started" if source == "plan" else "Ready"), rows)
 
     def test_unit_waits_name_the_reason_at_each_target_and_set_the_bucket(self) -> None:
         member = self.member("reasons")
@@ -900,13 +1076,13 @@ class UnitPhasesTests(unittest.TestCase):
              "The user keeps it waiting until the user approves the release; since 17:50"),
             ("done", "delivery", "Now", "waiting to merge",
              "The user keeps it waiting until the user approves the release; since 17:50"),
-            ("queue", "acctcolor", "Next", "waiting on other work",
+            ("queue", "acctcolor", "Now", "waiting on other work",
              "The user keeps it waiting until the user approves the release; since 17:50"),
             ("queue later", "acctcolor", "Later", "unknown",
              "The user keeps it waiting until the user approves the release; since 17:50"),
             ("queue text", "acctcolor", "Now", "waiting on other work",
              "The user keeps it waiting until the user approves the release; since 17:50"),
-            ("plan", "30", "Next", "waiting on other work",
+            ("plan", "30", "Now", "waiting on other work",
              "The user keeps it waiting until the user approves the release; since 17:50"),
             ("free", "The release", "Now", "waiting on other work",
              "The user keeps it waiting until the user approves the release; since 17:50"),
@@ -949,10 +1125,9 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(queues.call_count, 1)
                 if target_state in ("queue", "plan"):
                     now_row, = [row for row in rows if row[0] == "Now"]
-                    self.assertEqual(now_row[1], "Not recorded")
+                    self.assertEqual(now_row[1], "Later delivery (30)" if target_state == "plan" else "Add account colors (acctcolor)")
                     self.assertFalse(now_row.state.startswith("Nothing runs"), now_row)
-                    wait_target = "it" if target_state == "plan" else target
-                    self.assertIn(f"the user keeps {wait_target} waiting until the user approves the release", now_row[2].casefold())
+                    self.assertIn("the user keeps it waiting until the user approves the release", now_row[2].casefold())
                     self.assertNotIn("has not started; reason not recorded", rendered)
                 if target_state in ("queue", "queue later"):
                     queue_row, = [row for row in rows if row.work == "Add account colors (acctcolor)"]
@@ -965,9 +1140,9 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn(("Next", "Add account colors (Review acctcolor)", "Ready"), rows)
                     self.assertIn(("Now", "acctcolor", expected), rows)
                 if target_state == "plan":
-                    plan_row, = [row for row in rows if row.item == "Next"]
+                    plan_row, = [row for row in rows if row.item == "Now"]
                     self.assertEqual(plan_row[1], "Later delivery (30)")
-                    self.assertIn(("Later", "Last delivery (31)", "Not started"), rows)
+                    self.assertIn(("Next", "Last delivery (31)", "Not started"), rows)
                 if target_state == "working":
                     self.assertIn(("Now", "Current delivery (work)", "Implementation worker runs it"), rows)
                 if target_state in ("free", "working"):
@@ -1044,10 +1219,10 @@ class UnitPhasesTests(unittest.TestCase):
                                         for row in rows))
                 elif name == "single":
                     self.assertIn(("Now", "First work (a)", "1st in sdlc's merge line"), rows)
-                    self.assertIn(("Also", "Second work (b)", "Merge submission not in the merge line; reason not recorded"), rows)
+                    self.assertIn(("Also", "Second work (b)", f"Checkpoint {second[:9]} at time not recorded; not in sdlc's merge line"), rows)
                 elif name == "absent":
-                    for work in ("First work (a)", "Second work (b)"):
-                        self.assertIn((work, "Merge submission not in the merge line; reason not recorded"),
+                    for work, commit in (("First work (a)", first), ("Second work (b)", second)):
+                        self.assertIn((work, f"Checkpoint {commit[:9]} at time not recorded; not in sdlc's merge line"),
                                       [(row.work, row.state) for row in rows if row.item in ("Now", "Also")])
                 elif name == "unused":
                     self.assertIn(("Now", "First work (a)", "Merge position not recorded"), rows)
@@ -1211,7 +1386,8 @@ class UnitPhasesTests(unittest.TestCase):
                 self.assertEqual(rendered.splitlines()[0],
                     "working 1 · waiting to merge 1 · waiting on other work "
                     + ("2 · idle 0 · unknown 1 · 5 units" if blocked_first else "1 · idle 0 · unknown 2 · 5 units"))
-                self.assertIn(("Now", "Not recorded", "Waits for unknown phase future to merge" if blocked_first
+                self.assertIn(("Now", "Blocked delivery" if blocked_first else "Not recorded",
+                              "After unknown phase future; not started" if blocked_first
                               else "Director's current step not recorded"),
                               detail_rows(rendered, "idle"))
 
