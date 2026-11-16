@@ -430,7 +430,7 @@ class ControlTests(CostFixture):
                 table = next(table for table in costs.tables if table.title == size)
                 self.assertEqual(table.headers[2:4], (f'{costs.scope.noun} (minutes)', 'runs'))
                 self.assertEqual(table.rows[0][2:5], (*run_time, usd))
-                self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0)):.4f}', usd)
+                self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0), unmeasured_extra_s=Decimal(0)):.4f}', usd)
                 self.assertEqual(costs.summary, f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
                 # The Cost per gate view shows the same estimate; a GPU type without runs has none.
                 standard, gpu = costs.prices

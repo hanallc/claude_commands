@@ -240,6 +240,7 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
     allocations = run_cost.billed_allocations(bills, runs)
     values = conf.read_or_repository('cloud_gate')
     wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
+    unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
     default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
@@ -256,7 +257,8 @@ def run_costs(directory: Path, now: int, kinds: tuple[tuple[str, ...], tuple[str
                 price = minimum.get((region, size))
                 seconds, _own = evidence.box_seconds(size, region, scope.modes)
                 if price is not None and seconds:
-                    grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds)
+                    grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds,
+                                                               unmeasured_extra_s=unmeasured.get(region, Decimal(0)))
         headers = ('region', SPOT_HEADER, f'{scope.noun} (minutes)', 'runs', ESTIMATE_HEADER, 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []

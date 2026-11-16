@@ -6,7 +6,7 @@ AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU s
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+`regions` in `cloud_gate.conf` holds all 19 regions of `spot_candidate_regions`.
 The saved deployment record identifies the regions available for launch.
 Boxes boot the official NixOS image and fetch their tools at boot.
 GPU trial boxes then import the prepared GPU system and reboot.
@@ -442,7 +442,8 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The list contains `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+The list holds every region of `spot_candidate_regions`, so a region that becomes the cheapest gets the next gate.
+The user, 2026-11-15: "i want all regions availble so if one becomes cheaper then it will immediatelyh start being used".
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
@@ -791,6 +792,10 @@ That cost includes the hourly Spot price times the expected box hours and the re
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
+`unmeasured_region_extra_seconds` holds a JSON map from region names to seconds.
+A region without its own runs borrows box time from the other regions and adds its seconds from this map.
+The seeds come from the 2026-11-14 runs: Europe 15 s, Canada 10 s, South America and Asia Pacific 30 s.
+After the first run in a region, its own median box time replaces the borrowed time and the extra.
 `gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
 It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
 Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
@@ -798,11 +803,15 @@ Expected box time is the median box time, launch to finish, for the type, region
 A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
 `/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+Its expected cost includes the unmeasured seconds.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.
 Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
 The median combined size is 7,107,672 bytes.
 At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+`region_transfer_usd` holds a JSON map from far regions to their transfer USD per gate.
+Each value is about 10 MB per gate, the 2026-11-14 bill, at that region's inter-region transfer price.
+A region outside the map uses `remote_region_transfer_usd`.
 Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.
