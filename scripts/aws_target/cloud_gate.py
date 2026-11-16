@@ -78,6 +78,8 @@ class RegionalLiveSpotRead:
 
 
 SPOT_INTERRUPTION_CODES = frozenset(('Server.SpotInstanceTermination', 'Server.SpotInstanceShutdown'))
+# The downloaded box result; outcome.json names this file and holds no second copy.
+RESULT_FILE = 'remote-result.json'
 
 
 def settings() -> conf.ConfigRead:
@@ -823,15 +825,18 @@ class GateWorker:
                                 deadline = began + limit if limit else float('inf')
                         if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
                             raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
-                        if self.download(bucket, prefix + '/result.json', folder / 'remote-result.json'):
+                        if self.download(bucket, prefix + '/result.json', folder / RESULT_FILE):
                             received_at = int(self.clock())
                             if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
                                 raise ValueError('The final log is absent')
-                            result = read(folder / 'remote-result.json')
+                            result = read(folder / RESULT_FILE)
                             validate_result(result, request, instance=instance)
                             if request.get('task') == 'paired' and any(
                                     sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
                                 raise ValueError('The sample instance type differs from the launch')
+                            if request.get('task') == 'paired':
+                                # Validation names the box in each sample; the outcome reads this file.
+                                save(folder / RESULT_FILE, result)
                             result_seen_at = received_at
                             self.record_launch(request, ledger.text(arguments, 'InstanceType'), '', 'finished',
                                                gate_s=float(str(result['gate_s'])))
@@ -862,6 +867,7 @@ class GateWorker:
                     if time.monotonic() >= deadline:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
+                        save(folder / RESULT_FILE, row)
                         with (folder / 'gate.log').open('a') as output:
                             _ = output.write('\n' + gate_box.decode_run(row['gate']).time_limit_report + '\n')
                         break
@@ -872,14 +878,14 @@ class GateWorker:
                 with cancellation.defer_cleanup_signals():
                     self.terminate(attempt, instance, result_seen_at=result_seen_at)
                     interruption_confirmed = bool(interruption_code)
-            return {'status': 'complete', 'instance': instance, 'result': row}
+            return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
             if 'arguments' not in launch:
                 self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
             if row and request.get('task') != 'paired' and not gate_box.decode_run(row['gate']).passed:
-                return {'status': 'complete', 'result': row}
+                return {'status': 'complete', 'result_file': RESULT_FILE}
             if interruption_confirmed:
                 return {'status': 'interrupted', 'reason': str(error), 'interruption_code': interruption_code}
             return {'status': 'fallback', 'reason': str(error)}
@@ -916,6 +922,11 @@ def time_limit_result(request: dict[str, object], text: str, elapsed: float,
     return {'attempt': request['attempt'], 'commit': request['commit'], 'tree': request['tree'],
             'host': record['host'], 'verdict': 'fail', 'gate': gate_box.encode_run(run),
             'record': record, 'gate_s': elapsed}
+
+
+def outcome_result(folder: Path, outcome: dict[str, object]) -> dict[str, object]:
+    """Read a complete outcome's result: its named file, or the result an older outcome holds."""
+    return read(folder / RESULT_FILE) if outcome.get('result_file') == RESULT_FILE else ledger.mapping(outcome['result'])
 
 
 def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
@@ -958,7 +969,15 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.keep_failure_logs(ledger.text(record, 'id'), host, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
-    save(folder / 'imported.json', {'id': record['id']})
+    from scripts.buildlog.record import keep_result
+    imported: dict[str, object] = {'id': record['id']}
+    try:
+        # The result leaves the checkout: a gate copy is a reused slot.
+        imported['result'] = keep_result(json.dumps(row).encode(), host, at, ledger.text(record, 'id'))
+        (folder / RESULT_FILE).unlink(missing_ok=True)
+    except OSError as error:
+        gate_record.report_not_written(error)
+    save(folder / 'imported.json', imported)
 
 
 def working_tree(repo: Path) -> tuple[str, set[str]]:
@@ -1169,10 +1188,10 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
         return LocalFallback(ledger.text(outcome, 'reason'))
     if outcome.get('status') != 'complete':
         return LocalFallback(ledger.text(outcome, 'reason'))
-    row = ledger.mapping(outcome['result'])
     try:
+        row = outcome_result(folder, outcome)
         validate_result(row, request)
-    except (ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != request['head']:
         return LocalFallback('The checkout changed during the cloud attempt')

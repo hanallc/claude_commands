@@ -4332,3 +4332,93 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - The test_verify_wait_holder drivers that extract the wait functions also extract `verify_helper`; they start no helper, so their recorder observers see each call.
 - AWS pair, 9 wait-recording modules: about 9.7 CPU s less (wait_holder 6.65).
 - Commit 966a0f225. Production change; the diff went to sdlc.
+
+### Phase 303 — The verify holder lookup runs inside the helper process  · status: done
+**Depends on:** Phase 302
+**Owner:** natest (builds gave the go on 11-15; production change, the diff goes to sdlc).
+
+#### As-built
+
+- `phase_wait_holder_flags` in verify.sh ran a 115-line python heredoc, a new Python start for each holder lookup.
+- The lookup is `scripts/direct/phase_wait_holder.py` with a typed `main` (5 arguments). `verify_helper` runs it in its process; with no helper, it falls back to `"$PY"`. Output lines are unchanged.
+- The script path comes from the recorder folder, so function extracts in tests keep working. The script finds its package root from its own place.
+- Tests that extract the function without a helper still start a separate Python (26 of 59 lookups in wait_holder).
+- AWS pair, 9 verify and recorder modules: about 1.5 CPU s less (wait_holder 1.04).
+- Commit 6fd02cc51. Production change; the diff went to sdlc.
+
+### Phase 304 — A cloud gate result keeps one copy and only what natedev reads  · status: done
+**Depends on:** none
+**Owner:** natest (builds approved on 11-15; production change, the diff goes to sdlc).
+
+#### As-built
+
+- Each gate copy kept outcome.json and remote-result.json, 20.2 MB each; the outcome held the full result again.
+- `gate_box.encode_run` omits executions when it equals jobs; `decode_run` reads a missing list as jobs. Job times keep only counts and seconds (`tests` is []); the gate run record keeps the slow tests and read lists.
+- outcome.json names `cloud_gate.RESULT_FILE` (remote-result.json); `cloud_gate.outcome_result` reads it, or an older outcome's inline result. A missing or broken file is a local fallback. A validated paired result and a time-limit result are written to that file.
+- Gate f7bd8f16: two 20.2 MB files become one 5.7 MB file (gate 0.8 MB, record 4.8 MB).
+- Commit a04d00a10. Production change; the diff went to sdlc.
+
+### Phase 305 — A cloud gate result moves out of the checkout, beside its gate run record  · status: done
+**Depends on:** Phase 304
+**Owner:** natest (builds asked on 11-15: gate copies become reused slots; production change, the diff goes to sdlc).
+
+#### As-built
+
+- Gate copies become reused slots; the largest copy held 11.2 GB of gate results in 472 folders of .git/cloud-gates.
+- `record.keep_result` keeps a result gzipped at `<host>/results/<YYYY-MM>/<record id>.json.gz` in the buildlog store (`store.RESULTS_DIR`). `keep_log` and `keep_result` share `_keep_compressed`.
+- `cloud_gate.import_record` keeps the imported row after the record append, deletes `remote-result.json` from the gate folder and names the stored file in imported.json `result`. A store write failure is reported with `report_not_written` and leaves the folder file.
+- Commit ce1875a45. Production change.
+
+### Phase 306 — verify.sh reads a runner result in its helper, and tests check the reading in process  · status: done
+**Depends on:** Phase 305
+**Owner:** natest (builds gave a go on 11-15 if small: one module and a few test moves; holds, routing and waits are dropped).
+
+#### As-built
+
+- New `scripts/direct/runner_result.py` reads the Mac runner result file: `read_result(path, status, selected_is_mac)` returns a usable or unusable result; `main` prints 7 lines (word, reason, seconds, holder, fetch, fix, build target folder), exits 1 when unusable and 2 on bad arguments.
+- `try_mac_test` in verify.sh calls it through `verify_helper`. A helper status other than 0 or 1 prints `verify.sh: runner_result.py failed (status N); the Mac result is not used`. An unusable result no longer sets MAC_FIX_RESULT or REMOTE_BUILD_TARGET_DIR.
+- `test_runner_result.py` checks the reading in process; three result modules were removed; test_verify_mac_malformed keeps one flow. About 16 natedev CPU s less.
+- Commit a3d9484e2. verify-unit reviewed the diff.
+
+### Phase 307 — A verify_helper call starts no env process  · status: done
+**Depends on:** Phase 306
+**Owner:** natest (builds gave a go on 11-15: fix 2 of the flow cost plan, with the git_identity cache folded in; verify-unit reviews the verify.sh diff).
+
+#### As-built
+
+- `verify_helper` in verify.sh runs `compgen -V names -e` before the lock and the request write, so a failure sends no request and the local fallback runs. The write is a `( ... )` subshell with no trap: a dead helper kills only that subshell, and the call reaches the fallback. `printf '%s=%s\0'` sends the exported variables in place of `env -0`; array exports and `BASH_FUNC_*` entries are not sent. The perl lock and the `--stdin` capture are unchanged. (Phase 308 made the subshell and compgen changes after builds held the first form.)
+- natedev, the Mac and the AWS gate run bash 5.3.9 (the gate takes bash from natedev's locked nixpkgs rev), so there is one path.
+- `step_estimator.git_identity` caches by `(git directory, cwd)` for the life of the process; `clear_git_identity_cache` clears it for tests.
+- Tests: new `scripts/build_queue/test_step_estimator.py` (2 cache tests); `test_verify_helper` checks environment equality, the same-shell write and the compgen fallback in one bash program.
+- Paired A/B on 4 verify modules, 3 rounds: about 11% fewer process starts; env starts on the 8 sample modules 1,128 to 102; the natedev CPU change is below load noise. The AWS pair measures it.
+- Builds dropped the windowed lock (spec item 3) on 11-15: a mode tracked by hand, and a missed set is silent and unsafe.
+- Commit effcb3c11. verify-unit reviewed the diff.
+
+### Phase 308 — A Mac clippy failure in verify.sh lint starts no local mend fix  · status: done
+**Depends on:** Phase 307
+**Owner:** natest (builds assigned it on 11-15; verify-unit reviews the diff, because the code is from its phase maclintfix, e07d86209).
+
+#### As-built
+
+- `run_lint_held_sequence` sets `LINT_HELD_CLIPPY_FAILED` when Mac mend passed (or is off) and Mac clippy failed. `run_lint_sequence` then removes `MEND_LOG` and the `lint-held` mark and exits with the clippy failure, only on the Mac path (`force_mac=1`). A failed Mac mend and the memory-judgment path keep their behavior; `step_writes_tree` is unchanged.
+- Tests: `test_verify_lint_judgment` checks the Mac clippy exit (held calls, exit 1, no second mend). `test_verify_helper`'s bash program checks the compgen fallback and that the next call reads its own reply. `test_verify_lint_local_writes` holds natedev before the clippy fix in its clippy cases.
+- Commit ffd2432f2. verify-unit reviews the diff.
+
+### Phase 309 — A clippy failure on the lint memory-judgment path starts no local mend fix  · status: done
+**Depends on:** Phase 308
+**Owner:** natest (builds gave a go on 11-15 from verify-unit's phase 308 review note; verify-unit reviews the diff).
+
+#### As-built
+
+- `run_lint_sequence` takes the `LINT_HELD_CLIPPY_FAILED` exit for `force_mac` 0 and 1, so the memory-judgment path also exits with the clippy failure and starts no local `mend --fix`. The memory-judgment early return keeps its behavior.
+- `test_verify_lint_judgment` runs the phase 308 check for both paths as subTests.
+- Commit a70e06a87. verify-unit reviews the diff.
+### Phase 310 — The dataclasses the gate imports most carry a one-line docstring  · status: done
+**Depends on:** Phase 309
+**Owner:** natest (builds gave a go on 11-15 after it held the `_process_class` wrap; base a7cdf31b5; queue owns the build_queue files and has no open edits in them).
+
+#### As-built
+
+- Each of the 371 dataclasses with no docstring in the 26 files of the `mac_test`, `admission_protocol`, `offload`, `eligibility` and `buildlog.sync` import closure has a one-line docstring, so `dataclasses` builds no default `__doc__` with `inspect.signature`. A class whose body was only `pass` holds only its docstring. No code changed.
+- Import A/B, 30 paired rounds on natedev: `mac_test` + `admission_protocol` import CPU 93.2 -> 78.3 ms (16% less).
+- Commit 304e400f5. The fieldless shared base stays in the backlog.

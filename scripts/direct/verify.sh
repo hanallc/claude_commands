@@ -595,7 +595,8 @@ verify_helper() {
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry
+    local input="" has_input=0 status output errors entry name
+    local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
         shift
@@ -614,9 +615,12 @@ verify_helper() {
             done
         fi
         exec 72>"$VERIFY_HELPER_LOCK"
-        if lock_file_descriptor 72 2>/dev/null && (
+        if compgen -V names -e 2>/dev/null && lock_file_descriptor 72 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
-            env -0
+            for name in "${names[@]}"; do
+                [[ -v "$name" && "${!name@a}" != *[aA]* ]] || continue
+                printf '%s=%s\0' "$name" "${!name}"
+            done
             printf '\0%s\0' "$input"
             if [[ ${#forwarded[@]} -gt 0 ]]; then printf '%s\0' "${forwarded[@]}"; fi
             printf '\0'
@@ -1509,125 +1513,8 @@ PHASE_TOKEN_OBSERVATION=""
 PHASE_TOKEN_HOLDER=""
 phase_wait_holder_flags() {
     local record_script="${STEP_RECORD_SCRIPT:-$PHASE_WAIT_RECORDER}"
-    VERIFY_PY_HELPER=PHASE_WAIT_HOLDER "$PY" - "$1" "${2:-}" \
-        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" \
-        "$record_script" "${DOC_REPO_TOP:-$PWD}" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-from uuid import UUID
-
-kind, payload, board_name, hold_name, recorder, repository = sys.argv[1:]
-with open(Path(recorder).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-
-
-def text(value):
-    return value.strip() if isinstance(value, str) and not any(c in value for c in "\r\n\t\0") else ""
-
-
-def read(path):
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
-
-
-def fields(raw):
-    try:
-        value = json.loads(raw)
-    except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-owner, owner_flag = "", "--holder-session"
-resource_kind, resource = "slot", "cargo"
-if kind == "token":
-    from scripts.production import staff
-    from scripts.lib import unit_runs
-
-    board = Path(board_name)
-    if payload == "director":
-        owner = unit_runs.director(board)
-    elif payload and payload != "unknown":
-        matches = []
-        if not matches:
-            for path in board.glob("impl_worker_*.json"):
-                worker = fields(read(path))
-                if (text(worker.get("slot")) == payload
-                        or path.stem == "impl_worker_" + payload):
-                    matches.append(worker)
-        state = fields(read(board / "progress_history_state.json"))
-        if matches:
-            reference = text(matches[0].get("staff_id")) if len(matches) == 1 else ""
-        else:
-            active_pass = state.get("pass", {})
-            worker = active_pass.get(payload, {}) if isinstance(active_pass, dict) else {}
-            if isinstance(active_pass, dict) and payload not in active_pass:
-                workers = [entry for entry in active_pass.values() if isinstance(entry, dict)
-                           and entry.get("worker_name") == payload]
-                worker = workers[0] if len(workers) == 1 else {}
-            reference = text(worker.get("worker_id")) if isinstance(worker, dict) else ""
-        try:
-            record = staff.snapshot()
-            member = record.by_id(staff.StaffId(reference)) if reference else None
-            if member is not None:
-                owner = member.current_session
-            if not owner:
-                unit = unit_runs.run_owner(state, record)
-                owner_flag = "--holder-unit"
-                owner = unit.name if isinstance(unit, staff.StaffRow) else ""
-        except (OSError, ValueError):
-            pass
-elif kind == "hold":
-    from scripts.build_hold import build_hold, owning_session
-    from scripts.build_targets import build_targets
-
-    resource = "natedev"
-    directory = Path(hold_name)
-    holder = build_targets.hold_waited_on(build_hold.natedev_holds(directory),
-                                        owning_session.owning_session(), directory, build_targets.current_caller_lineage())
-    if isinstance(holder, build_hold.Holder):
-        session = build_hold.holder_session(holder.key)
-        try:
-            UUID(session)
-            owner = session
-        except ValueError:
-            owner_flag, owner = "--holder-unit", text(holder.name)
-elif kind in ("mac", "target"):
-    from scripts.mac_test import mac_test
-
-    resource = payload or "mac"
-    paths = mac_test.state_paths("" if resource == "mac" else resource)
-    scope = mac_test.target_claim_scope(paths, repository)
-    session = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    for claim in mac_test.read_claims(paths):
-        if mac_test.scopes_overlap(claim.scope, scope) and mac_test.run_is_live(claim.record):
-            candidate = text(claim.record.get("holder_session"))
-            if candidate and candidate != session:
-                owner = candidate
-                break
-elif kind == "provider":
-    diagnostic = fields(payload)
-    print(text(diagnostic.get("target")))
-    print(text(diagnostic.get("what")))
-elif kind in ("memory", "resource"):
-    holder = fields(payload)
-    if kind == "resource":
-        resource = text(holder.get("resource"))
-        print(resource)
-        print(text(holder.get("reason")))
-        holder = holder.get("holder", {})
-    else:
-        resource_kind, resource = "memory", "memory"
-    if holder.get("kind") == "session":
-        owner = text(holder.get("session_id"))
-    elif holder.get("kind") == "unit":
-        owner_flag, owner = "--holder-unit", text(holder.get("unit"))
-if owner:
-    print("\n".join(("--holder-resource-kind", resource_kind, "--holder-resource", resource, owner_flag, owner)))
-PY
+    VERIFY_PY_HELPER=PHASE_WAIT_HOLDER verify_helper "${record_script%/*}/phase_wait_holder.py" "$1" "${2:-}" \
+        "${BOARD_DIR:-$PHASE_WAIT_SESSION}" "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" "${DOC_REPO_TOP:-$PWD}"
 }
 phase_wait_target_busy() {
     local holder
@@ -2249,8 +2136,8 @@ try_mac_test() {
     trap 'forward_mac_runner_signal TERM 143' TERM
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
-    local runner_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed mac_words=0 line name
+    local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 name
     MAC_FIX_RESULT=""
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1"
@@ -2349,28 +2236,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     MAC_RUNNER_PID=""
     release_wait_claim
 
-    if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
-          && -s "$MAC_RESULT_FILE" ]]; then
-        result_text="$(< "$MAC_RESULT_FILE")"
-        while IFS= read -r line; do
-            case "$line" in
-                outcome=*)
-                    if [[ "$selected_is_mac" == 0 ]]; then
-                        ((mac_words += 1)); result_word="${line#outcome=}"
-                    fi
-                    ;;
-                mac=*)
-                    ((mac_words += 1))
-                    result_word="${line#mac=}"
-                    ;;
-                reason=*) result_reason="${line#reason=}" ;;
-                seconds=*) result_seconds="${line#seconds=}" ;;
-                holder=*) result_holder="${line#holder=}" ;;
-                fetch=*) result_fetch="${line#fetch=}" ;;
-                fix=*) MAC_FIX_RESULT="${line#fix=}" ;;
-                build_target_directory=*) REMOTE_BUILD_TARGET_DIR="${line#build_target_directory=}" ;;
-            esac
-        done <<< "$result_text"
+    if result_text="$(verify_helper "$VERIFY_START_DIR/runner_result.py" \
+        "$MAC_RESULT_FILE" "$runner_status" "$selected_is_mac")"; then
+        result_usable=1
+        {
+            IFS= read -r result_word || true
+            IFS= read -r result_reason || true
+            IFS= read -r result_seconds || true
+            IFS= read -r result_holder || true
+            IFS= read -r result_fetch || true
+            IFS= read -r MAC_FIX_RESULT || true
+            IFS= read -r REMOTE_BUILD_TARGET_DIR || true
+        } <<< "$result_text"
+    else
+        result_status=$?
+        if [[ "$result_status" != 1 ]]; then
+            printf 'verify.sh: runner_result.py failed (status %s); the Mac result is not used\n' "$result_status" >&2
+        fi
     fi
     if [[ -d "$MAC_RESULT_FILE" ]]; then
         rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
@@ -2379,10 +2261,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
     MAC_RESULT_FILE=""
 
-    if [[ "$mac_words" -ne 1 \
-          || ! "$result_word" =~ ^(passed|failed|lost|declined)$ \
-          || ( "$result_word" == passed && "$runner_status" -ne 0 ) \
-          || ( "$result_word" == failed && "$runner_status" -eq 0 ) ]]; then
+    if [[ "$result_usable" == 0 ]]; then
         BUILDLOG_MAC=declined
         BUILDLOG_MAC_REASON=runner
         BUILDLOG_MAC_S=""
@@ -4220,6 +4099,7 @@ run_mac_lint_fix() {
 
 run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
+    LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
     lint_rewrite fmt_cargo --all
@@ -4246,7 +4126,10 @@ run_lint_held_sequence() {
     fi
     if lint_config_enabled clippy; then
         start_tree_watch
-        invoke_clippy --workspace --all-targets --all-features || lint_status=1
+        if ! invoke_clippy --workspace --all-targets --all-features; then
+            if (( lint_status == 0 )); then LINT_HELD_CLIPPY_FAILED=1; fi
+            lint_status=1
+        fi
         finish_tree_watch
     fi
     return 0
@@ -4328,6 +4211,10 @@ run_lint_sequence() {
                 if (( lint_status == 0 )); then
                     rm -f "$MEND_LOG"
                     exit 0
+                fi
+                if [[ "$LINT_HELD_CLIPPY_FAILED" == 1 ]]; then
+                    rm -f "$MEND_LOG" "$HOLD_WAIT_DIR/lint-held"
+                    exit "$lint_status"
                 fi
                 HOLD_LINT=0
                 rm -f "$HOLD_WAIT_DIR/lint-held"
