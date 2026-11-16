@@ -488,20 +488,25 @@ def mark_read(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
                    "Marked read", source, unread=False)
 
 
+def order(item: ListItem) -> tuple[bool, bool, float, int]:
+    """Put user decisions first, unread updates next, and early checks before late checks."""
+    return (item.state != ItemState.WAITING_FOR_NATE, not isinstance(item.unread_since, datetime),
+            item.next_check.timestamp() if isinstance(item.next_check, datetime) else float("inf"), item.number)
+
+
 def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked: bool = False) -> str:
     moment = now()
     items = records(keeper, include_closed=include_closed)
     items = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
-    items.sort(key=lambda item: (item.state != ItemState.WAITING_FOR_NATE, not isinstance(item.unread_since, datetime),
-                                item.next_check.timestamp() if isinstance(item.next_check, datetime) else float("inf"), item.number))
+    items.sort(key=order)
     record = staff.snapshot()
     lines = ["| # | Owner | Item | State | Next step | ETA | Update |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for item in items:
         owner = record.by_id(item.owner) if not isinstance(item.owner, UnassignedOwner) else None
         state = item.state.value
-        if isinstance(item.next_check, datetime):
+        if item.state != ItemState.CLOSED and isinstance(item.next_check, datetime):
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()
-        if isinstance(item.next_check, CheckCondition):
+        if item.state != ItemState.CLOSED and isinstance(item.next_check, CheckCondition):
             state += "; check: " + item.next_check.text
         if isinstance(item.parked_until, datetime) and item.parked_until > moment:
             state += "; parked until " + item.parked_until.isoformat()
