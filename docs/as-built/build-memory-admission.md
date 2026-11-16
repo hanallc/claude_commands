@@ -42,6 +42,8 @@ The fields are state, target, owner, session, claim ID, and reason.
 The owner uses `host:pid:start_time`.
 Absent fields use `-`.
 The command returns 0 for current, 1 for closed or unknown, and 2 for an unreachable service.
+A live service that answers slowly makes it wait, as the placement requests do. A missing socket or a refused connection returns 2 at once.
+The Mac cargo gate runs this check over ssh. A failed check refuses the call with the status and the last error line of the check.
 The check grants no permission and records no caller version.
 The status and replay paths share the same placement lifetime check.
 An ended local reservation or run returns closed even when its saved assignment still says current.
