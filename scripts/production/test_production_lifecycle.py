@@ -684,6 +684,8 @@ class LifecycleTests(LifecycleFixture):
         self.running()
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
+        hook = destination / ".claude/config/post_push.sh"
+        self.write(hook, 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -694,6 +696,8 @@ class LifecycleTests(LifecycleFixture):
         first = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(first, "ok")
         self.assertIn(f"{destination}: pushed {tip}", first.stdout)
+        self.assertIn("post-push hook: done", first.stdout)
+        self.assertEqual((destination / ".git/hook-runs").read_text().splitlines(), [tip])
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
         reject = self.origin / "hooks/pre-receive"
         self.write(reject, "#!/bin/sh\nexit 1\n")
@@ -701,6 +705,8 @@ class LifecycleTests(LifecycleFixture):
         second = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(second, "ok")
         self.assertIn(f"{destination}: already at {tip}", second.stdout)
+        self.assertIn("post-push hook: skipped", second.stdout)
+        self.assertEqual((destination / ".git/hook-runs").read_text().splitlines(), [tip])
 
         with self.subTest(holder="another process"):
             reject.unlink()

@@ -415,7 +415,9 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 ## Status, counts, and notes
 
 `StatusReading` separates stored facts from their display.
-`StatusDocument` carries account rows, problems, and session input paths.
+`StatusDocument` carries account rows, the board, problems, and session input paths.
+The `board` is `accounts.status_board()`: the table the unit-board plugin and the console Accounts page draw.
+Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
 `Report` distinguishes `LoginEndKnown` from `LoginEndUnknown`.
