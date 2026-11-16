@@ -4523,35 +4523,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 318
 **Owner:** natest writes; builds asked for it (11-16, ~17:30): after the merge promotes main and before the deploy move runs, `land_queue.py` must not read an empty `~/.local/state/gate` and drop the line.
 
-#### Work Order
+#### As-built
 
-**Goal:** while `~/.local/state/merge-gate` exists and `~/.local/state/gate` does not, every default-path read or write of gate state stops with an error that names the move; no reader sees an empty queue.
-
-**Source:** builds 11-16 ~17:30, option 2 of its two choices; phase 318 deploy steps.
-
-**Spec:**
-1. In `land_runs.py`, add one function that returns the default state folder. It raises a dedicated error type when the old folder `~/.local/state/merge-gate` exists (`os.path.lexists`) and the new folder does not. The message names `/tmp/claude/scratch/natest-probe/p89/move_gate_state.py` and the drain hold. Keep the old folder path in this one place, with a comment that chunk 6 removes the guard.
-2. `land_runs.state_dir()` calls that function only when `GATE_STATE_DIR` is not set. Both `GATE_PASSED_DIR` defaults in `gate.py` (`PassedTreeLedger.path`, `push_record_path`) call it only when `GATE_PASSED_DIR` is not set. An explicit variable never meets the guard.
-3. Check every caller path of `state_dir()`, `gate_state_dir()`, `land_queue` path helpers and the two `gate.py` paths. No caller may catch the new error and treat it as an empty queue, empty results or no record. Name each `except` that could catch it (`Exception`, `RuntimeError`, `OSError` if the type derives from it) and show it lets the error through. A CLI exits non-zero with the message.
-4. The move program sets no variable and uses explicit paths; confirm it does not import a path that meets the guard.
-5. Tests: add rows to the existing `test_land_runs.py` (no new module): (a) old exists, new absent, no variable → the error; (b) the same with `GATE_STATE_DIR` set → the set folder; (c) both absent → the new default; (d) new exists → the new default. Use a temporary `HOME`. Add one row for the `GATE_PASSED_DIR` default in an existing gate ledger test.
-6. Tests must not depend on the live `~/.local/state` folders. natedev has the old folder now: run the touched modules on natedev and show they pass there.
-7. No signal handlers, masks or dispositions. No lazy imports. Remove no assertion. Every behavior check stays.
-
-**Files:**
-- `scripts/production/land_runs.py`
-- `scripts/production/gate.py`
-- `scripts/production/test_land_runs.py`
-- `scripts/production/test_gate_ledger.py`
-
-**Workers:** 1 writer. The guard is one function and its callers; nothing splits.
-- impl: every file above.
-- test: opens as impl.
-
-**Constraints from prior phases:** Phase 318: `land_runs.DEFAULT_STATE_DIR` is `~/.local/state/gate`; `state_dir()`, `PassedTreeLedger.path` and `push_record_path` use it; the move program at `/tmp/claude/scratch/natest-probe/p89/move_gate_state.py` refuses without a natedev drain hold, waits for holders, then renames once. Phase 317: variables are `GATE_*`.
-
-**Acceptance gate:**
-1. The four rows of Spec item 5 and the passed-folder row pass.
-2. test_land_runs, test_land_queue, test_gate_ledger and test_gate_holds pass on natedev (old folder present), in batches of 4 under the hold rules.
-3. The reply lists each caller and `except` from Spec item 3 with its verdict.
-4. basedpyright adds no finding on each touched Python file.
+- `land_runs.default_state_dir()` returns `~/.local/state/gate`. It raises `GateStateMoveRequired(Exception)` while `~/.local/state/merge-gate` exists and the new folder does not; the message names `/build:hold drain natedev` and the move program. Chunk 6 removes the guard.
+- `land_runs.state_dir()`, `PassedTreeLedger.path` and `push_record_path` call it only when `GATE_STATE_DIR` or `GATE_PASSED_DIR` is not set.
+- No caller turns the error into an empty queue, empty results or no record; broad handlers raise again or keep the message in `GateRefused`. `land_queue.py list` and `next` exit 1 with the message.
+- The move program uses explicit paths and imports no guarded reader.
+- Reviews found nothing. Checkpoint 9871162ed; main merged at 8416aab51.
