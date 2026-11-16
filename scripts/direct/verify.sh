@@ -648,13 +648,23 @@ hash_stream() {
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../lib/conf_record.sh"
 
+FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../mac_test/fix_return.py"
+
+# Sets LINT_CODE_FILES: the code and config files that a recorded result depends
+# on, in addition to the tree. A change to one of them makes the record stale.
+# fix_return.py places the lint copy, and that place can decide whether lint passes.
+lint_code_files() {
+    LINT_CODE_FILES=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" "${FIX_RETURN_SCRIPT:-}"
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+}
+
 lint_code_key() {
-    local file hash
+    local file hash LINT_CODE_FILES
+    lint_code_files
     hash="$(
         set -o pipefail
         {
-            for file in "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-                "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
+            for file in "${LINT_CODE_FILES[@]}"; do
                 if [[ -f "$file" ]]; then
                     printf 'present\0'
                     case "$file" in *.conf) stem="${file##*/}"; conf_record "${stem%.conf}" ;; esac
@@ -684,7 +694,6 @@ LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
-FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../mac_test" && pwd)/fix_return.py"
 FINAL_PASS_START=""
 finish_verify_run() {
     if [[ -n "$FINAL_PASS_START" ]]; then
@@ -1908,13 +1917,13 @@ fi
 
 tree_key() {
     local words=("$CMD" "${ARGS[@]}") names=() name scope=() key_options=() scripts=()
-    local option content=0
+    local option content=0 LINT_CODE_FILES
     for option in "$@"; do
         if [[ "$option" == --tree-content ]]; then content=1; else key_options+=("$option"); fi
     done
     if [[ "$content" == 0 ]]; then
-        scripts=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
-            "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+        lint_code_files
+        scripts=("${LINT_CODE_FILES[@]}")
     fi
     if [[ "$CMD" == lint ]]; then
         if [[ ${#ARGS[@]} -eq 1 ]]; then words=(lint); fi
