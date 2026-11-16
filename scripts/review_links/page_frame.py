@@ -113,7 +113,7 @@ document.addEventListener('click',event=>{
 
 # Both pages use these durations and complete a cancelled motion before the next motion.
 MOTION_SCRIPT = r'''function createCardMotion(){
- const fadeOutMs=120, fadeInMs=180;
+ const fadeOutMs=180, fadeInMs=270;
  const reduced=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  let generation=0, animations=[], commit=()=>{}, pending=Promise.resolve();
  function finish(){
