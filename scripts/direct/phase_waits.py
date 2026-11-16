@@ -29,6 +29,47 @@ class PhaseWait(NamedTuple):
     wait_attribution: Mapping[str, object]
 
 
+class UnitWait(NamedTuple):
+    """An open unit wait on named work in one run."""
+
+    target: str
+    by: str
+    reason: str
+    kind: str
+    started: float
+    wait_id: str
+
+
+class NoUnitWait(NamedTuple):
+    """The work has no recorded unit wait."""
+
+
+NO_UNIT_WAIT = NoUnitWait()
+
+
+def unit_waits(events: Sequence[Mapping[str, object]]) -> list[UnitWait]:
+    """Read open unit waits in start order, with the newest reason per target."""
+    waits: dict[str, UnitWait] = {}
+    for event in events:
+        kind = event.get("event_type")
+        if kind == "run_finished":
+            waits.clear()
+        elif kind == "phase_started":
+            _ = waits.pop(str(event.get("phase_id", "")), None)
+        elif kind in ("wait_finished", "wait_unclosed"):
+            wait_id = event.get("wait_id")
+            waits = {target: wait for target, wait in waits.items() if wait.wait_id != wait_id}
+        elif kind == "wait_started" and event.get("wait_scope") == "unit":
+            target = str(event.get("target_work", ""))
+            started = event.get("wait_started_epoch", event.get("timestamp_epoch"))
+            if target and isinstance(started, int | float) and not isinstance(started, bool):
+                _ = waits.pop(target, None)
+                waits[target] = UnitWait(target, str(event.get("wait_by", "")),
+                                         str(event.get("wait_reason", "")), str(event.get("wait_kind", "")),
+                                         float(started), str(event.get("wait_id", "")))
+    return list(waits.values())
+
+
 def _wait_holder(value: object) -> NamedWaitHolder | UnnamedWaitHolder:
     if isinstance(value, dict):
         fields = cast(dict[str, object], value)
@@ -49,7 +90,8 @@ def phase_waits(events: Sequence[Mapping[str, object]], instance_id: str) -> lis
         wait_id = str(event.get("wait_id", ""))
         if kind == "run_finished" or kind == "phase_finished" and event.get("phase_instance_id") == instance_id:
             waits.clear()
-        elif kind == "wait_started" and event.get("phase_instance_id") == instance_id:
+        elif (kind == "wait_started" and event.get("wait_scope") != "unit"
+              and event.get("phase_instance_id") == instance_id):
             waits[wait_id] = event
         elif kind in ("wait_finished", "wait_unclosed"):
             _ = waits.pop(wait_id, None)

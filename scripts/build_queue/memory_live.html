@@ -216,7 +216,8 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-chart { margin-right: var(--details); }
 .walk-chart { min-width: 0; position: relative; }
 .walk-chart-head { height: 30px; }
-.walk-bud { position: absolute; top: 30px; bottom: 22px; width: 0; margin-left: -1px; border-left: 3px solid var(--cap); pointer-events: none; z-index: 1; transition: left 0.6s ease; }
+.walk-bud { position: absolute; top: 30px; bottom: 22px; width: 0; margin-left: -1px; border-left: 3px solid transparent; pointer-events: none; z-index: 1; }
+.walk-bud .cap-part { position: absolute; left: -3px; border-left: 3px solid var(--cap); }
 .wrow, .walk-axis { display: grid; grid-template-columns: var(--amt) minmax(0, 1fr); gap: var(--gap); position: relative; align-items: center; font-size: 0.88rem; text-align: left; }
 .wrow { min-height: 44px; }
 .row-label { min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
@@ -231,11 +232,10 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .bar-amount { position: absolute; white-space: nowrap; cursor: help; }
 .wrow.room .row-heading { font-size: 0.75rem; gap: 8px; justify-content: space-between; }
 .wrow.room .name { flex: none; overflow: visible; text-overflow: clip; }
-.walk-table tr.room > *, .walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
+.walk-table tr.wait-first > * { border-top: 1px solid var(--line); }
 .wrow.wait-first::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
-.walk-table tr.room > * { border-bottom: 1px solid var(--line); }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
 .queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
@@ -260,7 +260,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.beside .walk-table { position: absolute; top: 0; left: var(--table-left); }
 .walk.beside .walk-chart .queue-head { max-width: calc(var(--table-left) - 16px); }
 .walk.beside .wrow.room, .walk.beside .wrow.wait-first,
-.walk.beside .walk-table tr.room > *, .walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
+.walk.beside .walk-table tr.wait-first > * { border-top: 0; border-bottom: 0; }
 .walk.beside .wrow.room::after { width: calc(100% + var(--details)); }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before {
   content: ""; position: absolute; top: 0; left: 0; width: calc(100% + var(--details));
@@ -268,11 +268,29 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 }
 .walk.beside .wrow.room::before, .walk.beside .wrow.wait-first::before { top: var(--divider-top, 0px); }
 .walk.stacked .step { display: table-cell; }
+/* The stacked chart above the table shows the next step room, so the table leaves out its empty row. */
+.walk.stacked .walk-table tr.room { display: none; }
+.walk.stacked .walk-table tr.queue-head > * { border-top: 1px solid var(--line); }
 .walk.stacked .walk-table { width: 100%; overflow-x: auto; }
-.walk.stacked .walk-table .cell-text { max-width: min(6rem, var(--table-label, 6rem)); }
-.walk.stacked .walk-table .unit .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
+.walk.stacked .walk-table .cell-text, .walk.measuring .walk-table .unit .cell-text { max-width: none; }
+.walk.stacked .row-label .name { white-space: normal; overflow-wrap: anywhere; }
 .walk.measuring .step { display: none; }
 .walk.measuring .walk-table .cell-text { max-width: 8rem; }
+/* A stacked table wider than the card shows each step on two lines: Step, Stage and Done, then the other columns. */
+.walk.compact .walk-table table { display: grid; grid-template-columns: auto auto auto minmax(auto, 1fr) auto; column-gap: 12px; width: 100%; }
+.walk.compact .walk-table thead, .walk.compact .walk-table tbody { display: contents; }
+.walk.compact .walk-table tr { display: grid; grid-column: 1 / -1; grid-template-columns: subgrid; align-content: center; row-gap: 2px; height: auto; padding: 4px 0; }
+.walk.compact .walk-table th, .walk.compact .walk-table td { width: auto; padding: 0; white-space: normal; overflow-wrap: break-word; }
+.walk.compact .walk-table .step { grid-area: 1 / 1 / 2 / 3; contain: inline-size; }
+.walk.compact .walk-table .place { grid-area: 1 / 3 / 2 / 5; contain: inline-size; }
+.walk.compact .walk-table .done { grid-area: 1 / 5; }
+.walk.compact .walk-table .duration { grid-area: 2 / 1; min-width: var(--duration); text-align: left; }
+.walk.compact .walk-table .unit { grid-area: 2 / 2; }
+.walk.compact .walk-table .pid { grid-area: 2 / 3; text-align: left; }
+.walk.compact .walk-table .machine { grid-area: 2 / 4; }
+.walk.compact .walk-table .vcpus { grid-area: 2 / 5; }
+.walk.compact .walk-table tr.wait-first > *, .walk.compact .walk-table tr.queue-head > * { border-top: 0; }
+.walk.compact .walk-table tr.wait-first, .walk.compact .walk-table tr.queue-head { border-top: 1px solid var(--line); }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
@@ -306,7 +324,6 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
   .swaprows .row { flex-wrap: wrap; }
   .legend .row .name { min-width: 0; }
   .walk-table table { font-size: 0.78rem; }
-  .walk.stacked .walk-table .cell-text { max-width: min(4.5rem, var(--table-label, 4.5rem)); }
   .walk { gap: 10px; }
 }
 @media (max-width: 560px) {
@@ -639,7 +656,8 @@ function identityHtml(row) {
 }
 function stageText(row) {
   if (macRow(row)) return ["MacTesting", "MacTestingCounter"].includes(row.stage?.kind) ? "testing" : row.stage?.kind === "MacBuilding" ? "building" : "—";
-  return row.progress?.kind === "RowProgress" ? row.progress.phase : "—";
+  return row.progress?.kind === "RowProgress" ? row.progress.phase
+    : row.progress?.kind === "TokenWaitProgress" ? row.progress.stage : "—";
 }
 function doneText(row) {
   const progress = row.progress;
@@ -1103,7 +1121,9 @@ function renderWalk(d) {
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${i}" data-run="${i}">${rowLabel(r.name, rowOwner(r))}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${i}`) : rowMemory(`row:${i}`)) + `</div>`;
   });
-  cells("", "Next step room", "", "", null, "", null, "room", "room");
+  // The table row only holds the place of the chart room row beside it; its value shows in the chart.
+  const columnClasses = ["place", "done", "step", "duration", "unit", "pid", "machine", "vcpus"];
+  tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Next step room")}` + rowMemory("room") + `</div>`);
   if (d.waiters.length) {
     const units = d.queued_priority_units || [];
@@ -1169,7 +1189,7 @@ function fitWalkDetails() {
   if (!latest || !table || !track || document.body.classList.contains("queue-unavailable")) return;
   const root = document.documentElement;
   // Measure without the last layout: a stacked table is full width, so the chart would stay stacked on a wider page.
-  walk.classList.remove("beside", "stacked");
+  walk.classList.remove("beside", "stacked", "compact");
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
   function measure(labelWidth) {
@@ -1229,15 +1249,9 @@ function fitWalkDetails() {
   walk.classList.toggle("beside", beside);
   walk.classList.toggle("stacked", !beside);
   walk.classList.remove("measuring");
+  walk.classList.toggle("compact", !beside && table.scrollWidth > table.clientWidth);
   measureColumn("duration");
   measureColumn("machine");
-  if (!beside) {
-    const fixedWidth = ["place", "done", "duration", "machine", "vcpus", "pid"].reduce((width, name) =>
-      width + table.querySelector(`th.${name}`).getBoundingClientRect().width, 0);
-    const padding = ["step", "unit"].reduce((width, name) =>
-      width + parseFloat(getComputedStyle(table.querySelector(`th.${name}`)).paddingRight), 0);
-    root.style.setProperty("--table-label", `${Math.max(0, (walk.clientWidth - fixedWidth - padding) / 2)}px`);
-  }
   if (beside) {
     // The chart takes its scale from its own track: the memory bar is hidden when RAM readings disagree.
     const range = track.getBoundingClientRect();
@@ -1246,17 +1260,24 @@ function fitWalkDetails() {
       : range.left + range.width * capFraction + 0.5 + TABLE_CAP_GAP;
     walk.style.setProperty("--table-left", `${tableLeft - walk.getBoundingClientRect().left}px`);
   }
-  for (const row of walk.querySelectorAll(".wrow[data-tip]")) {
-    const metadata = table.querySelector(`tr[data-tip="${row.dataset.tip}"]`);
+  for (const row of walk.querySelectorAll(".wrow[data-tip], .wrow.room")) {
+    const metadata = table.querySelector(row.dataset.tip ? `tr[data-tip="${row.dataset.tip}"]` : "tr.room");
     if (!metadata) continue;
     const detail = row.querySelector(".amounts");
     if (row.classList.contains("cloud-work")) detail.style.maxWidth = beside
       ? `${Math.max(0, table.getBoundingClientRect().left - detail.getBoundingClientRect().left - TABLE_CAP_GAP)}px` : "";
     row.style.minHeight = "44px";
-    metadata.style.height = "44px";
+    metadata.style.height = "";
     const height = Math.ceil(Math.max(row.getBoundingClientRect().height, metadata.getBoundingClientRect().height));
     row.style.minHeight = `${height}px`;
     metadata.style.height = `${height}px`;
+  }
+  const queueRow = table.querySelector("tr.queue-head");
+  const queueSpacer = walk.querySelector(".walk-chart .queue-head");
+  if (queueRow && queueSpacer) {
+    queueRow.style.height = queueSpacer.style.height = "";
+    const height = Math.ceil(Math.max(queueRow.getBoundingClientRect().height, queueSpacer.getBoundingClientRect().height));
+    queueRow.style.height = queueSpacer.style.height = `${height}px`;
   }
 }
 
@@ -1363,9 +1384,45 @@ function placeMemoryBars(d) {
   }
 }
 
+const CAP_TEXT_GAP = 3;
+// The cap line stops at each line of chart text that it would cross, so no text sits on it.
+function cutCapLine() {
+  const line = $("walk").querySelector(".walk-bud");
+  if (!line) return;
+  const bounds = line.getBoundingClientRect();
+  const range = document.createRange();
+  const gaps = [];
+  const walker = document.createTreeWalker(line.parentElement, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.textContent.trim()) continue;
+    range.selectNodeContents(node);
+    // Text past the edge of a clipped box, such as a name that ends in an ellipsis, does not show.
+    let right = Infinity;
+    for (let box = node.parentElement; box !== line.parentElement; box = box.parentElement) {
+      if (getComputedStyle(box).overflowX !== "visible") right = Math.min(right, box.getBoundingClientRect().right);
+    }
+    for (const rect of range.getClientRects()) {
+      if (rect.width && rect.left < bounds.right + CAP_TEXT_GAP && Math.min(rect.right, right) > bounds.left - CAP_TEXT_GAP &&
+        rect.top < bounds.bottom && rect.bottom > bounds.top) {
+        gaps.push([rect.top - bounds.top - CAP_TEXT_GAP, rect.bottom - bounds.top + CAP_TEXT_GAP]);
+      }
+    }
+  }
+  gaps.sort((a, b) => a[0] - b[0]);
+  const parts = [];
+  let end = 0;
+  for (const [top, bottom] of gaps) {
+    if (top > end) parts.push([end, top]);
+    end = Math.max(end, bottom);
+  }
+  if (end < bounds.height) parts.push([end, bounds.height]);
+  line.innerHTML = parts.map(([top, bottom]) => `<span class="cap-part" style="top:${top}px;height:${bottom - top}px"></span>`).join("");
+}
+
 function fitLabels() {
   fitWalkDetails();
   if (latest) placeMemoryBars(latest);
+  cutCapLine();
   fitAxisLabels();
   const at = latest ? $("barwrap").getBoundingClientRect().width * capEnd(latest) : 0;
   $("mark").style.left = `${at}px`;

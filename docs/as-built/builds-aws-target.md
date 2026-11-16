@@ -683,11 +683,15 @@ The user asked for these page changes on 2026-11-14 through builds:
 2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
    In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
-   A thin dark edge around the white box keeps it visible on the light page. Equal cells all have the box.
+   The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold. One legend line explains the colors, the box and the bold.
+   The lowest and the highest cell of each table have only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes.
+   The user asked for it on 2026-11-15 through builds. A legend line above the cards explains the colors.
+   A legend line under each price card that has a box names both outlines.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
+   The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
+   The region chips have 6 px padding and a 4 px gap, so the 21 chips fit one row in a 1920 px window.
    The user asked for the side by side cards on 2026-11-15 through builds.
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
 5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
@@ -697,10 +701,12 @@ The user asked for these page changes on 2026-11-14 through builds:
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it. `All` shows every region again.
+   The chips show the groups `us`, `eu`, `ap`, `ca` and `sa` in that order, each A to Z; a region outside them comes last.
+   `aws_page.region_filter_key` sets the order; the user asked for it on 2026-11-15 through sdlc and builds.
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The colors, the white box and the bold use only the chosen regions. `Table.values` holds the number of each cell.
+3. The colors and both outlines use only the chosen regions. `Table.values` holds the number of each cell.
    One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
