@@ -232,7 +232,7 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
-                            "due", "marked", "follows", "asked_by", "followup", "followups"}, where)
+                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log"}, where)
         if "parts" in fields:
             _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
@@ -317,6 +317,8 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
+    review_id: NotRequired[str]
+    review_log: NotRequired[str]
     since: str
     text: str
     after: NotRequired[str]
@@ -1038,8 +1040,38 @@ def close_questions(document: Path, identities: QuestionStaff) -> None:
                 write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
 
 
+def question_review_id(record: QuestionRecord) -> str:
+    """Allocate the question's stable owner-local number in its existing record."""
+    with outstanding_lock(record.path.parent / ".review-ids"):
+        fields = frontmatter(record.path) if record.path.exists() else {}
+        if fields:
+            current = _question_records([Issue(record.path, fields)])[0]
+            record = current
+        identity = record.item.get("review_id", "")
+        if identity:
+            return identity
+        highest = 0
+        for path in record.path.parent.glob("question-*.md"):
+            for other in _question_records([Issue(path, frontmatter(path))]):
+                number = other.item.get("review_id", "")
+                if number.startswith("Q") and number[1:].isdigit():
+                    highest = max(highest, int(number[1:]))
+        identity = f"Q{highest+1}"
+        record.item["review_id"] = identity
+        write_question_record(record)
+        return identity
+
+
 def write_question_record(record: QuestionRecord) -> None:
     item = record.item
+    if "review_id" not in item and record.path.exists():
+        stored = _question_records([Issue(record.path, frontmatter(record.path))])
+        if stored and stored[0].item.get("review_id"):
+            item["review_id"] = stored[0].item.get("review_id", "")
+    if "review_log" not in item and record.path.exists():
+        stored = _question_records([Issue(record.path, frontmatter(record.path))])
+        if stored and stored[0].item.get("review_log"):
+            item["review_log"] = stored[0].item.get("review_log", "")
     if "question" not in item:
         raise RegistrationFailure("questions", f"{record.path}: the question text is missing")
     text = "\n".join([
@@ -1050,6 +1082,17 @@ def write_question_record(record: QuestionRecord) -> None:
     ])
     if not record.path.exists() or record.path.read_text(encoding="utf-8") != text:
         write_text_atomic(record.path, text)
+
+
+def record_review_log(path: Path, words: str) -> None:
+    """Keep the user's action on the canonical question record."""
+    from scripts.review_links import review_events
+    with outstanding_lock(path.parent / ".review-ids"):
+        record = _question_records([Issue(path, frontmatter(path))])[0]
+        events = review_events.decode(record.item.get("review_log", ""))
+        event = review_events.ReviewLog(datetime.now().astimezone(), "nate", words)
+        record.item["review_log"] = review_events.encode(review_events.append(events, event))
+        write_question_record(record)
 
 
 def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
@@ -1072,7 +1115,9 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
                      if record.asker == row.id and record.item["text"] == item["text"]),
                     folder.path / f"question-{row.id}-{digest[:16]}.md")
         open_paths.add(path)
-        write_question_record(QuestionRecord(path, owner, row.id, item, "open"))
+        record = QuestionRecord(path, owner, row.id, item, "open")
+        write_question_record(record)
+        _ = question_review_id(record)
     for record in existing:
         if record.status == "open" and record.path not in open_paths:
             write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))

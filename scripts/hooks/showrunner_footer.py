@@ -91,8 +91,9 @@ def read_production(instance_dir: Path) -> Production | None:
 def open_questions(productions: list[Production], *, identities: QuestionStaff | None = None,
                    source: str = "") -> int | None:
     """Count due questions, with an optional fixed source staff id."""
-    from scripts.production.update_registration import (InputError, OutstandingReminder, RegistrationFailure,
-                                                        due, read_open_items)
+    from scripts.review_links import review_items
+    from scripts.production.update_registration import (InputError, RegistrationFailure,
+                                                        read_open_items)
 
     try:
         identities = identities if identities is not None else QuestionStaff.read()
@@ -109,8 +110,7 @@ def open_questions(productions: list[Production], *, identities: QuestionStaff |
             items = read_open_items(outstanding_path(owner.id, identities=identities),
                                     document=production.doc, identities=identities)
             now = datetime.now(ZoneInfo(production.zone)).replace(tzinfo=None)
-            count += sum(not source or (not isinstance(item, OutstandingReminder) and item.asked_by == source)
-                         for item in due(items, now))
+            count += review_items.count_due(items, now, source)
         except (InputError, OSError, ValueError, RegistrationFailure, staff.StaffRefused) as error:
             print(f"questions: unavailable — {error}", file=sys.stderr)
             return None
