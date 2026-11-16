@@ -199,13 +199,18 @@ class PhaseStartUnavailable:
 
 
 @dataclass(frozen=True)
+class WaitsNotRecorded:
+    """The finish came before phase_active_seconds, so its wall time can hold waits."""
+
+
+@dataclass(frozen=True)
 class ProgressFinish:
     timestamp_epoch: float
     phase_instance_id: str
     working_dir: str
     host: str
-    # Phase time without waits for the user or a supplier; wall time for a record written before that count.
-    active_s: float | PhaseStartUnavailable
+    # Phase time without waits for the user or a supplier.
+    active_s: float | PhaseStartUnavailable | WaitsNotRecorded
 
 
 def progress_events() -> tuple[ProgressFinish, ...]:
@@ -243,7 +248,7 @@ def progress_events() -> tuple[ProgressFinish, ...]:
                         continue
                     active = event.get("phase_active_seconds")
                     seconds = (float(active) if isinstance(active, (int, float)) and not isinstance(active, bool) and active >= 0
-                               else float(at - started) if isinstance(started, (int, float))
+                               else WaitsNotRecorded() if isinstance(started, (int, float))
                                and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
                     events[instance] = ProgressFinish(float(at), instance, directory, host, seconds)
         except OSError:

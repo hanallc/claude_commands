@@ -50,7 +50,8 @@ class CostTests(unittest.TestCase):
             finish = fixtures.START.timestamp() + number + 10
             common: Record = {"phase_instance_id": f"phase-{number}", "working_dir": directory}
             events.extend(({**common, "event_type": "phase_started", "timestamp_epoch": finish - seconds},
-                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds}))
+                           {**common, "event_type": "phase_finished", "timestamp_epoch": finish, "status": "completed", "phase_started_at": finish - seconds,
+                            "phase_active_seconds": seconds}))
         self.fixture.progress(events)
 
     def test_first_source_uses_a_recorded_event_instead_of_a_month_boundary(self) -> None:
@@ -94,10 +95,11 @@ class CostTests(unittest.TestCase):
         self.assertEqual(len(phases), 1)
         self.assertIsInstance(phases[0].active_s, moments.PhaseStartUnavailable)
 
-    def test_finish_wall_time_needs_no_start_event_or_event_field_substring(self) -> None:
+    def test_finish_time_needs_no_start_event_or_event_field_substring(self) -> None:
         self.fixture.progress([
             {"event_type": "phase_finished", "phase_instance_id": "kept", "working_dir": "/r/hana",
-             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590},
+             "timestamp_epoch": fixtures.START.timestamp() + 10, "phase_started_at": fixtures.START.timestamp() - 3590,
+             "phase_active_seconds": 3600},
             {"event_type": "unrelated", "phase_started_at": 1, "phase_instance_id": "noise"},
         ])
         self.fixture.progress([

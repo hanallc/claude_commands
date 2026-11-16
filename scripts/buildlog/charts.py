@@ -331,7 +331,10 @@ def chart_data(series: ChartSet) -> dict[str, object]:
         if durations:
             phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))
         else:
-            phase.update(state="unavailable", reason="no valid durations" if hana else "no finished phases")
+            phase.update(state="unavailable", reason=(
+                "phases ended before waits were recorded"
+                if any(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
+                else "no valid durations" if hana else "no finished phases"))
         rows: list[dict[str, object]] = []
         days = (bucket.end-bucket.start).total_seconds()/86400
         for machine in series.machines:

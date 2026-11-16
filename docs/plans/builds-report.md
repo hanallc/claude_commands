@@ -1841,8 +1841,9 @@ As built:
 - `finish-phase` writes `phase_active_seconds`: the phase time less the union
   of its `WaitingForUser` and `WaitingForSupplier` waits. An open wait ends at
   the finish. `phase_elapsed_seconds` is unchanged, so ETA bands do not change.
-- `moments.progress_events` reads `phase_active_seconds`, else the wall time.
-  Records from before this change keep their wall time.
+- `moments.progress_events` reads `phase_active_seconds`. A record from before
+  this change is `WaitsNotRecorded`, because its wall time can hold waits.
+  A day with only such records reads `phases ended before waits were recorded`.
 - The plot title is "Hana phase time, without waits for the user or the
   showrunner". The legend says "half of phases take up to" and "most phases
   take up to". The memory action says "Most runs peak at N GiB or less."

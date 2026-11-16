@@ -352,7 +352,8 @@ class ChartTests(ChartFixture):
     def test_exact_edges_assign_steps_phases_ci_and_moments_to_the_later_bucket(self) -> None:
         edge = fixtures.START+timedelta(days=1)
         self.fixture.progress([{"event_type": "phase_finished", "phase_instance_id": "edge", "working_dir": "/r/hana",
-                                "timestamp_epoch": edge.timestamp(), "phase_started_at": edge.timestamp()-60}])
+                                "timestamp_epoch": edge.timestamp(), "phase_started_at": edge.timestamp()-60,
+                                "phase_active_seconds": 60}])
         job = ci_job(1, "build", "cancelled", (edge.isoformat(), edge.isoformat(), (edge+timedelta(hours=1)).isoformat()))
         run = ci_run(1, 1, [job])
         run.update(started_at=edge.isoformat(), created_at=edge.isoformat(), updated_at=(edge+timedelta(hours=1)).isoformat(), conclusion="cancelled")
@@ -450,11 +451,21 @@ class ChartTests(ChartFixture):
         self.fixture.progress([
             {"event_type": "phase_finished", "phase_instance_id": "paused", "working_dir": "/r/hana",
              "timestamp_epoch": start + 7200, "phase_started_at": start, "phase_active_seconds": 1800},
-            # A record from before the active count keeps its wall time.
+            # A record from before the active count has wall time that can hold waits.
             {"event_type": "phase_finished", "phase_instance_id": "old", "working_dir": "/r/hana",
              "timestamp_epoch": start + 3600, "phase_started_at": start}])
         times = {event.phase_instance_id: event.active_s for event in moments.progress_events()}
-        self.assertEqual(times, {"paused": 1800.0, "old": 3600.0})
+        self.assertEqual(times, {"paused": 1800.0, "old": moments.WaitsNotRecorded()})
+
+    def test_a_day_of_phases_without_an_active_count_has_no_phase_time(self) -> None:
+        start = fixtures.START.timestamp()
+        self.fixture.progress([{"event_type": "phase_finished", "phase_instance_id": "old", "working_dir": "/r/hana",
+                                "timestamp_epoch": start + 3600, "phase_started_at": start}])
+        with closing(self.fixture.connection(fixtures.build("record", 10, target="natedev"))) as connection:
+            series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
+        buckets = cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
+        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "state": "unavailable",
+                                               "reason": "phases ended before waits were recorded"})
 
     def test_bucket_sums_match_shared_costs_and_each_source_reads_once(self) -> None:
         self.fixture.progress([{"event_type":"phase_finished", "phase_instance_id":"one", "working_dir":"/r/hana",
