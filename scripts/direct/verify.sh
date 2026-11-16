@@ -24,6 +24,7 @@
 #   --run-ignored only   test: run only ignored tests, with optional filters
 #   --features <list>    check, test, doc, build: enable Cargo features
 #   --no-cache           test, lint: ignore saved results
+#   --attached           build: stay in the foreground; never detach
 #   --target <name>      pin movable steps to one configured target
 #   --mac "<reason>"     pin movable steps to the Mac
 #   --local "<reason>"   pin steps to natedev
@@ -136,7 +137,7 @@
 #
 # Help build:
 # Usage: verify build [<package>] [--bin <name> | --example <name>]
-#                     [--release] [--features <list>]
+#                     [--release] [--features <list>] [--attached]
 #
 # Build binaries on natedev unless --target or --mac pins the step.
 # --local pins the step to natedev.
@@ -149,6 +150,8 @@
 # Cargo resolves features for the whole workspace.
 # Print local executables as binary: <path>.
 # Print remote executables as binary: <target>:<path>.
+# A Codex worker's call detaches and sends these lines as a message later.
+# --attached keeps the call in the foreground, so its caller reads them inline.
 # Always build; do not reuse a saved result.
 # End help.
 #
@@ -258,6 +261,14 @@ parse_routing_arguments() {
                 ;;
             --no-cache)
                 NO_CACHE=1
+                shift
+                ;;
+            --attached)
+                # The detach step reads this flag before this parser runs.
+                if [[ "$CMD" != build ]]; then
+                    echo 'verify.sh: --attached is a build flag: verify.sh build <package> --attached.' >&2
+                    exit 2
+                fi
                 shift
                 ;;
             --mac)
@@ -1402,9 +1413,10 @@ esac
 # Exit 3 means the caller is not a registered worker; this call then runs attached.
 # Exit 4 refuses the run at its live-run limit; never run that command attached.
 # The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
+# A build call with --attached does not detach: its caller reads the binary line inline.
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/detached_runs.py}"
 verify_helper --start
-if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
+if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
     verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
