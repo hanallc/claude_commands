@@ -387,6 +387,7 @@ class HoldEnforcerTests(unittest.TestCase):
     def test_a_hold_keeps_a_gate_whose_build_waits_for_or_runs_on_the_mac_or_aws(self) -> None:
         # The fps hold on 2026-11-15 stopped a Mac-only lint that waited for the Mac
         # and a lint whose Mac step had passed and whose claim had ended.
+        # A drain does not keep such a gate: a later natedev step must wait for the release.
         state = step_record.StepState
         cases = (
             ("Mac only, waiting for placement", ("mac",), state.WAITING_HOLD, True),
@@ -411,6 +412,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     claims = self.claim_reader(self.proc)
                 assert isinstance(claims, build_hold.LiveClaims)
                 self.assertEqual(table[10].identity in claims.identities, kept)
+                self.assertEqual(table[10].identity in claims.routed, kept)
                 signals: list[tuple[int, int]] = []
                 with redirect_stdout(io.StringIO()):
                     hold_enforcer.stop_queued_runs(table, holders, self.uid, 999, claims.identities, self.proc,
@@ -419,7 +421,24 @@ class HoldEnforcerTests(unittest.TestCase):
                 runs = hold_enforcer.classify_drain_runs(table, frozenset(), claims)
                 assert not isinstance(runs, build_hold.ClaimsUnreadable)
                 run, = runs
-                self.assertIsInstance(run, hold_enforcer.WorkingRun if kept else hold_enforcer.WaitingRun)
+                self.assertIsInstance(run, hold_enforcer.WaitingRun)
+                with mock.patch.object(build_hold, "read_audit_processes", return_value=table), \
+                     mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+                     mock.patch.object(target_config, "read_targets", return_value=()):
+                    kept_runs = hold_enforcer.drain_identities(
+                        self.proc, build_hold.HolderIdentity(holders[0].key, holders[0].name))
+                self.assertNotIn(table[10].identity, kept_runs)
+
+    def test_an_unreadable_step_record_makes_the_claims_unreadable(self) -> None:
+        # A damaged record can name a Mac-only gate; a hold must not stop that gate.
+        _ = self.process(10, "bash", session="gate", argv=("bash", "verify.sh", "lint", "hana", "--mac", "lint"))
+        directory = step_record.record_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "gate-call.json").write_text("{damaged")
+        with mock.patch.object(target_config, "read_targets", return_value=()):
+            claims = self.claim_reader(self.proc)
+        assert isinstance(claims, build_hold.ClaimsUnreadable)
+        self.assertIn("gate-call.json", claims.reason)
 
     def test_drain_keeps_first_scan_entries_and_bounds_second_scan_additions(self) -> None:
         from scripts.build_targets import build_targets

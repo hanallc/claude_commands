@@ -352,7 +352,13 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class LiveClaims:
+    """Name the processes that a hold must not stop.
+
+    `routed` names the identities that only a step record routed off natedev claims. A drain does not keep them:
+    a later natedev step of that call waits for the release.
+    """
     identities: frozenset[ProcessIdentity]
+    routed: frozenset[ProcessIdentity] = frozenset()
 
 
 @dataclass(frozen=True)

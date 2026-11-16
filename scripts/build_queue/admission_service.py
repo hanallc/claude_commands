@@ -2915,8 +2915,15 @@ done
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
             state = self._assignment_state(saved)
-            if isinstance(state, placement.ClosedAssignment):
+            if isinstance(state, placement.ClosedAssignment) and saved.assignment.destination.provider == "local":
                 return self._placement_status(saved.assignment, state.reason)
+            if isinstance(state, placement.ClosedAssignment):
+                # A released provider claim is final only after a pass settles the attempt and its retry.
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                return wire.PlacementWait(request.episode, request.since, 1,
+                    self.placement_eligibility.get(request.episode, ()),
+                    provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
+                    retry_notices=retry_notices)
             if saved.assignment.destination.provider == "local":
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)

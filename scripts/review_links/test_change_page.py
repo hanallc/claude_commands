@@ -251,6 +251,65 @@ class ReviewTextTests(unittest.TestCase):
         self.assertIn(plain, change_page.document(plain).decode())
         self.assertNotIn(page_frame.COPY_BUTTON, change_page.document(plain).decode())
 
+    def test_question_commands_stay_inside_the_item_that_ends_with_a_colon(self) -> None:
+        for block, code in (("```sh\nprintf '<check>'\n```", "printf '<check>'"),
+                            ("`printf '<check>'`", "printf '<check>'")):
+            for form in ("parts continuation", "parts entry", "one text"):
+                with self.subTest(block=block, form=form):
+                    item = update_registration.OutstandingItem(since="now", text="Check the steps?")
+                    if form.startswith("parts"):
+                        items = (["Read the title.", "Run this:\n\n" + block, "Read the result."]
+                                 if form == "parts continuation" else
+                                 ["Read the title.", "Run this:", block, "Read the result."])
+                        item["parts"] = update_registration.QuestionParts(ask="Check the steps?", context="",
+                            items=items, recommend="", choices=[])
+                    else:
+                        item["question"] = "Check the steps?\n\n1. Read the title.\n2. Run this:\n\n" + block + "\n3. Read the result."
+                    body, _ = change_browser.question_parts(item)
+                    entries = [match.group(1) for match in re.finditer(r"<li>(.*?)</li>", body, re.DOTALL)]
+                    self.assertEqual(len(entries), 3)
+                    self.assertEqual(entries[0], "Read the title.")
+                    self.assertEqual(entries[2], "Read the result.")
+                    self.assertTrue(entries[1].startswith('Run this:<div class="code-block"><pre><code>'))
+                    self.assertIn("<pre><code>" + html.escape(code) + "</code></pre>", entries[1])
+                    self.assertEqual(entries[1].count(page_frame.COPY_BUTTON), 1)
+                    self.assertNotIn("```", body)
+
+    def test_question_item_numbers_and_blank_lines_inside_code_do_not_split_the_list(self) -> None:
+        for block in ("```text\n1. code line\n\n2. code line\n```", "`1. code line 2. code line`"):
+            for final in (False, True):
+                with self.subTest(block=block, final=final):
+                    text = ("1. Read the title.\n2. Run this:\n\n" + block
+                            + ("\n\nContext after the list." if final else "\n3. Read the result."))
+                    lead, items, trailing = change_browser.numbered_run(text)
+                    self.assertEqual(lead, "")
+                    self.assertEqual(len(items), 2 if final else 3)
+                    self.assertEqual(items[1], "Run this:\n\n" + block)
+                    self.assertEqual(trailing, "Context after the list." if final else "")
+                    body, _ = change_browser.text_sections(text)
+                    self.assertEqual(body.count("<li>"), 2 if final else 3)
+                    self.assertEqual(body.count(page_frame.COPY_BUTTON), 1)
+
+    def test_reviewed_question_without_a_question_mark_uses_its_first_sentence_as_the_title(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            reviewed="Check the title. Keep this context once.\n\nCan the later paragraph stay in the body?")
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, "Check the title.")
+        self.assertEqual(context, "Keep this context once.\n\nCan the later paragraph stay in the body?")
+        body, _ = change_browser.question_parts(item)
+        self.assertNotIn(title, body)
+        self.assertEqual(body.count("Keep this context once."), 1)
+        self.assertEqual(body.count("Can the later paragraph stay in the body?"), 1)
+        for reviewed in ("Check the title. keep this context once.", "Check the title! keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed, ""))
+        for reviewed in ("Check the title. Keep this context once.", "Check the title! Keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed[:16], "Keep this context once."))
+        item["reviewed"] = "Keep this question? Keep the present title rule.\n\nContext."
+        self.assertEqual(change_browser.question_text(item),
+                         ("Keep this question? Keep the present title rule.", "Context."))
+
     def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
         parts = update_registration.QuestionParts(
             ask="Approve both page changes to land?", context="Two changes wait.",

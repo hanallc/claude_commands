@@ -331,6 +331,52 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Gotchas:** The branch carries sdlc-fix-rounds at 304c80d16 (merge 6dbb94f81), so it lands after the admin-console batch.
 
+### Phase 38 — A change-review write holds the lock under 1 s, and one batch writes many rows  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `_commit(paths, what)` in `change_review.py` commits one or more lists of one repository by plumbing only. It runs from the repository top level: `hash-object -w --path` for each list, then `read-tree` of HEAD (or `--empty`), `update-index --cacheinfo` and `write-tree` in a temporary `GIT_INDEX_FILE`. It sets each list's entry in the real index, then runs `commit-tree` and `update-ref HEAD <new> <old HEAD>`. A moved HEAD retries up to 5 times. A tree equal to HEAD's makes no commit. No command refreshes the index, so clean filters on other modified files never run. A write in a repository shaped like hanadocs takes 0.01-0.06 s, down from about 3.1 s.
+- A failure warns "written but not committed: <reason>; the next write commits it" and moves no ref.
+- `change_review.py batch --file <json>` takes an array of `edit` and `verdict` items (`op`, `production`, `row`, optional `list`; `change`, `check`, `see`, `image`, `output` for `edit`; `verdict` for `verdict`). It checks every item and registers images before the lock. All lists must be in one folder, and a row named twice is refused. Under one lock it writes every list, then makes one commit over every target list, changed or not: subject `change-review: batch <N> writes (<owner> <count>, ...)`. Any error exits 1 and names the item index. A rerun after a stopped batch finishes the remaining writes and commits every list.
+- `edit_row` and `record_verdict` share `_edit_write` and `_verdict_write` (a `RowWrite` with `write` and `after`) with `batch`.
+- `add`, `edit` and batch `edit` items accept `--output` like the `image` action; `--image` with `--output` is refused.
+- `show --row <id>` prints that row with `describe`; a row not on the list exits 1.
+- `ACTION_OPTIONS` maps each action to the options it reads. Any other option given a value exits 1 and names the option.
+
+**Files:**
+- `scripts/production/change_review.py` — `_commit`, `_edit_write`, `_verdict_write`, `_register_image`, `batch`, `ACTION_OPTIONS`, `show --row`
+- `scripts/production/test_change_review.py` — plumbing commit, race, unborn HEAD, filter, batch and option tests
+- `commands/change_review.md` — `batch`, the plumbing commit, the option rules
+
+**Gotchas:**
+- `hash-object --path` takes a path relative to the top level, so it must run from the top level, or list attributes do not match.
+- Images a failed batch registered stay unclaimed until `sweep_change_images` removes them.
+
+### Phase 39 — The ten C51 suites pass on the Mac  · status: done
+**Depends on:** none
+
+#### As-built
+
+- `scripts/lib/py` writes every array expansion as `${name[@]+"${name[@]}"}` (`shim_parts`, `python_options`, `file_separator`). macOS `/bin/bash` 3.2 runs it under `set -u` with no Python options. Other behavior does not change.
+- `scripts.lib.test_py_shim` refuses a bare `"${name[@]}"` expansion in the file (a text check), and runs the shim under `bash -u` with no options (stdin) and with `-c`.
+- `NativePaneSessionTests` pins `herdr._PLATFORM` to `"linux"` in the three tests that fake `/proc`: `test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread`, `test_codex_native_process_uses_its_resume_argument_or_own_pane_report` and `test_cached_starting_pane_reports_once_in_each_run`. Product code does not change.
+- The account_move preview test sets `CLAUDE_PYTHON=sys.executable`, so `scripts/lib/py` writes no interpreter cache under the test HOME on darwin.
+- Proof: a `mac_queue_run.py` run of the ten C51 suites plus `test_py_shim` at 7d40bfcc5 with this diff ran 826 tests OK; natedev ran 844 tests OK.
+
+**Files:**
+- `scripts/lib/py` — the Python launcher shim
+- `scripts/lib/test_py_shim.py` — shim tests and the bare-expansion check
+- `scripts/herdr/test_herdr.py` — `NativePaneSessionTests` platform pin
+- `scripts/agents/test_account_move.py` — the preview test sets `CLAUDE_PYTHON`
+
+**Gotchas:**
+- Under `set -u`, bash 3.2 treats `"${arr[@]}"` of an empty array as unbound. Bash 4.4 and later do not, so natedev cannot show the failure; the text check stands in for it.
+- On darwin, `scripts/lib/py` writes `$HOME/Library/Caches/claude/python3-x.y` unless `CLAUDE_PYTHON` is set. A test that compares HOME disk state sets `CLAUDE_PYTHON`.
+- A test that fakes Linux `/proc` pins `herdr._PLATFORM` to `"linux"`; on darwin, herdr reads `ps` instead.
+
+**Ruled out:** a class-wide platform pin in `setUp` (most `NativePaneSessionTests` tests do not fake `/proc`).
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
