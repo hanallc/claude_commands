@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.disks import disks_page
 from scripts.lib import file_lock, test_hang_guard
 from scripts.review_links import page_frame
@@ -44,6 +45,14 @@ class DisksPageTests(unittest.TestCase):
         self.assertNotIn("__", page.split("<script>", 1)[0].split("</style>", 1)[1])
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_disks_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
+        assert_status_states(self, page, SETTINGS["poll_seconds"], {"measured_at": 1, "render_seconds": .01,
+                                                                "keep_bytes": KEEP, "drives": [{"mount": "/build", "total": 200 * GIB,
+                                                                 "used": 100 * GIB, "free": 100 * GIB, "floor": 30 * GIB, "tree": TREE}]})
 
     def test_rows_fold_small_folders_and_show_one_small_folder_by_name(self) -> None:
         rows = self.rows(10 * GIB, ["/build/cargo"])
@@ -80,15 +89,14 @@ class DisksPageTests(unittest.TestCase):
         self.assertAlmostEqual(middle, GIB * math.sqrt(60), delta=1)
         self.assertEqual(result[5], 10 * GIB)
 
-    def test_the_status_line_names_the_age_then_the_measure_then_a_problem(self) -> None:
-        recent = "statusText(Date.now() / 1000 - 120, Date.now() / 1000, {}).replace(/^Sizes from [^,]+, /, '')"
-        calls = ("statusText(null, 0, true, '', 600)", "statusText(null, 0, false, '', 600)",
-                 "statusText(null, 0, false, 'The measure did not finish.', 600)",
-                 recent.format("false, '', 600"), recent.format("true, 'The measure did not finish.', 600"))
-        self.assertEqual(self.run_page(f"[{', '.join(calls)}]"), [
-            "Measuring the drives. The first measure takes some minutes.", "No sizes yet.", "The measure did not finish.",
-            "2 minutes ago. The page measures again when you open it and the sizes are more than 10 minutes old.",
-            "2 minutes ago. Measuring… The measure did not finish."])
+    def test_the_status_line_uses_the_shared_reader_and_measured_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            page = disks_page.publish(Path(directory), SETTINGS).read_text()
+        self.assertIn('</h1><p class="page-status"', page)
+        self.assertIn(page_frame.REFRESH_SCRIPT, page)
+        self.assertIn('createPageRefresh(loadDisks,()=>settings.poll_seconds)', page)
+        self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
+        self.assertIn('throw new Error("The measure did not finish.")', page)
 
     def test_publish_writes_the_page_only_when_its_content_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +192,7 @@ class DisksPageTests(unittest.TestCase):
     def run_drive(self, script: str) -> object:
         """Run driveView on a fake document: each element counts its innerHTML writes and keeps its listeners."""
         html = Path(disks_page.__file__).with_name(disks_page.PAGE_NAME).read_text()
-        functions = html[html.index("const GIB ="):html.index("function renderStatus")]
+        functions = html[html.index("const GIB ="):html.index("function renderSlots")]
         fake = ("""
             const input = JSON.parse(require("fs").readFileSync(0, "utf8"));
             const KEEP = input.keep;

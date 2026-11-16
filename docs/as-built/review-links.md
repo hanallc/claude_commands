@@ -97,6 +97,38 @@ Its title is **Hana console**, followed by the selected page title.
 The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+Each navigation page places `page_frame.title()` directly above its content.
+The shared `.page-status` line follows the title.
+It shows the state, data time, round trip and server render time, in that order.
+Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
+Late uses `clock-alert` and `--warning`; Failed uses `triangle-alert` and `--error`.
+Paused uses `circle-pause` and `--ink-3`.
+The state order is Paused, Failed, Late, Reading, Live.
+Late, Failed and Paused show a reason after the last data time instead of timings.
+Builds and Disks keep the shown data time when a later read or measure fails.
+A first read shows only Reading until data arrives.
+A slow read retains the last data time and timings.
+The age increases each second without a request.
+After one minute, the age includes the data time and zone.
+Round trip covers request start through the first frame after the data appears.
+Render time comes from the server or the data writer.
+The browser does not estimate render time.
+`config/console.conf` sets timing limits, the Reading delay and each page's age limit.
+Values above the timing limits use `--warning`.
+Late and Failed remain at the top during scrolling.
+The line wraps between its positions on a phone.
+The status speaks only when its state changes.
+Reduced motion stops the loader icon.
+`page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
+Each loader checks the request identity before it changes content.
+An older response cannot replace a newer response.
+Accounts, Changes, Investigations and Questions read their rendered page at `page_refresh_seconds` intervals.
+Builds reads `memory.json` at its feed interval.
+Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
+AWS reads its published page when shown; its hourly publisher sets the data time and render time.
+Images reads its rendered page when shown.
+The Changes and Questions pages show Paused while text or an active save holds a replacement.
+
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
 AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
@@ -131,7 +163,7 @@ A page that changes its place with `history.replaceState` posts `console-place` 
 A page in a hidden frame can pause its refresh: `window.frameElement?.hidden === true` while the frame is hidden.
 When the console shows a frame that was open before, it posts `console-shown` to that frame, and the page can load an update at once.
 The Changes page follows both rules.
-The Builds page refreshes in a hidden frame until it reads the same signal.
+The shared refresh component stops data requests in hidden frames and hidden browser tabs.
 
 Older links forward to the fixed address with a 303 and keep their query.
 The server forwards `/<snapshot>/console.html` to `/console/`.
@@ -367,6 +399,7 @@ The child keeps the status read's stderr capture away from the server's request 
 A failed or late first render gives 503 with **The Accounts page is not available.**
 A failed background render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
+A cached Accounts response carries its render failure to the status line.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
@@ -378,11 +411,34 @@ It also refreshes when the console shows it again and when the tab becomes visib
 Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
 Images has no interval timer.
 
-The line under the Accounts title shows the data age in whole seconds and the browser wait in seconds.
-It then shows the last render time and the median of at most 10 successful renders.
-The browser computes the data age from the render finish time and clamps negative ages to zero.
-The browser measures the first wait from request start to response end in its navigation entry.
-For a refresh, it measures the wait around `fetch` and the response body read.
+The shared status line shows the last server render time.
+The render value's hover text shows the median of at most 10 successful renders.
+
+### Investigations page
+
+`/console/investigations.html` reads every owner's investigation folder, including owners without a current staff row.
+The console places Investigations between Images and Questions with the Lucide `search` icon.
+Each card shows its title, question, answer when present, and the source, date and time as aligned footer lines.
+The source uses the current staff name, or the fixed staff id when the staff row is absent.
+A unit source shows its parent showrunner name and unit name.
+The date and time show the filed time in the user's zone.
+Question and answer text use the Questions page's paragraph and list helper.
+
+The Owner menu lists All and the owners with records, in name order.
+The Show menu lists Not read, Answer ready, Waiting, Read and All.
+Not read is the default.
+The address retains both filters.
+Ready answers appear first, newest answer first.
+Waiting questions follow, oldest filed first.
+Read answers appear last, newest read first.
+
+Only answer-ready cards show Mark read.
+The signed form posts to the server, which calls `investigation.mark_read`.
+A successful save removes the card from the Not read view without a document reload.
+A failed save retains the card and displays the error.
+The page uses `page_frame.createPageRefresh` and `page_refresh_seconds`, with the same visibility rules as Questions.
+Refresh retains the filters and scroll position, skips active saves, and refuses older responses after a newer response or save.
+New ready answers mark the navigation entry as new until the user visits the page.
 
 ### Investigations page
 

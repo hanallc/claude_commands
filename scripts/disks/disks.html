@@ -30,9 +30,6 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 syste
 __PAGE_FRAME_STYLE__
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
-.dot.old { background: var(--ink-3); }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; align-items: start; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; min-width: 0; }
 .head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
@@ -108,8 +105,7 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
 </head>
 <body>
 <main>
-  <h1 class="page-title">Disks</h1>
-  <div class="status"><span class="dot" id="dot" hidden></span><span id="status">Reading the sizes…</span></div>
+  __PAGE_TITLE__
   <div class="grid" id="drives"></div>
   <div class="grid" id="cards">
     <section class="card" id="slots" hidden></section>
@@ -213,14 +209,6 @@ function minutes(seconds) {
   return `${count} minute${count === 1 ? "" : "s"}`;
 }
 
-// The status line: the age of the sizes, then a running measure or when the next measure starts, then a problem.
-function statusText(measuredAt, now, measuring, problem, cacheSeconds) {
-  if (measuredAt == null) return measuring ? "Measuring the drives. The first measure takes some minutes." : problem || "No sizes yet.";
-  const next = measuring ? "Measuring…"
-    : `The page measures again when you open it and the sizes are more than ${minutes(cacheSeconds)} old.`;
-  return [measuredText(measuredAt, now), next, problem].filter(Boolean).join(" ");
-}
-
 function floorNote(drive) {
   if (drive.floor == null || !drive.total) return "The cleanup floor is unknown.";
   return `Cleanup starts below ${size(drive.floor)} free (${Math.round(100 * drive.floor / drive.total)}%).`;
@@ -297,7 +285,6 @@ let data = null;
 let slotReport = null;
 let sessionReport = null;
 let measuring = null;
-let problem = "";
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
@@ -401,14 +388,6 @@ function driveView(card) {
   };
 }
 
-function renderStatus() {
-  const now = Date.now() / 1000, dot = document.getElementById("dot");
-  dot.hidden = !data;
-  if (data) dot.classList.toggle("old", now - data.measured_at > settings.cache_seconds);
-  document.getElementById("status").textContent =
-    statusText(data ? data.measured_at : null, now, Boolean(measuring), problem, settings.cache_seconds);
-}
-
 function renderSlots() {
   const card = document.getElementById("slots");
   card.hidden = !slotReport;
@@ -436,84 +415,52 @@ function render() {
   }
   for (const drive of data.drives) driveViews.get(drive.mount)(drive);
   renderCards();
-  renderStatus();
 }
 
 async function readData() {
   const response = await fetch(DATA_FILE + "?" + Date.now(), {cache: "no-store"});
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`the server answered ${response.status}`);
+  if (response.status === 404 && !data) return null;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
 
 function show(next) {
   data = next;
-  if (data) render(); else { renderCards(); renderStatus(); }
+  if (data) render(); else { renderCards(); }
 }
 
 // Ask the server for a measure and the slots and sessions in use now. The server starts a measure only when the sizes
 // are old. The page keeps the old sizes and reads the data file again until it changes.
-async function askMeasure() {
-  try {
-    const response = await fetch(MEASURE, {method: "POST", body: "",
-                                           headers: {"Content-Type": "application/x-www-form-urlencoded"}});
-    const answer = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(answer.reason || `the server answered ${response.status}`);
-    slotReport = answer.slots || null;
-    sessionReport = answer.sessions || null;
-    if (answer.state === "current") {
-      // The page's sizes are old only when another measure finished since the page read them.
-      show(!data || Date.now() / 1000 - data.measured_at >= settings.cache_seconds ? await readData() : data);
-      return;
-    }
-    renderCards();
-    measuring = {since: Date.now() / 1000, before: data ? data.measured_at : null};
-    setTimeout(poll, settings.poll_seconds * 1000);
-  } catch (error) {
-    problem = `The page could not start a measure: ${error.message}.`;
-  }
-  renderStatus();
+async function askMeasure(current) {
+  const response=await fetch(MEASURE,{method:"POST",body:"",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"}});
+  const answer=await response.json();
+  if(!current()) return;
+  if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
+  slotReport=answer.slots || null;sessionReport=answer.sessions || null;renderCards();
+  if(answer.state!=="current" && !measuring)
+    measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
 }
-
-async function poll() {
-  try {
-    const next = await readData();
-    if (next && next.measured_at !== measuring.before) {
-      // A new measure gives new slot and session sizes, so the page asks once more; the server answers "current".
-      measuring = null;
-      show(next);
-      await askMeasure();
-      return;
-    }
-  } catch (error) {
-    // A failed read leaves the measure running; the next read tries again.
-  }
-  if (Date.now() / 1000 - measuring.since > settings.wait_seconds) {
-    measuring = null;
-    problem = "The measure did not finish.";
-    renderStatus();
-    return;
-  }
-  setTimeout(poll, settings.poll_seconds * 1000);
+async function loadDisks(supersede=false,current=()=>true){
+ const next=await readData();
+ if(!current()) return;
+ if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
+ let failure='';
+ try{if(!measuring) await askMeasure(current);}
+ catch(error){if(!data) throw error;failure=error.message;}
+ if(!current()) return;
+ if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
+  measuring=null;throw new Error("The measure did not finish.");
+ }
+ if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,failure};
 }
-
-async function start() {
-  try {
-    data = await readData();
-  } catch (error) {
-    document.getElementById("status").textContent = `No sizes: ${error.message}.`;
-    return;
-  }
-  show(data);
-  await askMeasure();
-}
-
 onToggle(document.getElementById("slots"), "tr[data-group]", row => {
   if (!openGroups.delete(row.dataset.group)) openGroups.add(row.dataset.group);
   renderSlots();
 });
-start();
-setInterval(renderStatus, 30000);
+__PAGE_REFRESH_SCRIPT__
+const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+void pageRefresh.refresh();
 </script>
 </body>
 </html>

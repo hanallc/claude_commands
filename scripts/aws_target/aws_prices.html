@@ -20,8 +20,6 @@
 /* The content fills the window, so the region filter fits on one row; the user likes dense pages. */
 __PAGE_FRAME_STYLE__
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
-.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
@@ -97,8 +95,7 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 </head>
 <body>
 <main>
-<h1 class="page-title">AWS</h1>
-<div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
+__PAGE_TITLE__
 <section class="card" id="spend">
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
@@ -135,7 +132,8 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 <script id="aws-prices-data" type="application/json">__AWS_PRICES_DATA__</script>
 <script>
 "use strict";
-const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
+__PAGE_REFRESH_SCRIPT__
+let data = JSON.parse(document.getElementById("aws-prices-data").textContent);
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
@@ -322,9 +320,6 @@ function drawSpend() {
 }
 drawSpend();
 
-const published = new Date(data.read_at * 1000);
-document.getElementById("published").textContent =
-  `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
 
 function markOverflow() {
   for (const wrap of document.querySelectorAll(".scroll")) wrap.classList.toggle("overflows", wrap.scrollWidth > wrap.clientWidth + 1);
@@ -484,6 +479,16 @@ let saved = [];
 try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
 const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
 showRegions(new Set(known.length ? known : data.regions));
+async function loadAws(supersede=false,current=()=>true){
+ const response=await fetch(location.pathname,{cache:'no-store'});
+ if(!response.ok) throw new Error('HTTP '+response.status);
+ const page=new DOMParser().parseFromString(await response.text(),'text/html');
+ const next=JSON.parse(page.querySelector('#aws-prices-data').textContent);
+ if(!current()) return;data=next;
+ drawSpend();draw();
+ return {readAt:data.read_at,renderSeconds:data.render_seconds};
+}
+createPageRefresh(loadAws,()=>0,()=>'',{readAt:data.read_at,renderSeconds:data.render_seconds});
 </script>
 </body>
 </html>
