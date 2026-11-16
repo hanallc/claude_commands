@@ -29,8 +29,7 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
-from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
@@ -40,7 +39,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
-from scripts.lib import scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -574,7 +573,9 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
 
     def git(*arguments: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(folder), "--literal-pathspecs", *arguments],
-                              capture_output=True, text=True, check=False, env=env)
+                              capture_output=True, text=True, check=False, env=env,
+                              pass_fds=((build_folders.build_folder_lock_fd(Path(env["GIT_INDEX_FILE"]).parent),)
+                                        if env is not None and "GIT_INDEX_FILE" in env else ()))
 
     def checked(*arguments: str, env: dict[str, str] | None = None) -> str:
         result = git(*arguments, env=env)
@@ -592,10 +593,8 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                   checked("hash-object", "-w", "--path", str(path.resolve().relative_to(root)), "--", str(path.resolve())))
                  for path in paths]
         subject = f"change-review: {what}"
-        with tempfile.NamedTemporaryFile(delete=False) as temporary:
-            index = Path(temporary.name)
-        try:
-            index.unlink()
+        with build_folders.tool_folder("change-review-index") as temporary:
+            index = temporary / "index"
             environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
             for attempt in range(5):
                 head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
@@ -613,8 +612,6 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                     return
                 if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                     raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
-        finally:
-            index.unlink(missing_ok=True)
     except (ChangeReviewError, OSError) as error:
         reason = str(error).splitlines()[0]
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
@@ -846,7 +843,10 @@ def _covered(rows: list[dict[str, str]], change: PublicationChange, repo: Path) 
 
 def _merge_covered(rows: list[dict[str, str]], changes: Sequence[PublicationChange],
                    repo: Path, merged: str) -> list[PublicationChange]:
-    """Use text matches first, then pair merge rows with ready changes and held changes from one step."""
+    """Use text matches first, then pair merge rows with changes from the same known producer.
+
+    For each producer, pair ready changes in commit order before held changes that all wait on one step.
+    """
     covered: list[PublicationChange] = []
     used: set[int] = set()
     for change in changes:
@@ -855,18 +855,22 @@ def _merge_covered(rows: list[dict[str, str]], changes: Sequence[PublicationChan
                 covered.append(change)
                 used.add(index)
                 break
-    uncovered = [change for change in changes if change not in covered]
-    ready = [change for change in uncovered if isinstance(change.item.readiness, ReadyNow)]
-    held = [change for change in uncovered if isinstance(change.item.readiness, AfterStep)]
-    steps = {change.item.readiness.step for change in held if isinstance(change.item.readiness, AfterStep)}
-    remaining = iter(ready + (held if len(steps) == 1 else []))
+    producers: dict[str, list[PublicationChange]] = {}
+    for change in changes:
+        if change not in covered and isinstance(change.producer, str) and change.producer:
+            producers.setdefault(change.producer, []).append(change)
+    remaining: dict[str, Iterator[PublicationChange]] = {}
+    for producer, uncovered in producers.items():
+        ready = [change for change in uncovered if isinstance(change.item.readiness, ReadyNow)]
+        held = [change for change in uncovered if isinstance(change.item.readiness, AfterStep)]
+        steps = {change.item.readiness.step for change in held if isinstance(change.item.readiness, AfterStep)}
+        remaining[producer] = iter(ready + (held if len(steps) == 1 else []))
     for index, row in enumerate(rows):
         found = _HASH.search(row.get("Merged", ""))
         if index not in used and found is not None and (found[0].startswith(merged) or merged.startswith(found[0])):
-            change = next(remaining, None)
-            if change is None:
-                break
-            covered.append(change)
+            candidates = remaining.get(row.get(PRODUCER, ""))
+            if candidates is not None and (change := next(candidates, None)) is not None:
+                covered.append(change)
     return covered
 
 
