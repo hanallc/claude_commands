@@ -86,11 +86,6 @@ class RoomTextTests(unittest.TestCase):
                     admission_policy_fixture(), ci_use=ci_use)
                 assert isinstance(room, records.MemoryRoom)
                 self.assertEqual(queue_evidence.room_text(room), text)
-                check = records.RoomCheck(16 * GIB, room.signed_room, False, basis=records.DoesNotFit())
-                values = dict(queue_evidence.head_room_values(check, room))
-                self.assertEqual(values, {"Free RAM": room.available, "Safety net": room.safety,
-                    "Swap coming back": room.agent_swap_demand, "Build reserved": room.kept})
-
 
 
 class QueueEvidenceTests(unittest.TestCase):

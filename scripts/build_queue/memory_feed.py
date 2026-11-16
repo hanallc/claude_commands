@@ -46,7 +46,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import placement
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
-from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_evidence, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
 from scripts.build_queue.queue_lines import age, plain, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lib.build_steps import StepNames, read_step_names
@@ -143,7 +143,8 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
                                               "system.slice": "system", "hana.slice": "ci", "hana-ci.slice": "ci"}
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
-SWAP_RETURN_NOTE = "It comes back into RAM when they run, so the queue holds RAM for it."
+SWAP_RETURN_NOTE = "It can come back into RAM when they run, so it is outside the cap."
+BUILD_RESERVED_NOTE = "Build reserved is memory that running builds used at their next points in earlier runs."
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
 SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
 
@@ -332,7 +333,8 @@ class RoomRow(TypedDict):
 
 
 class HeadRoom(TypedDict):
-    """The first waiting step's room: free memory, less each term, then the memory free for builds."""
+    """The first waiting step's room inside the queue cap: the cap, less each term, then the memory free for builds."""
+    cap_text: str
     rows: list[RoomRow]
     note: str
 
@@ -430,20 +432,45 @@ CLOUD_RUNS_ON = "AWS (natedev only when AWS cannot start the gate)"
 
 
 def head_room(check: admission_records.RoomCheck,
-              room: admission_records.MemoryRoom | admission_records.ReadingUnavailable) -> HeadRoom:
-    """Show the first waiting step's room as free memory less each term, in the same order each time."""
-    rows: list[RoomRow] = []
-    if isinstance(room, admission_records.MemoryRoom):
-        rows.extend({"label": ("− " if index else "") + label, "gib": gib(amount)}
-                    for index, (label, amount) in enumerate(queue_evidence.head_room_values(check, room)))
-    rows.append({"label": "= Free", "gib": gib(max(0, check.room))})
-    swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB of memory in swap. {SWAP_RETURN_NOTE}"
-            if isinstance(room, admission_records.MemoryRoom) and room.agent_swap_demand else "")
+              room: admission_records.MemoryRoom | admission_records.ReadingUnavailable, ram: RamBlocks) -> HeadRoom:
+    """Show the first waiting step's room inside the queue cap, with the memory bar legend's amounts.
+
+    The rows add up: the cap less Builds, Build reserved and the memory held for builds ahead is free for builds."""
+    override = isinstance(check.basis, admission_records.OverrideRoom)
     basis = ("It can start alone, because no build runs." if isinstance(check.basis, admission_records.StartsAlone) else
             "It fits in the memory it already holds." if isinstance(check.basis, admission_records.WithinSlot) else
-            "The user's admit does not count memory held for running builds." if isinstance(check.basis, admission_records.OverrideRoom) else
-            "Free memory reading unavailable: " + room.reason if isinstance(room, admission_records.ReadingUnavailable) else "")
-    return {"rows": rows, "note": " ".join(filter(None, (swap, basis)))}
+            "The user's admit does not count memory held for running builds." if override else "")
+    if isinstance(room, admission_records.ReadingUnavailable):
+        return {"cap_text": f"Queue cap unavailable: {room.reason}", "rows": [], "note": basis}
+    if isinstance(room.cap, admission_records.CapUnavailable):
+        return {"cap_text": f"Queue cap unavailable: {cap_unavailable_reason(room.cap)}", "rows": [], "note": basis}
+    cap = ram["cap_bytes"]
+    builds = ram["queued_builds_bytes"] + ram["build_tools_bytes"] + ram["ci_bytes"]
+    reserved = 0 if override else ram["build_covered_bytes"]
+    free = max(0, check.room)
+    ahead = cap - builds - reserved - free
+    cap_text = (f"Queue cap: {gib(cap):.1f} GiB. It is RAM less the programs that run now, "
+                f"the {gib(room.safety):.1f} GiB safety net and the {gib(room.agent_swap_demand):.1f} GiB of swap coming back. "
+                "Those three are outside the cap.")
+    rows: list[RoomRow] = [{"label": "Queue cap", "gib": gib(cap)}, {"label": "− Builds", "gib": gib(builds)},
+                           {"label": "− Build reserved", "gib": gib(reserved)}]
+    if ahead > 0:
+        rows.append({"label": "− Held for builds ahead in line", "gib": gib(ahead)})
+    rows.append({"label": "= Free for builds", "gib": gib(free)})
+    uncovered = (f"Running builds need {gib(ram['build_target_bytes']):.1f} GiB reserved. "
+                 + f"Free RAM covers {gib(ram['build_covered_bytes']):.1f} GiB of it."
+                 if not override and ram["build_target_bytes"] > ram["build_covered_bytes"] else "")
+    swap = (f"Other programs have {gib(room.agent_swap_demand):.1f} GiB in swap. {SWAP_RETURN_NOTE}"
+            if room.agent_swap_demand else "")
+    return {"cap_text": cap_text, "rows": rows,
+            "note": " ".join(filter(None, (BUILD_RESERVED_NOTE, uncovered, swap, basis)))}
+
+
+def cap_unavailable_reason(cap: admission_records.CapUnavailable) -> str:
+    """Name the runs whose memory use is unknown, so the cap cannot be read."""
+    missing = "; ".join(f"{run.owner}: {run.use.reason}" for run in cap.runs
+                        if isinstance(run.use, admission_records.RunUseUnavailable))
+    return f"memory use is unavailable for {missing}" if missing else "memory use is unavailable for a running build"
 
 
 def page_owner_labels(identity: unit_labels.UnitLabels, *, ci_label: str = "") -> PageOwnerLabels:
@@ -1865,7 +1892,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         for waiting_row in waiting_rows:
             if waiting_row["pid"] == head_pid:
                 if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
-                    waiting_row["head_room"] = head_room(explanation.head.room, explanation.room)
+                    waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
                 break
     pressure = explanation.decided_from.pressure
     policy = explanation.policy.pressure

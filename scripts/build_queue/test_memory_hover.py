@@ -470,11 +470,13 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         priority = "queue priority: port (the user's bump)"
-        swap_note = ("Other programs have 2.0 GiB of memory in swap. "
-                     "It comes back into RAM when they run, so the queue holds RAM for it.")
-        room: memory_feed.HeadRoom = {"rows": [{"label": "Free RAM", "gib": 10.5}, {"label": "− Safety net", "gib": 3.0},
-                         {"label": "− Swap coming back", "gib": 2.0}, {"label": "− Build reserved", "gib": 6.0},
-                         {"label": "= Free", "gib": 0.0}], "note": swap_note}
+        cap_text = ("Queue cap: 7.5 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net "
+                    + "and the 2.0 GiB of swap coming back. Those three are outside the cap.")
+        note = (f"{memory_feed.BUILD_RESERVED_NOTE} Other programs have 2.0 GiB in swap. "
+                + "It can come back into RAM when they run, so it is outside the cap.")
+        room: memory_feed.HeadRoom = {"cap_text": cap_text, "rows": [
+            {"label": "Queue cap", "gib": 7.5}, {"label": "− Builds", "gib": 1.5},
+            {"label": "− Build reserved", "gib": 6.0}, {"label": "= Free for builds", "gib": 0.0}], "note": note}
         data = {"read_at": 200, "waiters": [
             {"name": "port nextest", "unit": "port", "need": 1.9, "since": 100, "place": 1,
              "why": "only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
@@ -489,8 +491,8 @@ class MemoryHoverTests(unittest.TestCase):
         expected = ("\n".join((
             "It is first in line.", "It needs 1.9 GiB to start.",
             "Why it waits: only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
-            "can run on: natedev only", "Free RAM: 10.5 GiB", "− Safety net: 3.0 GiB",
-            "− Swap coming back: 2.0 GiB", "− Build reserved: 6.0 GiB", "= Free: 0.0 GiB", swap_note, priority)),
+            "can run on: natedev only", cap_text, "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
+            "− Build reserved: 6.0 GiB", "= Free for builds: 0.0 GiB", note, priority)),
             "It is number 2 in line.\nIt needs 2.0 GiB to start.\n"
             + "Why it waits: it is behind the first build in line, which gets memory first.\ncan run on: natedev or Mac",
             "It is number 3 in line.\nIt needs 2.0 GiB to start.\n"
@@ -501,19 +503,12 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(hover[1], body)
                 self.assertNotIn("Head", hover[1])
                 html = str(self.page_expression(f"tooltipHtml('wait:{index}', data)", data, walk=True))
-                self.assertEqual(html.count("= Free"), int(index == 0))
+                self.assertEqual(html.count("= Free for builds"), int(index == 0))
+                self.assertEqual(html.count("Those three are outside the cap."), int(index == 0))
                 self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
             self.assertNotIn(removed, page)
-        ram = {**RAM_FIXTURE, "available_bytes": int(10.5 * GIB), "safety_target_bytes": 3 * GIB,
-               "swap_target_bytes": 2 * GIB, "build_target_bytes": 6 * GIB, "room_bytes": 0}
-        room_tip = str(self.page_expression("tipText('room', data)[1]", {**data, "ram": ram}))
-        head_tip = str(self.page_expression("tipText('wait:0', data)[1]", data))
-        for row in room["rows"][:4]:
-            term = f"{str(row['label']).removeprefix('− ')}: {row['gib']:.1f} GiB"
-            self.assertIn(term, room_tip)
-            self.assertIn(term, head_tip)
         for removed in ("admission-terms", "admission-check-rows", "renderAdmissionRequirements"):
             self.assertNotIn(removed, page)
         for unmatched in ("", priority):

@@ -773,7 +773,8 @@ function waitNotes(w) {
   return [w.head_room?.note, w.kind === "cloud" ? "No local memory reservation." : "", w.priority_text];
 }
 function waitTipHtml(w, d) {
-  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + fieldsHtml(roomFields(w), "numbers") +
+  return identityHtml(w, waitFields(w)) + waitLines(w).map(lineHtml).join("") + lineHtml(w.head_room?.cap_text) +
+    fieldsHtml(roomFields(w), "numbers") +
     waitNotes(w).map(lineHtml).join("");
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
@@ -878,8 +879,9 @@ function rawTipText(key, d) {
   if (kind === "wait") {
     const w = d.waiters[+i];
     if (!w) return ["", ""];
-    const fields = [...waitFields(w), ...roomFields(w)];
-    return [`Waits · ${w.name}`, [...waitLines(w), ...fields.map(([name, value]) => `${name}: ${value}`), ...waitNotes(w)]
+    const fields = [...waitFields(w).map(([name, value]) => `${name}: ${value}`), w.head_room?.cap_text,
+      ...roomFields(w).map(([name, value]) => `${name}: ${value}`)];
+    return [`Waits · ${w.name}`, [...waitLines(w), ...fields, ...waitNotes(w)]
       .filter(Boolean).join("\n")];
   }
   return TIPS[key](d);
