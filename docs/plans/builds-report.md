@@ -1898,6 +1898,7 @@ From builds, relaying the user: "sometime i see the build is waiting for a token
 As built:
 
 - `memory_feed.token_pool` runs `stevie -a -t -j` (floor MiB, free, total) from the `stevie_program` path in `config/memory_feed.conf`; the feed service PATH does not hold the system programs folder. The pool is paused while the admission's MemAvailable is under the floor.
+- The memory bar legend starts collapsed; the page refresh keeps it open once the user opens it. It has no "How free is worked out" section: the Free tooltip explains free. The missing-readings fault shows under the RAM-disagree line.
 - The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
 - In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
 - The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
