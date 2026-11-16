@@ -15,7 +15,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -24,6 +23,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.lib import build_folders
 from scripts.production import change_review as change_review
 from scripts.production import unit_lookup
 from scripts.production import update_registration
@@ -741,7 +741,7 @@ def publish(production: Path, review_list: Path, rows: list[str]) -> str:
     # A fresh page has its own immutable row allowlist. Only metadata is stored
     # beside the HTML: every GET reads the answers from the review record.
     root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-changes-") as temporary:
+    with build_folders.tool_folder("review-changes") as temporary:
         source = Path(temporary) / PAGE_NAME
         _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
         url = review_link.snapshot_at(root, [source], new=True)[0]

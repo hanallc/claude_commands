@@ -524,7 +524,9 @@ def main() -> None:
         run_module(NoConfigReadLog())
         return
 
-    with tempfile.TemporaryDirectory(prefix="config-reads-") as temporary:
+    from scripts.lib import build_folders
+
+    with build_folders.tool_folder("config-reads") as temporary:
         log = Path(temporary) / "reads"
         log.touch()
         with conf_reads.record_reads(log):
