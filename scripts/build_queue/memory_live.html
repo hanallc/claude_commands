@@ -676,7 +676,8 @@ Object.assign(TIPS, {
   pill: (d) => [`Memory pressure · ${({ ok: "none", warn: "near a limit", hold: "queue holds", neutral: "stall not recorded" })[level(d)]}`, `Pressure means the system waits for memory. Above a limit, the queue starts no new step. Click to see swap and the pressure checks.`],
   walksum: (d) => [!hasCap(d) ? `Taken · ${f1(d.taken)} GiB · cap unavailable` : `Taken · ${f1(d.taken)} of ${f1(d.cap)} GiB`, !hasCap(d) ? d.cap_text : lines(
     `Builds: ${ramAmount(legendBytes(d.ram, "builds"))}.`, `+ Build reserved: ${ramAmount(d.ram.build_covered_bytes)}.`,
-    `= Taken: ${f1(d.taken)} GiB.`, `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`)],
+    `= Taken: ${f1(d.taken)} GiB.`, `The rest of the queue cap is free: ${ramAmount(d.ram.room_bytes)}.`,
+    optional(overCapBytes(d), `Over cap: ${ramAmount(overCapBytes(d))} of build reserves do not fit under the cap.`))],
   tokens: (d) => d.tokens?.kind !== "TokenPool" ? ["Tokens · unavailable", d.tokens?.reason || "The feed sent no token pool reading."]
     : [`Tokens · ${d.tokens.total} total, ${d.tokens.free} free`, lines(
       "A token lets a natedev build run one more job at the same time.",
@@ -807,6 +808,8 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
+// Build reserves that do not fit under the queue cap; the cap holds only the covered part.
+function overCapBytes(d) { return hasCap(d) && recorded(d.ram.build_missing_bytes) ? Math.max(0, d.ram.build_missing_bytes) : 0; }
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -1319,10 +1322,10 @@ function renderWalk(d) {
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  const overCap = hasCap(d) && d.taken > d.cap;
+  const overCap = overCapBytes(d);
   $("walk-sum").textContent = !hasCap(d) ? `${f1(d.taken)} GiB taken · cap unavailable`
-    : `${f1(d.taken)} of ${f1(d.cap)} GiB taken${overCap ? ` · ${f1(d.taken - d.cap)} GiB over cap` : ""}`;
-  $("walk-sum").classList.toggle("over-cap", overCap);
+    : `${f1(d.taken)} of ${f1(d.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
+  $("walk-sum").classList.toggle("over-cap", overCap > 0);
   $("walk-tokens").textContent = tokenPoolText(d.tokens);
   fitLabels();
 }

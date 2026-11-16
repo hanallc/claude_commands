@@ -794,7 +794,7 @@ try {
               await writeFile(join(folder,'legend-totals-dark-desktop.png'),Buffer.from(legendShot.data,'base64'));
             }
             proof.capLine=capLine;
-            // Builds that take more than the cap stop at the cap line; a cut bar ends in the cap color.
+            // Bars that add to more than the cap stop at the cap line; a cut bar ends in the cap color.
             const overReading=structuredClone(base), over=overReading.room+1;
             Object.assign(overReading.ram,{build_tools_bytes:overReading.ram.build_tools_bytes+over*gib,
               available_bytes:overReading.ram.available_bytes-over*gib,room_bytes:0});
@@ -803,30 +803,47 @@ try {
             // A waiting step that needs more than the cap also stops at the cap line.
             overReading.waiters.find(row=>row.kind!=='cloud').need=overReading.cap+10;
             await show(overReading,true,false);
-            if(theme==='dark'&&width===1400) {
-              const overClip=await evaluate(`(()=>{
-                const box=document.querySelector('#walk').closest('.card').getBoundingClientRect();
-                return {x:Math.floor(box.left),y:Math.floor(box.top+scrollY),width:Math.ceil(box.width)+1,height:Math.ceil(box.height)+1,scale:1};
-              })()`);
-              const overShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:overClip});
-              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(overShot.data,'base64'));
-            }
             const overCap=await evaluate(`(() => {
               const edge=document.querySelector('#walk .walk-bud').getBoundingClientRect().left+1;
               const bars=[...document.querySelectorAll('#walk .wrow .track .b:not(.row-progress):not(.seg-remote)')]
                 .map(bar=>({cls:bar.className,right:bar.getBoundingClientRect().right}));
               const cut=document.querySelector('#walk .track .b.over-cap');
-              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',sum:document.querySelector('#walk-sum').textContent,
-                sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,
+              return {edge,bars,cut:cut?getComputedStyle(cut).boxShadow:'',
                 cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor};
             })()`);
             assert.ok(overCap.bars.length>0,'The over-cap chart draws no bars.');
             assert.ok(overCap.bars.some(bar=>bar.cls.includes('waitb')),'The over-cap chart draws no wait bar.');
             for(const bar of overCap.bars) assert.ok(bar.right<=overCap.edge+0.5,'A bar runs past the cap line. '+JSON.stringify({bar,edge:overCap.edge}));
             assert.ok(overCap.cut.includes(overCap.cap),'A bar cut at the cap has no cap-colored end. '+JSON.stringify(overCap));
-            assert.equal(overCap.sum,overReading.taken.toFixed(1)+' of '+overReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
-            assert.equal(overCap.sumColor,overCap.cap,'The over-cap total is not in the cap color.');
             proof.overCap=overCap;
+            // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
+            const shortReading=structuredClone(base);
+            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
+            shortRun.reserved+=shortReading.room+1;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            await show(shortReading);
+            if(theme==='dark'&&width===1400) {
+              const shortClip=await evaluate(`(()=>{
+                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
+                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+              })()`);
+              const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
+              await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
+            }
+            const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
+              sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],
+              cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
+            assert.equal(overHeader.sum,shortReading.cap.toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
+            assert.ok(overHeader.hover.includes('Over cap: 1.0 GiB of build reserves do not fit under the cap.'),overHeader.hover);
+            const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
+            assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
             cloudReading.walk.push({kind:'cloud',name:'cloud merge',showrunner:'fixture-owner',unit:'cloud',pid:31,detail:'cloud',
