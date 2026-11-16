@@ -166,10 +166,14 @@ class Fake:
         ]
         self.named_entity_snapshots: list[list[SceneEntityFixture]] = []
         self.tool_entities: list[tuple[int, str, int, str]] = list(TOOLS)
+        self.drawn_by_show_registered: bool = False
+        self.ray_cast_backfaces_registered: bool = False
         self.fit_moves_camera: bool = False
         self.camera_yaw: float = 0.0
         self.camera_pitch: float = 0.3
         self.camera_radius: float = 6.0
+        self.camera_moving_reads: int = 0
+        self.camera_viewport: object = None
         self.frame: int = 0
         self.screenshot: str = "ok"
         self.remote: Path | None = None
@@ -187,6 +191,16 @@ class Fake:
     def methods(self, method: str) -> list[dict[str, object]]:
         with self.lock:
             return [call["params"] for call in self.calls if call["method"] == method]
+
+    def camera_components(self) -> dict[str, object]:
+        components = camera_components(self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
+                                       self.camera_yaw, self.camera_pitch, self.camera_radius)
+        camera = cast(hana_shot.CameraValue, components[hana_shot.CAMERA])
+        camera["viewport"] = self.camera_viewport
+        if self.camera_moving_reads:
+            self.camera_moving_reads -= 1
+            cast(hana_shot.OrbitCamValue, components[ORBIT_CAM])["update_request"] = "Animating"
+        return components
 
     def answer(self, method: str, params: dict[str, object]) -> dict[str, object]:
         with self.lock:
@@ -220,10 +234,7 @@ class Fake:
             return {"result": {"value": {"home": {"animation_duration_milliseconds": 2000}}}}
         if method == "world.get_components":
             entity = params["entity"]
-            components = camera_components(
-                self.window_physical_size, self.window_scale_factor_override or self.window_scale_factor,
-                self.camera_yaw, self.camera_pitch, self.camera_radius,
-            ) if entity == CAMERA_ENTITY else next(
+            components = self.camera_components() if entity == CAMERA_ENTITY else next(
                 (row["components"] for row in self.named_entities if row["entity"] == entity), dict[str, object](),
             )
             requested = cast(list[str], params["components"])
@@ -233,9 +244,17 @@ class Fake:
         if method == "world.list_components":
             entity = params.get("entity")
             if entity is None:
-                return {"result": [NAME, AABB, GRAYSCALE, BLUR]}
+                registered = [NAME, AABB, *(tool[1] for tool in self.tool_entities)]
+                if self.drawn_by_show_registered:
+                    registered.append(hana_shot.DRAWN_BY_SHOW)
+                if self.ray_cast_backfaces_registered:
+                    registered.append(hana_shot.RAY_CAST_BACKFACES)
+                return {"result": list(dict.fromkeys(registered))}
             if entity == EXTRA_ENTITY:
                 return {"result": [NAME]}
+            for row in self.named_entities:
+                if row["entity"] == entity:
+                    return {"result": list(row["components"])}
             return {"error": {"code": -23402, "message": f"entity {entity} not found"}}
         if method == "brp_extras/screenshot":
             self.screenshot_started.set()
@@ -266,11 +285,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
     data = cast(dict[str, list[str]], params.get("data") or {})
     rows: list[SceneEntityFixture]
     if EDITOR_CAMERA in with_types:
-        rows = [{"entity": CAMERA_ENTITY, "components": camera_components(
-            fake.window_physical_size,
-            fake.window_scale_factor_override or fake.window_scale_factor,
-            fake.camera_yaw, fake.camera_pitch, fake.camera_radius,
-        )}]
+        rows = [{"entity": CAMERA_ENTITY, "components": fake.camera_components()}]
     elif PRIMARY_WINDOW in with_types:
         width, height = fake.window_physical_size
         rows = [{"entity": WINDOW_ENTITY, "components": {WINDOW: {"resolution": {
@@ -284,7 +299,7 @@ def query(fake: Fake, params: dict[str, object]) -> list[SceneEntityFixture]:
             {"entity": entity, "components": {path: {"id": tool_id, "definition": definition}}, "has": {AABB: False}}
             for entity, path, tool_id, definition in fake.tool_entities
         ]
-    elif NAME in data.get("components", []) or GLOBAL_TRANSFORM in data.get("components", []):
+    elif any(path in data.get("components", []) for path in (NAME, GLOBAL_TRANSFORM, CHILD_OF, hana_shot.DRAWN_BY_SHOW)):
         if fake.named_entity_snapshots:
             fake.named_entities = fake.named_entity_snapshots.pop(0)
         rows = fake.named_entities
@@ -1639,6 +1654,329 @@ class PortGuardTests(HanaShotTest):
         self.assertIn("1024 to 65535", result.stderr)
 
 
+class LocateTests(HanaShotTest):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake.window_scale_factor = 2.0
+        self.fake.tool_entities = [(100, hana_shot.TOOL_PREFIX + "hana::Shape>", 1, "hana.shape"),
+                                   (200, hana_shot.TOOL_PREFIX + "hana::Show>", 2, "hana.show")]
+        self.fake.named_entities = [
+            {"entity": 100, "components": {NAME: "Shape"}},
+            {"entity": 200, "components": {NAME: "Show"}},
+            self.box(101, "Tool body", (0, 2, 0), (1.5, 1.5, 0), parent=100),
+        ]
+
+    def box(self, entity: int, name: str, center: hana_shot.Vec3, half: hana_shot.Vec3, *, parent: int = 0) -> SceneEntityFixture:
+        components: dict[str, object] = {
+            NAME: name, GLOBAL_TRANSFORM: [1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0, *center],
+            AABB: {"center": [0.0, 0.0, 0.0], "half_extents": list(half)},
+        }
+        if parent:
+            components[CHILD_OF] = parent
+        return {"entity": entity, "components": components}
+
+    def locate(self, selector: str = "tool:Shape#1", *options: str) -> subprocess.CompletedProcess[str]:
+        return self.run_script("locate", "--port", str(self.port), "--target", selector, *options)
+
+    def test_locate_prints_logical_pixels_and_json_without_a_move_capture_or_timing(self) -> None:
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "tool:Shape#1 240.0 135.0 160.0 90.0 320.0 180.0 scale 2.0\n")
+        encoded = self.locate("tool:Shape#1", "--json")
+        self.assertEqual(encoded.returncode, 0, encoded.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(encoded.stdout))
+        self.assertEqual(reply, {
+            "selector": "tool:Shape#1", "entity": 100,
+            "rect": {"x": 240.0, "y": 135.0, "width": 160.0, "height": 90.0},
+            "click": {"x": 320.0, "y": 180.0}, "scale_factor": 2.0,
+            "window": {"width": 640.0, "height": 360.0}, "clipped": False, "occluded": False,
+        })
+        for method in ("world.trigger_event", "world.mutate_components", "brp_extras/screenshot", "hana/invoke_command"):
+            self.assertEqual(self.fake.methods(method), [])
+        self.assertFalse(self.timings.exists())
+
+    def test_scoped_selectors_choose_the_jack_under_the_named_tool_for_locate_and_shot(self) -> None:
+        self.fake.named_entities.extend([
+            {"entity": 110, "components": {NAME: "Rear Shape Jack", CHILD_OF: 100}},
+            self.box(111, "Jack mesh", (-2, 2, 0), (0.5, 0.5, 0), parent=110),
+            {"entity": 210, "components": {NAME: "Rear Shape Jack", CHILD_OF: 200}},
+            self.box(211, "Jack mesh", (2, 2, 0), (0.5, 0.5, 0), parent=210),
+        ])
+        selector = "tool:Show#1/name:Rear Shape Jack"
+        result = self.locate(selector, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+        self.assertEqual(reply["entity"], 210)
+        self.assertAlmostEqual(reply["click"]["x"], 426.6666667)
+        shot = self.shot("--target", selector, "--mode", "hana-frame")
+        self.assertEqual(shot.returncode, 0, shot.stderr)
+        self.assertIn({"event": ZOOM_TO_TARGET, "value": {"entity": 210}}, self.fake.methods("world.trigger_event"))
+
+    def test_show_scopes_include_their_beamed_parts_and_the_parts_children(self) -> None:
+        self.fake.drawn_by_show_registered = True
+        show_type = hana_shot.TOOL_PREFIX + "hana::Show>"
+        self.fake.tool_entities = [(200, show_type, 17, "hana.show"), (400, show_type, 39, "hana.show")]
+        self.fake.named_entities = [
+            {"entity": 200, "components": {NAME: "First Show"}},
+            {"entity": 400, "components": {NAME: "Second Show"}},
+            {"entity": 900, "components": {NAME: "Stage"}},
+            {"entity": 310, "components": {NAME: "Shown geometry part", CHILD_OF: 900, hana_shot.DRAWN_BY_SHOW: 200}},
+            {"entity": 410, "components": {NAME: "Shown geometry part", hana_shot.DRAWN_BY_SHOW: 400}},
+            self.box(311, "Beam detail", (-2, 2, 0), (0.5, 0.5, 0), parent=310),
+            self.box(411, "Beam detail", (2, 2, 0), (0.5, 0.5, 0), parent=410),
+        ]
+        for index, part, detail in ((1, 310, 311), (2, 410, 411)):
+            for name, entity in (("Shown geometry part", part), ("Beam detail", detail)):
+                with self.subTest(index=index, name=name):
+                    before = len(self.fake.methods("world.list_components"))
+                    result = self.locate(f"tool:Show#{index}/name:{name}", "--json")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertEqual(reply["entity"], entity)
+                    self.assertEqual(len(self.fake.methods("world.list_components")) - before, 1)
+        queries = self.fake.methods("world.query")
+        self.assertTrue(any(query.get("data") == {"components": [hana_shot.DRAWN_BY_SHOW]} for query in queries))
+
+    def test_unregistered_show_links_explain_missing_parts_and_keep_child_scope(self) -> None:
+        self.fake.named_entities.append({
+            "entity": 310, "components": {NAME: "Shown geometry part", hana_shot.DRAWN_BY_SHOW: 200},
+        })
+        result = self.locate("tool:Show#1/name:Shown geometry part")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must name exactly one entity; found nothing", result.stderr)
+        self.assertIn("; this Hana does not reflect DrawnByShow, so a Show scope reaches only its children", result.stderr)
+        self.assertEqual(len(self.fake.methods("world.list_components")), 1)
+        self.assertFalse(any(query.get("data") == {"components": [hana_shot.DRAWN_BY_SHOW]}
+                             for query in self.fake.methods("world.query")))
+        self.fake.named_entities.append(self.box(211, "Child mesh", (2, 2, 0), (0.5, 0.5, 0), parent=200))
+        child = self.locate("tool:Show#1/name:Child mesh", "--json")
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(cast(hana_shot.LocateReply, json.loads(child.stdout))["entity"], 211)
+
+    def test_scoped_selector_failures_name_both_parts_and_keep_the_single_entity_error(self) -> None:
+        self.fake.named_entities.extend([
+            {"entity": 110, "components": {NAME: "Jack", CHILD_OF: 100}},
+            {"entity": 111, "components": {NAME: "Jack", CHILD_OF: 100}},
+        ])
+        for selector in ("name:Missing/name:Jack", "name:Jack/name:Tool body", "entity:100/name:Missing", "entity:100/name:Jack"):
+            with self.subTest(selector=selector):
+                result = self.locate(selector)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(selector, result.stderr)
+                self.assertIn("must name exactly one entity; found", result.stderr)
+
+    def test_locate_clips_window_edges_and_drops_behind_camera_corners(self) -> None:
+        for center, half in (((6, 2, 0), (1.5, 1.5, 0)), ((0, 2, 6), (1, 1, 1))):
+            with self.subTest(center=center):
+                self.fake.named_entities[-1] = self.box(101, "Tool body", center, half, parent=100)
+                if center[2] == 6:
+                    self.fake.ray_cast_backfaces_registered = True
+                    self.fake.named_entities[-1]["components"][hana_shot.RAY_CAST_BACKFACES] = {}
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertTrue(reply["clipped"])
+                self.assertGreater(reply["rect"]["width"], 0)
+                self.assertLessEqual(reply["rect"]["x"] + reply["rect"]["width"], 640)
+                self.assertLessEqual(reply["rect"]["y"] + reply["rect"]["height"], 360)
+                if center[2] == 0:
+                    self.assertEqual(reply["rect"], {"x": 560.0, "y": 135.0, "width": 80.0, "height": 90.0})
+
+    def test_scoped_selector_runs_setup_before_resolving_a_missing_outer(self) -> None:
+        answer = self.fake.answer
+
+        def spawn_outer(method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "hana/invoke_command":
+                self.fake.named_entities.extend([
+                    {"entity": 300, "components": {NAME: "Outer"}},
+                    self.box(301, "Inner", (0, 2, 0), (1, 1, 0), parent=300),
+                ])
+            return answer(method, params)
+
+        with mock.patch.object(self.fake, "answer", side_effect=spawn_outer):
+            result = self.shot("--target", "name:Outer/name:Inner", "--mode", "hana-frame", "--setup", "scene::spawn")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("hana/invoke_command"), [{"command": "scene::spawn"}])
+        self.assertIn({"event": ZOOM_TO_TARGET, "value": {"entity": 301}}, self.fake.methods("world.trigger_event"))
+
+    def test_missing_scoped_outer_names_the_outer_in_the_final_error(self) -> None:
+        result = self.locate("name:Outer/name:Inner")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("name:Outer/name:Inner: outer name:Outer found nothing", result.stderr)
+
+    def test_locate_skips_zero_scale_boxes_for_other_entities_and_the_target(self) -> None:
+        for parent in (0, 100):
+            with self.subTest(parent=parent):
+                box = self.box(300, "Zero scale", (0, 2, 3), (1, 1, 1), parent=parent)
+                cast(list[float], box["components"][GLOBAL_TRANSFORM])[:9] = [0.0] * 9
+                self.fake.named_entities = self.fake.named_entities[:3] + [box]
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                self.assertFalse(reply["occluded"])
+
+    def test_locate_prints_a_fractional_scale_without_rounding_it(self) -> None:
+        self.fake.window_scale_factor = 1.25
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "tool:Shape#1 384.0 216.0 256.0 144.0 512.0 288.0 scale 1.25\n")
+
+    def test_locate_reports_missing_visible_bounds_with_the_parent_hint(self) -> None:
+        self.fake.named_entities.append({"entity": 102, "components": {NAME: "Leaf", CHILD_OF: 101}})
+        result = self.locate("name:Leaf")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: the target has no visible mesh bounds"
+                         + "; nearest ancestor with an AABB: --target entity:101 (Tool body)\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_reports_no_clear_point_when_grid_and_center_miss_visible_boxes(self) -> None:
+        self.fake.named_entities = self.fake.named_entities[:2] + [
+            self.box(101, "First tip", (-1, 1, 0), (0.001, 0.001, 0), parent=100),
+            self.box(102, "Last tip", (1, 3, 0), (0.001, 0.001, 0), parent=100),
+        ]
+        result = self.locate()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: no clear click point on tool:Shape#1\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_reports_targets_behind_the_camera_or_off_screen(self) -> None:
+        for center, reason in (((0, 2, 8), "behind the camera"), ((20, 2, 0), "off screen")):
+            with self.subTest(reason=reason):
+                self.fake.named_entities[-1] = self.box(101, "Tool body", center, (0.5, 0.5, 0.5), parent=100)
+                result = self.locate()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, f"hana_shot: {reason}\n")
+                self.assertEqual(result.stdout, "")
+
+    def test_locate_moves_the_click_point_when_a_nearer_box_covers_the_center(self) -> None:
+        self.fake.named_entities.append(self.box(300, "Cover", (0, 2, 3), (0.3, 0.3, 0)))
+        result = self.locate("tool:Shape#1", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+        self.assertTrue(reply["occluded"])
+        self.assertFalse(reply["clipped"])
+        click = reply["click"]
+        self.assertFalse(288 <= click["x"] <= 352 and 162 <= click["y"] <= 198)
+        self.assertGreaterEqual(click["x"], 240)
+        self.assertLessEqual(click["x"], 400)
+        self.assertGreaterEqual(click["y"], 135)
+        self.assertLessEqual(click["y"], 225)
+        text = self.locate()
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertTrue(text.stdout.endswith(" scale 2.0 occluded\n"))
+
+    def test_locate_ignores_a_pass_through_cover_but_keeps_a_pass_through_target(self) -> None:
+        cover = self.box(300, "Pass-through cover", (0, 2, 3), (1.5, 1.5, 0))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": False, "is_hoverable": False}
+        self.fake.named_entities.append(cover)
+        for target_passes_through in (False, True):
+            with self.subTest(target_passes_through=target_passes_through):
+                self.fake.named_entities[2]["components"][hana_shot.PICKABLE] = {
+                    "should_block_lower": not target_passes_through, "is_hoverable": False,
+                }
+                result = self.locate("tool:Shape#1", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                self.assertFalse(reply["occluded"])
+
+    def test_locate_keeps_a_cover_that_blocks_lower_hits(self) -> None:
+        cover = self.box(300, "Blocking cover", (0, 2, 3), (1.5, 1.5, 0))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": True, "is_hoverable": False}
+        self.fake.named_entities.append(cover)
+        result = self.locate()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: covered by Blocking cover\n")
+        self.assertEqual(result.stdout, "")
+
+    def test_locate_ignores_an_enclosing_cover_unless_it_casts_backfaces(self) -> None:
+        cover = self.box(300, "Enclosing case", (0, 2, 4), (3, 3, 3))
+        cover["components"][hana_shot.PICKABLE] = {"should_block_lower": True}
+        self.fake.named_entities.append(cover)
+        for registered, present in ((False, True), (True, False), (True, True)):
+            with self.subTest(registered=registered, present=present):
+                self.fake.ray_cast_backfaces_registered = registered
+                if present:
+                    cover["components"][hana_shot.RAY_CAST_BACKFACES] = {}
+                else:
+                    del cover["components"][hana_shot.RAY_CAST_BACKFACES]
+                before = len(self.fake.methods("world.query"))
+                result = self.locate("tool:Shape#1", "--json")
+                if registered and present:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr, "hana_shot: covered by Enclosing case\n")
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertEqual(reply["click"], {"x": 320.0, "y": 180.0})
+                    self.assertFalse(reply["occluded"])
+                queries = self.fake.methods("world.query")[before:]
+                boxes = [cast(dict[str, list[str]], query["data"]) for query in queries
+                         if AABB in cast(dict[str, list[str]], query.get("data", {})).get("components", [])]
+                self.assertEqual(len(boxes), 1)
+                self.assertEqual(hana_shot.RAY_CAST_BACKFACES in boxes[0]["has"], registered)
+
+    def test_locate_applies_backface_culling_to_target_members(self) -> None:
+        self.fake.ray_cast_backfaces_registered = True
+        self.fake.named_entities[-1] = self.box(101, "Tool body", (0, 2, 6), (1, 1, 1), parent=100)
+        for backfaces in (False, True):
+            with self.subTest(backfaces=backfaces):
+                self.fake.named_entities[-1]["has"] = {hana_shot.RAY_CAST_BACKFACES: backfaces}
+                result = self.locate("tool:Shape#1", "--json")
+                if backfaces:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reply = cast(hana_shot.LocateReply, json.loads(result.stdout))
+                    self.assertFalse(reply["occluded"])
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stderr, "hana_shot: no clear click point on tool:Shape#1\n")
+
+    def test_locate_names_the_covering_box_or_its_entity_when_every_grid_point_is_covered(self) -> None:
+        cover = self.box(300, "Cover", (0, 2, 3), (1.5, 1.5, 0))
+        self.fake.named_entities.append(cover)
+        for label in ("Cover", "entity:300"):
+            with self.subTest(label=label):
+                if label == "entity:300":
+                    del cover["components"][NAME]
+                result = self.locate()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, f"hana_shot: covered by {label}\n")
+                self.assertEqual(result.stdout, "")
+
+    def test_locate_waits_for_a_moving_camera_without_moving_it(self) -> None:
+        self.fake.camera_moving_reads = 1
+        result = self.locate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(len(self.fake.methods("world.get_components")), 1)
+        self.assertEqual(self.fake.methods("world.mutate_components"), [])
+        self.assertEqual(self.fake.methods("world.trigger_event"), [])
+        self.assertFalse(self.timings.exists())
+
+    def test_locate_refuses_a_viewport_and_requires_a_target(self) -> None:
+        self.fake.camera_viewport = {"physical_position": [0, 0], "physical_size": [640, 360]}
+        result = self.locate()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("the camera has a viewport", result.stderr)
+        missing = self.run_script("locate", "--port", str(self.port))
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--target", missing.stderr)
+
+    def test_shared_projection_keeps_crop_padding_and_the_full_window_for_a_behind_camera_corner(self) -> None:
+        state = hana_shot.camera_state(camera_components())
+        box = self.fake.named_entities[-1]["components"]
+        transform = cast(list[float], box[GLOBAL_TRANSFORM])
+        aabb = cast(hana_shot.AabbValue, box[AABB])
+        bounds = hana_shot.Bounds({101: 100}, {101: (transform, aabb)})
+        self.assertEqual(hana_shot.hierarchy_rect(bounds, 100, state, 8, hana_shot.TargetEvidence()),
+                         hana_shot.Rect(472, 262, 336, 196))
+        transform[11] = 6
+        aabb["half_extents"][2] = 1
+        self.assertEqual(hana_shot.hierarchy_rect(bounds, 100, state, 8, hana_shot.TargetEvidence()),
+                         hana_shot.Rect(0, 0, 1280, 720))
+
+
 class SelectorTests(HanaShotTest):
     def target_queries(self) -> list[dict[str, object]]:
         return [
@@ -1674,6 +2012,30 @@ class SelectorTests(HanaShotTest):
                     continue
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(triggers, [{"event": ZOOM_TO_TARGET, "value": {"entity": entity}}])
+
+    def test_negative_tool_indices_select_from_the_highest_tool_id(self) -> None:
+        self.fake.tool_entities = [(30, GRAYSCALE, 35, "hana.effect.grayscale"),
+                                   (20, GRAYSCALE, 13, "hana.effect.grayscale"),
+                                   (50, GRAYSCALE, 40, "hana.effect.grayscale")]
+        for index, entity in ((-1, 50), (-2, 30), (-3, 20), (1, 20), (3, 50)):
+            with self.subTest(index=index):
+                before = len(self.fake.methods("world.trigger_event"))
+                result = self.shot("--target", f"tool:Grayscale#{index}", "--mode", "hana-frame")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.fake.methods("world.trigger_event")[before:],
+                                 [{"event": ZOOM_TO_TARGET, "value": {"entity": entity}}])
+
+    def test_tool_indices_past_either_end_keep_the_missing_target_error(self) -> None:
+        self.fake.tool_entities = [(30, GRAYSCALE, 35, "hana.effect.grayscale"),
+                                   (20, GRAYSCALE, 13, "hana.effect.grayscale"),
+                                   (50, GRAYSCALE, 40, "hana.effect.grayscale")]
+        for index in (-4, 4):
+            with self.subTest(index=index):
+                selector = f"tool:Grayscale#{index}"
+                result = self.shot("--target", selector, "--mode", "hana-frame")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{selector} must name exactly one entity; found nothing", result.stderr)
+        self.assertEqual(self.fake.methods("world.trigger_event"), [])
 
     def test_ambiguous_and_missing_targets_fail(self) -> None:
         for selector, found in (("name:Twin", "Twin"), ("tool:Grayscale#5", "nothing"), ("entity:999", "nothing")):

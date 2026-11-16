@@ -173,6 +173,7 @@ class FeedConfiguration:
     colors: PageColors
     other_rows: int
     token_dump_seconds: int
+    stevie_program: Path
 
 
 def configured_output_folder(settings: conf.ConfigRead) -> Path:
@@ -200,7 +201,8 @@ def read_configuration(settings: conf.ConfigRead | conf.UseConfiguredValue = con
                              settings.number("interval_seconds"), settings.whole("history_days"),
                              settings.whole("swap_rows"), settings.whole("report_refresh_seconds"),
                              {"light": theme("light"), "dark": theme("dark")}, settings.whole("other_rows"),
-                             settings.whole("token_dump_seconds"))
+                             settings.whole("token_dump_seconds"),
+                             Path(os.path.expandvars(settings.text("stevie_program"))).expanduser())
 
 
 class PageArguments(CodeRootArguments):
@@ -1094,14 +1096,14 @@ class TokenPoolUnavailable(TypedDict):
 
 
 # stevie prints one line for each option, in argument order: the memory floor in MiB, free tokens, total tokens.
-STEVIE_POOL_COMMAND = ("stevie", "-a", "-t", "-j")
+STEVIE_POOL_OPTIONS = ("-a", "-t", "-j")
 STEVIE_TIMEOUT_SECONDS = 0.5
 
 
-def stevie_output() -> str:
+def stevie_output(program: Path) -> str:
     """Read the natedev jobserver pool; an error returns its reason."""
     try:
-        result = subprocess.run(STEVIE_POOL_COMMAND, capture_output=True, text=True,
+        result = subprocess.run((str(program), *STEVIE_POOL_OPTIONS), capture_output=True, text=True,
                                 timeout=STEVIE_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ValueError(f"stevie did not answer: {error}") from error
@@ -1110,13 +1112,13 @@ def stevie_output() -> str:
     return result.stdout
 
 
-def token_pool(available_bytes: int) -> TokenPool | TokenPoolUnavailable:
+def token_pool(available_bytes: int, program: Path) -> TokenPool | TokenPoolUnavailable:
     """The pool gives no token while MemAvailable is under its floor."""
     try:
-        values = [int(value) for value in stevie_output().split()]
+        values = [int(value) for value in stevie_output(program).split()]
     except ValueError as error:
         return {"kind": "TokenPoolUnavailable", "reason": str(error)}
-    if len(values) != len(STEVIE_POOL_COMMAND) - 1 or min(values) < 0:
+    if len(values) != len(STEVIE_POOL_OPTIONS) or min(values) < 0:
         return {"kind": "TokenPoolUnavailable", "reason": f"stevie printed {values}"}
     floor_mib, free, total = values
     floor = floor_mib * 1024 ** 2
@@ -1877,7 +1879,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             scope_members = [{"pid": step.pid, "program": activity.program}]
         leftovers.append({"owner": owner, "age": queue_view.leftover_age(age(activity.started_at, explanation.now))
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
-    tokens = token_pool(captured.available)
+    tokens = token_pool(captured.available, configuration.stevie_program)
     token_stage = token_wait_stage(tokens)
     ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
                      explanation.now, configuration.other_rows)
