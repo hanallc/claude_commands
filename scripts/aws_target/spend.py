@@ -1,6 +1,6 @@
 """The AWS spend per day and per month from the local cost ledger, without an AWS call.
 
-The /aws_spend report and the AWS page both read the spend here, so both show the same numbers.
+The buildlog report and the AWS page both read the spend here, so both show the same numbers.
 """
 from __future__ import annotations
 

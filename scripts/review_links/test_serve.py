@@ -23,12 +23,13 @@ from unittest.mock import patch
 
 
 from typing import cast, override
+from urllib.parse import urlencode
 
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
-from scripts.production import change_review
-from scripts.review_links import accounts_page, change_browser, change_page, console, serve
+from scripts.production import change_review, investigation, staff
+from scripts.review_links import accounts_page, change_browser, change_page, console, investigations_page, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -57,6 +58,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-server-test-")))
         self.root = temporary / "root"
         self.root.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "SHOWRUNNER_STATE_DIR": str(temporary / "investigations-state")})))
         self.outside = temporary / "outside.txt"
         _ = self.outside.write_text("outside the served root", encoding="utf-8")
         server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
@@ -176,6 +179,28 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
+
+    def test_investigation_mark_read_saves_and_reports_refused_or_failed_requests(self) -> None:
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))
+        owner = staff.StaffId("fixture-owner")
+        item = investigation.file(owner, "Find the cause", "Why?")
+        fields = {"owner": owner, "id": item.id,
+                  "token": investigations_page.request_token(self.root, owner, item.id)}
+        self.assertEqual(self.request(investigations_page.PAGE_PATH).status, 200)
+        self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields))[0], 400)
+        _ = investigation.answer(owner, item.id, "Found it.")
+        for body in (urlencode({**fields, "token": "bad"}), urlencode(fields) + '&owner=other'):
+            with self.subTest(body=body):
+                self.assertEqual(self.post(investigations_page.PAGE_PATH, body)[0], 400)
+                self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
+        with patch.object(investigations_page, "submit", side_effect=OSError("fixture write failed")):
+            status, body = self.post(investigations_page.PAGE_PATH, urlencode(fields))
+            self.assertEqual(status, 503)
+            self.assertIn(b'"reason"', body)
+        self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.ANSWER_READY)
+        self.assertEqual(self.post(investigations_page.PAGE_PATH, urlencode(fields)), (200, b'{"state": "read"}'))
+        self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (

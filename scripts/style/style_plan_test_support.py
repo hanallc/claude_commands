@@ -31,6 +31,7 @@ from scripts.production import proposal_issue
 from scripts.lib import berth_board
 from scripts.style import fake_fmt
 from scripts.style.style_child_test_support import style_cli_command, unqueued_style_children
+from scripts.style.style_reader_test_support import oracle_reader
 from scripts.style import mechanical_classes
 from scripts.style import rules
 from scripts.style import style_ledger
@@ -192,6 +193,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
     def configure_fixture(self) -> None:
+        _ = self.enterContext(oracle_reader())
         _ = self.enterContext(unqueued_style_children())
         with private_class_catalog(self.fixture_root.parent):
             listed = mechanical_classes.classes()

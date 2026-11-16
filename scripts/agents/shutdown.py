@@ -28,7 +28,7 @@ from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.herdr import herdr, pane_launch, worker_panes
-from scripts.lib import process_group, process_start, conf, berth_board, git_files, unit_runs
+from scripts.lib import process_group, process_start, conf, berth_board, git_files, unit_runs, build_folders
 from scripts.lib.conf import UseConfiguredValue
 from scripts.message import sessions, session_send, send_budget, send_result
 from scripts.production import (
@@ -1759,12 +1759,14 @@ def recovery_launch_command(unit: RetiredUnitRecovery) -> list[str]:
 def recovery_make_worktree(unit: RetiredUnitRecovery) -> None:
     if recovery_has_worktree(unit):
         return
-    command = ["git", "-C", str(unit.production.checkout), "worktree", "add", str(unit.worktree)]
-    command += ([unit.branch] if recovery_git(unit, "branch", "--list", unit.branch) else
-                ["-b", unit.branch, unit.production.merge_branch])
-    result = retirement_run(command)
-    if result.returncode:
-        raise RecoveryRefused(f"worktree {unit.worktree}: {retirement_failure(result)}")
+    branch = (build_folders.ExistingWorktreeBranch(unit.branch)
+              if recovery_git(unit, "branch", "--list", unit.branch)
+              else build_folders.NewWorktreeBranch(unit.branch, unit.production.merge_branch))
+    try:
+        _ = build_folders.create_build_folder(build_folders.LinkedEditableRepository(
+            unit.worktree, unit.production.checkout, branch))
+    except (OSError, ValueError) as error:
+        raise RecoveryRefused(f"worktree {unit.worktree}: {error}") from error
     print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
 
 def recovery_launch(unit: RetiredUnitRecovery) -> None:
