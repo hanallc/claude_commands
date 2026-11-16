@@ -1114,6 +1114,7 @@ function phaseTimeHtml(buckets, phases) {
   if (buckets.some(bucket => bucket.phase.state === "measured")) return reportPlot(title, buckets, phases, "h/phase");
   const line = buckets.some(bucket => bucket.phase.unrecorded > 0)
     ? "Shown from the first phase that ends with a wait record. Earlier phases have no wait record."
+    : buckets.some(bucket => bucket.phase.finished > 0) ? "Hana phases ended in this range, but none has a valid start time."
     : "No Hana phase ended in this range.";
   return `<h3>${esc(title)}</h3><p class="report-window">${esc(line)}</p>`;
 }

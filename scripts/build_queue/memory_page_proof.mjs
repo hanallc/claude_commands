@@ -1011,11 +1011,14 @@ try {
                 assert.match(state.top,/2026/);
               }
             }
-            await show(readings.unrecorded_report);
-            const phaseTime=await evaluate(`({text:document.querySelector('#history-phase').textContent,
-              plots:document.querySelectorAll('#history-phase svg, #history-phase details').length})`);
-            assert.equal(phaseTime.plots,0,'A phase time plot without measured days shows a plot or a table.');
-            assert.match(phaseTime.text,/Shown from the first phase that ends with a wait record\. Earlier phases have no wait record\./);
+            for (const [name,line] of [['unrecorded_report',/Shown from the first phase that ends with a wait record\. Earlier phases have no wait record\./],
+                ['startless_report',/Hana phases ended in this range, but none has a valid start time\./]]) {
+              await show(readings[name]);
+              const phaseTime=await evaluate(`({text:document.querySelector('#history-phase').textContent,
+                plots:document.querySelectorAll('#history-phase svg, #history-phase details').length})`);
+              assert.equal(phaseTime.plots,0,'A phase time plot without measured days shows a plot or a table.');
+              assert.match(phaseTime.text,line);
+            }
             await show(readings.shrink);
             assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
             await evaluate(`showTip('row:${readings.shrink.walk.length-1}',200,200)`);
