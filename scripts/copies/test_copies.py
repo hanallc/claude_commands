@@ -1277,6 +1277,7 @@ class StandingTests(unittest.TestCase):
                 tree = copies.workspace_path(self.owner_id, self.source, boundary)
                 original_git = copies.git
                 original_register = scratch.register_copy
+                original_folder = build_folders.temporary_build_folder
                 interrupted = False
                 def register(path: Path, **fields: str) -> None:
                     nonlocal interrupted
@@ -1287,15 +1288,25 @@ class StandingTests(unittest.TestCase):
                 def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
                     nonlocal interrupted
                     result = original_git(repo, *arguments, data=data)
-                    match = ((boundary == "clone" and "clone" in arguments)
-                             or (boundary == "checkout" and "checkout" in arguments)
+                    match = ((boundary == "checkout" and "checkout" in arguments)
                              or (boundary == "config" and repo == tree and len(arguments) == 3
                                  and arguments[:2] == ("config", "user.email")))
                     if match and not interrupted:
                         interrupted = True
                         raise RuntimeError("interrupted init")
                     return result
-                with mock.patch.object(scratch, "register_copy", side_effect=register), mock.patch.object(copies, "git", side_effect=git):
+                @contextmanager
+                def temporary_folder(request: build_folders.UniqueBuildFolder | build_folders.GitCloneStage |
+                                     build_folders.BuildFolderSpec) -> Generator[Path]:
+                    nonlocal interrupted
+                    with original_folder(request) as folder:
+                        if boundary == "clone" and isinstance(request, build_folders.GitCloneStage) and not interrupted:
+                            interrupted = True
+                            raise RuntimeError("interrupted init")
+                        yield folder
+                with mock.patch.object(scratch, "register_copy", side_effect=register), \
+                     mock.patch.object(copies, "git", side_effect=git), \
+                     mock.patch.object(build_folders, "temporary_build_folder", side_effect=temporary_folder):
                     with self.assertRaisesRegex(RuntimeError, "interrupted init"):
                         with copies.workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker"):
                             self.fail("initialization reached the caller")
@@ -2168,22 +2179,55 @@ os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
         self.assertEqual(marker.read_text(), self.head)
-        git = copies.git
         partial = self.base / "partial-clone"
         partial.mkdir()
-
-        def failed_clone(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
-            if arguments[:1] == ("clone",):
-                stage = Path(arguments[-1])
-                self.assertEqual(stage.parent, partial)
-                _ = (stage / "partial").write_text("unfinished clone")
-                raise copies.CopyError("clone failed")
-            return git(repo, *arguments, data=data)
-
-        with mock.patch.object(copies, "git", side_effect=failed_clone), \
+        failed_bin = self.base / "failed-bin"
+        failed_bin.mkdir()
+        failed_git = failed_bin / "git"
+        _ = failed_git.write_text("#!/bin/sh\nprintf 'clone failed' >&2\nexit 1\n")
+        failed_git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(failed_bin) + os.pathsep + os.environ["PATH"]}), \
              self.assertRaisesRegex(copies.CopyError, "clone failed"):
             copies.initialize_git(partial, self.source)
         self.assertEqual(list(partial.iterdir()), [])
+
+    def test_killed_clone_stage_is_collectible_but_live_holder_keeps_it(self) -> None:
+        tree = self.base / "partial-clone"
+        tree.mkdir()
+        probe = """import pathlib, subprocess, sys
+from unittest import mock
+from scripts.copies import copies
+original = subprocess.run
+def stopped_clone(command, **options):
+    if 'clone' in command:
+        stage = pathlib.Path(command[-1])
+        (stage / 'partial').write_text('unfinished clone')
+        print(stage, flush=True)
+        sys.stdin.buffer.read(1)
+    return original(command, **options)
+with mock.patch.object(subprocess, 'run', side_effect=stopped_clone):
+    copies.initialize_git(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))
+"""
+        child: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", probe, str(tree), str(self.source)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stream = cast(TextIO, child.stdout)
+            self.assertTrue(select.select([stream], [], [], 5)[0])
+            stage = Path(stream.readline().strip())
+            self.assertEqual(stage.parent, tree)
+            self.assertEqual(stage.stat().st_dev, tree.stat().st_dev)
+            build_folders.sweep_temporary_build_folders(tree, wait=False, prefix=copies.CLONE_STAGE + "-")
+            self.assertEqual((stage / "partial").read_text(), "unfinished clone")
+            self.assertEqual(build_folders.build_folder_state(stage), "held")
+            child.kill()
+            _ = child.communicate(timeout=3)
+            self.assertEqual(build_folders.build_folder_state(stage), "free")
+            build_folders.sweep_temporary_build_folders(tree, wait=False, prefix=copies.CLONE_STAGE + "-")
+            self.assertEqual(list(tree.iterdir()), [])
+        finally:
+            if child.poll() is None:
+                child.kill()
+            _ = child.communicate(timeout=3)
 
     def test_claim_state_distinguishes_owned_and_busy_checkout(self) -> None:
         tree = self.gates / "origin-slot1"

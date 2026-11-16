@@ -13,6 +13,7 @@ import sys
 from typing import TextIO, cast
 import unittest
 
+from scripts.lib import build_folders
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
@@ -86,9 +87,14 @@ from scripts.build_queue import admission_records as records, step_estimator
 from scripts.buildlog import store
 from scripts.lib import conf
 faulthandler.register(signal.SIGUSR2)
+read_config = conf.read
+def folder_config(name):
+    if name == 'build_folders':
+        return read_config(name)
+    raise PermissionError('runner config path')
 with mock.patch.object(records, 'read_memory_config', side_effect=PermissionError('runner config')), \\
      mock.patch.object(step_estimator, 'step_estimate', side_effect=PermissionError('runner history')), \\
-     mock.patch.object(conf, 'read', side_effect=PermissionError('runner config path')), \\
+     mock.patch.object(conf, 'read', side_effect=folder_config), \\
      mock.patch.object(store, 'locked_rows', side_effect=PermissionError('runner history path')):
     runpy.run_module('scripts.build_queue.ci_cargo_front', run_name='__main__')
 """
@@ -127,15 +133,22 @@ class CargoLifetimeTests(unittest.TestCase):
                 expected_shared: list[Path] = []
                 prefix = f"build-admission-ci-{os.getuid()}-"
                 if use_shared:
+                    request = build_folders.UniqueBuildFolder(prefix, build_folders.ExplicitBuildParent(shared))
+                    live_folder = fixture.enter_context(build_folders.temporary_build_folder(request))
+                    expected_shared = [live_folder, live_folder.with_name(live_folder.name + ".lock"),
+                                       live_folder.with_name(live_folder.name + ".lease.json")]
+                    spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=shared,
+                        purpose=prefix, suffix_length=8)
+                    with build_folders.leased_build_folder(spec) as leftover:
+                        _ = (leftover / "cargo.cgroup").write_text("")
                     with subprocess.Popen([sys.executable, "-c", "pass"]) as finished:
                         self.assertEqual(finished.wait(timeout=3), 0)
                     live_start = records.process_start_time(os.getpid())
                     self.assertIsNotNone(live_start)
-                    live_folder = shared / f"{prefix}{os.getpid()}-{live_start}-live"
-                    for leftover in (shared / f"{prefix}{finished.pid}-1-dead", shared / f"{prefix}old", live_folder):
-                        leftover.mkdir()
-                        _ = (leftover / "cargo.cgroup").write_text("")
-                    expected_shared = [live_folder]
+                    legacy_live = shared / f"{prefix}{os.getpid()}-{live_start}-live"
+                    for legacy in (shared / f"{prefix}{finished.pid}-1-dead", shared / f"{prefix}old", legacy_live):
+                        legacy.mkdir()
+                    expected_shared.append(legacy_live)
                 wrapper = front_dir / "cargo"
                 cargo = cargo_dir / "cargo"
                 compiler = devshell_dir / "cc"
@@ -167,9 +180,12 @@ class CargoLifetimeTests(unittest.TestCase):
                     self.assertEqual(records.waiter_route(record.queue_waiter),
                                      target_config.LocalRequired(reason) if reason else records.DIRECT_CARGO)
                     self.assertEqual(Path(record.sidecar).parent.parent, shared if use_shared else job_temporary)
+                    self.assertEqual(Path(record.sidecar).stat().st_mode & 0o777, 0o644)
+                    self.assertEqual(Path(record.sidecar).parent.stat().st_mode & 0o777, 0o755)
+                    self.assertEqual(build_folders.build_folder_state(Path(record.sidecar).parent), "held")
                     if use_shared:
                         self.assertTrue(Path(record.sidecar).parent.name.startswith(
-                            f"{prefix}{child.pid}-{record.owner.start_time}-"))
+                            prefix))
                 os.kill(int(str(data["pid"])), signal.SIGUSR1)
                 output, errors = child.communicate(timeout=8)
                 self.assertEqual(child.returncode, 0, output + errors)
@@ -180,7 +196,7 @@ class CargoLifetimeTests(unittest.TestCase):
                 self.assertEqual(paths.split(os.pathsep),
                     [*(str(folder) for folder in expected_folders), *os.environ["PATH"].split(os.pathsep)])
                 self.assertEqual((temporary, module_path), (str(job_temporary), "job-module-path"))
-                self.assertEqual(list(shared.iterdir()), expected_shared)
+                self.assertCountEqual(list(shared.iterdir()), expected_shared)
                 self.assertEqual(list(job_temporary.iterdir()), [])
                 self.assertEqual(len(fixture.history()), 1)
                 with fixture.loop_turn():
@@ -204,6 +220,33 @@ class CargoLifetimeTests(unittest.TestCase):
                     os.kill(cargo, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def test_killed_front_leaves_a_collectible_sidecar_but_live_holder_keeps_it(self) -> None:
+        with AdmissionFixture() as fixture, fixture.serving():
+            child = self.start_front(fixture, "build")
+            data = self.started(child)
+            with fixture.loop_turn():
+                record, = fixture.server.reservations.values()
+                folder = Path(record.sidecar).parent
+            build_folders.sweep_temporary_build_folders(folder.parent, wait=False,
+                                                       prefix=f"build-admission-ci-{os.getuid()}-")
+            self.assertTrue(folder.exists())
+            self.assertEqual(build_folders.build_folder_state(folder), "held")
+            cargo = int(str(data["pid"]))
+            descriptor = os.pidfd_open(cargo)
+            try:
+                child.kill()
+                _ = child.communicate(timeout=3)
+                self.assertTrue(select.select([descriptor], [], [], 3)[0])
+                self.assertTrue(folder.exists())
+                self.assertEqual(build_folders.build_folder_state(folder), "free")
+                build_folders.sweep_temporary_build_folders(folder.parent, wait=False,
+                                                           prefix=f"build-admission-ci-{os.getuid()}-")
+                self.assertFalse(folder.exists())
+                self.assertFalse(folder.with_name(folder.name + ".lock").exists())
+                self.assertFalse(folder.with_name(folder.name + ".lease.json").exists())
+            finally:
+                os.close(descriptor)
 
     def start_front(self, fixture: AdmissionFixture, *arguments: str) -> subprocess.Popen[str]:
         cargo = fixture.root / "fake-cargo"

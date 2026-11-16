@@ -61,6 +61,14 @@ class InheritedTemporaryParent:
 
 
 @dataclass(frozen=True)
+class ConfiguredTemporaryParent:
+    """Use the configured parent for temporary run folders."""
+
+
+CONFIGURED_TEMPORARY_PARENT = ConfiguredTemporaryParent()
+
+
+@dataclass(frozen=True)
 class ExplicitBuildParent:
     """The path specifies the parent for a build folder."""
     path: Path
@@ -76,7 +84,7 @@ class UnitRunParent:
     """Use the director's session run root, else the unit root (unit_runs.new_run_root)."""
 
 
-BuildFolderParent = InheritedTemporaryParent | ExplicitBuildParent | SystemTemporaryParent | UnitRunParent
+BuildFolderParent = InheritedTemporaryParent | ConfiguredTemporaryParent | ExplicitBuildParent | SystemTemporaryParent | UnitRunParent
 
 
 @dataclass(frozen=True)
@@ -94,7 +102,17 @@ class StableOwnerFolder:
     mode: int = 0o777
 
 
-BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder
+@dataclass(frozen=True)
+class GitCloneStage:
+    """Create temporary clone metadata beside its destination."""
+    source: Path
+    parent: Path
+    prefix: str
+    mode: Literal["--shared", "--no-local"]
+    pass_fds: tuple[int, ...] = ()
+
+
+BuildFolderRequest = UniqueBuildFolder | StableOwnerFolder | GitCloneStage
 
 
 def inherited_temporary_parent() -> Path:
@@ -112,6 +130,9 @@ def tmpfs_temporary_parent() -> Path:
 def _parent(parent: BuildFolderParent) -> Path:
     if isinstance(parent, InheritedTemporaryParent):
         return inherited_temporary_parent()
+    if isinstance(parent, ConfiguredTemporaryParent):
+        value = _settings().text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent()))
+        return Path(os.path.expandvars(value)).expanduser()
     if isinstance(parent, SystemTemporaryParent):
         return Path(_settings().text("roots.system"))
     if isinstance(parent, UnitRunParent):
@@ -377,7 +398,7 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
 @dataclass(frozen=True)
 class _TemporaryFolderRequest:
     """The temporary folder request retains its cleanup stack."""
-    request: UniqueBuildFolder | BuildFolderSpec
+    request: UniqueBuildFolder | GitCloneStage | BuildFolderSpec
     cleanup: ExitStack
 
 
@@ -386,6 +407,8 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         return _request_spec(request.request)
     if isinstance(request, BuildFolderSpec):
         return request
+    if isinstance(request, GitCloneStage):
+        return _request_spec(UniqueBuildFolder(request.prefix, ExplicitBuildParent(request.parent)))
     else:
         stable = isinstance(request, StableOwnerFolder)
         name = request.name if isinstance(request, StableOwnerFolder) else request.prefix
@@ -491,6 +514,14 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(descriptor,),
                                            timeout=repository_git_timeout())
                         _write_lease(path, directory, allocation)
+                    if isinstance(original, GitCloneStage):
+                        import subprocess
+
+                        _ = subprocess.run(["git", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+                                            "-C", str(original.source), "clone", original.mode,
+                                            "--no-checkout", "--quiet", "--", str(original.source), str(path)],
+                                           check=True, capture_output=True, pass_fds=(*original.pass_fds, descriptor),
+                                           timeout=repository_git_timeout())
                     os.set_inheritable(descriptor, True)
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
@@ -499,11 +530,17 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
                     return path
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
-                    if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
-                        _remove_failed_allocation(path, directory, made_inode)
+                    closing = descriptor
+                    descriptor = -1
+                    os.close(closing)
+                    if made_inode is not None or (new_folder and not stable):
+                        descriptor = _open_lock(path, directory, create=True)
+                        if (_take_lock(descriptor, fcntl.LOCK_EX, wait=False)
+                                and _lock_current(path, directory, descriptor)):
+                            _remove_failed_allocation(path, directory, made_inode)
                     raise
                 finally:
-                    if descriptor not in _locks:
+                    if descriptor >= 0 and descriptor not in _locks:
                         closing = descriptor
                         descriptor = -1
                         os.close(closing)
@@ -683,15 +720,22 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
 
 
-def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
+def sweep_temporary_build_folders(parent: Path, *, wait: bool = True, prefix: str = "",
+                                  legacy_names: Sequence[str] = ()) -> None:
     """Remove free allocations in a parent reserved for temporary maker folders.
+    Include caller-approved legacy names that have no maker metadata.
     With wait False, a held folder costs one lock try, not the probe wait."""
     try:
         with _folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
+            for name in legacy_names:
+                _check_name(name)
+                if not name or not name.startswith(prefix):
+                    raise ValueError("a legacy folder name must match the sweep prefix")
+                names.add(name)
             for entry in os.listdir(directory):
                 match = _METADATA.fullmatch(entry)
-                if match is not None:
+                if match is not None and match[1].startswith(prefix):
                     names.add(match[1])
             for name in sorted(names):
                 _ = _remove_free(parent / name, directory, wait=wait)
@@ -700,7 +744,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
 
 
 @contextmanager
-def temporary_build_folder(request: UniqueBuildFolder | BuildFolderSpec) -> Generator[Path]:
+def temporary_build_folder(request: UniqueBuildFolder | GitCloneStage | BuildFolderSpec) -> Generator[Path]:
     """Remove private work after the caller ends, including interrupted callers."""
     with ExitStack() as cleanup:
         yield create_build_folder(_TemporaryFolderRequest(request, cleanup))
@@ -819,17 +863,21 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
 
 
 def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str = "", unit: str = "",
-              work: str = "") -> int:
+              work: str = "", parent: BuildFolderParent = CONFIGURED_TEMPORARY_PARENT, prefix: str = "") -> int:
     """Keep the folder until the command and its descendants stop."""
     import json
 
     settings = _settings()
-    root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
+    root = _parent(parent).expanduser().resolve()
     spec = BuildFolderSpec(kind="temporary", parent=root, repository=repository_key(Path.cwd()),
                            owner=owner, purpose=name, suffix_length=settings.whole("names.suffix_length"),
                            showrunner=showrunner, unit=unit, work=work)
 
-    with temporary_build_folder(spec) as path:
+    request: UniqueBuildFolder | BuildFolderSpec = spec
+    if prefix:
+        sweep_temporary_build_folders(root, wait=False, prefix=prefix)
+        request = replace(spec, kind="legacy-unique", purpose=prefix, repository="")
+    with temporary_build_folder(request) as path:
         pid = os.getpid()
         start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
         marker = {"owner": owner, "pid": pid, "start_time": start_time,
@@ -877,6 +925,10 @@ def main(argv: Sequence[str]) -> int:
     _ = run.add_argument("--unit", default="")
     _ = run.add_argument("--work", default="")
     _ = run.add_argument("--name", required=True)
+    _ = run.add_argument("--prefix", default="")
+    run_parent = run.add_mutually_exclusive_group()
+    _ = run_parent.add_argument("--parent", type=Path)
+    _ = run_parent.add_argument("--system-temp", action="store_true")
     _ = run.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     request: BuildFolderRequest
@@ -887,8 +939,14 @@ def main(argv: Sequence[str]) -> int:
             owner = cast(str, args.owner) or cast(str, args.unit)
             if not owner:
                 raise ValueError("run needs --owner or --unit")
+            run_destination: BuildFolderParent = CONFIGURED_TEMPORARY_PARENT
+            if cast(bool, args.system_temp):
+                run_destination = SystemTemporaryParent()
+            elif cast(Path | None, args.parent) is not None:
+                run_destination = ExplicitBuildParent(cast(Path, args.parent))
             return run_build(owner, cast(str, args.name), arguments[1:] if arguments[:1] == ["--"] else arguments,
-                             showrunner=cast(str, args.showrunner), unit=cast(str, args.unit), work=cast(str, args.work))
+                             showrunner=cast(str, args.showrunner), unit=cast(str, args.unit), work=cast(str, args.work),
+                             parent=run_destination, prefix=cast(str, args.prefix))
         if command == "tool":
             print(_claim_tool_folder(cast(str, args.tool), cast(Path | None, args.parent), create_build_folder,
                                      owner_pid=cast(int, args.owner_pid)))

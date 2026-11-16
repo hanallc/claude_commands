@@ -12,7 +12,7 @@
 // Add --unadmitted after the output folder for one dark desktop app image.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
-import {readFile, writeFile, mkdtemp, rm, mkdir} from 'node:fs/promises';
+import {readFile, writeFile, mkdir} from 'node:fs/promises';
 import {createServer} from 'node:http';
 import {spawn, execFileSync} from 'node:child_process';
 import {once} from 'node:events';
@@ -22,13 +22,48 @@ import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const callerFolder = process.argv[2];
-const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(), 'memory-page-proof-'));
-try {
+const maker = join(repo, 'scripts/lib/build_folders.py');
+const python = process.env.PYTHON || 'python3';
+function leaseStdio(streams) {
+  const descriptor = Number(process.env.BUILD_FOLDER_LOCK_FD);
+  if (Number.isInteger(descriptor) && descriptor > 2) {
+    while (streams.length <= descriptor) streams.push('ignore');
+    streams[descriptor] = descriptor;
+  }
+  return streams;
+}
+if (process.argv[2] === '--leased-chrome') {
+  const profile = process.env.BUILD_FOLDER;
+  const temporary = join(profile, 'tmp');
+  await mkdir(temporary);
+  const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
+    '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
+    '--no-first-run', '--disable-extensions', '--disable-background-networking',
+    '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
+  ], {env:{...process.env,TMPDIR:temporary},stdio:leaseStdio(['ignore','ignore','inherit'])});
+  const exited = once(chrome, 'exit');
+  process.stdin.resume();
+  await Promise.race([exited, once(process.stdin, 'end')]);
+  chrome.kill('SIGTERM');
+  await exited;
+  process.exit(0);
+}
+const leasedOutput = process.argv[2] === '--leased-output';
+if (!process.argv[2]) {
+  const child = spawn(python, [maker, 'run', '--owner', 'queue', '--name', 'memory-page-proof',
+    '--prefix', 'memory-page-proof-', '--parent', tmpdir(), '--', process.execPath,
+    fileURLToPath(import.meta.url), '--leased-output'], {cwd:repo,stdio:leaseStdio(['inherit','inherit','inherit'])});
+  const [status] = await once(child, 'exit');
+  process.exit(status ?? 1);
+}
+const callerFolder = leasedOutput ? null : process.argv[2];
+const folder = callerFolder ? resolve(callerFolder) : process.env.BUILD_FOLDER;
+{
   await mkdir(folder, {recursive:true});
-  const systemTemporaryRoot = execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())', folder],
-    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
+  execFileSync(python, ['-c',
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE))', folder],
+    {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8',
+      stdio:leaseStdio(['pipe','pipe','pipe'])});
   const page = await readFile(join(folder, 'memory_live.html'));
   const beforePage = process.argv[3] && !process.argv[3].startsWith('--') ? (await readFile(process.argv[3], 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
@@ -127,15 +162,11 @@ try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     // Chrome needs a short path for its Unix sockets.
-    const profile = await mkdtemp(join(systemTemporaryRoot, 'memory-proof-chrome-'));
-    try {
-      const temporary = join(profile, 'tmp');
-      await mkdir(temporary);
-      const chrome = spawn(process.env.CHROME || '/run/current-system/sw/bin/google-chrome-stable', [
-        '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars',
-        '--no-first-run', '--disable-extensions', '--disable-background-networking',
-        '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
-      ], {env:{...process.env,TMPDIR:temporary},stdio:['ignore','ignore','pipe']});
+    {
+      const chrome = spawn(python, [maker, 'run', '--owner', 'queue', '--name', 'memory-proof-chrome',
+        '--prefix', 'memory-proof-chrome-', '--system-temp', '--', process.execPath,
+        fileURLToPath(import.meta.url), '--leased-chrome'],
+        {cwd:repo,env:process.env,stdio:leaseStdio(['pipe','ignore','pipe'])});
       const exited = new Promise(resolve => {
         chrome.once('exit', resolve);
         chrome.once('error', resolve);
@@ -2300,15 +2331,11 @@ try {
         }
       } finally {
         if(ws) ws.close();
-        chrome.kill('SIGTERM');
+        chrome.stdin.end();
         await exited;
       }
-    } finally {
-      await rm(profile,{recursive:true,force:true,maxRetries:3});
     }
   } finally {
     server.close();
   }
-} finally {
-  if (!callerFolder) await rm(folder,{recursive:true,force:true});
 }
