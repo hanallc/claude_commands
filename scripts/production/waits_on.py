@@ -77,22 +77,32 @@ def landed_phase(repo: Path, unit: str, phase: str) -> str:
 
 
 def phase_state(repo: Path, member: staff.StaffRow, phase: str, read_run: RunReader) -> WaitState:
-    if landed := landed_phase(repo, member.name, phase):
-        return OnMain(landed)
-    if not isinstance(member.run, staff.OpenRun):
-        return PhaseNotStarted()
-    events = read_run(plan_history.run_events_path(member.run.path))
+    events = read_run(plan_history.run_events_path(member.run.path)) if isinstance(member.run, staff.OpenRun) else []
     instance = next((event.get("phase_instance_id") for event in reversed(events)
                      if event.get("event_type") == "phase_started" and event.get("phase_id") == phase), None)
-    if instance is None:
-        return PhaseNotStarted()
-    for event in reversed(events):
-        commit = event.get("checkpoint_commit")
-        if event.get("phase_instance_id") == instance and event.get("event_type") == "checkpoint" and isinstance(commit, str) and commit:
-            if on_main(repo, commit):
-                return OnMain(commit)
-            wait = next((wait for wait in phase_waits.unit_waits(events) if wait.target == phase), phase_waits.NO_UNIT_WAIT)
-            return PhaseSent(commit, wait)
+    phase_events = [event for event in events if instance is not None and event.get("phase_instance_id") == instance]
+    resumed = False
+    for event in reversed(phase_events):
+        kind = event.get("event_type")
+        if kind == "phase_finished":
+            resumed = False
+            break
+        if kind == "checkpoint" and event.get("checkpoint_commit"):
+            break
+        if kind in ("pass_started", "activity_started"):
+            resumed = True
+    if not resumed:
+        if landed := landed_phase(repo, member.name, phase):
+            return OnMain(landed)
+        if instance is None:
+            return PhaseNotStarted()
+        for event in reversed(phase_events):
+            commit = event.get("checkpoint_commit")
+            if event.get("event_type") == "checkpoint" and isinstance(commit, str) and commit:
+                if on_main(repo, commit):
+                    return OnMain(commit)
+                wait = next((wait for wait in phase_waits.unit_waits(events) if wait.target == phase), phase_waits.NO_UNIT_WAIT)
+                return PhaseSent(commit, wait)
     eta = next((event.get("eta_at") for event in reversed(events)
                 if event.get("event_type") == "eta_stated" and event.get("eta_phase_id") == phase), None)
     return PhaseOpen(float(eta) if isinstance(eta, int | float) and not isinstance(eta, bool) else None)

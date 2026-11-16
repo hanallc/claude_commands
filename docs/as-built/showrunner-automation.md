@@ -184,10 +184,10 @@ The list uses `UNIT_QUEUE_STATE_DIR/<staff id>.json`, default `~/.local/state/un
 a `<unit>/<phase>` of an active unit is `OnMain` when `origin/main` has its `Merge <unit> phase <phase> (` merge;
 else the unit's open run gives `PhaseSent` (a checkpoint commit not on main), `PhaseOpen` (newest stated ETA), or `PhaseNotStarted`.
 Any other work is a commit or a branch (`<ref>`, then `origin/<ref>`): `OnMain`, `NotOnMain`, or `NotFound`.
-`unit_phases.queued_text` preserves the item text and appends its dependency state.
-Satisfied work says `Ready: <work> is on the local copy of main.`
-Unmet work says `After <work>: <state>.`
-Submitted work without a merge record says `submitted; absent from the merge line; reason not recorded`.
+`unit_phases.queued_text` cleans the title and supplies its dependency state.
+Satisfied work says `Ready`.
+Unmet work says `After <dep>; <short state>`.
+A checkpoint outside the merge line gives the dependency state `not in the merge line`.
 An open dependency says `started`; an unstarted dependency says `not started`.
 A missing dependency says `dependency not found locally`.
 `done` removes the first item.
@@ -768,14 +768,15 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Now names the current task and its recorded worker, director action, resource wait, or merge state.
     The open phase takes priority over merge tasks for Now.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
-    No row has an empty Work cell.
+    No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.
     Every remaining queue entry and plan phase has its own Later row and dependency state.
     Queue text uses the description after its first colon as the title and the prefix as the ID.
-    `queue_title` drops notes in parentheses and each clause after the first semicolon.
+    `queue_title` removes balanced notes, including nested notes, and clauses after the first semicolon, with or without a colon.
+    If cleanup leaves no title, the board uses the entry text with single spaces.
     `capitalized` gives a capital only to a plain lowercase first word; file names and IDs stay as written.
     A matching finished activity produces a queue conflict instead of an unstarted claim.
     Missing next work uses `Not recorded` and `The director has not chosen the next task`.
@@ -789,19 +790,31 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Unresolved attempts say `Stopped; reason not recorded` when the stop event supplies no reason.
   - **Merge and wait facts:** Each merge phase has its title in Work.
     State names the live merge rank, the production that merges it, or the short failure cause.
+    `SentCommit` retains the checkpoint's `timestamp_epoch`, or `CheckpointTimeUnrecorded` when the event has no time.
+    A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
+    Without a production name, the text ends with `not in the merge line`.
     A second phase in the same merge names the first phase by ID (`Merges with phase 40`).
     A phase's shrink and repair items have no separate rows.
     The phase's live state takes priority over older failures from those items.
     Merge grouping and bucket evidence retain the existing shared merge view.
     Resource waits preserve the resource and holder; unit waits preserve the actor, condition, and target.
+    A resource wait held by the same unit counts as working.
+    A resource wait held by another unit, or without a recorded holder, counts as waiting on other work.
     Phase ETA text retains its first-task placement and the production time zone.
     Dependencies use local `origin/main` without a fetch.
-    Phase titles come from plan and dependency run records already in the command caches.
-    Local dependencies use their IDs, with `phase` before a numeric ID.
-    A local queue dependency adds `to merge`; `phase_reference` builds the ID text.
-    External merge dependencies use `Waits for <unit> to merge: <title>`.
-    Without a title, they use `Waits for <unit> phase <id> to merge`.
-    Other dependencies omit `to merge`.
+    Queue and plan dependencies use `After <dep>; <short state>`.
+    Queue and plan dependencies share `wait_state` and `dependency_state_text`, including main checks and recorded holds.
+    Plan references to this unit lose their unit prefix before the completed-phase filter.
+    A queue dependency on main uses `Ready`; a plan dependency on main has no wait.
+    A dependency outside the merge line says `not in the merge line`.
+    A local dependency uses its ID, with `phase` before a numeric ID.
+    An external dependency uses `<unit> phase <id>` without its title.
+    A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+    A git ref that is not hexadecimal, with or without `/`, uses `After branch <name>; <short state>`.
+    A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
+    Recorded unit waits and plan `waits_for` conditions retain their text.
+    With no current task, the first blocked pending task supplies Now with its own Work and State.
+    Next and Later contain only the remaining tasks, so they do not repeat that wait.
     The board adds no reads for historical outcomes, titles, or finished queue activities.
   - **Style productions:** `Kind: style` selects `style_units.table` for all staff units.
     Other productions use it for units named in their `Style units` table.
