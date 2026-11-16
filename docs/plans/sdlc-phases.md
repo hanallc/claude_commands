@@ -431,7 +431,7 @@ User request 11-15 10:24: before and after shots side by side, with one metadata
 
 **Gotchas:** `push_release.sh` and `restore_unreleased.sh` were already safe to rerun.
 
-### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: todo
+### Phase 42 — One `/release` run releases a list of crates and runs the post-publish hook for each  · status: done
 **Depends on:** Phase 40, Phase 41
 
 #### Work Order

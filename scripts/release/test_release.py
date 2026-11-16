@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from datetime import date
 import json
+from pathlib import Path
 from typing import cast, override
 
-from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+from scripts.lib.rerun_test_support import SCRIPTS, ScriptRepositoryTestCase
 
 
 class ReleaseRerunTests(ScriptRepositoryTestCase):
@@ -62,6 +63,76 @@ else:
     def calls(self, command: str) -> list[list[str]]:
         path = self.root / f"{command}.calls"
         return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_an_absent_post_publish_hook_succeeds_without_running_a_hook(self) -> None:
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        for options in ((), ("--dry-run",)):
+            with self.subTest(options=options):
+                result = self.script("release/post_publish_hook.sh", "fixture", "1.2.3", sha, *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "post-publish hook: absent\n")
+                self.assertEqual(result.stderr, "")
+
+    def test_the_post_publish_hook_receives_the_values_and_runs_from_the_repository_root(self) -> None:
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        _ = self.write(self.repo / ".claude/config/post_publish.sh",
+                       'printf "%s\\n" "$CRATE" "$VERSION" "$SHA" "$PWD" > .git/hook-values\n'
+                       + 'echo "hook output"\necho "hook detail" >&2\n')
+        subfolder = self.repo / "nested folder"
+        subfolder.mkdir()
+        result = self.run_in_repo("bash", "-c", 'cd "$1" && exec bash "$2" "$3" "$4" "$5"',
+                                  "hook-fixture", str(subfolder), str(SCRIPTS / "release/post_publish_hook.sh"),
+                                  "fixture", "1.2.3", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.repo / ".git/hook-values").read_text().splitlines(),
+                         ["fixture", "1.2.3", sha, str(self.repo)])
+        self.assertEqual(result.stdout, "hook output\npost-publish hook: done\n")
+        self.assertEqual(result.stderr, "hook detail\n")
+
+    def test_a_failed_post_publish_hook_reports_its_exit_and_a_quoted_rerun_command(self) -> None:
+        self.repo: Path = self.repo.rename(self.root / "repo with spaces")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        crate = "fixture odd;$value"
+        _ = self.write(self.repo / ".claude/config/post_publish.sh",
+                       'printf "%s\\n" "$CRATE" "$VERSION" "$SHA" "$PWD" >> .git/hook-values\nexit 23\n')
+        result = self.script("release/post_publish_hook.sh", crate, "1.2.3", sha)
+        self.assertEqual(result.returncode, 1)
+        lines = result.stderr.splitlines()
+        self.assertEqual(lines[0], "post-publish hook: failed (exit 23)")
+        self.assertTrue(lines[1].startswith("rerun: cd "))
+        rerun = self.run_in_repo("bash", "-c", lines[1].removeprefix("rerun: "))
+        self.assertEqual(rerun.returncode, 23, rerun.stderr)
+        self.assertEqual((self.repo / ".git/hook-values").read_text().splitlines(),
+                         [crate, "1.2.3", sha, str(self.repo)] * 2)
+
+    def test_post_publish_dry_run_reports_the_values_without_running_the_hook(self) -> None:
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        _ = self.write(self.repo / ".claude/config/post_publish.sh", "touch hook-ran\n")
+        result = self.script("release/post_publish_hook.sh", "fixture", "1.2.3", sha, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout,
+                         f"[DRY-RUN] Would run post-publish hook: CRATE=fixture VERSION=1.2.3 SHA={sha}\n")
+        self.assertFalse((self.repo / "hook-ran").exists())
+
+    def test_post_publish_refuses_invalid_arguments_before_running_the_hook(self) -> None:
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        blob = self.git("hash-object", "seed.txt").stdout.strip()
+        _ = self.write(self.repo / ".claude/config/post_publish.sh", "touch hook-ran\n")
+        for arguments, message in (
+            (("fixture", "1.2.3"), "Usage:"),
+            (("fixture", "1.2.3", sha, "--unknown"), "Usage:"),
+            (("fixture", "1.2.3", sha, "--dry-run", "extra"), "Usage:"),
+            (("fixture", "1.2.3", ""), "Usage:"),
+            (("fixture", "v1.2.3", sha), "ERROR: version must have no leading v"),
+            (("fixture", "1.2.3", sha[:12]), "ERROR: sha must name a full 40-character commit id"),
+            (("fixture", "1.2.3", "0" * 40), "ERROR: sha must name a full 40-character commit id"),
+            (("fixture", "1.2.3", blob), "ERROR: sha must name a full 40-character commit id"),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.script("release/post_publish_hook.sh", *arguments)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+                self.assertFalse((self.repo / "hook-ran").exists())
 
     def test_a_new_release_branch_starts_at_head(self) -> None:
         head = self.git("rev-parse", "HEAD").stdout
