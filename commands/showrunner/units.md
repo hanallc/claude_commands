@@ -37,7 +37,6 @@ Its rows use the same cached plan and run records as the Progress bar.
 3. `Next` names the first queue item, or the first unfinished plan phase.
 4. `Later` names every remaining queue item and unfinished plan phase with its own state.
 5. `Stopped` names each unresolved stopped task and its recorded reason.
-6. `Done` explains a stopped task that a later attempt finished while the bar still includes that attempt.
 
 A busy session does not prove a task.
 With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
@@ -65,6 +64,7 @@ Only a readable plan with every phase done permits `Nothing queued; the plan is 
 Absent, unreadable, and readable empty plans remain separate facts.
 
 Merge rows name each phase title and its live rank, active merge, or short failure cause.
+An open sent phase with a successful final merge state has no merge row and contributes no pending merge.
 A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
 Without a production name, the text ends with `not in the merge line`.
 A finished phase counts as merged when its checkpoint reaches main, its unit and phase have a successful result, or main records its merge.
@@ -84,6 +84,7 @@ A second phase in the same merge uses `Merges with <id>`, or `Merges with phase 
 The board omits a phase's shrink and repair merge items.
 The phase's live state takes priority over older failures from those items.
 Queue and plan dependencies use `After <dep>; <short state>`.
+Queued dependencies show their line position and carrier, when present, without text from earlier failed attempts.
 A queue dependency on main uses `Ready`; a plan dependency on main or a completed local phase has no wait.
 Dependencies outside the merge line say `not in the merge line`.
 A local dependency uses its ID, with `phase` before a numeric ID.
@@ -95,8 +96,8 @@ A recorded phase ID keeps its phase form, even when it contains only hexadecimal
 Recorded unit waits and plan `waits_for` conditions retain their text.
 With no current task, the first blocked pending task supplies Now with its own Work and State.
 Next and Later contain only the remaining tasks, so they do not repeat that wait.
-Stopped attempts resolve only through a later completed attempt with the same plan scope and phase ID.
-An explicit completion title can name the unit that finished the work.
+A stopped attempt shows a Stopped row until a later completed attempt has the same plan scope and phase ID.
+Then the board shows no row for that stopped attempt.
 The board does not infer replacements from equal titles.
 
 Recorded unit waits retain their actor, condition, and target.
