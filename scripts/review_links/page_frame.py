@@ -3,24 +3,144 @@
 from __future__ import annotations
 
 import html
+import json
 import re
+import time
+from pathlib import Path
 
-REFRESH_SCRIPT = r'''function createPageRefresh(load,seconds=()=>0){
- const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
- let timer;
- function refresh(supersede=false){if(!paused()) return load(supersede);}
- function restart(){
-  clearInterval(timer);
-  if(!paused() && Number(seconds())>0) timer=setInterval(()=>refresh(),Number(seconds())*1000);
+from scripts.lib import conf
+from scripts.lib.user_zone import user_zone
+
+ICONS = Path(__file__).with_name("lucide")
+
+
+def icon_svg(name: str) -> str:
+    """Read a vendored Lucide icon without a path outside the icon folder."""
+    if not re.fullmatch(r"[a-z][a-z-]*", name):
+        raise ValueError(f"unsupported console icon: {name}")
+    source = (ICONS / f"{name}.svg").read_text(encoding="utf-8")
+    return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
+
+
+def title(text: str, page: str) -> str:
+    """Build the title and its shared refresh status."""
+    settings = conf.read_or_repository("console")
+    options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
+               "renderLimit": settings.number("status.render_limit_seconds"),
+               "readingDelay": settings.number("status.reading_delay_seconds"),
+               "ageLimit": settings.number(f"status.{page}.age_limit_seconds"), "zone": str(user_zone())}
+    icons = ''.join(f'<span data-status-icon="{state}"' + ('' if state == 'Reading' else ' hidden')
+                    + '>' + icon_svg(icon) + '</span>' for state, icon in (
+                        ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
+                        ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
+    return (f'<h1 class="page-title">{html.escape(text)}</h1>'
+            + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
+            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
+            + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
+            + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
+            + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
+            + '<span class="page-status-announcement" aria-live="polite" data-status-announcement></span></p>')
+
+
+def rendered(content: bytes, started: float, read_at: float) -> bytes:
+    """Attach the measured server build time and the data read time."""
+    facts = f'data-page-facts data-read-at="{read_at:.6f}" data-render-seconds="{time.perf_counter() - started:.6f}"'
+    return content.replace(b'data-page-facts', facts.encode(), 1)
+
+
+def template(source: str, text: str, page: str) -> str:
+    """Fill the shared title, style and script in a static page template."""
+    return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
+            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT))
+
+
+REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
+ const line=page.querySelector('[data-page-status]');
+ if(!line || !line.dataset.readAt) throw new Error('The page has no data time.');
+ return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
+  renderMedian:line.dataset.renderMedian,renderCount:line.dataset.renderCount,failure:line.dataset.readError};
+}
+function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
+ const line=document.querySelector('[data-page-status]');
+ const options=line ? JSON.parse(line.dataset.statusOptions) : {};
+ const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
+ const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ let last=null,failure='',reading=false;
+ let request=0,active=false,started=0,pending=null,timer,clock,delay;
+ let trip=null,state='',nextAt=0;
+ const duration=value=>Number(value)<10 ? Number(value).toFixed(2) : Number(value).toFixed(0);
+ const held=()=>hidden() ? 'This page is hidden.' : hold();
+ function draw(){
+  if(!line) return;
+  const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && age>options.ageLimit ? 'Late' : reading || !last ? 'Reading' : 'Live';
+  line.dataset.state=next;
+  line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
+  line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
+  if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
+  const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
+  const time=last ? new Intl.DateTimeFormat('en-US',{timeZone:options.zone,hour:'2-digit',minute:'2-digit',second:'2-digit',
+   hour12:false,timeZoneName:'short'}).format(new Date(last.readAt*1000)) : '';
+  part('age',last ? age<60 ? age+' s ago' : time+', '+Math.floor(age/60)+' min ago' : '');
+  const why=next==='Paused' ? reason : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  part('reason',why);
+  const timings=last && !why;
+  const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
+  round.classList.toggle('page-status-slow',trip>options.roundTripLimit);
+  const render=part('render',timings ? 'render '+duration(last.renderSeconds)+' s' : '');
+  render.classList.toggle('page-status-slow',last?.renderSeconds>options.renderLimit);
+  render.title=last?.renderMedian ? 'Median '+duration(last.renderMedian)+' s of the last '+last.renderCount+' renders.' : '';
  }
- document.addEventListener('visibilitychange',()=>{restart();refresh(true);});
+ function failed(error,own){if(own===request){failure=error.message || 'The read failed.';reading=false;draw();}}
+ async function present(value,began,own,initial=false){
+  try{
+  if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
+  if(initial){last=value;failure=value.failure || '';draw();}
+  await frame();if(own!==request) return;
+  if(held()){pending={value,began,own};draw();return;}
+  last=value;trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
+  }catch(error){failed(error,own);}
+ }
+ async function refresh(supersede=false){
+  if(hidden()){draw();return;}
+  if(active && !supersede) return;
+  const own=++request,began=performance.now();active=true;started=began;
+  clearTimeout(delay);if(!last) reading=true;
+  delay=setTimeout(()=>{if(own===request){reading=true;draw();}},options.readingDelay*1000);
+  draw();
+  try{
+   const value=await load(supersede,()=>own===request);
+   if(own===request && value) await present(value,began,own);
+  }catch(error){failed(error,own);}
+  finally{if(own===request){active=false;clearTimeout(delay);reading=false;draw();}}
+ }
+ function abandon(){
+  request++;active=false;clearTimeout(delay);reading=false;pending=null;draw();
+ }
+ function changed(){
+  if(pending && !held()){const value=pending;pending=null;void present(value.value,value.began,value.own);}
+  draw();
+ }
+ function restart(){
+  clearInterval(timer);clearInterval(clock);
+  const period=Number(seconds());nextAt=performance.now()+period*1000;
+  clock=setInterval(changed,1000);
+  if(!hidden() && period>0) timer=setInterval(()=>{
+   if(performance.now()>=nextAt){nextAt=performance.now()+period*1000;void refresh();}
+  },period*1000);
+  draw();
+ }
+ document.addEventListener('visibilitychange',()=>{restart();void refresh(true);});
  window.addEventListener('message',event=>{
   if(event.source===parent && event.origin===location.origin && event.data==='console-shown'){
-   restart();refresh(true);
+   restart();void refresh(true);
   }
  });
  restart();
- return {restart,refresh};
+ const first=initial || (line?.dataset.readAt ? pageRefreshFacts() : null);
+ if(first){const navigation=performance.getEntriesByType('navigation')[0];
+  void present(first,navigation?.requestStart || started,request,true);}
+ return {restart,refresh,changed,abandon};
 }
 '''
 
@@ -40,8 +160,26 @@ def code_block_html(block: re.Match[str]) -> str:
 # sets only its own max-width. A page that measures its layout puts
 # layout-measuring on the root element, so it measures with the desktop gutter.
 STYLE = ('main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
-         '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 16px}'
-         '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}')
+         + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px}'
+         + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
+         + r'''
+.page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
+color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
+.page-status>[hidden],.page-status [hidden]{display:none!important}
+.page-status>span:not(.page-status-announcement){white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+.page-status>span:not(:first-child):not(.page-status-announcement)::before{content:'·';margin:0 10px;color:var(--ink-3)}
+.page-status svg{display:block;width:16px;height:16px;flex:none}
+.page-status-state{font-weight:600;color:var(--room)}
+.page-status[data-state=Reading] .page-status-state{color:var(--accent)}
+.page-status[data-state=Late] .page-status-state,.page-status-slow{color:var(--warning)}
+.page-status[data-state=Failed] .page-status-state{color:var(--error)}
+.page-status[data-state=Paused] .page-status-state{color:var(--ink-3)}
+.page-status[data-state=Late],.page-status[data-state=Failed]{position:sticky;top:0;z-index:20;padding:4px 0}
+.page-status-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+[data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
+@keyframes page-status-turn{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){[data-status-icon=Reading] svg{animation:none}}
+''')
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
 <svg data-copy-icon width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"

@@ -1,6 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.review_links.test_page_frame import assert_status_states
 from scripts.build_queue import admission_records
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -398,8 +399,7 @@ class MemoryFeedTests(unittest.TestCase):
     def expected_page(self, seconds: float = 0.125) -> str:
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
-        return (page.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
+        return page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -440,7 +440,7 @@ class MemoryFeedTests(unittest.TestCase):
         html = self.expected_page()
         functions = html[html.index("function field("):html.index("const tip =")]
         render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
-        escape = html[html.index("function esc("):html.index("let lastRead =")]
+        escape = html[html.index("function esc("):html.index("const consoleHidden =")]
         javascript = functions + render + escape + """
 const elements = new Map();
 const $ = id => {
@@ -996,6 +996,9 @@ process.stdout.write(JSON.stringify({
         for seconds, stale in ((0.125, 15), (60.0, 300)):
             with self.subTest(seconds=seconds):
                 self.configure(seconds=seconds)
+                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
+                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
+                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
                 _ = (self.output / "memory_live.html").write_text("previous page")
                 with mock.patch.object(admission_client, "view", return_value=captured_reading()):
                     self.assertEqual(memory_feed.main(["--once"]), 0)
@@ -1003,11 +1006,27 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page, self.expected_page(seconds))
                 constants = page[page.index("const SECONDS ="):page.index("const $ =")]
                 result = subprocess.run(
-                    [executable, "-e", constants + "\nprocess.stdout.write(String(STALE));"],
+                    [executable, "-e", constants + "\nprocess.stdout.write(String(SECONDS));"],
                     text=True, capture_output=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(float(result.stdout), stale)
+                self.assertEqual(float(result.stdout), seconds)
+                self.assertIn(f'&quot;ageLimit&quot;: {float(stale)}', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_page_status_uses_the_real_builds_loader_with_configured_timing(self) -> None:
+        self.output.mkdir()
+        for seconds, stale in ((0.125, 15), (60.0, 300)):
+            with self.subTest(seconds=seconds):
+                self.configure(seconds=seconds)
+                console_settings = Path(__file__).resolve().parents[2] / "config/console.conf"
+                _ = (self.root / "console.conf").write_text(console_settings.read_text().replace(
+                    "status.builds.age_limit_seconds=15", f"status.builds.age_limit_seconds={stale}"))
+                _ = (self.output / "memory_live.html").write_text("previous page")
+                with mock.patch.object(admission_client, "view", return_value=captured_reading()):
+                    _ = memory_feed.main(["--once"])
+                page = (self.output / "memory_live.html").read_text()
+                assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
         _ = write_config_fixture(self.root / "build_folders.conf")
@@ -1474,6 +1493,7 @@ process.stdout.write(JSON.stringify({
                 _ = shutil.copytree(source, installed / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
                 (installed / "config").mkdir()
                 _ = shutil.copyfile(conf.path("memory_feed"), installed / "config/memory_feed.conf")
+                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", installed / "config/console.conf")
                 probe = textwrap.dedent("""
                     import builtins
                     import json

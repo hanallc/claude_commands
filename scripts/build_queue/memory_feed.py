@@ -240,8 +240,8 @@ def page_link() -> int:
 def publish_page(configuration: FeedConfiguration) -> None:
     """Publish the repository page with the configured refresh interval."""
     source = console_theme.with_theme(PAGE_SOURCE.read_text(encoding="utf-8"))
-    page = (source.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
-            .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
+    page = page_frame.template(source, "Builds", "builds").replace(
+        "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 
@@ -758,6 +758,7 @@ class MemoryPage(TypedDict):
     colors: PageColors
     ok: bool
     read_at: float
+    render_seconds: float
     total: float
     available: float
     cap: float | admission_records.CapUnavailable
@@ -1916,6 +1917,7 @@ def memory_status(explanation: admission_records.QueueExplanation, room: admissi
 
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET) -> MemoryPage:
+    started = time.perf_counter()
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
@@ -2213,9 +2215,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         pressure_label = admission_records.pressure_text(pressure)
     elif isinstance(pressure, admission_records.PressureUnavailable):
         pressure_label = "unavailable: " + pressure.reason
-    return {
+    page: MemoryPage = {
         "colors": configuration.colors,
-        "ok": True, "read_at": explanation.now, "total": total, "available": gib(captured.available),
+        "ok": True, "read_at": explanation.now, "render_seconds": 0.0, "total": total, "available": gib(captured.available),
         "cap": cap, "floor": safety, "cap_text": room_text(captured),
         "shortfall": gib(captured.shortfall), "used": used, "reserved": reserved,
         "taken": gib(ram["cap_bytes"] - captured.room), "room": gib(captured.room), "room_source": "free",
@@ -2244,6 +2246,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "report_version": report_version,
         "swap_rows": configuration.swap_rows, "leftovers": leftovers,
     }
+    page["render_seconds"] = time.perf_counter() - started
+    return page
 
 
 def page_json(payload: MemoryPage | RetainedReading | PageUnavailable) -> str:

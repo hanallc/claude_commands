@@ -79,6 +79,7 @@ class SpendData(TypedDict):
 
 class PageData(TypedDict):
     read_at: int
+    render_seconds: float
     spend: SpendData
     # Every region a table shows, for the region filter.
     regions: list[str]
@@ -138,6 +139,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int) -> Page
     regions = dict.fromkeys((*(read.region for read in tables.regions), *tables.hours.headers[1:]))
     return {
         'read_at': now,
+        'render_seconds': 0.0,
         'spend': spend,
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
@@ -161,6 +163,7 @@ def output_folder() -> Path:
 
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
+    started = time.perf_counter()
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
     today = datetime.fromtimestamp(now, UTC).date().isoformat()
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
@@ -168,7 +171,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now)
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
-    page = (source.replace('__PAGE_FRAME_STYLE__', page_frame.STYLE)
+    data['render_seconds'] = time.perf_counter() - started
+    page = (page_frame.template(source, 'AWS', 'aws')
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))
     page_path = folder / PAGE_NAME
     folder.mkdir(parents=True, exist_ok=True)

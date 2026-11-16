@@ -15,7 +15,7 @@ from typing import NamedTuple, TypedDict, cast
 from scripts.build_queue import memory_files
 from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import page_frame, review_link
+from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = "disks.html"
 DATA_FILE = "disks.json"
@@ -91,8 +91,9 @@ def shared_step_tip(source: str) -> StepTip:
 def publish(folder: Path, settings: PageSettings) -> Path:
     source = Path(__file__).with_name(PAGE_NAME).read_text(encoding="utf-8")
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding="utf-8"))
+    source = source.replace("__PAGE_FRAME_STYLE__", console_theme.TOKENS + "__PAGE_FRAME_STYLE__")
     # A '</' in a name must not end the script element.
-    page = (source.replace("__PAGE_FRAME_STYLE__", page_frame.STYLE)
+    page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
     folder.mkdir(parents=True, exist_ok=True)
