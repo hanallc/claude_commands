@@ -2001,6 +2001,20 @@ Cause: each hana runner's `cargo` is a store front, `ci_cargo_front.py --front <
 
 - `parse.cargo_front_call` splits the front's options from cargo's words. `ci_cargo_front.main` and `memory_feed.cargo_job` both use it, so a CI row says its job ("CI build", "CI tests").
 - Under a CI step the Builds page shows the label's first part ("hana CI"). The tooltip title keeps the whole label with the runner and the job.
+
+#### overcap — The Builds bar draws build reserved over the queue cap · status: done
+
+From the user (via builds, 2026-11-16), on two Builds shots: "how am i to interpret this overage of 34.6 of 29.9 taken - i see the que cap of 29.9 - but where does it show that it has been overtaken in the memory bar above? I don't think it does". Then: "the rserved is actually a number that we're NOT taking we're just reporting it - we're eating back into the reserve but we're pretty safe because there is still so much of it". The user approved mockup 0f8ecf5d1a1c: "Go: report builds it as in the mockup".
+
+Cause: build reserved is room that running steps may still grow into, not RAM in use. Free RAM covers the safety net and swap coming back first. The bar drew only the covered part of the reserve and stopped at the cap line. Taken counts the full reserve, so it read 34.6 of 29.9 with no box for the 4.7. "builds 12.7" was 3.4 build tools + 9.1 queued builds + 0.2 hana CI, a part too narrow to see.
+
+As built:
+
+- `memory_live.html`: when build reserved is over the cap, a red dashed box (`b-overlay`) lies past the cap line over the safety net and swap, and a dashed "over cap" brace (`b-over`) sits beside "queue cap". The build reserved brace reads "<full> · <covered> covered".
+- The `over` tooltip shows Build reserved (full) − Free RAM after safety net and swap = Over cap. Then it shows what the reserve takes first if steps grow: the safety net, swap coming back, then cache and other programs.
+- `statusLine`: when only the build reserve is not covered, the line says it is over the cap and that a reserve is not RAM in use. An uncovered safety net or swap keeps "reserves exceed free RAM".
+- The hana CI part is at least 3 px wide. Bar parts can shrink, so the bar still ends at its right edge.
+- Tests: `test_memory_hover` (brace list, status line row), the Builds proof (box at the cap line, brace and box widths, labels, tooltip sums, no box when nothing is over the cap; the shot `over-cap-dark-desktop.png`).
 - Tests: `test_memory_admit` (a step's use and kept bytes count its compilers; the sccache reading groups compilers by scope and leaves out the server), `test_invoke_scope` (the step sees `BUILDLOG_STEP_SCOPE`), `test_memory_feed`, `test_memory_hover`, and the Builds proof.
 
 ### Tokens — The Builds page shows the jobserver tokens · status: done

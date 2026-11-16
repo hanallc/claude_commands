@@ -820,9 +820,9 @@ function fitLabels() {}
         self.assertNotIn("How free is worked out", page)
         # The user, 11-15: braces name builds, free RAM and everything else; free RAM has three parts.
         self.assertEqual([part.split('"')[0] for part in bar.split('class="brace ')[1:]],
-                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap"])
+                         ["l1", "l1 free", "l1", "l2 reserved", "l2 free", "l2", "cap", "cap over"])
         self.assertEqual([part.split('"')[0] for part in bar.split('id="b-')[1:]],
-                         ["builds", "free", "else", "reserved", "room", "system", "cap"])
+                         ["builds", "free", "else", "reserved", "room", "system", "overlay", "cap", "over"])
         # The user, 11-15: the queue cap starts at 0 and ends at the end of free.
         self.assertIn('<div class="brace cap" id="b-cap" data-tip="cap">', bar)
         for removed in ("updateNativeOwnerTips", "pageOwnerTipFields", "nativeTipText", 'id="mark"', 'id="marklabel"'):
@@ -882,6 +882,10 @@ function fitLabels() {}
             ("pressure", RAM_FIXTURE, "Memory pressure prevents a new start; free is 18.0 GiB."),
             ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB},
              "Nothing is free: reserves exceed free RAM by 3.0 GiB."),
+            # The user, 11-16: a build reserve over the cap is a promise, not RAM in use.
+            ("shortfall", {**RAM_FIXTURE, "room_bytes": 0, "shortfall_bytes": 3 * GIB, "build_missing_bytes": 3 * GIB,
+                           "safety_missing_bytes": 0, "swap_missing_bytes": 0},
+             "Nothing is free: build reserved is 3.0 GiB over the cap. A reserve is room a step may still grow into, not RAM in use."),
             ("no_room", {**RAM_FIXTURE, "room_bytes": 0},
              "Nothing is free: the safety net, swap coming back and build reserved use all free RAM."),
             ("one_running_memory_wait", RAM_FIXTURE, "One build runs; another needs 12.0 GiB, but free is 9.0 GiB."),

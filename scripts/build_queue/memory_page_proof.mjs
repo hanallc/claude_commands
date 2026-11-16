@@ -998,13 +998,13 @@ try {
             proof.overCap=overCap;
             // Build reserves that do not fit under the cap: the Running header names the amount over the cap.
             const shortReading=structuredClone(base);
-            // The running build reserves all of free and 1 GiB more, so its reserve fills the cap.
+            // The running build reserves all of free and 4 GiB more, so its reserve fills the cap.
             const shortRun=shortReading.walk.find(row=>row.kind!=='cloud'&&!row.ci&&typeof row.reserved==='number');
-            shortRun.reserved+=shortReading.room+1;
-            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+1;
+            shortRun.reserved+=shortReading.room+4;
+            if(typeof shortReading.reserved==='number') shortReading.reserved+=shortReading.room+4;
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
-            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+gib,build_missing_bytes:gib,shortfall_bytes:gib});
-            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:1});
+            Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
+            Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
             await show(shortReading);
             if(theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
@@ -1015,16 +1015,35 @@ try {
               const shortShot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:shortClip});
               await writeFile(join(folder,'over-cap-dark-desktop.png'),Buffer.from(shortShot.data,'base64'));
             }
+            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            const overBar=await evaluate(`(() => {
+              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
+              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
+              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
+                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+            })()`);
+            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
+            // A small hana CI part stays visible, so the builds parts add up on screen.
+            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
+            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
+            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
+            assert.equal(overBar.brace,'over cap 4.0');
+            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
+            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
+            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
+            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
+              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
+            proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
-            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            // Taken counts the full reserve, so it reads 4 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+1).toFixed(1)+' GiB');
+            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
             assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
-            assert.equal(fields['Over cap'],'1.0 GiB');
+            assert.equal(fields['Over cap'],'4.0 GiB');
             assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
@@ -1036,6 +1055,7 @@ try {
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
+            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);

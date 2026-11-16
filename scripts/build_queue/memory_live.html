@@ -93,6 +93,10 @@ __PAGE_FRAME_STYLE__
 .brace.l2 { top: 26px; height: 24px; }
 .brace.cap { top: auto; bottom: 0; height: 24px; border: 2px solid var(--cap); border-top: none; border-radius: 0 0 6px 6px; color: var(--cap); line-height: 18px; }
 .brace.free { border-color: var(--room); color: var(--room); }
+.brace.cap.over { border-style: dashed; }
+.bar-over { position: absolute; top: 49px; height: 50px; border: 2px dashed var(--cap); border-radius: 4px; cursor: help;
+  background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--cap) 38%, transparent) 0 3px, transparent 3px 7px); }
+.bar > .seg-ci { min-width: 3px; }
 .brace.reserved { border-color: var(--res-a); color: var(--res-a); }
 .brace b { font-weight: 700; font-variant-numeric: tabular-nums; }
 .brace .brace-label { display: inline-block; }
@@ -349,7 +353,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
 @media (max-width: 560px) {
   .answer .big { font-size: 2.2rem; }
 }
-.brace[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
+.brace[hidden], .bar-over[hidden], .cap-value[hidden], .bar-wrap[hidden], .scale[hidden], .bar > div[hidden] { display: none; }
 .reserved-amount { color: var(--ink-2); }
 .room-value { margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pressure-reason { color: var(--ink-2); overflow-wrap: anywhere; }
@@ -389,7 +393,7 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
       <div class="brace l1" id="b-builds" data-tip="g-builds"><span class="brace-label"><span class="bn">builds </span><b id="bv-builds"></b></span></div>
       <div class="brace l1 free" id="b-free" data-tip="g-free"><span class="brace-label"><span class="bn">free RAM </span><b id="bv-free"></b></span></div>
       <div class="brace l1" id="b-else" data-tip="g-else"><span class="brace-label"><span class="bn">everything else </span><b id="bv-else"></b></span></div>
-      <div class="brace l2 reserved" id="b-reserved" data-tip="reserved"><span class="brace-label"><span class="bn">build reserved </span><b id="bv-reserved"></b></span></div>
+      <div class="brace l2 reserved" id="b-reserved" data-tip="reserved"><span class="brace-label"><span class="bn">build reserved </span><b id="bv-reserved"></b><span class="bn" id="bc-reserved"></span></span></div>
       <div class="brace l2 free" id="b-room" data-tip="room"><span class="brace-label"><span class="bn">free </span><b id="bv-room"></b></span></div>
       <div class="brace l2" id="b-system" data-tip="system"><span class="brace-label"><span class="bn">system reserved </span><b id="bv-system"></b></span></div>
       <div class="bar">
@@ -407,7 +411,9 @@ body.queue-unavailable .status, body.queue-unavailable .card { display: none; }
         <div class="seg-cache" id="s-cache" data-tip="cache"><span class="lbl" id="l-cache"></span></div>
         <div class="seg-unattributed" id="s-unattributed" data-tip="unattributed"><span class="lbl" id="l-unattributed"></span></div>
       </div>
+      <div class="bar-over" id="b-overlay" data-tip="over" hidden></div>
       <div class="brace cap" id="b-cap" data-tip="cap"><span class="brace-label"><span class="bn">queue cap </span><b id="bv-cap"></b></span></div>
+      <div class="brace cap over" id="b-over" data-tip="over"><span class="brace-label"><span class="bn">over cap </span><b id="bv-over"></b></span></div>
     </div>
     <div class="scale num" id="scale"><div class="ticks" id="ticks-top" data-tip="budget"></div></div>
 
@@ -608,6 +614,16 @@ const TIPS = {
   cache: d => legendTip('File and kernel cache', d.ram.cache_bytes, 'Estimated cache outside free RAM'),
   unattributed: d => legendTip('Not attributed', d.ram.unattributed_bytes, 'RAM that the readings do not explain', memoryRows([
     ['Kernel, no counter', d.ram.kernel_no_counter_bytes], ['+ No program name', d.ram.unnamed_bytes]])),
+  over: d => {
+    const over = overCapBytes(d), covered = queueCapMemory(d).reserved;
+    const safety = Math.min(over, d.ram.safety_covered_bytes), swap = Math.min(over - safety, d.ram.swap_covered_bytes);
+    return legendTip('Over cap', over,
+      'Reserve held for growth, not RAM in use', [
+        ...memoryRows([['Build reserved (full)', covered + over], ['− Free RAM after safety net and swap', covered]]),
+        field('= Over cap', ramAmount(over), 'sum'),
+        ...groupRows(memoryRows([['If steps grow, from safety net', safety], ['+ Swap coming back', swap],
+          ['+ Cache and other programs', over - safety - swap]].filter(([, bytes]) => bytes > 0)))]);
+  },
   cap: d => legendTip('Queue cap', hasCap(d) ? d.cap * GIB : null, 'What builds may use', memoryRows([
     ['Builds', queueCapMemory(d).builds], ['+ Build reserved', queueCapMemory(d).reserved], ['+ Free', queueCapMemory(d).free]])),
   budget: d => legendTip('RAM', d.ram.total_bytes, 'Memory across this machine', memoryRows([
@@ -680,7 +696,9 @@ function statusLine(d) {
     gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot." + (status.next_need_bytes > status.check_room_bytes
       ? ` It also needs ${ramAmount(status.next_need_bytes)}, and free is ${ramAmount(status.check_room_bytes)}.` : ""),
     pressure: `Memory pressure prevents a new start; free is ${room}.`,
-    shortfall: `Nothing is free: reserves exceed free RAM by ${ramAmount(d.ram.shortfall_bytes)}.`,
+    shortfall: d.ram.build_missing_bytes > 0 && !(d.ram.safety_missing_bytes > 0) && !(d.ram.swap_missing_bytes > 0)
+      ? `Nothing is free: build reserved is ${ramAmount(d.ram.build_missing_bytes)} over the cap. A reserve is room a step may still grow into, not RAM in use.`
+      : `Nothing is free: reserves exceed free RAM by ${ramAmount(d.ram.shortfall_bytes)}.`,
     no_room: "Nothing is free: the safety net, swap coming back and build reserved use all free RAM.",
     one_running_memory_wait: `One build runs; another needs ${ramAmount(status.next_need_bytes)}, but free is ${ramAmount(status.check_room_bytes)}.`,
   })[status.code] || "";
@@ -999,7 +1017,7 @@ const SECONDS = __MEMORY_FEED_INTERVAL_SECONDS__;
 const STALE = Math.max(15, SECONDS * 5);
 const $ = (id) => document.getElementById(id);
 function setSeg(id, value, total) {
-  $(id).style.flex = `0 0 ${value / total * 100}%`;
+  $(id).style.flex = `0 1 ${value / total * 100}%`;
 }
 
 function showQueueError(message) {
@@ -1102,15 +1120,22 @@ function render(d) {
   const capBytes = hasCap(d) ? d.cap * GIB : 0;
   for (const [id, from, size] of [["builds", 0, builds], ["free", builds, freeShown], ["else", builds + freeShown, groupBytes(r, "else")],
     ["reserved", builds, r.build_covered_bytes], ["room", builds + r.build_covered_bytes, r.room_bytes],
-    ["system", builds + r.build_covered_bytes + r.room_bytes, system], ["cap", 0, capBytes]]) {
+    ["system", builds + r.build_covered_bytes + r.room_bytes, system], ["cap", 0, capBytes], ["over", capBytes, overCapBytes(d)]]) {
     const brace = $(`b-${id}`);
     brace.hidden = !total || size <= 0;
     brace.style.left = `${pctOf(from, total)}%`;
     brace.style.width = `${pctOf(size, total)}%`;
     const amount = ({builds:capMemory.builds,free:amounts.available_bytes,else:legendBytes(amounts,"else"),
-      reserved:capMemory.reserved,room:capMemory.free,system:amounts.safety_covered_bytes+amounts.swap_covered_bytes,cap:shown.cap*GIB})[id];
+      reserved:capMemory.reserved+overCapBytes(shown),room:capMemory.free,system:amounts.safety_covered_bytes+amounts.swap_covered_bytes,
+      cap:shown.cap*GIB,over:overCapBytes(shown)})[id];
     $(`bv-${id}`).textContent = f1(amount / GIB);
   }
+  // The reserve that free RAM does not cover lies over the safety net and swap, which it takes first if steps grow.
+  const overlay = $("b-overlay");
+  overlay.hidden = $("b-over").hidden;
+  overlay.style.left = `${pctOf(capBytes, total)}%`;
+  overlay.style.width = `${pctOf(overCapBytes(d), total)}%`;
+  $("bc-reserved").textContent = overCapBytes(shown) > 0 ? ` · ${f1(capMemory.reserved / GIB)} covered` : "";
 
   const [roomValue, roomUnit] = ramAmount(capMemory.free).split(" ");
   $("room").textContent = roomValue;
