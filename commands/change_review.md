@@ -276,6 +276,14 @@ These rows hide all showrunner actions, including Send feedback.
 The server refuses question and feedback requests without saving.
 Its count covers all page lists, including independent production roots.
 Menu options with waiting changes precede empty options in alphabetical order.
+Each showrunner view follows `/next change` for that production, with its pin and moved rows.
+All lists each root's `/next change --all-below` order in turn, with each root's pin and moved rows.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The first card and Skip for now follow the selected view's order.
 Keyboard focus keeps its visible outline.
 Answers save in the background.
 Works and Does not work open the next waiting change at once, before the server answers.

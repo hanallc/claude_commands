@@ -15,7 +15,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
@@ -100,10 +100,14 @@ class BrowserForms(HTMLParser):
         self.pending: dict[str, bool] = {}
         self.outcomes: dict[str, list[str]] = {}
         self.current: str = ""
+        self.orders: dict[str, list[str]] = {}
+        self.reading_orders: bool = False
 
     @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "script" and "data-change-orders" in values:
+            self.reading_orders = True
         if tag == "div" and values.get("data-kind"):
             self.kind = values["data-kind"] or ""
         if tag == "section" and values.get("data-key"):
@@ -124,8 +128,15 @@ class BrowserForms(HTMLParser):
 
     @override
     def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self.reading_orders = False
         if tag == "section":
             self.current = ""
+
+    @override
+    def handle_data(self, data: str) -> None:
+        if self.reading_orders:
+            self.orders = cast(dict[str, list[str]], json.loads(data))
 
 
 SEND_MESSAGE = change_page.send_message
@@ -2296,11 +2307,76 @@ class ChangePageTests(unittest.TestCase):
         queue = next_item.change_queue(self.production)
         urgency.pin(queue.name, "C3")
         path, forms, body = self.browser()
-        self.assertEqual(list(forms.rows), ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
+        self.assertEqual(forms.orders["page-owner"], ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
         before = set(self.root.iterdir())
         self.assertEqual(self.request(path, {}).status, 200)
         self.assertEqual(set(self.root.iterdir()), before)
         self.assertIn('data-next hidden>Skip for now', body)
+
+    def test_change_views_use_next_queues_across_children_and_independent_roots(self) -> None:
+        root = staff.snapshot().by_path("page-owner")
+        assert root is not None
+        root = staff.rename(root.id, "natedev")
+        docs: dict[str, Path] = {root.name: self.production}
+        for name, level, day in (("alpha", urgency.BLOCKS, 3), ("zeta", urgency.LATER, 2)):
+            doc = self.temporary / f"{name}.md"
+            _ = doc.write_text(f"# {name}\n- **Change review:** `{self.review_list}`\n")
+            owner = fixture_member("showrunner", name=name, parent=root.id, doc=staff.LiveDoc(local_machine(), doc))
+            docs[name] = doc
+            _ = change_review.append_rows(self.review_list, [change_review.Visible(name, "Read", "Proof")],
+                date(2026, 11, day), "", doc, urgency.cell(urgency.Urgency(level)),
+                producers=[owner.id], record=staff.snapshot())
+        _ = next_item.move_to_end(next_item.CHANGE, docs["alpha"], key="C4")
+        tab_queue = next_item.change_queue(self.production)
+        urgency.pin(tab_queue.name, "C3")
+        all_queue = next_item.change_queue(self.production, below=True)
+        urgency.pin(all_queue.name, "C2")
+        urgency.move_to_end(all_queue.name, "C5", datetime(2026, 11, 5))
+        _ = change_review.append_rows(self.review_list, [change_review.Visible("Unrouted", "Read", "Proof")],
+            date(2026, 10, 1), "", self.production, urgency.cell(urgency.Urgency(urgency.BLOCKS)),
+            producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
+
+        def expected(doc: Path, below: bool = False) -> list[str]:
+            queue = next_item.change_queue(doc, below)
+            prefix = change_review.scope_list(doc).stem.removeprefix(change_review.PREFIX) + "/"
+            return [entry.key if "/" in entry.key else prefix + entry.key
+                    for entry in urgency.queue_order(queue.entries, queue.name)]
+
+        _, forms, _ = self.browser()
+        for name, doc in docs.items():
+            with self.subTest(tab=name):
+                self.assertEqual(forms.orders[name], expected(doc))
+        self.assertEqual(forms.orders[""], expected(self.production, below=True) + ["page-owner/C6"])
+        self.assertEqual(list(forms.rows), forms.orders[""])
+        self.assertEqual(forms.orders["natedev"][0], "page-owner/C3")
+        self.assertEqual(forms.orders[""][0], "page-owner/C2")
+
+        other = self.temporary / "change-review - hana.md"
+        doc = self.temporary / "hana.md"
+        _ = doc.write_text(f"# Hana\n- **Change review:** `{other}`\n")
+        owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(local_machine(), doc))
+        docs[owner.name] = doc
+        _ = change_review.append_rows(other, [change_review.Visible(f"Hana {number}", "Read", "Proof")
+                                              for number in range(3)],
+            date(2026, 10, 2), "", doc, urgency.cell(urgency.Urgency(urgency.BLOCKS)),
+            producers=[owner.id] * 3, record=staff.snapshot())
+        hana_queue = next_item.change_queue(doc, below=True)
+        urgency.pin(hana_queue.name, "C3")
+        urgency.move_to_end(hana_queue.name, "C1", datetime(2026, 11, 5))
+        self.assertEqual(expected(doc, below=True), ["hana/C3", "hana/C2", "hana/C1"])
+        settings = self.temporary / "config/review_links.conf"
+        original = settings.read_text()
+        for first, roots in (("natedev", ("natedev", "hana")), ("hana", ("hana", "natedev")),
+                             ("missing", ("hana", "natedev")), ("alpha", ("hana", "natedev"))):
+            _ = settings.write_text(original.replace("changes_first_root=natedev", f"changes_first_root={first}"))
+            _, forms, _ = self.browser()
+            with self.subTest(first_root=first):
+                for name, production in docs.items():
+                    self.assertEqual(forms.orders[name], expected(production))
+                self.assertEqual(forms.orders[""], expected(docs[roots[0]], below=True)
+                                 + expected(docs[roots[1]], below=True) + ["page-owner/C6"])
+                self.assertEqual(forms.orders["unrouted"], ["page-owner/C6"])
+                self.assertEqual(list(forms.rows), forms.orders[""])
 
     def test_empty_lists_keep_their_zero_count_tabs(self) -> None:
         for row in ("C1", "C2", "C3"):
@@ -2972,7 +3048,7 @@ class ChangePageTests(unittest.TestCase):
                          "new DOMParser()", "content.replaceWith(fresh)", "fresh.outerHTML===shownPage",
                          "if(!heldPage || activeSaves", "field.value!==''", "document.addEventListener('input'",
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
-                         "row.dataset.key===current?.dataset.key", "rows.slice(previous+1)"):
+                         "row.dataset.key===current?.dataset.key", "ordered.slice(previous+1)"):
                 self.assertIn(rule, body)
             # The one full reload is for a page whose script is older than the server's.
             self.assertEqual(body.count('location.reload'), 1)
@@ -3036,6 +3112,7 @@ class ChangePageTests(unittest.TestCase):
         feedback = status.ask(self.page, "C3", "Make the proof clearer.", kind="feedback")
         assert isinstance(feedback, change_page.QuestionDelivery)
         self.assertTrue(status.answer_question(self.page, "C3", feedback.question_id, "The proof has three steps."))
+        urgency.pin(next_item.change_queue(self.production).name, "C3")
         probe = r'''
 <script>
 (async()=>{
@@ -3100,9 +3177,15 @@ class ChangePageTests(unittest.TestCase):
    navigate('');
    check(tab==='' && runnerMenu.options[0].value==='','All is the first menu option and the default filter');
    check(runnerMenu.options[0].textContent==='All (4)' && waiting().length===4,'All counts every waiting change');
-   check(waiting().map(row=>row.dataset.tab).join(',')==='all,page-owner,page-owner,page-owner','All keeps every showrunner in the existing order');
+   check(waiting().map(row=>row.dataset.tab).join(',')==='all,page-owner,page-owner,page-owner','All follows the root name order');
    check([...runnerMenu.options].slice(1).map(option=>option.value).join(',')==='all,page-owner,demo','the menu keeps the showrunner order');
    check(rows.every(row=>row.dataset.type==='changes'),'the page holds only changes');
+   check(current.dataset.key==='all/C1','All starts with its first ordered change');
+   navigate('page-owner');
+   check(current.dataset.key==='page-owner/C3','the tab starts with its pinned change');
+   check(waiting().map(row=>row.dataset.key).join(',')==='page-owner/C3,page-owner/C1,page-owner/C2','the tab receives the /next order');
+   next.click();check(current.dataset.key==='page-owner/C1','Skip follows the selected tab order');
+   navigate('');check(current.dataset.key==='all/C1','All retains its own order');
    navigate('all');
    check(tab==='all' && runnerMenu.value==='all' && waiting().length===1 && current.dataset.tab==='all','the showrunner named all has a separate filter');
    runnerMenu.focus();

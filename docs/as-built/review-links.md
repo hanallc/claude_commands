@@ -229,7 +229,7 @@ A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and includes every showrunner in the existing item order.
+All is the default and lists each root showrunner's queue in turn.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
@@ -571,9 +571,17 @@ The selected type tab joins the content panel.
 Its keyboard focus outline stays inside the tab edges.
 Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
-The page keeps row entries during ordering and does not format the text that `/next` prints.
-The existing urgency order, pin, dependencies, and moved rows determine its order.
+Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
+The page shares its list reads and staff routing with `change_review.change_queue`.
+All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
+It keeps each root queue's pin, moved rows, and dependencies.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The server supplies each view's order for the first card, waiting list, and Skip for now.
+The browser uses these orders without sorting rows.
 Queue keys and prerequisites retain their list-based IDs.
 The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.
