@@ -468,8 +468,7 @@ def unit_lands(unit: str, land: land_queue.LandView, *, open_sent: dict[str, Pha
         return suffix in ("shrink", "repair") and parent in phase_ids
 
     def named(phase: str) -> str:
-        work = work_name(phase, titles.get(phase, ""))
-        return work[:1].upper() + work[1:]
+        return capitalized(work_name(phase, titles.get(phase, "")))
 
     def own(owner: str) -> str:
         phase = owner.removeprefix(prefix) if owner.startswith(prefix) else ""
@@ -730,8 +729,7 @@ def queued_text(item: unit_queue.QueuedItem, found: waits_on.WaitState | None,
                 land: land_queue.LandView, *, now: float, zone: ZoneInfo, unit: str = "") -> WorkItem:
     """Separate the queue name from its short dependency state."""
     target, colon, title = item.text.partition(":")
-    work = work_name(target.strip(), title.strip()) if colon else item.text
-    work = work[:1].upper() + work[1:]
+    work = capitalized(work_name(target.strip(), queue_title(title)) if colon else queue_title(item.text))
     if not item.after or found is None or isinstance(found, waits_on.OnMain):
         return WorkItem(work, "Ready")
     if isinstance(found, waits_on.PhaseSent) and isinstance(found.wait, phase_waits.UnitWait):
@@ -960,6 +958,17 @@ class UnitBoardState(NamedTuple):
         if isinstance(self.next_work.first, BlockedNext) or any(task.kind == "unit_wait" for task in self.tasks):
             return "waiting on other work"
         return "unknown"
+
+
+def capitalized(text: str) -> str:
+    """Capitalize a first word of plain lowercase letters; keep file names and code as written."""
+    return text[:1].upper() + text[1:] if re.match(r"[a-z]+(?=\s|$)", text) else text
+
+
+def queue_title(text: str) -> str:
+    """Keep a queue entry's title: drop its notes in parentheses and every clause after the first semicolon."""
+    without_notes = re.sub(r"\s*\([^()]*\)", "", text)
+    return single_spaced(without_notes.partition(";")[0]).rstrip(" ,.")
 
 
 def work_name(phase_id: str, title: str) -> str:
@@ -1239,9 +1248,14 @@ def item_rows(label: str, entries: Sequence[WorkItem | TaskLine], *, numbered: b
     rows: list[tuple[str, ...]] = []
     for index, entry in enumerate(entries, 1):
         name = f"{label} {index}" if numbered or len(entries) > 1 and label != "Also" else label
-        for line, text in enumerate(entry.state_text.splitlines() or [""]):
-            rows.append((name, entry.work if line == 0 else "", text.rstrip().rstrip(".")))
+        rows.append((name, entry.work, state_sentence(entry.state_text)))
     return rows
+
+
+def state_sentence(text: str) -> str:
+    """Join an entry's state lines into one State cell, so no row has an empty Work cell."""
+    parts = [line.strip().rstrip(".") for line in text.splitlines() if line.strip()]
+    return "; ".join(parts[:1] + [part[:1].lower() + part[1:] if part[1:2].islower() else part for part in parts[1:]])
 
 
 def unit_block(state: UnitBoardState, *, columns: int | None) -> str:
