@@ -19,7 +19,7 @@ import math
 import sys
 import tempfile
 import time
-import unittest
+import unittest.mock
 from pathlib import Path
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
@@ -35,6 +35,7 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -271,6 +272,7 @@ class NativePaneSessionTests(StaffTestCase):
                 _ = client.codex_launch("w1:p1", arguments)
 
     def test_bare_codex_launch_uses_its_process_instead_of_the_tabs_old_thread(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         owner = staff.StaffRow(staff.native_id(fixture_runtime_id("bare-client-owner")), "producer", "bare-client",
                               staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("bare-client-thread")))
         client = herdr.Herdr("agents")
@@ -443,6 +445,7 @@ class NativePaneSessionTests(StaffTestCase):
         self.assertEqual(native.call_args_list, [call(998075, "codex", identity)] * 2)
 
     def test_codex_native_process_uses_its_resume_argument_or_own_pane_report(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         launch = fixture_runtime_id("native-launch-thread")
         current = fixture_runtime_id("native-replaced-thread")
         environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
@@ -498,7 +501,8 @@ class NativePaneSessionTests(StaffTestCase):
             (["codex", "--model", "--no-alt-screen"], False, "option --model has a missing or dash value"),
         )
         for arguments, starting, cause in pending_launches:
-            with self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence:
+            with (self.subTest(arguments=arguments), codex_launch_evidence(self.root, arguments) as evidence,
+                  patch.object(time, "sleep", side_effect=AssertionError("pane readers must not wait"))):
                 pane = herdr.json_object(evidence["pane"], "fixture pane")
                 pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
                 info = herdr.json_object(evidence["process_info"], "fixture process info")
@@ -540,6 +544,7 @@ class NativePaneSessionTests(StaffTestCase):
 
 
     def test_cached_starting_pane_reports_once_in_each_run(self) -> None:
+        _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         with codex_launch_evidence(self.root, ["codex"]) as evidence:
             pane = herdr.json_object(evidence["pane"], "fixture pane")
             pane.update(session_id=None, tab_id="w1:t1", terminal_id="starting-terminal")
@@ -933,6 +938,65 @@ class PromptSubmissionTests(unittest.TestCase):
         cast(Mock, self.start).assert_called_once()
         self.assertEqual(set(self.ready_panes), {"destination:p1"})
         self.assertGreaterEqual(cast(Mock, self.read).call_count, 2)
+
+    def test_start_waits_for_a_changing_native_registry_before_checking_the_prompt_target(self) -> None:
+        for registry in ("ready after two reads", "identity changes after two reads", "changing until deadline", "unavailable"):
+            with self.subTest(registry=registry):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                _ = self.path.write_bytes(b"")
+                self.submit_on_type = True
+                events: list[str] = []
+                requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                             if registry == "identity changes after two reads" else self.transcript)
+                publications: list[herdr.SessionTranscript] = []
+                original_check_target = herdr.check_target
+
+                def native_session(pane: str, kind: str, timeout: float) -> str:
+                    self.assertEqual((pane, kind), ("destination:p1", "claude"))
+                    self.assertGreater(timeout, 0)
+                    events.append("native")
+                    if registry in {"ready after two reads", "identity changes after two reads"} and events.count("native") == 3:
+                        return self.transcript.session_id
+                    try:
+                        if registry == "unavailable":
+                            raise herdr.NativeRegistryUnavailable("fixture registry unavailable")
+                        raise herdr.NativeRegistryChanging("fixture registry changes")
+                    except herdr.NativeRegistryUnavailable as error:
+                        raise herdr_types.HerdrFailure("fixture native identity unavailable") from error
+
+                def check_target(*_args: object, **_kwargs: object) -> object:
+                    self.assertEqual(events.count("native"), 3)
+                    events.append("target")
+                    return cast(object, unittest.mock.DEFAULT)
+
+                with (patch.object(self.client, "native_session", side_effect=native_session) as native,
+                      patch.object(herdr, "check_target", side_effect=check_target, wraps=original_check_target) as target,
+                      redirect_stderr(io.StringIO()) as errors):
+                    outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                        ["--resume", requested.session_id],
+                        herdr.OpeningPrompt("resume the saved work", requested, publications.append), 300)
+                if registry in {"ready after two reads", "identity changes after two reads"}:
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(native.call_count, 3)
+                    self.assertEqual(events[:4], ["native", "native", "native", "target"])
+                    self.assertEqual(target.call_args_list[0], call(self.transcript.session_id,
+                        action="keys", place=herdr.HerdrPlace(self.client.session, "destination:p1")))
+                    self.assertEqual(publications, [self.transcript])
+                    self.assertEqual([(pane, text) for pane, text, _at in self.typed],
+                        [("destination:p1", script_prompt("resume the saved work"))])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted("native session is unavailable; pane retained"))
+                    target.assert_not_called()
+                    self.assertEqual(self.typed, [])
+                    self.assertIn("native session is unavailable", errors.getvalue())
+                    if registry == "changing until deadline":
+                        self.assertAlmostEqual(self.elapsed, 0.3)
+                    else:
+                        self.assertEqual(native.call_count, 1)
+                        self.assertEqual(self.elapsed, 0)
 
     def test_slash_command_recorded_as_command_tags_is_submitted_once(self) -> None:
         text = "/showrunner:produce /x/doc.md resume"
@@ -1335,6 +1399,73 @@ class PromptSubmissionTests(unittest.TestCase):
         )
         self.assertIsInstance(result, herdr.PromptSubmitted)
         self.assertGreater(cursor.offsets[self.path], before)
+
+    def check_start_cursor(self, *, supplied: bool, native_identity_changes: bool) -> None:
+        self.write_turn("prelaunch-only-history", kind="assistant", seconds_after_launch=-1)
+        historical_size = self.path.stat().st_size
+        requested = (herdr.SessionTranscript(self.transcript.config_dir, "before-native")
+                     if native_identity_changes else self.transcript)
+        source = self.path.with_name(requested.session_id + ".jsonl")
+        if source != self.path:
+            _ = source.write_bytes(self.path.read_bytes())
+        cursor: herdr.TranscriptCursor | herdr.UnspecifiedPromptTranscript = herdr.UnspecifiedPromptTranscript()
+        if supplied:
+            cursor = herdr.TranscriptCursor(requested, self.launched_at)
+            cursor.skip_existing_turns()
+        publications: list[herdr.SessionTranscript] = []
+        seen: list[herdr.TranscriptCursor] = []
+        positions: list[dict[Path, int]] = []
+        original_read = herdr.TranscriptCursor.read_turns
+
+        def read_turns(reader: herdr.TranscriptCursor) -> list[tuple[datetime, dict[str, object]]]:
+            seen.append(reader)
+            positions.append(dict(reader.offsets))
+            return original_read(reader)
+
+        def start(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.write_turn("resume the saved work")
+            self.write_turn("Resumed work", kind="assistant", seconds_after_launch=2)
+            return subprocess.CompletedProcess(["fixture agent start"], 0, "", "")
+
+        def publish(actual: herdr.SessionTranscript) -> None:
+            publications.append(actual)
+
+        cast(Mock, self.start).side_effect = start
+        with (patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(self.transcript.session_id), "fixture-prompt-recipient", {})),
+              patch.object(self.client, "native_session", return_value=self.transcript.session_id),
+              patch.object(herdr.TranscriptCursor, "read_turns", read_turns),
+              patch.object(json, "loads", wraps=json.loads) as parsed):
+            outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
+                ["--resume", requested.session_id],
+                herdr.OpeningPrompt("resume the saved work", requested, publish, cursor), 1000)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        cast(Mock, self.start).assert_called_once()
+        self.assertEqual(self.typed, [])
+        self.assertEqual(self.enters, [])
+        self.assertEqual(publications, [self.transcript])
+        self.assertTrue(seen)
+        self.assertTrue(all(reader is seen[0] for reader in seen))
+        if supplied:
+            self.assertIs(seen[0], cursor)
+        self.assertEqual(seen[0].transcript, self.transcript)
+        self.assertEqual(positions[0], {} if native_identity_changes else {self.path: historical_size})
+        self.assertEqual(len(seen[0].read_turns()), 2)
+        self.assertEqual(any("prelaunch-only-history" in str(value)
+                            for parsed_call in parsed.call_args_list
+                            for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
+
+    def test_start_positions_an_automatic_cursor_before_the_agent_command(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=False)
+
+    def test_start_keeps_a_supplied_cursor_and_its_publication_callback(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=False)
+
+    def test_start_moves_a_supplied_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=True, native_identity_changes=True)
+
+    def test_start_moves_an_automatic_cursor_to_the_native_transcript(self) -> None:
+        self.check_start_cursor(supplied=False, native_identity_changes=True)
 
     def test_transcript_cursor_reads_only_appended_bytes_after_its_first_poll(self) -> None:
         self.write_turn("old context " * 1000, kind="assistant", seconds_after_launch=-1)
@@ -1852,6 +1983,33 @@ class LaunchDestinationTests(StaffTestCase):
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
         self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
         started.assert_called_once()
+
+    def test_a_member_claude_launch_starts_in_the_member_session_folder(self) -> None:
+        member = fixture_member("showrunner", name="boss")
+        account = self.root / "folder-account"
+        account.mkdir()
+        session_root = Path(os.environ["SESSION_TEMP_ROOT"])
+        for root_exists in (False, True):
+            with self.subTest(root_exists=root_exists):
+                if root_exists:
+                    session_root.mkdir()
+                prepared = herdr.PreparedAgentEnvironment(self.root, {"CLAUDE_CONFIG_DIR": str(account)})
+                with (patch.object(herdr, "open_tab", return_value="unit-pane") as opened,
+                      patch.object(herdr.Herdr, "run_in_pane"),
+                      patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                      patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired())):
+                    _ = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "boss"), prepared, "claude",
+                        ["--resume", str(member.current_session)], herdr.NoOpeningPrompt(), 5000, agent="boss")
+                environment = cast(dict[str, str], opened.call_args.args[4])
+                folder = session_root / "boss"
+                if root_exists:
+                    self.assertEqual(environment["TMPDIR"], str(folder))
+                    self.assertEqual(environment[session_folder.FOLDER_ENV], "boss")
+                    self.assertEqual(session_folder.read_record(folder),
+                                     {"owner": str(member.id), "session_id": str(member.current_session)})
+                else:
+                    self.assertNotIn("TMPDIR", environment)
+                    self.assertNotIn(session_folder.FOLDER_ENV, environment)
 
     def test_failed_claude_trust_write_prints_one_anomaly_and_does_not_start(self) -> None:
         account = self.root / "broken-account"
@@ -2816,6 +2974,36 @@ class HerdrTests(unittest.TestCase):
                 scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
             self.assertEqual(scan, expected)
             self.assertEqual(errors.getvalue(), notice if printed else "")
+
+    def test_claude_pane_that_starts_or_exits_keeps_placement_without_a_notice(self) -> None:
+        client = self.herdr
+        owner = staff.StaffRow(staff.native_id(fixture_runtime_id("changing-owner")), "unit", "changing",
+                              staff.StaffRoot(), current_session=staff.native_id(fixture_runtime_id("changing-session")))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "tab_id": "w1:t1"}
+        info = {"process_info": {"shell_pid": 992000, "foreground_process_group_id": 992001,
+                                "foreground_processes": [{"pid": 992001, "argv": ["claude"]}]}}
+        registry = self.root / "changing-sessions"
+        registry.mkdir()
+        unavailable = "pid 992001: native registry identity is unavailable"
+        for case, births, record, notice in (
+                ("starting", ["birth", "birth"], False, ""),
+                ("exits during the check", ["birth", ValueError("pid 992001: process start is unavailable")], True, ""),
+                ("steady", ["birth", "birth"], True,
+                 f"herdr fixture:w1:p1 tab w1:t1: pane evidence is unknown: {unavailable}; row placement retained\n")):
+            with (self.subTest(case=case),
+                  patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
+                  patch.object(client, "result", return_value=info),
+                  patch.object(herdr, "_process_birth", side_effect=births),
+                  patch.object(herdr, "process_environment", return_value={}),
+                  patch.object(staff, "runtime_id", return_value=""),
+                  redirect_stderr(io.StringIO()) as errors):
+                (registry / "992001.json").unlink(missing_ok=True)
+                if record:
+                    _ = (registry / "992001.json").write_text("{}")
+                scan = client.scan_row_panes(staff.StaffSnapshot((owner,)), [pane])
+            reason = unavailable if notice else "starting or exiting"
+            self.assertEqual(scan, herdr.RowPaneScan({}, [herdr.UnknownPane("w1:p1", "w1:t1", reason)]))
+            self.assertEqual(errors.getvalue(), notice)
 
     def test_unreadable_pane_session_reports_one_anomaly_and_keeps_the_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [{
@@ -6850,6 +7038,34 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_launch_ignores_an_unreadable_identity_in_another_rows_retained_pane(self) -> None:
+        owner = unit_membership("natedev", "report")
+        _ = unit_membership("natedev", "accounts")
+        client = LayoutHerdr()
+        pane = client.open_tab("natedev", owner.name, str(self.root), {})
+        tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+        _ = tab.pop("session_id")
+        entry = pane_launch.launch(pane, owner.current_session, str(self.root), {}, ["claude"])
+        pane_launch.save(pane_launch.record_directory() / "fixture.json", {pane: entry})
+        record = staff.initial_snapshot()
+        with herdr.pane_evidence_run():
+            panes = client.listed("pane")
+            cached = client.scan_row_panes(record, panes)
+            self.assertEqual(cached, herdr.RowPaneScan({}, []))
+            tab["session_id"] = owner.current_session
+            with (patch.object(herdr, "pane_native_process",
+                               side_effect=herdr.NativeRegistryUnavailable("pid 992000: native registry identity is unavailable")) as decoded,
+                  patch.object(client, "run_in_pane"),
+                  patch.object(herdr, "start_agent", return_value=herdr.PromptSubmissionNotRequired()) as started):
+                result = herdr.launch_prepared_agent("fixture", herdr.NewTab("natedev", "accounts"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(),
+                    5000, agent="accounts", client=client)
+                self.assertGreater(decoded.call_count, 0)
+                started.assert_called_once()
+        self.assertNotEqual(result.pane, pane)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        self.assertIn(tab, client.tabs)
+
     def test_saved_row_tab_uses_the_supplied_fallback_workspace(self) -> None:
         client = LayoutHerdr()
         cases: tuple[tuple[staff.Kind, str, str], ...] = (
@@ -7332,3 +7548,23 @@ class SavedLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class PaneSessionsTests(unittest.TestCase):
+    """An exited agent child keeps its name without an argv; the live agent beside it still names the pane."""
+
+    LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
+    EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
+
+    def sessions(self, *processes: dict[str, object]) -> set[str]:
+        observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
+        with patch.object(herdr, "native_process", return_value=observed):
+            return herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+
+    def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
+        self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})
+        self.assertEqual(self.sessions(self.EXITED, self.LIVE), {"recorded-id"})
+
+    def test_an_agent_without_an_argv_and_no_live_agent_is_unknown(self) -> None:
+        with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent argv is unavailable"):
+            _ = self.sessions(self.EXITED)

@@ -9,20 +9,53 @@ import subprocess
 import tempfile
 from pathlib import Path
 from dataclasses import replace
+from typing import override
 from unittest.mock import patch
 
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import session_folder, unit_runs  # noqa: E402
+from scripts.lib.session_folder import Member
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, showrunner_relationship
 
 
 class UnitRunsTest(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        bind_private_run_roots(self, self.root)
+
     def set_open_run(self, session: str, path: Path) -> None:
         row = staff.by_current_session(session)
         if row is None:
             row = fixture_member("showrunner", name=f"owner-{session}", runtime_id=session)
         _ = staff.set_run(row.id, staff.OpenRun(path))
+
+    def test_a_new_run_goes_in_the_directors_session_folder(self) -> None:
+        sessions = self.root / "session"
+        environment = {session_folder.ROOT_ENV: str(sessions), "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "director"}
+        with patch.dict(os.environ, environment):
+            self.assertEqual(unit_runs.new_run_root(), unit_runs.RUN_ROOT)
+            sessions.mkdir()
+            self.assertEqual(unit_runs.run_roots(), (unit_runs.RUN_ROOT, unit_runs.FORMER_RUN_ROOT))
+            folder = session_folder.launch_folder(Member("m1", "verify"), "director")
+            assert folder is not None
+            run_root = unit_runs.new_run_root()
+            self.assertEqual(run_root, folder / session_folder.RUN)
+            run = run_root / "run-1"
+            run.mkdir(parents=True)
+            (folder / "tool").mkdir()
+            self.assertEqual(unit_runs.run_roots(), (run_root, unit_runs.RUN_ROOT, unit_runs.FORMER_RUN_ROOT))
+            self.assertEqual(unit_runs.run_roots(self.root / "override"), (self.root / "override",))
+            self.assertEqual(unit_runs.run_folders(), [run])
+            self.assertTrue(unit_runs.is_unit_run(run))
+            self.assertTrue(unit_runs.is_unit_run(run / "phases"))
+            for other in (run_root, folder / "tool", folder):
+                with self.subTest(other=other):
+                    self.assertFalse(unit_runs.is_unit_run(other))
+            os.environ["CLAUDE_CODE_SESSION_ID"] = ""
+            self.assertEqual(unit_runs.new_run_root(), unit_runs.RUN_ROOT)
 
     def test_open_run_reads_the_current_session_and_supplied_record(self) -> None:
         owner = fixture_member("showrunner", name="open-owner")
@@ -216,7 +249,16 @@ class UnitRunsTest(StaffTestCase):
                 self.assertIn(str(path), errors.getvalue())
 
     def test_both_roots_are_read_the_new_name_first(self) -> None:
-        self.assertEqual(unit_runs.run_roots(), (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
+        repository = Path(__file__).resolve().parents[2]
+        environment = {name: value for name, value in os.environ.items()
+                       if name not in {"SCRATCH_ROOT", "ASTRA_REVIEW_DIR"}}
+        result = subprocess.run(
+            [str(repository / "scripts/lib/py"), "-c",
+             "from scripts.lib import unit_runs; print(*unit_runs.run_roots(), sep='\\n')"],
+            env=environment, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(tuple(Path(value) for value in result.stdout.splitlines()),
+                         (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate")))
 
     def test_an_override_replaces_both_names(self) -> None:
         self.assertEqual(unit_runs.run_roots("/x/runs"), (Path("/x/runs"),))

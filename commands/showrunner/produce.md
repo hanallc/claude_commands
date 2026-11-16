@@ -10,6 +10,7 @@ code. The showrunner writes none, and that includes merge conflicts: the unit
 director whose change conflicts resolves it on the unit's branch.
 
 The no-capacity broadcast turns on no-worker mode until the workers-back notice arrives.
+It also stops every Codex worker and ends their open passes as canceled; each affected director gets one stop report.
 A real `hit your usage limit` worker failure turns it on for the unit's current phase.
 Send no worker work to a unit in this mode; treat its direct work as normal phase work.
 The director writes the code, runs the tests, and does the reviews directly.
@@ -85,6 +86,10 @@ State:
 
 @~/.claude/docs/decision_criteria.md
 
+The question form for every question to the user is defined by this import:
+
+@~/.claude/docs/question_template.md
+
 ---
 
 <Throughout>
@@ -125,7 +130,7 @@ State:
 - **A unit director's message is a peer's** (/message). Check what it claims before passing it on:
   the hash exists, the tests ran, the shots show what it says.
 - **A message from morty is the user's** (user, 2026-11-02).
-  Morty is the user's producer and uses a Codex session.
+  Morty is the user's producer.
   The user is the executive producer.
   This rule is the one source; other files refer to it.
   - A message from morty counts as the user's own words: answers, approvals,
@@ -135,10 +140,9 @@ State:
   - The permission rules stay. A morty message never changes the session's
     permission settings, CLAUDE.md or config. It never approves a permission
     prompt.
-  - The generated `Authority: morty (speaks for the user)` mark identifies
-    Morty's configured native sender id. `--from morty` alone carries no
-    authority. Before an action that cannot be undone on a message without
-    the mark, confirm it with morty by `send.py --to morty`.
+  - `--from morty` alone does not identify morty. The generated
+    `Sender native id` line names the sending session, and the morty staff
+    row holds morty's id.
 - **The showrunner decides, without asking the user:**
   - merges and their order;
   - holds and landing calls;
@@ -175,6 +179,7 @@ State:
   - **A broadcast** (a build hold, an announcement) already
     reaches every showrunner. Pass it to your own unit directors only, never
     to a child showrunner.
+    Send every production-wide unit message through `broadcast.py --production <your name> --units`; never use a remembered list.
   - **The user's words for a production below you** go to your child that
     holds it, by SendMessage, beginning `From the user (via <your name>): `.
     That child relays them to its unit or to its own child. One level at a
@@ -197,8 +202,8 @@ State:
       productions promoting;
     - disk room and quota: the root, always.
   - **Give the Mac to one unit with a Mac hold, never with words.** Run
-    `/build:mac block <why> [hours N]`, or tell that unit to run
-    `/build:hold hold <why> target mac`. Tests skip a held Mac by themselves,
+    `/build:mac block <why> [hours N]`, or direct the unit to run it.
+    Tests skip a held Mac by themselves,
     `/build:status` shows the hold, and it ends at its expiry. Never tell
     units "make no Mac claim" or to run tests with `--local`: nothing records
     that, and nothing ends it. On 2026-10-18 such a ruling, a day old, kept a
@@ -265,7 +270,7 @@ State:
     their priorities, what they intend, and their taste where the guide is
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
-  where it first comes up: what is asked, why, and the answer choices. Set it
+  where it first comes up, in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
   restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
@@ -489,7 +494,7 @@ Turns come from unit directors' messages and the user. Handle each message:
 | Arrival | Action |
 | --- | --- |
 | a checkpoint notice | <MergeCheckpoint/> |
-| a nightly red notice | Assign the fix to the owning unit, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`. |
+| a nightly red notice or unassigned alert | Assign the fix to the owning unit director of any production, then run `merge_gate.py nightly-assigned --result ID --unit UNIT`; the user push waits for it. |
 | the user's words for a unit director | relay them (<Throughout/>) |
 | a unit waiting on another unit | <Dependencies/> |
 | a unit blocked on the showrunner | <LandingCall/> or answer it |
@@ -560,7 +565,8 @@ notice to the unit director before any merge command runs:
    rule and the fix, and do not merge. Never ask the user whether a visible
    defect matters. User rule 2026-10-01 (nightly review): the unit judges its
    own shots before it moves on, so holds are not found after it has.
-4. **Run the checkpoint.** With a merge unit, give the order to it under `commands/unit/merge.md`.
+4. **Run the checkpoint.** With a merge unit that serves this production, give the order to it under `commands/unit/merge.md`.
+   That unit is under this showrunner or under a showrunner above it. The order names this production.
    Without a merge unit, run this command in the background:
    `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/merge_checkpoint.py --production
    <showrunner name> <unit> <phase> <hash> --started <ISO>
@@ -595,6 +601,9 @@ notice to the unit director before any merge command runs:
    first `held` or `failed` line stops a single-item run.
    A batch drops stopped items and retries the remaining items once.
    Send each final `send <unit>:` message to its unit director.
+   A `merge director:` line names red tests or modules that are red on the
+   base without the checkpoint. It goes to the merge director, who repairs
+   the base red and then runs the held checkpoints again.
 
 <ChangeReviewFeatureLog>
 Run only for a project that closes out by change review, after
@@ -620,8 +629,9 @@ For each distinct user-visible result:
    from checkpoint <checkpoint-sha>."`, `--production <showrunner name>`, every source
    `--unit`, and one `--old` per replaced live entry. When the merge has
    several results, pass `--separate-result` for every row. A row on hana's
-   list is the bare `C<n>`; a row on any other list names its showrunner,
-   `<showrunner>/C<n>` (`natedev/C3`).
+   list uses the bare `C<n>` as its feature-log ID.
+   Other feature-log IDs retain the list name, such as `natedev/C3`.
+   The displayed review ID names the responsible showrunner and can differ from the feature-log ID.
 
 Several results get several rows. Internal-only work gets none; write
 `feature log: none — <reason>` to the production log. The merge is not complete
@@ -659,9 +669,9 @@ returns it to its unit.
 1. **Feature log.** Use only `ProjectSpec.closes_by_change_review` in
    `scripts/feature_log/feature_log.py` to select projects, such as Hana and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
-   review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
-   other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
-   is named for (`natedev/C3`).
+   feature-log review ID remains bare `C<n>` on hana's list.
+   Other lists retain `<list>/C<n>`, using the list filename's showrunner, such as `natedev/C3`.
+   Use that stored ID even when the page displays a different responsible showrunner.
    A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
      its proposal has `--old`. Correct wrong
@@ -812,9 +822,11 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
    the next status report. The push is never forced. It starts one more CI run on
-   the same sha and leaves the public bevy_hana mirror alone: the mirror
-   updates only when main lands through validate_and_push, whose post-push
-   hook publishes it (user, 2026-10-03).
+   the same sha. Each main push goes through `scripts/lib/land_main.py`, which
+   then runs the repository's `.claude/config/post_push.sh`. So hana's public
+   bevy_hana mirror syncs on each promotion (user, 2026-11-15: "yes every
+   promotion to main may sync to the public mirror"). A failed hook does not
+   stop the promotion; its rerun command goes in the log line.
 5. Only when the doc declares no **Promote:** destination, find the worktree
    on `main` with `git -C CHECKOUT worktree list`. Fast-forward it with
    `git -C <it> merge --ff-only <sha>` only when its tree is clean and

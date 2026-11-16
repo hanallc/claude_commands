@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
+
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
 import select
 import shlex
-import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -26,7 +26,7 @@ from scripts.copies.copies_test_support import copies_environment
 
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
@@ -36,7 +36,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
-from scripts.build_hold import build_hold
+from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
 
 SCRIPT = Path(__file__).with_name("offload.py")
@@ -52,7 +52,7 @@ def assigned_adapter_main() -> int:
     """Run the adapter after placement, with the current provider state."""
     arguments = offload.parser().parse_args(namespace=offload.CliArguments())
     request = offload.request_from_arguments(arguments)
-    config = offload.read_config(Path(arguments.settings)) if arguments.settings else offload.read_config()
+    config = eligibility.read_config(Path(arguments.settings)) if arguments.settings else eligibility.read_config()
     controller = offload.ProcessController()
     started = time.monotonic()
     with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
@@ -146,7 +146,7 @@ class RemoteClaimRecord(TypedDict):
     since: str
     remote_host: str
 
-HANA = offload.KnownRepository("hana")
+HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
 
@@ -373,8 +373,8 @@ class OffloadCommandFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
 
-    def assignment_options(self, repository: Path, verb: offload.MacVerb,
-                           settings: Path | offload.DefaultMacSettings,
+    def assignment_options(self, repository: Path, verb: eligibility.MacVerb,
+                           settings: Path | eligibility.DefaultMacSettings,
                            runner_options: tuple[str, ...], *, environment: dict[str, str] | None = None) -> list[str]:
         """Give command fixtures one real queue assignment before the adapter starts."""
         if "--assignment-file" in runner_options:
@@ -401,7 +401,7 @@ class OffloadCommandFixture(unittest.TestCase):
         source = (placement.SourceKeyKnown(source_key) if source_key is not None
                   else placement.SourceKeyUnavailable("the fixture has no tree key"))
         constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
-            build_hold.owning_session(self.environment if environment is None else environment),
+            session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
         request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, owner.pid, owner.start_time),
             local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
@@ -419,10 +419,7 @@ class OffloadCommandFixture(unittest.TestCase):
         return ["--assignment-file", str(assignment_file)]
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(
-            f"#!{sys.executable}\n" + source, encoding="utf-8"
-        )
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def sync_config(self) -> None:
         ready = self.config_path.with_suffix(".ready")
@@ -454,11 +451,11 @@ class OffloadCommandFixture(unittest.TestCase):
         filter_run: bool = False,
         timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
         subprocess_cli: bool = False,
-        settings: Path | offload.DefaultMacSettings = offload.DEFAULT_MAC_SETTINGS,
+        settings: Path | eligibility.DefaultMacSettings = eligibility.DEFAULT_MAC_SETTINGS,
         last_decline: str = "",
         separate_stderr: bool = False,
         copy: bool = False,
-        verb: offload.MacVerb = "nextest",
+        verb: eligibility.MacVerb = "nextest",
         package: str = "hana",
         source: offload.MacSource = WORKING_TREE_SOURCE,
         runner_options: tuple[str, ...] = (),
@@ -526,7 +523,7 @@ class OffloadCommandFixture(unittest.TestCase):
         program = r'''
 import subprocess
 import sys
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 
 clock = [100.0]
 offload.time.monotonic = lambda: clock[0]
@@ -597,7 +594,7 @@ raise SystemExit(offload.main())
             "--result",
             str(self.result_path),
             *runner_options,
-            *self.assignment_options(self.repository, "nextest", offload.DEFAULT_MAC_SETTINGS, runner_options,
+            *self.assignment_options(self.repository, "nextest", eligibility.DEFAULT_MAC_SETTINGS, runner_options,
                                      environment={**self.environment, **(extra or {})}),
             "--",
             *nextest_arguments,
@@ -621,22 +618,11 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        scripts_directory = self.root / "claim-runner" / "scripts"
-        runner_directory = scripts_directory / "mac_test"
-        runner_directory.mkdir(parents=True)
-        runner = runner_directory / "offload.py"
-        _ = shutil.copyfile(SCRIPT, runner)
-        _ = shutil.copyfile(SCRIPT.with_name("cargo_manifest.py"), runner_directory / "cargo_manifest.py")
+        checkout = self.root / "claim-runner"
+        copy_runtime(checkout)
+        runner_directory = checkout / "scripts/mac_test"
         self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
-        (scripts_directory / "lib").symlink_to(SCRIPT.parent.parent / "lib", target_is_directory=True)
-        (scripts_directory / "lint").symlink_to(
-            SCRIPT.parent.parent / "lint", target_is_directory=True
-        )
-        (scripts_directory / "build_hold").symlink_to(SCRIPT.parent.parent / "build_hold", target_is_directory=True)
-        (scripts_directory / "buildlog").symlink_to(
-            SCRIPT.parent.parent / "buildlog", target_is_directory=True
-        )
-        return runner
+        return runner_directory / "offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

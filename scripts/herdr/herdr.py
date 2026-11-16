@@ -41,7 +41,7 @@ from contextvars import ContextVar
 from threading import RLock
 from functools import cache, cached_property
 from importlib import import_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,7 +51,7 @@ from typing import BinaryIO, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequi
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, models_registry, operation_deadline
+from scripts.lib import conf, models_registry, operation_deadline, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 # herdr refuses a longer `agent start --timeout`.
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
+PANE_POLL_SECONDS = 0.1
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
@@ -139,6 +140,10 @@ def _platform() -> str:
 
 class NativeRegistryUnavailable(ValueError):
     """The process has no native registry identity."""
+
+
+class NativeRegistryChanging(NativeRegistryUnavailable):
+    """The process starts or exits: its registry record is not written yet or is already removed."""
 
 
 class _DarwinProcessGone(HerdrFailure):
@@ -329,6 +334,14 @@ class OpeningPrompt:
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
+    def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
+        """Keep a supplied cursor or position a new cursor before the agent starts."""
+        if isinstance(self.cursor, TranscriptCursor) or not isinstance(self.transcript, SessionTranscript):
+            return self
+        cursor = TranscriptCursor(self.transcript, since)
+        cursor.skip_existing_turns()
+        return replace(self, cursor=cursor)
+
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
@@ -370,6 +383,17 @@ class TranscriptCursor:
     current_paths: tuple[Path, ...] = field(default=(), init=False)
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def bind_transcript(self, transcript: SessionTranscript) -> None:
+        """Read a changed native transcript from zero and retain the launch time filter."""
+        if transcript == self.transcript:
+            return
+        self.transcript = transcript
+        self.offsets.clear()
+        self.sizes.clear()
+        self.turns.clear()
+        self.current_paths = ()
+        self.readability = TranscriptReadable()
 
     def skip_existing_turns(self) -> None:
         """Skip complete rows before launch without parsing historical JSON."""
@@ -783,6 +807,14 @@ class PaneRunning:
     commands: tuple[str, ...]
 
 
+class OwnPaneNotAtShell(HerdrFailure):
+    """A restart refused: the session's own pane did not reach the shell in time."""
+
+    def __init__(self, name: str, session: str, pane: str, seconds: float) -> None:
+        super().__init__(f"{name}: restart refused: own pane {pane} is not at the shell after {seconds:g} s; "
+                         + f"session {session} stays stopped; when that pane is at the shell, run: agents resume {name}")
+
+
 @dataclass(frozen=True)
 class ProcessGenerationUnavailable:
     """The process start time cannot prove its generation."""
@@ -1027,6 +1059,31 @@ def herdr_binary() -> str:
     if not binary:
         raise HerdrMissing("herdr is not installed")
     return binary
+
+
+def own_pane_columns(timeout: float) -> int | None:
+    """Return the width in columns of the pane that runs this process, or None when herdr cannot tell in time."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    path = os.environ.get("HERDR_SOCKET_PATH")
+    if not pane or not path:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+            stream.settimeout(timeout)
+            stream.connect(path)
+            stream.sendall((json.dumps({"id": "pane-columns", "method": "pane.layout",
+                                        "params": {"pane_id": pane}}) + "\n").encode())
+            with stream.makefile("r", encoding="utf-8") as reply:
+                response = decode_object(reply.readline(), "herdr pane.layout")
+        layout = json_object(json_object(response.get("result"), "herdr pane.layout").get("layout"), "herdr pane.layout")
+        for item in json_items(layout.get("panes"), "herdr pane.layout"):
+            row = json_object(item, "herdr pane")
+            width = json_object(row.get("rect"), "herdr pane rect").get("width")
+            if row.get("pane_id") == pane and isinstance(width, int):
+                return width
+    except (OSError, HerdrFailure):
+        return None
+    return None
 
 
 # A tab or workspace gone from the shared session keeps its saved place this long, so a restart
@@ -1307,17 +1364,25 @@ class PaneSessionsStarting:
 
 
 @dataclass(frozen=True)
+class PaneSessionsChanging:
+    """The Claude process starts or exits, so the pane has no current session to read."""
+
+
+@dataclass(frozen=True)
 class PaneSessionsUnknown:
     """The process evidence cannot establish the pane's current sessions."""
 
     reason: str
 
 
+PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown
+
+
 @dataclass
 class PaneEvidenceRun:
     """Share decoded pane evidence and printed reasons within one run."""
 
-    sessions: dict[tuple[str, str, str], frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown] = field(default_factory=dict)
+    sessions: dict[tuple[str, str, str], PaneSessions] = field(default_factory=dict)
     shell_processes: dict[tuple[str, str, str], int] = field(default_factory=dict)
     reported: set[tuple[str, str, str]] = field(default_factory=set)
     lock: RLock = field(default_factory=RLock)
@@ -1379,6 +1444,7 @@ def forget_pane_evidence(session: str, pane: str) -> None:
                     _ = run.shell_processes.pop(key, None)
     observed = _pane_observations.get()
     if observed is not None:
+        _ = observed.replies.pop((session, ("pane", "list")), None)
         _ = observed.replies.pop((session, ("pane", "process-info", "--pane", pane)), None)
 
 
@@ -1430,7 +1496,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise failure
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
@@ -1789,38 +1855,72 @@ class Herdr:
             _ = _bind_row_tab(saved, workspace, row_id, target, max(0, index - 1))
             _write_layout(self.session, saved)
 
-    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str) -> NewTab | SplitPane | ExistingPane:
-        """Select current native placement and leave an unowned shell unowned."""
-        record = _tab_staff()
+    def saved_row_tab(self, row_id: str, title: str, fallback_workspace: str,
+                      *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
+        """Reuse the member's own pane once it is at the shell; open a tab only when it has none."""
+        record = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
         member = record.by_id(staff.StaffId(row_id))
         if member is None:
             return NewTab(fallback_workspace, title)
-        if not any(tab["staff_id"] == row_id for space in saved_layout(self.session)["workspaces"] for tab in space["tabs"]):
+        own = self._own_pane(member, record)
+        if own is None:
             return NewTab(row_workspace(member, record, fallback_workspace), title)
+        return self._own_pane_at_shell(member, own)
+
+    def _own_pane(self, member: staff.StaffRow, record: staff.StaffSnapshot) -> dict[str, object] | None:
+        """The pane that runs the member, else the newest pane launched for it that no other member runs in."""
         panes = self.listed("pane")
         scan = self.scan_row_panes(record, panes)
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
-        matches = pane_launch.reference_panes(pane_launch.StaffLaunchReference(member.id), record, self, entries,
-                                             evidence=pane_launch.NativePaneEvidence(panes, scan))
-        for pane in matches:
-            identity = json_text(pane.get("pane_id"), "pane id")
-            if isinstance(self.pane_activity(identity), PaneAtShell):
-                return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
-        tabs = {pane.get("tab_id") for pane in matches}
-        children = {row.id for row in record.find(parent=member.id)}
-        siblings = [pane for identity, found in scan.found.items() for pane in found
-                    if (pane.get("tab_id") in tabs and pane not in matches) or identity in children]
-        if siblings:
-            return SplitPane(json_text(siblings[0].get("pane_id"), "pane id"), "right", 0.5, title)
-        return NewTab(row_workspace(member, record, fallback_workspace), title)
+        reference = pane_launch.StaffLaunchReference(member.id)
+        own = pane_launch.reference_panes(reference, record, self, entries, evidence=pane_launch.NativePaneEvidence(panes, scan))
+        if own:
+            return own[0]
+        others = [pane for owner, found in scan.found.items() if owner != member.id for pane in found]
+        launched = [pane for pane in panes if pane not in others
+                    and (entry := entries.get(str(pane.get("pane_id")))) is not None
+                    and pane_launch.launch_reference(entry, record) == reference]
+        return max(launched, key=lambda pane: entries[str(pane.get("pane_id"))]["written_at"], default=None)
+
+    def _own_pane_at_shell(self, member: staff.StaffRow, pane: dict[str, object]) -> ExistingPane:
+        """Wait for the own pane to reach the shell; refuse the start when the time passes first."""
+        identity = json_text(pane.get("pane_id"), "pane id")
+        if not isinstance(self.pane_activity(identity), PaneAtShell):
+            limit = conf.read("shutdown").number("OWN_PANE_SHELL_SECONDS")
+            if not self._shell_within(identity, limit):
+                raise OwnPaneNotAtShell(member.name, str(member.current_session), identity, limit)
+        return ExistingPane(identity, json_text(pane.get("terminal_id"), "terminal id"))
+
+    def _shell_within(self, pane: str, seconds: float) -> bool:
+        """Read the pane until it is at the shell or the time passes."""
+        end = time.monotonic() + operation_deadline.remaining(seconds)
+        while not isinstance(self.pane_activity(pane), PaneAtShell):
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
+        return True
 
     def producer_row_tab(self, row_id: str, title: str, workspace: str,
                          *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> NewTab | ExistingPane:
         """Reuse a producer's shell only in its own tab in the configured workspace."""
-        destination = self.saved_row_tab(row_id, title, workspace)
-        if isinstance(destination, ExistingPane) and self.producer_pane(destination.pane, row_id, workspace, record=record):
+        membership = _tab_staff() if isinstance(record, ReadStaffAtUse) else record
+        member = membership.by_id(staff.StaffId(row_id))
+        own = self._own_pane(member, membership) if member is not None else None
+        if member is None or own is None or not self._producer_place(own, workspace):
+            return NewTab(workspace, title)
+        destination = self._own_pane_at_shell(member, own)
+        if self.producer_pane(destination.pane, row_id, workspace, record=membership):
             return destination
         return NewTab(workspace, title)
+
+    def _producer_place(self, pane: dict[str, object], workspace: str) -> bool:
+        """The pane is alone in its tab, and the tab is in the producer workspace."""
+        panes = self.listed("pane")
+        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == pane.get("tab_id")), None)
+        return (tab is not None and sum(item.get("tab_id") == tab.get("tab_id") for item in panes) == 1
+                and any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
+                        for space in self.listed("workspace")))
 
     def producer_pane(self, pane_id: str, row_id: str, workspace: str,
                       *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE) -> bool:
@@ -1833,10 +1933,7 @@ class Herdr:
         own = next((pane for pane in panes if pane.get("pane_id") == pane_id), None)
         if own is None or not isinstance(self.pane_activity(pane_id), PaneAtShell):
             return False
-        tab = next((tab for tab in self.listed("tab") if tab.get("tab_id") == own.get("tab_id")), None)
-        if (tab is None or sum(pane.get("tab_id") == tab.get("tab_id") for pane in panes) != 1
-                or not any(space.get("label") == workspace and space.get("workspace_id") == tab.get("workspace_id")
-                           for space in self.listed("workspace"))):
+        if not self._producer_place(own, workspace):
             return False
         entries = pane_launch.read(pane_launch.record_directory() / f"{self.session}.json")
         scan = self.scan_row_panes(record, panes)
@@ -1910,7 +2007,7 @@ class Herdr:
                 self.save_layout()
             return True
 
-    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown:
+    def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
         with run.lock:
             if key in run.sessions:
@@ -1919,13 +2016,14 @@ class Herdr:
                 info = json_object(self.result("pane", "process-info", "--pane",
                     json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
                 shell, foreground = _pane_process_ids(info, "native pane processes")
-                sessions: frozenset[str] | PaneSessionsStarting | PaneSessionsUnknown = frozenset(_pane_sessions(info, pane))
+                sessions: PaneSessions = frozenset(_pane_sessions(info, pane))
                 if not sessions and foreground == shell:
                     run.shell_processes[key] = shell
             except CodexPaneStarting:
                 sessions = PaneSessionsStarting()
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                sessions = PaneSessionsUnknown(str(error))
+                sessions = (PaneSessionsChanging() if isinstance(error.__cause__, NativeRegistryChanging)
+                            else PaneSessionsUnknown(str(error)))
             run.sessions[key] = sessions
             return sessions
 
@@ -1939,10 +2037,13 @@ class Herdr:
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
         for pane in panes:
             sessions = self._row_pane_sessions(pane, run)
-            if isinstance(sessions, (PaneSessionsStarting, PaneSessionsUnknown)):
-                reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
+            if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
+                reason = ("starting" if isinstance(sessions, PaneSessionsStarting)
+                          else "starting or exiting" if isinstance(sessions, PaneSessionsChanging) else sessions.reason)
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
+                if isinstance(sessions, PaneSessionsChanging):
+                    continue
                 if isinstance(sessions, PaneSessionsUnknown):
                     if launches is None:
                         try:
@@ -2344,6 +2445,8 @@ class Herdr:
         launched_at = datetime.now(timezone.utc)
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
+        if isinstance(opening, OpeningPrompt):
+            opening = opening.prepare_for_launch(launched_at)
         try:
             while True:
                 result = self.start_command(
@@ -2357,7 +2460,7 @@ class Herdr:
                     if (error.code != "agent_pane_busy"
                             or deadline <= time.monotonic()):
                         raise
-                    time.sleep(operation_deadline.remaining(min(0.1, deadline - time.monotonic())))
+                    time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, deadline - time.monotonic())))
                     attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000),
                                              _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     continue
@@ -2389,21 +2492,36 @@ class Herdr:
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
                 transcript = opening.transcript
-                if transcript.session_id and not check_target(
-                        transcript.session_id, action="keys", place=HerdrPlace(self.session, pane)):
-                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 try:
-                    identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                    while True:
+                        try:
+                            identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                            break
+                        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                            cause: BaseException | None = error
+                            while cause is not None and not isinstance(cause, NativeRegistryChanging):
+                                cause = cause.__cause__ or cause.__context__
+                            remaining = deadline - time.monotonic()
+                            if not isinstance(cause, NativeRegistryChanging) or remaining <= 0:
+                                raise
+                            time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, remaining)))
+                            if time.monotonic() >= deadline:
+                                raise
                 except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"herdr {name}:{pane}: native session is unavailable: {error}; pane retained", file=sys.stderr)
                     return PromptNotSubmitted("native session is unavailable; pane retained")
+                if transcript.session_id and not check_target(
+                        identity, action="keys", place=HerdrPlace(self.session, pane)):
+                    return PromptNotSubmitted("prompt target is unknown; session retained")
                 transcript = SessionTranscript(transcript.config_dir, identity)
+                if isinstance(opening.cursor, TranscriptCursor):
+                    opening.cursor.bind_transcript(transcript)
                 try:
                     _ = opening.before_prompt(transcript)
                 except Exception as error:
                     print(f"herdr {transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
                     return PromptNotSubmitted(f"staff publication failed: {error}")
-                opening = OpeningPrompt(opening.text, transcript)
+                opening = replace(opening, transcript=transcript)
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()
@@ -2611,7 +2729,7 @@ class Herdr:
                 return state
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(0.1, remaining))
+                time.sleep(min(PANE_POLL_SECONDS, remaining))
         return PromptInputTimedOut(screen)
 
     def composer(self, pane: str) -> ComposerInput | NoComposer:
@@ -2635,7 +2753,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return result
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
     def submit_opening_prompt(self, pane: str, opening: OpeningPrompt, launched_at: datetime,
                               timeout_ms: int) -> PromptSubmitOutcome:
@@ -2863,7 +2981,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HerdrFailure(f"{pane}: agent did not return to its shell")
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
     def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
@@ -3022,12 +3140,15 @@ def pane_native_process(info: dict[str, object], kind: str,
 
 def _pane_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
     kinds: set[str] = set()
+    exited = False
     for value in json_items(info.get("foreground_processes"), "foreground processes"):
         process = json_object(value, "foreground process")
         arguments = _foreground_arguments(process)
-        if not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex"):
-            raise HerdrFailure("agent argv is unavailable")
+        exited = exited or not arguments and Path(str(process.get("name", ""))).name in ("claude", "codex")
         kinds.update(kind for kind in ("claude", "codex") if _is_agent_process(arguments, kind))
+    # An agent child that exits leaves its name without an argv; the live agent beside it still names the pane.
+    if exited and not kinds:
+        raise HerdrFailure("agent argv is unavailable")
     return {pane_native_process(info, kind, pane).current_identity for kind in kinds}
 
 
@@ -3514,7 +3635,7 @@ def start_server(name: str, timeout_ms: int, *,
             pass
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
 
 def restore_server(name: str, timeout_ms: int, *,
@@ -3549,7 +3670,7 @@ def restore_server(name: str, timeout_ms: int, *,
                 return WindowServerCreated()
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(0.1, remaining))
+                time.sleep(min(PANE_POLL_SECONDS, remaining))
     except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
         print(f"herdr {name}: desktop start is incomplete: {error}", file=sys.stderr)
     print(f"herdr {name}: desktop server is pending", file=sys.stderr)
@@ -3928,6 +4049,8 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
         except staff.StaffRefused as error:
             raise ValueError(f"pid {pid}: native registry identity is invalid") from error
         if not current:
+            if _registry_changing(pid, started):
+                raise NativeRegistryChanging(f"pid {pid}: native registry identity is unavailable; process starts or exits")
             raise NativeRegistryUnavailable(f"pid {pid}: native registry identity is unavailable")
         identity = EnvironmentThread(current)
     else:
@@ -3941,6 +4064,16 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
     if isinstance(identity, CodexLaunchIdentityUnknown):
         raise ValueError(identity.reason)
     return NativeAgentProcess(identity, started, environment)
+
+
+def _registry_changing(pid: int, started: str) -> bool:
+    """The process exited, or it runs without its registry record: before the first write or after the removal."""
+    try:
+        if _process_birth(pid) != started:
+            return True
+    except ValueError:
+        return True
+    return not (runtime_sessions.sessions_dir() / f"{pid}.json").exists()
 
 
 def check_native_target(pid: int, kind: str, expected: NativeAgentProcess) -> bool:
@@ -5504,6 +5637,19 @@ class LaunchClientSource(Enum):
     NEW = "create a client for this launch"
 
 
+def in_session_folder(prepared: PreparedAgentEnvironment, member: session_folder.Member,
+                      session_id: str) -> PreparedAgentEnvironment:
+    """Start Claude Code with TMPDIR in the member's session folder, so its scratchpad is made there."""
+    try:
+        folder = session_folder.launch_folder(member, session_id)
+    except OSError as error:
+        print(f"herdr {member.name}: session folder: {error}", file=sys.stderr)
+        return prepared
+    if folder is None:
+        return prepared
+    return replace(prepared, env={**prepared.env, "TMPDIR": str(folder), session_folder.FOLDER_ENV: folder.name})
+
+
 def agent_alias_script(kind: str) -> str:
     """Clear the agent alias before the shell starts the agent."""
     return f"unalias {kind} 2>/dev/null; "
@@ -5529,12 +5675,14 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     reuse_client = not isinstance(client, LaunchClientSource)
     client = Herdr(name) if isinstance(client, LaunchClientSource) else client
     member = ""
+    folder_member: session_folder.Member | None = None
     try:
         membership = _tab_staff()
         owner = membership.by_member_reference(session_id or agent) or membership.by_path(agent)
         if owner is not None:
             session_id = owner.current_session
             member = owner.id
+            folder_member = session_folder.member_for(owner, membership)
         observed = (read_conversation(session_id, kind,
                     **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
                     if session_id else StoppedConversation())
@@ -5545,6 +5693,8 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
         if isinstance(observed, UnknownConversation) and not reported_unknown:
             conversation_note(observed)
+    if kind == "claude" and folder_member is not None:
+        prepared = in_session_folder(prepared, folder_member, session_id)
     if isinstance(destination, NewTab):
         pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
                                **({"member": member} if member else {})) if reuse_client else

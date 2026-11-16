@@ -10,6 +10,7 @@ import unittest
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, RUNNER_STUB, VERIFY
 from scripts.direct.verify_step_routes_test_support import TARGETS
@@ -20,16 +21,16 @@ class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
         Path(self.environment["BUILD_HOLD_DIR"]).mkdir()
         targets = self.root / "claim-targets.py"
         _ = targets.write_text(TARGETS.replace(
-            'if command == "eligible":',
-            'if command in ("reserve", "release-wait"):\n'
-            + '    import subprocess\n'
-            + '    arguments = sys.argv[1:]\n'
-            + '    if command == "reserve":\n'
-            + '        package = arguments.index("--package") + 1\n'
-            + '        if arguments[package] == "--workspace":\n'
-            + '            arguments[package] = ""\n'
-            + '    raise SystemExit(subprocess.call([sys.executable, os.environ["TEST_REAL_TARGETS"], *arguments]))\n'
-            + 'if command == "eligible":'))
+            '    if command == "eligible":',
+            '    if command in ("reserve", "release-wait"):\n'
+            + '        import subprocess\n'
+            + '        arguments = sys.argv[1:]\n'
+            + '        if command == "reserve":\n'
+            + '            package = arguments.index("--package") + 1\n'
+            + '            if arguments[package] == "--workspace":\n'
+            + '                arguments[package] = ""\n'
+            + '        return subprocess.call([sys.executable, os.environ["TEST_REAL_TARGETS"], *arguments])\n'
+            + '    if command == "eligible":'))
         reader = self.root / "claim-lint-config.sh"
         _ = reader.write_text(
             'lint_config_enabled() { [[ "$1" == mend || "$1" == fmt ]]; }\n'
@@ -48,7 +49,7 @@ import sys
 if sys.argv[1] == "acquire":
     records = Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json")
     with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.test_verify_step_state import read_step_row
+    from scripts.direct.step_row_test_support import read_step_row
     if any(read_step_row(path.stem)["runs_on"]["kind"] == "natedev_only" for path in records):
         (Path(os.environ["TEST_RUNNER_STATE"]) / "local-token-wait").touch()
 ''')
@@ -147,7 +148,8 @@ exec bash "$TEST_REAL_BOARD" "$@"
 
         def release_provider(reply: wire.Reply) -> wire.Reply:
             if isinstance(reply, wire.PlacementWait):
-                for path in Path(self.environment["TMPDIR"]).glob("verify-hold.*/placement-*.json.wait"):
+                for path in (wait for hold in tool_folders(Path(self.environment["TMPDIR"]), "verify")
+                             for wait in hold.glob("placement-*.json.wait")):
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                     if isinstance(notice.last_reply, wire.Wait):
                         _ = controls.hosts.pop("mac", None)

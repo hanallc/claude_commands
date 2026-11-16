@@ -113,7 +113,14 @@ The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-Resume from its own empty pane executes the saved launch in that pane.
+Resume, restart and account moves start a session in its own pane.
+The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
+`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+When the wait ends first, the start is refused with one line.
+The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
+A new tab opens only for a session with no own pane.
+A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A restart never splits a pane beside a worker.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
 Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
 Other rows use their parent showrunner's workspace, the entry name, or the shared session.
@@ -157,6 +164,13 @@ Delegated callers and sessions proved live on the target write nothing.
 `move_sessions` uses the same stop and resume functions. All stops and prompt cancellation requests finish before any resumes. A retained request compares its wall-clock cutoff with the prompt's immutable observation-start time. An observation that spans stop/resume can be retired; the next watcher pass observes the resumed prompt afresh. A prompt first observed after the stop survives the older request, and failed retirement is retried by stall-watch. Each member resumes in its own pane on the target account; failures are independent. A resumed session retries failed native identity reads within the start deadline before it submits the resume message. A selected caller hands off the same batch before any signal. Linux uses a user systemd service; macOS uses a detached process. An optional warning lasts for the requested duration. The detached batch clears `CLAUDE_CODE_SESSION_ID` so it does not hand off again. Final results are one line per member under the shutdown state folder's `logs` directory.
 
 The notes timer delegates account moves to this detached batch before any stop.
+An automatic move (cause `auto`, `refusal` or `credits off`) reads the build admission queue before any stop.
+A session that owns a running, waiting or cloud build step does not stop with the others.
+The others move at once; only the detached batch waits, so a caller hands owners to it.
+The batch reads the queue every `MOVE_BUILD_POLL_SECONDS` and moves each owner when it owns no step.
+At `MOVE_BUILD_WAIT_MINUTES` the batch moves the remaining owners and logs each step that the move ends.
+An unread queue before the wait means no wait; during the wait it keeps the owner held.
+A move by hand never reads the queue. The batch writes its wait lines to its move log.
 The supervisor needs a restart request; an exited child alone does not cause a restart.
 A saved launch keeps its conversation marks but cannot replace an explicit destination account.
 The batch includes the existing stay observation before it records a confirmed or failed move outcome.
@@ -246,6 +260,16 @@ Publication replaces earlier bindings through the recoverable `.producer-publica
 Resume compares source and destination pane locations before it lists panes.
 An own-pane resume therefore needs no pane list call.
 
+### Catch-up reader
+
+`scripts/agents/catch_up.py NATIVE_ID [--blocks N] [--chars N]` prints the last blocks of a saved conversation.
+A session that takes a producer role reads the earlier conversation of that role with it.
+`NATIVE_ID` is `session:<id>`, `codex:<id>` or an ID alone. An ID alone selects the newest transcript of either family.
+A block is one user message, assistant message, tool call or tool result. A tool block is one shortened line.
+A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
+The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
+`config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
@@ -285,6 +309,24 @@ Recovery resumes the retained conversation only when no other live session carri
 Several tabs with the producer label therefore do not select a different conversation.
 The shared native process reader uses Claude's session registry to prove a plain `claude` start.
 The process arguments need no session ID.
+
+`agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
+
+1. Refuse a caller that another staff row records. Refuse a producer on another machine.
+2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
+3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
+5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
+6. Publish `[producers].NAME` through `models_registry.store_producer`.
+7. Write the row through `staff.transfer_producer`, then publish the pane record as the producer binding.
+8. Give the tab the producer name through `retitle_row`; the saved layout supplies the position of the old tab.
+
+`restart.restart(stop_all=True, only=(row id,))` then restarts the caller outside the row lock.
+The restart runs in a detached process and sends no opening prompt.
+The row id, the document, and the `staff:<row id>` message queue do not change.
+Each step is safe to run again; a caller that already holds the row skips step 5.
+A failure between steps 6 and 7 leaves the new settings on the old session until the next run.
 
 `agents remove-stray NAME SESSION` removes a local stray producer conversation.
 The command uses this order:
@@ -375,6 +417,23 @@ The message names idle children separately.
 It keeps the account move source and destination.
 Restart and pane restore select each worker's current staff parent directly.
 Closed idle workers stay closed until their next assignment.
+
+`quota_state.no_worker_mode()` reads the quota state at each call, from the current `XDG_STATE_HOME`.
+`scripts/whoami/quota_state.py` is a leaf module, so restart, resume and worker code never import `quota_alert`.
+A missing or unreadable state reads as off.
+In no-worker mode, `worker.restore` prints `<worker>: not resumed: no-worker mode` for each Codex worker it would start or resume, and leaves it stopped.
+In no-worker mode, no command starts new worker work. Each refuses with exit 2 and the `quota_state.NO_WORKER_START` text:
+- `assign.sh`, before it writes run state;
+- `worker.py add` and `worker.py assign`;
+- `worker_panes.py start-or-resume`.
+In the mode, `style_plan.py next-phase --session-dir` restores the run and phase records of each ticket and sends no assignment. It prints `style-ticket-<id>: <the refusal text>`, and the director does the ticket directly.
+`worker.restore` and account moves keep work that started before the mode, so a Claude worker with an open pass resumes.
+`agents restart`, the restart of a director, `agents resume` and unit recovery all restore workers through `worker.restore`.
+A skipped worker leaves the restart record. The next assignment resumes it.
+`stop_resume` refuses a Codex worker row with `no-worker mode keeps Codex workers stopped`, before it opens a pane.
+`resume_message.worker_mode()` gives `WorkersHeld` in no-worker mode.
+The resume, restart and relaunch messages of a director then carry the `no_worker_mode_on` text from `config/accounts.conf` and no worker lines.
+A paused director gets `Continue where you stopped.` and the same text.
 Pane worker resume uses the dispatch record and transcript to select one step.
 An idle worker receives a continuation prompt when its transcript contains the open dispatch.
 Restore holds the dispatch lock across the record read, receipt read, and prompt delivery.
@@ -419,7 +478,17 @@ After login, run `agents restart`.
 
 `agents stop --all` selects live Claude and Codex rows on this machine from `staff.json`.
 The selection includes producers, such as brain, morty, and dwight.
-It saves each row ID before its stop. It starts nothing.
+A complete unscoped read prunes recorded rows whose sessions still run.
+Each prune checks current liveness again while it holds the row lock.
+A refused row lock preserves the entry.
+A partial liveness read prints an anomaly and prunes nothing.
+Recorded stopped rows remain pending.
+Each stop holder saves its selected rows while it holds their row locks.
+A refused stop removes its provisional entry before the row lock releases.
+No command clears the whole record.
+It starts nothing.
+`stop --all --only ID[,ID...]` and `stop --all --account ACCOUNT` merge selected rows into the record.
+These scoped stops preserve other saved rows.
 A live session without a staff row prints one anomaly line. Stop does not save it.
 `agents restart --all` uses the same selection and stop loop, then resumes the selected rows.
 It keeps only the row IDs whose starts failed.
@@ -447,7 +516,17 @@ If a stop includes the caller, restart continues in a detached process before th
 The caller prints the restart log path and returns.
 Other restarts run in the caller's process.
 A stop checks the current conversation before it sends a signal.
-A failed row prints one anomaly line. Other rows continue.
+A failed row does not stop other rows.
+After the start pool finishes, restart reads each failed unit director or showrunner conversation again.
+If the read proves that the conversation stopped, restart retries that start once with the same arguments.
+A successful retry prints only `<name>: down; started`.
+If the row becomes live before the retry launches it, the retry prints only `<name>: unchanged`.
+A second failure prints `<name>: down: <reason>` on stdout and keeps the row pending.
+An error without text uses its type name as the reason.
+A live or unknown conversation keeps the existing anomaly line and gets no retry.
+Trust-write failures and row-lock refusals keep their existing behavior without a retry.
+An unreadable native identity in a retained pane excludes that pane from placement candidates.
+It does not abort another row's launch.
 
 `agents restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
@@ -461,6 +540,20 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
+The opening prompt and the Claude resume check share a cursor positioned before launch.
+Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
+It retries only when the native registry changes while the process starts or exits.
+The launch deadline bounds this wait.
+For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
+`config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
+The operation deadline can reduce either limit.
+Other launches use `START_SECONDS`.
+The launch limit covers the start, input readiness, and proof of the opening prompt's user turn.
+The separate resume check then requires an assistant turn or tool call.
+The cursor skips complete historical records without parsing their JSON.
+Herdr preserves a caller's cursor and prepares one before the start command when the caller supplies none.
+If the native session identity changes, the cursor reads that transcript from byte zero and filters turns by the launch time.
+The cursor retains observed turns, so prompt submission does not remove evidence from the resume check.
 The reader leaves a final record without a newline unread until the writer completes it.
 The launch boundary follows the last complete newline.
 A malformed Codex record with a newline makes the transcript unreadable.
@@ -485,6 +578,12 @@ A running row gets no continuation message.
 Producers keep their existing start behavior.
 Herdr server restore keeps its existing start behavior.
 A row leaves the saved list when it starts or already runs.
+`stop_resume.resume` removes a row after a confirmed start while it holds the row lock.
+Upkeep, account moves, watchdog recovery, and named resume share this removal.
+Named resume also removes a row after a successful continuation message.
+Retired recovery removes a row after it proves the resumed native session.
+These removals and restart cleanup occur before the row locks release.
+Native resume, continuation messages, restart, retired recovery, and pruning use `shutdown_record.remove_started`.
 A failed start adds the row to the list.
 A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
@@ -496,6 +595,21 @@ Both commands change nothing.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.
 The record stores no session facts, progress, claims, recovery states, or pane positions.
+The record holds only rows that a restart starts:
+- `stop --all` and scoped `held-sessions` save no worker that `worker.restore` would not start.
+- `worker.not_restored` names that worker: a Codex worker in no-worker mode, or a worker with no active dispatch and no detached run.
+- `restart` removes a saved id with no staff row, or a saved worker that `worker.not_restored` names, with one anomaly line: `<name>: restart anomaly: <reason>; removed from the restart record`.
+- `restart --dry-run` prints the same line with `would leave the restart record` and changes nothing.
+- `staff.retire`, a worker pane close in `worker_panes.close`, and the Codex worker stop in `worker_capacity.py` remove the id with `shutdown_record.forget`.
+- An id stays only after a failure that a retry can fix, such as an unreadable dispatch record.
+`shutdown_record.update` holds the record lock for each change.
+Unscoped `held-sessions` prunes confirmed live entries after a complete liveness read.
+It checks current liveness again under each row lock.
+It saves the live tab positions and preserves recorded stopped rows.
+`held-sessions ACCOUNT` and `held-sessions --only ID[,ID...]` merge selected rows and preserve other saved rows.
+A failed staff read preserves the record.
+A partial live-row read prunes nothing.
+The stop loop can still save rows that it stops.
 Herdr stores the tab order and associates each saved tab with its staff row ID.
 
 Start reads `current_session` and the worktree from staff.
@@ -526,6 +640,28 @@ An unconfirmed worker stop needs targeted proof of process absence before restar
 Live or unknown evidence leaves the worker pending.
 The worker check uses the same function as the Codex row check.
 
+### Legacy Claude launchers
+
+`assign_claude.run` installs no signal handler.
+Its child commands inherit the launcher's process group.
+Stop that group to stop the launcher and its child commands.
+`assign.sh` uses `exec` for `assign.py` and creates no separate process group.
+The current native worker path does not call the legacy Claude launcher.
+
+The launcher checks the claim owner under the claim lock before each publication.
+The launcher records its PID and process start in `impl_claim_<slot>.json` before work starts.
+The claim also records the host, boot, and PID namespace.
+`read_worker_claim` rejects dead processes, zombie processes, and reused PIDs.
+It compares local processes only when the saved scope matches the current scope.
+It retains claims with missing start evidence, missing scope, different scope, or unreadable identity.
+Status readers recover an `implementing` status whose launcher has ended.
+They write `error` and add a blocked board entry under the claim lock.
+The next assignment can replace the ended claim.
+Normal completion still releases the claim.
+An interrupted exit retains the claim, including a Python `KeyboardInterrupt` from SIGINT.
+A killed launcher cannot record pass completion.
+Its ledger entry keeps the last saved state.
+
 ### Gates during a session restart
 
 A session stop sends TERM, then KILL after the grace period, to the one proved agent PID (`stop_resume.py`).
@@ -535,6 +671,14 @@ A normal stop keeps the pane and its shell.
 A detached run continues across a session stop or restart.
 `detached_runs.py start` starts its supervisor in a new process session.
 The command runs in a `builds-detached.slice` scope when systemd is available.
+The command runs in its own session, including through the scope prefix.
+The record saves the command's process group.
+The supervisor uses default TERM, INT, and HUP dispositions.
+It installs no signal handler.
+`detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
+The supervisor stays alive, records the exit status and delivers the result.
+If the supervisor dies, the next start, worker restore, or explicit `detached_runs.py reap` finishes its record and delivers its result.
+The result reports no exit status unless the supervisor saved the command's status before it died.
 The record, the log and the exit code stay in the run folder's `detached_runs` directory.
 After the command ends, the supervisor starts a new Python process to deliver the result from the current code tree.
 The supervisor waits for delivery before it marks the run finished.

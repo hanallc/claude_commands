@@ -443,12 +443,12 @@ MAC_IDLE_COLUMNS: list[Column] = [
     ("call_id", "TEXT", "verify call; joins calls.id after the call ends"),
     ("pid", "INTEGER", "verify process id"),
     ("proc_start", "TEXT", "process start ticks; guards pid reuse"),
-    ("session", "TEXT", "live call session"),
+    ("session", "TEXT", "live call session; rows before 2026-11-15 only"),
     ("repo", "TEXT", "call repository path"),
     ("package", "TEXT", "test package"),
-    ("wait", "TEXT", "memory, build_hold, cargo_token or routing; backed by live wait evidence"),
-    ("cause", "TEXT", "missing_temp_root, missing_leave_hook, retry_delayed, call_has_no_marker_hook or idle_with_waiter"),
-    ("action", "TEXT", "created_session_temp_root, retry_marker, message_showrunner or message_pending (send retried; row stays once)"),
+    ("wait", "TEXT", "memory, build_hold or routing; backed by live wait evidence; older rows also cargo_token"),
+    ("cause", "TEXT", "missing_leave_hook or idle_with_waiter; older rows also missing_temp_root, retry_delayed or call_has_no_marker_hook"),
+    ("action", "TEXT", "recorded, message_showrunner or message_pending (send retried; row stays once); older rows also created_session_temp_root or retry_marker"),
 ]
 
 QUEUE_BUMP_COLUMNS: list[Column] = [

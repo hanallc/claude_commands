@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import html
 import os
 import re
 import json
@@ -14,7 +15,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
@@ -25,7 +26,7 @@ from types import ModuleType
 from typing import Literal, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, urgency
@@ -34,8 +35,9 @@ from scripts.production import change_routing, change_review, footer_counts, nex
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve
+from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
 from scripts.rebuild import need
+from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
 
@@ -94,16 +96,20 @@ class BrowserForms(HTMLParser):
         self.save_urls: dict[str, str] = {}
         self.counts: dict[str, int] = {}
         self.question_counts: dict[str, int] = {}
-        self.count_kind: str = "changes"
+        self.kind: str = "changes"
         self.pending: dict[str, bool] = {}
         self.outcomes: dict[str, list[str]] = {}
         self.current: str = ""
-        self.count_tab: str = ""
-        self.read_count: bool = False
+        self.orders: dict[str, list[str]] = {}
+        self.reading_orders: bool = False
 
     @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "script" and "data-change-orders" in values:
+            self.reading_orders = True
+        if tag == "div" and values.get("data-kind"):
+            self.kind = values["data-kind"] or ""
         if tag == "section" and values.get("data-key"):
             self.current = values["data-key"] or ""
             self.rows[self.current] = {}
@@ -117,24 +123,44 @@ class BrowserForms(HTMLParser):
         if tag == "button" and self.current and values.get("name") == "outcome":
             self.outcomes[self.current].append(values.get("value") or "")
         if tag == "option" and values.get("data-showrunner"):
-            counts = self.question_counts if values.get("data-type") == "questions" else self.counts
+            counts = self.question_counts if self.kind == "questions" else self.counts
             counts[values["data-showrunner"] or ""] = int(values.get("data-count") or "0")
 
     @override
-    def handle_data(self, data: str) -> None:
-        if self.read_count:
-            counts = self.question_counts if self.count_kind == "questions" else self.counts
-            counts[self.count_tab] = int(data)
-
-    @override
     def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self.reading_orders = False
         if tag == "section":
             self.current = ""
-        if tag == "span":
-            self.read_count = False
+
+    @override
+    def handle_data(self, data: str) -> None:
+        if self.reading_orders:
+            self.orders = cast(dict[str, list[str]], json.loads(data))
 
 
 SEND_MESSAGE = change_page.send_message
+
+# The Memory bar record predates structured question parts.
+MEMORY_BAR_ASK = "Memory bar on the Builds page: what name should the new block have?"
+MEMORY_BAR_REVIEWED = MEMORY_BAR_ASK + """
+
+The cap mark is the memory limit for builds that the build queue runs. The block holds:
+- sccache, the compiler cache: 2.2 GiB now, nearly all of the block.
+- rust-analyzer, the editor's Rust checker: 0 GiB now.
+- Other build programs: 0.1 GiB now.
+
+The resources unit named the block 'Build tools'. Nobody approved that name.
+
+'Compiler cache' (recommended): the block shows this name. It fits because nearly all of the block is sccache.
+
+'Build tools': the block keeps the name it has now.
+
+Your own name: the resources unit puts your name on the block."""
+MEMORY_BAR_RAW = (MEMORY_BAR_ASK + " The cap mark is the memory limit for builds that the build queue runs. "
+    + "The resources unit named the block 'Build tools'. Nobody approved that name. "
+    + "Choices: 'Compiler cache': nearly all of the block is sccache. 'Build tools': keep the current name. "
+    + "Your own name: the resources unit puts your name on the block. Recommended: 'Compiler cache', because it names the contents.")
 
 
 @cache
@@ -182,10 +208,8 @@ class ReviewTextTests(unittest.TestCase):
 
     def test_text_without_list_lines_keeps_all_whitespace_in_one_block(self) -> None:
         text = '\n First <line> \r\n\r Second & line\u2028Third\n'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</{block}>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>\n First &lt;line&gt; \r\n\r Second &amp; line\u2028Third\n</p>')
 
     def test_question_and_answer_show_list_runs_and_text_blocks(self) -> None:
         question = change_page.AnsweredQuestion("q1", "\n  Steps\n continue\n\n  - First\n- Second\n1. Third\n2. Fourth\n\n Done\n", "- Yes\n- No")
@@ -193,20 +217,233 @@ class ReviewTextTests(unittest.TestCase):
             '<h2>Question</h2><p>Steps\ncontinue</p><ul><li>First</li><li>Second</li></ul>'
             + '<ol><li>Third</li><li>Fourth</li></ol><p>Done</p><h2>Answer</h2><ul><li>Yes</li><li>No</li></ul>')
 
+    def test_code_blocks_remove_blank_edges_and_keep_internal_text_line_breaks(self) -> None:
+        for text, before, after in (
+            ('A:\n\n```sh\nx\n```\n\nB.', 'A:', 'B.'),
+            ('\n \t\n A:\nSecond line\n \t\n```sh\nx\n```\n \t\nB. \n\n', ' A:\nSecond line', 'B. '),
+        ):
+            with self.subTest(text=text):
+                rendered = change_page.review_html(text)
+                self.assertEqual(rendered, '<p>' + before + '</p>'
+                                 + '<div class="code-block"><pre><code>x</code></pre>'
+                                 + page_frame.COPY_BUTTON + '</div><p>' + after + '</p>')
+        self.assertEqual(change_page.review_html('\n\nA:\nSecond line\n\n'), '<p>A:\nSecond line</p>')
+
     def test_review_text_escapes_text_blocks_and_each_list_item(self) -> None:
         text = '<script>& "text"\n\n- <a href="x"> & **bold**\n1. `code` | <img>'
-        for block in ("p", "pre"):
-            with self.subTest(block=block):
-                self.assertEqual(change_page.review_text_html(text, block),
-                    f'<{block}>&lt;script&gt;&amp; &quot;text&quot;</{block}>'
-                    + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
-                    + '<ol><li>`code` | &lt;img&gt;</li></ol>')
+        self.assertEqual(change_page.review_text_html(text),
+                         '<p>&lt;script&gt;&amp; &quot;text&quot;</p>'
+                         + '<ul><li>&lt;a href=&quot;x&quot;&gt; &amp; **bold**</li></ul>'
+                         + '<ol><li>`code` | &lt;img&gt;</li></ol>')
 
     def test_each_numbered_run_starts_at_its_first_number(self) -> None:
         self.assertEqual(change_page.review_text_html('3. Third\n4. Fourth\n\n1. First\n- Bullet\n8. Eighth'),
             '<ol start="3"><li>Third</li><li>Fourth</li></ol><ol><li>First</li></ol>'
             + '<ul><li>Bullet</li></ul><ol start="8"><li>Eighth</li></ol>')
 
+    def test_question_text_links_addresses_and_leaves_punctuation_outside(self) -> None:
+        link = '<a href="http://h:1/x?a=b&amp;c=d" target="_top">http://h:1/x?a=b&amp;c=d</a>'
+        self.assertEqual(change_page.review_text_html("See http://h:1/x?a=b&c=d.\n- <b> https://e.invalid/p)", inline=True),
+                         f'<p>See {link}.</p><ul><li>&lt;b&gt; <a href="https://e.invalid/p" target="_top">'
+                         + 'https://e.invalid/p</a>)</li></ul>')
+        self.assertEqual(change_page.review_text_html("See http://h:1/x"), "<p>See http://h:1/x</p>")
+
+    def test_question_text_shows_backtick_spans_as_code(self) -> None:
+        self.assertEqual(change_page.inline_html("Run `a <b>` then see http://h:1/x and `http://h:1/y`"),
+                         'Run <code>a &lt;b&gt;</code> then see <a href="http://h:1/x" target="_top">http://h:1/x</a>'
+                         + ' and <code>http://h:1/y</code>')
+        self.assertEqual(change_browser.item_list([" `deploy.py up --x <y>` ", "Run `ls` now", "`a` and `b`"]),
+                         '<h2>Items</h2><ol class="question-items"><li><div class="code-block">'
+                         + '<pre><code>deploy.py up --x &lt;y&gt;</code></pre>' + page_frame.COPY_BUTTON + '</div></li>'
+                         + '<li>Run <code>ls</code> now</li><li><code>a</code> and <code>b</code></li></ol>')
+
+    def test_code_copy_markup_keeps_code_text_separate_from_the_control(self) -> None:
+        code = '  first <tag> & value\tsecond  '
+        rendered = change_browser.item_html('`' + code + '`')
+        self.assertIn('<pre><code>' + html.escape(code) + '</code></pre>' + page_frame.COPY_BUTTON, rendered)
+        self.assertEqual(rendered.count(page_frame.COPY_BUTTON), 1)
+        self.assertIn('type="button" data-copy-code aria-label="Copy code" title="Copy"', rendered)
+        inline = change_page.document(change_page.inline_html('Run `sudo systemctl start session.mount`.')).decode()
+        self.assertNotIn(page_frame.COPY_BUTTON, inline)
+        self.assertIn('<code>sudo systemctl start session.mount</code>', inline)
+        plain = change_page.review_html('Keep this proof text.')
+        self.assertEqual(plain, '<p>Keep this proof text.</p>')
+        self.assertIn(plain, change_page.document(plain).decode())
+        self.assertNotIn(page_frame.COPY_BUTTON, change_page.document(plain).decode())
+
+    def test_question_commands_stay_inside_the_item_that_ends_with_a_colon(self) -> None:
+        for block, code in (("```sh\nprintf '<check>'\n```", "printf '<check>'"),
+                            ("`printf '<check>'`", "printf '<check>'")):
+            for form in ("parts continuation", "parts entry", "one text"):
+                with self.subTest(block=block, form=form):
+                    item = update_registration.OutstandingItem(since="now", text="Check the steps?")
+                    if form.startswith("parts"):
+                        items = (["Read the title.", "Run this:\n\n" + block, "Read the result."]
+                                 if form == "parts continuation" else
+                                 ["Read the title.", "Run this:", block, "Read the result."])
+                        item["parts"] = update_registration.QuestionParts(ask="Check the steps?", context="",
+                            items=items, recommend="", choices=[])
+                    else:
+                        item["question"] = "Check the steps?\n\n1. Read the title.\n2. Run this:\n\n" + block + "\n3. Read the result."
+                    body, _ = change_browser.question_parts(item)
+                    entries = [match.group(1) for match in re.finditer(r"<li>(.*?)</li>", body, re.DOTALL)]
+                    self.assertEqual(len(entries), 3)
+                    self.assertEqual(entries[0], "Read the title.")
+                    self.assertEqual(entries[2], "Read the result.")
+                    self.assertTrue(entries[1].startswith('Run this:<div class="code-block"><pre><code>'))
+                    self.assertIn("<pre><code>" + html.escape(code) + "</code></pre>", entries[1])
+                    self.assertEqual(entries[1].count(page_frame.COPY_BUTTON), 1)
+                    self.assertNotIn("```", body)
+
+    def test_question_item_numbers_and_blank_lines_inside_code_do_not_split_the_list(self) -> None:
+        for block in ("```text\n1. code line\n\n2. code line\n```", "`1. code line 2. code line`"):
+            for final in (False, True):
+                with self.subTest(block=block, final=final):
+                    text = ("1. Read the title.\n2. Run this:\n\n" + block
+                            + ("\n\nContext after the list." if final else "\n3. Read the result."))
+                    lead, items, trailing = change_browser.numbered_run(text)
+                    self.assertEqual(lead, "")
+                    self.assertEqual(len(items), 2 if final else 3)
+                    self.assertEqual(items[1], "Run this:\n\n" + block)
+                    self.assertEqual(trailing, "Context after the list." if final else "")
+                    body, _ = change_browser.text_sections(text)
+                    self.assertEqual(body.count("<li>"), 2 if final else 3)
+                    self.assertEqual(body.count(page_frame.COPY_BUTTON), 1)
+
+    def test_reviewed_question_without_a_question_mark_uses_its_first_sentence_as_the_title(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            reviewed="Check the title. Keep this context once.\n\nCan the later paragraph stay in the body?")
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, "Check the title.")
+        self.assertEqual(context, "Keep this context once.\n\nCan the later paragraph stay in the body?")
+        body, _ = change_browser.question_parts(item)
+        self.assertNotIn(title, body)
+        self.assertEqual(body.count("Keep this context once."), 1)
+        self.assertEqual(body.count("Can the later paragraph stay in the body?"), 1)
+        for reviewed in ("Check the title. keep this context once.", "Check the title! keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed, ""))
+        for reviewed in ("Check the title. Keep this context once.", "Check the title! Keep this context once."):
+            item["reviewed"] = reviewed
+            self.assertEqual(change_browser.question_text(item), (reviewed[:16], "Keep this context once."))
+        item["reviewed"] = "Keep this question? Keep the present title rule.\n\nContext."
+        self.assertEqual(change_browser.question_text(item),
+                         ("Keep this question? Keep the present title rule.", "Context."))
+
+    def test_question_parts_show_as_sections_with_choice_buttons(self) -> None:
+        parts = update_registration.QuestionParts(
+            ask="Approve both page changes to land?", context="Two changes wait.",
+            items=["AWS filter\nAfter: http://h:1/i", "Memory <bar>"], recommend="go for both",
+            choices=["go for both", 'no "yet"'])
+        item = update_registration.OutstandingItem(
+            since="2026-11-15T08:00", text="Approve both?", question="joined", parts=parts)
+        body, choices = change_browser.question_parts(item)
+        self.assertEqual(body, '<p class="question-ask">Approve both page changes to land?</p>'
+                         + '<h2>Context</h2><p>Two changes wait.</p><h2>Items</h2><ol class="question-items">'
+                         + '<li>AWS filter<br>After: <a href="http://h:1/i" target="_top">http://h:1/i</a></li>'
+                         + '<li>Memory &lt;bar&gt;</li></ol><h2>Recommended</h2><p>go for both</p>')
+        self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
+                         + '<label><input type="radio" name="choice" value="go for both"><span>go for both</span></label>'
+                         + '<label><input type="radio" name="choice" value="no &quot;yet&quot;"><span>no &quot;yet&quot;</span></label>'
+                         + '</fieldset>')
+        parts["ask"] = "approve both"
+        parts["context"] = parts["recommend"] = ""
+        parts["items"] = parts["choices"] = []
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+        del item["parts"]
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+
+    def test_memory_bar_reviewed_text_keeps_paragraphs_lists_and_three_choice_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="2026-11-15", text=MEMORY_BAR_RAW,
+            question=MEMORY_BAR_RAW, reviewed=MEMORY_BAR_REVIEWED)
+        title, context = change_browser.question_text(item)
+        self.assertEqual(title, MEMORY_BAR_ASK)
+        self.assertNotIn(MEMORY_BAR_ASK, context)
+        body, choices = change_browser.question_parts(item)
+        self.assertNotIn(MEMORY_BAR_ASK, body + choices)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertIn("<li>rust-analyzer, the editor&#x27;s Rust checker: 0 GiB now.</li>", body)
+        self.assertIn("<p>The resources unit named the block &#x27;Build tools&#x27;. Nobody approved that name.</p>", body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+        self.assertIn('(recommended)', choices)
+        self.assertNotIn('because it names the contents', body + choices)
+        item["reviewed"] = MEMORY_BAR_REVIEWED + "\n\nRecommended: Keep the compiler cache name."
+        body, choices = change_browser.question_parts(item)
+        self.assertIn('<h2>Recommended</h2><p>Keep the compiler cache name.</p>', body)
+        self.assertEqual(choices.count('name="choice"'), 3)
+
+    def test_open_question_forms_use_short_titles_and_separate_context(self) -> None:
+        parts = update_registration.QuestionParts(ask="Keep the name?", context="First paragraph.\n\nSecond paragraph.",
+            items=["First item", "Second item"], recommend="Keep it", choices=["Keep it", "Change it"])
+        cases: tuple[tuple[str, update_registration.OutstandingItem, str, int], ...] = (
+            ("parts", update_registration.OutstandingItem(since="now", text="Keep the name?", parts=parts), "Keep the name?", 2),
+            ("reviewed only", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                reviewed=MEMORY_BAR_REVIEWED), MEMORY_BAR_ASK, 3),
+            ("raw one line", update_registration.OutstandingItem(since="now", text="Stored summary",
+                question="Keep the name? First paragraph. Second paragraph."), "Keep the name?", 0),
+            ("raw choices", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+                question=MEMORY_BAR_RAW), MEMORY_BAR_ASK, 3),
+        )
+        owner = staff.StaffId("owner")
+        for name, item, title, choices in cases:
+            with self.subTest(form=name):
+                record = update_registration.QuestionRecord(Path("/unused/question.md"), owner, owner, item, "open")
+                question = change_browser.WaitingQuestion("q1", "owner", record, Path("/unused/production.md"), owner, "asker")
+                section = change_browser.question_section(question, change_page.ReviewBrowser("private"), 4)
+                self.assertEqual(section.count(title), 1)
+                self.assertIn(f'<h1>{title}</h1>', section)
+                self.assertEqual(section.count('name="choice"'), choices)
+                if name in ("parts", "raw one line"):
+                    self.assertIn('<p>First paragraph.</p><p>Second paragraph.</p>', section)
+                if name == "raw choices":
+                    self.assertIn('<h2>Recommended</h2><p>&#x27;Compiler cache&#x27;, because it names the contents.</p>', section)
+                    self.assertIn('Your own name: the resources unit puts your name on the block.', section)
+
+    def test_reviewed_presence_and_ambiguous_choices_do_not_restore_raw_text_or_invent_buttons(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="Do not show this raw question? Raw text.", reviewed="Reviewed question?\n\nOne paragraph.\n\nAnother paragraph.")
+        self.assertEqual(change_browser.question_parts(item), ('<p>One paragraph.</p><p>Another paragraph.</p>', ""))
+        item["reviewed"] = ""
+        self.assertEqual(change_browser.question_parts(item), ("", ""))
+        _ = item.pop("reviewed")
+        item["question"] = "Keep it? Choices: yes = keep; no = drop. Recommended: yes"
+        self.assertEqual(change_browser.question_parts(item),
+            ('<h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul><h2>Recommended</h2><p>yes</p>', ""))
+
+    def test_title_uses_the_first_question_sentence_and_context_keeps_earlier_sentences(self) -> None:
+        item = update_registration.OutstandingItem(since="now", text="Stored summary",
+            question="A change waits. Keep it? use this name. Is that clear?")
+        self.assertEqual(change_browser.question_text(item), ("Keep it?", "A change waits.\n\nuse this name. Is that clear?"))
+
+
+    def test_one_text_question_shows_items_choices_and_recommendation_as_sections(self) -> None:
+        body, choices = change_browser.text_sections(
+            "Check two things. 1) A <b> shows; 2) One click works. It takes a minute. "
+            + "Choices: (a) ready: launch now; (b) later: name a time. Recommended: ready, see http://h:1/i")
+        self.assertEqual(body, '<p>Check two things.</p><h2>Items</h2><ol class="question-items">'
+                         + '<li>A &lt;b&gt; shows</li><li>One click works.</li></ol><p>It takes a minute.</p>'
+                         + '<h2>Recommended</h2><p>ready, see <a href="http://h:1/i" target="_top">http://h:1/i</a></p>')
+        self.assertEqual(choices, '<fieldset class="question-choices"><legend>Choices</legend>'
+                         + '<label><input type="radio" name="choice" value="ready: launch now"><span>ready: launch now</span></label>'
+                         + '<label><input type="radio" name="choice" value="later: name a time."><span>later: name a time.</span></label>'
+                         + '</fieldset>')
+        with self.subTest("choices without numbers show as text"):
+            self.assertEqual(change_browser.text_sections("Keep it? Choices: yes = keep; no = drop. Recommended: yes"),
+                             ('<p>Keep it?</p><h2>Choices</h2><ul><li>yes = keep</li><li>no = drop.</li></ul>'
+                              + '<h2>Recommended</h2><p>yes</p>', ""))
+        with self.subTest("numbers out of order are not items"):
+            self.assertEqual(change_browser.text_sections("Phase 2. Then 1) only one item."),
+                             ("<p>Phase 2.</p><p>Then 1) only one item.</p>", ""))
+        with self.subTest("lines: a blank line ends the last item"):
+            self.assertEqual(change_browser.text_sections("Pick one.\n\nChoices:\n1. Add it. Then measure.\n2. Keep it.\n\nMeanwhile I port."),
+                             ('<p>Pick one.</p><p>Meanwhile I port.</p>',
+                              '<fieldset class="question-choices"><legend>Choices</legend>'
+                              + '<label><input type="radio" name="choice" value="Add it. Then measure."><span>Add it. Then measure.</span></label>'
+                              + '<label><input type="radio" name="choice" value="Keep it."><span>Keep it.</span></label></fieldset>'))
+        with self.subTest("1. items"):
+            self.assertEqual(change_browser.text_sections("Steps: 1. open 2. close")[0],
+                             '<p>Steps:</p><h2>Items</h2><ol class="question-items"><li>open</li><li>close</li></ol>')
 
 class ChangePageTests(unittest.TestCase):
     temporary: Path = Path()
@@ -245,10 +482,49 @@ class ChangePageTests(unittest.TestCase):
         for content in (change_page.render(self.page, status).decode(),
                         change_browser.render(change_page.ReviewBrowser('token'), status).decode()):
             with self.subTest(page=content[:80]):
-                self.assertIn('<pre>Steps</pre><ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>'
-                              + '<pre>Finish. You see: Result</pre>', content)
+                self.assertIn('<p>Steps</p>', content)
+                self.assertIn('<ul><li>Click &lt;one&gt;</li><li>Click two</li></ul>', content)
+                self.assertIn('<p>Finish. You see: Result</p>', content)
                 self.assertIn('<h2>Question</h2><p>Which steps?</p><ol><li>First</li><li>Second</li></ol>', content)
                 self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
+
+    def test_both_pages_copy_question_feedback_and_answer_code_without_boxing_plain_text(self) -> None:
+        code = 'git -C /etc/nixos status --short\ngit -C /etc/nixos log --oneline -3'
+        fenced = 'Run this in a natedev terminal:\n\n```sh\n' + code + '\n```\n\nRead the result.'
+        status = change_page.DeliveryStatus(self.root)
+        for feedback in (False, True):
+            for answer in (fenced, 'First line\nSecond line'):
+                with self.subTest(feedback=feedback, answer=answer):
+                    row_id = 'C3' if feedback else 'C1'
+                    question = status.ask(self.page, row_id, fenced, kind='feedback' if feedback else 'question')
+                    assert isinstance(question, change_page.QuestionDelivery)
+                    self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
+                    selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (selected, section[1]):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, [code, code] if answer == fenced else [code])
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(blocks))
+                        self.assertEqual(body.count('<pre>'), len(blocks))
+                        if answer != fenced:
+                            prefix = 'Showrunner: ' if feedback else ''
+                            self.assertIn('<p>' + prefix + answer + '</p>', body)
+                    status.write_slots(self.page, row_id, change_page.DeliverySlots(change_page.NoDelivery(), change_page.NoDelivery()))
+
+    def test_both_pages_keep_a_plain_two_line_check_in_one_paragraph(self) -> None:
+        item = change_review.Visible('Numbered moves', 'First line\nSecond line', 'Result')
+        _ = change_review.edit_row(self.review_list, 'C1', item, date(2026, 11, 5), self.production)
+        row = change_page.answer_row(self.page, 'C1')
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        change = change_browser.WaitingChange('page-owner/C1', 'page-owner',
+                                             change_routing.UnavailableProduction(self.review_list), row)
+        for body in (selected, change_browser.section(change, 5)):
+            self.assertIn('<p>First line\nSecond line. You see: Result</p>', body)
+            self.assertNotIn('<pre>', body)
+        self.assertIn('p{white-space:pre-wrap;', selected)
 
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -271,17 +547,14 @@ class ChangePageTests(unittest.TestCase):
         row = change_page.answer_row(self.page, 'C1') | {change_review.CHECK: 'Read\n- First\n- Second'}
         change = change_browser.WaitingChange('orphan/C1', 'orphan',
             change_routing.UnavailableProduction(self.review_list), row)
-        self.assertIn('<h2>Proof</h2><pre>Read</pre><ul><li>First</li><li>Second</li></ul>',
+        self.assertIn('<h2>Proof</h2><p>Read</p><ul><li>First</li><li>Second</li></ul>',
                       change_browser.section(change, 5))
 
     def test_publications_keep_the_html_and_manifest_under_one_configured_root(self) -> None:
-        from scripts.review_links import review_link
-
         settings = Path(os.environ["CONF_DIR"]) / "change_review.conf"
         original = settings.read_text()
         real_write = atomic_file.write_bytes_atomic
         publications: list[tuple[Callable[[], str], str]] = [
-            (change_page.publish_browser, change_page.BROWSER_MANIFEST),
             (lambda: change_page.publish(self.production, self.review_list, ["C1"]), change_page.MANIFEST),
         ]
         for index, (publish, manifest) in enumerate(publications):
@@ -305,6 +578,34 @@ class ChangePageTests(unittest.TestCase):
                 self.assertTrue((folder / manifest).is_file())
                 self.assertFalse(second.exists())
                 self.assertEqual(review_link.review_root(), second)
+
+    def test_bare_command_prints_the_console_link_with_changes_selected(self) -> None:
+        configuration = self.temporary / "config"
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/console.conf", configuration / "console.conf")
+        _ = (configuration / "memory_feed.conf").write_text(f"output_folder={self.root / 'builds'}\n")
+        result = self.command(change_page, change_page.main, [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        url = urlsplit(result.stdout.strip())
+        self.assertEqual((url.scheme, url.path, url.query), ("http", "/console/", ""))
+        self.assertEqual(self.command(change_page, change_page.main, []).stdout, result.stdout)
+        console = self.request(url.path, {})
+        self.assertEqual(console.status, 200)
+        self.assertIn('data-url="/console/changes.html" data-title="Changes"', console.body)
+        self.assertIn('data-url="/console/rebuilds.html" data-title="Rebuilds needed"', console.body)
+        manifest = self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST
+        token = manifest.read_bytes()
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+        changes = self.request("/console/changes.html", {})
+        self.assertEqual(changes.status, 200)
+        self.assertIn("if(parent!==window) parent.postMessage('console-place',location.origin);", changes.body)
+        self.assertIn("const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;", changes.body)
+        self.assertIn("event.data==='console-shown')", changes.body)
+        self.assertIn("restart();refresh(true);", changes.body)
+        self.assertIn("createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", changes.body)
+        self.assertEqual(self.request("/console/rebuilds.html", {}).status, 200)
+        self.assertEqual(change_page.page_url(), "/console/changes.html")
+        self.assertEqual(manifest.read_bytes(), token)
+        self.assertEqual(sorted(path.name for path in manifest.parent.iterdir()), [change_page.BROWSER_MANIFEST])
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
@@ -348,6 +649,7 @@ class ChangePageTests(unittest.TestCase):
             "STAFF_FILE": str(self.temporary / "staff.json"),
             "SHOWRUNNER_STATE_DIR": str(self.temporary / "showrunner-state"),
             "REBUILD_NEEDS_DIR": str(self.temporary / "rebuild-needs"),
+            "USER_ZONE": "America/New_York",
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
@@ -495,7 +797,7 @@ class ChangePageTests(unittest.TestCase):
         def send(target: staff.StaffId, sender: str, message: str) -> None:
             del sender
             messages.append((target, message))
-            if "Change review C1:" in message:
+            if "Change review page-owner/C1:" in message:
                 started.set()
                 if not release.wait(10):
                     raise RuntimeError("test did not release the send")
@@ -505,12 +807,12 @@ class ChangePageTests(unittest.TestCase):
             try:
                 self.assertTrue(started.wait(10))
                 change_page.recover_pending(status)
-                self.assertEqual([target for target, message in messages if "Change review C3:" in message],
+                self.assertEqual([target for target, message in messages if "Change review page-owner/C3:" in message],
                                  list(delivery.alert_recipients))
             finally:
                 release.set()
             sent.result(10)
-        self.assertCountEqual([target for target, message in messages if "Change review C1:" in message],
+        self.assertCountEqual([target for target, message in messages if "Change review page-owner/C1:" in message],
                               delivery.recipients)
         self.assertIsInstance(status.slots(self.page, "C3").validation, change_page.ValidationRequested)
         self.assertNotIn(delivery.attempt, status.request_attempts)
@@ -687,6 +989,7 @@ class ChangePageTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root)
         question = status.ask(self.page, "C1", "Which groups?")
         assert isinstance(question, change_page.QuestionDelivery)
+        assert isinstance(question, change_page.QuestionDelivery)
         self.assertTrue(status.answer_question(self.page, "C1", question.question_id, "All groups"))
         self.assertNotIn(question.attempt, status.request_attempts)
         previous = change_page.DeliveryStatus(self.root)
@@ -754,7 +1057,7 @@ class ChangePageTests(unittest.TestCase):
                                       date(2026, 11, 2), "abcdef12", self.production, producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
         config = self.temporary / "config/review_links.conf"
         _ = config.write_text(config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
-        path = urlsplit(change_page.publish_browser()).path
+        path = change_page.page_url()
         with redirect_stderr(StringIO()) as errors:
             reply = self.request(path, {})
         forms = BrowserForms()
@@ -764,7 +1067,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("review-links unrouted alert:", errors.getvalue())
 
         key = self.file_user_question("Route an unknown owner")
-        browser = change_page.ReviewBrowser("private-owner")
+        browser = change_page.ReviewBrowser("private-owner", kind="questions")
         status = change_page.DeliveryStatus(self.root)
         question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
         _ = self.production.write_text(self.production.read_text() + f"- **Proposals:** `{question.record.path.parent}`\n")
@@ -876,7 +1179,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(read.call_args.args, (self.review_list,))
         self.assertEqual(len(self.messages), 2)
         for row in ("C1", "C3"):
-            self.assertEqual(sum(f"Change review {row}:" in message for _, _, message in self.messages), 1)
+            self.assertEqual(sum(f"Change review page-owner/{row}:" in message for _, _, message in self.messages), 1)
             self.assertIsInstance(status.slots(self.page, row).validation, change_page.ValidationRequested)
         before = self.review_list.read_bytes()
         change_page.recover_pending(change_page.DeliveryStatus(self.root))
@@ -895,7 +1198,7 @@ class ChangePageTests(unittest.TestCase):
         change_page.recover_pending(restarted)
         change_page.recover_pending(restarted)
         self.assertEqual(len(self.messages), 1)
-        self.assertIn("Change review C1: the user asks you to validate this", self.messages[0][2])
+        self.assertIn("Change review page-owner/C1: the user asks you to validate this", self.messages[0][2])
         self.assertIn(f"List: {self.review_list}", self.messages[0][2])
         self.assertIn("Production: page-owner", self.messages[0][2])
         self.assertIn("User feedback: Keep these words", self.messages[0][2])
@@ -995,7 +1298,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(change_review.review_snapshot(listing).reviewed[-1]["Verdict"], "works")
                 self.assertIn(self.production, change_routing.list_documents(listing.read_text()))
                 self.assertEqual([recipient for recipient, _, _ in self.messages], [runner.name] * number)
-                self.assertIn(f"Change review C{number}: works", self.messages[-1][2])
+                self.assertIn(f"Change review page-owner/C{number}: works", self.messages[-1][2])
         self.assertEqual({row["#"]: row["Verdict"] for row in change_review.review_snapshot(listing).reviewed},
                          {"C1": "works", "C2": "works"})
 
@@ -1101,9 +1404,178 @@ class ChangePageTests(unittest.TestCase):
     def answer(self, row: str = "C1", outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return {"row": row, "outcome": outcome, "feedback": feedback, "token": self.page.token}
 
-    def browser(self) -> tuple[str, BrowserForms, str]:
-        path = urlsplit(change_browser.publish()).path
-        reply = self.request(path, {})
+    def test_change_image_markup_is_shared_by_both_pages_and_absent_without_an_image(self) -> None:
+        _, _, before = self.browser()
+        self.assertNotIn('class="change-image"', before)
+        shot = self.temporary / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        text, reviewed = self.review_list.read_text().split(change_review.REVIEWED, 1)
+        lines = text.splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            if line.startswith("| # |"):
+                lines[index] = line.rstrip() + f" {change_review.IMAGE} |\n"
+            elif line.startswith("| ---"):
+                lines[index] = line.rstrip() + " --- |\n"
+            elif line.startswith("| C"):
+                lines[index] = line.rstrip() + (f" {identity} |\n" if line.startswith("| C1 |") else "  |\n")
+        _ = self.review_list.write_text("".join(lines) + change_review.REVIEWED + reviewed)
+        _, _, browser = self.browser()
+        page = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertEqual(browser.count(page_frame.MOTION_SCRIPT), 1)
+        self.assertIn("prefers-reduced-motion: reduce", browser)
+        for body in (browser, page):
+            self.assertEqual(body.count(page_frame.ZOOM_STYLE), 1)
+            self.assertEqual(body.count(page_frame.ZOOM_SCRIPT), 1)
+            self.assertIn('data-image-zoom class="change-image"', body)
+            self.assertIn(f'href="/change-images/{identity}/image.png" target="_blank" rel="noopener"', body)
+            self.assertIn('alt="Screenshot: Numbered moves"', body)
+            self.assertIn('class="change-text"', body)
+            self.assertEqual(body.count('class="change-image"'), 1)
+        with patch.object(change_review, "end_row_scratch", return_value=[]):
+            _ = change_page.submit(self.page, urlencode({"token": self.page.token, "row": "C1", "outcome": "works", "feedback": ""}),
+                                   change_page.DeliveryStatus(self.root))
+        self.assertFalse((self.root / image_store.CHANGE_FOLDER / identity).exists())
+
+    def test_code_copy_controls_reach_command_items_and_shared_assets_reach_both_changes_pages(self) -> None:
+        _ = self.file_user_question('Copy the command?', question='Copy the command?\n1. In a terminal:\n2. `git -C /etc/nixos diff`')
+        question = self.browser('questions')[2]
+        changes = self.browser()[2]
+        selected = change_page.render(self.page, change_page.DeliveryStatus(self.root)).decode()
+        self.assertIn('<pre><code>git -C /etc/nixos diff</code></pre>' + page_frame.COPY_BUTTON, question)
+        self.assertEqual(question.count(page_frame.COPY_BUTTON), 1)
+        for page in (changes, selected):
+            self.assertIn('<p>Run moves list. You see: Each group starts at 1</p>', page)
+            self.assertNotIn(page_frame.COPY_BUTTON, page)
+        for page in (question, changes, selected):
+            with self.subTest(title=page.split('<title>')[1].split('</title>')[0]):
+                self.assertEqual(page.count(page_frame.COPY_SCRIPT), 1)
+                self.assertEqual(page.count(page_frame.COPY_STYLE), 1)
+                self.assertEqual(page.count(page_frame.COPY_BUTTON), page.count('<pre><code>'))
+
+    def test_change_code_blocks_from_the_add_command_copy_exact_text_on_both_pages(self) -> None:
+        code = '  printf \'%s\\n\' "copy check $HOME <tag> & value"\n\techo done | cat\n'
+        before = 'Before:\n- Read the label.\n\n'
+        after = '\n\nAfter:\n- Read the result.'
+        for kind in ('See in action', 'Read only'):
+            for name, block, expected in (
+                ('fenced', '```sh\n' + code + '\n```', [code]),
+                ('backtick line', '`echo "$HOME"`', ['echo "$HOME"']),
+                ('plain', 'Run `echo` without a code block.', []),
+            ):
+                with self.subTest(kind=kind, block=name):
+                    title = f'{kind}: {name}'
+                    result = self.command(change_review, change_review.main, [
+                        'add', '--repo', str(self.repo), '--production', 'page-owner',
+                        '--list', str(self.review_list), '--change', title,
+                        '--check', before + block + after, '--see', 'The command stays exact',
+                    ])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    row = next(row for row in change_review.pending(self.review_list) if row['Change'] == title)
+                    self.assertEqual(row[change_review.CHECK], before + block + after + ' You see: The command stays exact')
+                    _ = change_review.set_row_kind(self.review_list, row['#'], kind, self.production)
+                    selected = change_page.render(replace(self.page, rows=(row['#'],)), change_page.DeliveryStatus(self.root)).decode()
+                    browser = self.browser()[2]
+                    section = re.search(r'<section\b[^>]*data-key="page-owner/' + row['#']
+                                        + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
+                    assert section is not None
+                    for body in (section[1], selected):
+                        blocks = [html.unescape(match[1]) for match in re.finditer(r'<pre><code>(.*?)</code></pre>', body, re.DOTALL)]
+                        self.assertEqual(blocks, expected)
+                        self.assertEqual(body.count(page_frame.COPY_BUTTON), len(expected))
+                        self.assertIn(change_page.review_text_html(before.rstrip()), body)
+                        self.assertIn(change_page.review_text_html(after.lstrip() + ' You see: The command stays exact'), body)
+                        if not expected:
+                            self.assertIn(change_page.review_text_html(row[change_review.CHECK]), body)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser behavior')
+    def test_code_copy_handles_results_repeated_clicks_and_new_blocks_inside_an_iframe(self) -> None:
+        text = '  first <tag> & value\n\tsecond\n'
+        content = change_page.document('<input id="answer" value="keep this">'
+                                       + change_browser.item_html('`placeholder`').replace('placeholder', html.escape(text))
+                                       + '<p>Keep <code>inline</code> unchanged.</p>').decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[], copied=[], turns=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+ const check=(value,text)=>{if(!value) failures.push(text);};
+ const button=document.querySelector('[data-copy-code]'),code=document.querySelector('pre code');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
+ button.click();await turns(0);
+ check(copied[0]===code.textContent,'The clipboard receives the exact code text.');
+ check(button.title==='Copied' && button.getAttribute('aria-label')==='Copied','Success has an accessible label.');
+ check(getComputedStyle(button.querySelector('[data-copy-icon]')).display==='none'
+  && getComputedStyle(button.querySelector('[data-copied-icon]')).display!=='none','Success shows the check icon.');
+ await turns(1200);button.click();await turns(1000);
+ check(button.title==='Copied','A second click restarts the result time.');
+ await turns(1100);
+ check(button.title==='Copy' && button.getAttribute('aria-label')==='Copy code','The result returns to Copy.');
+ navigator.clipboard.writeText=async()=>{throw new Error('Denied');};
+ button.click();await turns(0);
+ check(button.title==='Copy failed' && getComputedStyle(button.querySelector('[data-copy-icon]')).display!=='none','A failed write keeps the copy icon.');
+ await turns(2100);check(button.title==='Copy','A failure returns to Copy.');
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:undefined});
+ const field=document.getElementById('answer');field.focus();field.setSelectionRange(1,4);
+ document.execCommand=command=>{copied.push(document.querySelector('textarea').value);return command==='copy';};
+ button.click();await turns(0);
+ check(copied.at(-1)===code.textContent,'The fallback receives the exact code text.');
+ check(button.title==='Copied' && document.activeElement===field && field.selectionStart===1 && field.selectionEnd===4,'The fallback restores focus and the field selection.');
+ check(!document.querySelector('textarea'),'The fallback removes its textarea.');
+ const fresh=document.querySelector('.code-block').cloneNode(true);document.body.append(fresh);
+ fresh.querySelector('code').textContent='new block\n';fresh.querySelector('button').click();await turns(0);
+ check(copied.at(-1)==='new block\n','A new block works without another listener.');
+ document.execCommand=()=>false;button.click();await turns(0);
+ check(button.title==='Copy failed','A failed fallback reports failure.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})().catch(error=>fetch('/results',{method:'POST',body:JSON.stringify([String(error)])}));
+</script>'''
+        content = content.replace('</body>', probe + '</body>')
+        complete = threading.Event()
+        results: list[list[str]] = []
+
+        class CopyProbe(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == '/complete':
+                    if not complete.wait(20):
+                        self.send_error(504)
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body = (content if self.path == '/frame' else
+                        '<iframe src="/frame"></iframe><img src="/complete" hidden alt="">')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                _ = self.wfile.write(body.encode())
+
+            def do_POST(self) -> None:
+                results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                complete.set()
+                self.send_response(204)
+                self.end_headers()
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), CopyProbe) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                profile = self.temporary / 'copy-profile'
+                profile.mkdir()
+                result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                    '--screenshot', str(self.temporary / 'copy.png'), f'http://127.0.0.1:{server.server_port}/'],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertEqual(results, [[]])
+
+    def browser(self, kind: change_page.ReviewKind = "changes") -> tuple[str, BrowserForms, str]:
+        path = change_page.page_url()
+        reply = self.request(path + ("?type=questions" if kind == "questions" else ""), {})
         self.assertEqual(reply.status, 200)
         forms = BrowserForms()
         forms.feed(reply.body)
@@ -1120,7 +1592,9 @@ class ChangePageTests(unittest.TestCase):
                             ["answer-question", "--production", "page-owner", "--list", str(self.review_list),
                              "--row", row, "--question", question_id, "--text", text])
 
-    def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None) -> str:
+    def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None,
+                           question: str = "Which layout gives each review card enough space for its controls?\n"
+                           + "1. Compact <layout>\n2. Wide layout") -> str:
         """File a canonical question without a reviewer or a real message sender."""
         document = self.production.read_text()
         if "- **Merge branch:**" not in document:
@@ -1130,19 +1604,36 @@ class ChangePageTests(unittest.TestCase):
         owner = next(row for row in record.rows if row.name == "page-owner")
         production = read_production(owner, record)
         items = [item.item for item in update_registration.question_records(production, identities) if item.status == "open"]
-        item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text,
-            question="Which layout gives each review card enough space for its controls?\n1. Compact <layout>\n2. Wide layout",
-            asked_by=(asker or self.unit).id)
+        item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text, question=question,
+                                                   asked_by=(asker or self.unit).id)
         update_registration.store_questions(production, [*items, item], identities)
         filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
         return "question/" + owner.id + "/" + filed.path.name
+
+    def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
+        key = self.file_user_question(MEMORY_BAR_RAW, question=MEMORY_BAR_RAW)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
+                        if item.key == key)
+        update_registration.write_question_record(replace(question.record,
+            item={**question.record.item, "reviewed": MEMORY_BAR_REVIEWED}))
+        before = question.record.path.read_bytes()
+        _, forms, body = self.browser("questions")
+        self.assertIn(key, forms.rows)
+        self.assertIn(f'<h1>{MEMORY_BAR_ASK}</h1>', body)
+        self.assertEqual(body.count(MEMORY_BAR_ASK), 1)
+        self.assertEqual(body.count('name="choice"'), 3)
+        self.assertIn('<ul><li>sccache, the compiler cache: 2.2 GiB now, nearly all of the block.</li>', body)
+        self.assertNotIn('<h2>Recommended</h2>', body)
+        self.assertNotIn('because it names the contents', body)
+        self.assertEqual(question.record.path.read_bytes(), before)
 
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
                                       date(2026, 11, 2), "", self.production, producers=[owner.id], record=staff.snapshot())
-        path = urlsplit(change_browser.publish()).path
+        path = change_page.page_url()
         with patch.object(change_review, "read", wraps=change_review.read) as reads:
             reply = self.request(path, {})
         self.assertEqual(reply.status, 200)
@@ -1159,36 +1650,42 @@ class ChangePageTests(unittest.TestCase):
 
         question = self.file_user_question()
         _, forms, body = self.browser()
-        self.assertIn('data-review-type="questions"', body)
-        self.assertIn('data-review-type="changes"', body)
-        self.assertIn('data-review-type="rebuilds"', body)
-        self.assertIn('data-type-count="questions">1</span>', body)
-        self.assertIn('data-type-count="changes">4</span>', body)
-        self.assertIn("Which layout gives each review card enough space for its controls?", body)
-        self.assertEqual(body.count("Choose the layout"), 1)
-        self.assertIn("questions:'Questions to answer',changes:'Changes to review',rebuilds:'Rebuilds needed'", body)
+        self.assertIn('data-kind="changes"', body)
         self.assertIn('<title>Changes to review</title>', body)
+        self.assertIn('<h1 class="page-title">Changes to review</h1>', body)
+        self.assertNotIn("Which layout gives each review card enough space for its controls?", body)
+        _, forms, body = self.browser("questions")
+        self.assertIn('data-kind="questions"', body)
+        self.assertIn('<title>Questions to answer</title>', body)
+        self.assertIn('<h1 class="page-title">Questions to answer</h1>', body)
+        self.assertIn("Which layout gives each review card enough space for its controls?", body)
+        self.assertNotIn("Choose the layout", body)
         self.assertIn("Compact &lt;layout&gt;", body)
         self.assertIn("Asked by builder-unit", body)
+        self.assertNotIn("The old and new comments agree with the tests", body)
         self.assertEqual(forms.tabs[question], "page-owner")
-        self.assertEqual(forms.outcomes[question], ["answer"])
+        self.assertEqual(forms.outcomes[question], ["answer", "followup", "skip"])
         self.assertEqual(forms.question_counts["page-owner"], 1)
-        for review_type in ("questions", "changes", "rebuilds"):
-            with self.subTest(review_type=review_type, total="absent"):
-                self.assertNotIn('data-total', body)
-                self.assertNotIn("total.textContent", body)
-                self.assertNotIn("+' waiting'", body)
+        for kind in ("changes", "questions"):
+            with self.subTest(kind=kind, controls="absent"):
+                body = self.browser(kind)[2]
+                for removed in ('data-review-type', 'role="tab"', 'data-rebuilds', 'data-total', "total.textContent", "+' waiting'"):
+                    self.assertNotIn(removed, body)
+        with self.subTest(kind="unknown"):
+            for query in ("?type=rebuilds", "?type=changes&type=questions"):
+                self.assertEqual(self.request(path + query, {}).status, 503)
 
+        rebuilds = path.rsplit("/", 1)[0] + "/" + change_page.REBUILDS_NAME
         with self.subTest(rebuilds="missing folder"):
-            browser = change_page.ReviewBrowser("private-rebuilds")
-            status = change_page.DeliveryStatus(self.root)
             with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
-                body = change_browser.render(browser, status).decode()
+                body = change_browser.render_rebuilds().decode()
             reads.assert_called_once_with()
-            self.assertIn('data-type-count="rebuilds">0</span>', body)
-            empty = body.split('<div hidden data-rebuilds data-count="0">', 1)[1].split('</div>', 1)[0]
-            self.assertEqual(empty, '<p>No rebuilds needed.</p>')
+            self.assertIn('<title>Rebuilds needed</title>', body)
+            self.assertIn('<div data-rebuilds data-count="0" data-label=""><p>No rebuilds needed.</p></div>', body)
             self.assertFalse(Path(os.environ["REBUILD_NEEDS_DIR"]).exists())
+            self.assertEqual(self.request(rebuilds, {}).status, 200)
+            forwarded = self.http_request("/zzzzzz/" + change_page.REBUILDS_NAME, {})
+            self.assertEqual((forwarded.status, forwarded.location), (303, "/console/rebuilds.html"))
 
         with self.subTest(rebuilds="machine reasons and current names"):
             owner = next(row for row in staff.snapshot().rows if row.name == "page-owner")
@@ -1206,60 +1703,88 @@ class ChangePageTests(unittest.TestCase):
                 record["created_at"] = created
                 _ = path.write_text(json.dumps(record))
             with patch.object(need, "read_needs", wraps=need.read_needs) as reads:
-                body = change_browser.render(browser, status).decode()
+                body = change_browser.render_rebuilds().decode()
             reads.assert_called_once_with()
-            self.assertIn('data-type-count="rebuilds">2</span>', body)
-            self.assertLess(body.index('data-review-type="changes"'), body.index('data-review-type="rebuilds"'))
-            block = body.split('<div hidden data-rebuilds data-count="2">', 1)[1].split('</div>', 1)[0]
+            answer = rebuild_row.read(Path(os.environ["CONF_DIR"]) / "statusline.conf")
+            self.assertIn(change_browser.rebuild_list(answer, {}, staff.snapshot()), self.request(rebuilds, {}).body)
+            block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1].rsplit('</div>', 1)[0]
             self.assertLess(block.index('data-machine="natedev"'), block.index('data-machine="mac"'))
             self.assertIn('<h2>Rebuild natedev</h2>', block)
             self.assertIn('<h2>Rebuild the Mac</h2>', block)
-            self.assertIn('<p>Run <code>rebuild</code> in a terminal on natedev.</p>', block)
-            self.assertIn('<p>Run <code>rebuild</code> in Terminal on the Mac.</p>', block)
-            self.assertIn('<p>Mac updates can take five minutes while the Mac is reachable.</p>', block)
+            for removed in ("Run <code>rebuild</code>", "five minutes", "One rebuild applies", "Completed requests",
+                            "Commit", "Affected session", "running system"):
+                self.assertNotIn(removed, block)
             self.assertLess(block.index("Apply the second settings."), block.index("Apply the first &lt;settings&gt;."))
-            self.assertEqual(block.count('<p>After the rebuild</p>'), 2)
-            self.assertEqual(block.count('<details><summary>Details</summary>'), 2)
-            self.assertNotIn('<details open', block)
             natedev, mac = block.split('</article>', 1)
-            self.assertEqual(natedev.count('One rebuild applies all listed changes.'), 1)
-            self.assertNotIn('One rebuild applies all listed changes.', mac)
-            main, details = natedev.split('<details>', 1)
-            self.assertNotIn('For ', main)
-            self.assertNotIn('renamed', main)
-            self.assertNotIn('Configuration commit:', main)
-            self.assertIn('Configuration commit: <code>' + 'b' * 40 + '</code>', details)
-            self.assertIn('Configuration commit: <code>' + 'a' * 40 + '</code>', details)
-            self.assertLess(details.index('b' * 40), details.index('a' * 40))
-            self.assertIn('Affected session: renamed &lt;unit&gt; (unit)', details)
-            self.assertIn('Affected session: second-session (unit)', details)
-            self.assertEqual(details.count('Requested by:'), 1)
-            self.assertIn('Requested by: page-owner (showrunner)', details)
-            self.assertNotIn('Requested by: second-session', details)
-            self.assertIn('Unknown session: unknown-staff', mac)
-            self.assertIn('Unknown session: unknown-requester', mac)
-            self.assertIn('Configuration commit: <code>' + 'c' * 40 + '</code>', mac)
-            self.assertTrue(block.endswith('<p>Completed requests clear automatically. Refresh this page after the rebuild.</p>'))
+            self.assertIn('<div data-owner><h3>second-session (unit)</h3>'
+                          + '<dl><dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
+                          + '<dd>Apply the second settings.</dd></dl></div><div data-owner><h3>page-owner (showrunner)</h3>',
+                          natedev)
+            self.assertIn('<h3>Unknown session: unknown-requester</h3>', mac)
             for control in ('<form', '<textarea', 'data-showrunner', 'data-next', 'data-key'):
                 self.assertNotIn(control, block)
-            self.assertIn("showrunners.hidden=rebuildMode", body)
-            self.assertIn("next.hidden=rebuildMode || !waiting().some(r=>r!==current)", body)
-            self.assertNotIn('data-total', body)
 
-            with self.subTest(rebuilds="need spacing"):
-                self.assertIn('[data-rebuilds] li+li{margin-top:16px}', body)
-                self.assertIn('[data-rebuilds] details p{margin:0}', body)
-                self.assertIn('[data-rebuilds] details p+p{margin-top:8px}', body)
-                self.assertIn('margin-top:16px;padding-top:16px', body)
-                self.assertIn('flex-wrap:nowrap', body)
-                self.assertIn('section h1,h2{font-size:20px', body)
+            with self.subTest(rebuilds="time column"):
+                self.assertIn('[data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr)', body)
+                self.assertIn('[data-rebuilds] dt{grid-column:1;color:light-dark(#5f5f5f,#b0b0b0)}[data-rebuilds] dd{grid-column:2;', body)
 
             with self.subTest(rebuilds="requester absent"):
-                single: need.NeedRecord = {**need.read_needs()[0].newest, "requested_by": ""}
+                natedev_needs = next(item for item in need.read_needs() if item.newest["machine"] == "natedev")
+                single: need.NeedRecord = {**natedev_needs.newest, "requested_by": ""}
                 summary = need.MachineNeeds(single, (single["reason"],), (single,))
-                content = change_browser.rebuild_list([summary], staff.snapshot())
-                self.assertNotIn('Requested by:', content)
-                self.assertNotIn('One rebuild applies all listed changes.', content)
+                content = change_browser.rebuild_list(
+                    rebuild_row.RebuildAnswer(("natedev",), False, needs=(summary,)), {}, staff.snapshot())
+                self.assertIn('data-count="1" data-label="Rebuild natedev"', content)
+                self.assertIn('<h3>second-session (unit)</h3>', content)
+
+            with self.subTest(rebuilds="status line comparison"):
+                configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+                cache = self.temporary / "rebuild-cache"
+                _ = configuration.write_text(f"rebuild.cache={cache}\n")
+                details = rebuild_row.ExpectedSystems(
+                    "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
+                    "/nix/store/" + "1" * 32 + "-natedev", "/nix/store/" + "2" * 32 + "-mac").details()
+                _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{details}\n")
+                _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": [
+                    {"commit": "c" * 40, "at": "2026-11-12T10:00:00+00:00", "reason": "Apply the Mac settings.",
+                     "session": ""},
+                    {"commit": "e" * 40, "at": "2026-11-12T14:30:00+00:00", "reason": "memory: <defer> defrag",
+                     "session": owner.id}]}))
+                body = change_browser.render_rebuilds().decode()
+                self.assertEqual(rebuild_row.read(configuration).machines, ("natedev", "mac"))
+                block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1]
+                mac = block.split('</article>', 1)[1]
+                # The filed need covers its commit, so that commit shows once, with the need's requester.
+                self.assertEqual(mac.count("Apply the Mac settings."), 1)
+                self.assertIn('<h2>Rebuild the Mac</h2><div data-owner><h3>page-owner (showrunner)</h3>'
+                              + '<dl><dt><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dt>'
+                              + '<dd>memory: &lt;defer&gt; defrag</dd></dl></div><div data-owner>', mac)
+                only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
+                                                   {"mac": (rebuild_row.Change("f" * 40, "2026-11-12T15:00:00+00:00",
+                                                                               "Turn on swap", ""),)},
+                                                   staff.snapshot())
+                self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
+                                 + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
+                                 + '<div data-owner><h3>Unknown session</h3>'
+                                 + '<dl><dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
+                                 + '<dd>Turn on swap</dd></dl></div></article></div>')
+
+            with self.subTest(rebuilds="one owner and one time each"):
+                grouped = change_browser.rebuild_list(
+                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
+                    {"mac": (rebuild_row.Change("1" * 40, "2026-11-12T13:00:00+00:00", "Older", owner.id),
+                             rebuild_row.Change("2" * 40, "2026-11-12T15:00:00+00:00", "First", owner.id),
+                             rebuild_row.Change("3" * 40, "2026-11-12T14:00:00+00:00", "Between", ""),
+                             rebuild_row.Change("4" * 40, "2026-11-12T15:00:00+00:00", "Second", owner.id))},
+                    staff.snapshot())
+                self.assertEqual(grouped.count('<h3>page-owner (showrunner)</h3>'), 1)
+                self.assertIn('<div data-owner><h3>page-owner (showrunner)</h3><dl>'
+                              + '<dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
+                              + '<dd>First</dd><dd>Second</dd>'
+                              + '<dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
+                              + '<dd>Older</dd></dl></div><div data-owner><h3>Unknown session</h3>', grouped)
+                self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
+                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
 
     def test_user_question_answers_follow_each_typed_relay(self) -> None:
         destination = fixture_member("showrunner", name="destination")
@@ -1271,7 +1796,7 @@ class ChangePageTests(unittest.TestCase):
                 key = self.file_user_question("Choose " + name, asker=asker)
                 if name == "moved":
                     _ = staff.move(moved.id, staff.ReportsTo(destination.id))
-                path, forms, _ = self.browser()
+                path, forms, _ = self.browser("questions")
                 self.delivery_done.clear()
                 reply = self.http_request(path, self.browser_fields(forms, key, "answer", "Use compact\nKeep the choices"))
                 self.assertEqual(reply.status, 200, reply.body)
@@ -1282,7 +1807,7 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn("Use compact\nKeep the choices", self.messages[-1][2])
                 if name == "moved":
                     self.assertIn("For: moved-unit", self.messages[-1][2])
-                _, after, _ = self.browser()
+                _, after, _ = self.browser("questions")
                 self.assertNotIn(key, after.rows)
                 count = len(self.messages)
                 duplicate = self.http_request(path, self.browser_fields(forms, key, "answer", "Use compact"))
@@ -1297,10 +1822,10 @@ class ChangePageTests(unittest.TestCase):
             second_status = change_page.DeliveryStatus(self.root)
             first = next(item for item in change_browser.prepare(browser, first_status).questions if item.key == key)
             second = next(item for item in change_browser.prepare(browser, second_status).questions if item.key == key)
-            delivery, _ = change_browser.submit_question(first, "First answer", first_status)
+            delivery, _ = change_browser.submit_question(first, "answer", "First answer", first_status)
             pending = first_status.path(delivery.page, delivery.row).read_bytes()
             with self.assertRaises(change_page.QuestionAnswerRefused):
-                _ = change_browser.submit_question(second, "Second answer", second_status)
+                _ = change_browser.submit_question(second, "answer", "Second answer", second_status)
             self.assertEqual(first_status.path(delivery.page, delivery.row).read_bytes(), pending)
             count = len(self.messages)
             change_page.deliver(delivery, first_status)
@@ -1309,11 +1834,59 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
 
+    def test_followup_waits_for_the_reply_and_skip_moves_a_question_to_the_end(self) -> None:
+        texts = {self.file_user_question("Choose first"): "Choose first",
+                 self.file_user_question("Choose second"): "Choose second"}
+        path, forms, body = self.browser("questions")
+        first, second = [key for key in forms.rows if key.startswith("question/")]
+        self.assertEqual({first, second}, set(texts))
+        self.assertIn('<p class="answer-help" id=', body)
+        self.assertIn('>Your answer</label>', body)
+
+        with self.subTest(outcome="skip"):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, self.browser_fields(forms, first, "skip", "")).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+            _, after, _ = self.browser("questions")
+            self.assertEqual([key for key in after.rows if key.startswith("question/")], [second, first])
+            self.assertEqual(self.messages[-1][2], "From the user (via the review page), skipped for now; "
+                             + f"it stays open at the end of the list: {texts[first]}\nFor: builder-unit")
+
+        with self.subTest(outcome="followup without text"):
+            reply = self.http_request(path, self.browser_fields(forms, second, "followup", " "))
+            self.assertEqual(reply.status, 400)
+
+        with self.subTest(outcome="followup"):
+            self.delivery_done.clear()
+            reply = self.http_request(path, self.browser_fields(forms, second, "followup", "Which file holds it?"))
+            self.assertEqual(reply.status, 200, reply.body)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(self.messages[-1][0], self.unit.name)
+            self.assertIn("Which file holds it?", self.messages[-1][2])
+            self.assertIn(f"update_registration.py reply --production page-owner --item '{texts[second]}' --text",
+                          self.messages[-1][2])
+            _, after, _ = self.browser("questions")
+            self.assertNotIn(second, after.rows)
+            self.assertIn(first, after.rows)
+
+        with self.subTest(outcome="reply"):
+            record = staff.snapshot()
+            owner = next(row for row in record.rows if row.name == "page-owner")
+            production = read_production(owner, record)
+            identities = update_registration.QuestionStaff.for_record(record)
+            update_registration.reply(production, texts[second], "The file is layout.toml.", identities=identities)
+            _, after, body = self.browser("questions")
+            self.assertIn(second, after.rows)
+            self.assertIn("<h2>Follow-up</h2><p>Which file holds it?</p><h2>Reply</h2><p>The file is layout.toml.</p>", body)
+
     def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
         _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
         path, forms, body = self.browser()
         self.assertEqual(forms.tabs["page-owner/C1"], "sdlc")
+        self.assertIn('<dt>change:</dt><dd>sdlc/C1</dd>', body)
+        self.assertNotIn('<dt>change:</dt><dd>page-owner/C1</dd>', body)
+        self.assertIn('<dt>change:</dt><dd>sdlc/C1</dd>', self.request(self.page_path, {}).body)
         self.assertIn('sdlc (3)', body)
         reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Check this yourself"))
         self.assertEqual(reply.status, 200)
@@ -1326,8 +1899,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
 
     def test_a_renamed_unit_gets_its_current_staff_session(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         _ = staff.rename(self.unit.id, "x")
         current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
@@ -1335,8 +1906,6 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages[0][0], "x")
 
     def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:
-        from scripts.production.staff_test_support import fixture_runtime_id
-
         status = change_page.DeliveryStatus(self.root)
         delivery = change_page.submit(self.page, urlencode(self.answer(outcome="validate")), status)
         owner = staff.snapshot().by_path("page-owner")
@@ -1386,11 +1955,6 @@ class ChangePageTests(unittest.TestCase):
                 self.assertEqual(list(forms.counts.items()), [("page-owner", 3), ("alpha", 0), ("demo", 0)])
                 prepared = change_browser.prepare(change_browser.page_at(self.root, path), change_page.DeliveryStatus(self.root))
                 self.assertEqual(list(prepared.queues), ["page-owner", "alpha", "demo"])
-
-    def test_the_selected_tab_outline_stays_inside_its_scroll_container(self) -> None:
-        path, forms, body = self.browser()
-        del path, forms
-        self.assertIn(".review-types button:focus-visible{outline-offset:-5px}", body)
 
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
@@ -1475,8 +2039,10 @@ class ChangePageTests(unittest.TestCase):
         merged = self.git("rev-parse", "HEAD")
         _ = self.review_list.write_text(self.review_list.read_text().replace(merged, "").replace(self.unit.id, ""))
         path, forms, body = self.browser()
-        del path, body
+        del path
         self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
+        self.assertIn('<dt>change:</dt><dd>page-owner/C1</dd>', body)
+        self.assertIn('<dt>change:</dt><dd>page-owner/C1</dd>', self.request(self.page_path, {}).body)
 
     def test_an_unknown_unit_stays_in_its_list_even_when_production_names_another_showrunner(self) -> None:
         foreign = self.temporary / "sdlc-production.md"
@@ -1550,6 +2116,37 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         row = next(row for row in change_review.review_rows(earlier) if row["#"] == "C2")
         self.assertEqual(row["Verdict"], "not works: Needs a correction")
+
+    def test_a_dependent_row_follows_its_prerequisite_before_and_after_detachment(self) -> None:
+        parent = staff.snapshot().by_path("page-owner")
+        assert parent is not None
+        earlier = self.temporary / "change-review - sdlc.md"
+        document = self.temporary / "sdlc.md"
+        _ = document.write_text(f"# Child\n- **Change review:** `{earlier}`\n")
+        child = fixture_member("showrunner", name="sdlc", parent=parent.id,
+                               doc=staff.LiveDoc(local_machine(), document))
+        _ = staff.move(self.unit.id, staff.ReportsTo(child.id))
+        _ = change_review.append_rows(earlier, [change_review.Visible("Prerequisite", "Read", "Proof")],
+                                      date(2026, 11, 2), "abcdef12", document,
+                                      producers=[self.unit.id], record=staff.snapshot())
+        _ = earlier.write_text(earlier.read_text().replace("| C1 |", "| C41 |"))
+        result = self.command(change_review, change_review.main,
+                              ["add", "--production", "sdlc", "--repo", str(self.repo),
+                               "--change", "Dependent", "--check", "Read", "--see", "Proof",
+                               "--urgency", "blocks", "--after", "sdlc/C41"])
+        self.assertEqual((result.returncode, result.stdout), (0, "C4\n"), result.stderr)
+        added = next(row for row in change_review.pending(self.review_list) if row["#"] == "C4")
+        self.assertEqual(urgency.parse_cell(added[change_review.URGENCY])[1], "sdlc/C41")
+        for attached in (True, False):
+            with self.subTest(attached=attached):
+                if not attached:
+                    _ = staff.move(child.id, staff.StaffRoot())
+                path, forms, body = self.browser()
+                del path, body
+                keys = list(forms.rows)
+                self.assertEqual(forms.tabs["sdlc/C41"], "sdlc")
+                self.assertEqual(forms.tabs["page-owner/C4"], "sdlc")
+                self.assertLess(keys.index("sdlc/C41"), keys.index("page-owner/C4"))
 
     def test_rows_from_two_units_use_their_producer_ids_for_their_staff_tabs(self) -> None:
         first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
@@ -1633,13 +2230,13 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(next(row["Verdict"] for row in rows if row["#"] == "C1"), "not works: Keep <my> words & outcome")
 
         key = self.file_user_question("Choose a safe save")
-        path, forms, _ = self.browser()
+        path, forms, _ = self.browser("questions")
         fields = self.browser_fields(forms, key, "answer", "Keep my typed answer")
         with patch.object(update_registration, "answer", side_effect=OSError("private save unavailable")):
             failed = self.http_request(path, fields)
         self.assertEqual(failed.status, 503)
         self.assertIn("could not be saved", failed.body)
-        self.assertIn(key, self.browser()[1].rows)
+        self.assertIn(key, self.browser("questions")[1].rows)
         self.delivery_done.clear()
         saved = self.http_request(path, fields)
         self.assertEqual(saved.status, 200, saved.body)
@@ -1664,7 +2261,7 @@ class ChangePageTests(unittest.TestCase):
         for failures in (1, 3):
             with self.subTest(user_question_failures=failures):
                 key = self.file_user_question("Choose retry " + str(failures))
-                path, forms, _ = self.browser()
+                path, forms, _ = self.browser("questions")
                 calls: list[str] = []
                 remaining = failures
 
@@ -1683,7 +2280,7 @@ class ChangePageTests(unittest.TestCase):
                     self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
                 self.assertEqual(len(calls), 2 if failures == 1 else 4)
                 self.assertEqual(sum("delivery needs attention" in text for text in calls), int(failures == 3))
-                self.assertNotIn(key, self.browser()[1].rows)
+                self.assertNotIn(key, self.browser("questions")[1].rows)
 
     def test_the_browser_refuses_extra_fields_bad_tokens_and_unshown_rows(self) -> None:
         path, forms, body = self.browser()
@@ -1698,7 +2295,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.messages, [])
 
         key = self.file_user_question("Choose elsewhere")
-        path, forms, _ = self.browser()
+        path, forms, _ = self.browser("questions")
         owner = next(row for row in staff.snapshot().rows if row.name == "page-owner")
         _ = update_registration.answer(read_production(owner, staff.snapshot()), "Choose elsewhere")
         count = len(self.messages)
@@ -1712,11 +2309,76 @@ class ChangePageTests(unittest.TestCase):
         queue = next_item.change_queue(self.production)
         urgency.pin(queue.name, "C3")
         path, forms, body = self.browser()
-        self.assertEqual(list(forms.rows), ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
+        self.assertEqual(forms.orders["page-owner"], ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
         before = set(self.root.iterdir())
         self.assertEqual(self.request(path, {}).status, 200)
         self.assertEqual(set(self.root.iterdir()), before)
         self.assertIn('data-next hidden>Skip for now', body)
+
+    def test_change_views_use_next_queues_across_children_and_independent_roots(self) -> None:
+        root = staff.snapshot().by_path("page-owner")
+        assert root is not None
+        root = staff.rename(root.id, "natedev")
+        docs: dict[str, Path] = {root.name: self.production}
+        for name, level, day in (("alpha", urgency.BLOCKS, 3), ("zeta", urgency.LATER, 2)):
+            doc = self.temporary / f"{name}.md"
+            _ = doc.write_text(f"# {name}\n- **Change review:** `{self.review_list}`\n")
+            owner = fixture_member("showrunner", name=name, parent=root.id, doc=staff.LiveDoc(local_machine(), doc))
+            docs[name] = doc
+            _ = change_review.append_rows(self.review_list, [change_review.Visible(name, "Read", "Proof")],
+                date(2026, 11, day), "", doc, urgency.cell(urgency.Urgency(level)),
+                producers=[owner.id], record=staff.snapshot())
+        _ = next_item.move_to_end(next_item.CHANGE, docs["alpha"], key="C4")
+        tab_queue = next_item.change_queue(self.production)
+        urgency.pin(tab_queue.name, "C3")
+        all_queue = next_item.change_queue(self.production, below=True)
+        urgency.pin(all_queue.name, "C2")
+        urgency.move_to_end(all_queue.name, "C5", datetime(2026, 11, 5))
+        _ = change_review.append_rows(self.review_list, [change_review.Visible("Unrouted", "Read", "Proof")],
+            date(2026, 10, 1), "", self.production, urgency.cell(urgency.Urgency(urgency.BLOCKS)),
+            producers=[staff.StaffId("missing-producer")], record=staff.snapshot())
+
+        def expected(doc: Path, below: bool = False) -> list[str]:
+            queue = next_item.change_queue(doc, below)
+            prefix = change_review.scope_list(doc).stem.removeprefix(change_review.PREFIX) + "/"
+            return [entry.key if "/" in entry.key else prefix + entry.key
+                    for entry in urgency.queue_order(queue.entries, queue.name)]
+
+        _, forms, _ = self.browser()
+        for name, doc in docs.items():
+            with self.subTest(tab=name):
+                self.assertEqual(forms.orders[name], expected(doc))
+        self.assertEqual(forms.orders[""], expected(self.production, below=True) + ["page-owner/C6"])
+        self.assertEqual(list(forms.rows), forms.orders[""])
+        self.assertEqual(forms.orders["natedev"][0], "page-owner/C3")
+        self.assertEqual(forms.orders[""][0], "page-owner/C2")
+
+        other = self.temporary / "change-review - hana.md"
+        doc = self.temporary / "hana.md"
+        _ = doc.write_text(f"# Hana\n- **Change review:** `{other}`\n")
+        owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc(local_machine(), doc))
+        docs[owner.name] = doc
+        _ = change_review.append_rows(other, [change_review.Visible(f"Hana {number}", "Read", "Proof")
+                                              for number in range(3)],
+            date(2026, 10, 2), "", doc, urgency.cell(urgency.Urgency(urgency.BLOCKS)),
+            producers=[owner.id] * 3, record=staff.snapshot())
+        hana_queue = next_item.change_queue(doc, below=True)
+        urgency.pin(hana_queue.name, "C3")
+        urgency.move_to_end(hana_queue.name, "C1", datetime(2026, 11, 5))
+        self.assertEqual(expected(doc, below=True), ["hana/C3", "hana/C2", "hana/C1"])
+        settings = self.temporary / "config/review_links.conf"
+        original = settings.read_text()
+        for first, roots in (("natedev", ("natedev", "hana")), ("hana", ("hana", "natedev")),
+                             ("missing", ("hana", "natedev")), ("alpha", ("hana", "natedev"))):
+            _ = settings.write_text(original.replace("changes_first_root=natedev", f"changes_first_root={first}"))
+            _, forms, _ = self.browser()
+            with self.subTest(first_root=first):
+                for name, production in docs.items():
+                    self.assertEqual(forms.orders[name], expected(production))
+                self.assertEqual(forms.orders[""], expected(docs[roots[0]], below=True)
+                                 + expected(docs[roots[1]], below=True) + ["page-owner/C6"])
+                self.assertEqual(forms.orders["unrouted"], ["page-owner/C6"])
+                self.assertEqual(list(forms.rows), forms.orders[""])
 
     def test_empty_lists_keep_their_zero_count_tabs(self) -> None:
         for row in ("C1", "C2", "C3"):
@@ -1853,7 +2515,7 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
         self.assertEqual(refreshed.outcomes["page-owner/C1"], [])
         self.assertIn("The showrunner will act on this", content)
-        direct = self.request(self.page_path, {}).body.split('<section id="C1">', 1)[1].split('</section>', 1)[0]
+        direct = self.request(self.page_path, {}).body.split('<section id="C1" data-change-card>', 1)[1].split('</section>', 1)[0]
         self.assertIn("The showrunner will act on this", direct)
         self.assertNotIn('<form', direct)
         repeat = self.http_request(path, fields)
@@ -1950,6 +2612,49 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.answer_question("Some groups.").returncode, 1)
         self.assertEqual(record.read_bytes(), before[0])
 
+    def test_answer_question_accepts_current_and_list_ids_without_changing_delivery_keys(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "Which groups?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        for identity in ("sdlc/C1", "page-owner/C1"):
+            result = self.answer_question("All groups.", identity, question_id=question.question_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("sdlc/C1", result.stdout)
+        slots = status.slots(self.page, "C1")
+        self.assertIsInstance(slots.question, change_page.AnsweredQuestion)
+        self.assertFalse(status.path(self.page, "sdlc/C1").exists())
+
+    def test_selected_row_links_accept_current_and_list_ids_with_local_storage_keys(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
+        before = self.review_list.read_bytes()
+        for identity in ("sdlc/C1", "page-owner/C1"):
+            with self.subTest(identity=identity):
+                result = self.command(change_page, change_page.main, ["--production", "page-owner",
+                    "--list", str(self.review_list), identity])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                page = change_page.page_at(self.root, urlsplit(result.stdout.strip()).path)
+                self.assertEqual((page.review_list, page.rows), (self.review_list, ("C1",)))
+                self.assertIn('<dt>change:</dt><dd>sdlc/C1</dd>', change_page.render(page, change_page.DeliveryStatus(self.root)).decode())
+        self.assertEqual(self.review_list.read_bytes(), before)
+
+    def test_selected_row_link_resolves_the_productions_selected_legacy_list(self) -> None:
+        legacy = self.review_list.with_name("legacy-review.md")
+        _ = self.review_list.rename(legacy)
+        _ = self.production.write_text(self.production.read_text().replace(str(self.review_list), str(legacy)))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc(local_machine(), self.production))
+        _ = staff.move(self.unit.id, staff.ReportsTo(runner.id))
+        before = legacy.read_bytes()
+        result = self.command(change_page, change_page.main, ["--production", "sdlc", "sdlc/C1"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = change_page.page_at(self.root, urlsplit(result.stdout.strip()).path)
+        self.assertEqual((page.review_list, page.rows), (legacy, ("C1",)))
+        self.assertIn('<dt>change:</dt><dd>sdlc/C1</dd>', change_page.render(page, change_page.DeliveryStatus(self.root)).decode())
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertFalse(self.review_list.exists())
+
     def test_question_posts_refuse_empty_and_blank_text_without_saving_or_sending(self) -> None:
         path, forms, body = self.browser()
         del body
@@ -1990,6 +2695,9 @@ class ChangePageTests(unittest.TestCase):
                 path, _, content = self.browser()
                 del path
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
+                # An open page reloads, not updates, when the server's page script is newer than its own.
+                self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
+                self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
         for interval in ("4", "301", "nan"):
             with self.subTest(page_refresh_seconds=interval, range="invalid"):
                 _ = settings.write_text(original.replace("page_refresh_seconds=15", f"page_refresh_seconds={interval}"))
@@ -2035,7 +2743,7 @@ class ChangePageTests(unittest.TestCase):
                     self.assertIsInstance(slots.question, change_page.OpenQuestion)
                     assert isinstance(slots.question, change_page.OpenQuestion)
                     self.assertEqual(slots.question.text, normalized)
-                    self.assertIn('<p>\n First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
+                    self.assertIn('<p> First &lt;line&gt; \n\n Second &amp; line\nThird</p>',
                                   self.http_request(path, {}).body)
                 saved = self.review_list.read_bytes()
                 delivery = record.read_bytes() if record.exists() else b""
@@ -2287,7 +2995,7 @@ class ChangePageTests(unittest.TestCase):
             question = next(item for item in change_browser.prepare(browser, pending_status).questions if item.key == key)
             with patch.object(update_registration, "answer", side_effect=OSError("answer disk unavailable")):
                 with self.assertRaisesRegex(OSError, "answer disk unavailable"):
-                    _ = change_browser.submit_question(question, "Failed answer", pending_status)
+                    _ = change_browser.submit_question(question, "answer", "Failed answer", pending_status)
             page = change_page.ReviewPage(question.record.path, self.production, (question.record.path.stem,), "")
             self.assertIsInstance(pending_status.slots(page, page.rows[0]).verdict, change_page.NoDelivery)
             self.assertEqual(pending_status.request_attempts, {})
@@ -2300,7 +3008,7 @@ class ChangePageTests(unittest.TestCase):
             key = self.file_user_question("Keep an uncertain answer private")
             pending_status = change_page.DeliveryStatus(self.root)
             question = next(item for item in change_browser.prepare(browser, pending_status).questions if item.key == key)
-            delivery, _ = change_browser.submit_question(question, "Unconfirmed answer", pending_status)
+            delivery, _ = change_browser.submit_question(question, "answer", "Unconfirmed answer", pending_status)
             path = pending_status.path(delivery.page, delivery.row)
             saved = cast(change_page.StoredDeliverySlots, json.loads(path.read_text()))
             saved_answer = saved.get("user_answer")
@@ -2327,73 +3035,77 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn('data-next hidden>Skip for now', body)
         self.assertNotIn('data-left', body)
         self.assertIn('<p hidden data-empty></p>', body)
-        self.assertIn("empty.hidden=rebuildMode || current!==null", body)
+        self.assertIn("empty.hidden=current!==null", body)
         self.assertIn("No questions for this showrunner.", body)
         self.assertIn("No questions to answer.", body)
         self.assertIn("No changes for this showrunner.", body)
         self.assertIn("No changes to review.", body)
         self.assertIn("current===row && (tab==='' || tab===row.dataset.tab) && navigation===position", body)
-        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});", body)
         self.assertIn("go(following?.dataset.key || '')", body)
         self.assertNotIn("rows.push(row)", body)
         with self.subTest(refresh="visibility, held content, and position"):
-            for rule in ("document.visibilityState!=='visible'", "setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000)",
+            for rule in ("document.visibilityState!=='visible'", "setInterval(()=>refresh(),Number(seconds())*1000)",
+                         "createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds)", "pageRefresh.restart()",
                          "document.addEventListener('visibilitychange'", "fetch(location.href,{cache:'no-store'})",
                          "new DOMParser()", "content.replaceWith(fresh)", "fresh.outerHTML===shownPage",
                          "if(!heldPage || activeSaves", "field.value!==''", "document.addEventListener('input'",
                          "details[open]", "field.setSelectionRange(...selection)", "window.scrollTo({left,top,behavior:'instant'})",
-                         "row.dataset.key===current?.dataset.key", "rows.slice(previous+1)"):
+                         "row.dataset.key===current?.dataset.key", "ordered.slice(previous+1)"):
                 self.assertIn(rule, body)
-            self.assertNotIn('location.reload', body)
+            # The one full reload is for a page whose script is older than the server's.
+            self.assertEqual(body.count('location.reload'), 1)
+            self.assertIn('if(fresh.dataset.script!==content.dataset.script){location.reload();return;}', body)
         with self.subTest(refresh="one automatic load and a replacement load after saving"):
             self.assertIn("activeLoads && !supersede", body)
             self.assertIn("activeLoads++", body)
             self.assertIn("finally{activeLoads--;}", body)
-            self.assertIn("heldPage=null;newestRequest++;refreshPage(true)", body)
+            self.assertIn("heldPage=null;newestRequest++;pageRefresh.refresh(true)", body)
             self.assertIn("if(request!==newestRequest || !fresh) return", body)
         with self.subTest(refresh="a visible tab replaces an active load"):
             self.assertIn("async function refreshPage(supersede=false)", body)
-            self.assertIn("if(document.visibilityState==='visible') refreshPage(true)", body)
-        with self.subTest(navigation="tab bar and showrunner menu"):
-            self.assertIn('class="review-types" role="tablist"', body)
-            self.assertIn('id="review-panel" role="tabpanel"', body)
-            self.assertEqual(body.count('role="tab" aria-controls="review-panel"'), 3)
+            self.assertIn("document.addEventListener('visibilitychange',()=>{restart();refresh(true);})", body)
+            self.assertIn("if(!paused()) return load(supersede)", body)
+        with self.subTest(navigation="one kind and a showrunner menu"):
+            self.assertNotIn('role="tablist"', body)
+            self.assertIn('data-kind="changes"', body)
+            self.assertIn("kind=content.dataset.kind", body)
             self.assertIn('id="review-showrunner" aria-label="Showrunner"', body)
             self.assertIn("runnerMenu.replaceChildren(new Option('All ('", body)
             self.assertIn("tab=place.get('showrunner') || ''", body)
             self.assertIn("tab==='' || r.dataset.tab===tab", body)
             self.assertIn("runnerMenu.value=tab", body)
-            self.assertIn("event.key==='ArrowRight'", body)
-            self.assertIn("event.key==='ArrowLeft'", body)
-            self.assertIn("event.key==='Home'", body)
-            self.assertIn("event.key==='End'", body)
         with self.subTest(controls="labels and action groups"):
             self.assertIn('<label for="review-showrunner">Showrunner:</label>', body)
             self.assertIn('>Comment, question or feedback</label>', body)
             self.assertIn('value="validate">Ask showrunner to check</button>', body)
-            self.assertIn('<div class="secondary-actions"><div><button name="outcome" value="validate"', body)
-            self.assertIn('value="feedback">Send feedback', body)
-            self.assertIn('<div class="feedback-actions">', body)
-        with self.subTest(navigation="Skip follows the action buttons"):
-            self.assertIn('.navigation{padding:12px 0;background:Canvas}', body)
+            self.assertIn('<div class="answer-actions"><button name="outcome" value="works">Works</button>'
+                          + '<button name="outcome" value="not works">Does not work</button>'
+                          + '<button name="outcome" value="validate">Ask showrunner to check</button>', body)
+            self.assertIn('value="feedback">Send feedback</button></div></form>', body)
+            self.assertNotIn('secondary-actions', body)
+        with self.subTest(navigation="Skip joins the action row"):
+            self.assertIn("target?.querySelector('form:not([hidden]) .answer-actions')", body)
+            self.assertIn('.navigation:empty{display:none}', body)
             self.assertNotIn('position:sticky', body)
         with self.subTest(card="title and metadata"):
             card = body.split('<section hidden data-type="changes"', 1)[1].split('</section>', 1)[0]
-            title, metadata = card.split('<details><summary>Details</summary>', 1)
-            details, proof = metadata.split('</details>', 1)
-            self.assertIn('<h1>Numbered moves</h1>', title)
-            self.assertNotIn('class="kind"', title)
-            self.assertIn('page-owner/C1', details)
-            self.assertIn('2026-11-01', details)
-            self.assertIn(self.git('rev-parse', 'HEAD'), details)
-            self.assertIn('See in action', details)
+            proof, metadata = card.split('<dl class="change-details">', 1)
+            details = metadata.split('</dl>', 1)[0]
+            self.assertIn('<h1>Numbered moves</h1>', proof)
             self.assertIn('<h2>How to check</h2>', proof)
-            self.assertNotIn('<details open', card)
+            self.assertLess(proof.index('<h2>How to check</h2>'), proof.index('</form>'))
+            self.assertIn('<dt>change:</dt><dd>page-owner/C1</dd>', details)
+            self.assertIn('<dt>date:</dt><dd>2026-11-01</dd>', details)
+            self.assertIn(f'<dt>commit:</dt><dd>{self.git("rev-parse", "HEAD")}</dd>', details)
+            self.assertIn('<dt>kind:</dt><dd>See in action</dd>', details)
+            self.assertNotIn('<dt>time:</dt>', details)
+            self.assertNotIn('<details', card)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:
-        _ = self.file_user_question("First question")
-        _ = self.file_user_question("Second question")
+        for text in ("First question", "Second question"):
+            _ = self.file_user_question(text, question="Pick one.\n\nChoices:\n1. Compact\n2. Wide")
         other = self.temporary / "change-review - all.md"
         document = self.temporary / "all.md"
         _ = document.write_text(f"# All\n- **Showrunner checkout:** `{self.repo}`\n- **Change review:** `{other}`\n")
@@ -2404,7 +3116,7 @@ class ChangePageTests(unittest.TestCase):
         feedback = status.ask(self.page, "C3", "Make the proof clearer.", kind="feedback")
         assert isinstance(feedback, change_page.QuestionDelivery)
         self.assertTrue(status.answer_question(self.page, "C3", feedback.question_id, "The proof has three steps."))
-        _, _, body = self.browser()
+        urgency.pin(next_item.change_queue(self.production).name, "C3")
         probe = r'''
 <script>
 (async()=>{
@@ -2412,135 +3124,169 @@ class ChangePageTests(unittest.TestCase):
  const realFetch=window.fetch;
  const mode=new URLSearchParams(location.search).get('scheme');document.documentElement.style.colorScheme=mode;
  try{
-  const navigate=(type,runner='page-owner')=>{
-   history.replaceState(null,'','#'+new URLSearchParams({type,showrunner:runner}));show();
+  const navigate=(runner='page-owner')=>{
+   history.replaceState(null,'','#'+new URLSearchParams({showrunner:runner}));show();
   };
-  check(tab==='','the page starts with All');
-  navigate('changes','');
-  check(tab==='' && runnerMenu.options[0].value==='','All is the first menu option and the default filter');
-  check(runnerMenu.options[0].textContent==='All (4)' && waiting().length===4,'All counts every waiting change');
-  check(waiting().map(row=>row.dataset.tab).join(',')==='all,page-owner,page-owner,page-owner','All keeps every showrunner in the existing order');
-  check([...runnerMenu.options].slice(1).map(option=>option.value).join(',')==='all,page-owner,demo','the menu keeps the showrunner order');
-  navigate('changes','all');
-  check(tab==='all' && runnerMenu.value==='all' && waiting().length===1 && current.dataset.tab==='all','the showrunner named all has a separate filter');
-  for(const id of ['review-showrunner','type-changes','type-questions','type-rebuilds']){
-   const control=content.querySelector('#'+id);control.focus();
-   const fresh=content.cloneNode(true);fresh.dataset.focusUpdate=id;heldPage=fresh;applyHeldPage();
-   check(document.activeElement.id===id,'refresh retains focus on '+id);
-   check(tab==='all' && runnerMenu.value==='all' && waiting().length===1,'refresh retains the showrunner named all');
-  }
-  current=null;tab='';kind='';show();
-  check(tab==='all' && waiting().length===1,'a page load retains the showrunner named all');
-  navigate('changes','');
-  types.find(button=>button.dataset.reviewType==='changes').focus();
-  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
-  check(kind==='rebuilds' && document.activeElement.dataset.reviewType==='rebuilds','the right arrow selects and focuses the next tab');
-  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}));
-  check(kind==='questions','Home selects the first tab');
-  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}));
-  check(kind==='rebuilds','End selects the last tab');
-  document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true}));
-  check(kind==='changes','the left arrow selects the previous tab');
-  runnerMenu.value='demo';runnerMenu.dispatchEvent(new Event('change'));
-  check(tab==='demo' && current===null,'the menu selects an empty showrunner');
-  types.find(button=>button.dataset.reviewType==='questions').click();
-  check(tab==='','a new type starts with All');
-  types.find(button=>button.dataset.reviewType==='changes').click();
-  check(tab==='demo' && runnerMenu.value==='demo','a type retains its selected showrunner');
-  const refreshed=content.cloneNode(true);refreshed.dataset.testUpdate='new';heldPage=refreshed;applyHeldPage();
-  check(tab==='demo' && kind==='changes' && runnerMenu.value==='demo','an automatic update retains the type and filter');
-  current=null;tab='';kind='';show();
-  check(tab==='demo' && kind==='changes','a page load reads the type and filter from the URL');
-  const tabs=[...content.querySelectorAll('[role=tab]')];
-  check(tabs.length===3 && tabs.every(button=>button.getBoundingClientRect().top===tabs[0].getBoundingClientRect().top),'the tabs stay on one line');
-  check(content.querySelector('[role=tabpanel]').getAttribute('aria-labelledby')==='type-changes','the panel names its selected tab');
-  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
-  navigate('changes');
-  const luminance=color=>{
-   const channels=color.match(/[\d.]+/g).slice(0,3).map(value=>Number(value)/255).map(value=>value<=0.04045 ? value/12.92 : ((value+0.055)/1.055)**2.4);
-   return channels[0]*0.2126+channels[1]*0.7152+channels[2]*0.0722;
-  };
-  const background=luminance(getComputedStyle(content.querySelector('[role=tabpanel]')).backgroundColor);
-  const contrast=color=>{const text=luminance(color);return (Math.max(text,background)+0.05)/(Math.min(text,background)+0.05);};
-  const selectedContrast=contrast(getComputedStyle(types.find(button=>button.getAttribute('aria-selected')==='true')).color);
-  const unselected=types.filter(button=>button.getAttribute('aria-selected')==='false').map(button=>contrast(getComputedStyle(button).color));
-  check(unselected.every(value=>value>=4.5 && value<selectedContrast),'unselected tab labels have sufficient contrast and remain dimmer');
-  for(const key of ['page-owner/C1','page-owner/C3']){
-   go(key);const actions=[...current.querySelectorAll('button[name=outcome]')];
-   check(current.dataset.key!== 'page-owner/C3' || current.textContent.includes('Showrunner: The proof has three steps.'),'the feedback note appears above the actions');
-   check(getComputedStyle(next.parentElement).position==='static','Skip uses the normal flow');
-   check(next.getBoundingClientRect().top>=Math.max(...actions.map(button=>button.getBoundingClientRect().bottom)),'Skip follows every action button');
-   for(const button of actions){
-    button.scrollIntoView({block:'center'});const rect=button.getBoundingClientRect();
-    check([[rect.left+2,rect.top+2],[rect.right-2,rect.bottom-2]].every(([x,y])=>button.contains(document.elementFromPoint(x,y))),'the full '+button.textContent+' button is visible on '+key);
-   }
-  }
-  await realFetch('/measurements',{method:'POST',body:JSON.stringify({mode,width:innerWidth,unselectedContrast:unselected,selectedContrast,actionViews:['initial','feedback note']})});
-  window.scrollTo(0,0);navigate('changes');
-  const first=current, pending=waiting().length;
-  next.click();
-  check(current!==first && waiting().length===pending && first.dataset.pending==='true','skip keeps the change open');
-  for(const row of rows.filter(r=>r.dataset.type==='changes')) row.dataset.pending=String(row===first);
-  go(first.dataset.key);check(next.hidden,'one waiting change hides skip');
-  first.dataset.pending='false';
-  const other=rows.find(r=>r.dataset.type==='changes' && r.dataset.tab===tab && r!==first);other.dataset.pending='true';show();
-  check(!next.hidden,'a saved card can skip to another waiting change');
-  for(const row of rows) row.dataset.pending='true';
-  for(const [type,outcome,comment] of [
-   ['changes','works',''],['changes','works','Clear numbers'],['changes','not works','Still small'],
-   ['changes','validate','Check the number'],['changes','question','Which number?'],['changes','feedback','Use larger numbers'],['questions','answer','Use compact']]){
-   for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
-   navigate(type);check(current!==null,'the '+type+' card exists before '+outcome+' with filter '+tab);const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');field.value=comment;
+  const stubSave=outcome=>{
    let sent;
    window.fetch=async(url,request)=>{
     if(request.method!=='POST') return {ok:false};
     sent=request.body;return {ok:true,json:async()=>({answer:outcome})};
    };
-   await save(row,form,outcome);
-   check(sent.get('outcome')===outcome && sent.get('feedback')===comment,type+' '+outcome+' sends the shared field');
-   check(current!==row && row.dataset.pending==='false' && form.hidden,type+' '+outcome+' advances after saving');
-   check(!saveNotice.hidden && saveNotice.textContent===(type==='questions' ? 'Answer saved.' : 'Review saved.'),type+' save notice');
-   next.click();check(saveNotice.hidden,'skip clears the previous save notice');
-  }
-  for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
-  navigate('changes');const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
-  field.value='Keep <these> words';
-  window.fetch=async()=>({ok:false,json:async()=>({reason:'Fixture save failed'})});
-  await save(row,form,'not works');
-  check(current===row && row.dataset.pending==='true' && !form.hidden,'failed save keeps the card open');
-  check(field.value==='Keep <these> words','failed save keeps the text');
-  check(row.querySelector('[data-save-state]').textContent==='Not saved: Fixture save failed','failed save shows the reason');
-  check(saveNotice.hidden,'failed save hides the previous success notice');
-  for(const type of ['questions','changes']){
-   navigate(type,'demo');check(!empty.hidden && empty.textContent==='No '+type+' for this showrunner.',type+' empty group');
+   return ()=>sent;
+  };
+  check(tab==='','the page starts with All');
+  check(!content.querySelector('[role=tab]'),'the page has no type tabs');
+  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
+  if(kind==='questions'){
+   navigate('');
+   check(waiting().length===2 && rows.length===2,'the page holds only the waiting questions');
+   const question=current;
+   check(!question.querySelector('.kind') && question.firstElementChild.tagName==='H1','question title replaces the Question label');
+   check(question.textContent.includes('Asked by builder-unit'),'question keeps the asker');
+   const form=question.querySelector('form'),box=form.querySelector('textarea');
+   check(form.querySelector('label[for="'+box.id+'"]').textContent==='Your answer','the box label is Your answer');
+   check(form.querySelector('.answer-help').textContent.startsWith('A choice fills this.'),'the box has its help line');
+   check(getComputedStyle(question.querySelector('h1')).fontSize==='20px','card title size');
+   const buttons=[...form.querySelectorAll('button[name=outcome]')];
+   check(buttons.map(button=>button.textContent).join(',')==='Answer,Followup,Skip','the three question buttons');
+   check(new Set(buttons.map(button=>Math.round(button.getBoundingClientRect().top))).size===1,'the three buttons share one row');
+   check(buttons[0].disabled && buttons[1].disabled && !buttons[2].disabled,'Answer and Followup wait for text');
+   check(getComputedStyle(buttons[0]).opacity<getComputedStyle(buttons[2]).opacity,'a disabled button looks disabled');
+   check(next.hidden,'a question shows its own Skip, not Skip for now');
+   const radios=[...form.querySelectorAll('input[type=radio][name=choice]')];
+   check(radios.length===2,'the choices are a list of radio items');
+   radios[0].click();
+   check(box.value==='Compact' && !buttons[0].disabled,'a choice fills the box and enables Answer');
+   box.value='Use compact';box.dispatchEvent(new Event('input',{bubbles:true}));
+   check(!buttons[0].disabled && !buttons[1].disabled,'text enables Answer and Followup');
+   const sent=stubSave('answer');
+   await save(question,form,'answer');
+   check(sent().get('outcome')==='answer' && sent().get('feedback')==='Use compact' && !sent().has('choice'),'the answer sends the shared field');
+   check(current!==question && question.dataset.pending==='false' && form.hidden,'the answer advances after saving');
+   check(!saveNotice.hidden && saveNotice.textContent==='Answer saved.','question save notice');
+   for(const [outcome,notice] of [['followup','Follow-up sent.'],['skip','Skipped.']]){
+    for(const row of rows){row.dataset.pending='true';row.querySelector('form').hidden=false;}
+    navigate('');const row=current,rowForm=row.querySelector('form');
+    rowForm.querySelector('textarea').value=outcome==='skip' ? '' : 'Which file?';
+    const posted=stubSave('');
+    await save(row,rowForm,outcome);
+    check(posted().get('outcome')===outcome,outcome+' sends its outcome');
+    check(current!==row && row.dataset.pending==='false' && saveNotice.textContent===notice,outcome+' advances with its notice');
+   }
+   for(const row of rows) row.dataset.pending='false';
+   navigate('');check(!empty.hidden && empty.textContent==='No questions to answer.','questions empty page');
+   check(next.hidden,'an empty page hides skip');
+  } else {
+   navigate('');
+   check(tab==='' && runnerMenu.options[0].value==='','All is the first menu option and the default filter');
+   check(runnerMenu.options[0].textContent==='All (4)' && waiting().length===4,'All counts every waiting change');
+   check(waiting().map(row=>row.dataset.tab).join(',')==='all,page-owner,page-owner,page-owner','All follows the root name order');
+   check([...runnerMenu.options].slice(1).map(option=>option.value).join(',')==='all,page-owner,demo','the menu keeps the showrunner order');
+   check(rows.every(row=>row.dataset.type==='changes'),'the page holds only changes');
+   check(current.dataset.key==='all/C1','All starts with its first ordered change');
+   navigate('page-owner');
+   check(current.dataset.key==='page-owner/C3','the tab starts with its pinned change');
+   check(waiting().map(row=>row.dataset.key).join(',')==='page-owner/C3,page-owner/C1,page-owner/C2','the tab receives the /next order');
+   next.click();check(current.dataset.key==='page-owner/C1','Skip follows the selected tab order');
+   navigate('');check(current.dataset.key==='all/C1','All retains its own order');
+   navigate('all');
+   check(tab==='all' && runnerMenu.value==='all' && waiting().length===1 && current.dataset.tab==='all','the showrunner named all has a separate filter');
+   runnerMenu.focus();
+   const focusUpdate=content.cloneNode(true);focusUpdate.dataset.focusUpdate='menu';heldPage=focusUpdate;applyHeldPage();
+   check(document.activeElement.id==='review-showrunner','refresh retains focus on the showrunner menu');
+   check(tab==='all' && runnerMenu.value==='all' && waiting().length===1,'refresh retains the showrunner named all');
+   current=null;tab='';show();
+   check(tab==='all' && waiting().length===1,'a page load retains the showrunner named all');
+   runnerMenu.value='demo';runnerMenu.dispatchEvent(new Event('change'));
+   check(tab==='demo' && current===null,'the menu selects an empty showrunner');
+   check(!empty.hidden && empty.textContent==='No changes for this showrunner.','changes empty group');
    check(next.hidden,'empty group hides skip');
-   for(const row of rows.filter(r=>r.dataset.type===type)) row.dataset.pending='false';
-   navigate(type);check(!empty.hidden && empty.textContent===(type==='questions' ? 'No questions to answer.' : 'No changes to review.'),type+' empty type');
+   const refreshed=content.cloneNode(true);refreshed.dataset.testUpdate='new';heldPage=refreshed;applyHeldPage();
+   check(tab==='demo' && runnerMenu.value==='demo','an automatic update retains the filter');
+   current=null;tab='';show();
+   check(tab==='demo','a page load reads the filter from the URL');
+   navigate();
+   for(const key of ['page-owner/C1','page-owner/C3']){
+    go(key);await motion.settled();const actions=[...current.querySelectorAll('button[name=outcome]')];
+    check(current.dataset.key!== 'page-owner/C3' || current.textContent.includes('Showrunner: The proof has three steps.'),'the feedback note appears above the actions');
+    check(getComputedStyle(next.parentElement).position==='static','Skip uses the normal flow');
+    check(next.parentElement===actions[0].parentElement && actions.every(button=>button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING),'Skip ends the action row');
+    check(current.querySelector('.change-details').getBoundingClientRect().top>=next.getBoundingClientRect().bottom,'the details follow the buttons');
+    for(const button of actions){
+     button.scrollIntoView({block:'center'});const rect=button.getBoundingClientRect();
+     check([[rect.left+2,rect.top+2],[rect.right-2,rect.bottom-2]].every(([x,y])=>button.contains(document.elementFromPoint(x,y))),'the full '+button.textContent+' button is visible on '+key);
+    }
+   }
+   await realFetch('/measurements',{method:'POST',body:JSON.stringify({mode,width:innerWidth,actionViews:['initial','feedback note']})});
+   window.scrollTo(0,0);navigate();
+   const first=current, pending=waiting().length;
+   next.click();
+   check(current!==first && waiting().length===pending && first.dataset.pending==='true','skip keeps the change open');
+   for(const row of rows) row.dataset.pending=String(row===first);
+   go(first.dataset.key);check(next.hidden,'one waiting change hides skip');
+   first.dataset.pending='false';
+   const other=rows.find(r=>r.dataset.tab===tab && r!==first);other.dataset.pending='true';show();
+   check(!next.hidden,'a saved card can skip to another waiting change');
+   for(const [outcome,comment] of [['works',''],['works','Clear numbers'],['not works','Still small'],
+     ['validate','Check the number'],['question','Which number?'],['feedback','Use larger numbers']]){
+    for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
+    navigate();check(current!==null,'the card exists before '+outcome+' with filter '+tab);
+    const row=current,form=row.querySelector('form');form.querySelector('textarea').value=comment;
+    const sent=stubSave(outcome);
+    await save(row,form,outcome);
+    check(sent().get('outcome')===outcome && sent().get('feedback')===comment,outcome+' sends the shared field');
+    check(current!==row && row.dataset.pending==='false' && form.hidden,outcome+' advances after saving');
+    check(!saveNotice.hidden && saveNotice.textContent==='Review saved.',outcome+' save notice');
+    next.click();check(saveNotice.hidden,'skip clears the previous save notice');
+   }
+   for(const row of rows){row.dataset.pending='true';const form=row.querySelector('form');if(form) form.hidden=false;}
+   navigate();const row=current,form=row.querySelector('form'),field=form.querySelector('textarea');
+   field.value='Keep <these> words';
+   let answer;
+   window.fetch=()=>new Promise(resolve=>{answer=resolve;});
+   const saving=save(row,form,'not works');
+   check(current!==row && row.dataset.pending==='false','Does not work shows the next change before the server answers');
+   check(!saveNotice.hidden && saveNotice.textContent==='Saving review.','the notice says the review is saving');
+   const shown=current;
+   answer({ok:false,json:async()=>({reason:'Fixture save failed.'})});await saving;
+   check(current===shown,'a failed save does not move the shown change');
+   check(row.dataset.pending==='true' && !form.hidden,'a failed save puts the change back in the list');
+   check(field.value==='Keep <these> words','failed save keeps the text');
+   check(row.querySelector('[data-save-state]').textContent==='Not saved: Fixture save failed.','failed save shows the reason');
+   check(row.dataset.shown && row.querySelector('.change-details dd').textContent===row.dataset.shown,'the notice uses the change id the card shows');
+   check(saveNotice.textContent==='Not saved: '+row.dataset.shown+'. Fixture save failed. It is back in the list. Open it','the notice names the change that was not saved');
+   saveNotice.querySelector('button').click();
+   check(current===row && saveNotice.hidden,'Open it shows the change again');
+   for(const row of rows) row.dataset.pending='false';
+   navigate('');check(!empty.hidden && empty.textContent==='No changes to review.','changes empty page');
+   first.dataset.pending='true';go(first.dataset.key);
+   check(parseFloat(getComputedStyle(first.querySelector('h2')).fontSize)<20,'section labels are smaller than the title');
+   check(!first.querySelector('details') && first.querySelector('.change-details').textContent.startsWith('change:'),'the details are always shown');
   }
-  navigate('questions');
-  const question=rows.find(r=>r.dataset.type==='questions');question.dataset.pending='true';go(question.dataset.key);
-  check(!question.querySelector('.kind') && question.firstElementChild.tagName==='H1','question title replaces the Question label');
-  check(question.textContent.includes('Asked by builder-unit'),'question keeps the asker');
-  check(question.querySelector('label').textContent==='Answer','question keeps the Answer label');
-  check(getComputedStyle(question.querySelector('h1')).fontSize==='20px','card title size');
-  navigate('changes');first.dataset.pending='true';go(first.dataset.key);
-  check(parseFloat(getComputedStyle(first.querySelector('h2')).fontSize)<20,'section labels are smaller than the title');
-  const title=first.querySelector('h1'),details=first.querySelector('details');
-  check(!details.open && details.getBoundingClientRect().top-title.getBoundingClientRect().bottom>=15.9,'closed metadata has space after the title');
-  navigate('rebuilds');check(showrunners.hidden && document.querySelector('.navigation').hidden,'rebuild controls stay hidden');
  }catch(error){failures.push(String(error)+'\n'+(error.stack || ''));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>'''
-        content = body.replace('</body>', probe + '</body>').encode()
+        pages = {kind: self.browser(kind)[2].replace('</body>', '<img src="/probe-complete" alt="" hidden>' + probe + '</body>').encode()
+                 for kind in ("changes", "questions")}
         results: list[list[str]] = []
+        probe_complete = threading.Event()
 
         class BrowserProbe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                if self.path == "/probe-complete":
+                    # Keep Firefox alive until the asynchronous checks report their result.
+                    if not probe_complete.wait(20):
+                        self.send_error(504, "The browser checks did not complete.")
+                        return
+                    self.send_response(204)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                _ = self.wfile.write(content)
+                _ = self.wfile.write(pages[parse_qs(urlsplit(self.path).query)["kind"][0]])
 
             def do_POST(self) -> None:
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
@@ -2548,6 +3294,7 @@ class ChangePageTests(unittest.TestCase):
                     print("Review tab measurements:", payload.decode())
                 else:
                     results.append(cast(list[str], json.loads(payload)))
+                    probe_complete.set()
                 self.send_response(204)
                 self.end_headers()
 
@@ -2555,14 +3302,15 @@ class ChangePageTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                for mode in ("light", "dark"):
-                    with self.subTest(mode=mode):
+                for kind, mode in (("changes", "light"), ("changes", "dark"), ("questions", "light")):
+                    with self.subTest(kind=kind, mode=mode):
                         results.clear()
-                        profile = self.temporary / ("browser-profile-" + mode)
+                        probe_complete.clear()
+                        profile = self.temporary / f"browser-profile-{kind}-{mode}"
                         profile.mkdir()
                         run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                              "--window-size", "390,1200", "--screenshot", str(self.temporary / ("browser-" + mode + ".png")),
-                                              f"http://127.0.0.1:{server.server_port}/?scheme={mode}"], capture_output=True, text=True, timeout=45)
+                                              "--window-size", "390,1200", "--screenshot", str(self.temporary / f"browser-{kind}-{mode}.png"),
+                                              f"http://127.0.0.1:{server.server_port}/?scheme={mode}&kind={kind}"], capture_output=True, text=True, timeout=45)
                         self.assertEqual(run.returncode, 0, run.stderr)
                         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
             finally:
@@ -2754,8 +3502,8 @@ class ChangePageTests(unittest.TestCase):
 
     def test_read_only_change_stays_visible_with_kind_change_proof_and_controls_after_reload(self) -> None:
         body = self.request(self.page_path, {}).body
-        self.assertIn('<p class="kind">See in action</p>', body)
-        self.assertIn('<p class="kind">Read only</p>', body)
+        self.assertIn('<dt>kind:</dt><dd>See in action</dd>', body)
+        self.assertIn('<dt>kind:</dt><dd>Read only</dd>', body)
         self.assertIn("Internal comments clarified", body)
         self.assertIn("The old and new comments agree with the tests", body)
         self.assertIn('id="feedback-C3"', body)
@@ -2764,7 +3512,7 @@ class ChangePageTests(unittest.TestCase):
         reloaded = self.request(self.page_path, {}).body
         self.assertIn("Internal comments clarified", reloaded)
         self.assertIn("The old and new comments agree with the tests", reloaded)
-        self.assertIn('<p class="kind">Read only</p>', reloaded)
+        self.assertIn('<dt>kind:</dt><dd>Read only</dd>', reloaded)
         self.assertIn("Saved: works", reloaded)
 
     @process_boundary
@@ -2778,7 +3526,7 @@ class ChangePageTests(unittest.TestCase):
                 reply = self.request(path, {})
                 self.assertEqual(reply.status, 200)
                 for row in ("C1", "C2", "C3"):
-                    self.assertEqual(f'<section id="{row}">' in reply.body, row in rows)
+                    self.assertEqual(f'<section id="{row}" data-change-card>' in reply.body, row in rows)
 
     def test_delivery_failure_keeps_the_saved_answer_and_repeated_saves_send_nothing(self) -> None:
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
@@ -3493,6 +4241,19 @@ class FixtureStartupRecoveryTests(unittest.TestCase):
             self.assertNotIn("page", cast(dict[str, object], json.loads(path.read_text())))
             self.assertEqual(fixture.review_list.read_bytes(), before)
             self.assertIsInstance(status.slots(fixture.page, "C1").validation, change_page.ValidationRequested)
+
+
+
+class ChangeDetailsTests(unittest.TestCase):
+    def test_the_merged_cell_gives_the_date_time_and_commit(self) -> None:
+        row = {"Merged": "2026-11-13 16:20 · 31770c75", change_review.KIND: "See in action"}
+        self.assertEqual(change_page.ChangeDetails.read(row, "sdlc/C9").lines(), [
+            ("change", "sdlc/C9"), ("date", "2026-11-13"), ("time", "16:20"), ("commit", "31770c75"), ("kind", "See in action")])
+
+    def test_an_unknown_value_is_left_out(self) -> None:
+        for merged in ("", "2026-11-13 later · not a hash", "merged 2026-11-13"):
+            with self.subTest(merged=merged):
+                self.assertEqual(change_page.ChangeDetails.read({"Merged": merged}, "C1").lines(), [("change", "C1")])
 
 
 if __name__ == "__main__":

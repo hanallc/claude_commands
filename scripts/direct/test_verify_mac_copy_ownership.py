@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import unittest
 import subprocess
-from typing import final
+import json
+from typing import cast, final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
 import os
 import signal
@@ -11,6 +12,7 @@ from scripts.direct.verify_mac_offload_test_support import processes_carrying, i
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.wait_for_test_state import wait_for_pid
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 @final
@@ -21,11 +23,18 @@ class VerifyMacCopyOwnershipTests(VerifyMacOffloadFixture):
         # The step runs in its own process group, so a kill of verify's group alone misses it.
         self.assertNotEqual(os.getpgid(cargo), process.pid)
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
-        # Both folders carry the run's pid, and the copy folder sits in the hold folder, so
-        # tmp_sweep.py can tie a folder a kill leaves behind to its run.
-        holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
+        # Both leases name the run's pid, and the copy folder sits in the hold folder, so
+        # the next run can tie a folder a kill leaves behind to its run.
+        holds = tool_folders(self.root / "tmp", "verify", pid=process.pid)
         self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
-        self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
+        folders = tool_folders(holds[0], "verify-copy", pid=process.pid)
+        self.assertEqual(len(folders), 1)
+        for folder in [*holds, *folders]:
+            self.assertTrue(folder.with_name(folder.name + ".lock").is_file())
+            lease = cast(dict[str, object], json.loads(folder.with_name(folder.name + ".lease.json").read_text()))
+            self.assertEqual(set(lease), {"showrunner", "unit", "work", "purpose", "pid", "start_time"})
+            self.assertIsInstance(lease["pid"], int)
+            self.assertIsInstance(lease["start_time"], str)
         process.send_signal(signal.SIGTERM)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         _ = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)

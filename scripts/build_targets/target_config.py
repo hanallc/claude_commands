@@ -21,12 +21,14 @@ Platform = Literal["linux", "macos"]
 
 @dataclass(frozen=True)
 class LocalTarget:
+    """The local target holds its name and platform."""
     name: str
     platform: Platform
 
 
 @dataclass(frozen=True)
 class SshTarget:
+    """The SSH target holds its name, platform, and settings path."""
     name: str
     platform: Platform
     settings: Path
@@ -42,20 +44,59 @@ class AnyEligibleTarget:
 
 @dataclass(frozen=True)
 class LocalRequired:
+    """The reason requires local execution."""
     reason: str
 
 
 Routing = AnyEligibleTarget | LocalRequired
 ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
+# verify.sh --local pins a step to natedev.
+LOCAL_CALLER = LocalRequired("local caller")
+# A step that writes the tree runs on natedev.
+WRITES_TREE = LocalRequired("step writes the tree")
+
+
+@dataclass(frozen=True)
+class MacOnly:
+    """verify.sh --mac-only: the step runs only on the Mac."""
+
+
+@dataclass(frozen=True)
+class PinnedTarget:
+    """verify.sh --target or --mac: the step runs only on the named target."""
+
+    target: str
+
+
+# Where a step can run, as the caller asked. The placement request carries it to the queue's waiter record.
+StepRoute = AnyEligibleTarget | LocalRequired | MacOnly | PinnedTarget
+MAC_ONLY = MacOnly()
+
+
+def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool, local_reason: str = "") -> StepRoute:
+    """Apply the placement client's order: tree writes and --local stay on natedev, then --mac-only, then a pin."""
+    if local_reason:
+        return LocalRequired(local_reason)
+    if writes_tree:
+        return WRITES_TREE
+    if local:
+        return LOCAL_CALLER
+    if mac_only:
+        return MAC_ONLY
+    if target:
+        return PinnedTarget(target)
+    return ANY_ELIGIBLE_TARGET
 
 
 @dataclass(frozen=True)
 class EligibleTarget:
+    """This target is eligible for execution."""
     target: Target
 
 
 @dataclass(frozen=True)
 class ExcludedTarget:
+    """The target is excluded for this reason."""
     target: Target
     reason: str
 
@@ -168,3 +209,15 @@ def configured_ssh_target(target: str) -> SshTarget:
             require_target_name(target)
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
+
+
+def command_target_name(given: str | None) -> str:
+    """Resolve a positional target for clear, drain, or release."""
+    configuration = conf.read_or_repository("build_targets")
+    configured = read_targets(configuration.source)
+    selected = given if given is not None else configuration.text("default_target")
+    names = {target.name for target in configured}
+    names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
+    if selected != "all" and selected not in names:
+        raise ConfigError(f"unknown target {selected}; configured targets: {', '.join(target.name for target in configured)}")
+    return selected

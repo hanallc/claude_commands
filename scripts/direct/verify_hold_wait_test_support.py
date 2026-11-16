@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import fixture_shim_source
+
 from scripts.lint.memory_test_support import write_pressure_reading
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import textwrap
 import time
 import traceback
 import unittest
@@ -34,6 +37,7 @@ from scripts.direct.verify_mac_offload_test_support import (
 )
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 
@@ -139,8 +143,9 @@ def release_registered_call(path: Path) -> Generator[None, None, None]:
                                     continue
                     if stop.is_set():
                         return
-                    queued = (any(root.glob("**/verify-hold.*/placement-*.json.queued"))
-                              or any(root.glob("**/verify-hold.*/waiter")))
+                    holds = tool_folders(root, "verify", nested=True)
+                    queued = any(any(hold.glob("placement-*.json.queued")) or (hold / "waiter").exists()
+                                 for hold in holds)
                     if path.exists() and queued:
                         grant_call(path)
                         return
@@ -204,7 +209,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         for entry in source.iterdir():
             if entry.name != "py":
                 (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-        builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        builder.write_executable(library / "py", fixture_shim_source())
         (builder.root / "unit").mkdir()
         cls.fixture_environment = {
             **builder.environment,
@@ -311,7 +316,7 @@ class VerifyHoldWaitFixture(unittest.TestCase):
             + shell_functions(VERIFY, "verify_helper", "publish_step_state", "step_state", "phase_wait_start", "phase_wait_finish",
                               "build_hold_wait_local", "collect_routing_wait", "collect_hold_wait", "note_event")
             + '''
-PY=${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}
+PY=$HOME/.claude/scripts/lib/py
 CMD=$2 ARGS=(sample) CALL_NOTED=0 CACHE_DIR=""
 STEP_RECORD_ACTIVE=0 PHASE_WAIT_SESSION="" ROUTING_WAIT_STARTED=""
 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
@@ -491,6 +496,8 @@ exit "$status"
 from pathlib import Path
 with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + chr(10))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
         return starts
@@ -538,6 +545,8 @@ from pathlib import Path
 if os.environ.get("TEST_PYTHON_STARTS"):
     with Path(os.environ["TEST_PYTHON_STARTS"]).open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + chr(10))
+from scripts.lib.checkout_test_support import restore_startup_environment
+restore_startup_environment()
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.argv[1:]])
 ''')
         recorder = self.fixture.home / ".claude/scripts/buildlog/record.py"
@@ -550,8 +559,9 @@ if sys.argv[1:2] == ["call"]:
     path = Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"])
     Path(os.environ["TEST_WAIT_OBSERVATION"]).write_text(json.dumps({"total": os.environ.get("BUILDLOG_HOLD_WAIT_S", ""), "waits": path.read_text().splitlines() if path.exists() else [], "directory": str(path.parent)}))
 '''
-        _ = recorder.write_text(source.replace('runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")',
-            observation_code + 'runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")'))
+        anchor = "    return real_record()\n"
+        assert source.count(anchor) == 1
+        _ = recorder.write_text(source.replace(anchor, textwrap.indent(observation_code, "    ") + anchor))
         observation = self.fixture.root / "wait-observation"
         self.fixture.environment.update({"CLAUDE_PYTHON": str(observer), "TEST_REAL_PYTHON": sys.executable, "TEST_WAIT_OBSERVATION": str(observation), "TEST_STEP_OBSERVATIONS": str(self.fixture.root / "step-observations")})
         return observation

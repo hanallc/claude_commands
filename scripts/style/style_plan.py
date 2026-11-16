@@ -22,7 +22,7 @@ import tempfile
 import time
 import tomllib
 from collections import Counter, defaultdict
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -39,18 +39,23 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 from scripts.copies import copies
 from scripts.direct import phase_reservation
 from scripts.lib import berth_board
+from scripts.whoami import quota_state
 from scripts.lib.git_blob import git_blob_id
 from scripts.lib.process_failure import failure_detail
 from scripts.style import coverage_report
 from scripts.style import bulk_rename
 from scripts.style import finding_sites
 from scripts.style import mechanical_classes
-from scripts.style.approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
-                              MissingFile, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing,
-                              file_rename, inline_modules)
+from scripts.style.approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations,
+                              DefaultModulePath, FileRename, Folder, InlineModule, LiteralModulePath, MissingFile, ModuleDeclaration,
+                              ModuleDeclarations, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied,
+                              UncertainDeclarationPath, UncertainScan, UnreadableDeclarationText, applied_check, approved_rename,
+                              binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing, file_rename,
+                              inline_modules, module_name)
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
+from scripts.style import style_reader
+from scripts.style.refill_findings import FindingFootprint, decode_proof, encode_proof, proof_types
 from scripts.style.style_ledger import publication_lock, publication_path
 from scripts.style import approved_renames
 from scripts.style import style_footprint
@@ -256,15 +261,16 @@ def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[st
 
 def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges,
                      kind: str, crate: str, rule: str, files: tuple[str, ...],
-                     findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForSync | SyncNotNeeded:
+                     findings: tuple[style_ledger.HeldFinding, ...] = (),
+                     main_edits: EditedFiles | None = None) -> WaitingForSync | SyncNotNeeded:
     # Structure tickets read source and never edit it, even when main has moved.
     if kind == "structure":
         return SyncNotNeeded()
     # Only the selected proposal needs a footprint at main, where new callers may have appeared.
     if isinstance(changes, MainChanges) and changes.paths and findings:
         try:
-            main_edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
-            files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in main_edits.of(finding)))))
+            edits = main_edits or EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
+            files = tuple(dict.fromkeys((*files, *(path for finding in findings for path in edits.of(finding)))))
         except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
             changes = UnknownMainChanges(f"cannot read selected footprint at main: {error}")
     check = ticket_sync_check(changes, files)
@@ -309,6 +315,15 @@ class NoUnitBranch:
 
 
 UnitBase = UnitBranchTip | NoUnitBranch
+
+
+class FootprintRole(Enum):
+    """Which commit a footprint reader reads, so readers at different commits keep separate stored footprints."""
+
+    UNIT = "unit"
+    MAIN = "main"
+    CHECKPOINT = "checkpoint"
+    TICKET_BASE = "ticket-base"
 
 
 def unit_base(repo: Path, branch: str) -> UnitBase:
@@ -679,10 +694,22 @@ UNREAD_PATH_STRING = re.compile(r'(?<![\w])path(?:\s|/\*.*?\*/|//[^\n]*)*=(?:\s|
                                 re.DOTALL)
 
 
-def crate_root(repo: Path, file: str) -> PurePosixPath | NoCrateRoot:
+@dataclass(frozen=True)
+class UncachedCrateRoots:
+    """The caller has no refill cache for working tree folders."""
+
+
+_UNCACHED_CRATE_ROOTS = UncachedCrateRoots()
+
+
+def crate_root(repo: Path, file: str, *,
+               folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS) -> PurePosixPath | NoCrateRoot:
     """The nearest folder above the module file that holds a crate root file."""
+    checked: dict[PurePosixPath, bool] = {} if isinstance(folders, UncachedCrateRoots) else folders
     for folder in PurePosixPath(file).parents:
-        if any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs")):
+        if folder not in checked:
+            checked[folder] = any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs"))
+        if checked[folder]:
             return folder
     return NoCrateRoot()
 
@@ -700,12 +727,6 @@ def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
         if isinstance(table, dict) and isinstance(name := cast(dict[str, object], table).get("name"), str):
             return Library(name.replace("-", "_"))
     return NoLibrary()
-
-
-def module_name(file: str) -> str:
-    """The name a `mod` line declares the module file by: its folder's name for a `mod.rs`, else its stem."""
-    path = PurePosixPath(file)
-    return path.parent.name if path.name == "mod.rs" else path.stem
 
 
 @dataclass(frozen=True)
@@ -936,107 +957,123 @@ def plain_words(spans: tuple[style_footprint.TokenSpan, ...]) -> tuple[str, ...]
                  for span in spans)
 
 
-def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ...],
-                 pairs: tuple[ApprovedRename, ...]) -> RenamedText | NoRenamedText | UncertainModulePath:
-    """The HEAD text of the Rust file at path with the edits of the approved renames made.
+@dataclass(frozen=True)
+class ModuleSiteReading:
+    """Whether a Rust file names a module of an approved file rename, in its code or in a comment."""
 
-    Each module site of an approved file rename takes its new word, then each qualified reference of an approved rename,
-    which reads its parent from the HEAD words. The scan reads the file's `plain_words`, and a raw site keeps its `r#`,
-    so `mod r#lock;` takes `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
-    """
+    module_sites: bool
+
+
+@dataclass(frozen=True)
+class _ModuleRenames:
+    """A Rust file's HEAD words and comment lines with the module sites of the approved file renames renamed."""
+
+    words: tuple[str, ...]
+    renamed: tuple[str, ...]
+    comments: tuple[tuple[str, ...], ...]
+    module_sites: bool
+
+
+def _head_spans(before: str) -> tuple[style_footprint.TokenSpan, ...] | NoRenamedText:
+    """The token spans of a HEAD text, or `NoRenamedText` when the text has a token the gate cannot read."""
     try:
         old = style_footprint.token_spans(before)
     except style_footprint.UnreadableTokenSpans:
         return NoRenamedText()
-    if len(old) != len(style_footprint.tokens(before)):
-        return NoRenamedText()
+    return old if len(old) == len(style_footprint.tokens(before)) else NoRenamedText()
+
+
+def _module_renames(repo: Path, path: str, before: str, old: tuple[style_footprint.TokenSpan, ...],
+                    moves: tuple[FileRename, ...], *,
+                    folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS
+                    ) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
+    """Rename each module site of an approved file rename in the HEAD text of the Rust file at path, from its spans old.
+
+    The scan reads the file's `plain_words`, and a raw site keeps its `r#`, so `mod r#lock;` takes
+    `mod r#mutation_lock;`. In comments, each `crate` path to a renamed module is renamed.
+    """
+    plain = plain_words(old)
+
+    def scans() -> Generator[RenamedModuleScan | NoRenamedText]:
+        for moved in moves:
+            root = crate_root(repo, moved.old, folders=folders)
+            if isinstance(root, NoCrateRoot):
+                yield NoRenamedText()
+                return
+            module = style_footprint.crate_module(moved.old, root)
+            if isinstance(module, style_footprint.OutsideCrate):
+                yield NoRenamedText()
+                return
+            yield RenamedModuleScan(path, plain, style_footprint.crate_module(path, root), module[:-1], moved.old,
+                                    moved.new, crate_library(repo, root))
+
+    return module_renames_from_scans(path, before, old, scans())
+
+
+def module_renames_from_scans(path: str, before: str, old: tuple[style_footprint.TokenSpan, ...],
+                              scans: Iterable[RenamedModuleScan | NoRenamedText]) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
+    """Apply the scans to the code and comments of the file at path."""
     words, plain = tuple(span.token.value for span in old), plain_words(old)
     renamed = list(words)
-    scans: list[RenamedModuleScan] = []
-    for moved in moves:
-        root = crate_root(repo, moved.old)
-        if isinstance(root, NoCrateRoot):
-            return NoRenamedText()
-        module = style_footprint.crate_module(moved.old, root)
-        if isinstance(module, style_footprint.OutsideCrate):
-            return NoRenamedText()
-        scans.append(RenamedModuleScan(path, plain, style_footprint.crate_module(path, root), module[:-1], moved.old,
-                                       moved.new, crate_library(repo, root)))
-        sites = scans[-1].renames()
+    applied: list[RenamedModuleScan] = []
+    for scan in scans:
+        if isinstance(scan, NoRenamedText):
+            return scan
+        if scan.path != path:
+            raise ValueError("the module scan belongs to a different file")
+        sites = scan.renames()
         if isinstance(sites, UncertainModulePath):
             return sites
         for index, word in sites.items():
             renamed[index] = words[index].removesuffix(plain[index]) + word
-    comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, tuple(scans)))
+        applied.append(scan)
+    comment_scans = tuple(applied)
+    comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, comment_scans))
     module_sites = tuple(renamed) != words or comments != style_footprint.comment_gaps(before, old, lambda line: line)
+    return _ModuleRenames(words, tuple(renamed), comments, module_sites)
+
+
+def module_site_readings(repo: Path, path: str, before: str, moves: tuple[FileRename, ...], *,
+                         folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS
+                         ) -> tuple[ModuleSiteReading | NoRenamedText | UncertainModulePath, ...]:
+    """Whether the Rust file at path names a module of each move, without the renamed code that `renamed_text` builds.
+
+    One token read of the file serves every move.
+    """
+    old = _head_spans(before)
+    if isinstance(old, NoRenamedText):
+        return tuple(old for _ in moves)
+    readings: list[ModuleSiteReading | NoRenamedText | UncertainModulePath] = []
+    for moved in moves:
+        renames = _module_renames(repo, path, before, old, (moved,), folders=folders)
+        readings.append(ModuleSiteReading(renames.module_sites) if isinstance(renames, _ModuleRenames) else renames)
+    return tuple(readings)
+
+
+def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ...],
+                 pairs: tuple[ApprovedRename, ...]) -> RenamedText | NoRenamedText | UncertainModulePath:
+    """The HEAD text of the Rust file at path with the edits of the approved renames made.
+
+    Each module site of an approved file rename takes its new word (`_module_renames`), then each qualified reference
+    of an approved rename, which reads its parent from the HEAD words.
+    """
+    old = _head_spans(before)
+    if isinstance(old, NoRenamedText):
+        return old
+    renames = _module_renames(repo, path, before, old, moves)
+    if not isinstance(renames, _ModuleRenames):
+        return renames
+    words, renamed = renames.words, list(renames.renamed)
     use_parents = use_reference_parents(words)
     for index, word in enumerate(words):
         for pair in pairs:
             if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
                 renamed[index] = pair.new
-    return RenamedText(style_footprint.canonical_code(tuple(renamed), comments), module_sites)
+    return RenamedText(style_footprint.canonical_code(tuple(renamed), renames.comments), renames.module_sites)
 
 
-@dataclass(frozen=True)
-class DefaultModulePath:
-    """The file module has no path attribute."""
-
-
-@dataclass(frozen=True)
-class LiteralModulePath:
-    """One plain path string belongs to a file module item."""
-
-    value: str
-
-
-@dataclass(frozen=True)
-class UncertainDeclarationPath:
-    """The module's path attribute can name any module file."""
-
-
-@dataclass(frozen=True)
-class ModuleDeclaration:
-    """A module item has a name, an inline scope, and a path form."""
-
-    name: str
-    scope: tuple[InlineModule, ...]
-    path: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
-
-
-@dataclass(frozen=True)
-class ModuleDeclarationText:
-    """A readable file's declaration syntax is independent of the requested module file."""
-
-    words: tuple[str, ...]
-    starts: frozenset[int]
-    modules: tuple[InlineModule, ...]
-    declarations: tuple[ModuleDeclaration, ...]
-
-    def declares(self, path: str, module: style_footprint.CrateModule, parent: tuple[str, ...], file: str) -> bool:
-        """Read the kept items for one module file without scanning its owner's text again."""
-        name, filename = module_name(file), PurePosixPath(file).name
-        for declaration in self.declarations:
-            if isinstance(declaration.path, UncertainDeclarationPath):
-                return True
-            if isinstance(declaration.path, LiteralModulePath):
-                named = declaration.path.value
-                if named.rsplit("/", 1)[-1] != filename:
-                    continue
-                if declaration.scope or posixpath.normpath(str(PurePosixPath(path).parent / named)) == file:
-                    return True
-            elif (declaration.name == name and not isinstance(module, style_footprint.OutsideCrate)
-                  and module + tuple(scope.name for scope in declaration.scope) == parent):
-                return True
-        return False
-
-
-@dataclass(frozen=True)
-class UnreadableDeclarationText:
-    """The token scan cannot read this file's declarations."""
-
-
-def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDeclarationText:
-    """Scan one file text and keep its words, item starts, inline modules, and declaration paths."""
+def module_declaration_text(text: str) -> ModuleDeclarations | UnreadableDeclarationText:
+    """Scan source and keep only its module declarations."""
     try:
         spans = style_footprint.token_spans(text)
     except style_footprint.UnreadableTokenSpans:
@@ -1057,18 +1094,38 @@ def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDecl
                 and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
                 and words[owner + 2:owner + 3] == (";",)):
             paths[owner] = LiteralModulePath(named)
-    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""), enclosing(modules, owner),
+    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""),
+                                           tuple(module.name for module in enclosing(modules, owner)),
                                            paths.get(owner, DefaultModulePath()))
                          for owner in sorted(paths.keys() | {index for index, word in enumerate(words)
                                                               if word == "mod" and index in starts
                                                               and words[index + 2:index + 3] == (";",)}))
-    return ModuleDeclarationText(words, starts, modules, declarations)
+    return ModuleDeclarations(declarations)
 
 
-def declares_module(repo: Path, path: str, text: str | ModuleDeclarationText | UnreadableDeclarationText, file: str) -> bool:
+def reader_module_declaration_text(facts: style_reader.BlobFacts) -> ModuleDeclarations | UnreadableDeclarationText:
+    """Restore module declarations directly from the reader's module scan."""
+    reading = facts.module_scan()
+    if isinstance(reading, style_reader.UnreadableFact):
+        return UnreadableDeclarationText()
+    declarations: list[ModuleDeclaration] = []
+    for row in reading.declarations:
+        location: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
+        if isinstance(row.path, str):
+            location = LiteralModulePath(row.path)
+        elif row.path == style_reader.ModulePathForm.DEFAULT:
+            location = DefaultModulePath()
+        else:
+            location = UncertainDeclarationPath()
+        declarations.append(ModuleDeclaration(row.name, row.scope, location))
+    return ModuleDeclarations(tuple(declarations))
+
+
+def declares_module(repo: Path, path: str, text: str | ModuleDeclarations | UnreadableDeclarationText, file: str, *,
+                     folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS) -> bool:
     """Read kept declaration syntax, or scan text supplied directly by a caller."""
     reading = module_declaration_text(text) if isinstance(text, str) else text
-    root = crate_root(repo, file)
+    root = crate_root(repo, file, folders=folders)
     if isinstance(reading, UnreadableDeclarationText) or isinstance(root, NoCrateRoot):
         return True
     module = style_footprint.crate_module(file, root)
@@ -1230,8 +1287,9 @@ def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: s
 
 
 def run_verification_step(repo: Path, stage: str, package: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(["bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), stage, package],
-                          cwd=repo, check=False)
+    """Run one verify.sh stage for the package, or for the workspace when the package is ""."""
+    return subprocess.run(["bash", str(Path.home() / ".claude/scripts/direct/verify.sh"), stage, *([package] if package else [])],
+                          cwd=repo, check=False, pass_fds=copies.COMMAND_LOCKS.get())
 
 
 @dataclass(frozen=True)
@@ -1298,22 +1356,30 @@ def verify_source(ledger: style_ledger.Ledger, repo: Path, ticket_id: str, view:
     tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
     sources = style_footprint.RevisionTree(ledger.repo, snapshot)
     changed = ledger.ticket_changed_paths(ticket, snapshot)
-    if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
-           for path in changed if path):
-        raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
-    manifest: dict[str, object] = tomllib.loads(sources.text(str(PurePosixPath(ticket["crate"]) / "Cargo.toml")))
+    crates = {ticket["crate"]} | {sources.crate(path) for path in changed
+                                  if path.endswith((".rs", "Cargo.toml", "Cargo.lock"))}
+    names = {verified_package(sources, crate) for crate in crates}
+    packages = [""] if "" in names else sorted(names)
+    for stage in ("check", "lint", "test"):
+        for package in packages:
+            status = run_verification_step(view.repo, stage, package).returncode
+            if status:
+                return status
+            current = ticket_snapshot(ledger, ticket, repo) if view.isolated else style_footprint.worktree_commit(repo)
+            if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
+                raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
+    return 0
+
+
+def verified_package(sources: style_footprint.RevisionTree, crate: str) -> str:
+    """The crate's package name, or "" for a folder with no package: the workspace root."""
+    manifest_path = str(PurePosixPath(crate) / "Cargo.toml")
+    if manifest_path not in sources.paths:
+        return ""
+    manifest: dict[str, object] = tomllib.loads(sources.text(manifest_path))
     package_table = manifest.get("package")
     package = cast(dict[str, object], package_table).get("name", "") if isinstance(package_table, dict) else ""
-    if not isinstance(package, str) or not package:
-        raise style_ledger.LedgerError(f"{ticket_id}: no package to verify")
-    for stage in ("check", "lint", "test"):
-        status = run_verification_step(view.repo, stage, package).returncode
-        if status:
-            return status
-        current = ticket_snapshot(ledger, ticket, repo) if view.isolated else style_footprint.worktree_commit(repo)
-        if git(repo, "rev-parse", f"{current}^{{tree}}").strip() != tree:
-            raise style_ledger.LedgerError(f"{ticket_id}: tree changed during {stage}")
-    return 0
+    return package if isinstance(package, str) else ""
 
 
 @dataclass(frozen=True)
@@ -1846,11 +1912,13 @@ class RefillCells:
     """The cells one refill weighs.
 
     Ranking and structure blocking read every cell in cells. No ticket takes a cell in judged_at_base: it is one of
-    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it.
+    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it. No ticket takes a
+    cell at a path in absent_at_base: a commit after the synced tip deleted its file, so the unit tip has no file there.
     """
 
     cells: tuple[style_ledger.Cell, ...]
     judged_at_base: frozenset[style_ledger.Cell]
+    absent_at_base: frozenset[str]
     # The files where the unit's family waits for a family ranked above it; no ticket takes a cell at one.
     waits: Mapping[str, style_proposals.RankWait]
 
@@ -2046,8 +2114,12 @@ def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, .
         context = RefillContext(ledger)
     result = context.eligible_cells(cells, definitions)
     own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))
-    judged = ledger.judged_at_base(own, base.commit) if isinstance(base, UnitBranchTip) else ()
-    return RefillCells(result, frozenset(judged), waits)
+    if not isinstance(base, UnitBranchTip):
+        return RefillCells(result, frozenset(), frozenset(), waits)
+    # Three dots diff from the merge base, so only commits on the unit tip after the synced tip count as deletes.
+    absent = git(ledger.repo, "diff", "-z", "--no-renames", "--name-only", "--diff-filter=D",
+                 f"{synced_tip(ledger)}...{base.commit}").split("\0")
+    return RefillCells(result, frozenset(ledger.judged_at_base(own, base.commit)), frozenset(filter(None, absent)), waits)
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
@@ -2099,7 +2171,8 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
         if structure:
             if family == "modules":
                 manifest = str(PurePosixPath(crate) / "Cargo.toml")
-                ticketed = tuple(cell for cell in structure if cell not in refill.judged_at_base)
+                ticketed = tuple(cell for cell in structure
+                                 if cell not in refill.judged_at_base and cell.path not in refill.absent_at_base)
                 manifest_cells = tuple(cell for cell in ticketed if cell.path == crate)
                 file_cells = tuple(cell for cell in ticketed if cell.path != crate)
                 available = {cell.path for cell in file_cells}
@@ -2119,7 +2192,8 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
                 continue
         own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
-                    and cell not in refill.judged_at_base and cell.path not in refill.waits
+                    and cell not in refill.judged_at_base and cell.path not in refill.absent_at_base
+                    and cell.path not in refill.waits
                     and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
@@ -2660,61 +2734,130 @@ class EditedFiles:
     A plain file-module path string that ends in another file's name does not declare the requested module file.
     This exclusion also applies inside inline modules.
     Other findings include their own file.
+    Each `FootprintRole` keeps its own stored footprints.
     Append recorded need paths for every finding.
     Recorded needs also extend the gate's edit approval.
     """
 
-    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
+    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase,
+                 role: FootprintRole = FootprintRole.UNIT) -> None:
         self.repo: Path = repo
         self.ledger: style_ledger.Ledger = ledger
         self.base: UnitBase = base
+        self.role: FootprintRole = role
         self.tip: str | None = None
         # The blob of each named path at each commit, and the text of each blob.
         self.blobs: dict[tuple[str, str], str] = {}
         self.texts: dict[str, str] = {}
         # The renamed_text of each file rename in each file that names its old module.
-        self.readings: dict[FileRename, tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]] = {}
-        self.declarations: dict[str, ModuleDeclarationText | UnreadableDeclarationText] = {}
+        self.readings: dict[FileRename, tuple[tuple[str, ModuleSiteReading | NoRenamedText | UncertainModulePath], ...]] = {}
+        # The file moves of prepared findings with no saved footprint; the first module reading reads them all.
+        self.pending: dict[FileRename, None] = {}
+        self.declarations: dict[str, ModuleDeclarations | UnreadableDeclarationText] = {}
         self.edited: dict[str, tuple[str, ...]] = {}
         self.named: dict[str, tuple[tuple[str, str], ...]] = {}
+        self.footprints: dict[str, FindingFootprint] = {}
+        self.required_blobs: set[str] = set()
+
+    @cached_property
+    def root_inputs(self) -> tuple[tuple[str, bool, bool, str], ...]:
+        """Observe local root files and library names at the existing footprint stage."""
+        return tuple((folder, (self.repo / folder / "lib.rs").is_file(),
+                      (self.repo / folder / "main.rs").is_file(), encode_proof(crate_library(self.repo, PurePosixPath(folder))))
+                     for folder in self.ledger.footprint_roots(self.commits()))
+
+    def prepare(self, findings: Iterable[style_ledger.HeldFinding]) -> None:
+        """Load the saved footprint of each finding. Keep the file moves of the others, so that `module_readings` reads
+        each declaring file once for all of them."""
+        self.ledger.prepare_finding_footprints()
+        for finding in findings:
+            if finding.finding_id in self.footprints:
+                continue
+            stored = self.ledger.stored_finding_footprint(finding, *self._footprint_view(finding))
+            moved = file_rename(finding.kind, finding.path, finding.after)
+            if isinstance(stored, FindingFootprint):
+                self.footprints[finding.finding_id] = stored
+            elif isinstance(moved, FileRename) and moved not in self.readings:
+                self.pending[moved] = None
+
+    def _source_reads(self, finding: style_ledger.HeldFinding) -> bool:
+        return (isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)
+                or isinstance(approved_rename(finding.kind, finding.before, finding.after), ApprovedRename)
+                or approved_renames.edits_module_owners(finding.kind, finding.path, finding.after))
+
+    def _footprint_view(self, finding: style_ledger.HeldFinding) -> tuple[str, object]:
+        """The stored footprint view of finding and the inputs its identity holds."""
+        if not self._source_reads(finding):
+            return "recorded", ()
+        view = f"synced-and-{self.role.value}" if isinstance(self.base, UnitBranchTip) else "synced"
+        return view, (self.commits(), self.root_inputs)
+
+    def footprint(self, finding: style_ledger.HeldFinding) -> FindingFootprint:
+        if finding.finding_id not in self.footprints:
+            if not self.footprints:
+                self.ledger.prepare_finding_footprints()
+            moved = file_rename(finding.kind, finding.path, finding.after)
+            source_reads = self._source_reads(finding)
+            def calculate() -> FindingFootprint:
+                self.required_blobs = set()
+                files = self._computed_files(finding)
+                uncertain = (tuple(dict.fromkeys(path for path, renamed in self.module_readings(moved)
+                                                if isinstance(renamed, UncertainModulePath)))
+                             if isinstance(moved, FileRename) else ())
+                if source_reads:
+                    self.ledger.record_finding_sources(self.commits(), tuple(self.required_blobs))
+                return FindingFootprint(files, uncertain)
+            self.footprints[finding.finding_id] = self.ledger.finding_footprint(
+                finding, *self._footprint_view(finding), calculate)
+        return self.footprints[finding.finding_id]
 
     def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         """Return computed files first, then recorded need paths, without duplicates."""
+        return self.footprint(finding).files
+
+    def _computed_files(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
         if finding.finding_id in self.edited:
             return self.edited[finding.finding_id]
         moved = file_rename(finding.kind, finding.path, finding.after)
         pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(moved, FileRename):
             edited = (path for path, renamed in self.module_readings(moved)
-                      if not isinstance(renamed, RenamedText) or renamed.module_sites)
+                      if not isinstance(renamed, ModuleSiteReading) or renamed.module_sites)
             computed = (finding.path, moved.new, *edited)
         elif isinstance(pair, ApprovedRename):
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             computed = (finding.path, *named_files)
-        elif finding.kind == "restructure" and finding.path.endswith(".rs"):
+        elif approved_renames.edits_module_owners(finding.kind, finding.path, finding.after):
             owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
-                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
+                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path,
+                                                                 folders=self.ledger.crate_root_folders))
             computed = (finding.path, *owners)
         else:
             computed = (finding.path,)
         self.edited[finding.finding_id] = tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
         return self.edited[finding.finding_id]
 
-    def declaration_text(self, blob: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+    def declaration_text(self, blob: str) -> ModuleDeclarations | UnreadableDeclarationText:
         """Keep one declaration scan for each blob read during this refill."""
+        self.required_blobs.add(blob)
+        if self.ledger.reader_source == style_config.ReaderSource.RUST:
+            if blob not in self.ledger.reader_module_declarations:
+                try:
+                    self.ledger.reader_module_declarations[blob] = reader_module_declaration_text(self.ledger.blob_facts(blob))
+                except style_reader.ReaderError as error:
+                    raise style_ledger.CheckCouldNotRun(str(error)) from error
+            return self.ledger.reader_module_declarations[blob]
         if blob not in self.declarations:
-            self.declarations[blob] = module_declaration_text(self.texts[blob])
+            self.declarations[blob] = self.ledger.finding_source_fact(
+                "footprint_modules", blob, lambda: module_declaration_text(self.texts[blob]),
+                lambda source: cast(ModuleDeclarations | UnreadableDeclarationText,
+                                    decode_proof(source, proof_types(globals(), vars(approved_renames)))))
         return self.declarations[blob]
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
-        """For a file rename, each file at either commit that names the old module and has a `path` word the rename gate
-        cannot read with certainty (`UncertainModulePath`), so the gate cannot prove the rename's edit to it."""
-        moved = file_rename(finding.kind, finding.path, finding.after)
-        if not isinstance(moved, FileRename):
-            return ()
-        return tuple(dict.fromkeys(path for path, renamed in self.module_readings(moved)
-                                   if isinstance(renamed, UncertainModulePath)))
+        """Return source paths whose module attributes remain uncertain."""
+        return self.footprint(finding).uncertain
 
     def of_ticket(self, ticket: style_ledger.TicketRecord) -> tuple[str, ...]:
         """The ticket's files, and for a proposal ticket its widened paths and each file its findings' changes edit."""
@@ -2754,6 +2897,10 @@ class EditedFiles:
             self.read(named)
             self.named[name] = tuple(dict.fromkeys((path, self.blobs[commit, path])
                                                   for commit, paths in named.items() for path in paths))
+        else:
+            for commit in self.commits():
+                _ = self.ledger.files_naming(commit, name)
+        self.required_blobs.update(blob for _, blob in self.named[name])
         return self.named[name]
 
     def declaring(self, name: str) -> tuple[tuple[str, str], ...]:
@@ -2764,12 +2911,18 @@ class EditedFiles:
 
     def declaring_versions(self, name: str) -> tuple[tuple[str, str], ...]:
         """The path and blob of each candidate module-declaring file at either commit."""
+        _ = self.named_versions("path")
         return tuple(dict.fromkeys((*self.named_versions(name), *self.unread_path_versions)))
 
     @cached_property
     def unread_path_versions(self) -> tuple[tuple[str, str], ...]:
-        """Find unreadable path strings once for the refill."""
-        return tuple(entry for entry in self.named_versions("path") if UNREAD_PATH_STRING.search(self.texts[entry[1]]))
+        """Find unreadable path strings once for each blob that the ledger's readers see."""
+        searched = self.ledger.unread_path_blobs
+        versions = self.named_versions("path")
+        for _, blob in versions:
+            if blob not in searched:
+                searched[blob] = UNREAD_PATH_STRING.search(self.texts[blob]) is not None
+        return tuple(entry for entry in versions if searched[entry[1]])
 
     def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
         """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read
@@ -2793,25 +2946,94 @@ class EditedFiles:
         for label, content in style_ledger.blob_contents(self.repo, unread):
             self.texts[unread[label]] = content.decode(errors="replace")
 
-    def module_readings(self, moved: FileRename) -> tuple[tuple[str, RenamedText | NoRenamedText | UncertainModulePath], ...]:
-        """`renamed_text` of moved in each Rust file at either commit that `declaring` gives for its old stem, the renamed
-        file included, scanned once for each file version and kept for the refill.
+    def module_readings(self, moved: FileRename) -> tuple[tuple[str, ModuleSiteReading | NoRenamedText | UncertainModulePath], ...]:
+        """`module_site_readings` of moved in each Rust file at either commit that `declaring` gives for its old stem, the
+        renamed file included, kept for the refill. The first reading also reads the `pending` moves, so each file version
+        is tokenized once for all of them.
 
         A file outside the crate's root folder names the module only through the library's name or a `path` attribute
         that names the old file, so a text that holds neither name, and no `path` string the scan cannot read, is not
         scanned.
         """
         if moved not in self.readings:
-            root = crate_root(self.repo, moved.old)
-            library = crate_library(self.repo, root) if isinstance(root, PurePosixPath) else NoLibrary()
-            self.readings[moved] = tuple(
-                (path, renamed_text(self.repo, path, text, (moved,), ())) for path, text in self.declaring(moved.old_stem)
-                if not (isinstance(root, PurePosixPath)
-                        and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
-                        and PurePosixPath(moved.old).name not in text
-                        and not (isinstance(library, Library) and library.name in text)
-                        and not UNREAD_PATH_STRING.search(text)))
+            # The other moves' reads are not this finding's sources.
+            required = set(self.required_blobs)
+            self._read_module_sites((moved, *(other for other in self.pending if other not in self.readings)))
+            self.pending.clear()
+            self.required_blobs = required
+        _ = self.declaring_versions(moved.old_stem)
         return self.readings[moved]
+
+    def _read_module_sites(self, moves: tuple[FileRename, ...]) -> None:
+        """Read the tokens of each declaring file once, for every move whose old stem the file may declare."""
+        declaring = {moved: self._declaring_files(moved) for moved in moves}
+        movers: dict[tuple[str, str], list[FileRename]] = defaultdict(list)
+        for moved, files in declaring.items():
+            for file in files:
+                movers[file].append(moved)
+        if self.ledger.reader_source == style_config.ReaderSource.RUST:
+            readings = self._reader_module_sites(movers)
+        else:
+            readings = {(path, text): dict(zip(file_moves, module_site_readings(
+                        self.repo, path, text, tuple(file_moves), folders=self.ledger.crate_root_folders), strict=True))
+                        for (path, text), file_moves in movers.items()}
+        for moved, files in declaring.items():
+            self.readings[moved] = tuple((file[0], readings[file][moved]) for file in files)
+
+    def _reader_module_sites(self, movers: Mapping[tuple[str, str], list[FileRename]]
+                             ) -> dict[tuple[str, str], dict[FileRename, ModuleSiteReading | NoRenamedText | UncertainModulePath]]:
+        """Read every required module query in one request without saved blob facts."""
+        blobs = {text: blob for blob, text in self.texts.items()}
+        queries: list[style_reader.ModuleQuery] = []
+        requested: dict[tuple[str, str], tuple[FileRename, ...]] = {}
+        readings: dict[tuple[str, str], dict[FileRename, ModuleSiteReading | NoRenamedText | UncertainModulePath]] = {}
+        for (path, text), moves in movers.items():
+            selected: list[FileRename] = []
+            contexts: list[style_reader.ModuleMove] = []
+            readings[path, text] = {}
+            for moved in moves:
+                root = crate_root(self.repo, moved.old, folders=self.ledger.crate_root_folders)
+                if isinstance(root, NoCrateRoot):
+                    readings[path, text][moved] = NoRenamedText()
+                    continue
+                module = style_footprint.crate_module(moved.old, root)
+                if isinstance(module, style_footprint.OutsideCrate):
+                    readings[path, text][moved] = NoRenamedText()
+                    continue
+                library = crate_library(self.repo, root)
+                contexts.append(style_reader.ModuleMove(
+                    moved.old, moved.new, style_footprint.crate_module(path, root), module[:-1],
+                    library.name if isinstance(library, Library) else style_reader.NoCrateLibrary()))
+                selected.append(moved)
+            if contexts:
+                query = style_reader.ModuleQuery(blobs[text], path, tuple(contexts))
+                queries.append(query)
+                requested[query.blob, query.path] = tuple(selected)
+        if queries:
+            try:
+                answers = style_reader.read_module_sites(self.repo, queries)
+            except style_reader.ReaderError as error:
+                raise style_ledger.CheckCouldNotRun(str(error)) from error
+            for (blob, path), answer in answers.items():
+                text = self.texts[blob]
+                requested_moves = requested[blob, path]
+                values = (tuple(style_reader.ModuleSiteRefusal.NO_RENAMED_TEXT for _ in requested_moves)
+                          if isinstance(answer, style_reader.UnreadableFact) else answer)
+                for moved, value in zip(requested_moves, values, strict=True):
+                    readings[path, text][moved] = (
+                        ModuleSiteReading(value) if isinstance(value, bool) else
+                        UncertainModulePath() if value == style_reader.ModuleSiteRefusal.UNCERTAIN_MODULE_PATH else NoRenamedText())
+        return readings
+
+    def _declaring_files(self, moved: FileRename) -> tuple[tuple[str, str], ...]:
+        root = crate_root(self.repo, moved.old, folders=self.ledger.crate_root_folders)
+        library = crate_library(self.repo, root) if isinstance(root, PurePosixPath) else NoLibrary()
+        return tuple((path, text) for path, text in self.declaring(moved.old_stem)
+                     if not (isinstance(root, PurePosixPath)
+                             and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
+                             and PurePosixPath(moved.old).name not in text
+                             and not (isinstance(library, Library) and library.name in text)
+                             and not UNREAD_PATH_STRING.search(text)))
 
 
 def _unbuilt_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
@@ -2889,14 +3111,14 @@ def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketR
     if (not concurrent and base.commit != checkpoint) or subprocess.run(["git", "-C", str(ledger.repo), "merge-base", "--is-ancestor", checkpoint, base.commit],
                                                        capture_output=True, check=False).returncode != 0:
         raise style_ledger.LedgerError("unit branch is not at the waiting checkpoint")
-    edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint))
+    edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(checkpoint), FootprintRole.CHECKPOINT)
     origin = ledger.ticket_origin(ticket["id"])
     if isinstance(origin, style_ledger.ApprovedProposal):
         if not origin.finding_ids or len(edits.ticket_findings(origin)) != len(origin.finding_ids):
             raise style_ledger.LedgerError("waiting findings cannot be read")
     if edits.uncertain_of_ticket(ticket):
         raise style_ledger.LedgerError("waiting footprint has an uncertain module route")
-    original = EditedFiles(ledger.repo, ledger, UnitBranchTip(ticket["base"]))
+    original = EditedFiles(ledger.repo, ledger, UnitBranchTip(ticket["base"]), FootprintRole.TICKET_BASE)
     if not ticket["base"] or original.uncertain_of_ticket(ticket):
         raise style_ledger.LedgerError("waiting base footprint cannot be proved")
     files = frozenset((*edits.of_ticket(ticket), *original.of_ticket(ticket)))
@@ -2909,13 +3131,23 @@ def waiting_checkpoint(ledger: style_ledger.Ledger, ticket: style_ledger.TicketR
     return work
 
 
+def edits_at_main(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges) -> EditedFiles | None:
+    """The footprint reader at main's pushed tip when main changed paths. A selection passes one reader to each
+    `checkpoint_selection` and `ticket_sync_wait`, so each declaring file is tokenized once."""
+    if isinstance(changes, MainChanges) and changes.paths:
+        return EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
+    return None
+
+
 def checkpoint_selection(work: WaitingCheckpoint | NoCheckpointBlock, ledger: style_ledger.Ledger,
                          changes: MainChanges | UnknownMainChanges, files: tuple[str, ...],
-                         findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForMerge | NoCheckpointBlock:
+                         findings: tuple[style_ledger.HeldFinding, ...] = (),
+                         main_edits: EditedFiles | None = None) -> WaitingForMerge | NoCheckpointBlock:
+    """A merge wait for the files, and for the files at main of the findings; a call without main_edits reads its own."""
     if isinstance(work, NoCheckpointBlock):
         return work
     if isinstance(changes, MainChanges) and changes.paths and findings:
-        edits = EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip))
+        edits = main_edits or EditedFiles(ledger.repo, ledger, UnitBranchTip(changes.pushed_tip), FootprintRole.MAIN)
         if any(edits.uncertain(finding) for finding in findings):
             raise style_ledger.LedgerError("selected footprint at main is uncertain")
         files = (*files, *(path for finding in findings for path in edits.of(finding)))
@@ -3383,6 +3615,7 @@ def _select_observed_phase(
         # A finding whose change edits another busy file waits, and so does a file rename whose edit the gate cannot
         # prove; the other findings of its file stay available.
         footprint_waits: Counter[tuple[str, str]] = Counter()
+        edits.prepare(finding for path in set(by_file) - outside - held - set(changed) for finding in by_file[path])
         for path in sorted(set(by_file) - outside - held - set(changed)):
             free: list[style_ledger.HeldFinding] = []
             for finding in by_file[path]:
@@ -3400,14 +3633,17 @@ def _select_observed_phase(
         refusals["outside pilot scope"] += sum(len(by_file[path]) for path in outside)
         refusals["busy or rank held"] += sum(len(by_file[path]) for path in held)
         refusals["waiting for sync"] += sum(len(by_file[path]) for path in changed)
+        main_edits = edits_at_main(ledger, changes)
+        if main_edits is not None:
+            main_edits.prepare(finding for path in set(by_file) - outside - held - set(changed) for finding in by_file[path])
         for path in sorted(set(by_file) - outside - held - set(changed)):
             members = tuple(by_file[path])
             if not members:
                 continue
             footprint = tuple(dict.fromkeys(edited for finding in members for edited in edits.of(finding)))
-            checkpoint = checkpoint_selection(predecessor, ledger, changes, footprint, members)
+            checkpoint = checkpoint_selection(predecessor, ledger, changes, footprint, members, main_edits)
             sync = ticket_sync_wait(ledger, changes, "proposal", style_proposals.crate_for(directories, path), rule,
-                                    footprint, members)
+                                    footprint, members, main_edits)
             if isinstance(checkpoint, WaitingForMerge) or isinstance(sync, WaitingForSync):
                 refusals["waiting for merge" if isinstance(checkpoint, WaitingForMerge) else "waiting for sync"] += len(members)
                 by_file[path] = []
@@ -3512,6 +3748,19 @@ def family_idle_reason(family: rules.Family, result: PhaseWritten | NoAvailableW
     return FamilyIdleReason(family, reason)
 
 
+def count_refill(ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
+                 doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
+                 definitions: Mapping[str, rules.Rule], changes: MainChanges | UnknownMainChanges,
+                 predecessor: WaitingCheckpoint | NoCheckpointBlock) -> (BuildableFindings | PhaseWritten | NoAvailableWork |
+                 WaitingForStructure | MergeStyleBranchFirst | UnitNeedsSyncedTip | WaitingForSync | WaitingForMerge):
+    """Count buildable work for the unit's assigned families without publishing tickets or decisions."""
+    config = style_config.config_for_unit(unit, ledger.staff_resolver().record)
+    families = config.assignment(ledger.unit_name(unit)).families
+    return _select_phase(ledger, unit, branch, plan, repo, doc, text, scope, busy, first_files,
+                         definitions, changes, predecessor, family=min(families, key=family_rank),
+                         families=families, selection=FamilySelection.COUNT)
+
+
 def select_family_work(ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
                        doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
                        definitions: Mapping[str, rules.Rule], changes: MainChanges | UnknownMainChanges,
@@ -3570,9 +3819,12 @@ def restore_ticket_worker(run: Path, worktree: Path, plan: Path, ticket_id: str,
     commands.append([str(SCRIPTS / "lib/py"), str(SCRIPTS / "direct/progress_history.py"), "start-phase",
                      "--session-dir", str(run), "--phase-id", phase_id, "--phase-title", ticket_id])
     if passed.get("status") not in ("active", "completed"):
-        commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
-                     "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
-                     "--cwd", str(worktree), "--paths", str(paths)])
+        if quota_state.no_worker_mode():
+            print(f"{slot}: {quota_state.NO_WORKER_START}")
+        else:
+            commands.append(["bash", str(SCRIPTS / "direct/assign.sh"), "--role", "implement", "--new-worker", slot,
+                             "--session-dir", str(run), "--phase", phase_id, "--prompt", str(prompt),
+                             "--cwd", str(worktree), "--paths", str(paths)])
     for command in commands:
         result = subprocess.run(command, cwd=worktree, capture_output=True, text=True, check=False)
         if result.returncode:

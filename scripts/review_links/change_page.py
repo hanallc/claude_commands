@@ -7,8 +7,10 @@ except FileNotFoundError:
     pass
 
 import argparse
+import hashlib
 import html
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -34,11 +36,13 @@ from scripts.production.delivery_state import (
 from scripts.lib import atomic_file, conf, file_lock, urgency
 from scripts.production.production_doc import Refusal as Refusal, production_field
 from scripts.feature_log import feature_log
-from scripts.review_links import review_link
+from scripts.review_links import page_frame, review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
+REBUILDS_NAME = "rebuilds.html"
 BROWSER_MANIFEST = ".review-link-browser.json"
+CONSOLE_FOLDER = "console"
 SEND_ERRORS = (OSError, RuntimeError, subprocess.SubprocessError)
 SENDER = Path(__file__).stem
 DELIVERY_PREFIX = ".review-link-delivery-"
@@ -49,10 +53,15 @@ class BrowserManifest(TypedDict):
     initial: str
 
 
+type ReviewKind = Literal["changes", "questions"]
+TITLES: dict[ReviewKind, str] = {"changes": "Changes to review", "questions": "Questions to answer"}
+
+
 @dataclass(frozen=True)
 class ReviewBrowser:
     token: str
     initial: str = ""
+    kind: ReviewKind = "changes"
 
 
 class PageManifest(TypedDict):
@@ -128,6 +137,9 @@ class SentCloseoutAlerts(TypedDict):
     messages: list[str]
 
 
+QuestionOutcome = Literal["answer", "followup", "skip"]
+
+
 class StoredUserAnswer(TypedDict):
     saved: bool
     source: str
@@ -136,6 +148,8 @@ class StoredUserAnswer(TypedDict):
     question: str
     answer: str
     message: str
+    # A record saved before follow-ups and skips has no kind; it is an answer.
+    kind: NotRequired[QuestionOutcome]
 
 
 @dataclass(frozen=True)
@@ -394,23 +408,51 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
-def document(content: str) -> bytes:
+def script_version(script: str) -> str:
+    """Name a page script by its content; an open page reloads, not updates, when the server's script differs."""
+    return hashlib.sha256(script.encode()).hexdigest()[:12]
+
+
+CHANGE_IMAGE_STYLE = """main:has(.change-image){max-width:1056px}
+:is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
+.change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
+.change-image img{display:block;box-sizing:border-box;width:280px;max-width:100%;max-height:420px;object-fit:cover;object-position:top left;border:1px solid #8886;border-radius:6px}
+[data-showrunner-filter]{max-width:680px}
+@media(max-width:999px){:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){display:block;max-width:680px}.change-image{margin-top:24px}}
+"""
+
+
+def change_content(row: dict[str, str], content: str) -> str:
+    """Place the change text beside its thumbnail when its image exists."""
+    path = change_review.image_path(row.get(change_review.IMAGE, ""))
+    if not path:
+        return content
+    alt = html.escape("Screenshot: " + row.get("Change", "Change preview"), quote=True)
+    thumbnail = (f'<a data-image-zoom class="change-image" href="{path}" target="_blank" rel="noopener">'
+                 + f'<img src="{path}" alt="{alt}"></a>')
+    return '<div class="change-text">' + content + '</div>' + thumbnail
+
+
+def document(content: str, title: str = TITLES["changes"]) -> bytes:
     return ('''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Changes to review</title><style>
+<title>''' + html.escape(title) + '''</title><style>
 :root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id{opacity:.7;font-size:14px}.kind{font-weight:600}
-h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
+body{margin:0}''' + page_frame.STYLE + page_frame.ZOOM_STYLE + '''main{max-width:744px}
+''' + CHANGE_IMAGE_STYLE + '''h1{font-size:26px;line-height:1.25;margin:0 0 16px}section h1,h2{font-size:20px;line-height:1.3}
 h2{margin:16px 0}p{white-space:pre-wrap;margin:16px 0}main{overflow-wrap:anywhere}
-section h2{font-size:17px}section details{margin:16px 0}.secondary-actions{margin-top:8px}
+section h2{font-size:17px}section details{margin:16px 0}
+.answer-actions{display:flex;flex-wrap:wrap;gap:8px}.answer-actions button{margin:0}
+@media (max-width:480px){.answer-actions{gap:6px}.answer-actions button{font-size:15px;padding:6px 8px}}
+.change-details{display:grid;grid-template-columns:max-content 1fr;column-gap:1ch;margin:16px 0 0;font:14px/1.45 ui-monospace,monospace;opacity:.8}
+.change-details dd{margin:0}
 ul,ol{margin:16px 0;padding-left:28px;overflow-wrap:anywhere}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
 section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
 form{margin-top:16px}label,textarea{display:block}textarea{box-sizing:border-box;width:100%;font:inherit;margin:8px 0 16px;resize:vertical}
 button{font:inherit;min-height:44px;max-width:100%;margin:0 8px 8px 0;padding:6px 12px;background:light-dark(#f2f2f2,#303030);color:CanvasText;border:1px solid light-dark(#707070,#a0a0a0)}button[aria-pressed=true]{outline:2px solid currentColor}
 summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible,summary:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid currentColor;outline-offset:2px}
-</style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
+</style><style>''' + page_frame.COPY_STYLE + '''</style></head><body><main>''' + content + "</main><script>" + page_frame.ZOOM_SCRIPT + page_frame.COPY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
@@ -441,14 +483,40 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
 <label for="feedback-{row_id}">Comment, question or feedback</label>
 <textarea id="feedback-{row_id}" name="feedback" rows="{feedback_rows}">
 {html.escape(notice.feedback)}</textarea>
-<div>{"".join(buttons[:2])}</div><div class="secondary-actions"><div>{"".join(buttons[2:3])}</div><div class="feedback-actions">{"".join(buttons[3:])}</div></div></form>'''
+<div class="answer-actions">{"".join(buttons)}</div></form>'''
+
+
+_COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+_ADDED = re.compile(r"^(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?$")
+
+
+@dataclass(frozen=True)
+class ChangeDetails:
+    """The facts shown under a change's buttons; an empty value is unknown."""
+    change: str
+    date: str
+    time: str
+    commit: str
+    kind: str
+
+    @classmethod
+    def read(cls, row: dict[str, str], key: str) -> ChangeDetails:
+        """Split the Merged cell `<date>[ <HH:MM>][ · <commit>]` into its parts."""
+        parts = [part.strip() for part in row.get("Merged", "").split(" · ")]
+        added = _ADDED.match(parts[0])
+        commit = parts[-1] if len(parts) > 1 and _COMMIT.match(parts[-1]) else ""
+        return cls(key, added[1] if added else "", (added[2] or "") if added else "", commit, row.get(change_review.KIND, ""))
+
+    def lines(self) -> list[tuple[str, str]]:
+        return [(label, value) for label, value in (("change", self.change), ("date", self.date), ("time", self.time),
+                                                    ("commit", self.commit), ("kind", self.kind)) if value]
 
 
 def change_details(row: dict[str, str], key: str) -> str:
-    """Keep change metadata inside one closed disclosure."""
-    return ('<details><summary>Details</summary>'
-            + f'<div class="id">{html.escape(key)} · {html.escape(row.get("Merged", ""))}</div>'
-            + f'<p class="kind">{html.escape(row.get(change_review.KIND) or "Kind not recorded")}</p></details>')
+    """Show the change's facts as aligned lines, always open."""
+    return ('<dl class="change-details">'
+            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
+            + "</dl>")
 
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
@@ -456,17 +524,35 @@ def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
 
 
-def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
-    """Render review text as escaped text blocks and consecutive list runs."""
+LINK = re.compile(r"(https?://[^\s<>\"']*[^\s<>\"'.,;:!?)\]])")
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def linked(text: str) -> str:
+    """Escape text and make each http or https address a link that opens in the same tab, outside the console frame."""
+    pieces = LINK.split(text)
+    return "".join(f'<a href="{html.escape(piece, quote=True)}" target="_top">{html.escape(piece)}</a>'
+                   if index % 2 else html.escape(piece) for index, piece in enumerate(pieces))
+
+
+def inline_html(text: str) -> str:
+    """Escape text, show each backtick span as code, and make each address outside a code span a link."""
+    pieces = CODE_SPAN.split(text)
+    return "".join(f"<code>{html.escape(piece)}</code>" if index % 2 else linked(piece) for index, piece in enumerate(pieces))
+
+
+def review_text_html(text: str, *, inline: bool = False) -> str:
+    """Render review text as escaped text blocks and consecutive list runs; `inline` adds links and code spans."""
+    escape = inline_html if inline else html.escape
     lines = text.splitlines()
     if not any(re.match(r"\s*(?:- |[0-9]+\. )", line) for line in lines):
-        return f"<{block}>{html.escape(text)}</{block}>"
+        return f"<p>{escape(text)}</p>"
     content: list[str] = []
     current = ""
     for line in lines:
         line = line.lstrip()
         numbered = re.match(r"([0-9]+)\. (.*)", line)
-        tag = "ul" if line.startswith("- ") else "ol" if numbered else block if line else ""
+        tag = "ul" if line.startswith("- ") else "ol" if numbered else "p" if line else ""
         if tag != current:
             if current:
                 content.append(f"</{current}>")
@@ -474,16 +560,37 @@ def review_text_html(text: str, block: Literal["p", "pre"] = "p") -> str:
                 start = (numbered[1].lstrip("0") or "0") if numbered else "1"
                 attribute = f' start="{start}"' if tag == "ol" and start != "1" else ""
                 content.append(f"<{tag}{attribute}>")
-        elif tag == block:
+        elif tag == "p":
             content.append("\n")
         if tag in ("ul", "ol"):
             item = numbered[2] if numbered else line[2:]
-            content.append(f"<li>{html.escape(item)}</li>")
+            content.append(f"<li>{escape(item)}</li>")
         elif tag:
-            content.append(html.escape(line))
+            content.append(escape(line))
         current = tag
     if current:
         content.append(f"</{current}>")
+    return "".join(content)
+
+
+BLANK_EDGES = re.compile(r"\A(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+\Z")
+
+
+def review_html(text: str) -> str:
+    """Render review text as paragraphs, lists, and code blocks with copy controls."""
+    content: list[str] = []
+    start = 0
+    for block in page_frame.CODE_BLOCK.finditer(text):
+        before = BLANK_EDGES.sub("", text[start:block.start()])
+        if before.strip():
+            content.append(review_text_html(before))
+        content.append(page_frame.code_block_html(block))
+        start = block.end()
+    if not content:
+        return review_text_html(BLANK_EDGES.sub("", text))
+    after = BLANK_EDGES.sub("", text[start:])
+    if after.strip():
+        content.append(review_text_html(after))
     return "".join(content)
 
 
@@ -491,9 +598,9 @@ def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str
     if isinstance(question, NoQuestion):
         return ""
     feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
-    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_text_html(question.text)
+    content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += review_text_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_text_html(question.answer)
+        content += review_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_html(question.answer)
     else:
         content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content
@@ -577,12 +684,12 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text and (verdict or not warning) else
                   "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
-        sections.append(f'''<section id="{row_id}">
-{alert}
+        content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
-{change_details(row, row["#"])}
-<h2>{proof_title}</h2>{review_text_html(row[change_review.CHECK], "pre")}
-{question_html(question)}{answer}</section>''')
+<h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
+{question_html(question)}{answer}
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
+        sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:
         sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
     queue = next_item.change_queue(page.production)
@@ -802,7 +909,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
 
 
 def review_message(page: ReviewPage, row: dict[str, str], headline: str, *details: str) -> str:
-    return "\n".join((f"Change review {row['#']}: {headline}", f"List: {page.review_list}",
+    shown = change_review.display_id(row, route_owner(page, row).tab)
+    return "\n".join((f"Change review {shown}: {headline}", f"List: {page.review_list}",
                       f"Production: {unit_lookup.doc_owner(page.production, staff.snapshot()).name}", f"Change: {row['Change']}", *details))
 
 
@@ -832,6 +940,26 @@ class DeliveryFailure:
     error: str
 
 
+def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
+                      pause: float) -> list[DeliveryFailure]:
+    """Send to all remaining recipients in each round, pause between rounds, and return the last failures."""
+    remaining = recipients
+    failures: list[DeliveryFailure] = []
+    for attempt in range(tries):
+        if not remaining:
+            break
+        failures = []
+        for target in remaining:
+            try:
+                send_to_staff(target, sender, message)
+            except SEND_ERRORS as error:
+                failures.append(DeliveryFailure(target, str(error)))
+        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
+        if remaining and attempt + 1 < tries:
+            time.sleep(pause)
+    return failures
+
+
 def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
     """Deliver each saved message and report exhausted attempts to its showrunner."""
     if isinstance(delivery, NoMessageDelivery):
@@ -848,22 +976,8 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
             _ = status.request_attempts.pop(delivery.attempt, None)
             return
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
-    remaining = delivery.recipients
-    failures: list[DeliveryFailure] = []
-    if not remaining:
-        failures.append(DeliveryFailure(MissingRecipient(), "no showrunner to send to"))
-    for attempt in range(tries):
-        if not remaining:
-            break
-        failures = []
-        for target in remaining:
-            try:
-                send_to_staff(target, SENDER, delivery.message)
-            except SEND_ERRORS as error:
-                failures.append(DeliveryFailure(target, str(error)))
-        remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
-        if remaining and attempt + 1 < tries:
-            time.sleep(pause)
+    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
+                else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
     alert_delivery_failures(delivery, failures, tries)
     status.record(delivery)
 
@@ -970,7 +1084,8 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 identities = update_registration.QuestionStaff.read()
                 question = next((item for item in update_registration.question_records_for_document(page.production, identities)
                                  if item.path == page.review_list), None)
-                if question is None or question.status != "closed":
+                # An answer closes its question; a follow-up or a skip leaves it open.
+                if question is None or question.status != ("closed" if saved.get("kind", "answer") == "answer" else "open"):
                     status.clear_locked(page, page.rows[0], slots, "verdict")
                     continue
                 if not saved.get("saved", False):
@@ -993,17 +1108,45 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                         del status.request_attempts[attempt]
 
 
-def publish_browser(initial: str = "") -> str:
-    """Publish one all-list page without copying change records."""
-    root = review_link.review_root()
-    with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
-        source = Path(temporary) / PAGE_NAME
-        _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
-        url = review_link.snapshot_at(root, [source], new=True)[0]
-    folder = root / urlsplit(url).path.split("/")[1]
-    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
-    atomic_file.write_bytes_atomic(folder / BROWSER_MANIFEST, json.dumps(manifest).encode(), mode=0o600)
-    return url
+def console_folder(root: Path) -> Path:
+    """Create the fixed console folder and its browser token once; later calls keep both."""
+    folder = root / CONSOLE_FOLDER
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = folder / BROWSER_MANIFEST
+    if target.exists():
+        return folder
+    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": ""}
+    draft = folder / f"{BROWSER_MANIFEST}.{secrets.token_hex(8)}"
+    atomic_file.write_bytes_atomic(draft, json.dumps(manifest).encode(), mode=0o600)
+    try:
+        # A link never replaces a token that a concurrent first request created.
+        os.link(draft, target)
+    except FileExistsError:
+        pass
+    finally:
+        draft.unlink()
+    return folder
+
+
+def console_url() -> str:
+    """Return the fixed console address; the server renders it from the current code at each request."""
+    return f"http://{review_link.link_host()}:{conf.read('review_links').whole('server_port')}/{CONSOLE_FOLDER}/"
+
+
+def page_url() -> str:
+    """Return the fixed Changes page path under the review root."""
+    _ = console_folder(review_link.review_root().resolve())
+    return f"/{CONSOLE_FOLDER}/{PAGE_NAME}"
+
+
+def questions_url() -> str:
+    """Return the Questions page: the same browser, limited to questions."""
+    return page_url() + "?type=questions"
+
+
+def rebuilds_url() -> str:
+    """Return the open rebuild needs beside the console's browser."""
+    return page_url().rsplit("/", 1)[0] + "/" + REBUILDS_NAME
 
 
 def main(arguments: list[str]) -> int:
@@ -1015,15 +1158,17 @@ def main(arguments: list[str]) -> int:
         _ = parser.add_argument("--question", required=True)
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
-        page = ReviewPage(cast(Path, args.list).expanduser(), change_review.production_doc(cast(str, args.production)),
-                          (cast(str, args.row),), "")
         try:
+            target = change_review.resolve_row(cast(str, args.row), production=cast(str, args.production),
+                                               review_list=cast(Path, args.list))
+            shown = change_review.row_display_id(target.path, target.row)
+            page = ReviewPage(target.path, change_review.production_doc(cast(str, args.production)), (target.row,), "")
             changed = DeliveryStatus(review_link.review_root()).answer_question(
                 page, page.rows[0], cast(str, args.question), cast(str, args.text))
         except (OSError, ValueError, change_review.ChangeReviewError, Refusal, subprocess.SubprocessError) as error:
             print(f"change page: {error}", file=sys.stderr)
             return 1
-        print(f"Answered {page.rows[0]}" if changed else f"{page.rows[0]} already has this answer")
+        print(f"Answered {shown}" if changed else f"{shown} already has this answer")
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("rows", nargs="*")
@@ -1035,13 +1180,15 @@ def main(arguments: list[str]) -> int:
     review_list = cast(Path | None, args.list)
     try:
         if not rows:
-            print(publish_browser())
+            print(console_url())
             return 0
         if production is None:
             raise ValueError("pass --production for an older selected-row link")
         doc = change_review.production_doc(production)
-        path = review_list.expanduser() if review_list else change_review.production_list(production)
-        print(publish(doc, path, rows))
+        targets = [change_review.resolve_row(row, production=production, review_list=review_list) for row in rows]
+        if any(target.path.resolve() != targets[0].path.resolve() for target in targets):
+            raise ValueError("selected rows must belong to one review list")
+        print(publish(doc, targets[0].path, [target.row for target in targets]))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1

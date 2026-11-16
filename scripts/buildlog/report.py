@@ -51,7 +51,7 @@ from scripts.buildlog.mac_outcome import (
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.aws_target import config as aws_config, ledger, measurement
+from scripts.aws_target import config as aws_config, ledger, measurement, spend as aws_spend
 from scripts.build_targets.target_config import ssh_target_state_directory
 
 
@@ -2315,32 +2315,43 @@ def peer_sync_lines() -> list[str]:
     return lines
 
 
+def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, today: date, pace_days: int) -> list[str]:
+    """Month to date, the month forecast from recent billed days, and the gate compute share."""
+    month = aws_spend.month_spend(spends, today, pace_days)
+    if month is None:
+        return []
+    return [f'**Month to date (UTC {today:%Y-%m}): ${month.to_date:.2f} of the ${monthly_limit:.2f} monthly limit. '
+            + f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last {month.billed_days} billed days.**',
+            '', f'32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.', '']
+
+
 def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
     settings = conf.path('aws_target')
     directory = ssh_target_state_directory('aws')
     instant = int(time.time())
-    spends: tuple[ledger.DailySpend, ...] = ()
-    daily_limit = Decimal(0)
+    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
+    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
+    last_estimate_day = today if current_report else day
+    spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
         snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
         usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
-        if isinstance(snapshot, measurement.AwsMeasurement) and isinstance(snapshot.costs, ledger.CostEstimate) and not isinstance(inputs.settings, measurement.MeasurementUnavailable):
-            spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
-            daily_limit = inputs.settings.daily_limit_usd
+        spend = aws_spend.spend_from(inputs, snapshot, directory, instant, last_estimate_day)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
+    if isinstance(spend, measurement.MeasurementUnavailable):
+        spend = aws_spend.NO_SPEND
+    shown = list(spend.days)
     saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
-    today = datetime.fromtimestamp(instant, UTC).date().isoformat()
-    current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
-    last_estimate_day = today if current_report else day
-    newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
-    shown = sorted((spend for spend in spends if spend.source == 'AWS bill'
-                    or newest_bill_day < spend.day <= last_estimate_day),
-                   key=lambda spend: spend.day, reverse=True)
-    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, daily_limit, today)]
+    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
+    try:
+        pace_days = conf.read(settings).whole('spend_pace_days')
+        lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))
+    except (OSError, ValueError, KeyError) as error:
+        lines.extend((f'Month forecast unavailable: {error}.', ''))
     notes: list[str] = []
     if saving.steps > 0:
         dollars = uptime = 'unavailable'

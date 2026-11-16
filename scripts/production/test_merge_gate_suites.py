@@ -16,8 +16,9 @@ import select
 from types import SimpleNamespace
 from pathlib import Path
 from typing import cast, final
+from collections.abc import Generator
 from unittest import mock
-from scripts.production import affected_modules, merge_gate
+from scripts.production import affected_modules, checkpoint_gate, merge_gate
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
 from scripts.test_times import gate_record
@@ -30,36 +31,51 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 class MergeGateSuitesTests(GateSuitesFixture):
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
-        now = 0.0
-        process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
+        # The queue admission wait comes before the time limit starts.
+        cases = (("whole machine", merge_gate.WholeMachine(), 0.0),
+                 ("shared after a 300 s admission wait", merge_gate.SHARED_MACHINE, 300.0))
+        for name, machine, admission_wait in cases:
+            with self.subTest(name):
+                now = 0.0
+                began = 0.0
+                process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
 
-        def start(*arguments: object) -> merge_gate.RunningGateJob:
-            nonlocal now
-            suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
-            now = 9.98
-            self.write(log, "OK\n")
-            return merge_gate.RunningGateJob(suite, path, process, 0, 0, log.open("r+"), log, path.name)
+                @contextlib.contextmanager
+                def admitted_after_wait(*_arguments: object, **_options: object) -> Generator[None]:
+                    nonlocal now, began
+                    now += admission_wait
+                    began = now
+                    yield None
 
-        def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
-            return (arguments[0] if now >= 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
+                def start(*arguments: object) -> merge_gate.RunningGateJob:
+                    nonlocal now
+                    suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
+                    now = began + 9.98
+                    self.write(log, "OK\n")
+                    return merge_gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
 
-        def advance(seconds: float) -> None:
-            nonlocal now
-            now += seconds
+                def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
+                    return (arguments[0] if now >= began + 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
 
-        with (mock.patch.dict(os.environ, self.environment),
-              mock.patch.object(time, "monotonic", side_effect=lambda: now),
-              mock.patch.object(time, "sleep", side_effect=advance),
-              mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
-              mock.patch.object(os, "wait4", side_effect=reap),
-              mock.patch.object(process_group, "send_process_group"),
-              contextlib.redirect_stdout(io.StringIO())):
-            run = merge_gate.run_suites(self.checkout, machine=merge_gate.WholeMachine(),
-                                       time_limit=gate_record.GateTimeLimit(10))
-        self.assertTrue(run.passed, run.time_limit_report)
-        self.assertEqual(run.jobs[0].returncode, 0)
-        self.assertEqual(run.jobs[0].killed_for, "")
-        self.assertEqual(run.time_limit_report, "")
+                def advance(seconds: float) -> None:
+                    nonlocal now
+                    now += seconds
+
+                with (mock.patch.dict(os.environ, self.environment),
+                      mock.patch.object(time, "monotonic", side_effect=lambda: now),
+                      mock.patch.object(time, "sleep", side_effect=advance),
+                      mock.patch.object(merge_gate, "gate_reservation", side_effect=admitted_after_wait),
+                      mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
+                      mock.patch.object(os, "wait4", side_effect=reap),
+                      mock.patch.object(process_group, "send_process_group"),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    run = merge_gate.run_suites(self.checkout, machine=machine,
+                                               time_limit=gate_record.GateTimeLimit(10))
+                self.assertTrue(run.passed, run.time_limit_report)
+                self.assertEqual(run.jobs[0].returncode, 0)
+                self.assertEqual(run.jobs[0].killed_for, "")
+                self.assertEqual(run.time_limit_report, "")
+                self.assertLess(run.seconds, 20)
 
     def test_time_limit_notice_resolves_staff_ids_and_unit_names(self) -> None:
         from scripts.message import roster, send
@@ -322,6 +338,28 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertEqual(len([event for event in self.module_events() if event["event"] == "start"]), 1)
         self.assertIn("hooks/test_first.py exit=1 seconds=", output.getvalue())
         self.assertNotIn("Rerun alone", output.getvalue())
+
+    @gate_suites("lib", "hooks")
+    def test_named_modules_run_alone_with_no_hold_ledger_or_record(self) -> None:
+        self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
+                   + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, self.environment),
+              contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
+            for name in ("BuildHoldWait", "gate_reservation", "PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+                _ = blocked.enter_context(mock.patch.object(merge_gate, name, side_effect=AssertionError(name)))
+            code = merge_gate.main(["--tests-only", "--repo", str(self.checkout),
+                                    "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
+        self.assertEqual(code, 1, output.getvalue())
+        starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
+        # A red module runs once more alone, as in the gate, so a flake is not a red name.
+        self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
+        self.assertEqual(checkpoint_gate.red_names(["merge_gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
+
+    def test_a_named_module_needs_tests_only(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = merge_gate.main(["--repo", str(self.checkout), "--module", "hooks/test_first.py"])
+        self.assertIn("--module needs --tests-only", errors.getvalue())
 
     @gate_suites("hooks")
     def test_whole_machine_stops_a_module_at_its_time_limit(self) -> None:

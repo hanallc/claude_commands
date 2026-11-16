@@ -38,7 +38,7 @@ from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -120,7 +120,7 @@ class TmpSweepCase(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
-            **config_environment(base / "config"),
+            **copies_environment(base),
         })))
         self.addCleanup(self.pane_world.process_directory.cleanup)
         pane_patches = [
@@ -281,6 +281,20 @@ class CopyTests(TmpSweepCase):
         self.assertEqual(events, ["guard"])
         self.assertFalse(checkout.exists())
 
+    def test_a_kept_cargo_output_keeps_its_folder_and_fails_nothing(self) -> None:
+        checkout = self.tmp / "kept-checkout"
+        checkout.mkdir(parents=True)
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        kept = scratch.CargoOutputKept("Cargo output kept: Cargo output is locked")
+        with (mock.patch.object(scratch, "clean_cargo_outputs", side_effect=kept),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertTrue(checkout.exists())
+        self.assertEqual(result.failed, [])
+        self.assertEqual(result.kept, {tmp_sweep.CARGO_OUTPUT_KEPT: [str(checkout)]})
+        self.assertIn(f"tmp sweep: keep {checkout}: Cargo output kept", output.getvalue())
+
     def test_private_root_never_selects_the_live_copies_authority(self) -> None:
         authority_root = self.tmp.parent / "authority copies"
         with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
@@ -295,7 +309,8 @@ class CopyTests(TmpSweepCase):
             with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
                 roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
                                                scratch_roots=(), wide_roots=(), session_temp_roots=())
-            self.assertEqual(roots.copies, (str(authority_root),))
+            # The live sweep also drains natedev's former copies root.
+            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(copy_record.FORMER_COPIES_ROOT)))
             authority.assert_called_once_with()
 
     def copy(self, name: str, **fields: object) -> Path:
@@ -783,21 +798,33 @@ class ScratchRootTests(TmpSweepCase):
         self.assertTrue(row.is_dir())
 
 
+def created_in_ended_process(requests: list[tuple[str, str]]) -> list[Path]:
+    """Allocate (prefix, parent) maker folders in a child; each lease is free once the child exits."""
+    code = ("import json, sys\nfrom pathlib import Path\nfrom scripts.lib import build_folders\n"
+            "for prefix, parent in json.loads(sys.argv[1]):\n"
+            "    print(build_folders.create_build_folder(build_folders.UniqueBuildFolder(\n"
+            "        prefix, build_folders.ExplicitBuildParent(Path(parent)))))\n")
+    child = subprocess.run([sys.executable, "-c", code, json.dumps(requests)], text=True, capture_output=True,
+                           check=True, cwd=Path(__file__).resolve().parents[2], timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+    return [Path(line) for line in child.stdout.splitlines()]
+
+
 class TempParentTests(TmpSweepCase):
     def test_common_session_owner_keeps_its_root_and_sweeps_only_idle_entries(self) -> None:
         session_parent = self.tmp / "session"
         owner = build_folders.create_build_folder(build_folders.StableOwnerFolder(
             LIVE_SESSION, build_folders.ExplicitBuildParent(session_parent), mode=0o700))
-        idle = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "tmp", build_folders.ExplicitBuildParent(owner)))
-        recent = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-            "tmp", build_folders.ExplicitBuildParent(owner)))
+        idle, recent = created_in_ended_process([("tmp", str(owner)), ("tmp", str(owner))])
         _ = write(idle / "output")
         self.recent(write(recent / "output"))
-        _ = self.sweep()
+        result = self.sweep()
         self.assertTrue(owner.is_dir())
         self.assertFalse(idle.exists())
         self.assertTrue(recent.is_dir())
+        # The live owner's lease records stay; a free lease's records are free residue.
+        busy = result.kept["busy: .claude-busy is locked"]
+        for name in (LIVE_SESSION + ".lock", LIVE_SESSION + ".lease.json"):
+            self.assertIn(str(session_parent / name), busy)
 
     def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
         live_root = self.tmp / "session" / LIVE_SESSION
@@ -854,14 +881,15 @@ class TempFolderTests(TmpSweepCase):
     def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
         pairs: list[tuple[str, Path, Path]] = []
         parents: list[str] = []
+        requests: list[tuple[str, str]] = []
         for kind, template in build_folders.FOLDER_PREFIXES.items():
             parent = self.tmp.parent / "common-prefixes" / kind
             parent.mkdir(parents=True)
             parents.append(str(parent))
-            prefix = template.format(owner="123")
-            allocated = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
-                prefix, build_folders.ExplicitBuildParent(parent)))
-            previous = parent / (prefix + "Ab12Cd")
+            requests.append((template.format(owner="123"), str(parent)))
+        for kind, (prefix, _), allocated in zip(build_folders.FOLDER_PREFIXES, requests,
+                                                created_in_ended_process(requests), strict=True):
+            previous = allocated.parent / (prefix + "Ab12Cd")
             previous.mkdir()
             _ = write(allocated / "Cargo.toml")
             _ = write(previous / "Cargo.toml")
@@ -1128,6 +1156,39 @@ class LogTests(TmpSweepCase):
         tmp_sweep.append_log(path, current, now)
 
         self.assertEqual(self.log(), [*records[1:], current])
+
+    def log_settings(self, sample: int, max_mib: int) -> conf.ConfigRead:
+        return conf.read(write(self.state / "log-settings.conf",
+            f"# whole: 0..\ntmp_sweep_log_sample={sample}\n# whole: 1..\ntmp_sweep_log_max_mib={max_mib}\n"))
+
+    def test_log_line_keeps_each_count_and_a_sample_of_the_paths(self) -> None:
+        result = tmp_sweep.Sweep()
+        for number in range(5):
+            result.keep(f"/tmp/claude/busy-{number}", tmp_sweep.IN_USE)
+        result.keep("/tmp/claude/fresh", tmp_sweep.RECENT)
+
+        entry = tmp_sweep.record(result, False, self.now, lint_settings=self.log_settings(2, 1))
+
+        self.assertEqual(entry["kept"], {tmp_sweep.IN_USE: 5, tmp_sweep.RECENT: 1})
+        self.assertEqual(entry["kept_paths"], {tmp_sweep.IN_USE: ["/tmp/claude/busy-0", "/tmp/claude/busy-1"]})
+
+    def test_log_drops_the_oldest_lines_beyond_its_size_and_keeps_the_new_line(self) -> None:
+        now = float(int(self.now))
+        filler = "x" * (400 << 10)
+        records = [{"at": datetime.fromtimestamp(now - 60 * (4 - index), UTC).isoformat(), "marker": index, "filler": filler}
+                   for index in range(4)]
+        path = write(self.state / tmp_sweep.LOG_NAME, "".join(json.dumps(record) + "\n" for record in records))
+        settings = self.log_settings(20, 1)
+        current = tmp_sweep.record(tmp_sweep.Sweep(), False, now, lint_settings=settings)
+
+        tmp_sweep.append_log(path, current, now, lint_settings=settings)
+
+        self.assertEqual(self.log(), [*records[2:], current])
+        self.assertLessEqual(path.stat().st_size, 1 << 20)
+        big = tmp_sweep.RunRecord(at=current["at"], dry_run=False, freed_gib=0.0, deleted=[], failed=[],
+                                  kept={tmp_sweep.IN_USE: 1}, kept_paths={tmp_sweep.IN_USE: [filler * 4]})
+        tmp_sweep.append_log(path, big, now, lint_settings=settings)
+        self.assertEqual(self.log(), [big])
 
     def test_each_run_logs_what_went_and_why_the_rest_stayed(self) -> None:
         self.now: float = time.time() + 8 * DAY
@@ -1446,12 +1507,12 @@ from scripts.copies import copies
 source = Path(sys.argv[1])
 with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source)) as tree:
     (tree / "untracked").write_text("test output\\n")
-    print(tree.parent, flush=True)
+    print(tree, flush=True)
     signal.pause()
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
                        "SCRATCH_ROOT": str(self.tmp / "scratch"), "TMPDIR": str(self.tmp),
-                       "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+                       "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup")}
         for cargo in (False, True):
             if cargo:
                 _ = write(source / "Cargo.toml", "[workspace]\n")
@@ -1475,14 +1536,15 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                         child.kill()
                         _, errors = child.communicate(timeout=30)
                     self.assertEqual(child.returncode, -signal.SIGKILL, errors)
-                checkout = folder / "checkout"
+                checkout = folder
                 self.assertEqual((checkout / "file").read_text(), "working edit\n")
                 self.assertEqual((checkout / "untracked").read_text(), "test output\n")
-                self.assertTrue(folder.is_relative_to(self.tmp))
+                self.assertTrue(folder.is_relative_to(self.tmp.parent / "fresh-settings/slots"))
                 self.assertFalse((folder / copy_record.RECORD).exists())
                 result = self.sweep()
                 self.assertTrue(folder.exists())
-                self.assertIn(str(folder), result.kept[tmp_sweep.UNSAVED_WORK])
+                self.assertNotIn(str(folder), [entry["path"] for entry in result.deleted])
+                self.assertEqual(build_folders.build_folder_state(folder), "free")
 
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
@@ -1580,6 +1642,26 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
                 result = self.sweep()
                 self.assertTrue(repo.exists())
                 self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_clone_tag_that_the_source_holds_unchanged_is_not_unsaved_work(self) -> None:
+        for kind in ("same-tag", "moved-tag"):
+            with self.subTest(kind=kind):
+                repo = self.clone(kind)
+                source = self.tmp.parent / f"source-{kind}"
+                self.git(source, "checkout", "-q", "--detach")
+                _ = write(source / "file", "release\n")
+                self.git(source, "commit", "-qam", "release")
+                self.git(source, "tag", "-a", "-m", "release", "release-v1")
+                self.git(repo, "fetch", "-q", "--tags", "origin")
+                if kind == "moved-tag":
+                    self.git(source, "tag", "-f", "-a", "-m", "moved", "release-v1", "HEAD~1")
+                result = self.sweep()
+                if kind == "same-tag":
+                    self.assertFalse(repo.exists())
+                    self.assertIn(str(repo.parent), [entry["path"] for entry in result.deleted])
+                else:
+                    self.assertTrue(repo.exists())
+                    self.assertIn(str(repo.parent), result.kept[tmp_sweep.UNSAVED_WORK])
 
     def test_git_failure_or_timeout_keeps_the_idle_clone(self) -> None:
         repo = self.clone("error")

@@ -29,7 +29,13 @@ A task, and what ends it:
     With no task, a folder gets a separate deadline task for scratch.conf default_life_seconds from now.
     Old deadline tasks without an id remain valid.
 
-A folder lives in ROOT as `<task>-<word>-<suffix>`; scratch.conf suffix_length sets the suffix length.
+A folder of a caller with a session folder (scripts/lib/session_folder.py) lives there as `<word>`, else
+`<kind>-<name>` from its task, else `scratch`, with `-2`, `-3` and so on when the name is taken (user
+decision 6, 2026-11-15). Its path is in the HOLDS file with its task, so `end` finds it; an until:
+folder is not held and goes with its session's other content. Any other folder lives in ROOT
+(build_folders.conf roots.scratch) as `<kind>-<name>-<word>-<suffix>`. An until:
+task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its record keeps the time.
+scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
 The holds record indexes their paths, so task removal does not scan TMPDIR.
 `--visible` (rows only) puts it in VISIBLE_ROOT
@@ -49,7 +55,7 @@ audit to name to its maker. The scratch guard hook
 (scripts/hooks/pre-tool-use-scratch-guard.py) refuses a loose folder in /tmp, ~/rust and the
 other roots.
 
-Copies live at /tmp/claude/copies/<pair>/<copy>. Their records also name source and copy commits,
+Copies live at <roots.copies>/<pair>/<copy>. Their records also name source and copy commits,
 target mode, seed, borrowed git directory, owner and land target. Open phases and borrowed parents
 stay; an unreadable record, phase state or land target needs repair. Shared .claude-busy locks
 keep a copy while work runs or waits. Removal holds an exclusive lock through deletion.
@@ -79,10 +85,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from scripts.lib import cargo_output, conf, copy_record  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
-from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, inherited_temporary_parent  # noqa: E402
+from scripts.lib.build_folders import BuildFolderSpec, build_folder_path, collector_lease, inherited_temporary_parent  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
@@ -94,6 +100,7 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY = ".claude-busy"
+BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
 CACHE_TAG = "CACHEDIR.TAG"
@@ -209,21 +216,13 @@ class NoGitDirectory:
 
 
 def git_directory(repo: Path) -> GitDirectory | NoGitDirectory:
-    """Resolve the checkout's Git metadata, including a linked worktree's pointer."""
-    marker = repo / ".git"
-    if marker.is_dir() and not marker.is_symlink():
-        return GitDirectory(marker)
+    """Resolve the checkout's Git metadata, including a linked worktree's pointer; a linked .git is refused."""
+    if (repo / ".git").is_symlink():
+        return NoGitDirectory()
     try:
-        line = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+        return GitDirectory(git_files.at(repo).git_dir)
+    except git_files.GitFilesError:
         return NoGitDirectory()
-    if not line.startswith("gitdir:"):
-        return NoGitDirectory()
-    pointer = line.removeprefix("gitdir:").strip()
-    if not pointer or "\n" in pointer:
-        return NoGitDirectory()
-    found = repo / pointer
-    return GitDirectory(found) if found.is_dir() else NoGitDirectory()
 
 
 def busy_path(path: Path) -> Path:
@@ -339,16 +338,19 @@ def directory_record_lock(path: Path, *, wait: bool,
 
 @contextmanager
 def removal_lock(path: Path) -> Generator[bool]:
-    """Claim the busy mark even when absent, and hold it through removal."""
-    with busy_locks(path, create=True) as idle:
-        yield idle
+    """Claim the lease locks and the busy mark, even when absent, and hold them through removal.
+    A held lease on the folder or on any folder below it is busy, and the busy mark is then
+    not created."""
+    with collector_lease(path, children=True) as free, busy_locks(path, create=free) as idle:
+        yield free and idle
 
 
 @contextmanager
 def judgment_lock(path: Path) -> Generator[bool]:
-    """Check existing busy marks without creating metadata during a scan or dry run."""
-    with busy_locks(path, create=False) as idle:
-        yield idle
+    """Check the folder's lease lock and existing busy marks without creating metadata during a scan or dry run.
+    Leases below the folder are checked only at removal, so status reads do not walk the tree."""
+    with collector_lease(path) as free, busy_locks(path, create=False) as idle:
+        yield free and idle
 
 
 @contextmanager
@@ -608,11 +610,43 @@ def target(task: str, word: str, visible: bool, *,
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
+    # The record keeps an until: task's time, so its folder name holds only the word.
+    slug = "" if match["kind"] == "until" else f"{match['kind']}-{match['name'].replace('/', '-')}"
+    folder = session_folder.caller_folder()
+    if folder is not None:
+        return free_name(folder, word or slug or "scratch")
     suffix = random_suffix(scratch_settings)
-    name = until_stamp(match["name"]) if match["kind"] == "until" else match["name"]
-    slug = f"{match['kind']}-{name.replace('/', '-')}"
+    purpose = "-".join(part for part in (slug, word) if part) or "scratch"
     return build_folder_path(BuildFolderSpec(kind="scratch", parent=copy_record.root(), suffix_length=len(suffix),
-                                            purpose="-".join(part for part in (slug, word) if part), suffix=suffix))
+                                            purpose=purpose, suffix=suffix))
+
+
+def free_name(folder: Path, name: str) -> Path:
+    """The first of `name`, `name-2`, `name-3` ... that is free in the session folder; `run` is never free."""
+    number = 1
+    while True:
+        path = folder / (name if number == 1 else f"{name}-{number}")
+        if path.name != session_folder.RUN and not os.path.lexists(path):
+            return path
+        number += 1
+
+
+def in_session_folder(path: Path) -> bool:
+    root = session_folder.session_root()
+    return root is not None and path.parent.parent == root
+
+
+def held_in_session(path: Path, task: str) -> bool:
+    """Whether a new folder is in a session folder and has a task that ends it there."""
+    return in_session_folder(path) and checked_task(task, False)["kind"] != "until"
+
+
+def index_in_session(path: Path, task: str, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    """Hold a session folder's task folder, so `end` finds it without a scan."""
+    if held_in_session(path, task):
+        _ = hold(path, task, "scratch folder in the session folder", scratch_settings=scratch_settings)
 
 
 def maker() -> str:
@@ -650,11 +684,19 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
         scratch_settings = conf.read("scratch")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
-    path = target(task, word, visible, scratch_settings=scratch_settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.mkdir()
+    while True:
+        path = target(task, word, visible, scratch_settings=scratch_settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir()
+            break
+        except FileExistsError:
+            # Another call took the free name in the session folder first; take the next one.
+            if not in_session_folder(path):
+                raise
     try:
         write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
+        index_in_session(path, task, scratch_settings=scratch_settings)
     except BaseException:
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -716,6 +758,7 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = shutil.move(str(source), str(path))
     write_record(path, task, moment, scratch_settings=scratch_settings)
+    index_in_session(path, task, scratch_settings=scratch_settings)
     return path
 
 
@@ -950,7 +993,7 @@ def lifetime(path: Path, now: float | None = None, *,
 ) -> Live | Ended | Unknown:
     with judgment_lock(path) as idle:
         if not idle:
-            return Live("busy: .claude-busy is locked")
+            return Live(BUSY_REASON)
     return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings)
 
 
@@ -1008,6 +1051,14 @@ class SavedCargoOutput:
 
     def borrows_build_directory(self) -> bool:
         return any(self.roots.build_directory.is_relative_to(root) for root in self.shared_output_roots)
+
+
+# folder_audit.py --clean-cargo-output exits with this status when its guard keeps the output.
+CARGO_OUTPUT_KEPT_STATUS = 3
+
+
+class CargoOutputKept(OSError):
+    """The guard kept a checkout's Cargo output, so the checkout stays for a later sweep."""
 
 
 def cargo_removal_mark(path: Path) -> Path:
@@ -1099,6 +1150,8 @@ def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None
     result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
                              "--clean-cargo-output", str(path.resolve())],
                             capture_output=True, text=True, check=False)
+    if result.returncode == CARGO_OUTPUT_KEPT_STATUS:
+        raise CargoOutputKept(result.stderr.strip())
     if result.returncode:
         raise OSError(result.stderr.strip() or "Cargo output cleanup failed")
     if result.stderr:

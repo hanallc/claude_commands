@@ -17,6 +17,7 @@ NoAppliedCheck too when a folder of child modules is at either name, because a p
 from __future__ import annotations
 
 import re
+import posixpath
 import hashlib
 import tomllib
 from collections.abc import Callable, Mapping
@@ -32,6 +33,67 @@ from scripts.style.candidate_generators import snake_case
 from scripts.style.declarations import ITEM_KEYWORDS, type_path
 from scripts.lib.git_blob import git_blob_id
 
+def module_name(file: str) -> str:
+    """Return the folder name for mod.rs, or the file stem for another module file."""
+    path = PurePosixPath(file)
+    return path.parent.name if path.name == "mod.rs" else path.stem
+
+
+@dataclass(frozen=True)
+class DefaultModulePath:
+    """The file module has no path attribute."""
+
+
+@dataclass(frozen=True)
+class LiteralModulePath:
+    """One plain path string belongs to a file module item."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class UncertainDeclarationPath:
+    """The module's path attribute can name any module file."""
+
+
+@dataclass(frozen=True)
+class ModuleDeclaration:
+    """A module item has a name, enclosing inline module names, and a path form."""
+
+    name: str
+    scope: tuple[str, ...]
+    path: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
+
+
+@dataclass(frozen=True)
+class ModuleDeclarations:
+    """The module declarations used to find a module file's owners."""
+
+    declarations: tuple[ModuleDeclaration, ...]
+
+    def declares(self, path: str, module: style_footprint.CrateModule, parent: tuple[str, ...], file: str) -> bool:
+        """Read the kept items for one module file without scanning its owner's text again."""
+        name, filename = module_name(file), PurePosixPath(file).name
+        for declaration in self.declarations:
+            if isinstance(declaration.path, UncertainDeclarationPath):
+                return True
+            if isinstance(declaration.path, LiteralModulePath):
+                named = declaration.path.value
+                if named.rsplit("/", 1)[-1] != filename:
+                    continue
+                if declaration.scope or posixpath.normpath(str(PurePosixPath(path).parent / named)) == file:
+                    return True
+            elif (declaration.name == name and not isinstance(module, style_footprint.OutsideCrate)
+                  and module + declaration.scope == parent):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class UnreadableDeclarationText:
+    """The token scan cannot read this file's declarations."""
+
+
 # The keywords that declare an item with a name that other names can sit under.
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
 # The macros that make an item name from other tokens or bring in items from another file.
@@ -40,6 +102,8 @@ NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
+# A rename of a Rust file at any place in an after, as in `After the moves, rename <a> to <b>.`
+ANY_FILE_RENAME = re.compile(rf"(?<![\w/.-])rename ({RUST_FILE}) to {RUST_FILE}", re.IGNORECASE)
 # Words after a file rename that name a second file pair: another change.
 SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
 # A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.
@@ -1603,6 +1667,15 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
             or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
+
+
+def edits_module_owners(kind: str, path: str, after: str) -> bool:
+    """Whether a finding changes the module of its Rust file, so it edits each file that declares that module: a
+    restructure, or a rename of its own file in any words, also one that file_rename does not approve."""
+    if kind == "restructure":
+        return path.endswith(".rs")
+    return kind == "rename" and any(path == match[1] or path.endswith("/" + match[1])
+                                    for match in ANY_FILE_RENAME.finditer(after))
 
 
 def names_other_change(rest: str) -> bool:

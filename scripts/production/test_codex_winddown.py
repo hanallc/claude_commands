@@ -9,6 +9,7 @@ import json
 import os
 import io
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -128,10 +129,10 @@ class NoticeRetryTests(unittest.TestCase):
         self.assertEqual((self.state / codex_winddown.QUIET).read_text(encoding="utf-8"), "sent\n")
 
     def test_a_running_count_before_the_quiet_claim_cancels_the_pass(self) -> None:
-        def prepare(_push: object) -> list[str]:
+        def prepare(_push: object, *, send_script: Path) -> list[str]:
             self.assertFalse((self.state / codex_winddown.QUIET).exists())
             codex_winddown.announce_quiet(1)
-            return [sys.executable, str(self.state / "fake-send.py")]
+            return [sys.executable, str(send_script)]
 
         with (mock.patch("scripts.notify.push_texts.user_send_argv", side_effect=prepare),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", ""))):
@@ -431,7 +432,7 @@ class CountTests(unittest.TestCase):
         remote_arguments = shlex.split(ssh[0][-1])
         self.assertIn("--here", remote_arguments)
         self.assertEqual(remote_arguments[remote_arguments.index("--showrunners") + 1], "runner from sender")
-        self.assertEqual(remote_arguments[remote_arguments.index("--units") + 1], "unit from sender")
+        self.assertEqual(remote_arguments[remote_arguments.index("--all-units") + 1], "unit from sender")
         self.assertIn("mac: peer runner - showrunner - sent", output.getvalue())
         self.assertIn("mac: peer director - unit director - sent", output.getvalue())
 
@@ -615,7 +616,9 @@ class MessageTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "CONF_DIR": str(self.root / "config"),
         }
+        _ = shutil.copytree(SCRIPT.parents[2] / "config", self.root / "config")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
@@ -687,6 +690,19 @@ class MessageTests(unittest.TestCase):
         self.assertIn("send --to session:b861068b-66ee-573d-b3be-ec6d4a321e71 --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
+    def test_clear_in_no_worker_mode_ends_the_wind_down_and_keeps_codex_off(self) -> None:
+        state = self.root / ".local/state/quota_alert.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        _ = state.write_text(json.dumps({"no_worker_mode": True}), encoding="utf-8")
+        _ = self.run_script("start", "--from", "natedev")
+        done = self.run_script("clear", "--from", "natedev")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        log = (self.root / "log").read_text(encoding="utf-8")
+        self.assertIn("the wind-down is over and the Codex count has stopped. No-worker mode is still on", log)
+        self.assertIn("so launch no Codex agent", log)
+        self.assertNotIn("Start using Codex again", log)
+        self.assertNotIn("we are back with Codex", log)
+
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
         self.assertEqual(self.run_script("triage", "--from", "natedev").returncode, 1)
         _ = self.run_script("start", "--from", "natedev")
@@ -697,6 +713,24 @@ class MessageTests(unittest.TestCase):
         ])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))
+
+    def test_start_and_triage_say_first_that_paid_credits_stay_on(self) -> None:
+        accounts = self.root / "config/accounts.conf"
+        _ = accounts.write_text(accounts.read_text(encoding="utf-8").replace(
+            "\ncodex_credit_accounts=none\n", "\ncodex_credit_accounts=codex2 codex1\n"), encoding="utf-8")
+        line = ("Paid credits stay on for codex1, codex2. The wind-down does not stop them. "
+                + "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none")
+        before = accounts.read_bytes()
+        for command in ("start", "triage"):
+            with self.subTest(command=command):
+                done = self.run_script(command, "--from", "natedev")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout.splitlines()[0], line)
+        self.assertEqual(accounts.read_bytes(), before)
+
+    def test_start_names_no_credits_when_no_account_may_spend_them(self) -> None:
+        done = self.run_script("start", "--from", "natedev")
+        self.assertNotIn("Paid credits", done.stdout)
 
     def test_a_unit_records_its_answer_and_start_forgets_it(self) -> None:
         owner = staff.snapshot().by_id(staff.StaffId(fixture_runtime_id("showrunner::show")))

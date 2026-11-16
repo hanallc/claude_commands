@@ -14,34 +14,55 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 
 
 TARGETS = r'''
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
-import runpy
+from types import ModuleType
 
-command = sys.argv[1]
-holders = Path(os.environ["BUILD_HOLD_DIR"])
-with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
-    output.write(json.dumps({"command": command, "args": sys.argv[2:], "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
-if command in ("constraints", "submitting-session", "source-key", "assigned-info", "reserve", "release-wait"):
-    source = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2]
-    if command == "constraints" and os.environ.get("TEST_MAC_ALLOWED", "1") != "1":
-        sys.argv.extend(("--local", "makes natedev artifacts"))
-    runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
-    raise SystemExit(0)
-if command == "eligible":
-    allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
-    print("any_target" if allowed else "natedev_only makes natedev artifacts")
-    print("natedev\teligible\t-\t-\t-")
-    if allowed:
-        print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")
-elif command in ("register-local", "check-local"):
-    raise SystemExit(10 if any(holders.iterdir()) else 0)
-elif command == "wait-local":
-    for path in holders.iterdir():
-        path.unlink()
-    print("test hold released", file=sys.stderr)
+# verify_helper runs a program with a top-level main inside the helper process, as it runs build_targets.py.
+REAL_PROGRAMS: dict[Path, ModuleType] = {}
+
+
+def real_main() -> object:
+    path = Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/build_targets/build_targets.py"
+    if path not in REAL_PROGRAMS:
+        specification = importlib.util.spec_from_file_location("fixture_build_targets", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        REAL_PROGRAMS[path] = module
+    return REAL_PROGRAMS[path].main()
+
+
+def main() -> object:
+    command = sys.argv[1]
+    holders = Path(os.environ["BUILD_HOLD_DIR"])
+    with Path(os.environ["TEST_ROUTE_EVENTS"]).open("a") as output:
+        output.write(json.dumps({"command": command, "args": sys.argv[2:], "call_id": os.environ.get("BUILDLOG_CALL_ID", "")}) + "\n")
+    if command in ("constraints", "submitting-session", "source-key", "assigned-info", "reserve", "release-wait"):
+        if command == "constraints" and os.environ.get("TEST_MAC_ALLOWED", "1") != "1":
+            sys.argv.extend(("--local", "creates a Linux install"))
+        return real_main()
+    if command == "eligible":
+        allowed = os.environ.get("TEST_MAC_ALLOWED", "1") == "1"
+        print("any_target" if allowed else "natedev_only creates a Linux install")
+        print("natedev\teligible\t-\t-\t-")
+        if allowed:
+            print("mac\teligible\t-\t" + os.environ["MAC_TEST_CONFIG"] + "\tmacos")
+    elif command in ("register-local", "check-local"):
+        return 10 if any(holders.iterdir()) else 0
+    elif command == "wait-local":
+        for path in holders.iterdir():
+            path.unlink()
+        print("test hold released", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 RUNNER = r'''
@@ -58,7 +79,7 @@ result = Path(words[words.index("--result") + 1])
 ''' + ASSIGNED_RUNNER_SETUP + r'''
 call_id = words[words.index("--call-id") + 1]
 with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.direct.test_verify_step_state import read_step_row
+from scripts.direct.step_row_test_support import read_step_row
 record = read_step_row(call_id)
 with Path(os.environ["TEST_MAC_EVENTS"]).open("a") as output:
     output.write(json.dumps({"args": words, "record": record}) + "\n")
@@ -196,7 +217,7 @@ finished = root / "mend-finished"
 if arguments[:1] == ["mend"]:
     import sys
     with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.test_verify_step_state import read_step_row
+    from scripts.direct.step_row_test_support import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (root / "mend-state").write_text(record["state"])
     finished.touch()
@@ -204,7 +225,7 @@ if arguments[:1] == ["mend"]:
 if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (arguments[:1] == ["metadata"] or arguments == ["+nightly", "fmt", "--version"]):
     import sys
     with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.test_verify_step_state import read_step_row
+    from scripts.direct.step_row_test_support import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("hold after mend")
     with (root / "between-steps").open("a") as output:

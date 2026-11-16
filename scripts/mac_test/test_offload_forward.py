@@ -9,8 +9,12 @@ import shlex
 import signal
 import time
 from typing import cast
+from unittest import mock
 
-from scripts.mac_test import offload
+from scripts.build_hold.owning_session import OwningSession
+from scripts.build_queue import placement
+from scripts.mac_test import eligibility, offload
+from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
@@ -62,7 +66,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         words = shlex.split(remote)
         forwarded_start = words.index(f"SHOT_OUTPUT={value}")
         self.assertEqual(words[forwarded_start:forwarded_start + 3], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
-        self.assertEqual(words[forwarded_start + 3], "PATH=$HOME/.cargo/bin:$PATH")
+        self.assertEqual(words[forwarded_start + 3], "PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", words)
         self.assertNotIn("UNNAMED_PRIVATE_VALUE", remote)
         self.assertNotIn("never sent", remote)
@@ -70,13 +74,13 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
-        config = offload.read_config(self.config_path)
+        config = eligibility.read_config(self.config_path)
         expected = (
             'cd .local/state/mac-test/mirror/hana && { find "$HOME"/.local/state/mac-test/mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
             + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
-            + 'PATH="$HOME/.cargo/bin:$PATH" '
+            + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
             + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
@@ -113,6 +117,20 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)
+
+    def test_placed_mac_command_sends_the_assignment_placement_to_the_cargo_gate(self) -> None:
+        request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
+        destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
+        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, placement.SourceKeyKnown("source-a"),
+            placement.SubmittingOwner("natedev", 42, "start"), OwningSession("submitting-session"), 1.0)
+        config = eligibility.read_config(self.config_path)
+        with self.subTest(placement="assigned"), mock.patch.dict(os.environ, {"MAC_PLACEMENT": "environment/value"}):
+            placed = shlex.split(offload.remote_test_command(
+                config, replace(request, placement=offload.AssignedOffloadRequest(assignment)), HANA))
+            gate = placed.index("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH")
+            self.assertEqual(placed[gate + 1], "MAC_PLACEMENT=episode-a/attempt-b")
+        with self.subTest(placement="direct"):
+            self.assertNotIn("MAC_PLACEMENT=", offload.remote_test_command(config, request, HANA))
 
     def test_argument_refusals_start_no_work(self) -> None:
         self.environment["SHOT_OUTPUT"] = ""
@@ -192,7 +210,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertIn("du -sk target/shots", events[-3]["args"][-1])
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
         pull = events[-2]["args"]
-        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(offload.read_config(self.config_path).connection)])])
+        self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))

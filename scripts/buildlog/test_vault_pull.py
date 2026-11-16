@@ -19,9 +19,11 @@ from unittest import mock
 
 from scripts.buildlog import ci
 from scripts.buildlog import cli
-from scripts.lib import conf
+from scripts.lib import conf, land_main, main_push_lock
+from scripts.lib.land_main import land
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
+from scripts.buildlog.health import Machine
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 
@@ -147,6 +149,7 @@ class VaultPullTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(time, "time", side_effect=lambda: self.now))
         _ = self.enterContext(mock.patch.object(vault_pull, "run", new=self.run_transport))
         _ = self.enterContext(mock.patch.object(ci, "warm", new=self.credentials_warm))
+        _ = self.enterContext(mock.patch.object(land_main, "land", new=self.land_fixture))
 
     @staticmethod
     def command(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -170,6 +173,15 @@ class VaultPullTests(unittest.TestCase):
             _ = self.git(publisher, "push", "origin", "main")
             self.github_update = {}
         return self.warm
+
+    def land_fixture(self, checkout: Path, commit: str, branch: str, *,
+                     time_limit: land_main.CommandTimeLimit | land_main.NoTimeLimit) -> land_main.Landed:
+        self.assertEqual(time_limit, land_main.CommandTimeLimit(vault_pull.COMMAND_TIMEOUT_S))
+        if self.reject_push:
+            if self.push_rejection == "[rejected]":
+                raise land_main.NotFastForward("GitHub main changed")
+            raise land_main.LandError(f"stdout: !\tmain:main\t{self.push_rejection} (fetch first)")
+        return land(checkout, commit, branch, time_limit=time_limit)
 
     def run_transport(self, args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
         self.assertEqual(timeout, vault_pull.COMMAND_TIMEOUT_S)
@@ -195,8 +207,6 @@ class VaultPullTests(unittest.TestCase):
             self.assertEqual(args[2], str(self.local))
             if self.unreachable and "fixture-mac:rust/hanadocs" in args:
                 return subprocess.CompletedProcess(args, 128, "", "ssh: connect: Connection refused")
-            if self.reject_push and "push" in args and "origin" in args:
-                return subprocess.CompletedProcess(args, 1, f"!\tmain:main\t{self.push_rejection} (fetch first)\n", "")
             args = [str(self.mac) if arg == "fixture-mac:rust/hanadocs" else arg for arg in args]
         else:
             self.assertEqual(args[:2], ["python3", str(self.folder / "update_registration.py")])
@@ -218,7 +228,10 @@ class VaultPullTests(unittest.TestCase):
         return [args for args in self.questions("attempts.jsonl") if args[0] == "withdraw"]
 
     def question(self) -> str:
-        return option(self.questions()[-1], "--question")
+        """Join the filed parts, so a check can look for a phrase in any part."""
+        args = self.questions()[-1]
+        return " ".join(args[index + 1] for index, value in enumerate(args)
+                        if value in ("--ask", "--context", "--choice", "--recommend"))
 
     def conflict(self) -> tuple[str, str]:
         local = self.commit(self.local, {"shared.md": "natedev edit\n"})
@@ -235,6 +248,22 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(self.git(self.mac, "log", "-1", "--format=%s"), "vault: Mac edits")
         self.assertEqual(self.git(self.mac, "status", "--porcelain"), "")
         self.assertEqual(self.questions(), [])
+
+    def test_mac_publication_runs_the_hook_with_the_landed_commit_under_the_lock(self) -> None:
+        hook = self.local / ".claude/config/post_push.sh"
+        hook.parent.mkdir(parents=True)
+        log = self.folder / "hook-log"
+        _ = hook.write_text(f'printf "%s\\n" "$LANDED_SHA" > "{log}"\n')
+        receive = self.github / "hooks/pre-receive"
+        _ = receive.write_text(
+            f'#!/bin/sh\nif flock -n "{self.local}/.git/main-push.lock" true; then exit 93; fi\n')
+        receive.chmod(0o755)
+        _ = (self.mac / "note.md").write_text("Mac\n")
+        self.assertEqual(self.hour()[0], 0)
+        commit = self.git(self.github, "rev-parse", "main")
+        self.assertEqual(log.read_text(), commit + "\n")
+        self.assertEqual(self.git(self.github, "show", "main:note.md"), "Mac")
+        self.assertTrue((self.local / ".git" / main_push_lock.RECORD_NAME).is_file())
 
     def test_different_files_merge_on_the_mac_and_reach_github(self) -> None:
         local = self.commit(self.local, {"from-natedev.md": "natedev\n"})
@@ -277,7 +306,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(len(self.questions()), 1)
         self.assertIn("shared.md", self.question())
         self.assertIn("In a terminal on the Mac", self.question())
-        self.assertIn("I recommend choice 1", self.question())
+        self.assertIn("Combine the edits: the next hourly sync", self.question())
         self.assertFalse(any("push" in args and "origin" in args for args in self.commands))
         self.assertFalse(any("pushover" in " ".join(args) or "send.py" in " ".join(args) for args in self.commands))
 
@@ -540,9 +569,13 @@ class VaultPullTests(unittest.TestCase):
         args = self.questions()[0]
         self.assertEqual(args[0], "ask")
         self.assertEqual(option(args, "--production"), "natedev")
-        self.assertIn("conflict", option(args, "--question"))
-        self.assertIn("Combine the edits and commit the result", option(args, "--question"))
-        self.assertNotIn("Keep the current branch", option(args, "--question"))
+        self.assertIn("conflict", option(args, "--context"))
+        self.assertEqual(option(args, "--ask"), "In a terminal on the Mac, resolve the conflicting edits in ~/rust/hanadocs.")
+        self.assertEqual([args[index + 1] for index, value in enumerate(args) if value == "--choice"], [
+            "Combine the edits and commit the result. This keeps the wanted content from both copies.",
+            "Choose one copy for each file and commit the result. This replaces the other copy's content."])
+        self.assertEqual(option(args, "--recommend"), "Combine the edits: the next hourly sync retries the merge.")
+        self.assertNotIn("--question", args)
         self.assertEqual(option(args, "--text"), "Hanadocs vault sync stopped, 2027-01-15T08:00:00+00:00")
         self.assertEqual(option(args, "--urgency"), "soon")
         self.assertEqual(option(args, "--due"), "2027-01-16")
@@ -808,16 +841,10 @@ class VaultPullTests(unittest.TestCase):
 
     def test_rejection_text_without_a_porcelain_rejected_line_is_a_command_failure(self) -> None:
         _ = (self.mac / "note.md").write_text("Mac\n")
-        transport = self.run_transport
         for output, detail in (("", "[rejected] non-fast-forward; fetch first"),
                                ("error: [rejected]", "")):
             with self.subTest(output=output, detail=detail):
-                def rejected(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
-                    if "push" in args and "origin" in args:
-                        return subprocess.CompletedProcess(args, 1, output, detail)
-                    return transport(args, timeout)
-
-                with mock.patch.object(vault_pull, "run", new=rejected):
+                with mock.patch.object(land_main, "land", side_effect=land_main.LandError(output or detail)):
                     self.assertIsInstance(vault_pull.pull(), vault_pull.VaultCommandFailed)
 
     def test_command_failures_keep_both_output_streams_and_the_machine(self) -> None:
@@ -837,6 +864,29 @@ class VaultPullTests(unittest.TestCase):
                 self.assertEqual(outcome, vault_pull.VaultCommandFailed("stderr: fixture stderr\nstdout: fixture stdout"))
                 assert isinstance(outcome, vault_pull.VaultCommandFailed)
                 self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
+
+    def test_a_failed_mac_transfer_names_natedev_when_its_own_vault_is_damaged(self) -> None:
+        transport = self.run_transport
+
+        def refused(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | None:
+            if "fetch" in args and "fixture-mac:rust/hanadocs" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal: did not send all necessary objects")
+            return transport(args, timeout)
+
+        _ = self.commit(self.mac, {"mac.md": "Mac\n"})
+        with mock.patch.object(vault_pull, "run", new=refused):
+            self.assertEqual(vault_pull.pull(), vault_pull.VaultCommandFailed(
+                "stderr: fatal: did not send all necessary objects", Machine.MAC))
+            # A power loss keeps a ref update but leaves its loose commit object empty.
+            commit = self.commit(self.local, {"local.md": "natedev\n"})
+            damaged = self.local / ".git/objects" / commit[:2] / commit[2:]
+            damaged.chmod(0o644)
+            _ = damaged.write_bytes(b"")
+            outcome = vault_pull.pull()
+        self.assertEqual(outcome, vault_pull.VaultCommandFailed(
+            "stderr: fatal: did not send all necessary objects", Machine.NATEDEV))
+        assert isinstance(outcome, vault_pull.VaultCommandFailed)
+        self.assertIn("error on natedev", vault_pull.stop_details(outcome)[1])
 
     def test_each_stop_cause_survives_an_atomic_state_write(self) -> None:
         for cause in vault_pull.STOP_CAUSES:

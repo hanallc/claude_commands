@@ -7,10 +7,10 @@ from scripts.style.ledger_test_support import ticket_owner_id
 import unittest
 from dataclasses import replace
 from unittest import mock
-from typing import final
+from typing import cast, final
 
 
-from scripts.style import style_ledger, style_plan
+from scripts.style import refill_findings, style_ledger, style_plan
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 
@@ -22,18 +22,35 @@ class StylePlanTests(StylePlanFixture):
                                                     "#[cfg(test)]\nmod startup_tests;\n")
         ledger = self.ledger()
         held = ledger.named_held([finding])[0]
-        for edits in (style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()),
-                      style_plan.SplitEditedFiles(self.repo, ledger, style_plan.NoUnitBranch(),
-                                                  style_ledger.GitReadCache(self.repo))):
-            with (self.subTest(reader=type(edits).__name__),
-                  mock.patch.object(edits, "read", wraps=edits.read) as reads,
-                  mock.patch.object(style_plan, "module_declaration_text", wraps=style_plan.module_declaration_text) as scans):
-                first = edits.of(held)
-                counts = (reads.call_count, scans.call_count)
-                self.assertGreater(counts[1], 0)
-                self.assertEqual((edits.of(held), reads.call_count, scans.call_count), (first, *counts))
-                self.assertEqual((edits.of(replace(held, finding_id="another-finding")), reads.call_count, scans.call_count),
-                                 (first, *counts))
+        footprints: list[tuple[str, ...]] = []
+        initial_scans = 0
+        with mock.patch.object(style_plan, "module_declaration_text", wraps=style_plan.module_declaration_text) as scans:
+            for index, edits in enumerate((style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()),
+                                           style_plan.SplitEditedFiles(self.repo, ledger, style_plan.NoUnitBranch(),
+                                                                       style_ledger.GitReadCache(self.repo)))):
+                with (self.subTest(reader=type(edits).__name__),
+                      mock.patch.object(edits, "read", wraps=edits.read) as reads):
+                    first = edits.of(held)
+                    footprints.append(first)
+                    if index == 0:
+                        self.assertGreater(scans.call_count, 0)
+                        initial_scans = scans.call_count
+                    self.assertEqual(scans.call_count, initial_scans)
+                    counts = (reads.call_count, scans.call_count)
+                    self.assertEqual((edits.of(held), reads.call_count, scans.call_count), (first, *counts))
+                    self.assertEqual((edits.of(replace(held, finding_id="another-finding")), reads.call_count, scans.call_count),
+                                     (first, *counts))
+        self.assertEqual(footprints[0], footprints[1])
+        # A footprint calculated inside a selection commits its queued writes when it ends.
+        with ledger.finding_reads():
+            _ = style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()).of(replace(held, finding_id="third-finding"))
+            self.assertEqual(ledger._refill_write_batches[-1].operations, [])  # pyright: ignore[reportPrivateUsage]
+            # A later reader in the same selection does not check the objects that the selection checked again.
+            with (mock.patch.object(style_ledger, "_git_bytes", wraps=style_ledger._git_bytes) as git,  # pyright: ignore[reportPrivateUsage]
+                  mock.patch.object(refill_findings.FindingResults, "prepare_footprints") as prepare):
+                _ = style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()).of(replace(held, finding_id="third-finding"))
+            self.assertNotIn("cat-file", [word for call in git.call_args_list for word in cast(tuple[object, ...], call.args)])
+            prepare.assert_not_called()
         output = self.refill_with_busy("crates/alpha/src/terminal.rs")
         self.assertIn(f"waiting {issue}: {self.ledger().named_held([finding])[0].path} edits crates/alpha/src/terminal.rs, busy (1 finding)\n", output)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
@@ -42,13 +59,37 @@ class StylePlanTests(StylePlanFixture):
         issue, finding = self.owned_module_decision(
             "crates/alpha/src/census/hierarchy_snapshot_tests.rs", "crates/alpha/src/census/hierarchy.rs",
             '#[cfg(test)]\n#[path = "hierarchy_snapshot_tests.rs"]\nmod snapshot_tests;\n')
+        ledger = self.ledger()
+        held = ledger.named_held([finding])[0]
+        # A later reader of the same ledger searches no blob again for an unread path string.
+        searches = mock.Mock(wraps=style_plan.UNREAD_PATH_STRING)
+        with mock.patch.object(style_plan, "UNREAD_PATH_STRING", searches):
+            _ = style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()).of(held)
+            first_searches = cast(mock.Mock, searches.search).call_count
+            _ = style_plan.EditedFiles(self.repo, ledger, style_plan.NoUnitBranch()).of(replace(held, finding_id="another-finding"))
+        self.assertGreater(first_searches, 0)
+        self.assertEqual(cast(mock.Mock, searches.search).call_count, first_searches)
         output = self.refill_with_busy("crates/alpha/src/census/hierarchy.rs")
         self.assertIn(f"waiting {issue}: {self.ledger().named_held([finding])[0].path} edits crates/alpha/src/census/hierarchy.rs, busy (1 finding)\n", output)
 
     def test_decision_refill_holds_a_restructure_whose_owner_declares_it_only_at_the_unit_base(self) -> None:
         issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs", "")
         # The unit's branch adds the declaration after the synced tip.
-        _ = self.unit_commit("crates/alpha/src/terminal.rs", "#[cfg(test)]\nmod startup_tests;\npub fn open() {}\n")
+        unit_tip = self.unit_commit("crates/alpha/src/terminal.rs", "#[cfg(test)]\nmod startup_tests;\npub fn open() {}\n")
+        ledger = self.ledger()
+        held = ledger.named_held([finding])[0]
+        # Readers at two unit commits keep separate stored footprints, so neither calculates the other's again.
+        # Later readers of the same ledger also read no commit tree again for local root candidates.
+        readers = ((unit_tip, style_plan.FootprintRole.UNIT), (style_plan.synced_tip(ledger), style_plan.FootprintRole.CHECKPOINT))
+        for commit, role in readers:
+            _ = style_plan.EditedFiles(self.repo, ledger, style_plan.UnitBranchTip(commit), role).of(held)
+        with (mock.patch.object(style_plan.EditedFiles, "_computed_files", autospec=True,
+                                side_effect=style_plan.EditedFiles._computed_files) as calculated,  # pyright: ignore[reportPrivateUsage]
+              mock.patch.object(ledger, "_tip", wraps=ledger._tip) as tips):  # pyright: ignore[reportPrivateUsage]
+            for commit, role in readers:
+                _ = style_plan.EditedFiles(self.repo, ledger, style_plan.UnitBranchTip(commit), role).of(held)
+        calculated.assert_not_called()
+        tips.assert_not_called()
         output = self.refill_with_busy("crates/alpha/src/terminal.rs")
         self.assertIn(f"waiting {issue}: {self.ledger().named_held([finding])[0].path} edits crates/alpha/src/terminal.rs, busy (1 finding)\n", output)
 

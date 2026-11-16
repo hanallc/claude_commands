@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,10 +21,11 @@ from functools import cached_property
 from enum import Enum
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import cast, final, override
+from typing import ClassVar, cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts
+from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.direct import progress_history
@@ -33,12 +35,14 @@ from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import process_group, process_start, atomic_file, conf, unit_runs
+from scripts.lib import build_folders, process_group, process_start, atomic_file, conf, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.agents.test_support import write_machine_config
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker
@@ -53,7 +57,7 @@ from scripts.production.staff_test_support import (
     CHECKOUT,
     unit_membership,
 )
-from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record
+from scripts.agents import shutdown, remote, stop_resume, restart, pane_record as staff_pane_record, pane_record, producer_transfer
 from scripts.agents.stop_results import StopResult
 
 from scripts.production import rename_test_support as support
@@ -123,14 +127,26 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray"])
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "retire", "rename", "move", "restart", "stop", "remove-stray", "transfer"])
         self.assertIn("resume NAME", output)
+        self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("stop SESSION", output)
         self.assertIn("remove-stray NAME SESSION", output)
         self.assertIn("[ACCOUNT]", output)
         self.assertIn("--dry-run", output)
         for command in ("records", "held-sessions", "remote-control"):
             self.assertNotIn(command, output)
+
+    def test_transfer_gives_the_name_and_settings_to_the_producer_transfer(self) -> None:
+        with mock.patch.object(producer_transfer, "transfer", return_value=0) as transfer:
+            self.assertEqual(self.invoke(["transfer", "morty", "--model", "opus", "--effort", "high"])[0], 0)
+            self.assertEqual(self.invoke(["transfer", "brain"])[0], 0)
+        self.assertEqual(transfer.call_args_list, [mock.call("morty", model="opus", effort="high"),
+                                                   mock.call("brain", model="", effort="")])
+        with mock.patch.object(producer_transfer, "transfer", side_effect=ValueError("morty: no producer row")):
+            code, output, errors = self.invoke(["transfer", "morty"])
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("morty: no producer row", errors)
 
     def test_help_option_prints_the_same_public_usage(self) -> None:
         option = self.invoke(["--help"])
@@ -158,6 +174,7 @@ STOP_SESSION = stop_resume.stop
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+    isolate_state_home()
 
 def git(where: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,
@@ -210,13 +227,62 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(delegated.call_count, 1)
 
 
-class RetireUnitTests(unittest.TestCase):
+class ShutdownRepositoryFixture(unittest.TestCase):
+    repository_root: ClassVar[Path]
+    repository_snapshot: ClassVar[Path]
+    snapshot_available: ClassVar[bool] = False
+    root: Path = Path()
+    checkout: Path = Path()
+    worktree: Path = Path()
+    doc: Path = Path()
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        folder = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="shutdown-repository-"))
+        cls.repository_root = Path(folder).resolve() / "case"
+        cls.repository_snapshot = cls.repository_root.with_name("snapshot")
+        cls.repository_root.mkdir()
+        builder = cls()
+        builder.root = cls.repository_root
+        with mock.patch.dict(os.environ, {"HOME": str(builder.root)}):
+            builder.build_repository()
+        _ = shutil.copytree(cls.repository_root, cls.repository_snapshot)
+        shutil.rmtree(cls.repository_root)
+        cls.snapshot_available = True
+        cls.addClassCleanup(setattr, cls, "snapshot_available", False)
+
+    def bind_repository(self) -> None:
+        self.checkout = self.root / "checkout"
+        self.worktree = self.root / "alpha-wt"
+        self.doc = self.checkout / "alpha-production.md"
+
+    def restore_repository(self) -> None:
+        cls = type(self)
+        if cls.snapshot_available:
+            cls.snapshot_available = False
+            self.addCleanup(setattr, cls, "snapshot_available", True)
+            self.root = cls.repository_root
+            self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+            _ = shutil.copytree(cls.repository_snapshot, self.root)
+            self.bind_repository()
+        else:
+            # Nested fixtures need separate roots to preserve the outer repository.
+            self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+            with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+                self.build_repository()
+
+    def build_repository(self) -> None:
+        raise NotImplementedError
+
+
+class RetireUnitTests(ShutdownRepositoryFixture):
     @cached_property
     def pane_world(self) -> PaneWorld:
         return PaneWorld()
 
     def test_retirement_retains_the_identity_and_excludes_it_from_active_views(self) -> None:
-        from scripts.production import unit_phases, live_units
+        from scripts.production import census, unit_phases, live_units
         from scripts.production import session_staff
 
         row = staff.by_id(self.unit_staff_id)
@@ -230,15 +296,40 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(session_staff.production_members(record)["alpha"], ())
         observed = session_staff.group_labeled_sessions((), record=record, sources=session_staff.MemberSources(()))
         listing = live_units.units_in("alpha", observed)
-        rendered = unit_phases.table(listing, {}, snapshot=record, pane_rows={})
+        rendered = unit_phases.table(listing, {}, snapshot=record, census_read=census.Census((), (), ()))
         self.assertEqual(rendered.splitlines(), [
-            "| Unit | Status | Progress | Phase | ETA Next | Workers |",
-            "| --- | --- | --- | --- | --- | --- |",
-            "",
-            "| Unit | Notes | Non-Phase Work | Queued |",
-            "| --- | --- | --- | --- |",
+            "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · 0 units",
         ])
 
+
+        for foreign, placement in ((False, "retained unit shells"), (True, "foreign row"),
+                                   (False, "director gone"), (False, "worker in another tab")):
+            with self.subTest(tab=placement):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    owner = staff.by_id(case.unit_staff_id)
+                    assert owner is not None
+                    case.pane_world.session = "alpha"
+                    worker = staff.snapshot().find(kind="worker", parent=owner.id)[0]
+                    case.pane_world.record(worker, "w1:p2")
+                    if placement != "director gone":
+                        case.pane_world.add(owner, "w1:p1", live=False)
+                    if placement == "worker in another tab":
+                        case.pane_world.add(worker, "w1:p4", live=False, tab="w1:t2")
+                    sibling = (fixture_member("unit", name="other", parent=owner.parent.id)
+                               if foreign and isinstance(owner.parent, staff.ReportsTo) else owner)
+                    if placement in ("retained unit shells", "foreign row"):
+                        case.pane_world.add(sibling, "w1:p3", live=False)
+                        case.pane_world.record(sibling, "w1:p3")
+                    code, output = case.retire()
+                    case.assertEqual(code, 0, output)
+                    panes = {pane["pane_id"] for pane in case.pane_world.panes() if pane.get("tab_id") == "w1:t1"}
+                    case.assertEqual(panes, {"w1:p3"} if foreign else set())
+                    case.assertNotIn("w1:p4", case.pane_world.locations)
+                    case.assertIsNotNone(staff.by_id(worker.id))
+                finally:
+                    case.doCleanups()
 
     def test_retirement_continues_after_a_member_stop_raises(self) -> None:
         def stop(identity: str, *, deadline: float = math.inf) -> stop_resume.Stopped | stop_resume.NotRunning:
@@ -320,7 +411,10 @@ class RetireUnitTests(unittest.TestCase):
         path = self.root / "production.conf"
         _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
                             + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
-                            + "# whole: 40..\nunits_table_columns=170\n")
+                            + "# whole: 40..\nunits_table_columns=170\n"
+                            + "# whole: 40..\nunits_table_floor_columns=120\n"
+                            + "# whole: 1..4\nunits_table_cell_lines=4\n"
+                            + "# whole: 2..\nunits_table_break_columns=30\n")
         return path
 
 
@@ -328,18 +422,22 @@ class RetireUnitTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "scratch.conf")
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             cache = (tree / "target").resolve().parent
-        with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
-            other_cache = (other / "target").resolve().parent
+            with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
+                other_cache = (other / "target").resolve().parent
+            self.assertNotEqual(tree, other)
         with copies.workspace(
             str(self.unit_staff_id), self.checkout, "HEAD", name="worker", branch="worker", task="gate:retire-worker",
         ) as workspace:
             pass
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
         self.assertFalse(workspace.exists())
-        self.assertFalse(other.exists())
-        self.assertFalse(cache.exists())
+        self.assertTrue(other.exists())
+        self.assertEqual(build_folders.build_folder_state(other), "free")
+        self.assertTrue(cache.exists())
+        self.assertEqual(build_folders.build_folder_state(cache), "free")
         self.assertTrue(other_cache.is_dir())
 
     def test_retire_keeps_a_same_named_units_copy_in_another_production(self) -> None:
@@ -349,16 +447,20 @@ class RetireUnitTests(unittest.TestCase):
         other = fixture_member("unit", name="alpha", parent=parent.id)
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as mine:
             mine_cache = (mine / "target").resolve().parent
-        with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
-            their_cache = (theirs / "target").resolve().parent
-            their_commit = git(theirs, "rev-parse", "HEAD")
+            with copies.standing(str(other.id), self.checkout, copies.CommittedSource("HEAD")) as theirs:
+                their_cache = (theirs / "target").resolve().parent
+                their_commit = git(theirs, "rev-parse", "HEAD")
+            self.assertNotEqual(mine, theirs)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(mine.exists())
-        self.assertFalse(theirs.exists())
-        self.assertFalse(mine_cache.exists())
+        self.assertTrue(mine.exists())
+        self.assertEqual(build_folders.build_folder_state(mine), "free")
+        self.assertTrue(theirs.exists())
+        self.assertEqual(build_folders.build_folder_state(theirs), "free")
+        self.assertTrue(mine_cache.exists())
+        self.assertEqual(build_folders.build_folder_state(mine_cache), "free")
         self.assertTrue(their_cache.is_dir())
-        self.assertEqual(copies.read_record(their_cache).commit, their_commit)
+        self.assertEqual(git(their_cache, "rev-parse", "HEAD"), their_commit)
         self.assertEqual(their_commit, git(self.checkout, "rev-parse", "HEAD"))
 
     def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
@@ -369,19 +471,21 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
         with copies.standing(str(self.unit_staff_id), self.worktree, copies.CommittedSource("HEAD")) as tree:
             self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
-            self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
             self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertFalse(self.worktree.exists())
-        self.assertEqual(copies.owned_trees(str(self.unit_staff_id)).standing, ())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
 
     def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertIn("busy", output)
+            self.assertNotIn("busy", output)
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
             self.assertTrue(tree.exists())
         self.assertFalse(self.worktree.exists())
 
@@ -389,11 +493,13 @@ class RetireUnitTests(unittest.TestCase):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertIn("busy", output)
+            self.assertNotIn("busy", output)
+            self.assertEqual(build_folders.build_folder_state(tree), "held")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn("unchanged", output)
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
+        self.assertEqual(build_folders.build_folder_state(tree), "free")
 
 
     def test_one_retirement_shares_settings_through_validation_and_cleanup(self) -> None:
@@ -512,16 +618,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
 
     @override
-    def setUp(self) -> None:
-        _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.staff = StaffTestCase()
-        self.staff.setUp()
-        self.addCleanup(self.staff.doCleanups)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = self.limits()
-        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+    def build_repository(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"
@@ -547,6 +644,20 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge alpha", "alpha-branch")
 
+    @override
+    def setUp(self) -> None:
+        _ = self.enterContext(fake_cargo_output_roots(children=True))
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        self.restore_repository()
+        _ = self.limits()
+        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+        environment = copies_environment(self.root)
+        _ = shutil.copy2(Path(environment["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
+        self.enterContext(mock.patch.dict(os.environ, environment))
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+        write_machine_config(self.root)
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
@@ -1210,7 +1321,8 @@ class RetireUnitTests(unittest.TestCase):
             self.assertTrue(checkout.exists())
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_retirement_removes_only_its_remote_mirrors(self) -> None:
         mine = copies.RemoteMirror(str(self.unit_staff_id), copies.SelectedRepository("hana"), "mac", "mirror/alpha", "alpha-session")
@@ -1243,7 +1355,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(copies.remote_record_path(mirror).exists())
 
 @final
-class ResumeUnitTests(unittest.TestCase):
+class ResumeUnitTests(ShutdownRepositoryFixture):
     def test_retired_resume_passes_the_selected_account_to_the_launcher(self) -> None:
         code, output = self.resume("--to", "claude3")
         self.assertEqual(code, 0, output)
@@ -1362,14 +1474,7 @@ class ResumeUnitTests(unittest.TestCase):
 
 
     @override
-    def setUp(self) -> None:
-        self.staff = StaffTestCase()
-        self.staff.setUp()
-        self.addCleanup(self.staff.doCleanups)
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        for name in ("shutdown", "production", "direct"):
-            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+    def build_repository(self) -> None:
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"
@@ -1384,6 +1489,16 @@ class ResumeUnitTests(unittest.TestCase):
         _ = git(self.checkout, "add", "-A")
         _ = git(self.checkout, "commit", "-q", "-m", "production")
         _ = git(self.checkout, "push", "-q", "origin", "main")
+
+    @override
+    def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        self.restore_repository()
+        for name in ("shutdown", "production", "direct"):
+            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
         self.configs = [self.root / "claude1", self.root / "claude2"]
         self.transcript(self.configs[0])
@@ -2744,6 +2859,7 @@ class UnitRenameTests(UnitRenameFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
 
     def test_explicit_branch_change_keeps_the_staff_row(self) -> None:
@@ -3549,6 +3665,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        bind_private_run_roots(self, self.root)
         _ = self.enterContext(mock.patch.object(shutdown, "rename_send_notice"))
 
     def test_recordless_rename_keeps_the_staff_session_without_a_launch(self) -> None:

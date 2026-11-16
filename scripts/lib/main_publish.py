@@ -12,7 +12,8 @@ import subprocess
 import sys
 from typing import cast
 
-from scripts.lib import main_push_lock
+from scripts.lib import land_main, main_push_lock, waiting_rows
+from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
 from scripts.lib.atomic_file import write_text_atomic
 
 
@@ -74,19 +75,11 @@ class MacPullFailed:
     reason: str
 
 
-@dataclass(frozen=True)
-class CommandTimeLimit:
-    seconds: float
-
-
-@dataclass(frozen=True)
-class NoTimeLimit:
-    """The caller retains the existing unlimited Git operation."""
-
-
-UNLIMITED_GIT = NoTimeLimit()
 ZONE_SSH_LIMIT = CommandTimeLimit(120)
 PUBLICATION_PREFIXES = ("tune(", "zone(", "user zone: ")
+REGISTRY_SUBJECT = "config(models): "
+# A landing merges a main move made only of these commits, on config/ paths only, with no retest.
+SETTINGS_SUBJECTS = (*PUBLICATION_PREFIXES, REGISTRY_SUBJECT)
 
 
 def _timeout_detail(error: subprocess.TimeoutExpired) -> str:
@@ -118,7 +111,7 @@ def checkout_of(conf: Path) -> Path:
 
 
 def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> None:
-    """Update main from origin and rebase pending publisher commits when main diverges."""
+    """Move main to origin/main with the publisher commits on top; keep every waiting row live."""
     branch = git(checkout, "branch", "--show-current").stdout.strip()
     if branch != "main":
         raise Refusal(f"{checkout} is on {branch or 'no branch'}, not main")
@@ -126,31 +119,52 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
         fetched = git(checkout, "fetch", "-q", "origin", "main", time_limit=fetch_limit)
         if fetched.returncode:
             raise Refusal(f"git fetch origin main: {first_line(fetched)}")
-        listed = git(checkout, "log", "--format=%h %s", "origin/main..main")
+        listed = git(checkout, "log", "--format=%H %h %s", "--reverse", "origin/main..main")
         if listed.returncode:
             raise Refusal(f"cannot inspect unpublished commits: {first_line(listed)}")
-        commits = listed.stdout.splitlines()
-        for commit_line in commits:
-            if not commit_line.partition(" ")[2].startswith(PUBLICATION_PREFIXES):
-                raise Refusal(f"main holds other commit {commit_line} that origin does not have; main is unchanged")
-        merged = git(checkout, "merge", "-q", "--ff-only", "origin/main")
-        if not merged.returncode:
+        commits = [cast(tuple[str, str, str], tuple(line.split(" ", 2))) for line in listed.stdout.splitlines()]
+        for _, short, subject in commits:
+            if not subject.startswith(PUBLICATION_PREFIXES):
+                raise Refusal(f"main holds other commit {short} {subject} that origin does not have; main is unchanged")
+        if not git(checkout, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             return
-        if not commits:
-            raise Refusal(f"{checkout} main does not take origin/main as a fast-forward: {first_line(merged)}")
-        rebased = git(checkout, "rebase", "--no-autostash", "--no-update-refs", "--empty=drop", "origin/main")
-        if not rebased.returncode:
-            return
-        conflicted = git(checkout, "diff", "--name-only", "--diff-filter=U")
-        if conflicted.stdout:
-            stopped = git(checkout, "show", "-s", "--format=%h %s", "REBASE_HEAD")
-            cause = f"rebase conflict in {stopped.stdout.strip()}: {', '.join(conflicted.stdout.splitlines())}"
-        else:
-            cause = f"rebase refused: {first_line(rebased)}"
-        aborted = git(checkout, "rebase", "--abort")
-        if aborted.returncode and conflicted.stdout:
-            raise Refusal(f"{cause}; cannot restore main: {first_line(aborted)}")
-        raise Refusal(" ".join(cause.split()))
+        target = _rebuilt(checkout, commits)
+        try:
+            waiting_rows.move_to(checkout, target)
+        except (OSError, UnicodeError) as error:
+            raise Refusal(f"main is unchanged: {' '.join(str(error).split())}") from error
+
+
+def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]]) -> str:
+    """Copy each publisher commit onto origin/main without the worktree; drop a commit that origin has."""
+    def run(*arguments: str, input_text: str | None = None,
+            environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(checkout), *arguments], input=input_text, text=True,
+                              capture_output=True, env=environment, check=False)
+
+    tip = run("rev-parse", "origin/main").stdout.strip()
+    for commit_id, short, subject in commits:
+        parents = run("rev-list", "--parents", "-n", "1", commit_id).stdout.split()[1:]
+        if len(parents) != 1:
+            raise Refusal(f"main holds merge commit {short} {subject}; main is unchanged")
+        merged = run("merge-tree", "--write-tree", "--name-only", "--no-messages",
+                     "--merge-base", parents[0], tip, commit_id)
+        if merged.returncode:
+            files = ", ".join(merged.stdout.splitlines()[1:]) or first_line(merged)
+            raise Refusal(f"rebase conflict in {short} {subject}: {files}; main is unchanged")
+        tree = merged.stdout.splitlines()[0]
+        if tree == run("rev-parse", f"{tip}^{{tree}}").stdout.strip():
+            continue
+        author = run("show", "-s", "--format=%an%x00%ae%x00%ad", "--date=raw", commit_id).stdout.rstrip("\n")
+        name, email, date = author.split("\0")
+        message = run("show", "-s", "--format=%B", commit_id).stdout
+        made = run("commit-tree", tree, "-p", tip, input_text=message,
+                   environment={**os.environ, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+                                "GIT_AUTHOR_DATE": date})
+        if made.returncode:
+            raise Refusal(f"cannot copy {short} {subject}: {first_line(made)}; main is unchanged")
+        tip = made.stdout.strip()
+    return tip
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
@@ -178,15 +192,17 @@ def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMIT
         if listed.returncode:
             return False, f"not pushed: {first_line(listed)}"
         unpushed = listed.stdout.splitlines()
-        if not unpushed:
-            return True, "origin has it"
         others = [subject for subject in unpushed if not subject.startswith(PUBLICATION_PREFIXES)]
         if others:
             return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
-        pushed = git(checkout, "push", "-q", "origin", "main", time_limit=time_limit)
-        if pushed.returncode:
-            return False, f"not pushed: {first_line(pushed)}"
-        return True, "pushed"
+        try:
+            landed = land_main.land(checkout, "main", time_limit=time_limit)
+        except (land_main.LandError, OSError) as error:
+            return False, f"not pushed: {error}"
+        detail = "pushed" if isinstance(landed.push, land_main.Pushed) else "origin has it"
+        if isinstance(landed.hook, (land_main.HookDone, land_main.HookFailed)):
+            detail += "; " + land_main.hook_report(landed.hook)
+        return True, detail
 
 
 def ssh(remote: str, *, ssh_program: str, host: str = "mac",
@@ -212,11 +228,13 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def mac_pull_command(mac: PurePosixPath, source: Path) -> str:
-    """Fetch main without shared fetch state and merge its advertised tip."""
+    """Fetch main without shared fetch state and move to its advertised tip; waiting rows stay live."""
     url = f"natedev:{shlex.quote(str(source))}"
     return (f"cd {remote_path(mac)} && tip=$(git ls-remote {url} refs/heads/main | cut -f1) "
             f"&& git fetch -q --no-write-fetch-head {url} main "
-            "&& git merge -q --ff-only \"$tip\"; printf 'rc=%s\\n' \"$?\"")
+            "&& if [ -f scripts/lib/waiting_rows.py ]; "
+            "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward \"$tip\"; "
+            "else git merge -q --ff-only \"$tip\"; fi; printf 'rc=%s\\n' \"$?\"")
 
 
 def pull_mac(checkout: Path, *, ssh_program: str, mac: PurePosixPath = DEFAULT_MAC_CHECKOUT,

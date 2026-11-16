@@ -27,23 +27,28 @@ class VerifySshRoutingTests(VerifySshTargetsFixture):
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.build_queue import admission_protocol as wire
+''' + support.BUILD_TARGETS_STATUS + r'''
 
-if sys.argv[1] == "reserve":
-    assigned = wire.parse_reply(Path(sys.argv[sys.argv.index("--assignment-file") + 1]).read_text())
-    assert isinstance(assigned, wire.Assignment)
-    assignment = assigned.assignment
-    with (Path(os.environ["TEST_RUNNER_STATE"]) / "refused-assignments.jsonl").open("a") as output:
-        output.write(json.dumps({"episode": assignment.episode, "since": assignment.since}) + "\n")
-    Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 67108864 kB\n")
-    raise SystemExit(1)
-''' + support.RUN_BUILD_TARGETS + "\nraise SystemExit(status)\n")
+def main() -> object:
+    if sys.argv[1] == "reserve":
+        assigned = wire.parse_reply(Path(sys.argv[sys.argv.index("--assignment-file") + 1]).read_text())
+        assert isinstance(assigned, wire.Assignment)
+        assignment = assigned.assignment
+        with (Path(os.environ["TEST_RUNNER_STATE"]) / "refused-assignments.jsonl").open("a") as output:
+            output.write(json.dumps({"episode": assignment.episode, "since": assignment.since}) + "\n")
+        Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 67108864 kB\n")
+        return 1
+    return build_targets_status()
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''')
         result = self.verify("test", "sample", "--no-cache", extra={"BUILD_TARGETS_SCRIPT": str(wrapper)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         snapshots = [cast(dict[str, object], json.loads(line))
@@ -77,7 +82,6 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 import time
 from unittest import mock
@@ -85,34 +89,41 @@ source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib import process_start
-root = Path(os.environ["TEST_RUNNER_STATE"])
-recovering = sys.argv[1] == "recover-reservation"
-observations = root / "recovery-observations.jsonl"
-with ExitStack() as patches:
-    observations_seen = len(observations.read_text().splitlines()) if observations.exists() else 0
-    if recovering and observations_seen < int(os.environ.get("TEST_RECOVERY_UNKNOWN_READS", "0")):
-        owner = int(sys.argv[sys.argv.index("--pid") + 1])
-        original_start = process_start.process_start
-        def owner_start(pid):
-            return process_start.Unreadable("the private owner reading is unavailable") if pid == owner else original_start(pid)
-        patches.enter_context(mock.patch.object(process_start, "process_start", side_effect=owner_start))
-''' + "\n".join("    " + line if line else line for line in support.RUN_BUILD_TARGETS.splitlines()) + r'''
-if recovering:
-    identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
-    with observations.open("a") as output:
-        output.write(json.dumps({"status": status, "identity": identity_file.read_text(),
-                                 "at": time.monotonic()}) + "\n")
-if sys.argv[1] == "reserve" and status == 0:
-    marker = root / "saved-reserve.json"
-    if not marker.exists():
-        assignment_file = Path(sys.argv[sys.argv.index("--assignment-file") + 1])
+''' + support.BUILD_TARGETS_STATUS + r'''
+
+def main() -> object:
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+    recovering = sys.argv[1] == "recover-reservation"
+    observations = root / "recovery-observations.jsonl"
+    with ExitStack() as patches:
+        observations_seen = len(observations.read_text().splitlines()) if observations.exists() else 0
+        if recovering and observations_seen < int(os.environ.get("TEST_RECOVERY_UNKNOWN_READS", "0")):
+            owner = int(sys.argv[sys.argv.index("--pid") + 1])
+            original_start = process_start.process_start
+            def owner_start(pid):
+                return process_start.Unreadable("the private owner reading is unavailable") if pid == owner else original_start(pid)
+            patches.enter_context(mock.patch.object(process_start, "process_start", side_effect=owner_start))
+        status = build_targets_status()
+    if recovering:
         identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
-        marker.write_text(json.dumps({"assignment": assignment_file.read_text(),
-                                     "identity": identity_file.read_text()}))
-        raise SystemExit(1)
-raise SystemExit(status)
+        with observations.open("a") as output:
+            output.write(json.dumps({"status": status, "identity": identity_file.read_text(),
+                                     "at": time.monotonic()}) + "\n")
+    if sys.argv[1] == "reserve" and status == 0:
+        marker = root / "saved-reserve.json"
+        if not marker.exists():
+            assignment_file = Path(sys.argv[sys.argv.index("--assignment-file") + 1])
+            identity_file = Path(sys.argv[sys.argv.index("--claim-identity-file") + 1])
+            marker.write_text(json.dumps({"assignment": assignment_file.read_text(),
+                                         "identity": identity_file.read_text()}))
+            return 1
+    return status
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ''')
-        for unknown_reads, poll_seconds in ((0, "0.05"), (1, "0.05"), (3, "0.25")):
+        # The 3-read case checks the recovery retry loop and its poll spacing; the 0-read case recovers at once.
+        for unknown_reads, poll_seconds in ((0, "0.05"), (3, "0.25")):
             with self.subTest(unknown_reads=unknown_reads, poll_seconds=poll_seconds):
                 self.clear_observations()
                 for name in ("saved-reserve.json", "recovery-observations.jsonl", "ssh-events.jsonl"):
@@ -261,11 +272,10 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.configure("natedev,linux")
         settings = self.root / "linux_target.conf"
         _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/linux-build.nix\n")
+        # Each decline reason takes the same pinned refusal branch; the offload tests check how each reason is found.
+        # These runs keep a one-word reason after the run, a long reason with spaces and a busy reason from the probe.
         for mode, reason, detail in (
-            ("disk", "disk", "not running on the linux (disk)"),
             ("completed-decline", "state", "not running on the linux (state)"),
-            ("version-mismatch", "linux version mismatch: nextest box=nextest other natedev=nextest fixture; "
-             + "move the box pins in nixos hosts/linux-build.nix", "nextest box=nextest other"),
             ("runtime-version-mismatch", "linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
              + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix",
              "nextest box=nextest other"),
@@ -300,15 +310,15 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                             for attempt in saved), repr(saved) + result.stdout + result.stderr)
 
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility, offload
 
         self.configure("natedev,linux")
         state = self.target_state("linux")
         _ = (state / "box-tools.json").write_text(json.dumps({"versions": {"rustc": "rustc other"}}))
         reason = ("linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
                   "move the box pins in nixos hosts/linux-build.nix")
-        with mock.patch.object(offload, "state_directory", return_value=state):
-            path = offload.linux_version_decline_path("linux", self.root.name)
+        with mock.patch.object(eligibility, "state_directory", return_value=state):
+            path = eligibility.linux_version_decline_path("linux", self.root.name)
             self.assertFalse(path.exists())
             result = self.verify("test", "sample", "--target", "linux")
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -349,7 +359,7 @@ from pathlib import Path
 import runpy
 
 with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.direct.test_verify_step_state import read_step_row
+from scripts.direct.step_row_test_support import read_step_row
 snapshot = Path(os.environ["TEST_RUNNER_STATE"], "waiting-step.json")
 if not snapshot.exists():
     records = list(Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"))

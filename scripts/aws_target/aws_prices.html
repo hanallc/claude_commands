@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWS</title>
+<style>
+/*__CONSOLE_THEME__*/
+:root {
+  /* The color scale of a price column, as in a spreadsheet: the cheapest, the median and the most expensive. */
+  --scale-low: #57bb8a; --scale-mid: #ffffff; --scale-high: #e67c73;
+  --box: #ffffff; --box-edge: rgb(0 0 0 / 0.45);
+  /* The cheapest and the most expensive cell of a whole table; the same in both themes. */
+  --cheapest: #f5b400; --cheapest-ink: #1a1400; --dearest: #000000; --dearest-ink: #ffffff; --mark-edge: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
+}
+:root[data-theme="dark"] { --scale-low: #23664a; --scale-mid: var(--card); --scale-high: #8f3b35; }
+/* The content fills the window, so the region filter fits on one row; the user likes dense pages. */
+__PAGE_FRAME_STYLE__
+h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
+.status { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font-size: 0.88rem; margin: 0 0 16px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--room); flex: none; }
+.card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
+.answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
+table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
+th, td { text-align: left; padding: 5px 6px 5px 18px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+thead th { white-space: normal; vertical-align: bottom; }
+/* A header wraps only between words, never at the hyphen of a region name. */
+thead th span { white-space: nowrap; }
+tbody th.group { color: var(--ink); padding-top: 16px; }
+/* The first column stays while a wide table scrolls. */
+th:first-child, td:first-child { padding-left: 0; position: sticky; left: 0; z-index: 1; background: var(--card); }
+.scroll.overflows th:first-child, .scroll.overflows td:first-child { padding-right: 12px; box-shadow: inset -1px 0 var(--line); }
+th { color: var(--ink-2); font-weight: 600; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover td { background: var(--hover); }
+/* A header "name (unit)" shows the unit on a smaller second line. */
+thead th small { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-3); white-space: nowrap; }
+/* The lowest and the highest cell of each type column have a white box over the scale color. */
+td.end { box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 2px var(--box); }
+/* The table marks win over the scale color and the row hover. */
+td.cheapest, tbody tr:hover td.cheapest { background: var(--cheapest); color: var(--cheapest-ink); font-weight: 700;
+  box-shadow: inset 0 0 0 2px var(--mark-edge); }
+td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(--dearest-ink); font-weight: 700;
+  box-shadow: inset 0 0 0 2px var(--mark-edge); }
+.ban { width: 14px; height: 14px; vertical-align: -2px; fill: none; stroke: var(--ink-3); stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+/* The Standard and GPU price cards sit side by side, and stack on a narrow screen. */
+#prices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 16px; }
+@media (max-width: 760px) { #prices { grid-template-columns: minmax(0, 1fr); } }
+/* A half width card fits four type columns with less space between them. */
+#prices th:not(:first-child), #prices td:not(:first-child) { padding-left: 10px; padding-right: 10px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
+.swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.swatch.scale { background: linear-gradient(to right, var(--scale-low), var(--scale-mid), var(--scale-high));
+  box-shadow: inset 0 0 0 1px var(--line); }
+.swatch.end, .swatch.cheapest, .swatch.dearest { width: 18px; background: var(--scale-low); }
+.swatch.end { box-shadow: inset 0 0 0 1px var(--box-edge), inset 0 0 0 2px var(--box); }
+.swatch.cheapest { background: var(--cheapest); box-shadow: inset 0 0 0 2px var(--mark-edge), 0 0 0 1px var(--box-edge); }
+.swatch.dearest { background: var(--dearest); box-shadow: inset 0 0 0 2px var(--mark-edge), 0 0 0 1px var(--box-edge); }
+.price-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 4px 0 0; }
+.price-bar + .legend { margin: 8px 0 12px; }
+.filter[hidden] { display: none; }
+.snapshot { list-style: none; padding: 0; margin: 12px 0 0; font-size: 0.86rem; color: var(--ink-2); }
+.snapshot li { padding: 2px 0; }
+.filter { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.filter button { font: inherit; font-size: 0.86rem; color: var(--ink-2); background: transparent; border: 0; padding: 5px 12px; cursor: pointer; }
+.filter button + button { border-left: 1px solid var(--line); }
+.filter button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.filter button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* The geography and region filters stay at the top of the view while the page scrolls. */
+.regions { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline; gap: 6px 8px; background: var(--bg); padding: 8px 0 12px; margin: 0 0 4px; border-bottom: 1px solid var(--line); }
+.regions-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
+/* All, the 19 regions and None fit one row at a 1920 px window. */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chips button { font: inherit; font-size: 0.84rem; color: var(--ink-2); background: var(--card); border: 1px solid var(--line);
+  border-radius: 999px; padding: 3px 5px; cursor: pointer; }
+.chips button:hover { background: var(--hover); }
+.chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* A geography with some of its regions chosen. */
+.chips button[aria-pressed="mixed"] { background: color-mix(in srgb, var(--accent) 22%, var(--card)); border-color: var(--accent); color: var(--ink); }
+.chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chips .all { font-weight: 600; }
+/* The spend tiles sit in one row, and stack on a narrow screen. */
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 10px 0 0; }
+@media (max-width: 760px) { .tiles { grid-template-columns: minmax(0, 1fr); } }
+.tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+.tile-label { color: var(--ink-2); font-size: 0.86rem; font-weight: 600; }
+.tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile-note { color: var(--ink-3); font-size: 0.82rem; }
+.section-title { font-size: 1.15rem; margin: 24px 0 4px; }
+#spend .note { margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+<h1 class="page-title">AWS</h1>
+<div class="status"><span class="dot" aria-hidden="true"></span><span id="published"></span></div>
+<section class="card" id="spend">
+  <h2>Spend <span class="unit">(USD)</span></h2>
+  <div class="tiles" id="spend-tiles"></div>
+  <p class="note" id="spend-note"></p>
+</section>
+<h2 class="section-title">Prices</h2>
+<nav class="regions" aria-label="Regions to show">
+  <span class="regions-label" id="geographies-label">Geography</span>
+  <div class="chips" role="group" aria-labelledby="geographies-label" id="geographies"></div>
+  <span class="regions-label" id="regions-label">Regions</span>
+  <div class="chips" role="group" aria-labelledby="regions-label" id="regions"></div>
+</nav>
+<div class="price-bar">
+  <div class="filter" role="group" aria-label="Price to show" id="price-view"></div>
+  <div class="filter" role="group" aria-label="Runs to count" id="price-scope"></div>
+</div>
+<p class="legend"><span><span class="swatch scale" aria-hidden="true"></span>Each column: green is the cheapest, red the most expensive.</span></p>
+<div id="prices"></div>
+<h2 class="section-title">Quotas</h2>
+<div id="quotas"></div>
+<section class="card" id="runs">
+  <div class="card-head">
+    <h2>Cost per run</h2>
+    <div class="filter" role="group" aria-label="Runs to count" id="filter"></div>
+  </div>
+  <p class="answer" id="cheapest"></p>
+  <p class="note" id="explanation"></p>
+  <div id="run-tables"></div>
+</section>
+<section class="card" id="refused"></section>
+<section class="card" id="launched"></section>
+<section class="card" id="hours"></section>
+</main>
+<script id="aws-prices-data" type="application/json">__AWS_PRICES_DATA__</script>
+<script>
+"use strict";
+const data = JSON.parse(document.getElementById("aws-prices-data").textContent);
+const REGIONS_KEY = "aws-prices-regions";
+const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
+const NO_REGION = "No region chosen.";
+const NOT_SOLD = "Not sold here";
+const SVG = "http://www.w3.org/2000/svg";
+const VIEWS = [["spot", "Spot price"], ["cost", "Cost per gate"]];
+const query = new URLSearchParams(location.search);
+let shown = new Set(data.regions);
+// The price tables show the Spot price or the cost per gate of one run kind; the URL keeps both choices.
+let view = query.get("prices") === "cost" ? "cost" : "spot";
+let scope = query.get("runs");
+
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+// The lucide "ban" icon marks a type that the region does not sell.
+function banIcon() {
+  const icon = document.createElementNS(SVG, "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("class", "ban");
+  icon.setAttribute("role", "img");
+  icon.setAttribute("aria-label", NOT_SOLD);
+  for (const [tag, attributes] of [["circle", { cx: 12, cy: 12, r: 10 }], ["path", { d: "M4.929 4.929 19.07 19.071" }]]) {
+    const shape = document.createElementNS(SVG, tag);
+    for (const [name, value] of Object.entries(attributes)) shape.setAttribute(name, String(value));
+    icon.appendChild(shape);
+  }
+  return icon;
+}
+
+function remembered(key) {
+  try { return localStorage.getItem(key); } catch (error) { return null; }
+}
+
+function remember(key, value) {
+  try { localStorage.setItem(key, value); } catch (error) { /* The choice is kept only for this view. */ }
+}
+
+// The columns and rows of a table in the chosen regions; the first column always shows.
+function visible(table) {
+  const columns = table.headers.map((_header, index) => index)
+    .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
+  const rows = table.rows.map((_row, index) => index)
+    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]));
+  return { columns, rows };
+}
+
+// A three-color scale as in a spreadsheet: the low color at the minimum, the middle color at the median,
+// and the high color at the maximum, mixed in proportion between them.
+function scaleColor(value, low, middle, high) {
+  const [end, share] = value <= middle ? ["low", middle > low ? (middle - value) / (middle - low) : 0]
+    : ["high", high > middle ? (value - middle) / (high - middle) : 0];
+  return `color-mix(in srgb, var(--scale-${end}) ${(share * 100).toFixed(1)}%, var(--scale-mid))`;
+}
+
+// The scale color of each numbered cell in view, column by column, the lowest and highest cells of each column,
+// and the lowest and highest cells of the whole table.
+// A column or a table with fewer than two different numbers in view compares nothing, so it has no color or mark.
+// A column with two numbers has no box: each is an end, and the colors already show which.
+function scaleCells(table, cells) {
+  const colors = new Map();
+  const ends = new Set();
+  const cheapest = new Set();
+  const dearest = new Set();
+  const numbered = [];
+  for (const column of cells.columns) {
+    const columnCells = cells.rows.map(row => [String([row, column]), (table.values[row] || [])[column]])
+      .filter(([, value]) => typeof value === "number");
+    numbered.push(...columnCells);
+    const sorted = columnCells.map(([, value]) => value).sort((a, b) => a - b);
+    if (sorted.length < 2 || sorted[0] === sorted[sorted.length - 1]) continue;
+    const half = Math.floor(sorted.length / 2);
+    const middle = sorted.length % 2 ? sorted[half] : (sorted[half - 1] + sorted[half]) / 2;
+    const [low, high] = [sorted[0], sorted[sorted.length - 1]];
+    for (const [place, value] of columnCells) {
+      colors.set(place, scaleColor(value, low, middle, high));
+      if (sorted.length > 2 && (value === low || value === high)) ends.add(place);
+    }
+  }
+  const values = numbered.map(([, value]) => value);
+  if (new Set(values).size > 1) {
+    const [low, high] = [Math.min(...values), Math.max(...values)];
+    for (const [place, value] of numbered) {
+      if (value === low) cheapest.add(place);
+      if (value === high) dearest.add(place);
+    }
+  }
+  return { colors, ends, cheapest, dearest };
+}
+
+// Draw tables with the same headers as one grid, so their columns line up; a titled row starts each table.
+function tableElement(tables, titled) {
+  const first = tables[0];
+  const right = new Set(first.right);
+  const { columns } = visible(first);
+  const wrap = element("div", undefined, "scroll");
+  const grid = element("table");
+  const head = grid.createTHead().insertRow();
+  for (const index of columns) {
+    const cell = element("th", undefined, right.has(index) ? "n" : "");
+    const [, name, unit] = first.headers[index].match(/^(.*?)(?: (\(.*\)))?$/);
+    name.split(" ").forEach((word, position) => cell.append(...(position ? [" "] : []), element("span", word)));
+    if (unit) cell.appendChild(element("small", unit));
+    cell.scope = "col";
+    head.appendChild(cell);
+  }
+  for (const table of tables) {
+    const view = visible(table);
+    const body = grid.createTBody();
+    if (titled) {
+      const title = element("th", table.title, "group");
+      title.colSpan = columns.length;
+      title.scope = "rowgroup";
+      body.insertRow().appendChild(title);
+    }
+    const scale = table.values && table.values.length ? scaleCells(table, view) : { colors: new Map(), ends: new Set(), cheapest: new Set(), dearest: new Set() };
+    const notSold = new Set((table.not_sold || []).map(String));
+    for (const rowIndex of view.rows) {
+      const line = body.insertRow();
+      for (const index of columns) {
+        const value = table.rows[rowIndex][index];
+        const place = String([rowIndex, index]);
+        const cell = element("td", notSold.has(place) ? undefined : value, right.has(index) ? "n" : "");
+        if (notSold.has(place)) {
+          cell.title = NOT_SOLD;
+          cell.appendChild(banIcon());
+        }
+        if (scale.cheapest.has(place)) cell.classList.add("cheapest");
+        else if (scale.dearest.has(place)) cell.classList.add("dearest");
+        else {
+          if (scale.colors.has(place)) cell.style.background = scale.colors.get(place);
+          if (scale.ends.has(place)) cell.classList.add("end");
+        }
+        line.appendChild(cell);
+      }
+    }
+  }
+  wrap.appendChild(grid);
+  return wrap;
+}
+
+function heading(text) {
+  const [, name, unit] = text.match(/^(.*?)(?: (\(.*\)))?$/);
+  const title = element("h2", name);
+  if (unit) title.appendChild(element("small", " " + unit, "unit"));
+  return title;
+}
+
+// A table shows when a row and a region of it are in the chosen regions.
+function shows(tables) {
+  return tables.some(table => {
+    const view = visible(table);
+    return view.rows.length && (table.region_axis !== "columns" || view.columns.length > 1);
+  });
+}
+
+function fill(section, table, note) {
+  section.replaceChildren(heading(table.title));
+  if (note) section.appendChild(element("p", note, "note"));
+  if (shows([table])) section.appendChild(tableElement([table], false));
+  else if (table.rows.length) section.appendChild(element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
+  return section;
+}
+
+function cards(id, tables) {
+  const holder = document.getElementById(id);
+  const sections = tables.map(table => fill(element("section", undefined, "card"), table));
+  holder.replaceChildren(...sections);
+  return sections;
+}
+
+function drawSpend() {
+  const tiles = data.spend.tiles.map(tile => {
+    const box = element("div", undefined, "tile");
+    box.append(element("div", tile.label, "tile-label"), element("div", tile.usd, "tile-usd"), element("div", tile.note, "tile-note"));
+    return box;
+  });
+  document.getElementById("spend-tiles").replaceChildren(...tiles);
+  document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+}
+drawSpend();
+
+const published = new Date(data.read_at * 1000);
+document.getElementById("published").textContent =
+  `Published ${published.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}. The hourly AWS snapshot job publishes it again.`;
+
+function markOverflow() {
+  for (const wrap of document.querySelectorAll(".scroll")) wrap.classList.toggle("overflows", wrap.scrollWidth > wrap.clientWidth + 1);
+}
+addEventListener("resize", markOverflow);
+
+function scopeCosts() {
+  return data.runs.find(entry => entry.scope === scope) || data.runs[0];
+}
+
+const priceView = document.getElementById("price-view");
+const priceScope = document.getElementById("price-scope");
+// One line under a price table that names its two outlines.
+function outlineLegend() {
+  const line = element("p", undefined, "legend");
+  for (const [kind, text] of [["end", "Lowest and highest of each type"], ["cheapest", "Cheapest in the table"],
+                             ["dearest", "Most expensive in the table"]]) {
+    const item = element("span");
+    item.append(element("span", undefined, `swatch ${kind}`), text);
+    item.firstChild.setAttribute("aria-hidden", "true");
+    line.appendChild(item);
+  }
+  return line;
+}
+
+function drawPrices() {
+  for (const button of priceView.children) button.setAttribute("aria-pressed", String(button.dataset.view === view));
+  priceScope.hidden = view !== "cost";
+  const priceCards = cards("prices", view === "cost" ? scopeCosts().prices : data.prices);
+  for (const card of priceCards) if (card.querySelector("td.end, td.cheapest, td.dearest")) card.appendChild(outlineLegend());
+  const snapshot = element("ul", undefined, "snapshot");
+  for (const line of data.snapshot) if (!line.region || shown.has(line.region)) snapshot.appendChild(element("li", line.text));
+  priceCards[priceCards.length - 1].appendChild(snapshot);
+}
+
+function drawFixed() {
+  cards("quotas", data.quotas);
+  fill(document.getElementById("hours"), data.hours, data.hours_note);
+}
+
+// Both run kind switches, above the prices and in the Cost per run card, set the same run kind.
+const scopeFilters = [priceScope, document.getElementById("filter")];
+function drawScope() {
+  const costs = scopeCosts();
+  for (const group of scopeFilters) {
+    for (const button of group.children) button.setAttribute("aria-pressed", String(button.dataset.scope === costs.scope));
+  }
+  const cheapest = costs.estimates.find(entry => shown.has(entry.region));
+  document.getElementById("cheapest").textContent = cheapest ? cheapest.summary : costs.no_estimate;
+  document.getElementById("explanation").textContent = costs.explanation;
+  const tables = document.getElementById("run-tables");
+  tables.replaceChildren(shows(costs.tables) ? tableElement(costs.tables, true) : element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
+  fill(document.getElementById("refused"), costs.refused);
+  fill(document.getElementById("launched"), costs.launched);
+}
+
+function draw() {
+  drawPrices();
+  drawFixed();
+  drawScope();
+  markOverflow();
+}
+
+function keepInUrl() {
+  const next = new URLSearchParams(location.search);
+  next.set("prices", view);
+  next.set("runs", scopeCosts().scope);
+  try { history.replaceState(null, "", `?${next}${location.hash}`); } catch (error) { /* The URL keeps no choice. */ }
+}
+
+function showScope(next) {
+  scope = next;
+  drawPrices();
+  drawScope();
+  markOverflow();
+  keepInUrl();
+}
+
+function showView(next) {
+  view = next;
+  drawPrices();
+  markOverflow();
+  keepInUrl();
+}
+
+function button(text, key, value, action) {
+  const node = element("button", text);
+  node.type = "button";
+  node.dataset[key] = value;
+  node.addEventListener("click", () => action(value));
+  return node;
+}
+for (const [name, label] of VIEWS) priceView.appendChild(button(label, "view", name, showView));
+for (const group of scopeFilters) {
+  for (const costs of data.runs) group.appendChild(button(costs.label, "scope", costs.scope, showScope));
+}
+
+// The region filter: all regions by default, any combination. "none" clears every region, so one click then shows only that one.
+// The geography row above it groups the regions by the first word of their names, in the order of the region list.
+function chipRow(id, labels) {
+  const row = document.getElementById(id);
+  const chip = (label, className) => {
+    const button = element("button", label, className);
+    button.type = "button";
+    row.appendChild(button);
+    return button;
+  };
+  const all = chip("all", "all");
+  const each = labels.map(label => chip(label));
+  const none = chip("none", "all");
+  return {all, each, none};
+}
+const geographyOf = region => region.split("-", 1)[0];
+const geographies = [...new Set(data.regions.map(geographyOf))];
+const geographyRow = chipRow("geographies", geographies);
+const regionRow = chipRow("regions", data.regions);
+const regionChips = regionRow.each;
+regionChips.forEach((chip, index) => { chip.dataset.region = data.regions[index]; });
+// A geography is pressed when all its regions are chosen, and mixed when some are.
+function geographyState(geography) {
+  const regions = data.regions.filter(region => geographyOf(region) === geography);
+  const chosen = regions.filter(region => shown.has(region)).length;
+  return chosen === regions.length ? "true" : chosen ? "mixed" : "false";
+}
+function showRegions(next) {
+  shown = next;
+  for (const row of [geographyRow, regionRow]) {
+    row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+    row.none.setAttribute("aria-pressed", String(shown.size === 0));
+  }
+  geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
+  for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  draw();
+  remember(REGIONS_KEY, JSON.stringify([...shown]));
+}
+for (const row of [geographyRow, regionRow]) {
+  row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
+  row.none.addEventListener("click", () => showRegions(new Set()));
+}
+// A geography chip chooses all its regions, or clears them when all are already chosen.
+geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
+  const geography = geographies[index];
+  const next = new Set(shown);
+  const choose = geographyState(geography) !== "true";
+  for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
+  showRegions(next);
+}));
+for (const chip of regionChips) {
+  chip.addEventListener("click", () => {
+    const next = new Set(shown);
+    if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
+    showRegions(next);
+  });
+}
+
+let saved = [];
+try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
+const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
+showRegions(new Set(known.length ? known : data.regions));
+</script>
+</body>
+</html>

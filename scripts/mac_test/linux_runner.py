@@ -120,7 +120,7 @@ def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> S
             return ShellEnvironment(key, exports, destination / 'inputs')
         if not destination.exists():
             with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                    build_folders.FOLDER_PREFIXES["linux-cache-stage"].format(owner=key), build_folders.ExplicitBuildParent(cache))) as stage:
+                    f".{key}.", build_folders.ExplicitBuildParent(cache))) as stage:
                 inputs = stage / 'inputs'
                 inputs.mkdir()
                 for path in shell_inputs(root):
@@ -591,27 +591,30 @@ def toolchain_install_script(expected_rustc: str, target: str = 'linux') -> str:
     """Install the tree's toolchain under one lock for its channel."""
     version = re.fullmatch(r'rustc (\d+\.\d+\.\d+)(?: .*)?', expected_rustc)
     fallback = (f'export RUSTUP_TOOLCHAIN={shlex.quote(version[1])}' if version else ':')
-    name_code = '\n'.join((
-        'import hashlib, os, tomllib',
+    # Bash decides the inherited, file and fallback cases; Python only parses a toolchain file.
+    parse_code = '\n'.join((
+        'import hashlib, sys, tomllib',
         'from pathlib import Path',
-        'path = next((p for p in (Path("rust-toolchain"), Path("rust-toolchain.toml")) if p.is_file()), None)',
-        'if os.environ.get("RUSTUP_TOOLCHAIN"):',
-        '    print(os.environ["RUSTUP_TOOLCHAIN"])',
-        'elif path is None:',
-        '    print("")',
-        'else:',
-        '    text = path.read_text()',
-        '    try:',
-        '        toolchain = tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest()',
-        '    except tomllib.TOMLDecodeError:',
-        '        toolchain = text.strip()',
-        '    print(toolchain)',
+        'text = Path(sys.argv[1]).read_text()',
+        'try:',
+        '    print(tomllib.loads(text)["toolchain"].get("channel") or hashlib.sha256(text.encode()).hexdigest())',
+        'except tomllib.TOMLDecodeError:',
+        '    print(text.strip())',
     ))
     return '\n'.join((
-        'if [[ -z ${RUSTUP_TOOLCHAIN-} && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then',
-        f'  {fallback}',
+        'toolchain=${RUSTUP_TOOLCHAIN-}',
+        'if [[ -z $toolchain ]]; then',
+        '  toolchain_file=""',
+        '  if [[ -f rust-toolchain ]]; then toolchain_file=rust-toolchain',
+        '  elif [[ -f rust-toolchain.toml ]]; then toolchain_file=rust-toolchain.toml',
+        '  fi',
+        '  if [[ -n $toolchain_file ]]; then',
+        f'    toolchain=$(python3 -c {shlex.quote(parse_code)} "$toolchain_file") || exit 75',
+        '  else',
+        f'    {fallback}',
+        '    toolchain=${RUSTUP_TOOLCHAIN-}',
+        '  fi',
         'fi',
-        f'toolchain=$(python3 -c {shlex.quote(name_code)}) || exit 75',
         'if [[ -n "$toolchain" ]]; then',
         '  mkdir -p -- "${RUSTUP_HOME:-$HOME/.rustup}" || exit 75',
         '  (',
@@ -703,7 +706,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                           if target == (mirror / 'target').resolve() else '')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-            build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
+            ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
         started = step_directory / 'started'
         toolchain_environment = step_directory / 'toolchain'
         _ = toolchain_environment.write_text('')

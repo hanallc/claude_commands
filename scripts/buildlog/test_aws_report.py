@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
 import os
@@ -213,7 +213,8 @@ class AwsReportTests(MeasurementFixture):
         charges.mkdir(exist_ok=True)
         reading = ledger.ChargeRead('2026-01-14', NOW, MIDNIGHT - 86400, MIDNIGHT,
             Decimal('1.10'), Decimal(0), Decimal('.02'), (
-                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
+                # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
+                ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
@@ -252,6 +253,19 @@ class AwsReportTests(MeasurementFixture):
             self.assertIn('| 2026-01-15 | $0.30 | $0.30 | $0.00 | $0.00 | $0.00 | 1 | bill |',
                           aws_report.daily_spend_lines([renamed], Decimal(20), DAY))
         print('AWS layout fixture:\n### AWS\n' + section)
+
+    def test_spend_analysis_forecasts_the_month_from_billed_days(self) -> None:
+        def spend(day: str, source: str, gate: str, storage: str) -> ledger.DailySpend:
+            return ledger.DailySpend(day, source, (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(gate)),
+                                                   ledger.SpendGroupCost('storage', Decimal(storage))), 1)
+        spends = [spend('2026-01-15', 'estimated from the newest bill', '1', '0'),
+                  spend('2026-01-14', 'AWS bill', '3', '1'), spend('2026-01-13', 'AWS bill', '1', '1'),
+                  spend('2025-12-31', 'AWS bill', '9', '1')]
+        lines = report.spend_analysis(spends, Decimal(100), date(2026, 1, 15), 2)
+        self.assertEqual(lines[0], '**Month to date (UTC 2026-01): $7.00 of the $100.00 monthly limit. '
+                         + 'Month forecast: $57.00 at $3.00 a day, the average of the last 2 billed days.**')
+        self.assertIn('32-CPU gate compute is 67% of the spend on those days.', lines)
+        self.assertEqual(report.spend_analysis(spends[:1], Decimal(100), date(2026, 1, 15), 2), [])
 
     def test_daily_spend_shows_estimates_after_the_newest_bill(self) -> None:
         spends = tuple(
@@ -296,7 +310,8 @@ class AwsReportTests(MeasurementFixture):
             ('future', 'future.8xlarge', 'targeted-test', MIDNIGHT + 86400, 100, 90),
         ):
             launches.extend((
-                {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched'},
+                {'time': at - box_s, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'launched',
+                 'region': 'us-east-2'},
                 {'time': at, 'attempt': attempt, 'instance_type': size, 'mode': mode, 'result': 'finished', 'gate_s': gate_s}))
         launches.extend((
             {'time': NOW, 'instance_type': 'legacy.8xlarge', 'result': 'finished', 'gate_s': 10},
@@ -317,14 +332,15 @@ class AwsReportTests(MeasurementFixture):
             reading = ledger.ChargeRead(day, NOW, at, at + 86400, Decimal('11.20'), Decimal(0), Decimal(0), usage)
             _ = (charges / f'{day}.json').write_text(json.dumps(ledger.charge_record(reading)))
         output = self.render()
+        # The runs launched in us-east-2, so the USW2 bill goes to no run.
         self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', output)
-        self.assertIn('| m7a.8xlarge | $0.1000 per run (2) | $0.2000 per run (1) | $0.1500 per run (3) |', output)
+        self.assertIn('| m7a.8xlarge | $0.0667 per run (2) | $0.1333 per run (1) | $0.1000 per run (3) |', output)
         self.assertIn('| c7a.8xlarge | $0.6750 per run (1) | $0.2250 per run (2) | $0.4500 per run (3) |', output)
-        self.assertIn('| All types | $0.3875 per run (3) | $0.2125 per run (3) | $0.3000 per run (6) |', output)
+        self.assertIn('| All types | $0.3708 per run (3) | $0.1792 per run (3) | $0.2750 per run (6) |', output)
         self.assertNotIn('Median test time:', output)
-        self.assertIn('| All shown days | 3 | 2m 0s | 5m 0s | 3 | 1m 30s | 3m 20s | $0.3000 |', output)
+        self.assertIn('| All shown days | 3 | 2m 0s | 5m 0s | 3 | 1m 30s | 3m 20s | $0.2750 |', output)
         self.assertIn('| 2026-01-15 | 1 | 2m 0s | 10m 0s | 1 | 2m 30s | 6m 40s | not billed yet |', output)
-        self.assertIn('| 2026-01-14 | 2 | 2m 0s | 3m 20s | 2 | 1m 0s | 2m 30s | $0.3000 |', output)
+        self.assertIn('| 2026-01-14 | 2 | 2m 0s | 3m 20s | 2 | 1m 0s | 2m 30s | $0.2750 |', output)
         self.assertLess(output.index('| 2026-01-15 |'), output.index('| 2026-01-14 |'))
         for size in ('legacy.8xlarge', 'old.8xlarge', 'future.8xlarge', 'refused.8xlarge', 'orphan.8xlarge', 'excluded.8xlarge'):
             self.assertNotIn(f'| {size} |', output)

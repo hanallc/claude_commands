@@ -11,7 +11,6 @@ import fcntl
 import json
 import os
 import re
-import stat
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
@@ -23,6 +22,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, Self, TypeVar, cast
 from uuid import UUID
+
+from scripts.lib import git_files
 
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
@@ -447,6 +448,7 @@ class StaffRow:
             elif key in fields:
                 invalid.append(key)
         if invalid:
+            # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
         worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
@@ -533,51 +535,16 @@ class UnreadableGitCheckout:
 
 def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | UnreadableGitCheckout:
     """Read document identity from Git metadata without starting a process."""
-    metadata = path
     try:
         document = path.resolve()
-        for folder in document.parents:
-            metadata = folder / ".git"
-            try:
-                mode = metadata.lstat().st_mode
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(mode):
-                git_directory = metadata
-            elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-                if metadata.is_dir():
-                    git_directory = metadata
-                else:
-                    directive = metadata.read_text(encoding="utf-8").strip()
-                    if not directive.startswith("gitdir:"):
-                        raise ValueError("expected a gitdir: line")
-                    location = directive.removeprefix("gitdir:").strip()
-                    if not location:
-                        raise ValueError("empty gitdir path")
-                    git_directory = folder / location
-            else:
-                raise ValueError("expected a Git metadata file or directory")
-            metadata = git_directory
-            git_directory = git_directory.resolve(strict=True)
-            if not stat.S_ISDIR(git_directory.stat().st_mode):
-                raise ValueError("Git directory is not a directory")
-            metadata = git_directory / "commondir"
-            try:
-                _ = metadata.lstat()
-            except FileNotFoundError:
-                common_directory = git_directory
-            else:
-                location = metadata.read_text(encoding="utf-8").strip()
-                if not location:
-                    raise ValueError("empty commondir path")
-                common_directory = (git_directory / location).resolve(strict=True)
-            metadata = common_directory
-            if not stat.S_ISDIR(common_directory.stat().st_mode):
-                raise ValueError("Git common directory is not a directory")
-            return CheckoutDocument(common_directory, document.relative_to(folder))
-    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
-        return UnreadableGitCheckout(metadata, str(error))
-    return OutsideGitCheckout()
+        checkout = git_files.locate(next(folder for folder in document.parents if folder.is_dir()))
+    except git_files.NotACheckout:
+        return OutsideGitCheckout()
+    except git_files.UnreadableGitFiles as error:
+        return UnreadableGitCheckout(error.path, error.reason)
+    except (OSError, RuntimeError) as error:
+        return UnreadableGitCheckout(path, str(error))
+    return CheckoutDocument(checkout.common_dir, document.relative_to(checkout.toplevel))
 
 
 @dataclass(frozen=True)
@@ -611,8 +578,16 @@ class StaffSnapshot:
         row = self.by_member_reference(reference)
         return self.parent_of(row) if row is not None and row.kind == "worker" else row
 
+    @cached_property
+    def rows_by_current_session(self) -> dict[str, StaffRow]:
+        """The first row for each session, as a scan in row order finds it."""
+        found: dict[str, StaffRow] = {}
+        for row in self.rows:
+            _ = found.setdefault(row.current_session, row)
+        return found
+
     def by_current_session(self, session_id: str) -> StaffRow | None:
-        return next((row for row in self.rows if row.current_session == session_id), None)
+        return self.rows_by_current_session.get(session_id)
 
     def by_member_reference(self, reference: str) -> StaffRow | None:
         """Resolve a persisted fixed member id or its current conversation."""
@@ -622,7 +597,8 @@ class StaffSnapshot:
         return _row_by_path(self.rows, names)
 
     def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
-        matches = [row for row in self.rows if isinstance(row.worktree, PresentWorktree)
+        """A producer's worktree is its launch folder and owns no path."""
+        matches = [row for row in self.rows if row.kind != "producer" and isinstance(row.worktree, PresentWorktree)
                    and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
         return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
 
@@ -995,7 +971,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
             raise StaffRefused(f"{row.kind} cannot hold worktree")
         if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold doc")
-        if isinstance(row.worktree, PresentWorktree):
+        if row.kind != "producer" and isinstance(row.worktree, PresentWorktree):
+            # Two producers can start in one folder; a producer's worktree owns no path.
             location = (row.worktree.machine, row.worktree.path)
             if location in worktrees:
                 raise StaffRefused(f"duplicate present worktree: {location[0]}:{location[1]}")
@@ -1047,6 +1024,7 @@ def _rows(value: object) -> list[StaffRow]:
         fields = cast(dict[str, object], item) if isinstance(item, dict) else dict[str, object]()
         if isinstance(fields.get("kind"), str) and fields["kind"] not in _KINDS:
             unknown.append(fields)
+            # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped", file=sys.stderr)
             continue
         rows.append(StaffRow.from_json(cast(object, item)))
@@ -1057,13 +1035,19 @@ def _rows(value: object) -> list[StaffRow]:
     return sorted(rows, key=lambda row: row.id)
 
 
-def _local_fields() -> dict[str, object]:
-    """Read the local record without constructing every staff row."""
+def _local_text() -> str:
     try:
-        value = _decode(_file().read_text(encoding="utf-8"))
+        return _file().read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
+        raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
+
+
+def _record_fields(text: str) -> dict[str, object]:
+    try:
+        value = _decode(text)
+    except StaffUnreadable as error:
         raise StaffUnreadable(f"cannot read staff record {_file()}: {error}") from error
     if not isinstance(value, dict):
         raise StaffUnreadable("staff record must be an object")
@@ -1074,14 +1058,40 @@ def _local_fields() -> dict[str, object]:
     return fields
 
 
+def _local_fields() -> dict[str, object]:
+    """Read the local record without constructing every staff row."""
+    return _record_fields(_local_text())
+
+
+# A process reads the same staff text many times; the last clean parse serves each read of that text.
+_PARSED: dict[str, tuple[str, StaffSnapshot]] = {}
+
+
+def _clean_parse(fields: dict[str, object], loaded: StaffSnapshot) -> bool:
+    """True when the parse printed no anomaly, so a later read of the same text prints none either."""
+    rows = fields.get("rows")
+    return (isinstance(rows, list) and len(cast(list[object], rows)) == len(loaded.rows)
+            and not any("role" in row.unknown_fields or "home" in row.unknown_fields for row in loaded.rows))
+
+
 def _load(*, initial: bool = False) -> StaffSnapshot:
     try:
-        fields = _local_fields()
+        text = _local_text()
     except StaffAbsent:
         if initial:
             return StaffSnapshot(())
         raise
-    return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
+    path = str(_file().absolute())
+    parsed = _PARSED.get(path)
+    if parsed is not None and parsed[0] == text:
+        # A new snapshot finds backends again; they follow session files, not the staff text.
+        return replace(parsed[1])
+    fields = _record_fields(text)
+    loaded = replace(_snapshot_value(fields), inputs=(path,))
+    _PARSED.clear()
+    if _clean_parse(fields, loaded):
+        _PARSED[path] = (text, loaded)
+    return loaded
 
 
 def local_by_current_session(session_id: str) -> StaffRow | None:
@@ -1105,7 +1115,7 @@ def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
 def _found_backends(rows: Sequence[StaffRow],
                     running: frozenset[str] | None = None) -> dict[StaffId, ClaudeBackend | CodexBackend]:
     """Find worker sessions with one scan of each real session folder."""
-    from scripts.lib.transcripts import transcript_paths, uncompressed_path
+    from scripts.lib.transcripts import transcript_stems
     from scripts.message import session_records as sessions
 
     accounts = import_module("scripts.whoami.agent_accounts")
@@ -1124,10 +1134,7 @@ def _found_backends(rows: Sequence[StaffRow],
             for folder in ("sessions", "archived_sessions"):
                 real_folder = (home / folder).resolve()
                 if real_folder not in ids_by_folder:
-                    ids_by_folder[real_folder] = [
-                        StaffId(uncompressed_path(path).stem[-36:])
-                        for path in transcript_paths(real_folder)
-                    ]
+                    ids_by_folder[real_folder] = [StaffId(stem[-36:]) for stem in transcript_stems(real_folder)]
                 for session_id in ids_by_folder[real_folder]:
                     identity = wanted.get(session_id)
                     if identity is not None:
@@ -1586,6 +1593,26 @@ def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffR
         return _transaction(edit)
 
 
+def transfer_producer(identity: StaffId, session: StaffId, home: SessionHome, folder: PresentWorktree) -> StaffRow:
+    """Give a producer row to a proved conversation: its session, account home and launch folder."""
+    _ = native_id(session)
+    if not is_owner():
+        return _remote_row(["transfer-producer", identity, session, "--home", str(home.path),
+                            "--machine", folder.machine, "--path", str(folder.path)])
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if row.kind != "producer":
+            raise StaffRefused("transfer-producer requires a producer")
+        if any(session in (other.id, other.current_session) for other in rows if other.id != row.id):
+            raise StaffRefused(f"{session}: runtime identity already belongs to another member")
+        changed = replace(row, current_session=session, home=home,
+                          worktree=_keep_location_fields(folder, row.worktree))
+        rows[rows.index(row)] = changed
+        return changed
+    with row_operation(identity):
+        return _transaction(edit)
+
+
 @dataclass(frozen=True)
 class ShowrunnerRole:
     name: str
@@ -1847,10 +1874,23 @@ def require_stopped(identity: StaffId) -> None:
 def retire(staff_id: StaffId) -> StaffRow | None:
     if not is_owner():
         value = _remote(["retire", staff_id])
-        return None if value is None else StaffRow.from_json(value)
+        removed = None if value is None else StaffRow.from_json(value)
+    else:
+        require_stopped(staff_id)
+        removed = _transaction(lambda rows: _retire_row(rows, staff_id))
+    if removed is not None:
+        _forget_restart([staff_id])
+    return removed
 
-    require_stopped(staff_id)
-    return _transaction(lambda rows: _retire_row(rows, staff_id))
+
+def _forget_restart(staff_ids: list[StaffId]) -> None:
+    """A removed row never restarts, so its id leaves this machine's restart record."""
+    # The restart record sits above the writer, like the runtime checks.
+    forget = cast(Callable[[list[str]], None], import_module("scripts.agents.shutdown_record").forget)
+    try:
+        forget([str(staff_id) for staff_id in staff_ids])
+    except (OSError, ValueError) as error:
+        print(f"staff: restart record anomaly: {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -1898,7 +1938,9 @@ def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAb
         rows[:] = [candidate for candidate in rows if candidate.id not in selected]
         return FixtureRemoved(row)
 
-    return _transaction(edit)
+    removed = _transaction(edit)
+    _forget_restart(list(selected))
+    return removed
 
 
 def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
@@ -2071,6 +2113,7 @@ class _MoveCommand(Protocol):
 
 class _Arguments:
     hold_record: str = ""
+    home: str = ""
     runtime_id: str = ""
     new_id: str = ""
     value: str = ""
@@ -2150,6 +2193,13 @@ def _parser() -> argparse.ArgumentParser:
     _ = session_parser.add_argument("--json", action="store_true")
     _ = session_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     _ = add.add_argument("--runtime-id", default="")
+    transfer_parser = verbs.add_parser("transfer-producer", help=argparse.SUPPRESS)
+    _ = transfer_parser.add_argument("target")
+    _ = transfer_parser.add_argument("new_id")
+    _ = transfer_parser.add_argument("--home", required=True)
+    _ = transfer_parser.add_argument("--machine", required=True)
+    _ = transfer_parser.add_argument("--path", required=True)
+    _ = transfer_parser.add_argument("--json", action="store_true")
     for command in ("promote-unit", "demote-showrunner"):
         director = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = director.add_argument("target")
@@ -2227,6 +2277,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
+    if arguments.verb == "transfer-producer":
+        return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
+                                 SessionHome(Path(arguments.home).absolute()),
+                                 PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "set-worktree":
         worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
                     else RemovedWorktree(arguments.machine, Path(arguments.path),
@@ -2335,7 +2389,7 @@ def _main(arguments: _Arguments) -> int:
                                     arguments.verb == "ensure" and arguments.kind == "worker"):
         raise StaffRefused("row writes are for worker admission and retirement")
     seed_text = sys.stdin.read() if arguments.verb == "apply-seed" else ""
-    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run") else nullcontext():
+    with operation() if is_owner() and not arguments.row_write and arguments.verb not in ("set-worker-role", "set-home", "set-run", "clear-run", "transfer-producer") else nullcontext():
         result = _mutate(arguments, seed_text)
     if isinstance(result, tuple):
         print(json.dumps(result))

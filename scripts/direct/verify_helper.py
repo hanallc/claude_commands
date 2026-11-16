@@ -2,7 +2,6 @@
 """Run synchronous verify helpers in one process."""
 from __future__ import annotations
 
-import ast
 import ctypes
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -11,18 +10,26 @@ import importlib.util
 import inspect
 import os
 from pathlib import Path
+import re
 import select
 import signal
+import site
 import stat
 import sys
+import sysconfig
 import tempfile
+import time
 import traceback
 from types import ModuleType
-from typing import BinaryIO, Callable, cast
+from typing import Callable, cast
 
 
 PARENT_CHECK_INTERVAL_SECONDS = 1
+# One request carries the caller's whole environment, so a large read takes it in a few calls.
+READ_SIZE = 65536
 PR_SET_PDEATHSIG = 1
+# A top-level main marks a program that the helper runs inside the helper process.
+TOP_LEVEL_MAIN = re.compile(rb"^def main\(", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -45,40 +52,125 @@ class SeparateProcess:
     """The path needs its original interpreter process."""
 
 
-def read_field(source: BinaryIO) -> str:
-    value = bytearray()
-    while byte := source.read(1):
-        if byte == b"\0":
-            return os.fsdecode(bytes(value))
-        value.extend(byte)
-    raise EOFError
+@dataclass(frozen=True)
+class SourceStamp:
+    """What identifies one version of a source file on disk."""
+
+    modified: int
+    size: int
+    inode: int
 
 
-def read_fields(source: BinaryIO) -> list[str]:
-    values: list[str] = []
-    while value := read_field(source):
-        values.append(value)
-    return values
+@dataclass(frozen=True)
+class MissingSource:
+    """The source file is gone."""
 
 
-def read_call(source: BinaryIO) -> HelperCall:
-    program, directory = read_field(source), read_field(source)
-    count = int(read_field(source))
+@dataclass(frozen=True)
+class ChangedDuringCall:
+    """The file changed after its call began, so its module can be older than the file."""
+
+
+def source_stamp(path: str) -> SourceStamp | MissingSource:
+    try:
+        status = os.stat(path)
+    except OSError:
+        return MissingSource()
+    return SourceStamp(status.st_mtime_ns, status.st_size, status.st_ino)
+
+
+def installation_roots() -> tuple[str, ...]:
+    """Folders of the Python installation, whose files do not change while the helper runs."""
+    paths = sysconfig.get_paths()
+    roots = {sys.base_prefix, sys.prefix, sys.exec_prefix, *site.getsitepackages(),
+             *(paths[key] for key in ("stdlib", "platstdlib", "purelib", "platlib") if key in paths)}
+    return tuple(os.path.join(os.path.realpath(root), "") for root in roots)
+
+
+class LoadedSources:
+    """The source files of the modules the helper loaded, as they were when it loaded them.
+
+    A tree update between two calls leaves old modules in sys.modules while a lazy
+    import reads a new file, and the two versions need not fit. A changed source
+    drops every tracked module, so the next call imports one consistent tree.
+    """
+
+    def __init__(self) -> None:
+        self.installation: tuple[str, ...] = installation_roots()
+        self.stamps: dict[str, SourceStamp | MissingSource | ChangedDuringCall] = {}
+        self.untracked: set[str] = set()
+
+    def record(self, started: int) -> None:
+        """Stamp each source module loaded since the last record, by a call that began at started."""
+        for name, module in list(sys.modules.items()):
+            if name == "__main__" or name in self.untracked:
+                continue
+            path = getattr(module, "__file__", None)
+            if (not isinstance(path, str) or not path.endswith(".py")
+                    or os.path.realpath(path).startswith(self.installation)):
+                self.untracked.add(name)
+            elif path not in self.stamps:
+                stamp = source_stamp(path)
+                changed = isinstance(stamp, SourceStamp) and stamp.modified >= started
+                self.stamps[path] = ChangedDuringCall() if changed else stamp
+
+    def refresh(self, programs: dict[str, LoadedProgram | SeparateProcess]) -> None:
+        """Drop every tracked module and loaded program when any tracked source changed."""
+        if all(source_stamp(path) == stamp for path, stamp in self.stamps.items()):
+            return
+        for name, module in list(sys.modules.items()):
+            if name != "__main__" and getattr(module, "__file__", None) in self.stamps:
+                del sys.modules[name]
+        programs.clear()
+        self.stamps.clear()
+        importlib.invalidate_caches()
+
+
+class FieldReader:
+    """Read NUL-terminated fields from a descriptor in large reads."""
+
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor: int = descriptor
+        self.pending: bytearray = bytearray()
+        self.start: int = 0
+
+    @property
+    def buffered(self) -> bool:
+        return self.start < len(self.pending)
+
+    def field(self) -> str:
+        while (end := self.pending.find(b"\0", self.start)) < 0:
+            chunk = os.read(self.descriptor, READ_SIZE)
+            if not chunk:
+                raise EOFError
+            del self.pending[:self.start]
+            self.start = 0
+            self.pending += chunk
+        value = os.fsdecode(bytes(self.pending[self.start:end]))
+        self.start = end + 1
+        return value
+
+    def fields(self) -> list[str]:
+        values: list[str] = []
+        while value := self.field():
+            values.append(value)
+        return values
+
+
+def read_call(source: FieldReader) -> HelperCall:
+    program, directory = source.field(), source.field()
+    count = int(source.field())
     arguments: list[str] = []
     while len(arguments) < count:
-        arguments.append(read_field(source))
-    environment = dict(value.split("=", 1) for value in read_fields(source))
-    return HelperCall(program, directory, arguments, environment, read_field(source), read_fields(source))
+        arguments.append(source.field())
+    environment = dict(value.split("=", 1) for value in source.fields())
+    return HelperCall(program, directory, arguments, environment, source.field(), source.fields())
 
 
 def load_program(path: str) -> LoadedProgram | SeparateProcess:
     # Shell fixtures and scripts without main retain their original entry point.
-    source = Path(path).read_bytes()
-    try:
-        syntax = ast.parse(source, filename=path)
-    except (SyntaxError, ValueError):
-        return SeparateProcess()
-    if not any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in syntax.body):
+    # A text search costs far less than a parse of each program at each run.
+    if TOP_LEVEL_MAIN.search(Path(path).read_bytes()) is None:
         return SeparateProcess()
     name = "verify_helper_" + hashlib.sha256(os.fsencode(path)).hexdigest()
     specification = importlib.util.spec_from_file_location(name, path)
@@ -91,6 +183,15 @@ def load_program(path: str) -> LoadedProgram | SeparateProcess:
     if inspect.signature(main).parameters:
         return LoadedProgram(module, lambda: main(sys.argv[1:]))
     return LoadedProgram(module, main)
+
+
+def replace_environment(values: dict[str, str]) -> None:
+    """Make os.environ equal values; change only the names that differ."""
+    for name in [name for name in os.environ if name not in values]:
+        del os.environ[name]
+    for name, value in values.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
 
 
 def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProcess]) -> tuple[str, str, str]:
@@ -113,8 +214,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
                 if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
                     raise OSError("the helper cannot share this stderr stream")
                 stderr_output = live
-            os.environ.clear()
-            os.environ.update(call.environment)
+            replace_environment(call.environment)
             os.chdir(call.directory)
             tempfile.tempdir = None
             sys.argv = [call.program, *call.arguments]
@@ -155,8 +255,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
             sys.stdin, sys.stdout, sys.stderr = streams
             sys.argv, sys.path[:] = arguments, search
             os.chdir(directory)
-            os.environ.clear()
-            os.environ.update(environment)
+            replace_environment(environment)
             tempfile.tempdir = temporary_parent
         _ = stdout.seek(0)
         _ = stderr.seek(0)
@@ -164,8 +263,7 @@ def run_call(call: HelperCall, programs: dict[str, LoadedProgram | SeparateProce
     if status != "fallback" and (trace := call.environment.get("VERIFY_PY_TRACE")):
         try:
             with open(trace + ".calls", "a") as target:
-                argument = call.arguments[0] if call.arguments else ""
-                _ = target.write(f"{Path(call.program).name}\t{argument}\n")
+                _ = target.write("\t".join([Path(call.program).name, *call.arguments]) + "\n")
         except OSError:
             pass
     return status, output, errors
@@ -189,17 +287,23 @@ def main() -> int:
     parent = os.getppid()
     stop_when_parent_exits(parent)
     programs: dict[str, LoadedProgram | SeparateProcess] = {}
+    sources = LoadedSources()
     with os.fdopen(os.dup(0), "rb", buffering=0) as source, os.fdopen(os.dup(1), "wb") as reply:
+        reader = FieldReader(source.fileno())
         while True:
-            if not select.select([source], [], [], PARENT_CHECK_INTERVAL_SECONDS)[0]:
+            # Bytes already read belong to the next request, so select would wait for nothing.
+            if not reader.buffered and not select.select([source], [], [], PARENT_CHECK_INTERVAL_SECONDS)[0]:
                 if os.getppid() != parent:
                     break
                 continue
             try:
-                call = read_call(source)
+                call = read_call(reader)
             except EOFError:
                 break
+            sources.refresh(programs)
+            started = time.time_ns()
             result = run_call(call, programs)
+            sources.record(started)
             _ = reply.write(b"".join(os.fsencode(value) + b"\0" for value in result))
             reply.flush()
     if len(sys.argv) == 2:

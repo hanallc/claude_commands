@@ -334,6 +334,7 @@ class SyncTests(unittest.TestCase):
             mock.patch.object(ci, "ci", return_value=0) as poll,
             mock.patch.object(cli, "screenshot_hourly", return_value=0) as screenshots,
             mock.patch.object(cli, "aws_snapshot", return_value=0) as snapshot,
+            mock.patch.object(cli, "aws_page", return_value=0) as page,
             mock.patch.object(rust_release, "check_release", return_value=0) as release,
             mock.patch.object(index, "update", return_value=0),
         ):
@@ -343,13 +344,14 @@ class SyncTests(unittest.TestCase):
         screenshots.assert_called_once_with()
         release.assert_called_once_with()
         snapshot.assert_called_once_with()
+        page.assert_called_once_with()
         self.assertEqual(self.commands, [])
 
     def test_hourly_runs_vault_in_order_and_continues_after_each_job_failure(self) -> None:
         jobs = ((sync, "sync", "sync"), (vault_pull, "vault", "vault"),
                 (ci, "ci", "ci"), (cli, "screenshot_hourly", "screenshot"),
                 (rust_release, "check_release", "rust release"), (cli, "aws_snapshot", "AWS snapshot"),
-                (index, "update", "index"))
+                (cli, "aws_page", "AWS page"), (index, "update", "index"))
         expected = [name for _, _, name in jobs]
         for failed in expected:
             for raises in (False, True):
@@ -381,10 +383,24 @@ class SyncTests(unittest.TestCase):
 
         folder = self.root / "aws"
         with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
-              mock.patch.object(aws_target, "snapshot", return_value=1) as read):
+              mock.patch.object(aws_target, "hourly", return_value=1) as read):
             self.assertEqual(cli.aws_snapshot(), 1)
         state.assert_called_once_with("aws")
         read.assert_called_once_with(conf.path("aws_target"), folder)
+
+    def test_aws_page_publishes_from_the_installed_settings_and_state_directory(self) -> None:
+        from scripts.aws_target import aws_page
+        from scripts.build_targets import target_config
+        from scripts.lib import conf
+
+        folder = self.root / "aws"
+        with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
+              mock.patch.object(aws_page, "output_folder", return_value=self.root / "page"),
+              mock.patch.object(aws_page, "publish", return_value=self.root / "page" / aws_page.PAGE_NAME) as publish):
+            self.assertEqual(cli.aws_page(), 0)
+        state.assert_called_once_with("aws")
+        self.assertEqual(publish.call_args.args[::2], (folder, self.root / "page"))
+        self.assertEqual(publish.call_args.kwargs, {"settings_path": conf.path("aws_target")})
 
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []

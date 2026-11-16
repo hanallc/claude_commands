@@ -38,6 +38,11 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.terminal_cells import print_table, seconds
 from scripts.lib.user_zone import user_zone
 
+# Each AWS gate host name starts with this prefix; `top --host aws` selects every such host.
+AWS_HOST_PREFIX = "ip-"
+AWS_HOST_PATTERN = f"{AWS_HOST_PREFIX}%"
+AWS_HOSTS = "aws"
+
 
 def query(connection: sqlite3.Connection, sql: str,
           parameters: Sequence[object] = ()) -> list[dict[str, object]]:
@@ -143,9 +148,11 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
                for suite, path in discover_test_modules(repo)}
     config = conf.read("test_times")
     count = config.whole("TOP_RUNS")
-    checkout = Path(config.text("TOP_CHECKOUT")).expanduser().resolve()
+    host_test, host_value, checkout_key = (("LIKE", AWS_HOST_PATTERN, "TOP_AWS_CHECKOUT") if host == AWS_HOSTS
+                                           else ("=", host, "TOP_CHECKOUT"))
+    checkout = Path(config.text(checkout_key)).expanduser().resolve()
     checkouts = [str(row["checkout"]) for row in query(connection,
-                 "SELECT DISTINCT checkout FROM gate_runs WHERE host = ?", (host,))
+                 f"SELECT DISTINCT checkout FROM gate_runs WHERE host {host_test} ?", (host_value,))
                  if Path(str(row["checkout"])).expanduser().resolve() == checkout]
     checkout_parameters = ", ".join(["?"] * len(checkouts))
     oldest = cutoff(config.whole("TOP_MAX_AGE_DAYS"))
@@ -155,11 +162,11 @@ def top(connection: sqlite3.Connection, host: str, limit: int, repo: Path) -> No
         history: list[ModuleAttempt] = []
         seen: set[str] = set()
         for row in query_rows(connection, MODULE_ATTEMPTS_QUERY + f"""
-            WHERE m.suite = ? AND m.module = ? AND m.host = ? AND m.restart = ''
+            WHERE m.suite = ? AND m.module = ? AND m.host {host_test} ? AND m.restart = ''
               AND m.status = 0 AND r.aborted = 0 AND r.checkout IN ({checkout_parameters})
               AND m.started_at >= ?
             ORDER BY m.started_at DESC, m.run_id DESC, m.attempt ASC
-        """, (folder, filename, host, *checkouts, oldest)):
+        """, (folder, filename, host_value, *checkouts, oldest)):
             attempt = ModuleAttempt.from_row(row)
             if attempt.run_id in seen:
                 continue
@@ -474,7 +481,7 @@ def trend_day(connection: sqlite3.Connection, day: date,
         if row["cpu_s"] is None:
             continue
         host = str(row["host"])
-        place = "aws" if str(row["id"]) in costs or host.startswith("ip-") or "compute.internal" in host else host
+        place = "aws" if str(row["id"]) in costs or host.startswith(AWS_HOST_PREFIX) or "compute.internal" in host else host
         groups[place, str(row["selection"])].append(TrendRun(
             float(str(row["cpu_s"])), float(str(row["wall_s"])), int(str(row["modules_run"])), str(row["id"])))
     output: list[TrendDay] = []

@@ -84,11 +84,17 @@ A launch timeout permits local fallback and releases the cost reservation when n
 Every cloud setup or infrastructure failure permits local fallback.
 This includes upload errors, timeouts, missing results, invalid results, and instance failures.
 Capacity refusals first exhaust the configured sizes and zones.
+A connect failure at launch means AWS did not receive the request, so no box exists.
+The route then skips that region and tries the next region; it prints `Cloud gate skips <region>: <reason>`.
+A running box survives a short AWS outage: the result poll skips failed reads for up to `observe_outage_s`.
+Termination repeats an outage error until `termination_timeout_s` ends.
 The route releases the cost reservation and cloud slot before local admission.
 Only a real remote test failure remains red.
 A dead instance without a final test result permits local fallback.
 The route validates source identity, attempt, modules, host, verdict, and final log delivery.
-It imports the explicit `gate_run` record once under the real remote host.
+It imports the explicit `gate_run` record once into the one AWS place, `aws`.
+The record keeps the box host name in `host`.
+The history counts an older file of cloud gate runs under a box name as `aws` too.
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
@@ -146,6 +152,7 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `attempt_allowance_usd` | `0.02` | Reserve storage, IPv4, and transfer charges. |
 | `log_push_s` | `5` | Send progress logs. |
 | `result_poll_s` | `2` | Check remote results. |
+| `observe_outage_s` | `180` | Keep polling a running box through a short AWS outage. |
 | `launch_reply_tries` | `2` | Recover an uncertain launch reply. |
 | `api_timeout_s` | `30` | Bound each scaler API command. |
 | `termination_timeout_s` | `120` | Bound termination confirmation. |
@@ -303,6 +310,11 @@ This record changes no selection and refuses no run.
 
 **Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
 The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
+`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
+This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
+A red module runs once more alone, as in the gate.
+The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
+`--module` without `--tests-only` is refused.
 `--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
 `--production` defaults to the calling showrunner's production, read from its update timer.
 The gate refuses a merge when it cannot find a production.
@@ -433,27 +445,29 @@ It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
 The gate sends no red result push.
 `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
-The record holds the branch, tree, finish time, failure lines, receipt time, assignment, and push acceptance.
+The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 The notice names the failed test files and includes the result ID.
 After assignment, run `merge_gate.py nightly-assigned --result ID --unit UNIT`.
-The command requires a unit director under sdlc.
-`UNIT` accepts the staff ID or the unit name.
+The command accepts a unit director of any production.
+`UNIT` accepts the staff ID, a `<production>/<unit>` path, or the name of an sdlc unit.
 The command confirms receipt if the original notice has no delivery confirmation.
 It saves the assignment before it sends `nightly.assigned`.
 The push places the receipt and assignment status before the failure list.
 The phone retains that status when it truncates a long failure list.
 A rerun prints `unchanged` after the sender accepts the push.
-`merge_gate.py nightly-check` sends `nightly.unassigned` when an unassigned result reaches its deadline.
-`nightly_assign_minutes=30` sets that deadline in `config/merge_gate.conf`.
+Only `nightly-assigned` sends the user push, and the push names the assignee.
+An unassigned red result never sends a user push.
+`merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
+The alert repeats once in each later deadline window until the fix is assigned.
+`nightly_assign_minutes=30` sets that window in `config/merge_gate.conf`.
+The alert uses the key `merge-gate-nightly-unassigned:<id>` and names the `nightly-assigned` command.
+A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
-The fallback push states that sdlc has not assigned the fix yet.
-It reports an unconfirmed receipt when the sdlc notice failed.
-Assignment and fallback use the same file lock and push acceptance state.
-An assignment after a fallback push records the unit without another push.
-A failed send keeps the result pending for the next periodic check.
+Assignment and the check use the same file lock.
+A failed push keeps the result pending; run `nightly-assigned` again to send it.
 Each red result uses the key `nightly-result:<id>`.
 The sender suppresses a second accepted push for the complete `datetime` range.
 This also prevents another push when the gate cannot save its acceptance state.
@@ -528,6 +542,18 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - **CPU scope.** Once per run, the gate probes `systemd-run --user --scope --quiet --collect --expand-environment=no --slice=builds.slice -- true` with a 10 s timeout. On success it puts the same prefix before each test module's argv, including reruns. The `types` job has no prefix. The scope replaces itself with the command, so the module keeps the `Popen` PID, process group and memory sampling. `builds.slice` has CPUWeight=20; the gate adds no nice value. It skips the prefix when `BUILDLOG_SCOPE=0`, `/proc/self/cgroup` contains `/builds.slice/`, or the probe fails. One line reports the scope or the skip reason.
 - Each job has its own `TMPDIR` under `/dev/shm/merge-gate-*` or `/dev/shm/targeted-test-*`.
   The runner reads the output and removes the temporary folder when the job ends.
+  Outside gate jobs, the shared Python bootstrap gives direct unittest and timed runs a maker folder.
+  The bootstrap decides once, at interpreter startup, while `MERGE_GATE_PARENT_PID` marks a gate job.
+  A later `package_root.py` run inside an import selects the checkout only and starts no folder.
+  `targeted_test.py` uses the same test-folder context for its outer run.
+  These folders use `<inherited TMPDIR>/test-runs/test-run-*`.
+  Child processes inherit TMPDIR, and each run holds its folder lock.
+  Normal exit removes the folder, its lease, and its lock.
+  Before allocation, the next run sweeps free folders in that test-runs parent.
+  The sweep also removes free lease records, lock records, and unfinished temporary lease files.
+  Held locks prevent removal.
+  SIGTERM and SIGKILL leave recorded residue until the next sweep observes a free lock.
+  No signal handler runs cleanup.
 - Each test module gets a fresh `BUILDLOG_DIR` inside its temp root, so its log rows cannot reach the real build log.
 - Each test module starts with tripwires for `cargo`, `rustc`, `rustdoc`, `rustup` and `cargo-nextest` first on PATH: any call, including lookup commands, exits 99 and fails the module with the tool and arguments; a module can put its own stubs first. Each module also gets a private `BUILDLOG_LIVE_MEMORY_TRIPWIRE` record path: a recorded read of `/proc/meminfo` or `/proc/pressure/memory` fails the module with `a test read live memory`, the path and the arguments, even if its tests pass. Neither kind of tripwire failure runs again, including after a signal during a natedev hold. An incomplete or invalid memory record also fails the module and prints `a test read live memory (unreadable record):` with the raw line. The types job gets no live memory tripwire.
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.
@@ -617,14 +643,23 @@ The daily rule removes these jobs from default gates.
 2. Verify that the promotion checkout uses main and has an eligible recorded tip.
 3. Verify the settings blob and ancestry of `origin/<merge branch>`.
 4. Check edited paths against the target through `promotion_edit_conflict(repo, target)`.
-5. Record the exact source commit and base for push recovery.
-6. Fast-forward local main and push it.
-7. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
+5. Check live stored state with the target code through `live_state_refusal(repo, target)`.
+6. Record the exact source commit and base for push recovery.
+7. Fast-forward local main and push it.
+8. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
 
 `promotion_edit_conflict` refuses only edited paths that the promotion also changes.
 A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
 The live index and edits stay unchanged; untracked files do not count.
 Local, Mac, and checkpoint promotion use this function.
+
+`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/merge_gate.conf`.
+It runs each listed module from that tree as `python3 -m <module> state-check`, within `live_state_check_seconds`.
+A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/merge_gate.conf` or without the `live_state_checks` key has no checks.
+A nonzero exit refuses the promotion before main moves, and names the module and its last error line.
+The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
+The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
+It exists because the Phase 44 re-land on 2026-11-14 promoted a strict reader over old-shape rows and stopped the service.
 A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
 Tree equality alone does not authorize that push.
 The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.
@@ -633,8 +668,9 @@ A failed Mac advance names the published local commit and leaves retry to main s
 - **Main synchronization.** `scripts/lib/main_sync.py` fetches main and fast-forwards an eligible checkout.
   The `claude-sync` job runs every 15 minutes on both machines.
   It refuses another branch, an active Git operation, divergence, or tracked edits before an advance.
+  A `config/*.conf` edit that changes only setting values is a waiting row, not a tracked edit; the advance keeps it live.
   An interrupted update is not a tracked edit. When each changed tracked file, and each untracked file new at origin/main, equals origin/main, the job finishes the update.
-  It removes those untracked files, restores those tracked files to HEAD, then runs `git merge --ff-only`.
+  It removes those untracked files, restores those tracked files to HEAD, then advances with `waiting_rows.move_to`.
   A tracked candidate's index entry must also equal HEAD or origin/main. Any other change blocks as `dirty`, and no file changes.
   An untracked path that collides with a path origin/main adds also blocks as `dirty`: `dir` blocks an incoming `dir/file`, and `dir/file` blocks an incoming file `dir`.
   The `dirty` detail names each path that blocks the update, or the last line of each git output stream when git cannot list them.
@@ -663,6 +699,12 @@ Checkpoint integration modules separate inputs, receipts, validation, promotion,
 Ordinary CLI cases use the real parser and handlers in-process.
 Git, executable stand-ins, and selected unit and child-handoff cases retain real subprocesses.
 
+### Land line
+
+`land_queue.py` keeps the order in which the land runner takes items: `add`, `move`, `remove`, `list`, `next`.
+The runner takes each item with `next` under the line lock, so an item lands once and an edit never loses an item.
+The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
+
 ### Queued checkpoint batches
 
 `merge_checkpoint.py --production <name> --batch <file>` lands queued checkpoints in file order.
@@ -672,17 +714,23 @@ Batch lines refuse `--bump`, `--from-child`, and `--checkpoint` before any merge
 The outer command refuses positional item arguments.
 A batch can contain one item.
 
-1. Take the production merge lock once and retain the starting tip and whether a merge is unfinished.
-2. Check each item and make its own merge commit.
-3. Test all code paths changed from the published merge branch tip through HEAD once.
-4. Use one `tested_main_push` hold, one push, and one local promotion.
-5. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
+   Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
+2. Resume each item that the merge branch already contains through the single command's route, in file order.
+3. Retain the starting tip and whether a merge is unfinished.
+4. Check each remaining item and make its own merge commit.
+5. Test all code paths changed from the published merge branch tip through HEAD once.
+6. Use one `tested_main_push` hold, one push, and one local promotion.
+7. Complete each item's branch cleanup, receipt, review record, scratch cleanup, and director result.
+
+A resumed item retests an unpushed merge and resumes the promotion of a pushed merge, as the single command does.
+A failed resume stops every later item from the same unit, and the batch exits 1 after the other items land.
 
 Shrink and as-built items add no test paths of their own.
 A batch skips tests only when its unpublished paths belong entirely to its shrink and as-built items.
 The published tip is `origin/<merge branch>`.
-An interrupted batch's unpublished paths remain in the test selection when its already-merged item drops.
-Those paths still select tests when only shrink or as-built items remain.
+An interrupted batch's merged item retests its unpublished paths when it resumes.
+A red resume undoes that unpushed merge before the other items merge.
 Main integration retains the existing retest rule before publication.
 Any item's `--cancel-prior` applies to the shared push.
 Review-list publication, style notification, checkout announcement, and Mac promotion run once for the batch.
@@ -718,7 +766,7 @@ Full tests, probes, main retests, and all retries append to that log.
 The search restores the starting tip and drops the causing item and that unit's later items.
 A cancelled probe or another non-red stop drops every candidate with that stop.
 A command that cannot start is a non-red probe stop; full runs retain their existing failure behavior.
-Already-merged items receive `resume it alone with the single command`.
+A batch line that repeats an item merged in the same attempt receives `resume it alone with the single command`.
 The push start is the boundary for drop, reset, and retry.
 Once the push starts, a failure drops no items and starts no batch reset or retry.
 Only `push_rollback` can undo a failed push after it checks the live origin.
@@ -726,7 +774,8 @@ Each item receives the stop report.
 
 `test_merge_checkpoint_batch.py` covers shared publication, a conflicting middle item, and a red command selected by one item.
 It also covers unpublished paths after interruption and a wrapper failure after a successful push.
-The interruption rows include a shrink-only retry.
+The interruption rows resume the merged item alone, including a shrink-only batch.
+The rerun row resumes the promotion of two pushed items and then lands a new item.
 The held-batch rows preserve an earlier unfinished merge and its staged edits.
 They also land a clean item after two holds and remove a held unit's later item.
 The history rows merge closing items for an older plan after the configured plan changes.
@@ -917,8 +966,8 @@ This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_g
 | `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
-| `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
-| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
+| `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/eligibility.py` | `10` s | small or large per case; invalid values fall back to 10 |
+| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | every run root: each `/session/<name>/run`, then `/tmp/claude/unit` and `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 The build hold reader finds the run owner through `StaffRow.run`.

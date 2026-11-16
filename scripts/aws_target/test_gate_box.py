@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import base64
+import inspect
 import json
 import os
 from pathlib import Path
@@ -98,7 +99,6 @@ class GateBoxTests(unittest.TestCase):
     def test_guest_names_no_merge_gate_signal_function(self) -> None:
         for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):
             self.assertNotIn('rollback_signals', code)
-            self.assertNotIn('defer_signals', code)
             self.assertNotRegex(code, r'\bmerge_gate\.\w*signal\w*')
             self.assertNotIn('signal.signal', code)
 
@@ -229,7 +229,10 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
                         _ = (folder / '__init__.py').write_text('')
-                _ = (repo / 'scripts/lib/cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
+                library = repo / 'scripts/lib'
+                _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
+                self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
+                _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
                     'from types import SimpleNamespace\nimport os\n'
                     + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nSuiteMode = str\n'
@@ -239,7 +242,11 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'
                     + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
-                    (ROOT / 'scripts/aws_target/gate_box.py').read_text()
+                    'import json\nfrom pathlib import Path\nfrom typing import cast\n'
+                    + f'GUEST_TRANSFERS = {gate_box.GUEST_TRANSFERS!r}\n'
+                    + f'PAIRED_GUEST = {gate_box.PAIRED_GUEST!r}\n'
+                    + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
+                    + inspect.getsource(gate_box.run_guest)
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
                     + 'def completion_record(*args): return {"kind": "gate_run"}\n')
                 if candidate_change == 'rename':
@@ -367,6 +374,30 @@ else:
                     self.assertLess(trace.index('upload log'), trace.index('tools shell'))
                     print('Production boot stages: ' + ' -> '.join(stages))
 
+    def test_result_sends_one_job_list_and_leaves_test_times_and_reads_to_the_record(self) -> None:
+        times: gate_record.ModuleTimes = {
+            "wall_s": 2.0, "cpu_s": 1.5, "tests_s": 1.0, "tests_run": 2, "failures": 0, "errors": 0, "skipped": 0,
+            "tests": [{"test": "Fixture.test_slow", "s": 9.0, "status": "pass"},
+                      {"test": "Fixture.test_fast", "s": 0.1, "status": "pass"}],
+            "config_reads": ["config/a.conf"], "folder_scans": ["scripts/fixture"],
+            "content_reads": ["scripts/fixture/data.json"]}
+        job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "ok", cpu_seconds=1.5, times=times,
+                                 wall_clock=gate_record.WallClockSpan(10, 12))
+        run = gate.GateRun((job,), 2, 3, executions=(job,))
+        encoded = gate_box.encode_run(run)
+        self.assertNotIn("executions", encoded)
+        sent = ledger.mapping(ledger.rows(encoded, "jobs")[0]["times"])
+        self.assertEqual(sent, {"wall_s": 2.0, "cpu_s": 1.5, "tests_s": 1.0, "tests_run": 2, "failures": 0,
+                                "errors": 0, "skipped": 0, "tests": []})
+        decoded = gate_box.decode_run(encoded)
+        self.assertEqual(decoded.executions, decoded.jobs)
+        self.assertTrue(decoded.passed)
+        record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+        module, = ledger.rows(record, "modules")
+        self.assertEqual(module["content_reads"], ["scripts/fixture/data.json"])
+        self.assertEqual(module["folder_scans"], ["scripts/fixture"])
+        self.assertEqual([row["test"] for row in ledger.rows(module, "tests")], ["Fixture.test_slow"])
+
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,
                                    wall_clock=gate_record.WallClockSpan(10, 12))
@@ -418,6 +449,21 @@ else:
                         self.assertNotIn('started_at', module)
                         self.assertNotIn('ended_at', module)
 
+    def test_result_without_executions_reads_the_jobs_as_executions(self) -> None:
+        first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', wall_clock=gate_record.WallClockSpan(10, 12))
+        second = gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'passed', wall_clock=gate_record.WallClockSpan(13, 14))
+        with self.subTest(form='with executions'):
+            run = gate.GateRun((second,), 4, 3, executions=(first, second))
+            self.assertEqual(gate_box.decode_run(gate_box.encode_run(run)), run)
+        with self.subTest(form='without executions'):
+            run = gate.GateRun((second,), 4, 3, executions=(second,))
+            encoded = gate_box.encode_run(run)
+            # The older writer encodes executions equal to jobs; the newer writer leaves them out.
+            _ = encoded.pop('executions', None)
+            decoded = gate_box.decode_run(encoded)
+            self.assertEqual(decoded, run)
+            self.assertEqual([job.output for job in gate_box.execution_records(decoded)], ['passed'])
+
     def test_result_rejects_missing_or_invalid_status_and_metrics(self) -> None:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, ''),), 1, 1)
         for field, value in (('returncode', False), ('seconds', -1), ('seconds', float('nan')),
@@ -446,11 +492,19 @@ class GateResourcesTests(unittest.TestCase):
                                   check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         before = ledger.mapping(cast(object, json.loads(original.stdout)))
         current = self.template()
+        # The retired builder pieces must stay removed; every other Rust resource must stay unchanged.
+        retired = {'InstanceRole', 'InstanceProfile', 'SecurityGroup', 'LaunchTemplate', 'Instance', 'DataVolume',
+                   'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy', 'InstanceId', 'DataVolumeId',
+                   'InstanceType', 'AmiId', 'AvailabilityZone', 'SubnetId', 'RootVolumeGiB', 'DataVolumeGiB', 'DataVolumeIops',
+                   'DataVolumeThroughput', 'SpotMaxPrice', 'Bootstrap', 'EnableCompute', 'ExistingDataVolumeId',
+                   'ComputeEnabled', 'ExistingDataInput'}
         for section in ('Resources', 'Parameters', 'Outputs'):
+            rows = ledger.mapping(current[section])
+            self.assertFalse(retired & set(rows), section)
             for name, row in ledger.mapping(before[section]).items():
-                if name.startswith("Gate") or name.startswith("EnableGates"):
+                if name.startswith("Gate") or name.startswith("EnableGates") or name in retired:
                     continue
-                self.assertEqual(ledger.mapping(current[section])[name], row, (section, name))
+                self.assertEqual(rows[name], row, (section, name))
 
     def test_cloud_resources_use_the_machine_name(self) -> None:
         names = {'GateBucket': 'BucketName', 'GateRole': 'RoleName', 'GateProfile': 'InstanceProfileName',
@@ -486,7 +540,11 @@ class GateResourcesTests(unittest.TestCase):
 
     def test_scaler_grants_have_workload_and_resource_scopes(self) -> None:
         properties = ledger.mapping(ledger.mapping(self.resources()['GateScalerPolicy'])['Properties'])
-        statements = ledger.rows(ledger.mapping(properties['PolicyDocument']), 'Statement')
+        everything = ledger.rows(ledger.mapping(properties['PolicyDocument']), 'Statement')
+        # The regional image grant exists only when another gate region has an image.
+        regional_images = [row for row in everything if 'Fn::If' in row]
+        self.assertEqual([cast(list[object], row['Fn::If'])[0] for row in regional_images], ['GateHasRegionImages'])
+        statements = [row for row in everything if 'Fn::If' not in row]
         by_action = {str(row['Action']): row for row in statements}
         self.assertEqual(properties['Users'], [{'Ref': 'ScalerUser'}])
         terminate = by_action[str(['ec2:TerminateInstances'])]
@@ -499,7 +557,12 @@ class GateResourcesTests(unittest.TestCase):
             if row['Resource'] == '*':
                 self.assertIn(row['Action'], (['ec2:DescribeInstances'], ['ce:GetCostAndUsage']))
         launches = [row for row in statements if row['Action'] == ['ec2:RunInstances']]
-        self.assertEqual(len(launches), 5)
+        self.assertEqual(len(launches), 6)
+        tagged = next(row for row in launches if 'security-group/*' in json.dumps(row['Resource']))
+        self.assertEqual(ledger.mapping(ledger.mapping(tagged['Condition'])['StringEquals']), {
+            'aws:ResourceTag/GateDeployment': {'Ref': 'DeploymentId'}, 'aws:ResourceTag/Workload': 'cloud-claude-gate'})
+        subnet = next(row for row in launches if 'subnet/*' in json.dumps(row['Resource']))
+        self.assertEqual(subnet['Condition'], {'ArnEquals': {'ec2:Vpc': {'Ref': 'GateVpcs'}}})
         instance = next(row for row in launches if 'instance/*' in json.dumps(row['Resource']))
         condition = ledger.mapping(instance['Condition'])
         self.assertEqual(ledger.mapping(condition['StringEquals'])['ec2:InstanceType'], {'Ref': 'GateInstanceTypes'})

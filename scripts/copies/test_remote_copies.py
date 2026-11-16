@@ -10,7 +10,6 @@ import json
 import os
 import select
 import shutil
-import socket
 from pathlib import Path
 import signal
 import subprocess
@@ -21,7 +20,9 @@ from typing import cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.buildlog.store import host_name
 from scripts.copies import copies
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lib import conf, file_lock
@@ -54,6 +55,8 @@ class RemoteCopiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
+        private = private_slot_config(self.root, repository="repository", maximum=2)
+        self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
         self.mirror = self.root / "mirrors/repository"
@@ -108,7 +111,7 @@ class RemoteCopiesTests(unittest.TestCase):
                                     "localhost", str(checkout), holder.current_session)
         copies.register_remote(local)
         row = next(row for row in self.list_rows() if row["path"] == str(checkout))
-        self.assertEqual(row["host"], socket.gethostname())
+        self.assertEqual(row["host"], host_name())
         self.assertEqual(copies.read_remote_mirror(copies.remote_record_path(local)).host, "localhost")
         shutil.rmtree(checkout.parent)
         with copies.local_mirror_lease(checkout, "missing", create=False):
@@ -201,6 +204,8 @@ class RemoteCopiesTests(unittest.TestCase):
         fixture = OffloadCommandFixture()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
+        private_settings = Path(fixture.environment["COPIES_CONFIG"]).with_name("build_folders.conf")
+        _ = shutil.copyfile(private_settings, Path(fixture.environment["CONF_DIR"]) / private_settings.name)
         fixture.environment["STAFF_FILE"] = staff_file
         fixture.fixture["hold_run"] = True
         fixture.sync_fixture()
@@ -255,8 +260,8 @@ class RemoteCopiesTests(unittest.TestCase):
             target = target_root / "retained"
             _ = target.write_text("artifact")
         with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
-            self.assertNotEqual(reused, tree)
-            self.assertFalse(tree.exists())
+            self.assertEqual(reused, tree)
+            self.assertTrue(tree.exists())
             self.assertEqual((reused / "target").resolve(), target_root)
             self.assertEqual((reused / "stable.txt").stat().st_mtime_ns, 1_000_000_000)
             self.assertEqual(target.read_text(), "artifact")
@@ -312,7 +317,8 @@ class RemoteCopiesTests(unittest.TestCase):
             ("missing-status", 0, "", "remote status is missing"),
         )
         for cause, status, remote_output, detail in cases:
-            with self.subTest(cause=cause), mock.patch.dict(os.environ, copies_environment(self.root / cause)):
+            with self.subTest(cause=cause), mock.patch.dict(os.environ, {**copies_environment(self.root / cause),
+                    **private_slot_config(self.root / cause, repository="repository").environment}):
                 mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
                 for mirror in mirrors:
                     copies.register_remote(mirror)
@@ -343,7 +349,9 @@ class RemoteCopiesTests(unittest.TestCase):
         for action in ("remove", "reuse", "refused", "remote-refused", "missing-status"):
             root = self.root / action
             root.mkdir()
-            with self.subTest(action=action), local_remote_transport(root), warm_claim_servers(), ExitStack() as contexts:
+            with self.subTest(action=action), local_remote_transport(root), \
+                    mock.patch.dict(os.environ, private_slot_config(root, repository="repository").environment), \
+                    warm_claim_servers(), ExitStack() as contexts:
                 mirror = self.remote(path=str(root / "mirror"))
                 self.assertEqual(publish_mirror(mirror), 0)
                 payload = Path(mirror.path) / "saved-work"
@@ -535,16 +543,16 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertTrue((self.mirror / ".mac-test-mirror").exists())
 
     def test_remote_kind_covers_mac_linux_and_named_peer(self) -> None:
-        from scripts.mac_test import offload
+        from scripts.mac_test import eligibility, offload
         from scripts.build_targets import target_config
         targets: tuple[tuple[str, target_config.Platform], ...] = (("mac", "macos"), ("linux", "linux"), ("peer", "linux"))
         for name, platform in targets:
-            with self.subTest(target=name), mock.patch.object(offload, "configured_ssh_target",
+            with self.subTest(target=name), mock.patch.object(eligibility, "configured_ssh_target",
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
                 request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                                 target=name, owner="alpha", holder_session="session")
-                config = offload.OffloadConfig(True, offload.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
-                mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
+                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
+                mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
                 self.assertEqual(mirror.owner, "alpha")
                 self.assertEqual(mirror.repository, copies.SelectedRepository("repository"))
                 self.assertEqual(mirror.session, "session")
@@ -688,6 +696,7 @@ class RemoteCopiesTests(unittest.TestCase):
         _ = python.write_text(f"#!{sys.executable}\n" + f"""import sys
 from pathlib import Path
 from scripts.copies import copies
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.mac_test import floor_claims
 log = Path({str(log)!r})
 with log.open('a') as output:
@@ -707,7 +716,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         seed_interpreter_cache(self.root / "probe-cache", python)
         return subprocess.run(["/bin/sh", "-c", copies.mirror_probe_setup(str(self.mirror))],
                               env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                   "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                                   "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                                    "XDG_CACHE_HOME": str(self.root / "probe-cache"), "CLAUDE_PYTHON": ""},
                               capture_output=True, text=True, timeout=10)
 
@@ -730,7 +739,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "agents/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",
-            "bevy_migration_plan/bevy_migration_ensure_repo.sh"})
+            "bevy_migration_plan/bevy_migration_ensure_repo.sh", "lib/build_folders.py"})
 
 if __name__ == "__main__":
     _ = unittest.main()

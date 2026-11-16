@@ -36,6 +36,8 @@ from scripts.message import process_table
 from scripts.production import session_staff, showrunners, staff
 from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
+from scripts.lib import conf
+from scripts.whoami import agent_accounts, quota_state
 from scripts.production.live_units import live_unit_ids as live_unit_ids
 from scripts.message.sessions import live_sessions
 
@@ -147,6 +149,16 @@ UNIT_CLEAR = (
     "All clear, from the user (/codex_winddown clear in {sender}, {time}): we are back with Codex. Start"
     " using Codex again, starting with what your resume list holds. It is okay to let a running Claude"
     " agent finish up."
+)
+ALL_CLEAR_HELD = (
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over and the"
+    " Codex count has stopped. No-worker mode is still on: Codex stays off until the workers-back notice"
+    " arrives."
+)
+UNIT_CLEAR_HELD = (
+    "All clear, from the user (/codex_winddown clear in {sender}, {time}): the wind-down is over. No-worker"
+    " mode is still on, so launch no Codex agent. Do your work yourself and keep your resume list until"
+    " the workers-back notice arrives. It is okay to let a running Claude agent finish up."
 )
 
 
@@ -431,8 +443,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
         from scripts.notify import review
 
         push = render("codex.reset_ready", machine=machine)
-        command = user_send_argv(push)
-        command[1] = str(broadcast.SEND)
+        command = user_send_argv(push, send_script=broadcast.SEND)
         with quiet_notice_state() as state:
             if observation.generation != state.generation:
                 return
@@ -539,7 +550,26 @@ def start_count(owner: staff.StaffRow) -> bool:
     return done.returncode == 0
 
 
+def credits_line() -> str | None:
+    """The first line of a start or triage while paid credits stay on: the wind-down does not stop them."""
+    stop = "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none"
+    try:
+        accounts = sorted(agent_accounts.codex_credit_accounts())
+    except conf.Unusable as error:
+        return f"Paid credits: codex_credit_accounts cannot be read ({' '.join(str(error).split())}). {stop}"
+    if not accounts:
+        return None
+    return f"Paid credits stay on for {', '.join(accounts)}. The wind-down does not stop them. {stop}"
+
+
+def _show_credits() -> None:
+    line = credits_line()
+    if line is not None:
+        print(line, flush=True)
+
+
 def start(sender: str) -> int:
+    _show_credits()
     STATE.mkdir(parents=True, exist_ok=True)
     (STATE / PROJECTIONS).unlink(missing_ok=True)
     with quiet_notice_state() as state:
@@ -561,6 +591,7 @@ def start(sender: str) -> int:
 
 
 def triage(sender: str) -> int:
+    _show_credits()
     if not instances():
         print("No wind-down is on. Run /codex_winddown start first.", file=sys.stderr)
         return 1
@@ -577,7 +608,8 @@ def clear(sender: str) -> int:
     (STATE / PROJECTIONS).unlink(missing_ok=True)
     with quiet_notice_state() as state:
         _ = _cancel_quiet_notice(state)
-    return 0 if announce(sender, ALL_CLEAR, UNIT_CLEAR) and every else 1
+    texts = (ALL_CLEAR_HELD, UNIT_CLEAR_HELD) if quota_state.no_worker_mode() else (ALL_CLEAR, UNIT_CLEAR)
+    return 0 if announce(sender, *texts) and every else 1
 
 
 def main(arguments: list[str]) -> int:

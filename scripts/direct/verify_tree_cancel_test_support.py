@@ -25,6 +25,7 @@ from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 
 
 def cancellation_lines(output: str, command: str) -> list[re.Match[str]]:
@@ -172,7 +173,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
             "TEST_CONTROL": str(self.control), "VERIFY_TREE_WATCH_S": "0.2",
             "UNIT_RUN_DIR": str(self.board), "UNIT_SESSION_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
-            "PYTHONPATH": str(VERIFY.resolve().parents[2]), "BUILDLOG_SYNC": "1",
+            "PYTHONPATH": str(VERIFY.resolve().parents[1] / "lib/python_startup"), "BUILDLOG_SYNC": "1",
             "PYTHONDONTWRITEBYTECODE": "1", "NEXTEST_TEST_THREADS": "4",
         })
 
@@ -198,13 +199,15 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         # Formatting runs before clippy fix, then runs again without rewriting.
         for stage in ("mend", "fmt", "fix"):
             self.wait_for_running(self.control / (stage + ".rewritten"), process)
-            self.assertEqual(list((self.root / "tmp").glob("verify-tree.*")), [],
+            self.assertEqual(tool_folders(self.root / "tmp", "verify-tree"), [],
                              f"the watcher started during the {stage} rewrite")
             _ = (self.control / (stage + ".release")).touch()
 
     @staticmethod
     def write_tool(path: Path, code: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + code)
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup/sitecustomize.py"
+        bootstrap = f"import runpy, sys\nrunpy.run_path({str(startup)!r}, run_name='_fixture_python_startup')['select_checkout'](sys.argv)\n"
+        _ = path.write_text(f"#!{sys.executable}\n" + bootstrap + code)
         path.chmod(0o755)
 
     @staticmethod

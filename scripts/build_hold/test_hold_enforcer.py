@@ -9,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from collections.abc import Callable, Mapping
 from contextlib import redirect_stderr, redirect_stdout
@@ -62,7 +63,7 @@ class HoldEnforcerTests(unittest.TestCase):
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("test-boot\n")
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
+            "HOME": str(self.root), "CONF_DIR": str(self.root / "config"), "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),
@@ -132,136 +133,369 @@ class HoldEnforcerTests(unittest.TestCase):
             step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
 
-    def test_drain_stops_waiting_run_waits_for_working_run_and_releases_owner_once(self) -> None:
+    def test_drain_command_keeps_working_runs_and_waits_without_stopping(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.build_hold.owning_session import NoOwningSession
+
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         member = fixture_member("producer", name="holder")
         _ = (self.holders / "holder").rename(self.holders / member.id)
-        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="waiting-owner")
-        _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"))
+        _ = self.process(11, "python3", parent=10, argv=("python3", "targeted_test.py"))
+        _ = self.process(20, "python3", argv=("python3", "merge_gate.py"))
         _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
-        signals: list[tuple[int, int]] = []
-        notices: list[str] = []
-        pauses: list[float] = []
-        stop = hold_enforcer.stop_waiting_run
-        drain = hold_enforcer.drain
+        _ = self.process(30, "Runner.Worker")
+        _ = self.process(40, "custom-build")
+        _ = self.process(60, "cargo", argv=("cargo", "build"), session="existing-agent")
+        _ = self.process(61, "rustc", parent=60)
+        _ = self.process(80, "bash", argv=("bash", "verify.sh", "check"))
+        _ = self.process(81, "cargo", parent=80, argv=("cargo", "clippy"))
+        statuses: list[str] = []
+        original_wait = hold_enforcer.wait_for_kept_runs
 
-        def private_drain(holder: build_hold.Holder, proc_root: Path) -> int:
-            self.assertIn(build_hold.ProcessIdentity(20, "11000"), holder.keep)
-            self.assertNotIn(build_hold.ProcessIdentity(10, "11000"), holder.keep)
-            return drain(holder, proc_root, sleep=advance, clock=lambda: self.now)
-
-        def signal_process(pid: int, signum: int) -> None:
-            self.assertTrue(build_hold.natedev_holds(self.holders).in_force)
-            signals.append((pid, signum))
-
-        def private_stop(run: hold_enforcer.WaitingRun, holder: build_hold.Holder,
-                         processes: Mapping[int, build_hold.AuditProcess], proc_root: Path
-                         ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
-            return stop(run, holder, processes, proc_root, signal_process=signal_process,
-                        signal_group=lambda pid, signum: self.fail(f"unexpected group signal {pid} {signum}"))
+        def status() -> None:
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(build_hold.main(["status", "--proc-root", str(self.proc)]), 0)
+            statuses.append(output.getvalue())
 
         def advance(seconds: float) -> None:
-            self.assertEqual(signals, [(10, signal.SIGTERM)])
-            pauses.append(seconds)
+            self.assertEqual(seconds, 1)
             self.now += 60
-            if len(pauses) == 2:
-                shutil.rmtree(self.proc / "10")
-                shutil.rmtree(self.proc / "21")
-                shutil.rmtree(self.proc / "20")
+            if self.now == 60:
+                _ = self.process(50, "bash", start=12_000, argv=("bash", "verify.sh", "test"))
+                lineage = build_targets.read_caller_lineage(self.proc, 50, "12000")
+                self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+                    NoOwningSession(), self.holders, lineage), build_hold.Holder)
+                _ = self.process(70, "cargo", argv=("cargo", "build"), session="new-agent")
+                decisions = {item.process.identity.pid: item for item in self.decisions()}
+                self.assertIsInstance(decisions[60], hold_enforcer.KeptBuild)
+                self.assertIsInstance(decisions[61], hold_enforcer.KeptBuild)
+                self.assertIsInstance(decisions[70], hold_enforcer.WouldStopBuild)
+                for pid in (20, 21, 30, 60, 61):
+                    shutil.rmtree(self.proc / str(pid))
+            else:
+                for pid in (40, 80, 81):
+                    shutil.rmtree(self.proc / str(pid))
+            status()
 
-        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
-             mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())), \
-             mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=private_stop), \
-             mock.patch.object(hold_enforcer, "drain", side_effect=private_drain), \
+        def wait(holder: build_hold.Holder, proc_root: Path) -> int:
+            self.assertEqual(set(holder.keep), {build_hold.ProcessIdentity(pid, "11000") for pid in (20, 30, 40, 60, 80)})
+            self.assertIsInstance(holder.release, build_hold.KnownReleaseEta)
+            record = cast(dict[str, object], json.loads((self.holders / member.id).read_text()))
+            self.assertEqual(set(record), {"holder", "since", "for", "release_eta", "keep"})
+            for pid, expected in ((10, build_hold.Holder), (11, build_hold.Holder),
+                                  *((pid, build_targets.NoBlockingHold) for pid in (20, 21, 30, 60, 61, 80, 81))):
+                lineage = build_targets.read_caller_lineage(self.proc, pid, "11000")
+                self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+                    NoOwningSession(), self.holders, lineage), expected)
+            status()
+            return original_wait(holder, proc_root, sleep=advance, clock=lambda: self.now)
+
+        with mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
+             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
              mock.patch.object(hold_enforcer, "start"), \
-             redirect_stdout(io.StringIO()) as output:
-            status = build_hold.main(["hold", "--drain", "--holder", "holder", "--for", "timed test",
-                                      "--proc-root", str(self.proc)])
-        self.assertEqual(status, 0)
-        self.assertEqual(signals, [(10, signal.SIGTERM)])
-        self.assertGreaterEqual(len(pauses), 2)
-        lines = output.getvalue().splitlines()
-        self.assertEqual(lines[-1], "drained")
-        self.assertNotIn("waits by itself", output.getvalue())
-        self.assertNotIn("its own hold gate", output.getvalue())
-        self.assertIn("drain stops waiting runs", output.getvalue())
-        self.assertGreaterEqual(sum("working-owner" in line and "20" in line for line in lines), 2)
-        self.assertTrue(any("waiting-owner" in line and "10" in line and "age" in line for line in lines))
-        self.assertRegex(output.getvalue(), r"age|[0-9]+s|[0-9]+ min")
-        row, = [row for row in self.rows() if row["action"] == "stopped"]
-        self.assertEqual(row["stopped_run"], {"pid": 10, "proc_start": "11000"})
-        self.assertEqual(row["session"], "waiting-owner")
+             mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, \
+             mock.patch.object(os, "kill") as kill, \
+             mock.patch.object(build_hold, "start_hold_recorder"), \
+             mock.patch.object(build_hold, "print_hold_audit"), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--keep", "40", "--release-eta", "23:59", "--zone", "Etc/GMT+12",
+                "--proc-root", str(self.proc)]), 0)
+        stop.assert_not_called()
+        kill.assert_not_called()
+        self.assertIn("draining (5 runs left)", statuses[0])
+        self.assertIn("draining (2 runs left)", statuses[1])
+        self.assertIn(" - held", statuses[2])
+        self.assertIn("draining: 5 runs remain", output.getvalue())
+        self.assertIn("draining: 2 runs remain", output.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[-1], "drained; natedev stays held until release")
+        self.assertTrue((self.holders / member.id).is_file())
+        self.assertTrue((self.proc / "50/stat").is_file())
+        self.assertNotIn("pid 10,", statuses[0])
+        self.assertIn(": pid 80, start 11000", statuses[0])
+        self.assertIn(": pid 80, start 11000", statuses[1])
+        self.assertNotIn("kept by", statuses[2])
 
-        def notify(entry: build_hold.ReleaseEntry, socket: str, _notice: str) -> build_hold.ReleaseDelivered:
-            self.assertEqual(socket, "/private/socket")
-            notices.append(entry["session_id"])
-            return build_hold.ReleaseDelivered()
+    def test_drain_keeps_a_gate_started_before_the_hold_is_published(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.build_hold.owning_session import NoOwningSession
 
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/private/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=notify):
-            _ = build_hold.release_cycle(self.holders, member.id)
-            _ = build_hold.release_cycle(self.holders, member.id)
-        self.assertEqual(notices, ["waiting-owner"])
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        (self.holders / "holder").unlink()
+        original_start = build_hold.start_hold
+        discoveries: list[tuple[build_hold.ProcessIdentity, ...]] = []
+        original_discover = hold_enforcer.drain_identities
 
-        with self.subTest(claim_read="unreadable at hold start"):
-            _ = self.process(30, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
-            _ = self.process(31, "cargo", parent=30, start=11_001, argv=("cargo", "test"))
-            _ = self.process(40, "python3", argv=("python3", "targeted_test.py"), session="waiting-owner")
-            _ = self.process(41, "bash", parent=40, start=11_002, argv=("bash", "verify.sh", "check"))
-            signals.clear()
-            pauses.clear()
-            reads = 0
+        def discover(proc_root: Path, identity: build_hold.HolderIdentity) -> tuple[build_hold.ProcessIdentity, ...]:
+            kept = original_discover(proc_root, identity)
+            discoveries.append(kept)
+            return kept
 
-            def recover_claims(proc_root: Path) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
-                nonlocal reads
-                self.assertEqual(proc_root, self.proc)
-                reads += 1
-                if reads == 1:
-                    return build_hold.ClaimsUnreadable("private claims are damaged")
-                return build_hold.LiveClaims(frozenset())
+        def publish(directory: Path, identity: build_hold.HolderIdentity, purpose: str,
+                    request: build_hold.ReleaseRequest, now: datetime,
+                    keep: tuple[build_hold.ProcessIdentity, ...] | list[build_hold.ProcessIdentity], *,
+                    before_publish: Callable[[], None] | None = None) -> str:
+            self.assertEqual(discoveries, [()])
+            self.assertFalse(build_hold.has_holder_file(directory))
+            _ = self.process(55, "bash", argv=("bash", "verify.sh", "check"))
+            _ = self.process(57, "cargo", parent=55, argv=("cargo", "build"))
+            return original_start(directory, identity, purpose, request, now, keep, before_publish=before_publish)
 
-            def finish_drain(seconds: float) -> None:
-                self.assertEqual(signals, [(40, signal.SIGTERM), (41, signal.SIGTERM)])
-                pauses.append(seconds)
-                if len(pauses) == 1:
-                    shutil.rmtree(self.proc / "41")
-                    shutil.rmtree(self.proc / "40")
-                else:
-                    shutil.rmtree(self.proc / "31")
-                    shutil.rmtree(self.proc / "30")
+        def start_enforcer() -> None:
+            self.assertEqual(discoveries, [(), (build_hold.ProcessIdentity(55, "11000"),)])
+            holder = build_hold.read_holder(self.holders / member.id)
+            self.assertEqual(holder.keep, (build_hold.ProcessIdentity(55, "11000"),))
+            _ = self.process(56, "bash", argv=("bash", "verify.sh", "check"))
+            for pid, expected in ((55, build_targets.NoBlockingHold), (56, build_hold.Holder)):
+                lineage = build_targets.read_caller_lineage(self.proc, pid, "11000")
+                self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+                    NoOwningSession(), self.holders, lineage), expected)
 
-            def recovered_drain(holder: build_hold.Holder, proc_root: Path) -> int:
-                self.assertCountEqual(holder.keep, (build_hold.ProcessIdentity(30, "11000"),
-                                                   build_hold.ProcessIdentity(40, "11000")))
-                path = self.holders / member.id
-                saved = self.root / "saved-holder"
+        # The fake gate starts at tick 11000; fix the boot clock after it so a fresh host keeps it.
+        with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+             mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000), \
+             mock.patch.object(os, "sysconf", return_value=100), \
+             mock.patch.object(build_hold, "start_hold", side_effect=publish), \
+             mock.patch.object(hold_enforcer, "start", side_effect=start_enforcer), \
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs", return_value=0), \
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--proc-root", str(self.proc)]), 0)
 
-                def end_enforcer_pass(seconds: float) -> None:
-                    self.assertEqual(seconds, 1)
-                    self.assertEqual(signals, [])
-                    _ = path.rename(saved)
+    def test_drain_command_refuses_remote_targets(self) -> None:
+        for target in ("mac", "aws", "all"):
+            with self.subTest(target=target), \
+                 mock.patch.object(build_hold, "start_hold") as start, redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(build_hold.main(["drain", target, "--for", "private drain"]), 2)
+                self.assertEqual(output.getvalue(), f"drain {target} is not supported yet\n")
+                start.assert_not_called()
 
-                stopper = hold_enforcer.StopBuildsAndTests(proc_root, signal_process=signal_process)
-                self.assertEqual(hold_enforcer.run(
-                    proc_root, self.holders, self.root / "enforcer", uid=self.uid, enforcer_pid=999,
-                    stopper=stopper, sleep=end_enforcer_pass, cgroup_root=self.root / "cgroup"), 0)
-                _ = saved.rename(path)
-                self.assertEqual(signals, [])
-                return drain(holder, proc_root, sleep=finish_drain, clock=lambda: self.now)
+    def test_kept_drain_interrupt_retains_the_hold(self) -> None:
+        _ = self.process(10, "Runner.Worker")
+        self.write_holder((build_hold.ProcessIdentity(10, "11000"),))
+        holder = build_hold.read_holder(self.holders / "holder")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(hold_enforcer.wait_for_kept_runs(holder, self.proc,
+                sleep=mock.Mock(side_effect=KeyboardInterrupt), clock=lambda: 0), 130)
+        self.assertEqual(build_hold.read_holder(self.holders / "holder"), holder)
 
-            errors = io.StringIO()
-            with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
-                 mock.patch.object(hold_enforcer, "claimed_processes", side_effect=recover_claims), \
-                 mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=private_stop), \
-                 mock.patch.object(hold_enforcer, "drain", side_effect=recovered_drain), \
-                 mock.patch.object(hold_enforcer, "start"), \
-                 redirect_stdout(io.StringIO()) as output, redirect_stderr(errors):
-                self.assertEqual(build_hold.main([
-                    "hold", "--drain", "--holder", "holder", "--for", "timed test", "--proc-root", str(self.proc)]), 0)
-            self.assertEqual(signals, [(40, signal.SIGTERM), (41, signal.SIGTERM)])
-            self.assertEqual(output.getvalue().splitlines()[-1], "drained")
-            self.assertEqual(errors.getvalue().splitlines(), ["claims unreadable: private claims are damaged"])
-            self.assertGreater(reads, 1)
+    def test_clear_stops_existing_gates_and_running_children_but_keeps_explicit_runs(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        _ = (self.holders / "holder").rename(self.holders / member.id)
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="queued")
+        _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="running")
+        _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
+        _ = self.process(30, "bash", argv=("bash", "verify.sh", "test"), session="kept")
+        signals: list[tuple[int, int]] = []
+        original_stop = hold_enforcer.stop_waiting_run
+
+        def stop(run: hold_enforcer.WaitingRun, holder: build_hold.Holder,
+                 processes: Mapping[int, build_hold.AuditProcess], proc_root: Path, *,
+                 signal_process: Callable[[int, int], None] = os.kill,
+                 ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
+            _ = signal_process
+            return original_stop(run, holder, processes, proc_root,
+                signal_process=lambda pid, signum: signals.append((pid, signum)))
+
+        with mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=stop), \
+             mock.patch.object(hold_enforcer, "start") as start, \
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+                "--keep", "30", "--proc-root", str(self.proc)]), 0)
+        start.assert_called_once_with()
+        self.assertCountEqual(signals, [(10, signal.SIGTERM), (20, signal.SIGTERM), (21, signal.SIGTERM)])
+        self.assertEqual(build_hold.read_holder(self.holders / member.id).keep,
+                         (build_hold.ProcessIdentity(30, "11000"),))
+        self.assertEqual({row["session"] for row in self.rows() if row["action"] == "stopped"}, {"queued", "running"})
+
+    def test_clear_keeps_the_gate_above_an_explicitly_kept_cargo_child(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        _ = (self.holders / "holder").rename(self.holders / member.id)
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "test"))
+        _ = self.process(11, "cargo", parent=10, argv=("cargo", "test"))
+        _ = self.process(12, "rustc", parent=11)
+        with mock.patch.object(hold_enforcer, "start"), \
+             mock.patch.object(build_hold, "start_hold_recorder"), \
+             mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["clear", "--holder", "holder", "--for", "private clear",
+                "--keep", "11", "--proc-root", str(self.proc)]), 0)
+        stop.assert_not_called()
+        decisions = hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
+            self.uid, 999, self.claimed, drain=True)
+        self.assertTrue(all(isinstance(item, hold_enforcer.KeptBuild) for item in decisions))
+
+    def test_drain_and_stale_stops_protect_kept_children_and_their_parent(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "test"))
+        _ = self.process(11, "cargo", parent=10, argv=("cargo", "test"))
+        _ = self.process(12, "rustc", parent=11)
+        table = self.table()
+        holders = build_hold.natedev_holds(self.holders).in_force
+        decisions = hold_enforcer.decide_builds(table, holders, self.uid, 999, self.claimed, drain=True)
+        gate = next(item for item in decisions if item.process.identity.pid == 10)
+        assert isinstance(gate, hold_enforcer.WouldStopBuild)
+        self.write_holder((table[11].identity,))
+        holders = build_hold.natedev_holds(self.holders).in_force
+        signals: list[tuple[int, int]] = []
+        stopper = hold_enforcer.StopBuildsAndTests(self.proc,
+            signal_process=lambda pid, signum: signals.append((pid, signum)), clock=lambda: 5)
+        stopper.stop(gate, table, holders, 999, self.claimed)
+        stopper.terminating = {item.identity: 0 for item in table.values()}
+        stopper.kill_survivors(table, holders, 999, self.claimed)
+        self.assertEqual(stopper.terminating, {})
+        self.assertEqual(signals, [])
+        self.assertEqual(self.rows(), [])
+
+    def test_clear_does_not_stop_gates_when_claims_are_unreadable(self) -> None:
+        _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"))
+        with mock.patch.object(hold_enforcer, "claimed_processes",
+                 return_value=build_hold.ClaimsUnreadable("private claims are damaged")), \
+             mock.patch.object(hold_enforcer, "stop_waiting_run") as stop, redirect_stderr(io.StringIO()) as errors:
+            hold_enforcer.clear_queued_runs(self.proc)
+        stop.assert_not_called()
+        self.assertIn("claims unreadable; clear waits", errors.getvalue())
+
+    def test_a_hold_keeps_a_gate_whose_build_waits_for_or_runs_on_the_mac_or_aws(self) -> None:
+        # The fps hold on 2026-11-15 stopped a Mac-only lint that waited for the Mac
+        # and a lint whose Mac step had passed and whose claim had ended.
+        # A drain does not keep such a gate: a later natedev step must wait for the release.
+        state = step_record.StepState
+        cases = (
+            ("Mac only, waiting for placement", ("mac",), state.WAITING_HOLD, True),
+            ("waiting for the Mac", ("mac", "natedev"), state.WAITING_MAC, True),
+            ("on the Mac, claim ended", ("mac", "natedev"), state.ON_MAC, True),
+            ("waiting for AWS", ("aws", "natedev"), state.WAITING_SSH, True),
+            ("on AWS", ("aws", "natedev"), state.ON_SSH, True),
+            ("waiting for natedev", ("mac", "natedev"), state.WAITING_HOLD, False),
+            ("on natedev", ("mac", "natedev"), state.ON_NATEDEV, False),
+        )
+        holders = build_hold.natedev_holds(self.holders).in_force
+        for name, targets, step_state, kept in cases:
+            with self.subTest(name):
+                _ = self.process(10, "bash", session="gate",
+                                 argv=("bash", "verify.sh", "lint", "hana", "--mac", "lint on the Mac"))
+                step_record.write(step_record.StepRecord(
+                    "gate-call", 10, step_record.process_start(10), self.root, "lint",
+                    step_record.NamedPackage("hana"), step_record.AnyTarget(targets, ("mac",)), step_state,
+                    "2026-11-15T17:45:00+00:00"))
+                table = self.table()
+                with mock.patch.object(target_config, "read_targets", return_value=()):
+                    claims = self.claim_reader(self.proc)
+                assert isinstance(claims, build_hold.LiveClaims)
+                self.assertEqual(table[10].identity in claims.identities, kept)
+                self.assertEqual(table[10].identity in claims.routed, kept)
+                signals: list[tuple[int, int]] = []
+                with redirect_stdout(io.StringIO()):
+                    hold_enforcer.stop_queued_runs(table, holders, self.uid, 999, claims.identities, self.proc,
+                                                   signal_process=lambda pid, signum: signals.append((pid, signum)))
+                self.assertEqual(signals, [] if kept else [(10, signal.SIGTERM)])
+                runs = hold_enforcer.classify_drain_runs(table, frozenset(), claims)
+                assert not isinstance(runs, build_hold.ClaimsUnreadable)
+                run, = runs
+                self.assertIsInstance(run, hold_enforcer.WaitingRun)
+                with mock.patch.object(build_hold, "read_audit_processes", return_value=table), \
+                     mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
+                     mock.patch.object(target_config, "read_targets", return_value=()):
+                    kept_runs = hold_enforcer.drain_identities(
+                        self.proc, build_hold.HolderIdentity(holders[0].key, holders[0].name))
+                self.assertNotIn(table[10].identity, kept_runs)
+
+    def test_an_unreadable_step_record_makes_the_claims_unreadable(self) -> None:
+        # A damaged record can name a Mac-only gate; a hold must not stop that gate.
+        _ = self.process(10, "bash", session="gate", argv=("bash", "verify.sh", "lint", "hana", "--mac", "lint"))
+        directory = step_record.record_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        _ = (directory / "gate-call.json").write_text("{damaged")
+        with mock.patch.object(target_config, "read_targets", return_value=()):
+            claims = self.claim_reader(self.proc)
+        assert isinstance(claims, build_hold.ClaimsUnreadable)
+        self.assertIn("gate-call.json", claims.reason)
+
+    def test_drain_keeps_first_scan_entries_and_bounds_second_scan_additions(self) -> None:
+        from scripts.build_targets import build_targets
+        from scripts.build_hold.owning_session import NoOwningSession
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = fixture_member("producer", name="holder")
+        (self.holders / "holder").unlink()
+        _ = self.process(40, "Runner.Worker", start=12_000)
+        _ = self.process(41, "cargo", start=12_000, argv=("cargo", "build"))
+        _ = self.process(42, "rustc", start=12_000, parent=41)
+        _ = self.process(45, "custom-build", start=12_001)
+        original_discover = hold_enforcer.drain_identities
+        calls = 0
+
+        def discover(proc_root: Path, identity: build_hold.HolderIdentity) -> tuple[build_hold.ProcessIdentity, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                _ = self.process(50, "Runner.Worker", start=11_999)
+                _ = self.process(55, "Runner.Worker", start=12_000)
+                _ = self.process(60, "Runner.Worker", start=12_001)
+                _ = self.process(70, "bash", start=12_001, argv=("bash", "verify.sh", "test"))
+                _ = self.process(80, "cargo", start=12_001, argv=("cargo", "build"))
+            return original_discover(proc_root, identity)
+
+        def wait(holder: build_hold.Holder, proc_root: Path) -> int:
+            self.assertCountEqual(holder.keep, (build_hold.ProcessIdentity(40, "12000"),
+                build_hold.ProcessIdentity(41, "12000"), build_hold.ProcessIdentity(45, "12001"),
+                build_hold.ProcessIdentity(50, "11999")))
+            for pid, start in ((40, "12000"), (41, "12000"), (42, "12000"), (45, "12001")):
+                lineage = build_targets.read_caller_lineage(proc_root, pid, start)
+                self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+                    NoOwningSession(), self.holders, lineage), build_targets.NoBlockingHold)
+            for pid, start in ((55, "12000"), (60, "12001"), (70, "12001"), (80, "12001")):
+                lineage = build_targets.read_caller_lineage(proc_root, pid, start)
+                self.assertIsInstance(build_targets.hold_waited_on(build_hold.natedev_holds(self.holders),
+                    NoOwningSession(), self.holders, lineage), build_hold.Holder)
+            return 0
+
+        with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(time, "clock_gettime_ns", return_value=120_000_000_000) as clock, \
+             mock.patch.object(os, "sysconf", return_value=100), \
+             mock.patch.object(hold_enforcer, "start"), \
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs", side_effect=wait), \
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()):
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--keep", "45", "--proc-root", str(self.proc)]), 0)
+        clock.assert_called_once_with(time.CLOCK_BOOTTIME)
+
+    def test_release_during_second_drain_scan_does_not_restore_the_hold(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        member = fixture_member("producer", name="holder")
+        (self.holders / "holder").unlink()
+        original_discover = hold_enforcer.drain_identities
+        calls = 0
+
+        def discover(proc_root: Path, identity: build_hold.HolderIdentity) -> tuple[build_hold.ProcessIdentity, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with build_hold.release_lock():
+                    (self.holders / member.id).unlink()
+            return original_discover(proc_root, identity)
+
+        with mock.patch.object(hold_enforcer, "drain_identities", side_effect=discover), \
+             mock.patch.object(hold_enforcer, "start") as start, \
+             mock.patch.object(hold_enforcer, "wait_for_kept_runs") as wait, \
+             mock.patch.object(build_hold, "start_hold_recorder"), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_hold.main(["drain", "--holder", "holder", "--for", "private drain",
+                "--proc-root", str(self.proc)]), 0)
+        self.assertFalse((self.holders / member.id).exists())
+        self.assertIn("the hold was released", output.getvalue())
+        start.assert_not_called()
+        wait.assert_not_called()
+
+    def test_parser_rejects_removed_hold_command_and_drain_option(self) -> None:
+        for arguments in (["hold", "--for", "test"], ["clear", "--for", "test", "--drain"]):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as exit_code:
+                    _ = build_hold.main(arguments)
+                self.assertEqual(exit_code.exception.code, 2)
+                self.assertIn("usage:", errors.getvalue())
 
     def test_drain_classifies_gate_entry_points_and_work_evidence(self) -> None:
         entries = (("bash", "verify.sh", "check"), ("python3", "merge_gate.py", "--tests-only"),
@@ -276,7 +510,8 @@ class HoldEnforcerTests(unittest.TestCase):
                                        return_value=build_hold.ClaimsUnreadable("private claims are damaged")), \
                      mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
                      redirect_stderr(errors):
-                    self.assertEqual(hold_enforcer.working_drain_identities(self.proc), (identity,))
+                    self.assertEqual(hold_enforcer.working_gates(table, hold_enforcer.claimed_processes(self.proc)),
+                                     (identity,))
                 self.assertEqual(errors.getvalue().splitlines(), ["claims unreadable: private claims are damaged"])
                 for admitted, claimed, expected in (
                     (frozenset[build_hold.ProcessIdentity](), frozenset[build_hold.ProcessIdentity](),
@@ -308,9 +543,11 @@ class HoldEnforcerTests(unittest.TestCase):
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
-        for outcome in ("record failure", "identity change", "stopped"):
+        for outcome in ("record failure", "identity change", "no command group", "stopped"):
             with self.subTest(outcome=outcome):
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                # The command leads its own group; a record without one has not started its command.
+                command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
                 _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
                 table = self.table()
                 classified = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
@@ -357,10 +594,10 @@ class HoldEnforcerTests(unittest.TestCase):
                             signal_process=lambda pid, signum: self.fail(f"unexpected signal {pid} {signum}"),
                             supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
                         )
-                        expected = hold_enforcer.RunIdentityChanged if outcome == "identity change" else hold_enforcer.StoppedRun
+                        expected = hold_enforcer.StoppedRun if outcome == "stopped" else hold_enforcer.RunIdentityChanged
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
-                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -386,79 +623,6 @@ class HoldEnforcerTests(unittest.TestCase):
         self.assertEqual(signals, [])
         self.assertEqual(self.rows(), [])
 
-    def test_drain_interrupt_keeps_the_hold(self) -> None:
-        _ = self.process(20, "bash", argv=("bash", "verify.sh", "test"), session="working-owner")
-        _ = self.process(21, "cargo", parent=20, argv=("cargo", "test"))
-        holder, = build_hold.natedev_holds(self.holders).in_force
-
-        def interrupt(seconds: float) -> None:
-            self.assertGreater(seconds, 0)
-            raise KeyboardInterrupt
-
-        with mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
-             mock.patch.object(hold_enforcer, "claimed_processes", return_value=build_hold.LiveClaims(frozenset())), \
-             redirect_stdout(io.StringIO()) as output:
-            status = hold_enforcer.drain(holder, self.proc, sleep=interrupt, clock=lambda: self.now)
-        self.assertEqual(status, 130)
-        self.assertTrue(build_hold.natedev_holds(self.holders).in_force)
-        self.assertNotIn("drained", output.getvalue().splitlines())
-
-        stop_waiting = hold_enforcer.stop_waiting_run
-        for reading in ("unreadable", "claim after table"):
-            with self.subTest(claim_read=reading):
-                _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="waiting-owner")
-                reads = 0
-                pauses = 0
-                signals: list[int] = []
-                events: list[str] = []
-                read_table = build_hold.read_audit_processes
-
-                def table_before_claims(proc_root: Path) -> dict[int, build_hold.AuditProcess]:
-                    table = read_table(proc_root)
-                    events.append("table")
-                    return table
-
-                def read_after_table(proc_root: Path) -> build_hold.LiveClaims | build_hold.ClaimsUnreadable:
-                    nonlocal reads
-                    self.assertEqual(proc_root, self.proc)
-                    events.append("claims")
-                    self.assertEqual(events[-2:], ["table", "claims"])
-                    reads += 1
-                    if reading == "unreadable" and reads <= 2:
-                        return build_hold.ClaimsUnreadable("private claims are damaged")
-                    identities = frozenset({build_hold.ProcessIdentity(10, "11000")}) if reading == "claim after table" else frozenset[build_hold.ProcessIdentity]()
-                    return build_hold.LiveClaims(identities)
-
-                def private_stop(
-                    waiting: hold_enforcer.WaitingRun, holder: build_hold.Holder,
-                    processes: Mapping[int, build_hold.AuditProcess], proc_root: Path,
-                ) -> hold_enforcer.StoppedRun | hold_enforcer.RunIdentityChanged:
-                    def send(pid: int, signum: int) -> None:
-                        self.assertEqual(signum, signal.SIGTERM)
-                        signals.append(pid)
-
-                    return stop_waiting(
-                        waiting, holder, processes, proc_root, signal_process=send)
-
-                def finish(seconds: float) -> None:
-                    nonlocal pauses
-                    self.assertEqual(seconds, 1)
-                    pauses += 1
-                    self.assertEqual(signals, [10] if reading == "unreadable" and pauses == 3 else [])
-                    if pauses == (3 if reading == "unreadable" else 1):
-                        raise KeyboardInterrupt
-
-                errors = io.StringIO()
-                with mock.patch.object(build_hold, "read_audit_processes", side_effect=table_before_claims), \
-                     mock.patch.object(hold_enforcer, "claimed_processes", side_effect=read_after_table), \
-                     mock.patch.object(hold_enforcer, "admitted_processes", return_value=frozenset()), \
-                     mock.patch.object(hold_enforcer, "stop_waiting_run", side_effect=private_stop), \
-                     redirect_stdout(io.StringIO()), redirect_stderr(errors):
-                    self.assertEqual(hold_enforcer.drain(holder, self.proc, sleep=finish, clock=lambda: self.now), 130)
-                self.assertEqual(errors.getvalue().splitlines(),
-                                 ["claims unreadable: private claims are damaged"] if reading == "unreadable" else [])
-                shutil.rmtree(self.proc / "10")
-
     def test_drain_checks_detached_supervisor_before_group_stop_and_records_reason(self) -> None:
         record = self.root / "detached-run.json"
         _ = self.process(100, "python3", start=10_000,
@@ -478,7 +642,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running"}))
+                _ = record.write_text(json.dumps({"pid": 100, "status": "running",
+                                                  "command_group": 10, "command_started": "11000"}))
                 signals: list[tuple[int, int]] = []
                 inspected: list[int] = []
 
@@ -504,7 +669,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 self.assertIn(100, inspected)
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
-                    self.assertEqual(signals, [(100, signal.SIGTERM)])
+                    self.assertEqual(signals, [(10, signal.SIGTERM)])
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])
@@ -1068,6 +1233,65 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertIn("enforcement waits", errors.getvalue())
                     self.assertIn("claims readable; enforcement resumes", errors.getvalue())
                     self.assertIn(str(paths.run) if failure == "claim file" else "private target config", errors.getvalue())
+
+    def test_clear_cutoff_stays_fixed_when_claims_recover_after_a_clock_change(self) -> None:
+        _ = self.process(10, "bash", start=9_000, argv=("bash", "verify.sh", "check"))
+        _ = self.process(20, "bash", start=11_000, argv=("bash", "verify.sh", "check"))
+        _ = self.process(30, "bash", start=9_000, argv=("bash", "verify.sh", "check"))
+        _ = self.process(31, "cargo", parent=30, start=9_001, argv=("cargo", "test"))
+        self.write_holder((build_hold.ProcessIdentity(31, "9001"),))
+        signals: list[tuple[int, int]] = []
+        passes = 0
+
+        def recover(_seconds: float) -> None:
+            nonlocal passes
+            passes += 1
+            self.assertEqual(signals, [] if passes == 1 else [(10, signal.SIGTERM)])
+            if passes == 1:
+                wall_clock.return_value = 0
+                boot_clock.return_value = 121_000_000_000
+                _ = self.process(40, "bash", start=12_001, argv=("bash", "verify.sh", "check"))
+            if passes == 3:
+                (self.holders / "holder").unlink()
+
+        stopper = hold_enforcer.StopBuildsAndTests(self.proc,
+            signal_process=lambda pid, signum: signals.append((pid, signum)))
+        with mock.patch.object(hold_enforcer, "claimed_processes", side_effect=[
+                build_hold.ClaimsUnreadable("private claims are damaged"),
+                build_hold.LiveClaims(frozenset()), build_hold.LiveClaims(frozenset())]), \
+             mock.patch.object(time, "clock_gettime_ns", return_value=100_000_000_000) as boot_clock, \
+             mock.patch.object(time, "time_ns", return_value=120_000_000_000) as wall_clock, \
+             mock.patch.object(os, "sysconf", return_value=100), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            holder = build_hold.read_holder(self.holders / "holder")
+            hold_enforcer.record_clear_cutoff(build_hold.HolderIdentity(holder.key, holder.name), holder.since)
+            boot_clock.return_value = 120_000_000_000
+            self.assertEqual(hold_enforcer.run(self.proc, self.holders, self.root / "enforcer",
+                uid=self.uid, enforcer_pid=999, stopper=stopper, sleep=recover, cgroup_root=self.root / "cgroup"), 0)
+        self.assertEqual(passes, 3)
+        boot_clock.assert_called_once_with(time.CLOCK_BOOTTIME)
+        wall_clock.assert_not_called()
+        self.assertIn("claims readable; enforcement resumes", errors.getvalue())
+        self.assertEqual([row["pid"] for row in self.rows()], [10])
+
+    def test_clear_cutoff_requires_the_same_hold_and_boot(self) -> None:
+        holder = build_hold.read_holder(self.holders / "holder")
+        self.assertEqual(hold_enforcer.read_clear_cutoff(holder), 0)
+        with mock.patch.object(time, "clock_gettime_ns", return_value=100_000_000_000), \
+             mock.patch.object(os, "sysconf", return_value=100), \
+             mock.patch.object(hold_enforcer, "boot_identity", return_value="boot-one"):
+            hold_enforcer.record_clear_cutoff(build_hold.HolderIdentity(holder.key, holder.name), holder.since)
+            self.assertEqual(hold_enforcer.read_clear_cutoff(holder), 10_000)
+            other = replace(holder, since=datetime.fromtimestamp(101, timezone.utc))
+            self.assertEqual(hold_enforcer.read_clear_cutoff(other), 0)
+        with mock.patch.object(hold_enforcer, "boot_identity", return_value="boot-two"):
+            self.assertEqual(hold_enforcer.read_clear_cutoff(holder), 0)
+        path = hold_enforcer.clear_cutoff_path(holder.key, holder.since)
+        for contents in ("{broken", '[]', '{"boot_id":"boot-one","before":true}'):
+            with self.subTest(contents=contents), \
+                 mock.patch.object(hold_enforcer, "boot_identity", return_value="boot-one"):
+                _ = path.write_text(contents)
+                self.assertEqual(hold_enforcer.read_clear_cutoff(holder), 0)
 
     def test_rehold_keep_added_after_table_read_is_checked_before_any_signal(self) -> None:
         _ = self.process(10, "cargo", argv=("cargo", "check"))

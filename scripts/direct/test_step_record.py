@@ -271,7 +271,7 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
             root = Path(folder)
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
                 record = steps.StepRecord("old", 42, "123", root, "build", steps.WorkspacePackages(),
-                                          steps.NatedevOnly("makes natedev artifacts"), steps.StepState.ON_NATEDEV, "now")
+                                          steps.NatedevOnly("creates a Linux install"), steps.StepState.ON_NATEDEV, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("old"), steps.StaleRecord("old"))
                 process = root / "proc/42"
@@ -288,6 +288,24 @@ with patch("time.time_ns", return_value=1_700_000_000_123_456_789), \
                     self.assertIsInstance(steps.read("broken"), steps.UnreadableRecord)
                     self.assertEqual(steps.live_records(), [])
                 self.assertIsInstance(steps.read("../outside"), steps.UnreadableRecord)
+
+    def test_damaged_record_of_an_ended_writer_is_stale(self) -> None:
+        # A damaged record left by a killed gate made hold claims unreadable for good.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
+                (root / "steps").mkdir()
+                call_id = "v20261115T174500-42-1234"
+                for content in ("{", '{"v":1,"call_id":"%s","pid":42,"proc_start":"123"}' % call_id):
+                    with self.subTest(content=content):
+                        _ = steps.record_path(call_id).write_text(content)
+                        self.assertEqual(steps.read(call_id), steps.StaleRecord(call_id))
+                        process = root / "proc/42"
+                        process.mkdir(parents=True)
+                        _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
+                        self.assertIsInstance(steps.read(call_id), steps.UnreadableRecord)
+                        (process / "stat").unlink()
+                        process.rmdir()
 
     def test_atomic_update_leaves_only_complete_record(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

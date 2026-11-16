@@ -20,12 +20,10 @@ import sys
 import unittest
 from typing import Literal, cast
 from unittest import mock
-from zoneinfo import ZoneInfo
 
-from scripts.lib.build_steps import read_step_names
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
-from scripts.build_queue import admission_client as client, admission_protocol as wire, queue_evidence
+from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
@@ -33,6 +31,32 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_placement_status_round_trips_without_launch_permission(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            status_request = status_wire.PlacementStatusRequest(assignment.episode, assignment.attempt)
+            self.assertEqual(wire.parse_request(wire.encode_request(status_request)), status_request)
+            statuses = (status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.ClosedAssignment("cancelled"), claim),
+                status_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), placement.NoProviderClaim()),
+                status_wire.UnknownPlacementStatus("unseen-episode", "unseen-attempt"))
+            for status in statuses:
+                with self.subTest(status=status):
+                    reply = status_wire.PlacementStatusReply(status)
+                    encoded = wire.encode_reply(reply)
+                    self.assertEqual(wire.parse_reply(encoded, status_request), reply)
+                    self.assertNotIn("permission", encoded)
+                    with self.assertRaisesRegex(ValueError, "placement requires version 3"):
+                        _ = wire.encode_reply(reply, version=2)
+
     def test_older_placement_messages_keep_absence_and_authority_as_named_states(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
@@ -334,10 +358,9 @@ class ProtocolTests(unittest.TestCase):
                 parsed = wire.parse_reply(wire.encode_reply(reply))
                 self.assertEqual(parsed, reply)
                 assert isinstance(parsed, wire.ViewReply)
-                shown = queue_evidence.running_text(parsed.reading.explanation.running[0],
-                    parsed.reading.explanation, {}, ZoneInfo("UTC"), names=read_step_names())
-                self.assertIn("0.1 GiB RAM; 2.0 GiB swapped", shown)
-                self.assertIn("running job, 2 min" if isinstance(state, RunningServiceJob) else "idle", shown)
+                current = parsed.reading.view.running[0].measured
+                self.assertEqual(current, memory)
+
 
     def test_main_display_fields_and_diagnostics_remain_readable(self) -> None:
         from scripts.build_queue.scope_activity import LiveBuildRun
@@ -403,15 +426,25 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(cast(dict[str, object], run_encoded["data"])["run"], codec.snapshot_value(run))
 
     def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
-        conditions: tuple[records.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
-            "full", "swap", records.PressureConditionNotRecorded())
-        for condition in conditions:
-            with self.subTest(condition=condition):
+        conditions: tuple[tuple[str, records.PressureConditionNotRecorded | Literal["full", "some"]], ...] = (
+            ("full", "full"), ("some", "some"), ("swap", "some"), ("", records.PressureConditionNotRecorded()))
+        for saved, condition in conditions:
+            with self.subTest(condition=condition, saved=saved):
                 pressure = records.MemoryPressure(8, 15, 80, condition=condition)
                 reply = wait_reply(pressure)
                 reply = replace(reply, snapshot=replace(reply.snapshot,
-                    decision=replace(reply.snapshot.decision, pressure=pressure)))
-                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+                    decision=replace(reply.snapshot.decision, pressure=pressure), head_reason=pressure))
+                encoded = wire.encode_reply(reply)
+                if saved == "swap":
+                    encoded = encoded.replace('"condition":"some"', '"condition":"swap"')
+                restored = wire.parse_reply(encoded)
+                self.assertEqual(restored, reply)
+                if saved == "swap":
+                    assert isinstance(restored, wire.Wait)
+                    self.assertEqual(client.wait_reasons(restored.snapshot), ("some memory pressure",))
+                    restored_pressure = restored.snapshot.decision.pressure
+                    assert isinstance(restored_pressure, records.MemoryPressure)
+                    self.assertEqual(records.pressure_text(restored_pressure), "memory pressure: some avg10 15.0")
 
 
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
@@ -426,7 +459,6 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
-                wire.AdmitHeadRequest("head", "urgent", "actor"),
                 wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
                 wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
             for width in (records.RequestedTestWidth(3), records.UnspecifiedTestWidth(), records.NoTestWidth()):
@@ -552,15 +584,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
             self.assertEqual(parsed.explanation, local)
             self.assertEqual(parsed.explanation.decided_from, inputs)
             self.assertIsInstance(gate.smallest_head_release(parsed.explanation), records.EstimateExpired)
-            zone = ZoneInfo("UTC")
-            names = read_step_names()
-            shown = queue_evidence.release_text(gate.smallest_head_release(parsed.explanation), parsed.explanation, {}, zone, names=names)
-            self.assertEqual(shown,
-                             queue_evidence.release_text(gate.smallest_head_release(local), local, {}, zone, names=names))
-            self.assertTrue(shown.startswith("the estimate expired at"))
             assert isinstance(local.head, records.HeadExplanation)
             assert isinstance(local.head.cause, records.EstimateExpired)
             assert isinstance(parsed.explanation.head, records.HeadExplanation)
             assert isinstance(parsed.explanation.head.cause, records.EstimateExpired)
-            self.assertEqual(queue_evidence.estimate_refresh_text(parsed.explanation.head.cause, zone),
-                             queue_evidence.estimate_refresh_text(local.head.cause, zone))
+            self.assertEqual(parsed.explanation.head.cause, local.head.cause)

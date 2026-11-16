@@ -289,7 +289,6 @@ class LaunchBarrier(Protocol):
 
 def paired_module(folder: Path, directory: Path, settings_path: Path, connection: LaunchBarrier) -> None:
     """Keep one queue slot while the shared worker owns its box."""
-    request = cloud_gate.read(folder / 'request.json')
     policy = conf.read(settings_path)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path, folder / 'reservation.cgroup', clock=time.time)
@@ -301,6 +300,8 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                     return
                 if (folder / 'outcome.json').exists():
                     return
+                # The coordinator sets the box expiry at launch, so read the request now.
+                request = cloud_gate.read(folder / 'request.json')
                 outcome = worker.execute(folder, request, cloud_gate.read(folder / 'deployment.json'))
                 cloud_gate.save(folder / 'outcome.json', outcome)
                 slot.status = int(outcome.get('status') != 'complete')
@@ -346,6 +347,11 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
                     raise GateRefused('The module has no cloud slot')
             pending = [request for request in requests
                        if not (folder / ledger.text(request, 'attempt') / 'outcome.json').exists()]
+            # The box lifetime starts at launch, so a queue wait does not shorten the run budget.
+            expires = int(worker.clock()) + cloud_gate.settings().whole('lifetime_minutes') * 60
+            for request in pending:
+                request['expires'] = expires
+                cloud_gate.save(folder / ledger.text(request, 'attempt') / 'request.json', request)
             reserve_trial(worker, pending, record_query)
             for _process, connection in children:
                 connection.send('launch')
@@ -371,8 +377,8 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         attempt = ledger.text(request, 'attempt')
         path = folder / attempt
         runs: list[dict[str, object]] = []
-        if (path / 'remote-result.json').exists():
-            row = cloud_gate.read(path / 'remote-result.json')
+        if (path / cloud_gate.RESULT_FILE).exists():
+            row = cloud_gate.read(path / cloud_gate.RESULT_FILE)
             launch = cloud_gate.read(path / 'launch.json')
             try:
                 validate_paired_result(row, request, ledger.text(launch, 'instance'))
@@ -432,7 +438,8 @@ def paired_service(command: Sequence[str], unit: str) -> int:
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
-    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes')
+    parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes',
+                                     epilog='gate_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)

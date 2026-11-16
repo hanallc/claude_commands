@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
+from scripts.lib import git_files
 from scripts.production import staff
 from scripts.statusline import adhoc_items, rebuild_row
 
@@ -25,6 +26,8 @@ def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
         return f"{row.name} showrunner", "showrunner"
     if row.kind == "worker":
         return "worker", "worker"
+    if row.kind == "producer":
+        return f"{row.name} producer", "producer"
     parent = record.parent_of(row)
     label = f"{row.name} unit"
     if parent is not None:
@@ -51,28 +54,12 @@ def current_branch(payload: dict[str, object], pwd: str) -> str:
     if folder is None or folder is False:
         folder = payload.get("cwd")
     try:
-        directory = Path(str(folder or pwd)).resolve()
-        for parent in (directory, *directory.parents):
-            git = parent / ".git"
-            if git.is_dir():
-                gitdir = git
-            elif git.exists():
-                entry = git.read_text(encoding="utf-8").strip()
-                if not entry.startswith("gitdir:"):
-                    return ""
-                target = entry.removeprefix("gitdir:").strip()
-                if not target:
-                    return ""
-                gitdir = parent / target
-            else:
-                continue
-            head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
-            if head.startswith("ref: refs/heads/"):
-                return head.removeprefix("ref: refs/heads/")
-            return f"detached {head[:7]}" if head else ""
-    except (OSError, UnicodeError, ValueError):
+        head = git_files.head(git_files.locate(Path(str(folder or pwd))))
+    except (OSError, ValueError):
         return ""
-    return ""
+    if isinstance(head, git_files.OnBranch):
+        return head.name
+    return f"detached {head.commit[:7]}" if head.commit else ""
 
 
 def main() -> None:

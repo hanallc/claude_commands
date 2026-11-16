@@ -7,6 +7,7 @@ import argparse
 import json
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -37,7 +38,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.promotions = str(self.promote)
         self.production_doc(change_review=review)
         return review, self.dated_checkpoint(f"checkpoint({unit}): change\n\n" + "\n".join(
-            f"Change-Review: {change}" for change in changes))
+            f"Change-Review: {change} | image 012345abcdef" for change in changes))
 
     def test_checkpoint_reuses_its_staff_snapshot_after_the_file_changes(self) -> None:
         review, checkpoint = self.review_checkpoint("One change | Open it | Result")
@@ -62,6 +63,9 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         # Merge commits must be identical in the uninterrupted and resumed cases.
         self.env["GIT_COMMITTER_DATE"] = "2026-11-06T12:00:00-05:00"
         self.env["GIT_AUTHOR_DATE"] = self.env["GIT_COMMITTER_DATE"]
+        # A row records the minute it is added; one fixed clock keeps both cases on the same minute.
+        _ = self.enterContext(patch.object(change_review, "now",
+                                           return_value=datetime.fromisoformat(self.env["GIT_COMMITTER_DATE"])))
         return snapshot
 
     def after_input(self, change: Callable[[Path], object]) -> AbstractContextManager[object]:
@@ -173,7 +177,7 @@ class CheckpointRerunTests(MergeCheckpointFixture):
 
     def test_a_production_without_a_review_list_pushes_with_an_unreadable_staff_record(self) -> None:
         checkpoint = self.dated_checkpoint(
-            "checkpoint(alpha): change\n\nChange-Review: A change | Open it | Result")
+            "checkpoint(alpha): change\n\nChange-Review: A change | Open it | Result | image 012345abcdef")
         with self.after_input(Path.unlink):
             result = self.run_checkpoint(checkpoint).process
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

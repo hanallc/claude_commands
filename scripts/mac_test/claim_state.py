@@ -75,14 +75,18 @@ class WaitingOnLocalRun:
 
 
 class WaitingOnCiJob:
-    """A block waiting for CI's Mac job."""
+    """A block waiting for CI's Mac job to start."""
+
+
+class WaitingOnCiMacJob:
+    """A block waiting for CI's running Mac job to finish."""
 
 
 class WaitingOnUnknownCi:
     """A block waiting until CI can be checked."""
 
 
-WaitingOn = WaitingOnLocalRun | WaitingOnCiJob | WaitingOnUnknownCi
+WaitingOn = WaitingOnLocalRun | WaitingOnCiJob | WaitingOnCiMacJob | WaitingOnUnknownCi
 
 
 class FreeMessageNotNeeded:
@@ -137,6 +141,7 @@ MacBlockState = NoMacBlock | PendingMacBlock | ActiveMacBlock
 
 @dataclass(frozen=True)
 class MacBlockEvent:
+    """The event holds a block start or end, its time, and its target."""
     kind: Literal["began", "ended"]
     block: PendingMacBlock | ActiveMacBlock
     at: datetime
@@ -181,9 +186,9 @@ CALLING_SESSION = CallingSession()
 
 
 def submitting_session(session: SubmittingSession | CallingSession) -> SubmittingSession:
-    from scripts.build_hold import build_hold
+    from scripts.build_hold import owning_session
 
-    return build_hold.owning_session() if isinstance(session, CallingSession) else session
+    return owning_session.owning_session() if isinstance(session, CallingSession) else session
 
 
 def session_id(session: SubmittingSession) -> str:

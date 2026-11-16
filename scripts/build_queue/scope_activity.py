@@ -11,6 +11,29 @@ from typing import Protocol
 from scripts.lib.suite_runners import starts_suite_runner
 
 
+SESSION_KEYS = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_NAME")
+SCOPE_KEYS = ("BUILDLOG_RUN", "PYTEST_CURRENT_TEST", *SESSION_KEYS)
+
+
+def environment_values(environ: Path, keys: tuple[str, ...]) -> dict[str, str]:
+    """Read some keys from a process environment file; an unreadable file has none.
+    A search for each key costs less CPU than a parse of the whole environment."""
+    try:
+        raw = b"\0" + environ.read_bytes()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for key in keys:
+        marker = b"\0" + key.encode() + b"="
+        # The last copy of a key wins, as in a dict built from the whole environment.
+        start = raw.rfind(marker)
+        if start >= 0:
+            start += len(marker)
+            end = raw.find(b"\0", start)
+            values[key] = raw[start:end if end >= 0 else len(raw)].decode(errors="replace")
+    return values
+
+
 def runs_suite_runner(command: tuple[str, ...]) -> bool:
     return any(starts_suite_runner(command[index:]) for index in range(len(command)))
 
@@ -24,11 +47,12 @@ class ProcessIdentity(Protocol):
 
 @dataclass(frozen=True)
 class NoLiveBuildRun:
-    pass
+    """The process has no identified live build run."""
 
 
 @dataclass(frozen=True)
 class LiveBuildRun:
+    """The live build run holds its process identifier and birth and start times."""
     pid: int
     start_time: str
     started_at: float
@@ -36,31 +60,34 @@ class LiveBuildRun:
 
 @dataclass(frozen=True)
 class EmptyBuildScope:
-    pass
+    """The build scope has no active processes."""
 
 
 @dataclass(frozen=True)
 class NotServiceSlice:
-    pass
+    """The scope is not a compiler service slice."""
 
 
 @dataclass(frozen=True)
 class IdleService:
-    pass
+    """The compiler service has no active job."""
 
 
 @dataclass(frozen=True)
 class RunningServiceJob:
+    """The compiler service job runs from this start time."""
     started_at: float
 
 
 @dataclass(frozen=True)
 class WaitingServiceJob:
+    """The compiler service job waits from this start time."""
     started_at: float
 
 
 @dataclass(frozen=True)
 class UnmatchedServiceJob:
+    """The service job has no matching owner from this start time."""
     started_at: float
 
 
@@ -69,12 +96,14 @@ ServiceJobState = RunningServiceJob | WaitingServiceJob | UnmatchedServiceJob | 
 
 @dataclass(frozen=True)
 class ScopeProcess:
+    """The scope member holds its process identifier and program name."""
     pid: int
     program: str
 
 
 @dataclass(frozen=True)
 class ScopeProcesses:
+    """The scope activity holds process members, caller identity, folder, and run evidence."""
     count: int
     session_id: str
     session_name: str
@@ -95,6 +124,9 @@ class ScopeActivityReader:
         self.proc: Path = proc
         self.environments: dict[int, dict[str, str]] = {}
         self.commands: dict[int, tuple[str, ...]] = {}
+        # Each scope walks the same ancestors again. Keep each pid's command facts for the whole pass.
+        self.run_commands: dict[int, bool] = {}
+        self.fixtures: dict[int, bool] = {}
         self.runs: dict[int, LiveBuildRun] = {run.pid: run for run in runs}
         self.resolved_runs: dict[int, LiveBuildRun | NoLiveBuildRun] = {}
         self.boot: float = 0.0
@@ -107,11 +139,7 @@ class ScopeActivityReader:
 
     def environment(self, pid: int) -> dict[str, str]:
         if pid not in self.environments:
-            try:
-                raw = (self.proc / str(pid) / "environ").read_bytes().decode(errors="replace")
-                self.environments[pid] = dict(item.split("=", 1) for item in raw.split("\0") if "=" in item)
-            except OSError:
-                self.environments[pid] = {}
+            self.environments[pid] = environment_values(self.proc / str(pid) / "environ", SCOPE_KEYS)
         return self.environments[pid]
 
     def command(self, pid: int) -> tuple[str, ...]:
@@ -122,6 +150,18 @@ class ScopeActivityReader:
             except OSError:
                 self.commands[pid] = ()
         return self.commands[pid]
+
+    def starts_run(self, pid: int) -> bool:
+        if pid not in self.run_commands:
+            command = self.command(pid)
+            self.run_commands[pid] = "verify.sh" in {Path(arg).name for arg in command} or runs_suite_runner(command)
+        return self.run_commands[pid]
+
+    def fixture(self, pid: int) -> bool:
+        if pid not in self.fixtures:
+            self.fixtures[pid] = bool(self.environment(pid).get("PYTEST_CURRENT_TEST")) or any(
+                arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in self.command(pid))
+        return self.fixtures[pid]
 
     def started_at(self, pid: int) -> float:
         identity = self.processes.get(pid)
@@ -178,9 +218,7 @@ class ScopeActivityReader:
                     return LiveBuildRun(int(owner), start, self.started_at(int(owner)))
             # An inherited run identity cannot name a different process lifetime.
             return NoLiveBuildRun()
-        command = self.command(pid)
-        names = {Path(arg).name for arg in command}
-        if "verify.sh" in names or runs_suite_runner(command):
+        if self.starts_run(pid):
             return LiveBuildRun(pid, self.processes[pid].start, self.started_at(pid))
         return inherited
 
@@ -208,9 +246,7 @@ class ScopeActivityReader:
                 env = self.environment(ancestor)
                 session = session or env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
                 name = name or env.get("CLAUDE_SESSION_NAME", "")
-                command = self.command(ancestor)
-                fixture = fixture or bool(env.get("PYTEST_CURRENT_TEST")) or any(
-                    arg in ("unittest", "pytest") or Path(arg).name.startswith("test_") for arg in command)
+                fixture = fixture or self.fixture(ancestor)
                 ancestor = self.processes[ancestor].parent
             inherited = ancestor_runs.get(ancestor, NoLiveBuildRun())
             for ancestor in reversed(chain):

@@ -19,7 +19,7 @@ Merge and tests-only runs omit type checks unless --type-dirs names folders.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
 A green nightly sends a result push unless merge_gate.conf disables it.
-A red nightly records its result and notifies sdlc before an assignment push.
+A red nightly records its result and notifies sdlc. Only its assignment sends the user push.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -67,10 +67,10 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, main_push_lock
+from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
-from scripts.production import affected_modules, change_review  # noqa: E402
+from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -159,6 +159,7 @@ class GateArguments(argparse.Namespace):
     promote_only: bool = False
     full: bool = False
     nightly: bool = False
+    modules: list[str] = field(default_factory=list)
 
 
 class SuiteMode(Enum):
@@ -538,7 +539,7 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
             process = cleanup.enter_context(subprocess.Popen(
                 arguments, cwd=repo, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True))
+                text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -643,7 +644,7 @@ def slower_than_recorded(seconds: float, recorded: float) -> bool:
 
 
 def gate_state_dir() -> Path:
-    return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
+    return land_runs.state_dir()
 
 
 @dataclass(frozen=True)
@@ -756,8 +757,10 @@ class GateRecovery:
                     if descriptor >= 0:
                         os.close(descriptor)
         for folder in self.folders:
+            path = Path(folder)
             try:
-                shutil.rmtree(folder)
+                if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)):
+                    raise GateRefused(f"gate recovery kept held folder {path}")
             except FileNotFoundError:
                 pass
         self.folders.clear()
@@ -900,10 +903,10 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 
 @contextmanager
-def gate_temporary(recovery: GateRecovery, request: build_folders.UniqueBuildFolder) -> Generator[Path]:
+def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
             recovery.folders.append(str(folder))
             recovery.save()
         try:
@@ -1090,7 +1093,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
             process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -1124,6 +1127,7 @@ raise SystemExit(99)
             "STAFF_FILE": str(root / "staff.json"),
             "HERDR_PANE_RECORD_DIR": str(root / "herdr-panes"),
             "BUILDLOG_DIR": str(buildlog),
+            session_folder.ROOT_ENV: str(root / "session"),
             "TEST_TIMES_OUT": str(root / "test-times.json"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
@@ -1440,7 +1444,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     hold = BuildHoldWait() if shared else None
     if hold is not None:
         hold.wait_until_free()
-    initial_hold_seconds = hold.seconds if hold is not None else 0.0
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
@@ -1516,13 +1519,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     largest_module = ""
     starting_load = one_minute_load()
     maximum_load = starting_load
-    began = time.monotonic()
-    started_at = datetime.now(UTC).timestamp()
     python = os.environ.get("MERGE_GATE_PYTHON", str(python_shim(repo)))
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
     time_limit_report = ""
-    deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
@@ -1548,11 +1548,15 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             raise
 
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
-          gate_temporary(recovery, build_folders.UniqueBuildFolder(
-              build_folders.FOLDER_PREFIXES[mode.value], build_folders.ExplicitBuildParent(tmpfs))) as temporary,
+          gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
+        # The wall time and the time limit start here, after the queue admits the gate.
+        began = time.monotonic()
+        started_at = datetime.now(UTC).timestamp()
+        deadline = began + time_limit.seconds if isinstance(time_limit, gate_record.GateTimeLimit) else float("inf")
+        initial_hold_seconds = hold.seconds if hold is not None else 0.0
         environment = {**os.environ, "TMPDIR": str(temporary), "BUILDLOG_CALLER": mode.value}
         _ = environment.pop("PYTHONPATH", None)
         types_python = typecheck_python() if type_dirs else ""
@@ -1702,8 +1706,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     suite, path = request.suite, request.path
                     folder_cleanup = ExitStack()
                     _ = module_folders.callback(folder_cleanup.close)
-                    root = folder_cleanup.enter_context(build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
-                        build_folders.FOLDER_PREFIXES["suite-module"].format(owner=f"{suite}-{path.stem}"), build_folders.ExplicitBuildParent(temporary))))
+                    root = folder_cleanup.enter_context(build_folders.tool_folder(f"{suite}-{path.stem}", temporary))
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
@@ -1814,8 +1817,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     return run
 
 
-def promotion_edit_conflict(repo: Path, target: str) -> str:
-    """Name local edits on paths that the promotion changes."""
+def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
+    """Name local edits on paths that the promotion changes.
+
+    Files that the pathspec `waiting` names hold waiting rows; the move keeps them.
+    """
     environment = dict(os.environ)
     _ = environment.pop("GIT_INDEX_FILE", None)
     environment["GIT_OPTIONAL_LOCKS"] = "0"
@@ -1833,7 +1839,9 @@ def promotion_edit_conflict(repo: Path, target: str) -> str:
             _ = git("read-tree", "HEAD", index=index)
             files = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--", index=index)
         promoted = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", target, "--")
-        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - {b""})
+        kept: set[bytes] = set(git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--",
+                                   waiting).split(b"\0")) if waiting else set()
+        conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - kept - {b""})
         if conflicts:
             return "promotion refused: tracked edits overlap promotion: " + "; ".join(
                 json.dumps(os.fsdecode(path)) for path in conflicts)
@@ -1842,10 +1850,50 @@ def promotion_edit_conflict(repo: Path, target: str) -> str:
     return ""
 
 
+def live_state_refusal(repo: Path, target: str) -> str:
+    """Run the target tree's live state checks before its code is installed."""
+    with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
+        tree = Path(temporary)
+        try:
+            archive = subprocess.run(["git", "archive", "--format=tar", target], cwd=repo, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, check=True).stdout
+            _ = subprocess.run(["tar", "-x", "-C", str(tree)], input=archive, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"promotion refused: live state check could not export {target}: {error}"
+        settings = tree / "config" / "merge_gate.conf"
+        if not settings.exists():
+            return ""
+        # A target tree from before these checks names none.
+        config = conf.read(settings)
+        if "live_state_checks" not in config.values():
+            return ""
+        try:
+            checks = config.words("live_state_checks")
+            seconds = config.whole("live_state_check_seconds")
+        except conf.Unusable as error:
+            return f"promotion refused: live state check settings: {error}"
+        environment = {**os.environ, "PYTHONPATH": str(tree), "PYTHONDONTWRITEBYTECODE": "1"}
+        for module in checks:
+            if not (tree / Path(*module.split("."))).with_suffix(".py").exists():
+                return f"promotion refused: live_state_checks names {module}, absent from {target}"
+            try:
+                result = subprocess.run([sys.executable, "-m", module, "state-check"], cwd=tree, env=environment,
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                        timeout=seconds, check=False)
+            except (OSError, subprocess.SubprocessError) as error:
+                return f"promotion refused: {module} state-check failed to run: {error}"
+            if result.returncode:
+                detail = "; ".join(failure_detail(result, lines=1).splitlines())
+                return (f"promotion refused: {target} cannot read live state: {module}: {detail}; "
+                        "run its conversion before the land")
+    return ""
+
+
 # Send the same function to a Mac without repository Python modules.
 PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pathlib import Path\n"
                            + inspect.getsource(promotion_edit_conflict)
-                           + "reason = promotion_edit_conflict(Path.cwd(), sys.argv[1])\n"
+                           + "reason = promotion_edit_conflict(Path.cwd(), *sys.argv[1:3])\n"
                            + "if reason: print(reason)\nraise SystemExit(bool(reason))\n")
 
 
@@ -1939,19 +1987,31 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             target = record.commit
         if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
-        if conflict := promotion_edit_conflict(main_repo, target):
+        if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
+        if refusal := live_state_refusal(main_repo, target):
+            raise GateRefused(refusal)
         write_push_record(path, RecordedPush(origin, target, target))
-        _ = checked_git(main_repo, "merge", "--ff-only", target)
-        _ = checked_git(main_repo, "push", "origin", "main")
+        try:
+            waiting_rows.move_to(main_repo, target)
+        except (OSError, UnicodeError) as error:
+            raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+        try:
+            landed = land_main.land(main_repo, target)
+        except land_main.LandError as error:
+            raise GateRefused(str(error)) from error
+        print(land_main.hook_report(landed.hook), flush=True)
         promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    remote_check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
-              f"{remote_check} && git merge --ff-only -q origin/main); rc=$?; "
+              "if [ -f scripts/lib/waiting_rows.py ]; "
+              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward origin/main; "
+              f"else {check} && git merge --ff-only -q origin/main; fi); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, args.mac_host, remote],
@@ -2177,6 +2237,14 @@ def nightly_owner(args: GateArguments) -> str:
     return str(unit_lookup.doc_owner(doc, staff.snapshot()).id)
 
 
+def nightly_owner_name(args: GateArguments) -> str:
+    from scripts.production import staff
+
+    owner = nightly_owner(args)
+    row = staff.snapshot().by_id(staff.StaffId(owner))
+    return row.name if row is not None else owner
+
+
 def type_check_summaries(output: str) -> list[str]:
     return [line for line in output.splitlines()
             if re.fullmatch(r"\d+ errors?, \d+ warnings?, \d+ notes?", line)]
@@ -2253,8 +2321,18 @@ class NightlyFixAssigned:
 
 
 @dataclass(frozen=True)
+class NightlyAlertUnsent:
+    """The production owner has no alert about the missing assignment."""
+
+
+@dataclass(frozen=True)
+class NightlyAlertSent:
+    at: str
+
+
+@dataclass(frozen=True)
 class NightlyPushPending:
-    """Assignment or its deadline must release the result push."""
+    """Assignment must release the result push."""
 
 
 @dataclass(frozen=True)
@@ -2274,6 +2352,7 @@ class NightlyRedResult:
     received: NightlyNoticeUnreceived | NightlyNoticeReceived = NightlyNoticeUnreceived()
     assignment: NightlyFixUnassigned | NightlyFixAssigned = NightlyFixUnassigned()
     delivery: NightlyPushPending | NightlyPushAccepted = NightlyPushPending()
+    alerted: NightlyAlertUnsent | NightlyAlertSent = NightlyAlertUnsent()
 
 
 @contextmanager
@@ -2318,38 +2397,32 @@ def read_nightly_red(path: Path) -> NightlyRedResult:
     if identity != path.stem or not re.fullmatch(r"[a-zA-Z0-9_-]+", identity):
         raise GateRefused(f"{path}: nightly result identity differs")
     received, assignment, delivery = (fields(saved.get(key)) for key in ("received", "assignment", "delivery"))
+    # A result saved before the owner alert existed has no alert table.
+    alerted = fields(saved.get("alerted", {}))
     return NightlyRedResult(identity, text(saved, "branch"), text(saved, "tree"), at(saved, "finished"),
         tuple(cast(list[str], failures)), text(saved, "types"), text(saved, "tests"),
         NightlyNoticeReceived(at(received, "at")) if received else NightlyNoticeUnreceived(),
         NightlyFixAssigned(text(assignment, "unit"), at(assignment, "at")) if assignment else NightlyFixUnassigned(),
-        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending())
+        NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending(),
+        NightlyAlertSent(at(alerted, "at")) if alerted else NightlyAlertUnsent())
 
 
 def nightly_time(at: str) -> str:
     return datetime.fromisoformat(at).astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def send_nightly_red(directory: Path, result: NightlyRedResult) -> bool:
+def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: NightlyFixAssigned) -> bool:
     from scripts.message import send_budget
     from scripts.notify import push_texts, review
     from scripts.production import staff
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
         return False
-    values = {"branch": result.branch, "time": nightly_time(result.finished), "types": result.types,
-              "tests": result.tests, "outcome": "failed"}
-    if isinstance(result.assignment, NightlyFixAssigned):
-        row = staff.snapshot().by_id(staff.StaffId(result.assignment.unit))
-        values.update(unit=row.name if row is not None else result.assignment.unit,
-                      assigned=nightly_time(result.assignment.at),
-                      received=nightly_time(result.received.at) if isinstance(result.received, NightlyNoticeReceived)
-                      else nightly_time(result.assignment.at))
-        text_id = "nightly.assigned"
-    else:
-        values["notice"] = ("sdlc received it at " + nightly_time(result.received.at)
-                            if isinstance(result.received, NightlyNoticeReceived) else "sdlc has not confirmed receipt")
-        text_id = "nightly.unassigned"
-    rendered = push_texts.render(text_id, **values)
+    row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
+    rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
+        types=result.types, tests=result.tests, outcome="failed",
+        unit=row.name if row is not None else assignment.unit, assigned=nightly_time(assignment.at),
+        received=nightly_time(result.received.at if isinstance(result.received, NightlyNoticeReceived) else assignment.at))
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
@@ -2367,9 +2440,8 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
 
     record = staff.snapshot()
     row = record.by_member_reference(unit) or record.by_path(unit if "/" in unit else f"sdlc/{unit}")
-    parent = record.parent_of(row) if row is not None else None
-    if row is None or row.kind != "unit" or parent is None or parent.name != "sdlc":
-        raise GateRefused(f"{unit}: choose an sdlc unit director")
+    if row is None or row.kind != "unit" or record.parent_of(row) is None:
+        raise GateRefused(f"{unit}: choose a unit director by staff ID or <production>/<unit> path")
     with nightly_red_lock() as directory:
         results = [read_nightly_red(path) for path in sorted(directory.glob("*.json"))]
         if identity:
@@ -2380,18 +2452,41 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
         if len(results) != 1:
             raise GateRefused("choose one saved red result with --result ID")
         result = results[0]
-        changed = isinstance(result.assignment, NightlyFixUnassigned)
-        if isinstance(result.assignment, NightlyFixAssigned) and result.assignment.unit != str(row.id):
+        assignment = result.assignment
+        if isinstance(assignment, NightlyFixAssigned) and assignment.unit != str(row.id):
             raise GateRefused(f"{result.id}: another unit already owns this fix")
-        if changed:
-            at = datetime.now(UTC).isoformat()
-            result = replace(result, assignment=NightlyFixAssigned(str(row.id), at),
+        changed = isinstance(assignment, NightlyFixUnassigned)
+        if isinstance(assignment, NightlyFixUnassigned):
+            assignment = NightlyFixAssigned(str(row.id), datetime.now(UTC).isoformat())
+            result = replace(result, assignment=assignment,
                              received=result.received if isinstance(result.received, NightlyNoticeReceived)
-                             else NightlyNoticeReceived(at))
+                             else NightlyNoticeReceived(assignment.at))
             save_nightly_red(directory, result)
-        changed = send_nightly_red(directory, result) or changed
+        changed = send_nightly_red(directory, result, assignment) or changed
         print("done" if changed else "unchanged")
     return 0
+
+
+def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
+    """Tell the production owner once in each assignment window that a red result has no assigned fix."""
+    from scripts.production import showrunners
+
+    window = timedelta(minutes=conf.read("merge_gate").whole("nightly_assign_minutes"))
+    now = datetime.now(UTC)
+    since = datetime.fromisoformat(result.alerted.at if isinstance(result.alerted, NightlyAlertSent) else result.finished)
+    if now - since < window:
+        return False
+    owner = nightly_owner_name(GateArguments(merge_branch=result.branch))
+    minutes = int((now - datetime.fromisoformat(result.finished)).total_seconds() // 60)
+    outcome = showrunners.tell(owner, f"merge-gate-nightly-unassigned:{result.id}",
+        f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
+        + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
+        + f"The user gets the result push only after assignment: merge_gate.py nightly-assigned --result {result.id} --unit UNIT.")
+    print(f"Nightly assignment alert: {outcome}", flush=True)
+    if outcome != f"told {owner}":
+        return False
+    save_nightly_red(directory, replace(result, alerted=NightlyAlertSent(now.isoformat())))
+    return True
 
 
 def check_nightly_assignments() -> int:
@@ -2404,12 +2499,8 @@ def check_nightly_assignments() -> int:
         for path in sorted(directory.glob("*.json")):
             try:
                 result = read_nightly_red(path)
-                if isinstance(result.delivery, NightlyPushAccepted):
-                    continue
-                age = (datetime.now(UTC) - datetime.fromisoformat(result.finished)).total_seconds()
-                if isinstance(result.assignment, NightlyFixUnassigned) and age < 60 * conf.read("merge_gate").whole("nightly_assign_minutes"):
-                    continue
-                changed = send_nightly_red(directory, result) or changed
+                if isinstance(result.assignment, NightlyFixUnassigned):
+                    changed = alert_nightly_unassigned(directory, result) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
@@ -2419,7 +2510,7 @@ def check_nightly_assignments() -> int:
 
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                      type_failures: Sequence[GateJobResult] = (), result_id: str = "") -> NightlyNoticeReceived | NightlyNoticeUnreceived:
-    from scripts.production import showrunners, staff
+    from scripts.production import showrunners
 
     requires_full = bool(failed) or not type_failures
     try:
@@ -2436,10 +2527,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
                 detail += "\n" + summaries[-1]
         if result_id:
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
-        owner = nightly_owner(args)
-        row = staff.snapshot().by_id(staff.StaffId(owner))
-        if row is not None:
-            owner = row.name
+        owner = nightly_owner_name(args)
         outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
                                    f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
@@ -2529,6 +2617,8 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
+    _ = parser.add_argument("--module", action="append", default=[], dest="modules",
+                            help="run only this module, named as the gate prints it (suite/module), with no gate record")
 
 
 class CloudGateRoute(Protocol):
@@ -2600,19 +2690,65 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
         print(f"Gate time limit notice could not be sent: {error}", flush=True)
 
 
+def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
+    """Run only the named modules, as a merge red's check on its base.
+
+    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
+    """
+    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
+                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+                      time_limit=gate_record.NoGateTimeLimit("named modules"))
+
+
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = run_gate_suites(repo, args.type_dirs,
-                                      module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode)
+                run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
+                       run_gate_suites(repo, args.type_dirs,
+                                       module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
+
+
+def _sweep_nightly_slots() -> None:
+    """Sweep both slot pools without changing the nightly result."""
+    for machine in ("natedev", "Mac"):
+        try:
+            if machine == "natedev":
+                from scripts.lib import build_slots
+
+                build_slots.sweep_slots()
+            else:
+                settings = conf.read_or_repository("build_folders")
+                if not any(value for key, value in settings.values().items()
+                           if key == "roots.slots" or key.startswith("roots.slots.")):
+                    continue
+                scripts = Path(__file__).resolve().parents[1]
+                _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
+                                    sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
+                                    "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
+                                    "--", "/bin/zsh", "-c",
+                                    '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/build_slots.py" sweep'],
+                                   check=True, capture_output=True, text=True)
+        except (Exception, KeyboardInterrupt) as error:
+            detail = f"Nightly slot sweep on {machine} failed: " + " ".join(str(error).splitlines())
+            if isinstance(error, subprocess.CalledProcessError):
+                detail += " " + " ".join(cast(str, error.stderr or error.stdout or "").splitlines())
+            print(detail, flush=True)
+            try:
+                from scripts.message import send_budget, session_send
+
+                _ = subprocess.run(session_send.send_argv("--to", "builds", "--from", "nightly", "--text", detail),
+                                   check=True, capture_output=True, text=True, timeout=send_budget.seconds())
+            except (Exception, KeyboardInterrupt) as notice_error:
+                print(f"Nightly slot sweep on {machine}: notice failed: "
+                      + " ".join(str(notice_error).splitlines()), flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2655,6 +2791,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --merge-branch")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
+    if args.modules and not args.tests_only:
+        parser.error("--module needs --tests-only")
     if args.nightly:
         args.type_dirs = list(NIGHTLY_TYPE_DIRS)
     if not args.tests_only and not args.promote_only and not args.nightly:
@@ -2668,7 +2806,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
         with scratch.copy_lock(checkout):
             if args.nightly:
-                return nightly(args)
+                try:
+                    return nightly(args)
+                finally:
+                    _sweep_nightly_slots()
             if args.promote_only:
                 promote(args)
                 production, review_list = change_review_list(args)

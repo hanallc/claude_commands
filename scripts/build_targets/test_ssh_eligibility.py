@@ -26,8 +26,8 @@ import unittest
 from unittest import mock
 
 from scripts.build_targets import build_targets as build_targets, targets
-from scripts.mac_test import claim_state, mac_test as mac_test, offload as offload
-from scripts.build_hold import build_hold
+from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
+from scripts.build_hold import owning_session as session_owner
 from scripts.aws_target import ledger
 from scripts.aws_target.ledger_test_support import REAL_POPEN, instant
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -64,13 +64,13 @@ class SshEligibilityTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(mock.patch.object(offload, "repository_identity",
-                                               return_value=offload.KnownRepository("hana", "github.com/team/hana")))
+        _ = self.enterContext(mock.patch.object(eligibility, "repository_identity",
+                                               return_value=eligibility.KnownRepository("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(mac_test, "target_claim_scope",
                                                return_value=mac_test.RepositoryScope("hana", "github.com/team/hana")))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", side_effect=process_reader(self.process_start)))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
-        _ = self.enterContext(mock.patch.object(build_hold, "owning_session", return_value=NoOwningSession()))
+        _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
         book = ledger.CostLedger(mac_test.state_paths("linux").directory)
         book.record_inventory(ledger.ResourceInventory(self.now, (
             ledger.PricedResource("retained-storage", Decimal("0")),), "priced fixture inventory"))
@@ -107,6 +107,10 @@ class SshEligibilityTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", arguments), redirect_stdout(output):
             self.assertEqual(build_targets.main(), 0)
         return [line.split("\t") for line in output.getvalue().splitlines()[1:]]
+
+    def mac_offload_off(self) -> None:
+        # check, lint and doc ignore linux_only, so turn the Mac off to keep these Linux tests from probing it.
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\nlinux_only.hana=linux-part\n")
 
     def linux(self, kind: str = "test", local: bool = False) -> list[str]:
         return next(row for row in self.answer(kind, local) if row[0] == "linux")
@@ -170,7 +174,7 @@ class SshEligibilityTests(unittest.TestCase):
                 record.update(remote_host="fake-mac", cleanup_pending=True)
             _ = claim.path.write_text(json.dumps(record))
             if refusal == "blocked":
-                offload.backoff_path("mac").unlink(missing_ok=True)
+                eligibility.backoff_path("mac").unlink(missing_ok=True)
                 mac_test.write_block(paths.block, block)
             else:
                 paths.block.unlink(missing_ok=True)
@@ -282,6 +286,7 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertTrue(self.commands)
 
     def test_linux_test_check_and_doc_need_no_mac_repository_setting(self) -> None:
+        self.mac_offload_off()
         for kind in ("test", "check", "doc"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.linux(kind)[1], "eligible")
@@ -293,12 +298,14 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_artifacts_final_gate_and_lint_never_use_linux_ssh(self) -> None:
+        self.mac_offload_off()
         for kind in ("build", "example", "final", "lint"):
             with self.subTest(kind=kind):
                 self.assertEqual(self.linux(kind)[1], "excluded")
         self.assertEqual(self.commands, [])
 
     def test_configured_kinds_are_read_on_each_eligibility_check(self) -> None:
+        self.mac_offload_off()
         self.assertEqual(self.linux("check")[1], "eligible")
         _ = write_config_fixture(self.root / "linux.conf", "offload=on\nkinds=test,doc\n")
         self.assertEqual(self.linux("check")[1], "excluded")

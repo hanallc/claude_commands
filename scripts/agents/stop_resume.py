@@ -41,13 +41,13 @@ from scripts.lib import conf, models_registry, operation_deadline
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_send
-from scripts.agents import member_account, pane_record
+from scripts.agents import member_account, pane_record, shutdown_record
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
 from scripts.production import staff
 from scripts.lib.resume_message import (
-    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, launcher_prompt,
+    AccountMove, NO_ACCOUNT_MOVE, BusyPass, NO_OWN_PASS, WorkersHeld, launcher_prompt, worker_mode,
     ResumeWorkers as ResumeWorkers,
     NO_WORKERS as NO_WORKERS,
     resume_message as resume_message,
@@ -434,6 +434,12 @@ _resume_names: ContextVar[LaunchNames | LaunchNamesNotRead] = ContextVar("resume
 _NO_SOURCE_ACCOUNTS: Mapping[str, str] = MappingProxyType({})
 _detached_moves: ContextVar[bool] = ContextVar("detached_moves", default=False)
 _move_resume: ContextVar[bool] = ContextVar("move_resume", default=False)
+_batch_process: ContextVar[bool] = ContextVar("batch_process", default=False)
+
+
+@dataclass(frozen=True)
+class BuildQueueUnreadable:
+    reason: str
 
 
 @contextmanager
@@ -1082,6 +1088,18 @@ def _unrecorded_codex_launch(identity: str) -> pane_record.PaneLaunch | SessionN
 def _resume(session: str, *, why: str = "resumed by name", to: str | None = None, requester: str = "",
             client: herdr.Herdr | herdr.LaunchClientSource = herdr.LaunchClientSource.NEW) -> ResumeResult:
     names = LaunchNames.read()
+    result = _resume_from_names(session, names, why=why, to=to, requester=requester, client=client)
+    if isinstance(result, ClaudeUp):
+        members = [row for row in names.tab_record.rows
+                   if row.current_session == result.session_id or row.id == session or row.name == session]
+        if len(members) == 1:
+            with staff.row_operation(str(members[0].id)):
+                shutdown_record.remove_started([str(members[0].id)])
+    return result
+
+
+def _resume_from_names(session: str, names: LaunchNames, *, why: str, to: str | None, requester: str,
+                       client: herdr.Herdr | herdr.LaunchClientSource) -> ResumeResult:
     record = names.tab_record
     member = record.by_member_reference(session)
     matches = [row for row in record.rows if row.name == session or row == member]
@@ -1175,10 +1193,20 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         entry = original.entry if original is not None else None
         if original is not None:
             source_client = client if original.path == pane_record.record_path(client.session) else herdr.Herdr(original.path.stem)
-            source_matches = pane_launch.reference_panes(pane_launch.launch_reference(original.entry, names.tab_record),
-                names.tab_record, source_client, {original.entry["pane_id"]: original.entry})
+            locations = [dict(pane) for pane in source_client.panes()]
+            evidence = pane_launch.NativePaneEvidence(locations, source_client.scan_row_panes(names.tab_record, locations))
+            reference = pane_launch.launch_reference(original.entry, names.tab_record)
+            source_matches = pane_launch.reference_panes(reference, names.tab_record, source_client,
+                {original.entry["pane_id"]: original.entry}, evidence=evidence)
             if len(source_matches) == 1:
                 source_pane = pane_launch.ResumeSourcePane(str(source_matches[0]["pane_id"]))
+            elif not any(pane["pane_id"] == original.entry["pane_id"] for pane in locations):
+                source_pane = pane_launch.ResumeSourcePane(original.entry["pane_id"])
+            elif any(pane["pane_id"] == original.entry["pane_id"]
+                     for owner_id, panes in evidence.scan.found.items()
+                     if not isinstance(reference, pane_launch.StaffLaunchReference) or owner_id != reference.id
+                     for pane in panes):
+                source_pane = pane_launch.ResumeSourceAbsent.OTHER_OWNER
         if entry is None and row is None:
             recovered = _unrecorded_codex_launch(identity)
             if isinstance(recovered, SessionNotFound):
@@ -1204,6 +1232,9 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             if row is not None and isinstance(running, ClaudeUp) and isinstance(running.pid, int) and running.account != "unknown account":
                 member_account.repair_home(row, kind, running.pid)
             return running
+        mode = worker_mode() if row is not None else NO_WORKERS
+        if isinstance(mode, WorkersHeld) and row is not None and row.kind == "worker" and kind == "codex":
+            return ResumeFailed(identity, "no-worker mode keeps Codex workers stopped")
         if entry is None:
             if row is None:
                 return SessionNotFound(session)
@@ -1254,6 +1285,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 destination = client.producer_row_tab(str(row.id), row.name, space, record=names.tab_record)
                 tab = (herdr.TabSession(destination.pane, row.name, "", identity)
                        if isinstance(destination, herdr.ExistingPane) else SessionNotFound(identity))
+        elif row is not None and isinstance(tab, SessionNotFound):
+            own_pane = client.saved_row_tab(str(row.id), row.name, herdr.row_workspace(row, names.tab_record, row.name),
+                                             record=names.tab_record)
+            if isinstance(own_pane, herdr.ExistingPane):
+                tab = herdr.TabSession(own_pane.pane, row.name, "", identity)
         if isinstance(tab, SessionNotFound):
             space = herdr.row_workspace(row or STAFF_ROOT, names.tab_record, entry["name"])
             with herdr.restore_staff(names.tab_record, labels=names.labels):
@@ -1272,7 +1308,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                     _ = client.retitle(tab.pane_id, entry["name"])
             except (OSError, ValueError, herdr_types.HerdrFailure) as error:
                 print(f"{identity}: title anomaly: {error}", file=sys.stderr)
-        workers = NO_WORKERS
+        workers: ResumeWorkers | WorkersHeld = NO_WORKERS
         own = NO_OWN_PASS
         detached = ""
         from scripts.production import worker
@@ -1284,6 +1320,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 run = worker_panes.worker_run(row, record=names.tab_record)
                 own = worker.own_pass(row, names.tab_record, run=worker_panes.DispatchRun(run))
                 detached = detached_runs.resume_context(run / detached_runs.DETACHED_RUNS_DIR, row.name)
+            elif isinstance(mode, WorkersHeld):
+                workers = mode
             elif row is not None:
                 workers = worker.resume_workers(row.id, names.tab_record)
         except (OSError, ValueError) as error:
@@ -1618,10 +1656,70 @@ def _resume_move(identity: str, target: str, requester: str, why: str, began: fl
         _move_resume.reset(token)
 
 
+def _build_holders(sessions: list[str]) -> dict[str, tuple[str, ...]] | BuildQueueUnreadable:
+    """Name the running, waiting and cloud build steps that each session owns in the admission queue."""
+    from scripts.build_queue import admission_client, admission_protocol as wire
+
+    try:
+        reading = admission_client.view()
+    except wire.AdmissionUnavailable as error:
+        return BuildQueueUnreadable(str(error) or "no answer")
+    owned: dict[str, list[str]] = {}
+    steps = [*((step.session_id, step.step, step.folder) for step in reading.view.running),
+             *((step.session_id, step.step, step.folder) for step in reading.view.waiting),
+             *((row.identity.session_id, row.identity.step, row.identity.folder)
+               for row in (reading.cloud if isinstance(reading, wire.CloudQueueRead) else ()))]
+    for session, step, folder in steps:
+        if session in sessions:
+            owned.setdefault(session, []).append(f"{step} in {folder}" if folder else step)
+    return {session: tuple(names) for session, names in owned.items()}
+
+
+def _move_after_builds(selected: list[str], held: dict[str, tuple[str, ...]], target: str, *, why: str,
+                       warn_seconds: int, requester: str, cause: moves.MoveCause,
+                       source_accounts: Mapping[str, str]) -> list[MoveResult]:
+    """Move free sessions at once; move each build owner when its steps end or the wait limit passes."""
+    free = [session for session in selected if session not in held]
+    if not _batch_process.get():
+        # Only the detached batch waits, so no caller blocks on a build.
+        _handoff_batch(list(held), target, why, warn_seconds, cause, source_accounts)
+        handed: dict[str, MoveResult] = {session: MoveHandedOff(session) for session in held}
+        if free:
+            handed.update(zip(free, _move_now(free, target, why=why, warn_seconds=warn_seconds, requester=requester,
+                                              cause=cause, source_accounts=source_accounts)))
+        return [handed[session] for session in selected]
+    settings = conf.read("shutdown")
+    deadline = monotonic() + settings.whole("MOVE_BUILD_WAIT_MINUTES") * 60
+    poll = settings.whole("MOVE_BUILD_POLL_SECONDS")
+
+    def move_now(sessions: list[str]) -> dict[str, MoveResult]:
+        return dict(zip(sessions, _move_now(sessions, target, why=why, warn_seconds=warn_seconds,
+                                            requester=requester, cause=cause, source_accounts=source_accounts)))
+
+    for session, steps in held.items():
+        print(f"build wait: {session} owns {'; '.join(steps)}; the move waits for its steps to end")
+    results = move_now(free) if free else {}
+    waiting: dict[str, tuple[str, ...]] = dict(held)
+    while waiting and (left := deadline - monotonic()) > 0:
+        time.sleep(min(poll, left))
+        owned = _build_holders(list(waiting))
+        if isinstance(owned, BuildQueueUnreadable):
+            continue  # An unread queue cannot prove that a step ended.
+        ended = [session for session in waiting if session not in owned]
+        waiting = {session: owned[session] for session in waiting if session in owned}
+        if ended:
+            results.update(move_now(ended))
+    for session, steps in waiting.items():
+        print(f"build wait limit: {session}: the move ends {'; '.join(steps)}")
+    if waiting:
+        results.update(move_now(list(waiting)))
+    return [results[session] for session in selected]
+
+
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,
                   requester: str = "", cause: moves.MoveCause = "by hand",
                   source_accounts: Mapping[str, str] = _NO_SOURCE_ACCOUNTS) -> list[MoveResult]:
-    """Interrupt all selected sessions before resuming any; isolate each failure."""
+    """Interrupt all selected sessions before resuming any; an automatic move waits for live build steps."""
     warn_seconds = max(0, warn_seconds)
     selected = list(dict.fromkeys(sessions))
     if not selected:
@@ -1629,6 +1727,20 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
     if _detached_moves.get():
         _handoff_batch(selected, target, why, warn_seconds, cause, source_accounts)
         return [MoveHandedOff(identity) for identity in selected]
+    if cause != "by hand":
+        held = _build_holders(selected)
+        if isinstance(held, BuildQueueUnreadable):
+            print(f"build wait: the build queue is unreadable ({held.reason}); the move does not wait")
+        elif held:
+            return _move_after_builds(selected, held, target, why=why, warn_seconds=warn_seconds,
+                                      requester=requester, cause=cause, source_accounts=source_accounts)
+    return _move_now(selected, target, why=why, warn_seconds=warn_seconds, requester=requester,
+                     cause=cause, source_accounts=source_accounts)
+
+
+def _move_now(selected: list[str], target: str, *, why: str, warn_seconds: int, requester: str,
+              cause: moves.MoveCause, source_accounts: Mapping[str, str]) -> list[MoveResult]:
+    """Stop and resume the selected sessions without a build wait."""
     began = monotonic()
     already_up: dict[str, ClaudeUp] = {}
     handoff_failures: dict[str, StopFailed] = {}
@@ -1775,14 +1887,19 @@ def main(argv: list[str] | None = None) -> int:
                                 cast(int, args.pid), cast(str, args.generation), cast(str, args.requester), cast(str, args.why))
             _ = output.write(cause + "\n")
         return int(bool(cause))
-    with log.open("a", encoding="utf-8") as output:
-        results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
-                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
-                                requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
-                                source_accounts={identity: label for item in cast(list[str], args.source_account)
-                                                 for identity, _, label in (item.partition("="),)})
-        for result in results:
-            _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
+    # The batch is the one process that may wait for build steps; its output goes to the move log.
+    token = _batch_process.set(True)
+    try:
+        with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
+            results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
+                                    why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
+                                    requester=cast(str, args.requester), cause=cast(moves.MoveCause, args.cause),
+                                    source_accounts={identity: label for item in cast(list[str], args.source_account)
+                                                     for identity, _, label in (item.partition("="),)})
+            for result in results:
+                _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
+    finally:
+        _batch_process.reset(token)
     return int(any(not isinstance(result, ClaudeUp) for result in results))
 
 

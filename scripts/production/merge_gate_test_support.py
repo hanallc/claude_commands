@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.lib.python_startup.sitecustomize import STARTUP_FILES
+from scripts.lib.checkout_test_support import copy_runtime
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.build_queue import admission_records
 
 from scripts.agents import remote
+from scripts.copies.copies_test_support import copies_environment
 
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
@@ -47,11 +51,11 @@ FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "
 
 
 def install_test_runner(checkout: Path) -> Path:
-    """Install the real runner and its descendant helper in a fixture checkout."""
-    for relative in ("test_times/module_run.py", "lib/descendants.py"):
-        destination = checkout / "scripts" / relative
+    """Install the runner, its bootstrap, and its descendant helper in the copy."""
+    for relative in (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py", "scripts/lib/conf_reads.py"):
+        destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copyfile(SCRIPT.parents[1] / relative, destination)
+        _ = shutil.copyfile(SCRIPT.parents[2] / relative, destination)
     return checkout / "scripts/test_times/module_run.py"
 
 
@@ -160,18 +164,20 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
         self.assertEqual(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
         if os.environ.get("MERGE_GATE_TEST_ISOLATION") == "1":
-            self.assertEqual(os.environ.get("PYTHONPATH"), str(Path.cwd()))
+            self.assertNotIn(str(Path.cwd()), os.environ.get("PYTHONPATH", "").split(os.pathsep))
+            self.assertIn(str(Path.cwd()), sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_PYTHONPATH"], sys.path)
             self.assertNotIn(os.environ["MERGE_GATE_TEST_REPO"], sys.path)
         record({"suite": suite, "module": module_name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
         if (state / "sample-module-memory").exists():
-            with open(Path(os.environ["MERGE_GATE_TEST_REPO"]) / "scripts/lib/package_root.py") as package_root:
-                exec(package_root.read(), {"__file__": package_root.name})
-            from scripts.direct.wait_for_test_state import wait_until
+            import subprocess
+            checkout = Path(os.environ["MERGE_GATE_TEST_REPO"])
             (state / (str(os.getpgrp()) + ".memory-ready")).touch()
-            wait_until((state / (str(os.getpgrp()) + ".memory-done")).exists,
-                       state, timeout=TEST_HANG_GUARD_SECS)
+            subprocess.run([str(checkout / "scripts/lib/py"),
+                            str(checkout / "scripts/direct/wait_for_test_state.py"),
+                            str(state / (str(os.getpgrp()) + ".memory-done"))],
+                           check=True, timeout=TEST_HANG_GUARD_SECS)
         death = state / ("signal-" + suite)
         if death.exists():
             if death.read_text() == "once":
@@ -410,13 +416,14 @@ class MergeGateFixture(unittest.TestCase):
         self.checkout = self.root / "merge"
         self.unit = self.root / "unit"
         self.main = self.root / "main"
-        self.bin = self.root / "bin"
+        self.bin = self.root / "tools/bin"
         self.state = self.root / "state"
         self.quiet_production = self.root / "quiet-production.md"
         home = self.root / "home"
         git_config = write_fixture_git_config(root.parent)
         self.environment = {
-            **os.environ, **interpreter_cache_environment(root / "cache"), "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
+            **os.environ, **copies_environment(root, repository="origin"), **interpreter_cache_environment(root / "cache"),
+            "HOME": str(home), "STAFF_FILE": str(home / "staff.json"), "XDG_STATE_HOME": str(home / "state"),
             "CODEX_HOME": str(home / "codex"), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -440,7 +447,8 @@ class MergeGateFixture(unittest.TestCase):
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)
-        self.environment.update(fake_memory_readings(readings))
+        self.environment.update({key: value for key, value in fake_memory_readings(readings).items()
+                                 if key != "CONF_DIR"})
         self.environment.update({
             "BUILDLOG_DIR": str(root / "buildlog"),
             "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
@@ -534,6 +542,7 @@ class MergeGateFixture(unittest.TestCase):
 
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
+        copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
         _ = write_config_fixture(self.root / "config/buildlog.conf")
@@ -543,10 +552,12 @@ class MergeGateFixture(unittest.TestCase):
         history.mkdir(parents=True, exist_ok=True)
         with contextlib.closing(sqlite3.connect(index.index_path_in(history))) as connection, connection:
             index.create_schema(connection)
-            connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
-                VALUES ('fixture-normal', '2000-01-01', 'merge-gate', ?, 0, 0, 'full', 1000000)""",
-                (os.cpu_count() or 1,)).close()
+            # A full run's limit reads runs with its own job count, so seed every count a gate can use.
+            vcpus = os.cpu_count() or 1
+            connection.executemany("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s)
+                VALUES (?, '2000-01-01', 'merge-gate', ?, ?, 0, 0, 'full', 1000000)""",
+                [(f"fixture-normal-{jobs}", vcpus, jobs) for jobs in range(1, vcpus + 1)]).close()
         (self.root / "home").mkdir()
         # A production with no Change review line: a gate always names one, and these write no rows.
         self.quiet_production = self.root / "quiet-production.md"
@@ -593,7 +604,8 @@ class MergeGateFixture(unittest.TestCase):
         while True:
             try:
                 state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
+            # A process reaped between the open and the read is gone, so it is stopped.
+            except (FileNotFoundError, ProcessLookupError):
                 return
             if state == "Z":
                 return

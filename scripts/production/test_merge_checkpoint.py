@@ -5,8 +5,9 @@ from __future__ import annotations
 from scripts.production import checkpoint_gate
 
 from scripts.agents import remote
+from scripts.agents.remote import local_machine
 
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, recorded_showrunner
+from scripts.production.staff_test_support import fixture_runtime_id, isolated_staff_file, unit_membership, recorded_showrunner
 from scripts.production import staff
 
 import json
@@ -313,19 +314,26 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                     if outcome == "resume":
                         _ = self.git("merge", "--no-ff", "-m", "Merge interrupted checkpoint", checkpoint)
                     result = self.run_checkpoint(checkpoint, phase="3")
+                    tips: list[str] = []
                     if outcome != "conflict":
-                        tips = (self.state / "tested-tips").read_text().splitlines()
-                        lock_states = (self.state / "tested-locks").read_text().splitlines()
-                        self.assertEqual(lock_states, ["free" if tip == tips[0] else "held" for tip in tips])
+                        observed = list(zip((self.state / "tested-tips").read_text().splitlines(),
+                                            (self.state / "tested-locks").read_text().splitlines()))
+                        # The base check of a red runs on a tip without the checkpoint; the red outcomes alone have one.
+                        held = [pair for pair in observed if merge_checkpoint.git(
+                            self.checkout, "merge-base", "--is-ancestor", checkpoint, pair[0]).returncode == 0]
+                        self.assertEqual(len(held) < len(observed), outcome in ("red", "moving-red"))
+                        tips = [tip for tip, _ in held]
+                        self.assertEqual([lock for _, lock in held], ["free" if tip == tips[0] else "held" for tip in tips])
                     if outcome.startswith("moving-"):
-                        tips = (self.state / "tested-tips").read_text().splitlines()
                         moved = (self.state / "moved-main").read_text()
                         self.assertEqual(len(set(tips)), 2)
                         self.assertNotEqual(merge_checkpoint.git(self.checkout, "merge-base", "--is-ancestor", moved, tips[0]).returncode, 0)
                         self.assertEqual(self.git("merge-base", "--is-ancestor", moved, tips[-1]), "")
                         self.assertIn(["test", "later-main"], self.events("verify.sh"))
                         if outcome == "moving-red":
-                            self.assertIn("red: failed", result.process.stdout)
+                            # The moved main is red without the checkpoint too, so the checkpoint waits.
+                            self.assertIn("red: held", result.process.stdout)
+                            self.assertIn("merge director: package later-main, merge test 1 red on base ", result.process.stdout)
                             self.assertEqual(self.git("rev-parse", "HEAD"), before)
                         else:
                             self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
@@ -337,13 +345,14 @@ raise SystemExit(1 if (state / "red").exists() else 0)
                         self.assertEqual(self.events("checkpoint-test"), [])
                         self.assertEqual(self.git("rev-parse", "HEAD"), before)
                     else:
-                        tips = (self.state / "tested-tips").read_text().splitlines()
                         self.assertEqual(len(set(tips)), 1)
                         self.assertEqual(self.git("merge-base", "--is-ancestor", main, tips[0]), "")
                         self.assertEqual(self.git("merge-base", "--is-ancestor", checkpoint, tips[0]), "")
                         self.assertIn(["test", "main-proof"], self.events("verify.sh"))
                         if outcome == "red":
-                            self.assertIn("red: failed", result.process.stdout)
+                            # The fixture is red on every tree, so the base check holds the checkpoint.
+                            self.assertIn("red: held", result.process.stdout)
+                            self.assertIn("send alpha: your checkpoint adds no red", result.process.stdout)
                             self.assertEqual(self.git("rev-parse", "HEAD"), before)
                         else:
                             self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
@@ -525,9 +534,9 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         for subject, count in (("checkpoint(alpha): final change", 1), ("queue(7): final change", 2)):
             with self.subTest(subject=subject):
                 _ = self.checkpoint(content=f"draft for {subject}\n",
-                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result")
+                                    subject="fix(alpha): draft\n\nChange-Review: Draft change | Read | Draft result | image 012345abcdef")
                 final = self.checkpoint(content=f"final for {subject}\n",
-                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result")
+                                        subject=f"{subject}\n\nChange-Review: Final change | Read | Final result | image 012345abcdef")
                 with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
                     accepted = self.run_checkpoint(final)
                 self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
@@ -569,6 +578,11 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
                 if outcome == "equal-patch":
                     _ = self.git("cherry-pick", later, cwd=self.promote)
                     _ = self.git("push", "origin", "main", cwd=self.promote)
+                if outcome == "ancestor":
+                    # A producer's launch folder is not a checkout; it keeps no branch.
+                    (self.root / "producer-folder").mkdir()
+                    _ = staff.ensure("producer", name="dwight", runtime_id=fixture_runtime_id("dwight"),
+                                     worktree=staff.PresentWorktree(local_machine(), self.root / "producer-folder"))
                 if outcome == "merge-branch":
                     doc = self.root / "other-production.md"
                     _ = doc.write_text("- **Merge branch:** alpha-phase\n")

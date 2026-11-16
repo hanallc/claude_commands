@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.copies.copies_test_support import copies_environment
+from scripts.lib import build_folders
+
 import fcntl
 import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,7 +18,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
 from scripts.production import ci_points
@@ -117,7 +121,7 @@ class ValidationObservation(TypedDict):
     remote_tip: str
     cargo_target: str
     local_config: str
-    private_git: bool
+    slot_git: bool
     cache: str
 
 
@@ -134,9 +138,41 @@ class CiPointsTests(unittest.TestCase):
     doc: Path = Path()
     log: Path = Path()
     env: dict[str, str] = {}
+    fixture_root: ClassVar[Path]
+    fixture_seed: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls(methodName="runTest")
+        cls.addClassCleanup(builder.doCleanups)
+        builder.build_fixture()
+        cls.fixture_root = builder.root
+        cls.fixture_environment = dict(builder.env)
+        seed_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="ci-points-seed-")))
+        cls.fixture_seed = seed_root / "case"
+        _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
+        shutil.rmtree(builder.root)
 
     @override
     def setUp(self) -> None:
+        self.root = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
+        self.home = self.root / "home"
+        self.origin = self.root / "origin.git"
+        self.checkout = self.root / "checkout"
+        self.state = self.root / "state"
+        self.stub_state = self.root / "stub-state"
+        self.bin = self.root / "bin"
+        self.doc = self.root / "tool-based-ui-production.md"
+        self.log = self.checkout / "production.log"
+        self.env = dict(self.fixture_environment)
+        _ = self.git("update-index", "--refresh")
+
+    def build_fixture(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
@@ -163,7 +199,7 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
+        self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
@@ -248,8 +284,14 @@ class CiPointsTests(unittest.TestCase):
         validate = self.bin / "validate_and_push.sh"
         self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
         scripts = SCRIPT.parents[1] / "validate_and_push"
-        for name in ("validate_and_push.sh", "push_direct.sh", "post_push_hook.sh"):
+        for name in ("validate_and_push.sh", "push_direct.sh"):
             _ = shutil.copy2(scripts / name, self.bin / name)
+        library = self.bin.parent / "lib"
+        shim = library / "py"
+        self.write(shim, f'#!/bin/sh\nexec {shlex.quote(str(scripts.parent / "lib/py"))} "$@"\n')
+        shim.chmod(0o755)
+        for name in ("land_main.py", "main_push_lock.py"):
+            _ = shutil.copy2(scripts.parent / "lib" / name, library / name)
         self.write(self.bin / "run_validation.sh", '''#!/bin/sh
 set -eu
 "$TEST_PYTHON" - <<'PY'
@@ -282,8 +324,8 @@ observation = {
     "directory": str(directory), "initial": initial, "validated": validated,
     "origin": origin, "push_origin": git("remote", "get-url", "--push", "origin"), "remote_tip": remote_tip,
     "cargo_target": os.environ.get("CARGO_TARGET_DIR", ""),
-    "local_config": (directory / ".git/config").read_text(),
-    "private_git": (directory / ".git").is_dir(),
+    "local_config": Path(git("rev-parse", "--path-format=absolute", "--git-path", "config")).read_text(),
+    "slot_git": (directory / ".git").is_file(),
     "cache": str((directory / "target").resolve()),
 }
 (state / "validation-observation.json").write_text(json.dumps(observation))
@@ -321,7 +363,8 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["validated"])
         self.assertEqual(self.git("rev-parse", "HEAD"), observed["validated"])
         self.assertIn("fast-forward push", result.stdout)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_failed_validation_without_a_build_cache_keeps_its_log_and_removes_its_copy(self) -> None:
         _ = self.git("rm", "Cargo.toml")
@@ -334,7 +377,8 @@ PY
         self.assert_step(result, "validation", False)
         checkout = Path(self.validation_observation()["directory"])
         self.assertNotEqual(checkout, self.checkout)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
         log = self.state / "ci_validation.log"
         self.assertIn(str(log), result.stdout)
         self.assertIn("FAILED: fixed-commit validation", log.read_text())
@@ -359,8 +403,9 @@ PY
         self.assertEqual(ci_points.read_run(self.state).tip, observed["remote_tip"])
         self.assertTrue(any("--commit" in call and observed["remote_tip"] in call
                             for call in self.calls("gh")), self.calls("gh"))
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
@@ -382,30 +427,37 @@ PY
         self.assertEqual(self.git("rev-parse", "HEAD"), fixed)
         self.assertEqual(self.git("show", "production:README.md", cwd=self.origin), "validation fix")
         self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_keeps_the_standing_git_configuration_clean(self) -> None:
         push_origin = self.origin.as_uri()
         _ = self.git("remote", "set-url", "--push", "origin", push_origin)
         self.fixed_commit_validation()
+        original = self.git("config", "--local", "--list").splitlines()
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = [line for line in original if not line.startswith(("core.bare=", "core.worktree="))]
+        expected.append("extensions.worktreeconfig=true")
+        self.assertCountEqual(self.git("config", "--local", "--list").splitlines(), expected)
         observed = self.validation_observation()
         checkout = Path(observed["directory"])
         self.assertEqual(observed["origin"], str(self.origin))
         self.assertEqual(observed["push_origin"], push_origin)
-        self.assertFalse(checkout.exists())
+        self.assertTrue(checkout.exists())
+        self.assertEqual(build_folders.build_folder_state(checkout), "free")
         before = observed["local_config"]
         self.assertIn(str(self.origin), before)
-        for setting in ("pushurl", "pushInsteadOf", "[user]"):
-            self.assertNotIn(setting, before)
+        config = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "config"))
+        self.assertEqual(before, config.read_text())
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         current = self.validation_observation()
-        self.assertNotEqual(current["directory"], observed["directory"])
-        self.assertFalse(Path(current["directory"]).exists())
+        self.assertEqual(current["directory"], observed["directory"])
+        self.assertTrue(Path(current["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(current["directory"])), "free")
         self.assertEqual(current["local_config"], before)
         self.assertEqual(current["cache"], observed["cache"])
 
@@ -437,8 +489,9 @@ PY
         self.assertEqual(self.git("rev-parse", "production"), fixed)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue(self.validation_observation()["private_git"])
-        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue(self.validation_observation()["slot_git"])
+        self.assertTrue(Path(self.validation_observation()["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(self.validation_observation()["directory"])), "free")
         self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
 
         result = self.start_point()
@@ -454,9 +507,10 @@ PY
         self.assertIn(f"validation: ok — validated {fixed}; no push; following {fixed}", result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all(attempt["private_git"] for attempt in attempts))
-        self.assertFalse(any(Path(attempt["directory"]).exists() for attempt in attempts))
-        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 2)
+        self.assertTrue(all(attempt["slot_git"] for attempt in attempts))
+        self.assertTrue(all(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual({build_folders.build_folder_state(Path(attempt["directory"])) for attempt in attempts}, {"free"})
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
         self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
         self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
@@ -478,8 +532,9 @@ PY
         self.assertFalse((self.stub_state / "pushes").exists())
         self.assertFalse((self.state / "ci_run.json").exists())
         self.assertFalse(self.calls("gh"))
-        self.assertTrue(self.validation_observation()["private_git"])
-        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        self.assertTrue(self.validation_observation()["slot_git"])
+        self.assertTrue(Path(self.validation_observation()["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(self.validation_observation()["directory"])), "free")
         self.assertTrue(Path(self.validation_observation()["cache"]).is_dir())
         reject.unlink()
 
@@ -498,9 +553,10 @@ PY
                       result.stdout)
         self.assertEqual(ci_points.read_run(self.state).tip, fixed)
         self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
-        self.assertTrue(all(attempt["private_git"] for attempt in attempts))
-        self.assertFalse(any(Path(attempt["directory"]).exists() for attempt in attempts))
-        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 2)
+        self.assertTrue(all(attempt["slot_git"] for attempt in attempts))
+        self.assertTrue(all(Path(attempt["directory"]).exists() for attempt in attempts))
+        self.assertEqual({build_folders.build_folder_state(Path(attempt["directory"])) for attempt in attempts}, {"free"})
+        self.assertEqual(len({attempt["directory"] for attempt in attempts}), 1)
         self.assertEqual(len({attempt["cache"] for attempt in attempts}), 1)
         self.assertTrue(Path(attempts[0]["cache"]).is_dir())
 
@@ -567,8 +623,9 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {merged}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation(self) -> None:
@@ -585,8 +642,9 @@ PY
         self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
                          [f"refs/heads/production {initial} {observed['remote_tip']}"])
         self.assertFalse((self.state / "ci_run.json").exists())
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged(self) -> None:
@@ -606,8 +664,9 @@ PY
         self.assertEqual(self.git("status", "--porcelain"), before_status)
         self.assertEqual((self.checkout / "README.md").read_bytes(), before_readme)
         self.assertFalse((self.stub_state / "pushes").exists())
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
 
     def test_a_failed_validation_keeps_its_cache_without_pushing(self) -> None:
@@ -624,8 +683,9 @@ PY
         self.assertEqual((self.state / "ci_validation.log").read_text(),
                          "=== STEP: validation ===\nFAILED: fixed-commit validation\n")
         observed = self.validation_observation()
-        self.assertTrue(observed["private_git"])
-        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertTrue(observed["slot_git"])
+        self.assertTrue(Path(observed["directory"]).exists())
+        self.assertEqual(build_folders.build_folder_state(Path(observed["directory"])), "free")
         self.assertTrue(Path(observed["cache"]).is_dir())
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
         self.assertEqual(self.git("rev-parse", "HEAD"), initial)

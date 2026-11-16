@@ -1,12 +1,12 @@
 ---
 description: Review one pending item with the user.
-argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below]"
+argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below] | <change ID>"
 ---
 
 # Next
 
 **Usage:** `/next` · `/next <kind>` · `/next [<kind>] oldest` · `/next [<kind>] newest` ·
-`/next [<kind>] [oldest|newest] all-below` · `/next to the end`
+`/next [<kind>] [oldest|newest] all-below` · `/next to the end` · `/next <change ID>`
 
 Kinds: `change`, `proposal`, `efficiency`, `question`. The words "next", "next change", "next
 proposal", "next efficiency proposal", "next question", "next oldest" and "next newest" mean this
@@ -17,6 +17,9 @@ command too.
 - `oldest` or `newest`, alone or with a kind: the oldest or newest item instead (user,
   2026-10-22).
 - `all-below`, with any of the above: also the items of every production below this one.
+- A change ID, such as `C1535` or `sdlc/C1535`: that one change row. Run
+  `next_item.py show --id <ID>` (with `--production` outside the showrunner session).
+  It pins nothing. A row with a verdict, or an ID on no list, prints one line: show that line and stop.
 
 Any other argument: print the usage line and stop.
 
@@ -107,9 +110,11 @@ it follows a staff id in its Production cell. A unit id gives that unit's curren
 production, and a showrunner id gives that showrunner's production. A Producer id
 with no staff row is unrouted. Any other row belongs to its list's production.
 Mark: `change_review.py mark-important --row <id>`.
-Pass the ID as `/next` shows it, such as `C434` or `sdlc/C9`. Say
-what changed, how to try it and what the user sees, in plain words. Record the
-user's verdict through `/change_review` → verdict.
+Pass the displayed ID, such as `sdlc/C9`.
+Its prefix names the responsible showrunner from the shared staff resolver.
+The list-based ID remains valid; use `--list <path>` when the displayed ID matches several lists.
+Say what changed, how to try it, and what the user sees.
+Record the verdict through `/change_review` → verdict.
 
 ## proposal
 
@@ -142,7 +147,8 @@ approved change; commit and push only when the user says so.
 
 ## question
 
-The current open question. Mark: `update_registration.py mark-important
+The current open question. A question with a follow-up that waits for the asker's reply is not shown.
+A question skipped on the Questions page comes after the other questions. Mark: `update_registration.py mark-important
 --production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,
 why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
 Throughout says, and remove the item through its Open-questions list.

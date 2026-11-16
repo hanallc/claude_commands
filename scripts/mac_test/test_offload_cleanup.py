@@ -16,7 +16,7 @@ import io
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
-from scripts.mac_test import offload, mac_test
+from scripts.mac_test import eligibility, offload, mac_test
 from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import test_hang_guard
@@ -94,21 +94,24 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
     configuration_environment: dict[str, str] = {}
+    python: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home_directory = self.root / "home with spaces"
-        self.mirror = self.home_directory / offload.remote_mirror(offload.KnownRepository("hana's project"))
+        self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
         self.temporary_directory = self.root / "tmp"
         self.temporary_directory.mkdir()
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        python = self.home_directory / ".claude/scripts/lib/py"
-        python.parent.mkdir(parents=True)
-        write_shell(python, f'exec {shlex.quote(sys.executable)} "$@"\n')
+        # The trim step runs the lint sweep, about 0.5 CPU s a start. Tests of the trim call real_sweep();
+        # the other tests check the shell text around it, so this stub reports a clean trim at once.
+        self.python = self.home_directory / ".claude/scripts/lib/py"
+        self.python.parent.mkdir(parents=True)
+        write_shell(self.python, 'exit 0\n')
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -134,6 +137,10 @@ printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
 
+    def real_sweep(self) -> None:
+        """Run the real lint sweep in the trim step."""
+        write_shell(self.python, f'exec {shlex.quote(sys.executable)} "$@"\n')
+
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
@@ -144,20 +151,20 @@ exit "$CLEANUP_TEST_STATUS"
         budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
-        config = offload.OffloadConfig(
-            enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
+        config = eligibility.OffloadConfig(
+            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
-            + offload.remote_test_command(config, request, offload.KnownRepository("hana's project"))
+            + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
             env={**os.environ, **self.configuration_environment,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                  "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
@@ -288,6 +295,7 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
+        self.real_sweep()
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -324,9 +332,10 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    python = self.home_directory / ".claude/scripts/lib/py"
-                    write_shell(python, 'exit 9\n' if trim_fails else
-                                f'exec {shlex.quote(sys.executable)} "$@"\n')
+                    if trim_fails:
+                        write_shell(self.python, 'exit 9\n')
+                    else:
+                        self.real_sweep()
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"

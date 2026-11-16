@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import io
@@ -178,7 +179,7 @@ raise SystemExit(1)
         self.projects.mkdir()
         self.state = self.root / "stall-state"
         self.ps_file = self.root / "ps.txt"
-        self.send_log = self.root / "sends.jsonl"
+        self.send_log = self.root / "sends.txt"
         self.rca_log = self.root / "rca-sends.jsonl"
         self.fail_file = self.root / "fail-targets.json"
         _ = self.fail_file.write_text("[]")
@@ -186,9 +187,12 @@ raise SystemExit(1)
         self.config = self.root / "showrunners.conf"
         self.configure({"showrunner": ["unit-one"]})
         self.addCleanup(self.close_processes)
-        executable(self.bin / "ps", "#!/bin/sh\ncat \"$STALL_TEST_PS_FILE\"\n")
+        # Shell builtins print the rows; a cat child would double the starts for each snapshot.
+        executable(self.bin / "ps", "#!/bin/sh\nwhile IFS= read -r row; do printf '%s\\n' \"$row\"; done < \"$STALL_TEST_PS_FILE\"\n")
+        # The record is a Python literal, and json loads only for a fail list. A json import adds
+        # about 60% to the start time of this stub, and stall_watch starts it for each delivery.
         executable(self.bin / "send.py", """#!/usr/bin/env python3
-import json, os, sys, time
+import os, sys, time
 args = sys.argv[1:]
 retire = args[:1] == ['retire']
 record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
@@ -197,7 +201,7 @@ if retire:
     record['command'] = 'retire'
 if '--value' in args:
     record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
-line = (json.dumps(record) + '\\n').encode()
+line = (repr(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
 os.close(fd)
@@ -207,7 +211,13 @@ while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < ex
     if time.monotonic() >= deadline:
         raise SystemExit('send barrier did not receive every concurrent delivery')
     time.sleep(0.01)
-fail = json.load(open(os.environ['STALL_TEST_FAIL_FILE']))
+with open(os.environ['STALL_TEST_FAIL_FILE']) as targets:
+    text = targets.read()
+if text == '[]':
+    fail = []
+else:
+    import json
+    fail = json.loads(text)
 # A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
 if retire:
     raise SystemExit(3 if 'retire' in fail else 0)
@@ -572,7 +582,7 @@ always=natedev
     def sent(self) -> list[dict[str, str]]:
         if not self.send_log.exists():
             return []
-        return [json.loads(line) for line in self.send_log.read_text().splitlines()]
+        return [ast.literal_eval(line) for line in self.send_log.read_text().splitlines()]
 
     def moved_director_run(self, *, finished: bool = False) -> Path:
         """Keep stale staff and document paths while the held run uses another worktree."""
@@ -1500,6 +1510,18 @@ always=natedev
         self.assertEqual((len(self.prompt_followups()), self.prompt_followups()[-1]["key"], values["since"]), (3, PROMPT_KEY, "12:15 PDT"))
         self.assertEqual(len(self.prompt_notices()), 2)
 
+    def test_a_prompt_herdr_reports_idle_is_blocked_on_the_first_pass(self) -> None:
+        """rca 261114-1: herdr reported the pane idle for 10 h while its screen showed the prompt."""
+        transcript = self.projects / "project" / "204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, START - 3 * 3600))
+        self.panes["unit-one"].update(agent_status="idle", pane=OUTSIDE_PROMPT)
+        self.tell_prompt_owner(START)
+        result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspected showrunner/unit-one: permission prompt", result.stdout)
+        self.assertEqual([item["to"] for item in self.prompt_followups()], ["user"])
+        self.assertFalse(any(item["key"].endswith(":bump") for item in self.sent()))
+
     def prompt_state(self) -> Path:
         return self.watches["unit-one"].prompt_path
 
@@ -1515,7 +1537,7 @@ always=natedev
     def test_a_failed_retire_is_sent_again_next_tick_and_no_new_alert_goes(self) -> None:
         self.alerted_at_a_prompt()
         _ = self.fail_file.write_text('["retire"]')
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         failed = self.tick(START + 120)
         self.assertIn("stall-watch: retire:", failed.stderr)
         self.assertTrue(self.prompt_state().exists())
@@ -1549,7 +1571,7 @@ always=natedev
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
         _ = self.tick(START)
         self.assertTrue(self.prompt_state().exists())
-        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"].update(agent_status="idle", pane=PANE)
         self.assertEqual(self.tick(START + 30).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse(self.prompt_state().exists())
@@ -1627,7 +1649,7 @@ always=natedev
             self.assertTrue(prompt["alerted"])
             self.assertIn("case_pending", prompt)
             self.assertEqual(self.owner_messages(), [])
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             cleared = self.tick(START + 120)
         self.assertIn("rca: no case opened: OSError: case disk unavailable", cleared.stderr)
         self.assertEqual(self.prompt_followups()[1:], [RETIRE])
@@ -1655,7 +1677,7 @@ always=natedev
         with mock.patch.object(rca, "save", side_effect=OSError("case disk unavailable")):
             failed = self.tick(START + 60)
             self.assertIn("rca: no case opened: OSError: case disk unavailable", failed.stderr)
-            self.panes["unit-one"]["agent_status"] = "idle"
+            self.panes["unit-one"].update(agent_status="idle", pane=PANE)
             _ = self.tick(START + 120)
             self.assertEqual(self.prompt_followups()[1:], [RETIRE])
             self.assertFalse(self.prompt_state().exists())

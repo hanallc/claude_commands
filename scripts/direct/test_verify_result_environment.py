@@ -7,7 +7,6 @@ from pathlib import Path
 import shlex
 from typing import cast, override
 
-from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, RUNNER_STUB, VERIFY, VerifyMacOffloadFixture,
 )
@@ -24,8 +23,6 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.environment.update({name: value for name, value in copies_environment(self.root).items()
-                                 if name != "HOME"})
         for name in ("NO_COLOR", "CLICOLOR"):
             _ = self.environment.pop(name, None)
         cargo = CARGO_STUB.replace(
@@ -41,11 +38,11 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
         )
         self.write_executable(self.bin_directory / "cargo", cargo)
         observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)
-config = offload.read_config(Path(parsed.settings))
-command = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+config = eligibility.read_config(Path(parsed.settings))
+command = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
 Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 '''
         self.write_executable(self.runner, RUNNER_STUB.replace(
@@ -62,18 +59,17 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
         self.assertEqual(repeat.returncode, 0, repeat.stdout + repeat.stderr)
         self.assertIn("PASS (recorded)", repeat.stdout)
         self.assertEqual(self.local_runs(), [])
-        for name in ("NO_COLOR", "CLICOLOR"):
-            with self.subTest(name=name):
-                self.clear_observations()
-                values[name] = ""
-                empty = self.verify(*arguments, extra=values)
-                self.assertEqual(empty.returncode, 0, empty.stdout + empty.stderr)
-                self.assertEqual(len(self.local_runs()), 1)
-                self.clear_observations()
-                del values[name]
-                absent = self.verify(*arguments, extra=values)
-                self.assertEqual(absent.returncode, 0, absent.stdout + absent.stderr)
-                self.assertEqual(len(self.local_runs()), 1)
+        # Each result name reaches the key through the same policy list, so one name checks empty and unset values.
+        self.clear_observations()
+        values["NO_COLOR"] = ""
+        empty = self.verify(*arguments, extra=values)
+        self.assertEqual(empty.returncode, 0, empty.stdout + empty.stderr)
+        self.assertEqual(len(self.local_runs()), 1)
+        self.clear_observations()
+        del values["NO_COLOR"]
+        absent = self.verify(*arguments, extra=values)
+        self.assertEqual(absent.returncode, 0, absent.stdout + absent.stderr)
+        self.assertEqual(len(self.local_runs()), 1)
 
     def test_empty_environment_policy_reaches_cargo_and_passes(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
@@ -108,20 +104,19 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
                 self.assertIn("SNAPSHOT_MODE=" + value, words)
 
     def test_mac_routes_carry_result_values_and_fixed_terminal_values(self) -> None:
-        for routing in ((), ("--mac", "Mac test"), ("--target", "mac")):
-            with self.subTest(routing=routing):
-                self.clear_observations()
-                result = self.verify("test", "sample", *routing, "--no-cache", extra={
-                    "NO_COLOR": "1", "RUST_LOG": "sample=trace",
-                    **{name: "caller" for name in FIXED_ENVIRONMENT},
-                    "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
-                })
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(len(self.runner_events()), 1)
-                words = shlex.split((self.runner_state / "remote-command").read_text())
-                for name, value in {"NO_COLOR": "1", "RUST_LOG": "sample=trace", **FIXED_ENVIRONMENT}.items():
-                    self.assertIn(name + "=" + value, words)
-                    self.assertNotIn(name + "=caller", words)
+        # verify.sh sets the forwarded values before it picks a route, and each Mac route starts the runner in
+        # try_mac_test. The --mac route has its own value check in test_changed_forwarded_value_reaches_the_mac.
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "NO_COLOR": "1", "RUST_LOG": "sample=trace",
+            **{name: "caller" for name in FIXED_ENVIRONMENT},
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0",
+        })
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.runner_events()), 1)
+        words = shlex.split((self.runner_state / "remote-command").read_text())
+        for name, value in {"NO_COLOR": "1", "RUST_LOG": "sample=trace", **FIXED_ENVIRONMENT}.items():
+            self.assertIn(name + "=" + value, words)
+            self.assertNotIn(name + "=caller", words)
 
     def test_ssh_route_carries_result_values_and_fixed_terminal_values(self) -> None:
         settings = self.root / "linux.conf"

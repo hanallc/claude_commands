@@ -103,6 +103,33 @@ class DirectorStopTests(unittest.TestCase):
                 self.assertIn(f"/unit:{unit_type} run active", result.stderr)
                 self.assertIn(f"commands/unit/{unit_type}.md", result.stderr)
 
+    def test_merge_gate_with_no_open_order_phase_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            document = cast(dict[str, object], json.loads(fixture.staff_file.read_text()))
+            rows = cast(list[dict[str, object]], document["rows"])
+            rows[0].update(kind="unit", unit_type="merge")
+            _ = fixture.staff_file.write_text(json.dumps(document))
+            state_path = fixture.run / "progress_history_state.json"
+            state = cast(dict[str, object], json.loads(state_path.read_text()))
+            state["phase"] = {"id": "1", "instance_id": "fixture-phase", "status": "completed"}
+            _ = state_path.write_text(json.dumps(state))
+            self.assert_allowed(fixture.call(last_assistant_message="— holding: queue empty"))
+            self.assertFalse((fixture.run / "compaction_wake_line").exists())
+
+    def test_live_detached_run_of_the_director_stops_without_a_wake(self) -> None:
+        with director_stop_fixture() as fixture:
+            record = fixture.run / "detached_runs" / "land.json"
+            record.parent.mkdir()
+            supervisor = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
+                                           "detached_runs.py", "supervise", str(record.resolve())], stdin=subprocess.PIPE)
+            _ = record.write_text(json.dumps({"run_id": "land", "status": "running", "staff_id": SESSION,
+                                              "worker": "fixture-director", "pid": supervisor.pid}))
+            try:
+                self.assert_allowed(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+            finally:
+                _ = supervisor.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assert_blocked(fixture.call(last_assistant_message="— holding: waiting on the land run"))
+
     def assert_blocked(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual((result.returncode, result.stdout), (2, ""))
         self.assertIn(
@@ -218,7 +245,8 @@ class DirectorStopTests(unittest.TestCase):
             self.assert_allowed(fixture.call(last_assistant_message=(
                 "blocked: pause order from the user through the showrunner; only the showrunner restarts this work"
             )))
-            self.assertFalse((fixture.run / "turn_wait.json").exists())
+            # A pause opens a wait, so the paused time leaves active phase time.
+            self.assertTrue((fixture.run / "turn_wait.json").exists())
 
     def test_paused_status_without_a_prefix_above_the_threshold_allows_stop(self) -> None:
         with director_stop_fixture() as fixture:

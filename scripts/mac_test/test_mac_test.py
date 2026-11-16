@@ -1155,7 +1155,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.assert_command(self.command("free-now"), 1, "busy\n")
         self.assert_command(self.release_claim(owner.pid), 0, "")
         record = self.kept_claim()
-        self.assert_command(self.command("free-now"), 1, "busy\n")
+        # The next claim takes a kept claim over, so the kept claim does not make the Mac busy.
+        self.assert_command(self.command("free-now"), 0, "free\n")
         self.assert_command(self.release_claim(record["pid"]), 0, "")
         self.assert_command(self.command("free-now"), 0, "free\n")
 
@@ -1791,6 +1792,8 @@ for arguments in (
         active_runs: tuple[tuple[str, str, float, list[GhJob], str], ...] = (
             ("queued", "queued", 1, [], "ci_job"),
             ("in_progress", "in_progress", 1, [], "ci_job"),
+            ("Mac queued", "in_progress", 1, [{"name": CI_JOB, "status": "queued"}], "ci_job"),
+            ("Mac running", "in_progress", 1, [{"name": CI_JOB, "status": "in_progress"}], "ci_mac_job"),
             ("old queued", "queued", 61, [], ""),
             ("old in_progress", "in_progress", 61, [], "ci_job"),
             ("at limit", "queued", 60, [], "ci_job"),
@@ -1829,10 +1832,19 @@ for arguments in (
                 if waiting:
                     if waiting == "ci_job":
                         self.assertIn("a CI run may still use the Mac", result.stdout)
+                    elif waiting == "ci_mac_job":
+                        self.assertIn("hana CI is running on the Mac", result.stdout)
                     else:
                         self.assertIn("gh returned invalid JSON", result.stdout)
                     self.assertEqual(block["state"], "pending")
                     self.assertEqual(block["waiting_on"], {"kind": waiting})
+                    decoded = mac_test.read_block(self.state_directory / "block.json")
+                    self.assertIsInstance(decoded, mac_test.PendingMacBlock)
+                    assert isinstance(decoded, mac_test.PendingMacBlock)
+                    self.assertEqual(mac_test.block_record(decoded)["waiting_on"], {"kind": waiting})
+                    self.assertEqual(mac_test.pending_wait_text(decoded.waiting_on),
+                        "hana CI is running on the Mac" if waiting == "ci_mac_job" else
+                        "a CI run may still use the Mac" if waiting == "ci_job" else "CI could not be checked")
                 else:
                     self.assertEqual(block["state"], "active")
 
@@ -1851,41 +1863,41 @@ for arguments in (
         self.assertEqual(self.block_state()["state"], "active")
 
     def test_busy_ci_keeps_block_pending_until_watch_sends_once(self) -> None:
-        self.gh["queued"] = [{"databaseId": 41, "createdAt": datetime.now(timezone.utc).isoformat()}]
-        self.gh["jobs"] = {
-            "41": [{"name": CI_JOB, "status": "in_progress", "conclusion": ""}]
-        }
-        self.sync_gh()
-        pending = self.command("block", "--holder", "alice", "--for", "rendering")
-        block = self.block_state()
-        self.assert_command(
-            pending,
-            0,
-            "Block pending for alice: a CI run may still use the Mac. Nothing new "
-            + "starts there, and you get a message when CI no longer needs the Mac.\n"
-            + self.expiry_line(block),
-        )
-        self.assertEqual(block["state"], "pending")
-        self.assertEqual(block["waiting_on"], {"kind": "ci_job"})
+        for status, kind, text in (
+            ("queued", "ci_job", "a CI run may still use the Mac. Nothing new starts there, "
+             + "and you get a message when CI no longer needs the Mac."),
+            ("in_progress", "ci_mac_job", "hana CI is running on the Mac. Nothing new starts there, "
+             + "and you get a message when it finishes."),
+        ):
+            with self.subTest(status=status):
+                self.clear_log("send-delivered")
+                (self.stub_directory / "send-keys.json").unlink(missing_ok=True)
+                self.gh["queued"] = [{"databaseId": 41, "createdAt": datetime.now(timezone.utc).isoformat()}]
+                self.gh["jobs"] = {"41": [{"name": CI_JOB, "status": status, "conclusion": ""}]}
+                self.sync_gh()
+                pending = self.command("block", "--holder", "alice", "--for", "rendering")
+                block = self.block_state()
+                self.assert_command(pending, 0, f"Block pending for alice: {text}\n" + self.expiry_line(block))
+                self.assertEqual(block["state"], "pending")
+                self.assertEqual(block["waiting_on"], {"kind": kind})
 
-        self.gh["variable"] = "false"
-        self.gh["queued"] = []
-        self.gh["jobs"] = {}
-        self.sync_gh()
-        watcher = self.start_command("watch")
-        # The watcher records the message as sent only after the send process
-        # exits, which is later than the stand-in's delivery log line.
-        active = self.wait_for_free_message({"kind": "sent"})
-        self.assertEqual(active["state"], "active")
-        deliveries = self.logged_arguments("send-delivered")
-        self.assertEqual(len(deliveries), 1)
-        self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
+                self.gh["variable"] = "false"
+                self.gh["queued"] = []
+                self.gh["jobs"] = {}
+                self.sync_gh()
+                watcher = self.start_command("watch")
+                # Read the saved receipt after the sender finishes.
+                active = self.wait_for_free_message({"kind": "sent"})
+                self.assertEqual(active["state"], "active")
+                deliveries = self.logged_arguments("send-delivered")
+                self.assertEqual(len(deliveries), 1)
+                self.assertIn("CI's hold on the Mac ended", deliveries[0][-1])
 
-        unblocked = self.command("unblock", "--holder", "alice")
-        self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
-        stdout, stderr = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-        self.assertEqual(watcher.returncode, 0, stdout + stderr)
-        self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
+                unblocked = self.command("unblock", "--holder", "alice")
+                self.assertEqual(unblocked.returncode, 0, unblocked.stdout + unblocked.stderr)
+                stdout, stderr = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                self.assertEqual(watcher.returncode, 0, stdout + stderr)
+                self.assertEqual(len(self.logged_arguments("send-delivered")), 1)
 
     def test_failed_busy_check_records_unknown_ci(self) -> None:
         self.gh["failures"] = [
@@ -3247,6 +3259,94 @@ class ClaimWatchTests(NotificationGuardedTestCase):
             self.assertEqual(list(fence_directory.iterdir()), [])
             self.assertEqual(transport_calls, 2)
             send.assert_called_once()
+
+    def test_stopped_holder_release_ends_remote_work_before_the_fence_settles(self) -> None:
+        from scripts.mac_test import eligibility, offload, claim_state
+
+        # A copy stopped before its final status leaves remote work and a held start fence.
+        for leftovers, released in ((0, True), (1, False)):
+            with self.subTest(leftovers=leftovers):
+                record = self.write_claim()
+                identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                                     cast(str, record["attempt"]))
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                fence_directory = self.root / offload.start_fence_relative(identity, "mac").parent
+                pending = offload.pending_start_path(self.paths.target, identity)
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                _ = pending.write_text("pending")
+                scripts: list[str] = []
+
+                def end_work(repository: eligibility.KnownRepository, target: str, slot: int) -> str:
+                    self.assertEqual((repository.name, target, slot), ("alpha", self.paths.target, 1))
+                    return f"echo ended-work; printf 'leftovers={leftovers}\\nrc=0\\n'"
+
+                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    self.assertEqual((arguments[0], arguments[-2]), ("ssh", "claim-mac"))
+                    scripts.append(arguments[-1])
+                    return self.run_private_shell(arguments[-1], self.root)
+
+                with mock.patch.object(offload, "leftover_check_script", side_effect=end_work), \
+                     mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch.object(mac_test, "start_watcher"):
+                    answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "",
+                        remote_work=mac_test.EndStoppedWork(eligibility.KnownRepository("alpha")))
+                self.assertEqual(len(scripts), 1)
+                self.assertLess(scripts[0].index("ended-work"), scripts[0].index("dispatch_start_settled"))
+                if released:
+                    self.assertEqual(answer, mac_test.ClaimsReleased(1, ()))
+                    self.assertFalse(self.paths.run.exists())
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(list(fence_directory.iterdir()), [])
+                else:
+                    self.assertEqual(answer, mac_test.ClaimReleaseRefused("the remote work of the claim has not ended"))
+                    self.assertEqual(self.read_claim(), record)
+                    self.assertTrue(pending.exists())
+                    pending.unlink()
+                    self.paths.run.unlink()
+
+    def test_release_survives_a_watcher_pass_during_the_fence_settle(self) -> None:
+        from scripts.buildlog import sync as buildlog_sync
+        from scripts.mac_test import offload, claim_state
+
+        # A watcher pass that lands during the settle adds bookkeeping; a new owner still refuses.
+        transfer: buildlog_sync.TransferBytes = {"operation": "ssh_activity", "sent_bytes": 1992,
+                                                 "received_bytes": 21, "complete": True}
+        for new_owner in (False, True):
+            with self.subTest(new_owner=new_owner):
+                record = self.write_claim()
+                identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                                     cast(str, record["attempt"]))
+                prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac"), self.root)
+                self.assertEqual(prepared.returncode, 0, prepared.stderr)
+                pending = offload.pending_start_path(self.paths.target, identity)
+                pending.parent.mkdir(parents=True, exist_ok=True)
+                _ = pending.write_text("pending")
+                rewritten: dict[str, object] = {**record, "transfers": [transfer],
+                                                "idle_since": "2026-10-13T12:01:00+00:00",
+                                                "work_idle_since": "2026-10-13T12:01:00+00:00"}
+                if new_owner:
+                    rewritten["pid"] = cast(int, record["pid"]) + 1
+
+                def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                    del options
+                    _ = self.paths.run.write_text(json.dumps(rewritten))
+                    return self.run_private_shell(arguments[-1], self.root)
+
+                with mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch.object(mac_test, "start_watcher"):
+                    answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "")
+                if new_owner:
+                    self.assertEqual(answer, mac_test.ClaimReleaseRefused("the exact claim changed during cleanup"))
+                    self.assertEqual(self.read_claim(), rewritten)
+                    self.assertTrue(pending.exists())
+                    pending.unlink()
+                    self.paths.run.unlink()
+                else:
+                    self.assertEqual(answer, mac_test.ClaimsReleased(1, (transfer,)))
+                    self.assertFalse(self.paths.run.exists())
+                    self.assertFalse(pending.exists())
 
     def test_process_claim_release_message_keeps_process_bound_claim_command(self) -> None:
         record = self.write_claim(idle_since=mac_test.timestamp(self.now - timedelta(minutes=15)))

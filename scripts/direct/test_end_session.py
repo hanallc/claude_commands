@@ -14,10 +14,12 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib import unit_runs
+from scripts.lib import build_folders, unit_runs
+from scripts.lib.checkout_test_support import copy_runtime
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
 
@@ -85,6 +87,7 @@ class EndSessionTests(unittest.TestCase):
             encoding="utf-8",
         )
         python_shim.chmod(0o755)
+        copy_runtime(self.root)
         self.session_id = session_id
 
     def run_pointer(self) -> Path | None:
@@ -99,11 +102,11 @@ class EndSessionTests(unittest.TestCase):
         environment = {name: value for name, value in os.environ.items()
                        if name != "CODEX_THREAD_ID" and not name.startswith("PLAN_DELEGATE_")}
         environment.update({
+            **copies_environment(self.root),
             "HOME": str(self.root),
-            "PYTHONPATH": os.pathsep.join((str(END_SESSION.resolve().parents[2]), os.environ.get("PYTHONPATH", ""))),
+            "PYTHONPATH": os.pathsep.join((str(END_SESSION.resolve().parents[1] / "lib/python_startup"), os.environ.get("PYTHONPATH", ""))),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "CODEX_THREAD_ID": "",
-            "COPIES_CONFIG": str(END_SESSION.resolve().parents[2] / "config/copies.conf"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "END_SESSION_CALLS": str(self.calls),
             "UNIT_RUN_ROOT": str(self.runs),
@@ -131,16 +134,20 @@ class EndSessionTests(unittest.TestCase):
             source = self.seed()
             with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
                 cache = (tree / "target").resolve().parent
-            with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
-                other_cache = (other / "target").resolve().parent
+                with copies.standing("other-unit", source, copies.CommittedSource("HEAD")) as other:
+                    other_cache = (other / "target").resolve().parent
+                self.assertNotEqual(tree, other)
             with copies.workspace(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, "HEAD", name="worker", branch="worker") as workspace:
                 pass
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(tree.exists())
+            self.assertTrue(tree.exists())
+            self.assertEqual(build_folders.build_folder_state(tree), "free")
             self.assertFalse(workspace.exists())
-            self.assertFalse(other.exists())
-            self.assertFalse(cache.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(build_folders.build_folder_state(other), "free")
+            self.assertTrue(cache.exists())
+            self.assertEqual(build_folders.build_folder_state(cache), "free")
             self.assertTrue(other_cache.is_dir())
             self.assertIsNone(self.run_pointer())
 
@@ -153,13 +160,14 @@ class EndSessionTests(unittest.TestCase):
                                              "end@example.invalid", {"file": "content"}).checkout
             with copies.standing(owner, source, copies.CommittedSource("HEAD")) as tree:
                 self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
-                self.assertEqual(copies.owned_trees(owner).standing, ())
-                self.assertTrue((tree / ".git").is_dir())
-            self.assertFalse(tree.exists())
+                self.assertEqual(build_folders.build_folder_state(tree), "held")
+                self.assertTrue((tree / ".git").is_file())
+            self.assertTrue(tree.exists())
+            self.assertEqual(build_folders.build_folder_state(tree), "free")
             result = self.run_end(environment)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIsNone(self.run_pointer())
-            self.assertEqual(copies.owned_trees(owner).standing, ())
+            self.assertEqual(build_folders.build_folder_state(tree), "free")
 
     def test_end_keeps_a_busy_tree_and_still_clears_the_run_pointer(self) -> None:
         environment = self.environment()
@@ -169,7 +177,8 @@ class EndSessionTests(unittest.TestCase):
             with copies.standing(str(next(row.id for row in staff.local_snapshot().rows if row.name == "end-unit")), source, copies.CommittedSource("HEAD")) as tree:
                 result = self.run_end(environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("busy", result.stderr)
+                self.assertNotIn("busy", result.stderr)
+                self.assertEqual(build_folders.build_folder_state(tree), "held")
                 self.assertTrue(tree.exists())
             self.assertIsNone(self.run_pointer())
 

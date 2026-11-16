@@ -72,7 +72,7 @@ class UnitQueueTests(unittest.TestCase):
     def test_unreadable_queue_is_not_replaced_by_an_edit(self) -> None:
         path = unit_queue.state_path(self.member.id)
         path.parent.mkdir(parents=True)
-        for content in ('{"items": "lost"}', '["saved", 2]', 'not json'):
+        for content in ('{"items": "lost"}', '["saved", 2]', 'not json', '[{"text": "x", "after": 3}]', '[{"after": "main"}]'):
             with self.subTest(content=content):
                 _ = path.write_text(content)
                 error = io.StringIO()
@@ -85,6 +85,24 @@ class UnitQueueTests(unittest.TestCase):
                     self.assertEqual(unit_queue.main(["clear"]), 0)
                 self.assertEqual(output.getvalue(), "—\n")
                 self.assertEqual(unit_queue.read(self.member.id), [])
+
+
+    def test_an_item_can_name_the_work_it_waits_on(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(unit_queue.main(["add", "--text", "acctland", "--after", "builds/589"]), 0)
+            self.assertEqual(unit_queue.main(["add", "--text", "later"]), 0)
+            self.assertEqual(unit_queue.main(["show"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[-2:], ["1. acctland (after builds/589)", "2. later"])
+        self.assertEqual(unit_queue.read_items(self.member.id),
+                         [unit_queue.QueuedItem("acctland", "builds/589"), unit_queue.QueuedItem("later")])
+        self.assertEqual(unit_queue.read(self.member.id), ["acctland", "later"])
+        self.assertEqual(unit_queue.state_path(self.member.id).read_text(),
+                         '[{"text": "acctland", "after": "builds/589"}, "later"]\n')
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(unit_queue.main(["add", "--text", "two", "--after", "builds 589"]), 1)
+        self.assertIn("--after names one", error.getvalue())
 
 
 if __name__ == "__main__":

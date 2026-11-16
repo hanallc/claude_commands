@@ -205,7 +205,7 @@ esac
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
-               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_"))},
+               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_", "UNIT_DETACHED_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
@@ -265,9 +265,12 @@ esac
         if real_sleep is None:
             self.fail("the token fixture requires sleep on PATH")
         path = self.root / "stubs" / "sleep"
+        # A board.sh acquire waits for a held token with sleep 3 in a loop.
+        # A short real pause keeps that loop from spinning on ps, date and cat.
         _ = path.write_text(
             '#!/bin/sh\n'
-            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}"|3) ;;\n'
+            + 'case "$1" in "${BUILDLOG_MEM_POLL_S:-5}") ;;\n'
+            + f'    3) {shlex.quote(real_sleep)} 0.1 ;;\n'
             + f'    *) exec {shlex.quote(real_sleep)} "$@" ;;\nesac\n'
             + body)
         path.chmod(0o755)
@@ -508,7 +511,10 @@ esac
 
         admission.server.host_probe = provider
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=handle))
-        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"}
+        # The provider ends the hold at the next host probe, which comes with the next routing pass.
+        # A short pass interval keeps the waiter from sleeping the default 15 seconds before that probe.
+        return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
+                "BUILD_TARGETS_POLL_S": "0.5"}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
         with output.open("wb") as stream:

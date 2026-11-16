@@ -70,7 +70,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             _ = sends.pop(title)
         self.assertEqual(sends, {
             "quota_alert: codex1 now uses paid credits": ("decision", ActionRequired(
-                f"To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex1.md on {remote.local_machine()}")),
+                f"To stop it, remove codex1 from codex_credit_accounts in ~/.claude/config/accounts.conf on {remote.local_machine()}")),
             "Codex work stopped for lack of usage": ("decision", ActionRequired(REFUSAL_ACTION)),
         })
 
@@ -128,6 +128,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_legacy_blocked_cli_finds_the_canonical_episode_and_saves_no_spaced_label(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "1")]
         _ = self.alert(notes, self.now)
+        notes = [self.note("codex1.md", "active", "0", credit_balance="0")]
         _ = self.block(notes, self.now)
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.AccountCodexQuotaFallback)

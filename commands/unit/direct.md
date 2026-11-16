@@ -201,6 +201,8 @@ A no-capacity broadcast turns this mode on until the workers-back notice arrives
 A real worker launch or turn failure containing `hit your usage limit` also turns this mode on.
 That self-on mode lasts through the current phase; try a normal assign at the next phase start.
 A broadcast-on mode keeps its longer lifetime if both triggers occur.
+The no-capacity broadcast also stops every Codex worker and ends each of their open passes as canceled.
+A stop report names your stopped workers, your canceled passes, and each worker that is not proved stopped.
 Send no assign while this mode is on.
 Read `~/.claude/docs/direct/no_worker_mode.md` in full when this mode turns on.
 </NoWorkerMode>
@@ -348,12 +350,11 @@ This applies when a phase is parked, a round fails, a newer tree replaces the
 run's tree, or a result already in hand answers the question. No run finishes
 only to complete a report.
 
-- For a `detached_runs.py` run, read `pid` from its record in
-  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). Signal only while
-  its `status` is `running` and `ps -p <pid> -o args=` shows
-  `detached_runs.py supervise` with that record's path, so a reused pid is never
-  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
-  prints no pid: read it from that run's record.
+- For a `detached_runs.py` run, run
+  `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>` with its record in
+  `${SESSION_DIR}/detached_runs/` (the `.json` beside its log). It checks the
+  supervisor and the command identity, so a reused pid is never hit, and stops
+  the command's process group. The supervisor delivers the stopped result.
 - A detached `verify.sh` run uses the same record and command: `verify.sh`
   detaches through `detached_runs.py` and handles TERM to stop its step.
 - For a run in the memory queue, cancel its owning run as above. The queue
@@ -480,6 +481,20 @@ short outcome that row should show: `pass`, `clean`, `no change`. Without one
 the row can only say `done`, which reports that the window closed rather than
 what it found. Activities sit beside passes and are invisible to `findings.py`,
 which is why <PassOwnership/> forbids faking a pass for the same purpose.
+
+<WaitRecord>
+Record each wait and hold, so the units board names the reason. User, 2026-11-15.
+
+- **Wait.** When work you could start waits for a person or for other work, record it:
+  `progress_history.py start-wait --session-dir "${SESSION_DIR}" --kind <kind> --target <work> --by <who> --reason "<what lets it continue>"`.
+  `<work>` is a plan phase id or a queue item's leading id. `<who>` is who keeps it waiting: `the user`, a showrunner, a unit.
+  `<kind>` is `WaitingForUser` for a person's answer and `WaitingForSupplier` for other work.
+- **Hold.** When done work is kept from the merge, record the same command with the done phase id as `--target`.
+  `--reason` says until what: `the user checks the review page`. Use the `--kind` of whoever keeps it.
+- Close the record with `progress_history.py finish-wait --session-dir "${SESSION_DIR}" --wait-id <id>` when the reason ends.
+  `start-phase` of the target and the end of the run close it.
+- A wait for a worker, a gate, a build slot or build memory needs no record here; its own tools record it.
+</WaitRecord>
 
 A requested status check — `/unit:report`, or a user or showrunner asking —
 emits <ProgressReport/> immediately, which `~/.claude/commands/unit/report.md`

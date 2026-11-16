@@ -117,6 +117,28 @@ with (state / "validation-locks").open("a") as output:
         self.assertIn(sha[:change_review.SHORT], result.process.stdout)
         self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
         self.assertIn(change_review.COVERS, result.process.stdout)
+    def test_a_visible_checkpoint_without_an_image_is_held_before_merge(self) -> None:
+        line = "Change-Review: The grid fades | Open Hana | The grid appears"
+        with mock.patch.dict(self.env, {"GIT_COMMITTER_DATE": "2026-11-16T00:00:00-05:00",
+                                       "GIT_AUTHOR_DATE": "2026-10-15T12:00:00-04:00"}):
+            sha = self.checkpoint(subject="checkpoint(alpha): grid fades\n\n" + line)
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 1)
+        self.assert_stopped_before_merge(result, "held", "has no image")
+        self.assertIn(sha[:8] + " checkpoint(alpha): grid fades:", result.process.stdout)
+        self.assertIn("change_review.py image --image <png>", result.process.stdout)
+        self.assertIn(line, result.process.stdout)
+
+    def test_a_visible_checkpoint_before_the_image_cutoff_passes_without_an_image(self) -> None:
+        line = "Change-Review: The grid fades | Open Hana | The grid appears"
+        with mock.patch.dict(self.env, {"GIT_COMMITTER_DATE": "2026-11-15T23:59:59-05:00",
+                                       "GIT_AUTHOR_DATE": "2026-11-17T12:00:00-05:00"}):
+            sha = self.checkpoint(subject="checkpoint(alpha): grid fades\n\n" + line)
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
+        self.assertIn("change review: ok — 1 unit commit(s) carry their Change-Review lines", result.process.stdout)
+        self.assertNotIn("has no image", result.process.stdout + result.process.stderr)
+
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
         self.promotions = str(self.promote)
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"
@@ -124,7 +146,7 @@ with (state / "validation-locks").open("a") as output:
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
         self.production_doc(change_review=review)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
-                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
+                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away | image 012345abcdef\n"
                                     + "Change-Review: none — the merge script")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
@@ -135,7 +157,7 @@ with (state / "validation-locks").open("a") as output:
             assert isinstance(member.parent, staff.ReportsTo)
             production = member.parent.id
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {production} \| {producer} \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d \d\d:\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| {production} \| {producer} \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -143,7 +165,7 @@ with (state / "validation-locks").open("a") as output:
         for message, count in (("checkpoint(alpha): grid fades\n\nChange-Review: none — the merge script", 1),
                                ("Show waiting and starting session states", 0),
                                ("Show waiting and starting session states\n\n"
-                                + "Change-Review: Sessions show waiting | Read the session list | The state reads waiting", 1)):
+                                + "Change-Review: Sessions show waiting | Read the session list | The state reads waiting | image 012345abcdef", 1)):
             with self.subTest(message=message):
                 sha = self.dated_checkpoint(message)
                 result = self.run_checkpoint(sha)
@@ -380,7 +402,11 @@ with (state / "refreshed-test-locks").open("a") as output:
         failed = self.run_checkpoint(sha)
         self.assertIn("red: failed", failed.process.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
-        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"]])
+        # The base check runs the red tests alone on the tip before the merge; they pass there.
+        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"],
+                                                    ["test", "cargo-tile", "--filter", locale, "--filter", reader]])
+        self.assertIn(f"send alpha: repair merge test 1 ({locale}, {reader})", failed.process.stdout)
+        self.assertNotIn("merge director:", failed.process.stdout)
         (self.state / "events.jsonl").unlink()
         self.known_flaky_tests = f"`{reader}`, `{locale}` — red only under load"
         self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")

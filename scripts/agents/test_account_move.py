@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
 from scripts.agents.test_restart import showrunner, top_level, unit
 from scripts.agents.test_support import ShutdownTestCase
+from scripts.agents.test_support import write_machine_config
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
 HANG_GUARD_SECONDS = 300
@@ -46,6 +48,7 @@ class AccountMoveTests(ShutdownTestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(scratch_accounts_config())
+        write_machine_config(Path(os.environ["CONF_DIR"]))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.root / "notes"
         notes.mkdir()
@@ -213,6 +216,8 @@ class AccountMoveTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": os.environ["NOTIFIER_STATE_DIR"],
             "NOTIFIER_SESSIONS_DIR": str(self.root / "registry"),
             "USER_ZONE": "UTC",
+            # A set interpreter keeps scripts/lib/py from caching its choice under HOME.
+            "CLAUDE_PYTHON": sys.executable,
         }
         before = self.disk_state()
         result = subprocess.run(

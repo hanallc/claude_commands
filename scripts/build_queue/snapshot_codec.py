@@ -69,6 +69,10 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
             source = ({"kind": "SourceKeyKnown", "key": source} if source else
                       {"kind": "SourceKeyUnavailable", "reason": "older request has no source key"})
         return {**record, "source_key": source}
+    if (writing and schema.__module__ == "scripts.build_queue.admission_records"
+            and schema.__name__ == "QueueInputs"):
+        # Pinned clients require this inactive field in the wire record.
+        record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
         if writing:
             running = record["running"]
@@ -95,6 +99,60 @@ def remote_memory_row(value: object) -> bool:
             and cast(dict[str, object], measured).get("kind") == "RemoteMemoryUnavailable")
 
 
+def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
+    # Older clients at 7fdfd9a6a require the old pressure shape.
+    if record["kind"] == "PressurePolicy":
+        return {**record, "swap_used_limit": 0.0}
+    if record["kind"] == "MemoryPressure" and record.get("condition") == "some":
+        return {**record, "condition": "swap"}
+    return record
+
+
+GPU_SLOT_SUFFIX = "_gpu_slot"
+NATEDEV_HOLD_SUFFIX = "_natedev_hold"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX)
+
+
+@lru_cache(maxsize=None)
+def wait_reason_fields(schema: type) -> frozenset[str]:
+    """Name the fields that accept a wait behind the head, so an older client reads a newer wait there."""
+    return frozenset(name for name, hint in snapshot_fields(schema).items()
+                     if any(getattr(variant, "__name__", "") == "BehindHead" for variant in cast(tuple[object, ...], get_args(hint))))
+
+
+def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, object]:
+    """Write each newer wait as a wait behind the head, with the newer wait beside it.
+
+    Clients at 7fdfd9a6a have no GPU slot wait. The CI client pinned at bbc8803f4 has no natedev hold wait,
+    and it refuses its step on a wait that it cannot read.
+    """
+    shaped = dict(record)
+    for key in wait_reason_fields(schema):
+        item = record.get(key)
+        if not isinstance(item, dict):
+            continue
+        wait = cast(dict[str, object], item)
+        if wait.get("kind") == "GpuSlotWait":
+            head, suffix = f"the GPU test slot ({wait['used']} of {wait['slots']} in use)", GPU_SLOT_SUFFIX
+        elif wait.get("kind") == "NatedevHeld":
+            head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
+        else:
+            continue
+        shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}
+        shaped[key + suffix] = wait
+    return shaped
+
+
+def current_wait_shape(record: dict[str, object]) -> dict[str, object]:
+    """Restore each newer wait that the writer kept beside its older shape."""
+    shaped = dict(record)
+    for key, item in record.items():
+        for suffix in LEGACY_WAIT_SUFFIXES:
+            if key.endswith(suffix) and key.removesuffix(suffix) in record:
+                shaped[key.removesuffix(suffix)] = item
+                del shaped[key]
+    return shaped
+
 
 def snapshot_value(value: object) -> object:
     """Convert each shared record once within this encoding."""
@@ -109,9 +167,9 @@ def snapshot_value(value: object) -> object:
         if isinstance(item, Path):
             result: object = str(item)
         elif is_dataclass(item) and not isinstance(item, type):
-            result = wire_record(type(item),
+            result = legacy_wait_shape(type(item), legacy_pressure_shape(wire_record(type(item),
                 {"kind": type(item).__name__, **{name: convert(cast(object, getattr(item, name)))
-                 for name in record_field_names(type(item))}}, writing=True)
+                 for name in record_field_names(type(item))}}, writing=True)))
         elif isinstance(item, Mapping):
             result = {key: convert(value) for key, value in cast(Mapping[str, object], item).items()}
         elif isinstance(item, frozenset):
@@ -126,14 +184,42 @@ def snapshot_value(value: object) -> object:
     return convert(value)
 
 
+EXACT_SCALARS: tuple[object, ...] = (str, int, bool)
+
+
+@lru_cache(maxsize=None)
+def exact_scalars(schema: object) -> frozenset[object]:
+    """Name the scalar types that a schema takes unchanged by exact type; a float still needs its finite check."""
+    if schema in EXACT_SCALARS:
+        return frozenset({schema})
+    origin = get_origin(schema)
+    variants = cast(tuple[object, ...], get_args(schema))
+    if (origin is UnionType or origin is LITERAL_UNION_ORIGIN) and Path not in variants:
+        return frozenset(variant for variant in variants if variant in EXACT_SCALARS)
+    return frozenset()
+
+
+def parse_scalar(value: object, schema: type) -> object:
+    """Accept a value of the scalar type, or an int for a float; refuse a value that is not finite."""
+    valid = type(value) is schema or schema is float and type(value) is int
+    if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
+        raise ValueError("invalid snapshot scalar")
+    return value
+
+
 def parse_snapshot_value(value: object, schema: object) -> object:
     """Validate the wire shape against the same domain fields that the writer serializes."""
+    if schema is str or schema is int or schema is float or schema is bool:
+        # Profile records hold millions of scalars; this check comes before the typing lookups.
+        return parse_scalar(value, schema)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
     if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
+        if type(value) in exact_scalars(schema):
+            return value
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -148,11 +234,6 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         if value is not None:
             raise ValueError("invalid snapshot null")
         return None
-    if schema is str or schema is int or schema is float or schema is bool:
-        valid = (type(value) is schema or schema is float and type(value) is int)
-        if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-            raise ValueError("invalid snapshot scalar")
-        return value
     if schema is Path:
         return Path(cast(str, parse_snapshot_value(value, str)))
     if origin in (list, tuple, frozenset, Sequence):
@@ -160,7 +241,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
             raise ValueError("invalid snapshot sequence")
         items = cast(list[object], value)
         if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
-            parsed = [parse_snapshot_value(item, args[0]) for item in items]
+            exact = exact_scalars(args[0])
+            parsed = [item if type(item) in exact else parse_snapshot_value(item, args[0]) for item in items]
         else:
             if len(items) != len(args):
                 raise ValueError("invalid snapshot tuple")
@@ -182,7 +264,9 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
-    record = wire_record(schema, record, writing=False)
+    record = current_wait_shape(wire_record(schema, record, writing=False))
+    if schema.__name__ == "MemoryPressure" and record.get("condition") == "swap":
+        record = {**record, "condition": "some"}
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
         raise ValueError("invalid snapshot record fields")

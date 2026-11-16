@@ -41,6 +41,26 @@ class RoutingRuleTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2)
                     self.assertIn(message, result.stderr)
 
+    def test_attached_is_a_build_flag_that_leaves_the_command_words(self) -> None:
+        parser = shell_functions(Path(__file__).with_name("verify.sh"), "parse_routing_arguments") + r'''
+VERIFY_CALL_ENVIRONMENT=()
+CMD=$1
+shift
+parse_routing_arguments "$@"
+printf '%s\n' "${ARGS[@]}"
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            def parse(*words: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(["bash", "--noprofile", "--norc", "-c", parser, "verify-parser", *words],
+                                      cwd=directory, capture_output=True, text=True, check=False,
+                                      timeout=TEST_HANG_GUARD_SECS)
+            build = parse("build", "style_reader", "--release", "--attached")
+            self.assertEqual(build.returncode, 0, build.stderr)
+            self.assertEqual(build.stdout.splitlines(), ["style_reader", "--release"])
+            lint = parse("lint", "sample", "--attached")
+            self.assertEqual(lint.returncode, 2)
+            self.assertIn("--attached is a build flag", lint.stderr)
+
     def test_each_command_uses_the_same_rule_and_accepts_each_pin(self) -> None:
         commands: tuple[build_targets.StepKind, ...] = ("check", "test", "doc", "lint", "example", "build", "final")
         for command in commands:
@@ -49,7 +69,7 @@ class RoutingRuleTests(unittest.TestCase):
                     routing = targets.LocalRequired("local files") if pin == "--local" else targets.ANY_ELIGIBLE_TARGET
                     selection = Pinned("mac" if pin == "--mac" else "linux") if pin in ("--mac", "--target") else ROUTED
                     answer = build_targets.step_routing_rule(command, routing, selection)
-                    local = pin == "--local" or command in ("build", "final") and not pin
+                    local = pin == "--local" or command == "final" and not pin
                     self.assertIsInstance(answer, build_targets.NatedevOnly if local else build_targets.AnyTarget)
                     writing = build_targets.step_routing_rule(command, routing, selection, writes_tree=True)
                     self.assertIsInstance(writing, build_targets.NatedevOnly)
@@ -152,7 +172,7 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         targets = cast(list[dict[str, object]], packages[0]["targets"])
         targets.append({"name": "sample-cli", "kind": ["bin"], "src_path": str(self.root / "src/main.rs")})
         self.environment["TEST_METADATA"] = json.dumps(metadata)
-        result = self.verify("build", "sample", "--target", "linux")
+        result = self.verify("build", "sample", "--target", "linux", "--attached")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
         words, = self.received_arguments()
@@ -184,11 +204,11 @@ class FinalRemoteEnvironmentTests(VerifyMacOffloadFixture):
     def setUp(self) -> None:
         super().setUp()
         observe = f'''with open({str(VERIFY.parents[2] / "scripts/lib/package_root.py")!r}) as package_root: exec(package_root.read(), {{"__file__": package_root.name}})
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 parsed = offload.parser().parse_args(namespace=offload.CliArguments())
 request = offload.request_from_arguments(parsed)
-config = offload.read_config(Path(parsed.settings))
-command = offload.remote_test_command(config, request, offload.KnownRepository("hana"))
+config = eligibility.read_config(Path(parsed.settings))
+command = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
 with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as output:
     output.write(json.dumps({{"verb": request.verb, "environment": dict(request.environment),
                              "command": command, "copy": parsed.copy}}) + "\\n")

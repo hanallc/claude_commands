@@ -54,8 +54,8 @@ class GateRecordTests(unittest.TestCase):
                 ("g", 8, 0, 0, "affected", 1000), ("h", 8, 0, 0, "reused", 1000)]
         for identity, vcpus, status, aborted, selection, seconds in rows:
             connection.execute("""INSERT INTO gate_runs
-                (id, started_at, step, vcpus, status, aborted, selection, wall_s)
-                VALUES (?, ?, 'merge-gate', ?, ?, ?, ?, ?)""",
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'merge-gate', ?, ?, ?, ?, ?, 2, 1)""",
                 (identity, identity, vcpus, status, aborted, selection, seconds)).close()
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(40))
         self.assertIsInstance(gate_record.history_time_limit(connection, 4, (), 2, False), gate_record.NoGateTimeLimit)
@@ -78,6 +78,43 @@ class GateRecordTests(unittest.TestCase):
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
+
+    def test_full_time_limit_uses_only_runs_with_the_same_job_count(self) -> None:
+        """A 16-job run on natedev never takes its limit from 32-job cloud runs on the same vCPU count."""
+        _ = write_config_fixture(self.config / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        for identity, jobs, seconds in (("a", 32, 210), ("b", 32, 212), ("c", 32, 209)):
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'merge-gate', 32, 0, 0, 'full', ?, ?, 790)""",
+                (identity, identity, seconds, jobs)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 32, False), gate_record.GateTimeLimit(315))
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+            "no passing full gate history for 32 vCPUs at 16 jobs"))
+        connection.execute("""INSERT INTO gate_runs
+            (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+            VALUES ('d', 'd', 'merge-gate', 32, 0, 0, 'full', 420, 16, 790)""").close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(630))
+
+    def test_full_time_limit_skips_runs_of_the_type_check_alone(self) -> None:
+        """Five passing --full runs of the type check alone set a 175 s limit that cut the 11-15 nightly."""
+        _ = write_config_fixture(self.config / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        for identity, seconds, modules_run in (("a", 600, 790), ("b", 117, 0), ("c", 104, 0), ("d", 127, 0)):
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection, wall_s, max_jobs, modules_run)
+                VALUES (?, ?, 'merge-gate', 32, 0, 0, 'full', ?, 16, ?)""",
+                (identity, identity, seconds, modules_run)).close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.GateTimeLimit(900))
+        connection.execute("DELETE FROM gate_runs WHERE id = 'a'").close()
+        self.assertEqual(gate_record.history_time_limit(connection, 32, (), 16, False), gate_record.NoGateTimeLimit(
+            "no passing full gate history for 32 vCPUs at 16 jobs"))
 
     def write_json(self, value: object) -> None:
         _ = self.timing_path.write_text(json.dumps(value), encoding="utf-8")

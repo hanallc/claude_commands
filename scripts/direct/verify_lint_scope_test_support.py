@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from scripts.lib.berth_test_support import write_unconfigured_berth
+from scripts.lib.checkout_test_support import write_python_tool, write_stdlib_tool
+
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -12,7 +15,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
@@ -228,8 +230,8 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.taplo_events = self.root / "taplo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
-        self.write_executable(bin_directory / "cargo", CARGO_STUB)
-        self.write_executable(bin_directory / "taplo", TAPLO_STUB)
+        write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
         targets = self.root / "build-targets.py"
@@ -249,6 +251,7 @@ if __name__ == "__main__":
 ''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
+        write_unconfigured_berth(bin_directory)
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):
             (self.root / directory).mkdir()
         seed_interpreter_cache(self.root / "cache")
@@ -326,8 +329,7 @@ if __name__ == "__main__":
         })
 
     def write_executable(self, path: Path, source: str) -> None:
-        _ = path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
-        path.chmod(0o755)
+        write_python_tool(path, source)
 
     def write_shell(self, path: Path, source: str) -> None:
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")

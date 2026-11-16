@@ -13,7 +13,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.direct import step_record
-from scripts.direct.step_selection import Pinned
+from scripts.direct.step_row_test_support import read_step_row
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
 from scripts.direct.verify_mac_offload_test_support import VERIFY
 from scripts.lib.shell_test_support import shell_functions
@@ -21,23 +21,6 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 INVOKE = VERIFY.parent.parent / "lint/invoke.sh"
-
-
-def read_step_row(call_id: str) -> dict[str, object]:
-    """Adapt a decoded record for existing fixture observations."""
-    record = step_record.read(call_id)
-    if not isinstance(record, step_record.StepRecord):
-        raise AssertionError(f"The live record is invalid: {record}")
-    location: dict[str, object]
-    match record.runs_on:
-        case step_record.AnyTarget(_, mac_targets):
-            location = {"kind": "any_target", "mac_targets": list(mac_targets)}
-        case step_record.NatedevOnly(reason):
-            location = {"kind": "natedev_only", "reason": reason}
-    return dict(kind=record.kind, state=record.state.value, selected_target=record.selected_target,
-                updated=record.updated, runs_on=location, eligible_targets=list(record.eligible_targets),
-                pinned_target=record.selection.target if isinstance(record.selection, Pinned) else "",
-                package=step_record.package_name(record.package))
 
 
 OBSERVER = r'''
@@ -152,6 +135,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
             "read_metadata", "load_metadata", "workspace_taplo",
+            "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
         scripts = Path(step_record.__file__).resolve().parent.parent
         functions += shell_functions(INVOKE, "buildlog_step_compiles", "fmt_cargo", "invoke_mend", "invoke_clippy", "invoke_clippy_fix")
@@ -168,6 +152,7 @@ TOKEN_USED=0 TOKEN_WAITED=0
 HOLD_LINT=0 CHECK_LINT=0 METADATA_READY=0
 FEATURE_FLAGS=()
 VERIFY_METADATA_SCRIPT=$TEST_REAL_DIRECT/verify_metadata.py
+FIX_RETURN_SCRIPT=$TEST_REAL_DIRECT/../mac_test/fix_return.py
 source "$LINT_CONFIG_READER"
 run_once() { "$@"; }
 BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
@@ -252,18 +237,18 @@ if "--version" not in arguments and ("fmt" in arguments or ("mend" in arguments 
         for damage in ("removed", "foreign", "nul"):
             with self.subTest(damage=damage):
                 targets = Path(self.fixture.environment["BUILD_TARGETS_SCRIPT"])
-                source = TARGETS.replace('raise SystemExit(10 if any(holders.iterdir()) else 0)', '''
-    if command == "register-local":
-        for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
-            if os.environ["TEST_RECORD_DAMAGE"] == "removed":
-                path.unlink()
-            elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
-                path.write_bytes(path.read_bytes() + bytes([0]))
-            else:
-                row = json.loads(path.read_text())
-                row["pid"] = os.getpid()
-                path.write_text(json.dumps(row))
-    raise SystemExit(10 if any(holders.iterdir()) else 0)''')
+                source = TARGETS.replace('        return 10 if any(holders.iterdir()) else 0', '''
+        if command == "register-local":
+            for path in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+                if os.environ["TEST_RECORD_DAMAGE"] == "removed":
+                    path.unlink()
+                elif os.environ["TEST_RECORD_DAMAGE"] == "nul":
+                    path.write_bytes(path.read_bytes() + bytes([0]))
+                else:
+                    row = json.loads(path.read_text())
+                    row["pid"] = os.getpid()
+                    path.write_text(json.dumps(row))
+        return 10 if any(holders.iterdir()) else 0''')
                 _ = targets.write_text(source)
                 self.fixture.environment["TEST_RECORD_DAMAGE"] = damage
                 result = self.call_step_functions("run cargo check -p sample\n", kind="check")

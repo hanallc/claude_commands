@@ -27,6 +27,7 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
@@ -36,7 +37,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import offload
+from scripts.mac_test import eligibility, offload
 from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
@@ -69,6 +70,8 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
+        private = private_slot_config(self.root, repository="repository", maximum=2)
+        self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
         _ = self.enterContext(mock.patch("scripts.mac_test.offload", offload))
@@ -105,7 +108,7 @@ class RemoteEntryTests(unittest.TestCase):
         use_results: list[subprocess.CompletedProcess[str]] = []
 
         def use_during_removal(parent: Path) -> None:
-            # Remove the old lock files before checkout, as scratch.remove does.
+            # Remove the lock files first, as mirror_remove does after the task folder goes.
             for path in (floor_claims.mirror_lock_path(checkout), floor_claims.record_lock_path(checkout)):
                 path.unlink()
             result = subprocess.run([sys.executable, str(copies.__file__),
@@ -123,7 +126,9 @@ class RemoteEntryTests(unittest.TestCase):
               mock.patch.object(scratch, "remove", side_effect=use_during_removal)):
             self.assertEqual(copies.mirror_remove(mirror_arguments(task_mirror, "mirror-remove")), 0)
         self.assertEqual(len(use_results), 1)
-        self.assertFalse(checkout.parent.exists())
+        self.assertFalse(checkout.exists())
+        self.assertFalse(floor_claims.mirror_lock_path(checkout).exists())
+        self.assertFalse(floor_claims.record_lock_path(checkout).exists())
         self.assertFalse(floor_claims.mirror_parent_lock_path(checkout).exists())
 
         replacement_tree = self.root / "replacement-parent/checkout"
@@ -285,7 +290,7 @@ class RemoteEntryTests(unittest.TestCase):
         with copies.standing(owner, self.source, copies.CommittedSource("HEAD")) as tree:
             pass
         copies.remove_trees(owner)
-        self.assertFalse(tree.exists())
+        self.assertTrue(tree.exists())
         self.assertFalse(self.mirror.exists())
         self.assertEqual(copies.owned_remote_mirrors(owner), [])
         self.assertTrue(Path(other.path).exists())
@@ -427,9 +432,9 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 authority = self.interrupt_mirror_removal(original, moment)
                 tree = Path(original.path)
                 with self.admission(free_gib=0) as (controller, config, request):
-                    def receive(current: offload.ProcessController, settings: offload.OffloadConfig,
+                    def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: offload.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
                         self.assertIs(current, controller)
                         self.assertEqual(settings.host, config.host)
                         mirror = offload.request_mirror(settings, selected, repository)
@@ -546,9 +551,9 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 original = self.mirror_record(path=self.mirror.parent / "slot-1")
                 _ = self.interrupt_mirror_removal(original, moment)
                 with self.admission(free_gib=0) as (controller, config, request):
-                    def receive(current: offload.ProcessController, settings: offload.OffloadConfig,
+                    def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: offload.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
                         self.assertIs(current, controller)
                         mirror = offload.request_mirror(settings, selected, repository)
                         args = mirror_arguments(mirror, "mirror-receive")
@@ -627,10 +632,10 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             send_process_group(owner.pid, signal.SIGKILL)
             _ = owner.communicate(timeout=5)
 
-    def test_standing_checkout_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
+    def test_workspace_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
             with self.subTest(damaged=damaged):
-                with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as tree:
+                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as tree:
                     cache = (tree / "target").resolve()
                     _ = (tree / ".git/index.lock").write_text("stopped writer")
                     if damaged:
@@ -639,20 +644,20 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                     self.assertFalse((tree / ".git/index.lock").exists())
                     _ = copies.git(tree, "read-tree", "HEAD")
                     self.assertEqual((tree / "source.txt").read_text(), "content\n")
-                self.assertFalse(tree.exists())
-                with copies.standing("alpha", self.source, copies.StagedSource(copies.staged_tree(self.source))) as reused:
-                    self.assertNotEqual(reused, tree)
+                self.assertTrue(tree.exists())
+                with copies.workspace("alpha", self.source, "HEAD", name="repaired", branch="worker") as reused:
+                    self.assertEqual(reused, tree)
                     self.assertEqual((reused / "target").resolve(), cache)
                     self.assertEqual((reused / "source.txt").read_text(), "content\n")
                     self.assertFalse((reused / ".git/index.lock").exists())
 
     @contextmanager
     def admission(self, *, free_gib: float = 200) -> Generator[tuple[offload.ProcessController,
-            offload.OffloadConfig, offload.OffloadRequest]]:
+            eligibility.OffloadConfig, offload.OffloadRequest]]:
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "slots=2\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
-        config = offload.OffloadConfig(True, offload.SshConnectionSettings("host", 1, 1),
+        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1),
                                       1, 1, 1, "1", {"slots": "2"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
@@ -687,13 +692,13 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertEqual(copies.mirror_run(args), 0)
             return offload.ReportedMacStatus(0, offload.CleanupKept())
 
-        def mirror_path(repository: offload.KnownRepository, target: str = "mac", slot: int = 1) -> str:
+        def mirror_path(repository: eligibility.KnownRepository, target: str = "mac", slot: int = 1) -> str:
             self.assertEqual(repository.name, "repository")
             self.assertEqual(target, "linux")
             return str(self.mirror.parent / f"slot-{slot}")
 
         with (
-            mock.patch.object(offload, "mac_step_eligibility", return_value=offload.KnownRepository("repository")),
+            mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("repository")),
             mock.patch.object(offload, "trusted_linux_source", return_value=True),
             mock.patch.object(target_config, "configured_ssh_target", return_value=target),
             mock.patch.object(offload, "remote_mirror", side_effect=mirror_path),
@@ -769,8 +774,8 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
                 "run", "--repo-root", str(self.source), "--package", "repository", "--call-id", "owner-chain",
             ], namespace=offload.CliArguments())
             request = offload.request_from_arguments(args)
-            config = offload.read_config()
-            mirror = offload.request_mirror(config, request, offload.KnownRepository("repository"))
+            config = eligibility.read_config()
+            mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
             with copies.remote_lease(mirror):
                 copies.register_remote(mirror)
                 with self.assertRaisesRegex(copies.CopyError, f"busy; held by session {owner.current_session}"):
@@ -822,7 +827,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             reservation, = mac_test.read_claims(paths)
             request = replace(request, admission=offload.MacClaimFromWait(
                 os.getpid(), claim_state.claim_identity(reservation.record), NoOwningSession()))
-            result = offload.claim_for_run(controller, config, request, offload.KnownRepository("repository"), (2,))
+            result = offload.claim_for_run(controller, config, request, eligibility.KnownRepository("repository"), (2,))
             self.assertIsInstance(result, offload.MacClaimNotConfirmed)
             claims = mac_test.read_claims(paths)
             self.assertEqual(len(claims), 1)

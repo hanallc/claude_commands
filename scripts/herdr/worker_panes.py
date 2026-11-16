@@ -22,15 +22,16 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
-from functools import partial
+from functools import cache, partial
 from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, Literal, cast, final
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
+from scripts.whoami import quota_state
 from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -276,25 +277,32 @@ class WorkerLockHold:
 
 
 @contextmanager
-def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False) -> Generator[WorkerLockHold | Kept]:
-    """Serialize creation, then hold the published worker's fixed-id lock."""
+def worker_lock(parent: StaffId, name: WorkerName, *, blocking: bool = False,
+                deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[WorkerLockHold | Kept]:
+    """Hold the name lock and the fixed-id lock through startup and dispatch.
+
+    A deadline limits the wait for both locks.
+    """
     with ExitStack() as operations:
         record = staff.snapshot()
         row = worker_admission.find_worker(record, parent, name.value)
-        if row is None:
-            path = _worker_lock_path(f"{parent}-{name.value}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            creation = operations.enter_context(path.open("a"))
-            try:
+        path = _worker_lock_path(f"{parent}-{name.value}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        creation = operations.enter_context(path.open("a"))
+        try:
+            if deadline == worker_lifecycle.NO_LOCK_DEADLINE:
                 fcntl.flock(creation, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-            except BlockingIOError:
-                yield Kept("worker creation lock is held")
-                return
+            else:
+                worker_lifecycle.acquire_flock(creation, deadline=deadline)
+        except (BlockingIOError, worker_lifecycle.OperationDeadlineExpired):
+            yield Kept("worker creation lock is held" if row is None else "dispatch lock is held")
+            return
+        if row is None:
             row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         hold = WorkerLockHold(parent, name, operations, blocking=blocking)
         try:
             if row is not None:
-                hold.bind(row)
+                hold.bind(row, deadline=deadline)
         except BlockingIOError:
             yield Kept("dispatch lock is held")
             return
@@ -321,6 +329,7 @@ class PaneEvidence:
     scan: herdr.RowPaneScan
     states: list[WorkerPane]
     layout_terminals: frozenset[str]
+    parent_tabs: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -357,6 +366,7 @@ class PaneRead:
     scan: herdr.RowPaneScan
     statuses: dict[str, herdr.AgentStatus]
     launches: LaunchRecords | LaunchRecordsUnavailable
+    launch_owners: dict[str, StaffId]
 
 
 @dataclass(frozen=True)
@@ -423,7 +433,11 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
         statuses = {agent["pane_id"]: agent["agent_status"] for agent in agent_inventory(client)}
     except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
         statuses = {}
-    return PaneRead(panes, scan, statuses, launches)
+    # The staff owner of each launched pane, read once for all parents.
+    launch_owners = ({pane: reference.id for pane, entry in launches.entries.items()
+                      if isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)}
+                     if isinstance(launches, LaunchRecords) else {})
+    return PaneRead(panes, scan, statuses, launches, launch_owners)
 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
@@ -434,15 +448,16 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 or isinstance(selection, SelectedWorkers) and row.name in selection.names
                 or isinstance(selection, SelectedWorkerRows) and row.id in selection.ids]
     if isinstance(read, PaneReadUnavailable):
-        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected], frozenset())
-    panes, scan, statuses = read.panes, read.scan, read.statuses
-    launch_owners = ({pane: reference.id for pane, entry in read.launches.entries.items()
-                      if isinstance(reference := pane_launch.launch_reference(entry, record), pane_launch.StaffLaunchReference)}
-                     if isinstance(read.launches, LaunchRecords) else {})
+        return PaneEvidence([], herdr.RowPaneScan({}, []), [_uncertain(row, read.reason) for row in selected],
+                            frozenset(), frozenset())
+    panes, scan, statuses, launch_owners = read.panes, read.scan, read.statuses, read.launch_owners
     parent_panes = scan.found.get(parent, []) + [pane for pane in panes
         if launch_owners.get(_text(pane, "pane_id")) == parent
         and not any(pane in found for owner, found in scan.found.items() if owner != parent)]
     parent_tabs = {_text(pane, "tab_id") for pane in parent_panes} - {""}
+    # Only a worker that launched a pane in a parent tab can recover one.
+    launched_here = {launch_owners[pane_id] for pane in panes
+                     if (pane_id := _text(pane, "pane_id")) in launch_owners and _text(pane, "tab_id") in parent_tabs}
     states: list[WorkerPane] = []
     for row in selected:
         matches = scan.found.get(row.id, [])
@@ -461,7 +476,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         if isinstance(read.launches, LaunchRecordsUnavailable):
             states.append(_uncertain(row, read.launches.reason))
             continue
-        recovery = [pane for pane in pane_launch.reference_panes(
+        recovery = [] if row.id not in launched_here else [pane for pane in pane_launch.reference_panes(
                     pane_launch.StaffLaunchReference(row.id), record, client, read.launches.entries,
                     evidence=pane_launch.NativePaneEvidence(panes, scan))
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
@@ -497,7 +512,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
             if (launch_owners.get(_text(pane, "pane_id")) in worker_ids
                 or any(pane in scan.found.get(row.id, []) for row in workers))
             and _text(pane, "tab_id") in parent_tabs)
-    return PaneEvidence(panes, scan, states, terminals)
+    return PaneEvidence(panes, scan, states, terminals, frozenset(parent_tabs))
 
 
 def _evidence(parent: StaffId, record: staff.StaffSnapshot, client: herdr.Herdr, *,
@@ -585,15 +600,28 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
     workers = record.find(kind="worker")
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
+    from scripts.direct import progress_history
+
     scanned = parent_run_index(record)
+    linked = progress_history.recorded_dispatch_runs()
+    # Workers share their parent's runs; build their paths and read their state files once.
+    read = cache(_run_state)
+    parents: dict[StaffId, tuple[list[Path], Path, tuple[Path, ...]]] = {}
     found: dict[StaffId, tuple[Path, ...]] = {}
     for row in workers:
         parent = record.parent_of(row) or row
-        selected = worker_run(row, record=record, scanned=scanned)
-        held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-        recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
-        found[row.id] = tuple(dict.fromkeys((selected, *(Path(directory) for directory in held),
-                                            *recorded, worker_fallback_run(parent, record=record))))
+        if parent.id not in parents:
+            held = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
+            recorded = (parent.run.path,) if isinstance(parent.run, staff.OpenRun) else ()
+            fallback = worker_fallback_run(parent, record=record)
+            runs = [Path(run) for run in _parent_runs(parent, held)]
+            parents[parent.id] = (runs, runs[0] if runs else fallback,
+                                  (*(Path(directory) for directory in held), *recorded, fallback))
+        runs, first, shared = parents[parent.id]
+        dispatched = linked[row.id].directory if row.id in linked else None
+        selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
+                    else worker_run(row, record=record, scanned=scanned))
+        found[row.id] = tuple(dict.fromkeys((selected, *shared)))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
 
@@ -611,24 +639,37 @@ def worker_run(member: staff.StaffRow, *,
         return unit_runs.state_dir() / "staff" / "workers" / member.id
     if scanned is None:
         scanned = parent_run_index(record)
-    runs = unit_runs.held(str(parent.current_session), record=record, scanned=scanned)
-    if isinstance(parent.run, staff.OpenRun):
-        runs = list(dict.fromkeys((str(parent.run.path), *runs)))
+    runs = [Path(run) for run in _parent_runs(parent, unit_runs.held(str(parent.current_session), record=record, scanned=scanned))]
+    first = runs[0] if runs else worker_fallback_run(parent, record=record)
+    if member.kind != "worker":
+        return first
+    from scripts.direct import progress_history
+
+    dispatched = progress_history.recorded_dispatch_run(member.id)
+    linked = dispatched.directory if isinstance(dispatched, progress_history.RecordedDispatchRun) else None
+    return _worker_run_in(member, runs, linked, first, record=record, read=_run_state)
+
+
+def _parent_runs(parent: staff.StaffRow, held: list[str]) -> list[str]:
+    """Order the parent's open run, its held runs, then a supplied run that it owns."""
+    runs = list(dict.fromkeys((str(parent.run.path), *held))) if isinstance(parent.run, staff.OpenRun) else held
     if supplied := unit_runs.environ("RUN_DIR"):
         fields = worker_lifecycle.read_json_object(Path(supplied) / recorder_state.STATE_FILENAME)
         if fields.get(unit_runs.OWNER_FIELD) == parent.id:
             runs = list(dict.fromkeys((*runs, supplied)))
-    fallback = Path(runs[0]) if runs else worker_fallback_run(parent, record=record)
-    if member.kind == "worker":
-        from scripts.direct import progress_history
+    return runs
 
-        dispatched = progress_history.recorded_dispatch_run(member.id)
-        linked = (dispatched.directory,) if isinstance(dispatched, progress_history.RecordedDispatchRun) else ()
-        candidates = dict.fromkeys((*(Path(run) for run in runs), *linked, fallback))
-        passes = [(run, passed) for run in candidates if (passed := worker_pass(member, run, record=record))]
-        if passes:
-            return max(passes, key=lambda item: _pass_started_at(item[1]))[0]
-    return fallback
+
+def _worker_run_in(member: staff.StaffRow, runs: Sequence[Path], linked: Path | None, fallback: Path, *,
+                   record: staff.StaffSnapshot, read: Callable[[Path], dict[str, object]]) -> Path:
+    """Select the parent run or linked run that holds the worker's newest pass."""
+    candidates = dict.fromkeys((*runs, *(() if linked is None else (linked,)), fallback))
+    passes = [(run, passed) for run in candidates if (passed := _pass_in(member, read(run), record))]
+    return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else fallback
+
+
+def _run_state(run: Path) -> dict[str, object]:
+    return worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
 
 
 def _passes(state: dict[str, object]) -> list[dict[str, object]]:
@@ -647,8 +688,11 @@ def worker_pass(row: staff.StaffRow, run: Path, *,
                 record: staff.StaffSnapshot | None = None) -> dict[str, object]:
     """Select the fixed participant after checking its current staff parent."""
     record = staff.local_snapshot() if record is None else record
+    return _pass_in(row, _run_state(run), record)
+
+
+def _pass_in(row: staff.StaffRow, fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
     current = record.by_id(row.id)
-    fields = worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
     owner = unit_runs.run_owner(fields, record)
     if (current is None or current.kind != "worker" or not isinstance(owner, staff.StaffRow)
             or current.parent != staff.ReportsTo(owner.id)):
@@ -837,10 +881,11 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     return completion
 
 
-def launch_policy(role: WorkerRole) -> LaunchPolicy:
+def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned"] = "assigned") -> LaunchPolicy:
+    """Read the role's launch policy; a named family reads that family's row instead of the assigned one."""
     from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
-    settings = models_registry.launch_settings(section, key)
+    settings = models_registry.launch_settings(section, key, family)
     sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
@@ -889,6 +934,19 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
         if settings.effort and settings.effort != "unset":
             arguments += ["--effort", settings.effort]
     return arguments + _turn_end_arguments(settings.kind)
+
+
+def kept_settings(settings: models_registry.LaunchSettings, arguments: Sequence[str]) -> models_registry.LaunchSettings:
+    """Keep the model, effort and tier that a saved launch passed; a launch without a model keeps the given settings."""
+    recorded = {"--model": "", "--effort": "", "model_reasoning_effort": "", "service_tier": ""}
+    for flag, value in zip(arguments, arguments[1:]):
+        name, _, setting = value.partition("=") if flag == "-c" else (flag, "", value)
+        if name in recorded:
+            recorded[name] = setting.strip('"')
+    if not recorded["--model"]:
+        return settings
+    return settings._replace(model=recorded["--model"], effort=recorded["--effort"] or recorded["model_reasoning_effort"],
+                             service_tier=recorded["service_tier"])
 
 
 def launch_arguments(policy: LaunchPolicy, identity: str, directory: Path | str) -> list[str]:
@@ -1104,7 +1162,7 @@ def first_turn_session(client: herdr.Herdr, pane: str, terminal: str) -> str:
             session = client.native_session(pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS)
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             failure = str(error)
-            _ = Event().wait(max(0, min(0.1, deadline - time.monotonic())))
+            _ = Event().wait(max(0, min(herdr.PANE_POLL_SECONDS, deadline - time.monotonic())))
             continue
         remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
         if isinstance(client.wait_turn_end(pane, remaining_ms), herdr.WaitTimedOut):
@@ -1418,7 +1476,14 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     _layout(owner.id, fresh)
     if isinstance(result, (OpenWorker, ProcessUnknownWorker)):
         return replace(result, created_pane=created_pane())
-    return result if isinstance(result, UncertainWorker) else _uncertain(row, "agent launch is incomplete")
+    if isinstance(result, UncertainWorker):
+        return result
+    state_kind = type(result).__name__ if result is not None else "missing"
+    scan_reason = next((item.reason for item in fresh.scan.unknown if item.pane == launched.pane), "none")
+    tab = next((_text(pane, "tab_id") for pane in fresh.panes if _text(pane, "pane_id") == launched.pane), "")
+    parent_tab = "yes" if tab and tab in fresh.parent_tabs else "no"
+    return _uncertain(row,
+        f"agent launch is incomplete; state={state_kind}; scan={scan_reason}; parent_tab={parent_tab}")
 
 
 def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.StaffSnapshot) -> None:
@@ -1461,7 +1526,16 @@ def close(parent: StaffId, name: WorkerName, *,
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)
             _layout(parent, evidence)
+            forget_restart(row)
             return Closed()
+
+
+def forget_restart(row: staff.StaffRow) -> None:
+    """Remove a suspended worker from the restart record: a restart never starts it."""
+    try:
+        shutdown_record.forget([str(row.id)])
+    except (OSError, ValueError) as error:
+        print(f"{row.name}: restart record anomaly: {' '.join(str(error).split())}", file=sys.stderr)
 
 
 def _layout(parent: StaffId, evidence: PaneEvidence) -> None:
@@ -1556,6 +1630,9 @@ def main(arguments: list[str] | None = None) -> int:
             if worker_admission.find_worker(record, owner.id, name.value) is None:
                 return _result(AdmissionRefused(f"no worker named {name.value}"))
             return _result(close(owner.id, name))
+        if quota_state.no_worker_mode():
+            print(f"worker_panes.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
+            return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr_types.HerdrFailure) as error:

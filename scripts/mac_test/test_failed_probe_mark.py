@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from typing import cast, override
 import unittest
 from unittest import mock
@@ -26,7 +27,7 @@ from scripts.build_targets import build_targets, target_config, targets
 from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
 from scripts.lib.process_group import send_process_group
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import mac_test, offload, claim_state
+from scripts.mac_test import eligibility, mac_test, offload, claim_state
 from scripts.mac_test.offload_test_support import OffloadCommandFixture
 
 VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
@@ -34,7 +35,7 @@ VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
 
 class FailedProbeTests(OffloadCommandFixture):
     linux_settings: Path = Path()
-    identity: offload.KnownRepository = offload.KnownRepository("hana")
+    identity: eligibility.KnownRepository = eligibility.KnownRepository("hana")
 
     @override
     def setUp(self) -> None:
@@ -53,10 +54,13 @@ class FailedProbeTests(OffloadCommandFixture):
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
-        config = offload.read_config(self.config_path if target == "mac" else self.linux_settings)
+        config = eligibility.read_config(self.config_path if target == "mac" else self.linux_settings)
         return offload.probe_mac(offload.ProcessController(), config, self.identity, target)
 
     def healthy(self) -> None:
+        # Recovery starts after the configured failure backoff expires.
+        for target in ("mac", "box"):
+            offload.write_backoff(time.time() - 1, target)
         self.fixture["probe_status"] = 0
         self.fixture["probe_lines"] = ["free_gib=120", "host=fixture", "rc=0",
                                        "nextest=fixture", "mend=fixture", "scripts_commit=fixture"]
@@ -87,16 +91,55 @@ class FailedProbeTests(OffloadCommandFixture):
         return build_targets.command_release_wait(os.getpid(),
             identity=claim_state.claim_identity(claim.record), session=NoOwningSession())
 
+    def test_two_mac_eligibility_reads_share_the_failure_backoff(self) -> None:
+        target = target_config.configured_ssh_target("mac")
+        for failure in (offload.COMMAND_COULD_NOT_START, offload.COMMAND_TIMED_OUT,
+                        offload.CommandOutput(255, "", "private connection refused")):
+            with self.subTest(failure=type(failure).__name__):
+                eligibility.backoff_path("mac").unlink(missing_ok=True)
+                (eligibility.state_directory("mac") / "failed_probe").unlink(missing_ok=True)
+                with mock.patch.object(offload.ProcessController, "capture", return_value=failure) as capture, \
+                     redirect_stderr(io.StringIO()):
+                    first = build_targets.mac_target_eligibility(target, self.repository, "hana", "test",
+                        targets.ANY_ELIGIBLE_TARGET, session=NoOwningSession())
+                    second = build_targets.mac_target_eligibility(target, self.repository, "hana", "test",
+                        targets.ANY_ELIGIBLE_TARGET, session=NoOwningSession())
+                self.assertIsInstance(first, targets.ExcludedTarget)
+                self.assertIsInstance(second, targets.ExcludedTarget)
+                self.assertEqual(capture.call_count, 1)
+                self.assertIsInstance(eligibility.read_backoff(time.time(), "mac"), eligibility.ActiveBackoff)
+                self.assertIsInstance(eligibility.read_failed_probe("mac"), eligibility.FailedProbe)
+
+    def test_probe_logs_only_failure_and_recovery_transitions(self) -> None:
+        config = eligibility.read_config(self.config_path)
+        errors = io.StringIO()
+        with mock.patch.object(offload.ProcessController, "capture", return_value=offload.COMMAND_COULD_NOT_START) as capture, \
+             redirect_stderr(errors):
+            for _ in range(3):
+                self.assertIsInstance(offload.probe_mac(offload.ProcessController(), config, self.identity),
+                                      offload.UnavailableProbe)
+            self.assertEqual(capture.call_count, 3)
+            self.assertEqual(len(errors.getvalue().splitlines()), 1)
+            capture.return_value = offload.CommandOutput(0, "free_gib=120\nhost=fixture\nrc=0\n", "")
+            self.assertIsInstance(offload.probe_mac(offload.ProcessController(), config, self.identity),
+                                  offload.ProbeSnapshot)
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("could not start", lines[0])
+        self.assertIn("reachable again", lines[1])
+        self.assertIsInstance(eligibility.read_failed_probe("mac"), eligibility.NoFailedProbe)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "mac"), eligibility.NoBackoff)
+
     def test_version_decline_stays_repository_specific_after_backoff_expires(self) -> None:
         self.healthy()
         self.fixture["probe_lines"][-3] = "nextest=wrong"
         with redirect_stderr(io.StringIO()):
             probe = self.probe()
         self.assertIsInstance(probe, offload.UnavailableProbe)
-        self.assertIsInstance(offload.read_backoff(time.time(), "box"), offload.NoBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time(), "box"), eligibility.NoBackoff)
         self.assertEqual(self.free(), "bad")
         offload.write_backoff(time.time() - 1, "box")
-        _ = offload.linux_version_decline_path("box", "hana").write_text("0")
+        _ = eligibility.linux_version_decline_path("box", "hana").write_text("0")
         self.assertEqual(self.free(), "bad")
         other = self.root / "other"
         _ = subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
@@ -195,6 +238,7 @@ class FailedProbeTests(OffloadCommandFixture):
             self.assertIsInstance(self.probe("mac"), offload.UnavailableProbe)
         self.assertEqual(output.getvalue().splitlines(),
                          ["mac_test: could not reach the Mac: ValueError: fixture failed"])
+        offload.write_backoff(time.time() - 1, "mac")
         self.assertEqual(self.free("mac"), "bad")
 
 
@@ -244,7 +288,7 @@ class FailedProbeTests(OffloadCommandFixture):
             '    if [[ " $* " != *" --files-from="* ]]; then\n'
             + f'        {shlex.quote(sys.executable)} {shlex.quote(str(receiver))} "${{@: -2:1}}" "${{!#}}" || exit $?\n'
             + '    fi\n    exit "$rsync_status"')
-        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
         self.environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
         source = source.replace('exit "$probe_status"',
             'printf "end %s\\n" "$EPOCHREALTIME" >> "$root/probe-timing"\nexit "$probe_status"')
@@ -263,7 +307,7 @@ class FailedProbeTests(OffloadCommandFixture):
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         offload.write_version_decline("box", "hana")
-        decline = offload.linux_version_decline_path("box", "hana").read_text()
+        decline = eligibility.linux_version_decline_path("box", "hana").read_text()
         self.healthy()
         self.fixture["hold_probe"] = True
         self.sync_fixture()
@@ -280,7 +324,7 @@ class FailedProbeTests(OffloadCommandFixture):
                                                      targets.LocalRequired("local step"), new_step=True)
         self.assertIsInstance(result, targets.ExcludedTarget)
         # The worker holds the probe gate. The eligibility answer must return first.
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             with self.assertRaises(BlockingIOError):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = build_targets.ssh_target_eligibility(target, self.repository, "hana", "test",
@@ -291,11 +335,11 @@ class FailedProbeTests(OffloadCommandFixture):
             _ = os.write(descriptor, b"continue\ncontinue\ncontinue\n")
         finally:
             os.close(descriptor)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         elapsed = time.monotonic() - started
-        self.assertIsInstance(offload.read_failed_probe("box"), offload.NoFailedProbe)
-        self.assertEqual(offload.linux_version_decline_path("box", "hana").read_text(), decline)
+        self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.NoFailedProbe)
+        self.assertEqual(eligibility.linux_version_decline_path("box", "hana").read_text(), decline)
         self.assertEqual(stale_source.read_text(), "current repository tree")
         copies = [event for event in self.events() if event["command"] == "rsync"]
         self.assertEqual(len(copies), 2)
@@ -360,7 +404,7 @@ class FailedProbeTests(OffloadCommandFixture):
             if recovery_started:
                 with (self.stub_directory / "continue-probe").open("w") as release:
                     _ = release.write("continue\ncontinue\ncontinue\n")
-                with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+                with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertEqual(self.release_reservation(), 0)
 
@@ -376,7 +420,7 @@ class FailedProbeTests(OffloadCommandFixture):
         for attempt in range(2):
             with self.subTest(attempt=attempt), redirect_stdout(io.StringIO()):
                 self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(self.events(), [])
         self.assertEqual(self.free(), "bad")
@@ -389,7 +433,7 @@ class FailedProbeTests(OffloadCommandFixture):
         result = self.command()
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertEqual(self.free("mac"), "bad")
-        self.assertIsInstance(offload.read_backoff(time.time()), offload.NoBackoff)
+        self.assertIsInstance(eligibility.read_backoff(time.time()), eligibility.NoBackoff)
 
         self.fixture["run_lines"] = []
         self.fixture["run_status_reported"] = True
@@ -411,7 +455,7 @@ class FailedProbeTests(OffloadCommandFixture):
                                                      targets.ANY_ELIGIBLE_TARGET, new_step=True)
         self.assertIsInstance(result, targets.ExcludedTarget)
         self.assertEqual(len(self.events()), count)
-        self.assertIsInstance(offload.read_failed_probe("box"), offload.FailedProbe)
+        self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.FailedProbe)
         self.assertEqual(self.release_reservation(), 0)
 
     def install_probe_gate(self) -> Path:
@@ -434,7 +478,7 @@ fi
     def finish_recovery(self, target: str = "box") -> None:
         with (self.stub_directory / "continue-probe").open("w") as release:
             _ = release.write("continue\n")
-        with (offload.state_directory(target) / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory(target) / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
 
     def test_mac_eligibility_uses_its_first_capacity_answer_during_recovery(self) -> None:
@@ -464,7 +508,7 @@ fi
                       if not event["args"][-1].startswith("printf") and event["args"][-1] != "true"]
             self.assertEqual(len(probes), 1)
             self.assertEqual(self.free("mac"), "busy")
-            self.assertIsInstance(offload.read_failed_probe(), offload.FailedProbe)
+            self.assertIsInstance(eligibility.read_failed_probe(), eligibility.FailedProbe)
         finally:
             self.finish_recovery("mac")
         self.assertEqual(self.free("mac"), "free")
@@ -476,6 +520,18 @@ fi
         self.healthy()
         self.install_script_copy_tools()
         ready = self.install_probe_gate()
+        reaped = threading.Event()
+        statuses: list[tuple[int, int]] = []
+        real_waitpid = os.waitpid
+
+        def observe_reap(pid: int, options: int) -> tuple[int, int]:
+            result = real_waitpid(pid, options)
+            if threading.current_thread().name == "probe-recovery-reaper":
+                statuses.append(result)
+                reaped.set()
+            return result
+
+        _ = self.enterContext(mock.patch.object(os, "waitpid", side_effect=observe_reap))
         build_targets.start_probe_recovery(target_config.configured_ssh_target("box"), self.repository, "hana", "test")
         with ready.open() as notification:
             self.assertEqual(notification.readline(), "ready\n")
@@ -489,17 +545,18 @@ fi
 
         self.addCleanup(stop_recovery_group)
         os.kill(claim.record["pid"], signal.SIGTERM)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
         self.assertEqual(self.free(), "bad")
-        pid, status = os.waitpid(claim.record["pid"], 0)
+        self.assertTrue(reaped.wait(5), "the recovery child was not reaped")
+        pid, status = statuses[0]
         self.assertEqual(pid, claim.record["pid"])
         self.assertEqual(os.waitstatus_to_exitcode(status), 143)
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
         self.assertIsInstance(result, targets.EligibleTarget)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(self.free(), "free")
 
@@ -508,7 +565,7 @@ fi
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         offload.write_version_decline("box", "hana")
-        record = offload.linux_version_decline_path("box", "hana")
+        record = eligibility.linux_version_decline_path("box", "hana")
         previous = record.read_text()
         self.healthy()
         self.fixture["probe_lines"][-3] = "nextest=wrong"
@@ -517,10 +574,10 @@ fi
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
         self.assertIsInstance(result, targets.EligibleTarget)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(record.read_text(), previous)
-        self.assertIsInstance(offload.read_failed_probe("box"), offload.FailedProbe)
+        self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.FailedProbe)
 
     def test_recovery_copies_an_absent_mirror_before_the_real_linux_shell_probe(self) -> None:
         self.fixture["probe_status"] = 255
@@ -567,7 +624,7 @@ raise SystemExit("Unexpected remote command: " + command)
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.LocalRequired("local fixture tools"), new_step=True)
         self.assertIsInstance(result, targets.ExcludedTarget)
-        with (offload.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(self.free(), "free")
         mirror = home / offload.remote_mirror(self.identity, "box")
@@ -692,7 +749,7 @@ raise SystemExit(255)
         self.assertTrue(any(args[:1] == ["clippy"] for args in self.cargo_calls()))
         # The remote probe remains blocked after local work finishes.
         with mock.patch.dict(os.environ, self.environment):
-            self.assertIsInstance(offload.read_failed_probe("linux"), offload.FailedProbe)
+            self.assertIsInstance(eligibility.read_failed_probe("linux"), eligibility.FailedProbe)
         _ = os.write(descriptor, b"continue\n")
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

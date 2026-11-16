@@ -23,7 +23,7 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
 if arguments[:1] == ["check"]:
     import sys
     with open(Path.home() / ".claude/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.direct.test_verify_step_state import read_step_row
+    from scripts.direct.step_row_test_support import read_step_row
     record = read_step_row(os.environ["BUILDLOG_CALL_ID"])
     (Path(os.environ["PACKAGE_ROOT"]) / "compiling-state").write_text(record["state"])
     (Path(os.environ["BUILD_HOLD_DIR"]) / "other").write_text("new hold")
@@ -63,6 +63,46 @@ if arguments[:1] == ["check"]:
         self.assertIn("hold stopped this step", result.stderr)
         self.assertEqual(self.mac_rows(), [])
         self.assertEqual(len([event for event in self.fixture.cargo_events() if event["args"][:1] == ["check"]]), 1)
+        self.assert_removed()
+
+    def test_hold_stop_of_the_run_log_writes_no_pass(self) -> None:
+        # The hold stop also ends the run-log readers. The retry's next write
+        # then gets SIGPIPE while the last command status is 0.
+        self.fixture.environment["TEST_MAC_ALLOWED"] = "0"
+        self.fixture.environment["UNIT_RUN_DIR"] = str(self.fixture.board)
+        holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
+        (holders / "other").unlink()
+        cargo = self.fixture.bin_directory / "cargo"
+        source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
+first = Path(os.environ["PACKAGE_ROOT"]) / "first-nextest"
+if arguments[:2] == ["nextest", "--version"] and first.exists():
+    import signal
+    run_log = f"/run.{os.environ['BUILDLOG_CALL_ID'].split('-')[1]}.log"
+    for entry in Path("/proc").iterdir():
+        try:
+            words = (entry / "cmdline").read_bytes().split(b"\\0")
+        except OSError:
+            continue
+        if words[:3] == [b"tee", b"-i", b"-a"] and words[3].decode().endswith(run_log):
+            os.kill(int(entry.name), signal.SIGKILL)
+if arguments[:2] == ["nextest", "run"] and not first.exists():
+    import socket
+    first.write_text("stopped")
+    proc = Path("/proc")
+    start = (proc / str(os.getpid()) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    log = Path(os.environ["BUILDLOG_DIR"]) / socket.gethostname().split(".")[0]
+    log.mkdir(parents=True, exist_ok=True)
+    (log / "hold-builds-test.jsonl").write_text(json.dumps(dict(
+        kind="hold_build", action="stopped", call_id=os.environ["BUILDLOG_CALL_ID"],
+        boot_id=(proc / "sys/kernel/random/boot_id").read_text().strip(),
+        pid=os.getpid(), proc_start=start, id="stopped-nextest")) + "\\n")
+    raise SystemExit(143)
+''')
+        _ = cargo.write_text(source)
+        result = self.run_verify("test", "sample")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.saved_results(), [], result.stdout + result.stderr)
+        self.assertEqual(self.fixture.last_call()["outcome"], "interrupted")
         self.assert_removed()
 
 if __name__ == "__main__":

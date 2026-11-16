@@ -10,6 +10,7 @@ from typing import NamedTuple, TypedDict
 from scripts.direct import assign_gate, phase_reservation, progress_history
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import staff
+from scripts.whoami import quota_state
 
 
 @dataclass(frozen=True)
@@ -84,9 +85,21 @@ class ResumeWorkers(NamedTuple):
     panes: Sequence[PaneWorkerResume] = ()
 
 
+@dataclass(frozen=True)
+class WorkersHeld:
+    """No-worker mode keeps every Codex worker stopped; the director does the work alone."""
+
+    notice: str
+
+
 NO_ACCOUNT_MOVE = NoAccountMove()
 NO_WORKERS = ResumeWorkers()
 NO_OWN_PASS = NoOwnPass()
+
+
+def worker_mode() -> ResumeWorkers | WorkersHeld:
+    """`WorkersHeld` with the notice in no-worker mode; otherwise no worker lines."""
+    return WorkersHeld(quota_state.no_worker_notice()) if quota_state.no_worker_mode() else NO_WORKERS
 
 
 def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[str]) -> str:
@@ -96,7 +109,7 @@ def launcher_prompt(worker: staff.StaffId, dispatch_id: str, command: Sequence[s
 
 
 def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_MOVE,
-                   workers: ResumeWorkers = NO_WORKERS, context: str = "",
+                   workers: ResumeWorkers | WorkersHeld = NO_WORKERS, context: str = "",
                    own_pass: BusyPass | NoOwnPass = NO_OWN_PASS,
                    unit: staff.StaffRow | None = None, detached: str = "") -> str:
     moved = f" You were moved from {move.source} to {move.destination}." if isinstance(move, AccountMove) else ""
@@ -116,6 +129,9 @@ def resume_message(why: str, *, move: NoAccountMove | AccountMove = NO_ACCOUNT_M
         lines.append(f"Read ~/.claude/commands/{path}.md for {command} before continuing.")
     if detached:
         lines.append(detached)
+    if isinstance(workers, WorkersHeld):
+        lines.append(workers.notice)
+        return script_prompt(("\n" if detached else " ").join(lines))
     for pane in workers.panes:
         if isinstance(pane.turn, UnsubmittedAssignment):
             lines.append(launcher_prompt(pane.staff_id, pane.turn.dispatch_id, pane.turn.command))

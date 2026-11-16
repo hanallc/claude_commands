@@ -211,11 +211,17 @@ def screenshot_hourly() -> int:
 
 
 def aws_snapshot() -> int:
-    from scripts.aws_target.aws_target import snapshot
+    from scripts.aws_target.aws_target import hourly
     from scripts.build_targets.target_config import ssh_target_state_directory
     from scripts.lib import conf
 
-    return snapshot(conf.path('aws_target'), ssh_target_state_directory('aws'))
+    return hourly(conf.path('aws_target'), ssh_target_state_directory('aws'))
+
+
+def aws_page() -> int:
+    from scripts.aws_target import aws_page
+
+    return aws_page.publish_configured()
 
 
 def hourly() -> int:
@@ -229,7 +235,7 @@ def hourly() -> int:
     status = 0
     for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
-                      ("AWS snapshot", aws_snapshot)):
+                      ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
             status |= job()
         except Exception as error:  # noqa: BLE001 -- one job's failure must not cost the other its run
@@ -350,7 +356,7 @@ def main(argv: list[str]) -> int:
         taken = sample.sample()
         if taken.host == "natedev":
             try:
-                mac_idle.watch_once(mac_idle.watch_paths(), taken.at, time.monotonic())
+                mac_idle.watch_once(mac_idle.watch_paths(), taken.at)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"buildlog sample: Mac idle check failed: {error}", file=sys.stderr)
         return 0

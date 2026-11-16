@@ -188,7 +188,7 @@ steps_path.write_text(json.dumps(steps))
         self.configure("natedev,mac")
         self.enable_mac()
         # Keep os.environ stable while the admission reader uses the private memory paths.
-        claim = subprocess.run([sys.executable, "-c", """
+        claim = subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"), "-c", """
 import os
 from unittest import mock
 from scripts.lib import process_start as process_identity
@@ -234,11 +234,11 @@ with mock.patch.object(process_identity, "process_start", return_value=process_i
         self.write_executable(wrapper, r'''
 import os
 from pathlib import Path
-import runpy
 import sys
 source = Path(os.environ["TEST_SOURCE_REPO"])
 arguments = sys.argv[1:]
-''' + support.RUN_BUILD_TARGETS + r'''
+''' + support.BUILD_TARGETS_STATUS + r'''
+status = build_targets_status()
 from scripts.direct.wait_for_test_state import wait_for_file
 root = Path(os.environ["TEST_RUNNER_STATE"])
 marker = root / "reservation-interrupted"

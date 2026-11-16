@@ -21,9 +21,19 @@ With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
 Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` publishes the config file and pulls
-the Mac without a test or release cycle. Moving an unchanged value from code
+on approval, with the user's words. `/tune` makes the value live on both
+machines at once, then commits it on main and pulls the Mac, without a test or
+release cycle. Moving an unchanged value from code
 to config needs no approval and does not use `/tune`.
+
+## machines.conf
+
+`aliases` lists the workstation SSH aliases.
+Each alias has a `<alias>.platform` value and a `<alias>.hosts` list.
+The platform selects the local workstation.
+`send.py --machine` accepts an alias or a listed host name without regard to case.
+The command uses the alias for SSH.
+`build_targets.conf` keeps its separate `sync.hosts.*` settings.
 
 ## bake_textures_example.json
 
@@ -37,9 +47,10 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
 `config/models.conf` is the shared registry on both machines; there is no
-local override file. `/default_models` and `/showrunner:effort` edit it atomically,
-then publish a `config(agents): …` commit containing only this path to origin.
-The writer fetches and fast-forwards before editing, and replays all pending
+local override file. `/default_models` and `/showrunner:effort` write the edit live at once,
+then publish a `config(models): …` commit containing only this path to origin.
+A publication that fails keeps the edit live; the notes timer publishes it later.
+The publisher fetches and fast-forwards, and replays all pending
 local row changes on a newer remote tip if a push races another writer (three
 tries). Repeating an interrupted edit finishes its publication, even when the
 requested value is already in the local file. A lost push acknowledgement
@@ -408,36 +419,16 @@ Deployment reads the passphrase once through `/dev/tty` and disables the GPG sym
 `notification_email_file` names a private file with one address for Budget notices.
 The default path is `~/.config/aws-build/notification-email`.
 Keep this file outside the public repository. Never put the address in a tracked file.
-Only `prepare` and `apply` read the address file. `bootstrap` needs no address file.
+Only `prepare` and `apply` read the address file.
 The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
-`root_volume_gib` sizes the root volume.
-`data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.
-The saved `deployment.json` record identifies the instance and retained data volume.
-Replacement uses its saved `DataVolumeId`. Configuration contains no instance or volume ID.
-`spot_max_usd_per_hour` limits the Spot request price.
-`deployment_price_file` names the price state file outside the repository. Its default path is `~/.config/aws-build/deployment-price`.
-Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to complete the price, bootstrap, stacks, and scaler-key stages.
-The command records stage results and times in `up.json` beside `deployment.json`.
-It checks live state before each stage. It always refreshes the price.
-To inspect builder removal, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder`.
-To remove the builder, run `scripts/lib/py scripts/aws_target/deploy.py remove-builder --approve-destroy`.
-The command disables builder routing and `aws-target.service`, removes its Tailscale device, and removes its compute resources.
-It deletes the retained data volume after the stack update. The `/home` build cache is lost.
-It keeps the stack, Budget, scaler credentials, every gate resource, and `gate-deployment.json`.
-The command preserves spending history and resolves builder observations, pending compute requests, and resource inventory.
-A saved `builder-removal.json` identity supports a repeat after a partial removal.
-Current instance and volume identities take priority over the receipt.
-Removal uses the live CloudFormation template and changes only the builder role, profile, and security group conditions to `Compute`.
-It preserves live gate definitions that differ from the repository template.
-The repository template has the same three conditions for later gate deployment.
+`instance_type` and `spot_max_usd_per_hour` price the recorded builder hours in the cost history.
+The saved `deployment.json` record identifies the stack, the Budget and the scaler user.
+`prepare` and `apply --approve-resources` create or update the Budget foundation stack and the scaler key.
+Run `scripts/lib/py scripts/aws_target/deploy.py up --approve-resources` to add the gate resources to the stack and deploy the gate stack in each gate region.
+The builder is removed. Its compute resources are no longer in the template, and the `remove-builder` command is removed.
 `down --approve-destroy` removes the whole stack, including the gate resources, then deletes the retained volume and Budget.
-It is not the builder-only removal command.
 No removal command changes a tracked configuration value.
-Separate `price`, `bootstrap`, `prepare`, `apply`, and `setup-start` commands remain available.
-The command reads the current Spot price for the configured instance type and zone through `deployment_profile`.
-It writes the price and its read time atomically with mode `0600`.
-`prepare`, `apply`, and `setup-start` read this file. `bootstrap` needs no price file.
 `preflight_max_age_s` limits preparation age. A completed foundation wait renews preparation for unchanged inputs.
 The guard runs before each resource request. `deployment_timeout_s` bounds each deployment command.
 `scaler_user_name` names the IAM user.
@@ -454,12 +445,8 @@ The command switches the live stack GateImage parameter to `ami_id` and keeps ev
 The old image stays launchable until `gate-deployment.json` names the official image.
 A second stack update then removes the old image permission.
 Then the command deletes the saved gate image, its snapshot, and its cost row.
-Last, it deletes the former builder image, its snapshot, and `image.json`. A later builder `up` would make a new image.
+Last, it deletes the former builder image, its snapshot, and `image.json`.
 A repeat after a partial removal continues from the live state. A repeat after a full removal changes nothing.
-`bootstrap_template_path` selects the reviewed template in the separate NixOS checkout.
-`scripts_source_url`, `scripts_source_sha256`, and `scripts_source_commit` identify the public archive.
-The bootstrap command writes `bootstrap.sh` and `remote.conf` in the output directory.
-`prepare` reads that `bootstrap.sh` file.
 `aws_target.py serve` reads `tick_interval_s` between ticks. `controller_tick_timeout_s` bounds each tick process.
 `remote.py serve` reads `interruption_poll_s` between remote checks.
 The [runbook](../docs/plans/builds-aws-runbook.md) gives the deployment and activation steps.
@@ -679,7 +666,7 @@ roster.
 
 Colors for each role and account in the status line, plus usage-level colors
 and thresholds for context tokens used and quota percentages left. Role keys are
-`role.showrunner` (purple), `role.unit-director` (yellow),
+`role.showrunner` (purple), `role.unit-director` (yellow), `role.producer` (pink),
 `role.astra-designer` (mauve) and `role.astra-reviewer` (bright-green). Workers and
 unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
@@ -856,11 +843,13 @@ The command edits no tracked file.
 
 ### Cloud gate regions
 
-`cloud_gate.conf` sets `regions=us-east-2 us-west-2` in launch order.
+`cloud_gate.conf` sets `regions` to all 19 regions of `spot_candidate_regions`.
 The first region must match the home region in `aws_target.conf`.
 The list must contain at least one region and must not repeat a region.
 The list can include other regions that the account policy permits.
-Each gate tries every configured type and public zone in one region before it tries the next region.
+Each gate tries its types, regions and zones in order of expected USD per run.
+`region_transfer_usd` sets the transfer USD per gate for a far region.
+`unmeasured_region_extra_seconds` adds seconds to the borrowed box time of a region without its own runs.
 Capacity refusals and unsupported types select the next variant.
 After all regions refuse, a normal gate can use natedev.
 All regions use the same daily and monthly spend caps.

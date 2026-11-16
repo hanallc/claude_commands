@@ -4,6 +4,7 @@
 The queue selects the destination and the newest eligible candidate.
 The watcher collects results and stops the losing execution.
 The offload adapter owns the exact provider claim and uncertain cleanup.
+After a stopped copy exits, the watcher ends its remote work and releases the claim it kept.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from typing import Literal
 
 from scripts.lib import process_group
 from scripts.build_hold import override_guard
-from scripts.mac_test import claim_state, offload
+from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
 from scripts.direct import step_record
@@ -112,6 +113,7 @@ class RunningCopy:
     process: subprocess.Popen[bytes]
     result: Path
     started: float
+    assignment_file: Path
 
 
 @dataclass(frozen=True)
@@ -294,10 +296,10 @@ def start_copy(request: WatchRequest, result: Path, assignment_file: Path) -> Ru
     for name in os.environ.get("VERIFY_TEST_ENV_NAMES", "").split():
         command.extend(("--env", name))
     command += ["--", *request.nextest_words]
-    return RunningCopy(subprocess.Popen(command, stdin=subprocess.DEVNULL), result, time.monotonic())
+    return RunningCopy(subprocess.Popen(command, stdin=subprocess.DEVNULL), result, time.monotonic(), assignment_file)
 
 
-def stop_copy(copy: RunningCopy) -> None:
+def stop_copy(copy: RunningCopy, request: WatchRequest, repository: eligibility.KnownRepository) -> None:
     if copy.process.poll() is None:
         try:
             copy.process.send_signal(signal.SIGTERM)
@@ -308,6 +310,48 @@ def stop_copy(copy: RunningCopy) -> None:
         except subprocess.TimeoutExpired:
             copy.process.kill()
             _ = copy.process.wait()
+        release_stopped_copy(copy, request, repository)
+
+
+def release_stopped_copy(copy: RunningCopy, request: WatchRequest, repository: eligibility.KnownRepository) -> None:
+    """End the remote work of a stopped copy, release the claim it kept, and settle its assignment.
+
+    The copy keeps its claim when TERM comes before its remote start settles. Its process
+    has exited, so no later claim of that copy can come to take the claim over.
+    """
+    from scripts.build_queue import admission_client
+    from scripts.mac_test import mac_test
+
+    try:
+        reply = admission_client.read_assignment(copy.assignment_file)
+    except (OSError, ValueError, wire.AdmissionUnavailable) as error:
+        print(f"copy_watch: the stopped copy keeps its Mac claim: {error}", file=sys.stderr)
+        return
+    if not isinstance(reply, wire.Assignment):
+        return
+    assignment = reply.assignment
+    identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                                         assignment.episode, assignment.attempt)
+    try:
+        released = mac_test.release_exact_claims(claim_state.state_paths(), copy.process.pid, identity,
+                                                 str(request.settings), remote_work=mac_test.EndStoppedWork(repository))
+    except (OSError, ValueError) as error:
+        print(f"copy_watch: the stopped copy keeps its Mac claim: {error}", file=sys.stderr)
+        return
+    if isinstance(released, mac_test.ClaimReleaseRefused):
+        print(f"copy_watch: the stopped copy keeps its Mac claim: {released.reason}", file=sys.stderr)
+        return
+    if released.count == 0:
+        return
+    destination = assignment.destination
+    reference = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                                                 identity.claim_id, identity.episode, identity.attempt)
+    try:
+        _ = admission_client.report_execution(wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+            placement.ExecutionEvidenceUnavailable("the copy was stopped before its final status", time.time()),
+            placement.AttemptDeclined("lost"), placement.DispatchPathSettled()))
+    except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
+        print(f"copy_watch: cannot report the stopped copy: {error}", file=sys.stderr)
 
 
 def result_text(report: WatchReport) -> str:
@@ -418,9 +462,9 @@ class WaitingCopyAssignment(QueuedCopyPlacement):
 class Watch:
     """One call's copy state across ticks."""
 
-    def __init__(self, request: WatchRequest, repository: offload.KnownRepository, work: Path) -> None:
+    def __init__(self, request: WatchRequest, repository: eligibility.KnownRepository, work: Path) -> None:
         self.request: WatchRequest = request
-        self.repository: offload.KnownRepository = repository
+        self.repository: eligibility.KnownRepository = repository
         self.work: Path = work
         self.step: StepProgress = StepProgress(NO_STEP_INFO)
         self.copy: RunningCopy | NoCopy = NO_COPY
@@ -587,7 +631,7 @@ class Watch:
         if isinstance(self.copy, RunningCopy) and self.finish_copy(self.copy) is not None:
             self.outcome = "natedev_won"
         if isinstance(self.copy, RunningCopy):
-            stop_copy(self.copy)
+            stop_copy(self.copy, self.request, self.repository)
             self.copy_seconds += time.monotonic() - self.copy.started
             self.copy.result.unlink(missing_ok=True)
             self.copy = NO_COPY
@@ -598,7 +642,7 @@ class Watch:
         from scripts.build_queue import admission_client
 
         if isinstance(self.copy, RunningCopy):
-            stop_copy(self.copy)
+            stop_copy(self.copy, self.request, self.repository)
         if isinstance(self.placement, QueuedCopyPlacement):
             submitted = self.placement.request
             try:
@@ -661,9 +705,9 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
     arguments = parser().parse_args(namespace=CliArguments())
     request = request_from_arguments(arguments)
-    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
-        repository = offload.repository_identity(request.repo_root)
-        if isinstance(repository, offload.UnknownRepository):
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.tool_folder("copy-watch") as work:
+        repository = eligibility.repository_identity(request.repo_root)
+        if isinstance(repository, eligibility.UnknownRepository):
             report = wait_for_stop(wakeup)
         else:
             watch = Watch(request, repository, work)

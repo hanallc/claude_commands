@@ -38,6 +38,10 @@ Usage reports compare checkpointed phases through the usage store.
 ## Pane submission and completion
 
 `assign.sh` returns after successful prompt delivery or an accepted detached compaction. Both return exit 0.
+`assign.sh` and `assign.py` accept `--reply-file <absolute path>` for the reply output.
+Text, relative paths, and empty values exit 2 before dispatch.
+The old `--summary` option exits 2 and names `--reply-file`.
+Both reply writes and dispatch reply paths use the checked `Arguments.reply_file` value.
 The early return prints `compaction runs detached; the prompt follows` with the worker name.
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.
@@ -78,6 +82,13 @@ That notice names its own pass and says it is a late result. The pane stays for 
 The late step does not retire the worker, and it keeps a hold that the new assign also owns.
 If the late notice fails, the assign continues and prints an anomaly line that names the saved result file.
 
+A dispatch retry matches the slot, phase, role, prompt path, launcher arguments, and saved prompt content digest.
+The pass records the digest before submission.
+Changed content at the same prompt path starts a new pass after completion.
+With an active pass, changed content returns busy and names that pass without printing `submitted`.
+This refusal applies when the launcher arguments change.
+The recorder repeats the content check under its lock before it changes the pass.
+The intentional second review stage keeps its existing pass across its separate prompt path.
 An identical rerun of a completed dispatch sends one completion message through the hook's notice code.
 It saves the reply without typing another prompt.
 This rule also applies to a completed managed Astra review.
@@ -99,6 +110,13 @@ A new Codex worker has no resume argument.
 Its pane session report supplies the first native identity.
 The identity reader excludes only `scripts/herdr/turn_end.py` from the foreground process count.
 Every other foreground process prevents the pane report from proving a sole Codex process.
+After its first turn, the launcher clears the cached pane list before it checks the published worker.
+This refresh includes the pane session report and the process evidence within an observation snapshot.
+An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.
+Every worker operation takes the name lock before the fixed-id lock.
+The launcher holds both locks from publication through dispatch recording and submission.
+The first `ready` hook waits for these locks before it checks the dispatch.
+An ignored turn closes the pane when no dispatch holds the worker.
 
 `worker.dispatch_receipt` reads the transcript and detached run evidence.
 A live detached run holds DONE. A finished run permits completion with an anomaly for an absent transcript result.
@@ -577,6 +595,15 @@ Detached command results use `detached_runs.deliver` and `send.deliver_worker_te
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
+The command runs in its own session, including through a systemd scope prefix.
+The record saves the command's process group as `command_group`.
+The supervisor installs no signal handler.
+`detached_runs.py stop` and a build hold stop send TERM to the command group only.
+Each checks the supervisor and the command leader identity first, and saves a stop reason.
+The supervisor stays alive, records the exit status and delivers the result.
+A result with a stop reason reads `STOPPED (exit <n>)` and carries a `Stop reason:` line.
+If the supervisor dies, the orphan reaper finishes the record and delivers the result.
+The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
 Under a per-run delivery lock, `detached_runs.deliver` checks the worker transcript for that marker.
 It skips delivery when a user entry already contains the marker.
@@ -618,10 +645,11 @@ The [session roster](session-roster.md) shows open roles through their current s
 ## Worker operation fencing
 
 `scripts/herdr/worker_panes.py` owns `worker_lock` and `WorkerLockHold`.
-`worker_lock` holds the parent's named creation lock until the new worker has a fixed staff id.
-`WorkerLockHold.bind` locks that fixed id before creation serialization ends.
+`worker_lock` takes the parent's name lock before it reads the published worker and locks the fixed staff id.
+It holds both locks until the operation ends.
+The name lock prevents a hook from taking the fixed-id lock between publication and `WorkerLockHold.bind`.
 A competing dispatch returns `Kept` when the lock is held.
-`worker.py dispatch` holds this lock from pass creation through prompt submission or detached handoff.
+`worker.py dispatch` holds both locks from launch through pass creation, prompt submission, or detached handoff.
 The detached child takes the same lock before compaction and keeps it through prompt delivery.
 It releases the lock before the completion hook ends the pass.
 `worker_dispatch_state` keeps an active pass with a saved submission held during this gap.

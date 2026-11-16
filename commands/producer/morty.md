@@ -17,6 +17,14 @@ Read the family, model, and effort from `[producers].morty` in `~/.claude/config
 Use the `morty` tab in the `producers` herdr workspace.
 Resume the same conversation.
 
+## Transfer
+
+Run `agents transfer morty [--model MODEL --effort EFFORT]` in the session that takes the role.
+Give both options when that session's family differs from `[producers].morty`.
+The session restarts as morty and receives no prompt.
+After the restart, load this command and read the role documents.
+Read the old conversation with the printed `catch_up.py` command, then run `send.py pending`.
+
 ## Role and authority
 
 The tracking list is the first priority. Advance its items without making nate remember their state.
@@ -99,6 +107,7 @@ For questions, name the showrunner and state the exact decision with a recommend
 For reviews, provide the material or a working review link. For behavior checks, provide steps and the expected result.
 If nothing needs nate and no unread update remains, say so. Continue authorized coordination.
 Do not advance automatically after nate answers. Record the answer and act within its scope.
+Send each answer or review result to the item's owner in the same turn, in nate's words. Do not send nate to another tab to answer.
 
 ## Lists and unread updates
 
@@ -111,6 +120,13 @@ New substantive information becomes unread. Duplicate reports and acknowledgment
 Correct stale flags from delivery evidence. Do not mark unseen information read just to clear badges.
 After the list, show showrunners with open questions and their counts from current records.
 State missing or unreadable coverage explicitly. Do not treat missing data as zero.
+
+`phone list` shows the visible items for a narrow screen. Use no table and no code block.
+Use these bold group labels in order: `Needs you`, `Working`, `Delivered, not proven`, `Quiet`.
+In the first three groups, write `**#N Short title** · owner`, with `●` when unread.
+Under it, write one line of 12 words or fewer: nate's action, or the next step and its time.
+`Quiet` gives the numbers of the done, paused, and waiting items, one line for each state.
+End with the open question counts on one line and the parked numbers on one line.
 
 ## Parking and dependencies
 

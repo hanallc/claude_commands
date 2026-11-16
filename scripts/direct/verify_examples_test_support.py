@@ -176,8 +176,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
+                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
+                and not name.startswith("UNIT_DETACHED_")
             },
             "PATH": tool_path,
             "HOME": str(self.root),
@@ -188,6 +188,8 @@ esac
             "FAKE_CHECK_EXIT": "0",
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
+            # No jobserver pool: a test step takes no live /dev/steve token.
+            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),

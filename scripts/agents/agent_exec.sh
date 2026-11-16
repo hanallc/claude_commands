@@ -16,13 +16,6 @@ agents_exec_print_argv() {
     done
 }
 
-# Every Claude print launch sets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1.
-# An is_error result or errors array gives ERROR: <reason> and exit 1.
-# The output holds the final answer. The log holds the complete event stream.
-agents_claude_extract_result() {
-    "$PY" "$(dirname "${BASH_SOURCE[0]}")/claude_result.py" "$1" "$2"
-}
-
 agents_exec_main() {
     if [[ "$#" -ne 6 ]]; then
         echo "Usage: agent_exec.sh <task> <write|readonly> <working_dir> <prompt_file> <output_file> <log_file>" >&2
@@ -36,7 +29,7 @@ agents_exec_main() {
     local output_file="$5"
     local log_file="$6"
     local script_dir prompt family_args_line claude_code workers_home extraction_code
-    local -a family_args extra_args command task_args=()
+    local -a family_args extra_args command
 
     if [[ ! -f "$prompt_file" ]]; then
         printf 'Prompt not found: %s\n' "$prompt_file" > "$log_file"
@@ -55,10 +48,6 @@ agents_exec_main() {
     source "$script_dir/models_config.sh"
     models_launch_configuration || return 1
     agents_resolve "$task"
-    if [[ "$task" == direct.simplify ]]; then
-        [[ "$mode" == readonly ]] || return 2
-        task_args=(--disallowedTools Edit,Write,NotebookEdit)
-    fi
 
     prompt="$(cat "$prompt_file")"
     if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
@@ -104,7 +93,7 @@ agents_exec_main() {
                 unset AGENT_EXEC_CLAUDE_MODEL
             else
                 source "$script_dir/claude_account.sh"
-                if [[ "$task" == direct.simplify ]]; then
+                if [[ "$AGENT_CLAUDE_ACCOUNT" == caller ]]; then
                     claude_launch_environment || return 1
                 else
                     claude_launch_environment workers || return 1
@@ -117,13 +106,15 @@ agents_exec_main() {
             [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
+            # Every Claude print launch sets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1.
+            # An is_error result or errors array gives ERROR: <reason> and exit 1.
+            # The output holds the final answer. The log holds the complete event stream.
             command=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 "$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
             if [[ "$mode" == "write" ]]; then
                 command+=(--dangerously-skip-permissions)
             else
-                command+=(--permission-mode plan)
+                command+=(--permission-mode plan --disallowedTools Edit,Write,NotebookEdit)
             fi
-            command+=("${task_args[@]}")
             command+=(--settings '{"sandbox":{"enabled":false}}')
             command+=(--verbose --output-format stream-json)
             command+=("${family_args[@]}")
@@ -150,7 +141,7 @@ agents_exec_main() {
             claude_code=0
             ( cd "$working_dir" && models_agent_environment && "${command[@]}" < "$prompt_file" >> "$log_file" 2>&1 ) || claude_code=$?
             extraction_code=0
-            agents_claude_extract_result "$log_file" "$output_file" || extraction_code=$?
+            "$PY" "$script_dir/claude_result.py" "$log_file" "$output_file" || extraction_code=$?
             if [[ "$extraction_code" == 1 ]]; then
                 claude_code=1
             fi

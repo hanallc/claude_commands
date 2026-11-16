@@ -757,6 +757,23 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                                  ("median CPU s", "2.000"), ("runs counted", "1")):
             self.assertEqual(self.cell(output, alpha, header), expected, output)
 
+    def test_top_aws_host_ranks_every_aws_gate_host_from_the_aws_checkout(self) -> None:
+        gate = self.root / "gate-trial"
+        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={gate}")
+        self.write_run([module_run("test_alpha.py", 4.0)], host="ip-10-0-0-1.us-east-2.compute.internal",
+                       checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 8.0)], host="ip-10-0-0-2.us-east-2.compute.internal",
+                       epoch=EPOCH + 60, checkout=str(gate))
+        self.write_run([module_run("test_alpha.py", 900.0)], host="ip-10-0-0-3.us-east-2.compute.internal",
+                       epoch=EPOCH + 120)
+        # A gate host runs this test, so the run off the AWS hosts names its host.
+        self.write_run([module_run("test_alpha.py", 700.0)], host="natedev", epoch=EPOCH + 180, checkout=str(gate))
+        output = self.report("top", "--host", "aws", "--repo", str(self.repo))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "median s"), "6.000", output)
+        self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
+        self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
+
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
@@ -1241,7 +1258,8 @@ from pathlib import Path
 import os
 import socket
 import sys
-sys.path.insert(0, sys.argv[1])
+import runpy
+runpy.run_path(str(Path(sys.argv[1]) / 'scripts/lib/python_startup/sitecustomize.py'), run_name='_trend_python_startup')["select_checkout"](sys.argv)
 from scripts.test_times import show
 from scripts.lib import file_lock
 class FixedTime(datetime):

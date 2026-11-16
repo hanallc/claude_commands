@@ -257,11 +257,11 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(client, "admit", side_effect=acquire), redirect_stderr(output):
             with merge_gate.gate_reservation(self.checkout, self.state, merge_gate.BuildHoldWait()):
                 pass
-        self.assertIn("head older-step needs 0.4 GiB", output.getvalue())
+        self.assertIn("head older-step · nextest needs 0.4 GiB", output.getvalue())
         self.assertIsInstance(client.release(busy.reservation, 0, busy.cleanup_timing), wire.Ok)
         self.assert_gate_released()
 
-    def test_memory_wait_reports_changes_and_only_one_reminder_per_minute(self) -> None:
+    def test_memory_wait_reports_only_reason_and_place_changes(self) -> None:
         clock = FakeClock()
         formatter = client.WaitOutput()
         reported_at: list[float] = []
@@ -280,9 +280,9 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 before = len(output.getvalue().splitlines())
                 formatter(replace(reply, snapshot=snapshot))
                 reported_at.extend([float(at)] * (len(output.getvalue().splitlines()) - before))
-        self.assertEqual(reported_at, [0.0, 60.0, 61.0, 63.0], output.getvalue())
+        self.assertEqual(reported_at, [0.0, 61.0], output.getvalue())
         self.assertIn("memory pressure", output.getvalue())
-        self.assertIn("0.750 GiB needed", output.getvalue())
+        self.assertIn("needs 0.5 GiB", output.getvalue())
         self.assert_gate_released()
 
     @gate_suites("hooks")
@@ -485,14 +485,14 @@ class MergeGateAdmissionTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(root)))
 
-    def test_swap_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
+    def test_some_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
         peak = admission_records.ExpectedPeak(admission_records.GIB, "fallback", 0)
         default = admission_policy_fixture()
         root = Path(os.environ["CONF_DIR"])
         _ = fake_memory_readings(root, full_avg10=8, some_avg10=40,
                                  swap_total_kib=100, swap_free_kib=20)
-        lower = replace(default, pressure=replace(default.pressure, swap_used_limit=70))
-        higher = replace(default, pressure=replace(default.pressure, swap_used_limit=90))
+        lower = replace(default, pressure=replace(default.pressure, full_avg10_limit=9, some_avg10_limit=30))
+        higher = replace(default, pressure=replace(default.pressure, some_avg10_limit=50))
         host = memory_admit.read_meminfo(Path(os.environ["BUILDLOG_MEMINFO"]))
         pressure = memory_admit.read_pressure(host, policy=lower)
         assert isinstance(pressure, admission_records.MemoryPressure)
@@ -504,7 +504,7 @@ class MergeGateAdmissionTests(unittest.TestCase):
         with mock.patch.object(admission_records, "read_memory_config", side_effect=AssertionError("frozen check")), \
              mock.patch.object(step_estimator, "memory_config", side_effect=AssertionError("frozen check")):
             self.assertEqual(queue.wait_reasons(snapshot_with_head_cause(replace(result, policy=lower), pressure)),
-                             ("swap memory pressure",))
+                             ("some memory pressure",))
             self.assertEqual(queue.wait_reasons(snapshot_with_head_cause(replace(result, policy=higher),
                                  higher_pressure)),
                              ("memory pressure",))

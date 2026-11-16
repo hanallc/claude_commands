@@ -24,18 +24,19 @@ import subprocess
 import sys
 from typing import Literal, Protocol, cast, final
 
-from scripts.agents import detached_runs, worker_lifecycle
-from scripts.herdr import herdr_types
+from scripts.agents import detached_runs, pane_record, worker_lifecycle
+from scripts.herdr import herdr_types, pane_launch
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
 from scripts.usage import rollouts
-from scripts.lib import atomic_file, conf, detached, unit_runs
+from scripts.lib import atomic_file, conf, detached, models_registry, unit_runs
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.resume_message import BusyPass, IdleWorker, NoOwnPass, NO_OWN_PASS, PaneWorkerResume, ResumeWorkers, Unavailable, launcher_prompt, resume_message
 from scripts.lib.resume_message import UnsubmittedAssignment as UnsubmittedAssignment
 from scripts.lib.script_envelope import script_prompt
 from scripts.production import display_cells, session_staff, staff, worker_admission
+from scripts.whoami import quota_state
 
 from scripts.herdr import herdr
 
@@ -439,6 +440,28 @@ def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: 
         raise herdr_types.HerdrFailure(str(error)) from error
 
 
+def launched_agent(row: staff.StaffRow) -> progress_history.CalledAgent:
+    """Read the family, model and effort the worker's pane launch kept; a launch with no kept model is not recorded."""
+    try:
+        entry = pane_record.launch_for_session(str(row.current_session))
+        if entry is None:
+            return progress_history.CALLED_AGENT_NOT_RECORDED
+        kind = pane_launch.saved_kind(entry if "session_id" in entry else pane_record.resume_launch(entry))
+        settings = worker_panes.kept_settings(models_registry.LaunchSettings(kind, "", "", ""),
+                                              pane_record.resume_arguments(entry))
+    except (OSError, ValueError):
+        return progress_history.CALLED_AGENT_NOT_RECORDED
+    if not settings.model:
+        return progress_history.CALLED_AGENT_NOT_RECORDED
+    return progress_history.CalledAgent(kind, settings.model, settings.effort or "unset")
+
+
+def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) -> ExitCode:
+    print(f"{conflict.worker_name}: active pass {conflict.instance_id} has different prompt content; no prompt sent",
+          file=sys.stderr)
+    return ExitCode.BUSY
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -460,6 +483,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             return ExitCode.BUSY
         matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
             prompt=prompt, launcher_command=launcher_command)
+        if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+            return _prompt_conflict(matched)
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
                 and row is not None and worker_panes.worker_pass(row, session_dir).get("status") == "completed"):
@@ -503,9 +528,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             _ = cleanup.pop_all()
             _ = on_submission()
 
-        instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
-            worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-            fix_cause=fix_cause, fix_pass=fix_pass, activity=activity)
+        try:
+            instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
+                worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row))
+        except progress_history.DispatchPromptRefused as refused:
+            return _prompt_conflict(refused.conflict)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -822,6 +850,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command)
+            if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
+                return _prompt_conflict(matched)
             if isinstance(matched, progress_history.MatchedDispatch):
                 name = matched.worker_name
         record = staff.snapshot()
@@ -1061,6 +1091,29 @@ def _read_workers(parent: staff.StaffRow, record: staff.StaffSnapshot, *,
     return PaneWorkerStates(states, [Path(run) for run in runs])
 
 
+@dataclass(frozen=True)
+class NotRestored:
+    """Restore never starts this worker, so its id leaves the restart record."""
+
+    reason: str
+
+
+def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
+                 runs: dict[str, list[str]] | None = None) -> NotRestored | None:
+    """Read why restore would not start this worker; None when it would, or when a read fails."""
+    if quota_state.no_worker_mode() and isinstance(staff.backend(row), staff.CodexBackend):
+        return NotRestored("Codex worker in no-worker mode")
+    try:
+        run = worker_panes.worker_run(row, record=record, scanned=runs)
+        active = progress_history.active_dispatch(row.id, run)
+        detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)
+    except (OSError, ValueError, staff.StaffRefused):
+        return None
+    if isinstance(active, progress_history.NoActiveDispatch) and not detached:
+        return NotRestored("worker with no active dispatch")
+    return None
+
+
 @herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
@@ -1074,6 +1127,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     launch_account = ((worker_panes.DestinationWorkerAccount(account) if account else
                        worker_panes.ConfiguredWorkerAccount.CURRENT) if isinstance(account, str) else account)
     observed = _read_workers(holder, record, only=only, scanned=runs)
+    workers_held = quota_state.no_worker_mode()
     held_runs = list(dict.fromkeys(path.resolve() for path in observed.runs))
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
@@ -1120,6 +1174,9 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                             changed = True
                         if only != "all":
                             print(f"{state.row.name}: closed; its next assign resumes it")
+                        continue
+                    if workers_held and isinstance(staff.backend(state.row), staff.CodexBackend):
+                        print(f"{state.row.name}: not resumed: no-worker mode")
                         continue
                     resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
@@ -1605,6 +1662,9 @@ def main(arguments: list[str] | None = None) -> int:
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
     args = parser.parse_args(arguments, namespace=Arguments())
+    if args.command in ("add", "assign") and quota_state.no_worker_mode():
+        print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
+        return ExitCode.REFUSED
     try:
         if args.command == "finish-dispatch":
             return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir), args.dispatch_id)

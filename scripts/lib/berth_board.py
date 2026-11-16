@@ -32,6 +32,8 @@ class Reservation:
     scopes: tuple[str, ...]
     lifecycle: str
     edit_blocking_status: Literal["blocking", "clear"]
+    # The commit an outstanding reservation protects; empty in every other stage.
+    protected_tip: str = ""
 
     def blocks(self, path: str | Path) -> bool:
         if self.edit_blocking_status != "blocking":
@@ -46,18 +48,41 @@ class Reservation:
                 return True
         return False
 
+    def names_file(self, path: str | Path) -> bool:
+        """Whether a blocking file scope names this exact path; a tree scope does not."""
+        if self.edit_blocking_status != "blocking":
+            return False
+        candidate = PurePosixPath(path).as_posix()
+        return any(not scope.startswith("tree:") and candidate == scope.removeprefix("file:")
+                   for scope in self.scopes)
+
 
 @dataclass(frozen=True)
 class Board:
+    """The reservations; configured is False for a repository that berth does not configure."""
+
     entries: tuple[Reservation, ...]
+    configured: bool = True
 
     def reservations(self) -> tuple[Reservation, ...]:
         return self.entries
 
 
+# cargo-berth's message for a repository where `cargo-berth init` never ran,
+# such as a fresh clone. Its envelope has no other field for this case.
+LEDGER_NOT_INITIALIZED = "the cargo-berth ledger is not initialized"
+
+
 @dataclass(frozen=True)
 class BoardUnavailable:
+    """No board; ledger_missing is True when the repository has no ledger yet."""
+
     reason: str
+    ledger_missing: bool = False
+
+
+class LedgerMissing(ValueError):
+    """The repository has no cargo-berth ledger, so it has no reservations."""
 
 
 def _object(value: object) -> dict[str, object]:
@@ -96,8 +121,12 @@ def _reservation(value: dict[str, object]) -> Reservation:
     if isinstance(target, dict):
         target = cast(dict[str, object], target)["ref"]
     lifecycle = value["lifecycle"]
+    protected_tip = ""
     if isinstance(lifecycle, dict):
-        lifecycle = cast(dict[str, object], lifecycle)["stage"]
+        lifecycle_fields = cast(dict[str, object], lifecycle)
+        lifecycle = lifecycle_fields["stage"]
+        tip = lifecycle_fields.get("protected_tip")
+        protected_tip = tip if isinstance(tip, str) else ""
     status = value["edit_blocking_status"]
     if status not in ("blocking", "clear"):
         raise ValueError("unknown edit blocking status")
@@ -116,7 +145,7 @@ def _reservation(value: dict[str, object]) -> Reservation:
         raise ValueError("reservation has no scopes")
     return Reservation(
         _string(value["reservation_id"]), _string(target), Path(_string(holder["worktree_root"])),
-        _string(branch), tuple(scopes), _string(lifecycle), status,
+        _string(branch), tuple(scopes), _string(lifecycle), status, protected_tip,
     )
 
 
@@ -126,9 +155,10 @@ def _parse_board(value: object) -> Board:
         raise ValueError("not a cargo-berth board envelope")
     payload = _object(envelope["payload"])
     if envelope.get("status") == "ledger_unreadable":
-        raise ValueError(envelope.get("message") or "cargo-berth ledger unreadable")
+        message = str(envelope.get("message") or "cargo-berth ledger unreadable")
+        raise (LedgerMissing if LEDGER_NOT_INITIALIZED in message else ValueError)(message)
     if envelope.get("status") == "unconfigured" and payload.get("kind") == "no_facts":
-        return Board(())
+        return Board((), configured=False)
     if payload.get("kind") != "board":
         raise ValueError("envelope contains no board facts")
     fields = _object(payload["data"])
@@ -181,5 +211,7 @@ def read_board(repo: Path) -> Board | BoardUnavailable:
             return BoardUnavailable(result.stderr.strip() or f"cargo-berth returned no board (exit {result.returncode})")
         value = cast(object, json.loads(result.stdout))
         return _parse_board(value)
+    except LedgerMissing as error:
+        return BoardUnavailable(str(error), ledger_missing=True)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return BoardUnavailable(str(error))

@@ -36,13 +36,17 @@ def _template(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
+# Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
+TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+
+
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
-    for layer in (existing, overrides):
+    for layer in (TEST_CONFIG_DEFAULTS.get(source.name, ""), existing, overrides):
         previous = ""
         for raw in layer.splitlines():
             limit = previous if previous.startswith(limit_prefixes) else ""
@@ -86,16 +90,35 @@ def write_config_fault(path: Path, source: str) -> int:
     return path.write_text("\n".join(lines) + "\n")
 
 
+class ConfigFixtureRefused(ValueError):
+    """The configuration folder is not a private folder that only the test owns."""
+
+
 def commit_config_fixture(path: Path) -> None:
-    """Give the private configuration a known-good git revision for fault tests."""
+    """Give the private configuration a known-good git revision for fault tests.
+
+    The folder must be under the temporary root and outside every other git repository.
+    No caller GIT_* variable reaches git, so the commit can go only to the folder's own repository.
+    """
     import subprocess
+    import tempfile
     from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-    environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    folder = path.parent.resolve()
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if folder == temporary_root or not folder.is_relative_to(temporary_root):
+        raise ConfigFixtureRefused(f"{folder} is not a private folder under {temporary_root}")
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment |= {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    enclosing = subprocess.run(["git", "-C", str(folder), "rev-parse", "--show-toplevel"], capture_output=True,
+                               text=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
+    if enclosing.returncode == 0 and Path(enclosing.stdout.strip()).resolve() != folder:
+        raise ConfigFixtureRefused(f"{folder} is inside the git repository {enclosing.stdout.strip()}")
+    environment |= {"GIT_DIR": str(folder / ".git"), "GIT_WORK_TREE": str(folder)}
     for arguments in (("init", "-q"), ("config", "user.name", "Config fixture"),
                       ("config", "user.email", "fixture@example.invalid"),
                       ("add", path.name), ("commit", "-qm", "known good configuration")):
-        _ = subprocess.run(["git", "-C", str(path.parent), *arguments], check=True,
+        _ = subprocess.run(["git", "-C", str(folder), *arguments], check=True,
                            capture_output=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
 
 
@@ -108,7 +131,10 @@ def config_environment(root: Path) -> dict[str, str]:
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes(_template(name).read_bytes())
+            if name in TEST_CONFIG_DEFAULTS:
+                _ = write_config_fixture(destination)
+            else:
+                _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder)}
 
 
@@ -129,7 +155,8 @@ def private_ci_environment(root: Path) -> dict[str, str]:
     """Keep CI slice readings inside the private fixture."""
     ci = root / "ci.slice"
     ci.mkdir(exist_ok=True)
-    for name, value in (("memory.current", "0"), ("memory.stat", "anon 0\nshmem 0\ninactive_file 0\n"), ("memory.max", str(40 * 1024**3)), ("cgroup.procs", "")):
+    for name, value in (("memory.current", "0"), ("memory.stat", "anon 0\nshmem 0\ninactive_file 0\n"), ("memory.max", str(40 * 1024**3)),
+                        ("memory.swap.current", "0"), ("cgroup.procs", "")):
         path = ci / name
         if not path.exists():
             _ = path.write_text(value)
@@ -149,6 +176,8 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                          swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:
     meminfo = root / "meminfo"
     pressure = root / "pressure"
+    vmstat = root / "vmstat"
+    _ = vmstat.write_text("pswpin 0\n")
     _ = meminfo.write_text(f"MemTotal: {total_kib} kB\nMemAvailable: {available_kib} kB\n"
                           + f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_free_kib} kB\n")
     write_pressure_reading(pressure, full_avg10=full_avg10, some_avg10=some_avg10)
@@ -156,6 +185,7 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
         **config_environment(root),
         **private_ci_environment(root),
         "BUILDLOG_MEMINFO": str(meminfo),
+        "BUILDLOG_VMSTAT": str(vmstat),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "BUILDLOG_MEMORY_PRESSURE": str(pressure),
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE",

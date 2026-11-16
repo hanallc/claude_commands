@@ -22,6 +22,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.build_folders_test_support import tool_folders
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
@@ -56,7 +57,7 @@ def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
     return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
 
 
-RECORDER_OBSERVER = '''import json, os, sys
+RECORDER_OBSERVER = '''import json, os, runpy, sys
 from pathlib import Path
 arguments = sys.argv[1:]
 if arguments and arguments[0].endswith("progress_history.py"):
@@ -66,6 +67,9 @@ if arguments and arguments[0].endswith("progress_history.py"):
     if arguments[1] == os.environ.get("TEST_FAIL_RECORDER") and not failure.exists():
         failure.touch()
         raise SystemExit(1)
+    sys.argv = arguments
+    runpy.run_path(arguments[0], run_name="__main__")
+    raise SystemExit(0)
 os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *arguments])
 '''
 
@@ -121,7 +125,7 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         self.environment["TEST_FAIL_RECORDER"] = failure
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
-            + shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
+            + shell_functions(VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
                               "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
                               "buildlog_memory_event")
             + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
@@ -132,7 +136,7 @@ HOLD_WAIT_DIR=$TEST_EVENT_ROOT/waits
 BOARD_DIR=$UNIT_RUN_DIR
 ROUTING_WAIT_STARTED="" PHASE_RESOURCE_WAIT="" PLACEMENT_WAIT_MEMORY=0
 BUILDLOG_HOLD_WAIT_FILE=$HOLD_WAIT_DIR/hold-seconds
-BUILDLOG_MEM_ADMIT_SCRIPT=$TEST_EVENT_ROOT/event-client.py
+BUILDLOG_QUEUE_PLACE_SCRIPT=$TEST_EVENT_ROOT/event-client.py
 BUILDLOG_MEM_WAIT_SINCE=100
 BUILDLOG_MEM_WAIT_FIRST_FILE=$HOLD_WAIT_DIR/first-queued-at
 buildlog_memory_python() { "$PY" "$@"; }
@@ -349,7 +353,7 @@ exec "$TEST_REAL_PYTHON" "$@"
         recorded_count = len(wait_rows(self.root / "session"))
         script = self.root / "identity-wait.sh"
         _ = script.write_text('set -euo pipefail\n' + shell_functions(
-            VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
+            VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
 PY=$TEST_IDENTITY_ROOT/identity-python
 PHASE_WAIT_SESSION=$TEST_IDENTITY_ROOT/session
 PHASE_WAIT_RECORDER=$1
@@ -474,13 +478,48 @@ phase_wait_start token "cargo token"
                 self.assertEqual(calls.read_text().splitlines(), ["recorder", "recorder"])
 
 
-class VerifyHoldHolderTests(VerifyHoldWaitFixture):
+class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
+    """Copy a real recorded phase before each wait test."""
+
+    recorded_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        seed = cls()
+        fixture = seed.fixture
+        fixture.root = fixture.fixture_root
+        fixture.environment = fixture.fixture_environment.copy()
+        try:
+            _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
+            isolate_run_sources(fixture.environment, fixture.root)
+            _ = VerifyHoldWaitFixture.record_phase(seed)
+            cls.recorded_environment = {key: value for key, value in fixture.environment.items()
+                                        if fixture.fixture_environment.get(key) != value}
+            shutil.rmtree(fixture.fixture_seed)
+            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
+        finally:
+            shutil.rmtree(fixture.root)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment.update(self.recorded_environment)
+
+    @override
+    def record_phase(self) -> Path:
+        """Use the private phase that the class seed already records."""
+        return self.fixture.root / "history/runs/unit-run.jsonl"
+
+
+class VerifyHoldHolderTests(RecordedHoldWaitFixture):
     def start_hold_step(self) -> subprocess.Popen[str]:
         """Call the real hold wrapper before the real cargo launcher."""
         script = self.fixture.root / "held-step.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + 'eval "$(declare -f build_hold_wait_local | sed \'1s/build_hold_wait_local/build_hold_wait_local_only/\')"\n'
-            + shell_functions(VERIFY, "step_state", "publish_step_state", "phase_wait_holder_flags",
+            + shell_functions(VERIFY, "verify_helper", "step_state", "publish_step_state", "phase_wait_holder_flags",
                               "phase_wait_start", "phase_wait_finish", "build_hold_wait_local") + '''
 PY=$TEST_REAL_PYTHON
 PHASE_WAIT_RECORDER=$2 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
@@ -560,33 +599,7 @@ except SystemExit as result:
 '''
 
 
-class VerifyTargetWaitHolderTests(VerifyHoldWaitFixture):
-    recorded_environment: ClassVar[dict[str, str]]
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        seed = cls()
-        fixture = seed.fixture
-        fixture.root = fixture.fixture_root
-        fixture.environment = fixture.fixture_environment.copy()
-        _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
-        try:
-            isolate_run_sources(fixture.environment, fixture.root)
-            _ = seed.record_phase()
-            cls.recorded_environment = {key: value for key, value in fixture.environment.items()
-                                        if fixture.fixture_environment.get(key) != value}
-            shutil.rmtree(fixture.fixture_seed)
-            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
-        finally:
-            shutil.rmtree(fixture.root)
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.fixture.environment.update(self.recorded_environment)
-
+class VerifyTargetWaitHolderTests(RecordedHoldWaitFixture):
     def prepare_target_wait(self) -> Path:
         root = self.fixture.root
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
@@ -816,7 +829,7 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
-class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
+class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
     def prepare_memory_route(self) -> Path:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()
@@ -828,13 +841,12 @@ class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
         def observe(request: wire.Request,
                     connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
             if isinstance(request, wire.PlacementRequest):
-                for path in Path(self.fixture.environment["TMPDIR"]).glob(
-                        f"verify-hold.{request.owner.pid}.*/placement-*.json.wait"):
+                holds = tool_folders(Path(self.fixture.environment["TMPDIR"]), "verify", pid=request.owner.pid)
+                for path in (wait for hold in holds for wait in hold.glob("placement-*.json.wait")):
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                     if isinstance(notice.last_reply, wire.Wait):
                         _ = controls.hosts.pop("mac", None)
-                first, = Path(self.fixture.environment["TMPDIR"]).glob(
-                    f"verify-hold.{request.owner.pid}.*/first-queued-at")
+                first, = (hold / "first-queued-at" for hold in holds if (hold / "first-queued-at").exists())
                 with (self.fixture.root / "memory-joins.jsonl").open("a") as output:
                     _ = output.write(json.dumps({"since": str(request.since).removesuffix(".0"),
                         "first": first.read_text()}) + "\n")
@@ -898,8 +910,8 @@ class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
             "TEST_TAPLO_EVENTS": str(self.fixture.root / "taplo-events.jsonl"), "TEST_TAPLO_STATUS": "0",
             "TEST_RUNNER_MAC": "failed", "TEST_RUNNER_STATUS": "101"})
         process = self.start("lint", "sample")
-        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 2, "both Mac judgments", (process,),
-                                directory=self.fixture.runner_state)
+        self.fixture.wait_until(lambda: len(self.fixture.runner_events()) == 3, "the Mac judgments and fix pass",
+                                (process,), directory=self.fixture.runner_state)
         self.fixture.wait_until(lambda: sum(row["event_type"] == "wait_started" for row in wait_rows(session)) == 2,
                                 "the local repair interval", (process,), directory=session)
         self.assertFalse(any(row["args"][:1] == ["mend"] and "--fix" in row["args"]
@@ -913,7 +925,7 @@ class VerifyMemoryRouteHolderTests(VerifyHoldWaitFixture):
                             for row in self.fixture.cargo_events()))
         arguments = [row["args"] for row in self.fixture.runner_events()]
         self.assertEqual([words[words.index("--verb") + 1] for words in arguments],
-                         ["mend-check", "clippy", "clippy"])
+                         ["mend-check", "mend-fix", "clippy", "clippy"])
 
 
 if __name__ == "__main__":

@@ -8,13 +8,44 @@ from scripts.notify.push_texts import ActionTemplate, NoActionNeeded, PushExampl
 # typical cases use existing test facts or the Nix thresholds, never invented log citations.
 
 
-def mac_idle_reservation(holder: str, detail: str) -> str:
-    """The optional reservation sentence used as a catalog value."""
-    return (f'The Mac reservation lists holder "{holder}" and label "{detail}".'
-            if holder not in ("", "none") else "")
+def waiting_tests(count: int) -> str:
+    """Name the tests that wait for the Mac."""
+    return "1 test waits" if count == 1 else f"{count} tests wait"
 
 
 ENTRIES = (
+    PushText("accounts.login_sitting", "accounts", "note", "Claude logins will expire", NoActionNeeded(),
+        "You asked for early login reminders.\nWithout renewal, Claude work stops at these login end dates:\n{accounts}\nFor each account:\n"
+        + "1. Sign out of claude.ai in the browser.\n2. Sign in as that account.\n"
+        + "3. On each named machine, run /login in a Claude session on that account.",
+        (PushExample("weekly", {"accounts": "claude1: Mac Sat 11-28, natedev Fri 12-11\n"
+            + "claude2: Mac Sun 11-29, natedev Sat 12-12\nclaude3: Mac Mon 11-30, natedev Sun 12-13\n"
+            + "claude4: Mac Tue 12-01, natedev Mon 12-14\nclaude5: Mac Wed 12-02, natedev Tue 12-15"}),
+         PushExample("safety", {"accounts": "claude4: Mac Sat 11-28"})),
+        purpose="The weekly sitting or safety margin requires a preventive Claude login.", header=False),
+    # These examples use regional permission errors.
+    PushText("aws.snapshot_failed", "buildlog", "note", "Cloud gates use old AWS prices",
+        ActionTemplate("To allow AWS reads, in a terminal on natedev, run ~/.claude/scripts/lib/py "
+                       + "~/.claude/scripts/aws_target/deploy.py up --approve-resources"),
+        "Cloud gates run merge tests on AWS and pick a region from hourly AWS reads.\n{failures}\n"
+        + "With old data, a gate can pick a region that costs more or is full.\n"
+        + "The command only allows these reads and costs nothing. Then the hourly refresh works. "
+        + "It needs your AWS admin passphrase.",
+        (PushExample("permission", {
+            "failures": "AWS refused the us-east-2 price read."}),
+         PushExample("regional_permissions", {
+            "failures": "AWS refused the us-east-2 price read.\nAWS refused the us-west-2 Standard quota read."})),
+        purpose="AWS denied a regional read that the gate deployment can repair."),
+    PushText("aws.hours_gap", "buildlog", "note", "AWS billed hours differ from gate boxes",
+        ActionTemplate("To find the cause, ask builds to check the {size} hours in {region} on {day}"),
+        "On {day} UTC, AWS billed {billed} h of {size} Spot in {region}.\n"
+        + "The cost ledger records {box} h of gate boxes there. The gap is {gap}, above the {limit} limit.\n"
+        + "More billed hours can mean a box ran without a gate record. Fewer can mean the bill is not complete.",
+        (PushExample("more_billed", {"day": "2026-11-13", "billed": "5.40", "size": "c7a.8xlarge",
+                                     "region": "us-east-2", "box": "4.69", "gap": "15%", "limit": "15%"}),
+         PushExample("no_box", {"day": "2026-11-13", "billed": "0.50", "size": "c7a.4xlarge",
+                                "region": "eu-south-2", "box": "0.00", "gap": "all billed hours", "limit": "15%"})),
+        purpose="A gate type, region and day billed more or fewer hours than its boxes."),
     PushText("nightly.assigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
         "sdlc received it at {received}.\nAssigned to {unit} at {assigned}.\n"
         + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
@@ -25,16 +56,6 @@ ENTRIES = (
             "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed", "received": "03:00 EST",
             "unit": "types", "assigned": "03:05 EST"})),
         purpose="sdlc assigned the failed nightly check to a unit director."),
-    PushText("nightly.unassigned", "sdlc", "note", "Nightly check {outcome}", NoActionNeeded(),
-        "{notice}.\nsdlc has not assigned the fix yet.\n"
-        + "The nightly check of {branch} {outcome} at {time}.\nType check: {types}.\nFull tests: {tests}.",
-        (PushExample("received", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
-            "types": "passed", "tests": "failed in production/test_staff.py",
-            "notice": "sdlc received it at 03:00 EST"}),
-         PushExample("unreceived", {"branch": "main", "time": "03:00 EST", "outcome": "failed",
-            "types": "failed with 3 errors, 0 warnings, 0 notes", "tests": "passed",
-            "notice": "sdlc has not confirmed receipt"})),
-        purpose="The failed nightly check has no assignment at its deadline."),
     PushText("nightly.result", "nightly", "note", "Nightly check {outcome}", NoActionNeeded(),
         "The nightly check of {branch} finished at {time}.\nType check: {types}.\nFull tests: {tests}.",
         (PushExample("passed", {"branch": "main", "time": "03:53 EST", "outcome": "passed",
@@ -79,27 +100,12 @@ ENTRIES = (
         + "Recommendation: Acknowledge after you read the report.",
         (PushExample("report", {"session": "natedev", "machine": "natedev", "report": "12 of 12 phases that change the screen merged without the extra code reviewer: report ready, waiting for your acknowledgment"}),),
         purpose="A build report reminds you to acknowledge its review report.", session=SessionTemplate("{session}"), agent_written=True),
-    PushText("mac_idle.blocked", "Mac idle watch", "blocked", "{holder} blocks waiting Mac tests",
-        ActionTemplate("On natedev, in the {holder} session, ask it to finish its Mac work and run /build:mac unblock"),
-        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
-        + "{waiting} steps wait behind the {holder} session's block. It labeled the reservation \"{detail}\". "
-        + "Waiting work can use the Mac after {clears}.",
-        (PushExample("research_block", {"minutes": "10", "waiting": "7", "holder": "research",
-            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"}),
-         PushExample("three_waiting", {"minutes": "12", "waiting": "3", "holder": "research",
-            "detail": "P15 F11 L0 run", "since": "07:47 EDT", "clears": "/build:mac unblock by research"})),
-        purpose="A Mac block holds up eligible steps past the configured threshold."),
-    PushText("mac_idle.stuck", "Mac idle watch", "decision", "Waiting tests are not using the Mac",
-        ActionTemplate("On natedev, ask the builds showrunner to get the waiting steps onto the Mac"),
-        "No natedev build or test has run on the Mac for {minutes} minutes, since {since}. "
-        + "{waiting} steps wait. {reservation} "
-        + "To restore Mac work: {clears}.",
-        (PushExample("idle_research_claim", {"minutes": "10", "waiting": "3",
-            "reservation": mac_idle_reservation("research", "P15 F11 L0 run"), "since": "07:50 EDT", "clears": "release of the idle claim P15 F11 L0 run"}),
-         PushExample("free_mac", {"minutes": "10", "waiting": "7",
-            "reservation": mac_idle_reservation("none", ""), "since": "07:47 EDT",
-            "clears": "the builds showrunner checks why the waiting steps do not take the Mac"})),
-        purpose="Eligible steps wait while the Mac has no build or test."),
+    PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac tests stopped",
+        ActionTemplate("Wake the Mac or check its network."),
+        "Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.",
+        (PushExample("one_test", {"minutes": "10", "tests": waiting_tests(1)}),
+         PushExample("three_tests", {"minutes": "12", "tests": waiting_tests(3)})),
+        purpose="The Mac does not answer while natedev tests wait for it."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
@@ -437,7 +443,7 @@ ENTRIES = (
     # sender from the session's own name; a script with no session record names itself with --from.
     # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.
     PushText("quota.paid_credits", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
         "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
         + "Turn off: work moves to Claude until {next_reset}.",
@@ -449,7 +455,7 @@ ENTRIES = (
     # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
     # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.
     PushText("quota.paid_credits_queued", "{sender}", "decision", "{sender}: {account} now uses paid credits",
-        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        ActionTemplate("To stop it, remove {account} from codex_credit_accounts in ~/.claude/config/accounts.conf on {machine}"),
         "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
         + "Leave on (recommended): workers spend these credits until your queued move runs. "
         + "If the credits run out first, workers wait.\n\n"

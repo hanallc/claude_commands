@@ -137,16 +137,40 @@ def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
 
 
 class PushTextTests(unittest.TestCase):
+    def test_login_sitting_examples_name_end_dates_and_steps_as_normal_notes(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "accounts.login_sitting")
+        self.assertEqual(entry.sender, "accounts")
+        self.assertEqual(entry.need, "note")
+        self.assertEqual([example.name for example in entry.examples], ["weekly", "safety"])
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertTrue(push.body.startswith("You asked "))
+                self.assertIn("login end dates", push.body)
+                self.assertIn("Sign out of claude.ai in the browser.", push.body)
+                self.assertIn("Sign in as that account.", push.body)
+                self.assertIn("run /login in a Claude session on that account.", push.body)
+                self.assertNotIn("No action needed.", push.message)
+
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
                         "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
                         purpose="Test.")
 
-    def test_blocked_mac_catalog_keeps_its_required_action(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "mac_idle.blocked")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertIsInstance(push.action, ActionRequired)
-        self.assertEqual(push.action, ActionRequired(cast(ActionTemplate, entry.action).text.format_map(push.values)))
+    def test_unreachable_mac_catalog_requires_an_action_and_names_the_waiting_tests(self) -> None:
+        entries = [entry for entry in push_texts.catalog() if entry.id.startswith("mac_idle.")]
+        self.assertEqual([entry.id for entry in entries], ["mac_idle.unreachable"])
+        entry = entries[0]
+        for example, minutes, tests in (("one_test", "10", "1 test waits"),
+                                         ("three_tests", "12", "3 tests wait")):
+            with self.subTest(example=example):
+                values = next(row.values for row in entry.examples if row.name == example)
+                push = push_texts.render_entry(entry, values)
+                self.assertEqual(push.action, ActionRequired("Wake the Mac or check its network."))
+                self.assertEqual(push.title, "Mac tests stopped")
+                self.assertEqual(push.body, f"Mac tests stopped {minutes} min ago.\n{tests}; builds cannot reach the Mac.")
+                self.assertEqual(push.message.splitlines(), ["Action: Wake the Mac or check its network.",
+                    f"Mac tests stopped {minutes} min ago.", f"{tests}; builds cannot reach the Mac."])
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
@@ -432,7 +456,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
                          + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
@@ -443,7 +467,7 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual((entry.title, entry.action, entry.need, entry.sender), (plain.title, plain.action, plain.need, plain.sender))
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
-        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+        self.assertEqual(push.message, "Action: To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev\n"
                          + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): workers spend these credits until your queued move runs. "
                          + "If the credits run out first, workers wait.\n\n"

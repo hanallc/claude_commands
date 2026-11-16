@@ -26,6 +26,7 @@ from scripts.production.staff_test_support import (
 )
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib import conf, unit_runs
+from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import config_environment
 from scripts.agents.unit_staff_test_support import PARENTS, isolated_parents
 
@@ -62,13 +63,13 @@ class RunProcessTests(StaffTestCase):
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.unit_folder)
         theirs = self.run_folder("run-b", other)
-        lint = ["python3", "detached_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
+        lint = ["python3", "detached_runs.py", "supervise", str(self.run_record(mine, "lint", 101, group=102))]
         _ = self.run_record(mine, "test", 104)
         self.processes = {
-            # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
+            # The unit's detached lint run: verify.sh leads the command session, and tee is in it.
             101: FakeProcess(self.unit_folder, 101, lint),
-            102: FakeProcess(self.unit_folder, 101, ["bash", "verify.sh", "lint", "pkg"]),
-            103: FakeProcess(self.unit_folder, 101, ["tee", "-a", "run.log"]),
+            102: FakeProcess(self.unit_folder, 102, ["bash", "verify.sh", "lint", "pkg"]),
+            103: FakeProcess(self.unit_folder, 102, ["tee", "-a", "run.log"]),
             104: FakeProcess(self.unit_folder, 104, ["cargo", "build"]),
             900: FakeProcess(self.unit_folder, 900, ["zsh"]),
             # Another unit's detached run, in its own worktree.
@@ -96,11 +97,12 @@ class RunProcessTests(StaffTestCase):
         _ = (folder / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": member.id}))
         return folder
 
-    def run_record(self, folder: Path, label: str, pid: int) -> Path:
+    def run_record(self, folder: Path, label: str, pid: int, group: int = 0) -> Path:
         path = folder / shutdown.DETACHED_RUNS / f"{label}.json"
         parent = worker_admission.parent(staff.local_snapshot(), run=folder)
         member = fixture_worker(folder.name + "-" + label, parent.id, backend=staff.CodexBackend(self.root / "codex"))
-        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}))
+        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "staff_id": member.id}
+                                          | ({"command_group": group} if group else {})))
         return path
 
 
@@ -146,8 +148,8 @@ class RunProcessTests(StaffTestCase):
                       mock.patch.object(staff, "snapshot", side_effect=AssertionError("local staff is unavailable")),
                       mock.patch.object(staff, "local_snapshot", side_effect=AssertionError("local staff is unavailable")),
                       redirect_stderr(errors)):
-                    found = shutdown.retirement_run_processes(owner, [101, 102], record=supplied)
-                self.assertEqual(set(found), {101, 102})
+                    found = shutdown.retirement_run_processes(owner, [101, 102, 103, 104], record=supplied)
+                self.assertEqual(set(found), {101, 102, 103})
                 self.assertEqual(errors.getvalue(), "")
                 reads.assert_called_once_with("production")
                 settings = [cast(object, call.kwargs["settings"]) for call in arguments.call_args_list]
@@ -159,6 +161,11 @@ class RunProcessTests(StaffTestCase):
 
 
 class RunRecordLookupTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        bind_private_run_roots(self, self.root)
+
     def test_move_lookups_build_once_and_keep_exact_worktree_spelling(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         runs = root / "history/runs"

@@ -32,7 +32,8 @@ from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProj
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import queue_place
 from scripts.copies import copies
-from scripts.lib import copy_record, scratch
+from scripts.copies.copies_test_support import copies_environment
+from scripts.lib import build_folders, copy_record, scratch
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
@@ -197,8 +198,8 @@ class CrateRunTests(CargoProjectTests):
             seed = self.frozen_seed
         else:
             seed = self.fixture_seed
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         _ = shutil.copytree(seed, self.root, symlinks=True)
-        self.addCleanup(shutil.rmtree, self.root)
         self.repo: Path = self.root / "project"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
@@ -217,6 +218,7 @@ class CrateRunTests(CargoProjectTests):
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="style-fixture")
         self.enterContext(mock.patch.dict(os.environ, {
+            **copies_environment(self.root),
             "HOME": str(self.root / "gate-home"),
             "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
             "SCRATCH_HOLDS": str(self.root / "holds.json"),
@@ -553,8 +555,8 @@ class CrateRunTests(CargoProjectTests):
                 return self.commands(repo, arguments)
             _ = batch.advance("bulk_sample", renamed, commands, available, fixture_execute)
         self.assertEqual([call.args for call in calls.call_args_list], [(self.repo,)])
-        gates = list((copies.gates_root() / self.repo.name).iterdir())
-        self.assertEqual({path.name for path in gates}, {"sample-style-gate", "sample-style-gate-2"})
+        gates = [path for path in copies.gates_root().glob(f"{self.repo.name}-slot*") if path.is_dir()]
+        self.assertEqual({path.name for path in gates}, {f"{self.repo.name}-slot1", f"{self.repo.name}-slot2"})
         self.assertTrue(any(path in observed_caches for path in gates))
         self.assertTrue(any(not path.exists() for path in observed))
 
@@ -576,24 +578,26 @@ class CrateRunTests(CargoProjectTests):
         original = self.git("rev-parse", "HEAD")
         manifest = self.batch.read()
         with self.batch.frozen_checkout(manifest) as frozen:
-            frozen_owner = copies.read_record(frozen).owner
-            self.assertEqual(copies.read_record(frozen).source, str(self.repo))
-            with scratch.busy_locks(frozen, create=False) as idle:
-                self.assertFalse(idle)
+            lease = cast(dict[str, object], json.loads(frozen.with_name(frozen.name + ".lease.json").read_text()))
+            frozen_owner = lease["unit"]
+            self.assertEqual(copies.main_checkout(frozen), self.repo)
+            self.assertEqual(build_folders.build_folder_state(frozen), "held")
         observed: set[Path] = set()
 
         def registered(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
             observed.add(repo)
-            if (repo / copies.GATE_RECORD).is_file():
-                self.assertEqual(copies.read_record(repo).owner, frozen_owner)
+            if repo.is_relative_to(copies.gates_root()):
+                lease = cast(dict[str, object], json.loads(repo.with_name(repo.name + ".lease.json").read_text()))
+                self.assertEqual(lease["unit"], frozen_owner)
+                self.assertEqual(build_folders.build_folder_state(repo), "held")
             else:
                 self.assertIn(repo, list(scratch.copy_paths()))
                 record = scratch.task_of(repo)
                 self.assertIsInstance(record, copy_record.Registered)
                 assert isinstance(record, copy_record.Registered)
                 self.assertEqual(record.fields["source_path"], str(self.repo))
-            with scratch.busy_locks(repo, create=False) as idle:
-                self.assertFalse(idle)
+                with scratch.busy_locks(repo, create=False) as idle:
+                    self.assertFalse(idle)
             return self.commands(repo, arguments)
 
         for package in manifest["crates"]:
@@ -602,10 +606,11 @@ class CrateRunTests(CargoProjectTests):
             self.assertNotIn(worker, list(scratch.copy_paths()))
             self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
             self.assertFalse(worker.exists())
-        gates = list((copies.gates_root() / self.repo.name).iterdir())
-        self.assertEqual({tree.name for tree in gates}, {"sample-style-gate", "sample-style-gate-2"})
+        gates = [path for path in copies.gates_root().glob(f"{self.repo.name}-slot*") if path.is_dir()]
+        self.assertEqual({tree.name for tree in gates}, {f"{self.repo.name}-slot1", f"{self.repo.name}-slot2"})
         self.assertTrue(all((tree / "target").is_dir() for tree in gates))
-        self.assertFalse(frozen.exists())
+        self.assertTrue(frozen.exists())
+        self.assertEqual(build_folders.build_folder_state(frozen), "free")
         self.assertTrue(any(not path.exists() for path in observed))
         self.assertEqual(self.git("rev-parse", "HEAD"), original)
 

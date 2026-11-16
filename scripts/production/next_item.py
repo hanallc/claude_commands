@@ -2,12 +2,14 @@
 """The one item /next shows from the four lists the user works through, and moving an item to the end.
 
     next_item.py show [--production NAME] [--kind change|proposal|efficiency|question] [--order urgent|oldest|newest] [--all-below]
+    next_item.py show --id C1535|sdlc/C1535 [--production NAME]
     next_item.py move-to-end --kind change|proposal|efficiency|question [--production NAME] [--all-below]
 
 `show` prints the item's kind on the first line, then the item as its list prints it, and pins it
 (urgency.py). With a kind it takes that list's first item; with none, the first across the four
 lists (`urgency.top_across`). The order is urgency.py's: `urgent` (the default) or `oldest` or
-`newest`. It prints one item and never the one after it.
+`newest`. It prints one item and never the one after it. With `--id` it prints that change row
+and pins nothing; a row with a verdict, or an ID on no list, prints one line that says so.
 
 `move-to-end` moves the item /next last showed from that list to the end of the list, so the next
 `show` takes another item. It shows nothing after it.
@@ -90,10 +92,13 @@ READ_CHANGE_LISTS = ReadChangeLists()
 
 
 def change_queue(doc: Path, below: bool = False, *,
-                 prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
+                 prepared: change_review.ChangeQueue | change_review.PreparedChangeLists | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
     """The production's current and earlier change rows, and with `below` each lower one's."""
-    queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
-             if isinstance(prepared, ReadChangeLists) else prepared)
+    if isinstance(prepared, change_review.PreparedChangeLists):
+        queue = change_review.change_queue(change_review.scope_list(doc, prepared=prepared), doc, below, prepared=prepared)
+    else:
+        queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
+                 if isinstance(prepared, ReadChangeLists) else prepared)
     return Queue(queue.name, _as_text(queue.entries, lambda entry: change_review.describe(entry.item)))
 
 
@@ -154,6 +159,22 @@ def show(kind: str, order: str, production: Path | None, below: bool = False) ->
     return f"{kinds[name]}\n{shown.item}"
 
 
+def show_change(value: str, production: str) -> str:
+    """The change row with this ID, as /next shows a change; a row with a verdict, or on no list, is one line."""
+    try:
+        target = change_review.resolve_row(value, production=production)
+        row = next((row for row in change_review.review_rows(target.path) if row["#"] == target.row), None)
+        if row is None:
+            return f"{value} is on no review list"
+        if row.get("Verdict"):
+            return f"{value} has its verdict: {row['Verdict']}"
+        return f"{CHANGE}\n{change_review.describe(row | {'#': change_review.row_display_id(target.path, target.row)})}"
+    except change_review.RowNotListed:
+        return f"{value} is on no review list"
+    except (change_review.ChangeReviewError, OSError) as error:
+        raise NextError(f"{CHANGE}: {error}") from None
+
+
 def move_to_end(kind: str, production: Path | None, below: bool = False, *, key: str = "",
                 prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> str:
     """Move the given key, or the item /next last showed, to the list's end."""
@@ -176,6 +197,7 @@ def main(arguments: list[str]) -> int:
     shown = actions.add_parser("show")
     _ = shown.add_argument("--kind", choices=KINDS, default="")
     _ = shown.add_argument("--order", choices=urgency.ORDERS, default=urgency.URGENT)
+    _ = shown.add_argument("--id", default="", dest="row")
     moved = actions.add_parser("move-to-end")
     _ = moved.add_argument("--kind", choices=KINDS, required=True)
     for action in (shown, moved):
@@ -185,6 +207,9 @@ def main(arguments: list[str]) -> int:
     production_name = cast(str, args.production)
     below = cast(bool, args.below)
     try:
+        if cast(str, args.action) == "show" and cast(str, args.row):
+            print(show_change(cast(str, args.row), production_name))
+            return 0
         production = change_review.production_doc(production_name) if production_name else None
         if cast(str, args.action) == "show":
             print(show(cast(str, args.kind), cast(str, args.order), production, below))

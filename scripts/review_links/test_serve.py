@@ -1,6 +1,8 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lib.checkout_test_support import python_tool_source
+
 import importlib.util
 import os
 import select
@@ -23,7 +25,10 @@ from unittest.mock import patch
 from typing import cast, override
 
 
-from scripts.review_links import change_page, serve
+from scripts.aws_target import aws_page
+from scripts.build_queue import memory_feed
+from scripts.production import change_review
+from scripts.review_links import accounts_page, change_browser, change_page, console, serve
 from scripts.lib import atomic_file, conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -37,7 +42,7 @@ class HttpReply:
 
 def setUpModule() -> None:
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    for stem in ("review_links", "change_review"):
+    for stem in ("review_links", "change_review", "console"):
         _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf", configuration / f"{stem}.conf")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
@@ -95,6 +100,103 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("charset=utf-8", reply.content_type)
         self.assertEqual(reply.body.decode("utf-8"), text)
 
+    def head(self, path: str) -> tuple[int, dict[str, str], bytes]:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, {name.lower(): value for name, value in response.getheaders()}, response.read()
+        finally:
+            connection.close()
+
+    def test_console_route_renders_current_navigation_at_one_fixed_address(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+            "STAFF_FILE": str(self.root.parent / "staff.json")})))
+        _ = self.enterContext(patch.object(memory_feed, "page_url", return_value="/builds/memory_live.html", create=True))
+        _ = self.enterContext(patch.object(aws_page, "page_url", return_value="/aws/aws_prices.html"))
+        status, headers, body = self.head("/console/")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "text/html; charset=utf-8")
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertIn("frame-src 'self'", headers["content-security-policy"])
+        self.assertNotEqual(headers.get("x-frame-options"), "DENY")
+        self.assertIn(b"<h1>Hana console</h1>", body)
+        self.assertIn(b'data-url="/console/changes.html" data-title="Changes"', body)
+        self.assertIn(b'href="?page=rebuilds" data-page="rebuilds"\ndata-url="/console/rebuilds.html"', body)
+        self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).is_file())
+        for path in ("/console", "/console?page=questions"):
+            with self.subTest(path=path):
+                status, headers, _ = self.head(path)
+                self.assertEqual((status, headers["location"]), (303, "/console/" + path[len("/console"):]))
+        for path in ("/../console/", "/%2e%2e/console/", "/.review-link-console.html"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path).status, 404)
+
+    def post(self, path: str, body: str) -> tuple[int, bytes]:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request("POST", path, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_the_disks_measure_answers_at_once_with_the_measure_state_the_slots_and_the_sessions(self) -> None:
+        from scripts.disks import disks_page, sessions, slots
+
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
+        start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureStart.STARTED))
+        report: slots.SlotReport = {"root": "/build/slot", "groups": []}
+        _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
+        folders: sessions.SessionReport = {"root": "/session", "sessions": []}
+        _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
+        answer = b'{"state": "started", "slots": {"root": "/build/slot", "groups": []}, "sessions": {"root": "/session", "sessions": []}}'
+        self.assertEqual(self.post("/disks/measure", ""), (200, answer))
+        self.assertEqual(start.call_count, 1)
+        self.assertNotEqual(self.post("/other/measure", "")[0], 200)
+        self.assertEqual(start.call_count, 1)
+
+    def test_console_news_records_the_open_page_and_names_pages_with_new_items(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+            "STAFF_FILE": str(self.root.parent / "staff.json")})))
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
+        questions = self.enterContext(patch.object(change_browser, "waiting_questions", return_value=frozenset({"q1"})))
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": []}'))
+        questions.return_value = frozenset({"q1", "q2"})
+        self.assertEqual(self.post("/console/news", "open=changes"), (200, b'{"new": ["questions"]}'))
+        self.assertEqual(self.post("/console/news", "open=questions"), (200, b'{"new": []}'))
+        # The Rebuilds page names no open page; the marks still follow new items.
+        questions.return_value = frozenset({"q1", "q2", "q3"})
+        self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["questions"]}'))
+        for body in ("open=nowhere", "", "open=changes&open=questions"):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/console/news", body)[0], 400)
+        self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
+
+    def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
+        for path, location in (
+            ("/abc123/console.html?page=questions", "/console/?page=questions"),
+            ("/abc123/console.html", "/console/"),
+            ("/abc123/changes.html?type=questions", "/console/changes.html?type=questions"),
+            ("/abc123/rebuilds.html", "/console/rebuilds.html"),
+        ):
+            with self.subTest(path=path):
+                status, headers, _ = self.head(path)
+                self.assertEqual((status, headers["location"]), (303, location))
+        row = self.root / "def456"
+        row.mkdir()
+        _ = (row / change_page.MANIFEST).write_text("{}", encoding="utf-8")
+        with self.assertRaises(FileNotFoundError):
+            _ = serve.old_console_link(self.root, "/def456/changes.html")
+        for path in ("/abc123/notes.html", "/ABC123/console.html", "/abc123/sub/console.html"):
+            with self.subTest(path=path):
+                with self.assertRaises(FileNotFoundError):
+                    _ = serve.old_console_link(self.root, path)
+
     def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
         expired = self.root / "aaaaaa"
         expired.mkdir()
@@ -128,6 +230,151 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_accounts_route_renders_per_request_and_reports_a_failed_read(self) -> None:
+        with (patch.object(accounts_page, "render_with_facts", side_effect=OSError("staff file absent")),
+              redirect_stderr(StringIO()) as error):
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual(reply.status, 503)
+        self.assertIn(b"The Accounts page is not available.", reply.body)
+        self.assertNotIn(b"staff file absent", reply.body)
+        self.assertIn("review-links accounts: staff file absent", error.getvalue())
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"<p>board</p>", 0.5, 100)) as render:
+            reply = self.request(accounts_page.PAGE_PATH)
+        self.assertEqual((reply.status, reply.content_type, reply.body), (200, "text/html; charset=utf-8", b"<p>board</p>"))
+        render.assert_called_once_with()
+
+    def test_accounts_cache_keeps_the_page_during_one_render_and_after_a_failure(self) -> None:
+        cache = serve.AccountsPageCache()
+        first = accounts_page.AccountsRender(b'<p data-load-time>first</p>', 0.25, 100)
+        with patch.object(accounts_page, "render_with_facts", return_value=first):
+            kept = cache.get()
+        for fail in (False, True):
+            with self.subTest(failed_render=fail):
+                entered, release = threading.Event(), threading.Event()
+
+                def render() -> accounts_page.AccountsRender:
+                    entered.set()
+                    if not release.wait(TEST_HANG_GUARD_SECS):
+                        raise OSError("the test did not release the render")
+                    if fail:
+                        raise OSError("no stored data")
+                    return accounts_page.AccountsRender(b'<p data-load-time>second</p>', 0.75, 200)
+
+                before = tuple(cache.recent_times)
+                with patch.object(accounts_page, "render_with_facts", side_effect=render) as child, redirect_stderr(StringIO()) as errors:
+                    try:
+                        self.assertEqual(cache.get(), kept)
+                        self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                        self.assertEqual(cache.get(), kept)
+                        child.assert_called_once_with()
+                        self.assertEqual(tuple(cache.recent_times), before)
+                    finally:
+                        release.set()
+                        with cache.condition:
+                            self.assertTrue(cache.condition.wait_for(lambda: not cache.rendering, TEST_HANG_GUARD_SECS))
+                    if fail:
+                        self.assertEqual(cache.page, kept)
+                        self.assertEqual(tuple(cache.recent_times), before)
+                    else:
+                        self.assertIn(b">second</p>", cache.page)
+                        self.assertIn(b'data-render-median="0.500000"', cache.page)
+                        kept = cache.page
+                if fail:
+                    self.assertEqual(errors.getvalue(), "review-links accounts: no stored data\n")
+
+    def test_accounts_first_request_waits_for_its_render(self) -> None:
+        cache = serve.AccountsPageCache()
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        replies: list[bytes] = []
+
+        def render() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            return accounts_page.AccountsRender(b"first page", 0.5, 100)
+
+        def request() -> None:
+            replies.append(cache.get())
+            returned.set()
+
+        with patch.object(accounts_page, "render_with_facts", side_effect=render) as child:
+            threads = [threading.Thread(target=request)]
+            try:
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(returned.is_set())
+            finally:
+                release.set()
+                for thread in threads:
+                    thread.join(TEST_HANG_GUARD_SECS)
+                    self.assertFalse(thread.is_alive())
+            self.assertEqual(replies, [b"first page"])
+            child.assert_called_once_with()
+
+    def test_accounts_cache_keeps_only_the_last_ten_successful_render_times(self) -> None:
+        cache = serve.AccountsPageCache()
+        for seconds in range(1, 13):
+            with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b'<p data-load-time></p>', seconds, seconds+100)):
+                _ = cache.replace()
+        self.assertEqual(tuple(cache.recent_times), tuple(range(3, 13)))
+        self.assertIn(b'data-render-seconds="12.000000"', cache.page)
+        self.assertIn(b'data-render-finished="112.000000"', cache.page)
+        self.assertIn(b'data-render-median="7.500000"', cache.page)
+        self.assertIn(b'data-render-count="10"', cache.page)
+
+    def test_accounts_first_render_failure_reaches_every_waiter(self) -> None:
+        entered, release, waiters_ready = threading.Event(), threading.Event(), threading.Event()
+        waiting: set[str] = set()
+
+        class WaiterCondition(threading.Condition):
+            @override
+            def __enter__(self) -> bool:
+                acquired = super().__enter__()
+                name = threading.current_thread().name
+                if name.startswith("accounts-waiter-"):
+                    waiting.add(name)
+                    if len(waiting) == 2:
+                        waiters_ready.set()
+                return acquired
+
+        cache = serve.AccountsPageCache(condition=WaiterCondition())
+        failures: list[str] = []
+
+        def render() -> accounts_page.AccountsRender:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise OSError("the test did not release the render")
+            raise OSError("the first render timed out")
+
+        def request() -> None:
+            try:
+                _ = cache.get()
+            except OSError as error:
+                failures.append(str(error))
+
+        first = threading.Thread(target=request)
+        waiters = [threading.Thread(target=request, name=f"accounts-waiter-{index}") for index in range(2)]
+        with patch.object(accounts_page, "render_with_facts", side_effect=render) as child:
+            try:
+                first.start()
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                for waiter in waiters:
+                    waiter.start()
+                self.assertTrue(waiters_ready.wait(TEST_HANG_GUARD_SECS))
+            finally:
+                release.set()
+                for thread in (first, *waiters):
+                    if thread.ident is not None:
+                        thread.join(TEST_HANG_GUARD_SECS)
+                        self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, ["the first render timed out"] * 3)
+            child.assert_called_once_with()
+        self.assertEqual(tuple(cache.recent_times), ())
+        with patch.object(accounts_page, "render_with_facts", return_value=accounts_page.AccountsRender(b"retry page", 0.5, 100)) as retry:
+            self.assertEqual(cache.get(), b"retry page")
+            retry.assert_called_once_with()
 
     def test_inaccessible_sweep_entries_do_not_prevent_bind_or_other_links(self) -> None:
         session = self.root / "manual"
@@ -280,6 +527,24 @@ class SnapshotSweepTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-sweep-test-")))
 
+    def test_change_image_sweep_keeps_named_and_recent_images(self) -> None:
+        now = 1_800_000_000.0
+        listing = self.root / "lists"
+        listing.mkdir()
+        _ = (listing / (change_review.PREFIX + "test.md")).write_text(
+            f"## To review\n\n| # | {change_review.IMAGE} |\n| --- | --- |\n| C1 | 111111111111 |\n")
+        for identity, age in (("000000000000", 20), ("111111111111", 20), ("222222222222", 2)):
+            folder = self.root / "change-images" / identity
+            folder.mkdir(parents=True)
+            _ = (folder / "image.png").write_bytes(b"fixture image")
+            modified = now - age * 86400
+            os.utime(folder, (modified, modified))
+        with patch("scripts.production.change_review.lists_directory", return_value=listing):
+            self.assertEqual(serve.sweep_snapshots(self.root, now), 1)
+        self.assertFalse((self.root / "change-images" / "000000000000").exists())
+        self.assertTrue((self.root / "change-images" / "111111111111").is_dir())
+        self.assertTrue((self.root / "change-images" / "222222222222").is_dir())
+
     def snapshot(self, session: str, name: str, modified: float) -> Path:
         directory = self.root / session / name
         directory.mkdir(parents=True)
@@ -300,6 +565,15 @@ class SnapshotSweepTests(unittest.TestCase):
         self.assertTrue((kept / "review.html").is_file())
         self.assertFalse(removed.exists())
         self.assertFalse(other_removed.exists())
+
+    def test_sweep_keeps_the_fixed_console_folder_at_any_age(self) -> None:
+        now = 1_800_000_000.0
+        folder = self.root / change_page.CONSOLE_FOLDER
+        folder.mkdir()
+        _ = (folder / change_page.BROWSER_MANIFEST).write_text("{}", encoding="utf-8")
+        os.utime(folder, (now - 30 * 24 * 60 * 60, now - 30 * 24 * 60 * 60))
+        self.assertEqual(serve.sweep_snapshots(self.root, now), 0)
+        self.assertTrue((folder / change_page.BROWSER_MANIFEST).is_file())
 
     def test_sweep_tolerates_a_root_that_has_not_been_created(self) -> None:
         missing = self.root / "not-created-yet"
@@ -585,7 +859,7 @@ class ServerCodeHealthTests(unittest.TestCase):
 
 
 class ServerCodeRestartTests(unittest.TestCase):
-    def test_a_changed_module_restarts_the_same_process_and_keeps_serving_http(self) -> None:
+    def test_a_changed_module_restarts_the_same_process_and_answers_a_request_sent_during_the_restart(self) -> None:
         checkout = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-restart-test-")))
         server_file = checkout / "scripts/review_links/serve.py"
         server_file.parent.mkdir(parents=True)
@@ -598,14 +872,19 @@ class ServerCodeRestartTests(unittest.TestCase):
         root.mkdir()
         _ = (root / "answer.txt").write_text("The server answers after the restart.\n")
         driver = checkout / "driver.py"
-        _ = driver.write_text('''import importlib.util
+        _ = driver.write_text(python_tool_source('''import importlib.util
 import os
 import sys
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from scripts.review_links import serve
 
 checkout = Path(__file__).parent
+if serve.LISTEN_FD in os.environ:
+    # Hold the restart open, so the test sends a request before the new server starts.
+    print(f"restarting {os.getpid()}", file=sys.__stdout__, flush=True)
+    time.sleep(0.5)
 serve.__file__ = str(checkout / "scripts/review_links/serve.py")
 serve.tailscale_ip = lambda: "127.0.0.1"
 spec = importlib.util.spec_from_file_location("review_restart_fixture", checkout / "review_restart_fixture.py")
@@ -625,7 +904,7 @@ class ObservedServer(serve.ReviewLinksServer):
 serve.ReviewLinksServer = ObservedServer
 with redirect_stdout(sys.stderr):
     raise SystemExit(serve.main(["--port", os.environ.get("REVIEW_TEST_PORT", "0")]))
-''')
+'''))
         errors_path = checkout / "errors.txt"
         errors = self.enterContext(errors_path.open("w"))
         child: subprocess.Popen[str] = subprocess.Popen(
@@ -658,6 +937,18 @@ with redirect_stdout(sys.stderr):
         self.assertEqual(first[0], child.pid)
         self.assertEqual(first[1], "before")
         _ = module_file.write_text("VALUE = 'after_code_change'\n")
+        assert child.stdout is not None
+        ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
+        self.assertEqual(ready, [child.stdout], errors_path.read_text())
+        self.assertEqual(cast(str, child.stdout.readline()).split(), ["restarting", str(first[0])])
+        during = HTTPConnection("127.0.0.1", first[2], timeout=TEST_HANG_GUARD_SECS)
+        try:
+            during.request("GET", "/answer.txt")
+            response = during.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read().decode(), (root / "answer.txt").read_text())
+        finally:
+            during.close()
         second = read_start()
         self.assertEqual(second, (first[0], "after_code_change", first[2]))
         self.assertEqual((checkout / "starts.txt").read_text().splitlines(),
@@ -737,8 +1028,6 @@ class ReviewLinksConfigTests(unittest.TestCase):
                 self.assertFalse(snapshot.exists())
 
     def test_config_keeps_the_existing_values(self) -> None:
-        from scripts.lib import conf
-
         settings = conf.read(Path(__file__).resolve().parents[2] / "config/review_links.conf")
         for key, expected in {'unrouted_alert_recipient': 'natedev'}.items():
             with self.subTest(key=key):

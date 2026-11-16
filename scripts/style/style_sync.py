@@ -139,12 +139,11 @@ def direct_route(repo: Path, unit: str = "") -> DirectUnitSync | NoDirectRoute:
 
 def sync_notice(address: str, target: str, branch: str, tip: str) -> None:
     caller = showrunners.own_name() or "style_sync"
-    sent = subprocess.run([
-        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", caller,
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", caller,
         "--text", f"From {caller}: branch point {branch} moved to {tip[:7]}; sync.",
         "--key", f"style-sync:{target}",
-        "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+        "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+    ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(sent.returncode, sent.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"sent", "skipped", "kept", "replaced"}:
@@ -180,8 +179,8 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
 
 
 def lint_prefix() -> str:
-    """Read the current prefix for style lint folders."""
-    return build_folders.FOLDER_PREFIXES["style-sync-lint"]
+    """Name the start of each style lint folder; its sweep finds stopped runs by it."""
+    return "style-sync-lint-"
 
 
 def lint_temp_parent() -> Path:
@@ -370,8 +369,7 @@ def verify_lint(directory: Path) -> tuple[int, str]:
         verifier_command(directory, os.getpid()), cwd=directory / "checkout", env={**os.environ, "UNIT_DETACHED_RUN": "1",
             "CARGO_BUILD_BUILD_DIR": str((directory / "checkout/target").resolve() / "intermediates")},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True, preexec_fn=unblock_held_signals,
-    ) as child:
+        start_new_session=True, preexec_fn=unblock_held_signals, pass_fds=copies.COMMAND_LOCKS.get()) as child:
         try:
             with signal_mask(signal.SIG_UNBLOCK):
                 output, _ = child.communicate()
@@ -430,7 +428,7 @@ def remove_if_stale(directory: Path) -> None:
             return
     except (OSError, ValueError):
         return
-    if remove_lint_dir(owner_record.repo, directory):
+    if build_folders.remove_build_folder(directory, lambda: remove_lint_dir(owner_record.repo, directory)):
         print(f"style_sync: removed stale lint checkout {directory} (owner {owner_record.owner} not running)")
 
 
@@ -481,8 +479,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
             saved = subprocess.run(
                 [str(PYTHON), str(Path(scratch.__file__)), "cargo-save", str(snapshot)],
                 env={**os.environ, "CARGO_BUILD_BUILD_DIR": str(intermediates)},
-                capture_output=True, text=True, check=False,
-            )
+                capture_output=True, text=True, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             if saved.returncode:
                 raise Refusal(saved.stderr.strip() or "cannot save Cargo output roots")
             returncode, output = verify_lint(directory)
@@ -516,11 +513,10 @@ def handoff_notice(name: str, parent: str, checkpoint: str) -> HandoffDelivery:
     address = runner_value("address", parent)
     if not address:
         raise Refusal(f"no address for {parent}")
-    result = subprocess.run([
-        str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+    result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
         "--text", f"From the showrunner of {name}: hand-off {checkpoint}",
-        "--timeout", str(SEND_SECONDS),
-    ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+        "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+    ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
     outcome = send_result.send_outcome(result.returncode, result.stdout)
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         if outcome.header.outcome in {"queued", "kept"}:
@@ -603,11 +599,10 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                 address = director_address(directors, unit)
                 name = next(production.name for production in productions
                             if unit in {assignment.unit for assignment in production.config.assignments})
-                result = subprocess.run([
-                    str(PYTHON), str(session_send.SEND_SCRIPT), "--to", address, "--from", name,
+                result = subprocess.run(session_send.send_argv("--to", address, "--from", name,
                     "--text", f"From the showrunner of {name}: ticket {ticket_id} merged; refill.",
-                    "--timeout", str(SEND_SECONDS),
-                ], capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
+                    "--timeout", str(SEND_SECONDS), python_interpreter=PYTHON,
+                ), capture_output=True, text=True, check=False, timeout=send_budget.seconds(SEND_SECONDS))
                 if result.returncode:
                     raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, style_ledger.LedgerError, subprocess.TimeoutExpired) as error:

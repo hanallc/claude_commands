@@ -52,15 +52,9 @@ The JSON output contains the newest record fields with the joined `reason`.
 
 ## Typed reader
 
-`read_needs() -> list[MachineNeeds]` gives the page the same summaries as the list command.
+`read_needs() -> list[MachineNeeds]` gives the status line the same summaries as the list command.
 Each `MachineNeeds` contains `newest: NeedRecord` and `reasons: tuple[str, ...]`.
 Its `records: tuple[NeedRecord, ...]` retains each open record, from oldest to newest.
-The review page lists these records newest first under `After the rebuild` for each machine.
-It shows the rebuild instruction before the reasons.
-A closed Details disclosure shows full commits, current staff names and kinds, and different requesters.
-The page counts machines with open needs and has no combined total across review types.
-It shows natedev before the Mac and tells the user to refresh after the rebuild.
-An empty view shows `No rebuilds needed.`
 Its `record()` method returns the newest fields with the joined reason.
 The reader reads only the open JSON files in the needs folder.
 It does not read completed files or run subprocesses.
@@ -70,6 +64,15 @@ The reader skips files that a concurrent clear moves before the read.
 ## Status line
 
 `scripts/statusline/rebuild_row.py` combines cached system comparisons with `read_needs()` on each status read.
+Its `read()` answer keeps the compared machines in `compared` and the needs in `needs`.
+The console Rebuilds page renders that answer, so the page and the row name the same machines.
+The refresh also writes each machine's change list to `<rebuild.cache>-changes.json`.
+It reads the machine's last switch from `rebuild.generations` (on the Mac over `rebuild.ssh`) and lists the commits after it.
+Each commit's `Claude-Session` id maps to a local session through the transcript that records it.
+The refresh finds that transcript with one `rg` scan of the Claude projects folders and keeps the answer in `<rebuild.cache>-sessions.json`.
+A new session id costs one scan; a known id costs none.
+A machine that does not answer keeps its last list.
+The Hana console's bottom-left rebuild link shows only while the answer names a machine (`docs/as-built/review-links.md`, Rebuilds page).
 The `For you:` row shows `rebuild natedev`, `rebuild mac`, or both, without duplicates.
 Open needs appear even when evaluation has no result or the cache does not exist.
 Completed needs leave the row unless the cached system comparison still requires a rebuild.

@@ -4,91 +4,109 @@ description: List unit phases and style tickets.
 
 # Units
 
-Run this in the showrunner session. Run
-`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`
-and print its output exactly as it comes, with nothing added. It finds the
-production from this session's staff row. Print its total line too, when present.
-Print the tables as Markdown in the reply, without code fences.
-Keep each unit on one Markdown row so Claude Code wraps its cells within the terminal width.
-Each table shows only the production's staff units, sorted by unit name without case distinctions.
-For the phase status table, **Status** is `busy`, `starting`, `waiting`, `idle`, `paused` or `exited`.
-The accounts board uses the same status rule.
-An exit record gives `exited` before a pause record gives `paused`.
-A busy pane gives `busy`. A starting pane gives `starting` before a live detached run gives `waiting`.
-Without these activity states, a live session or pane process gives `idle`.
-No live session or process gives `exited`.
-The style table uses the same status words as the phase table.
-**Unit** is the unit's staff name, including stopped units and units without a session.
+Run this in the showrunner session:
+`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/unit_phases.py"`.
+The caller's staff row selects the production.
+Print the full output as Markdown, without code fences or added text.
+Include the summary, status table, unit blocks, style table, totals, and anomaly lines when present.
 
-The phase status table and the style table add **Machine** after **Status** only when a row runs on another machine.
-The home machine is the `kind.<machine>=local` entry in `config/build_targets.conf`.
+The phase board prints one block per staff unit, sorted by name without case distinctions.
+It includes paused units, stopped units, and units without a session.
+The first line counts each unit once:
+`working N · waiting to merge N · waiting on other work N · idle N · <total> units`.
+It inserts `unknown N` before the total only when that count exceeds zero.
+Counts include only units in these blocks.
 
-Each table omits a column when every row has `—` in that column.
-A table without rows keeps its columns.
-The phase tables preserve full work text and use Claude Code's native Markdown wrapping.
-Claude Code sets their column widths from the terminal width.
-The style table uses `units_table_columns` in `config/production.conf`, which defaults to 170 terminal columns.
-It allows four columns for the terminal margin and measures text before Markdown escaping.
-Long style text cells end with `…`; a cut never splits a wide character.
-Style column headers set the minimum text widths.
-Fixed style columns and minimum text widths can exceed a smaller configured width.
+The status table follows the count line, above the blocks.
+Its columns are `Unit | Director | Machine | Progress | Phase | ETA Next | ETA Plan`.
+- `Director` is the census status of the director's session; its values remain `busy`, `idle`, or the recorded session state.
+- `Machine` appears only when a unit uses another machine.
+- `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
+- `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
+- `ETA Next` is the stated ETA of the phase, with any delay.
+- `ETA Plan` appears only while a plan runs.
+The table omits a column whose cells are all `—`.
+It wraps cells to the pane width, or to `units_table_floor_columns` when the width is unknown.
 
-For units outside the `Style units` table in a production without `Kind: style`, the command prints two tables.
-Table 1 shows `| Unit | Status | [Machine] | Progress | Phase | ETA Next | [ETA Plan] | Workers |`.
-Table 2 shows `| Unit | Notes | Non-Phase Work | Queued |`.
-Both tables use the same unit order.
-Workers uses the configured display name.
-ETA Plan appears only when at least one row has unfinished plan phases.
+Each unit has a title, a blank line, and an `Item | Work | State` table.
+The table preserves titles, phase IDs, and all wrapped cell text.
+Its rows use the same cached plan and run records as the Progress bar.
 
-1. **Progress** shows only a bar: `🟩` done, `🟨` open, and `⬜` not started.
-   It uses one cell per phase, or 20 equal groups above 20 phases.
-   An open phase takes priority over not started, then done.
-   All three characters use the same display width.
-   With no recorded phases, Progress gives `—`.
-   When a row shows a Progress bar, one blank line separates table 1 from this legend:
-   `Progress: 🟩 done · 🟨 open · ⬜ not started`.
-   A blank line separates table 2 from the legend or table 1.
-   The style table has no Progress legend.
-2. **Phase** shows `<done>/<total>` from the same phases as Progress, or `—` with no phases.
-   When the plan has no phases, an open run supplies Progress, Phase, and both ETA cells from its recorded phases.
-   A finished newest run supplies no fallback.
-3. **Notes** shows `phase <id> — <step>: <task>` for the open phase.
-   The newest run supplies the open step; no step uses the phase title.
-   Other states are `between phases`, `not started`, `plan done`, `no phases`, and `no plan`.
-   Repair rounds append ` · fix rounds <n>[ + 1 running]` when the count exceeds zero.
-4. **ETA Next** shows the latest promise for the open plan phase first.
-   Without an open plan phase, it uses the newest open phase outside the plan.
-   Without open work, it uses the next not-started plan phase with a promise.
-   A passed promise adds ` · late <elapsed>`.
-   Open work without a promise shows `no ETA`; no open work or promised phase gives `—`.
-   Times use the production zone: `HH:MM` today, `Sat 18:41` within six days, otherwise `24 Oct`.
-5. **ETA Plan** shows the predicted plan finish in the same time form, without `ends`.
-   It never precedes the latest promise of any open or not-started plan phase.
-   A row without an unfinished plan shows `—`.
-6. **Workers** lists workers with runs before workers that are working.
-   Run states are `waiting on run: <label> <elapsed>`, `result queued: <label>`, and `run gone: <label>`.
-   Idle workers append ` +<n> idle` to a nonempty cell.
-   Closed workers and workers on another machine add nothing.
-7. **Non-Phase Work** shows the newest open phase outside the plan, with ` +<k> more` for other open phases.
-   It excludes the phase that Notes names in the same row.
-   With no remaining phase, it shows `—`.
-8. **Queued** combines the first `/unit:queue` item and `plan: phase <id>: <title>`.
-   It excludes each queue item whose text equals Notes in the same row.
-   Each part adds ` +<n> more` for later items.
-   The queue count includes only remaining items.
-   With no remaining queue item, it shows the plan part or `—`.
-   Plan work includes every phase that is neither done nor open.
-   It uses the configured plan when that plan has phases; otherwise, it uses the newest run's plan.
-   A missing plan adds nothing; a failed queue read keeps `queue unreadable`.
+1. `Now` names the current task and its recorded action, resource wait, or live merge state.
+2. `Also` names each additional current task.
+3. `Next` names the first queue item, or the first unfinished plan phase.
+4. `Later` names every remaining queue item and unfinished plan phase with its own state.
+5. `Stopped` names each unresolved stopped task and its recorded reason.
+6. `Done` explains a stopped task that a later attempt finished while the bar still includes that attempt.
 
-Workers first limits each cell to 80 characters.
-Notes, Non-Phase Work, and Queued retain every word of each displayed item or title.
-Each phase table calls `display_cells.wrapped()` to remove columns whose cells are all `—`.
-The helper preserves full cells for native Markdown wrapping.
-Workers uses the same wrapping form when the status table exceeds the terminal width.
-Do not insert `<br>` or continuation rows.
-Claude Code displays `<br>` as text and adds row borders around continuation rows.
-Empty cells show `—`.
+A busy session does not prove a task.
+With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
+The director's busy status does not change this result.
+Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
+Otherwise, its only current row is `Now | Nothing to do | No plan or queued work`.
+The block has no Next row.
+Only events from an open phase can supply a finished-step fallback.
+Unreadable sources never produce `Nothing to do`.
+A missing plan file in an existing local worktree is an absent plan.
+A missing plan file keeps its unavailable state when the worktree is missing or remote.
+Other plan read errors keep the plan unavailable.
+Each current task has one row.
+Several actors share its State cell, joined by semicolons; equal states appear once.
+No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
+The open phase supplies Now before any merge task.
+Without current activity, State names the missing step and the latest finished step with its recorded time.
+A queue entry uses `<title after the colon> (<id before the colon>)`.
+With or without a colon, title cleanup removes balanced notes, including nested notes, and clauses after the first semicolon.
+If cleanup leaves no title, the board uses the entry text with single spaces.
+A title that starts with a plain lowercase word gets a capital; file names and IDs stay as written.
+A finished activity that matches the queue ID produces a conflict row; the board does not remove the entry.
+An unknown next task uses `Next | Not recorded | The director has not chosen the next task`.
+Only a readable plan with every phase done permits `Nothing queued; the plan is complete`.
+Absent, unreadable, and readable empty plans remain separate facts.
+
+Merge rows name each phase title and its live rank, active merge, or short failure cause.
+A checkpoint outside the line uses `Checkpoint <9 hash characters> at <time>; not in <production>'s merge line`.
+Without a production name, the text ends with `not in the merge line`.
+A finished phase counts as merged when its checkpoint reaches main, its unit and phase have a successful result, or main records its merge.
+A finished phase also counts as merged when main has a non-merge commit with the same author time and subject as its checkpoint.
+The board reads main's non-merge commits once per render and caches each unresolved checkpoint's identity check.
+An unreadable checkpoint stays unmerged.
+A successful result for the exact checkpoint hash counts, with or without a valid result time.
+Other evidence needs a result time or merge commit time at or after the latest checkpoint time, when recorded.
+Without a checkpoint time, the merge subject must name a prefix of the checkpoint hash, in any letter case.
+The board ignores an invalid result time.
+Merge subjects must start with `Merge <unit> phase <phase> (<hash>)`.
+The board reads these subjects once per render and omits older failures for merged phases.
+The row uses its normal merge state when the checkpoint is in the merge line or currently merges.
+Carried work uses `merges with <owner> <name>`; queue work uses the production from its merge-line label.
+Without a recorded owner, carried work uses `merges with <name>`.
+A second phase in the same merge uses `Merges with <id>`, or `Merges with phase <id>` for a numeric ID.
+The board omits a phase's shrink and repair merge items.
+The phase's live state takes priority over older failures from those items.
+Queue and plan dependencies use `After <dep>; <short state>`.
+A queue dependency on main uses `Ready`; a plan dependency on main or a completed local phase has no wait.
+Dependencies outside the merge line say `not in the merge line`.
+A local dependency uses its ID, with `phase` before a numeric ID.
+An external dependency uses `<unit> phase <id>` without its title.
+A bare commit dependency uses `After commit <first 9 hash characters>; <short state>`.
+A missing commit, or a commit or branch not on main, uses `not on main yet`; other missing dependencies retain `dependency not found locally`.
+A branch dependency uses `After branch <name>; <short state>`.
+A recorded phase ID keeps its phase form, even when it contains only hexadecimal characters.
+Recorded unit waits and plan `waits_for` conditions retain their text.
+With no current task, the first blocked pending task supplies Now with its own Work and State.
+Next and Later contain only the remaining tasks, so they do not repeat that wait.
+Stopped attempts resolve only through a later completed attempt with the same plan scope and phase ID.
+An explicit completion title can name the unit that finished the work.
+The board does not infer replacements from equal titles.
+
+Recorded unit waits retain their actor, condition, and target.
+Resource waits retain the resource and holder.
+A resource wait held by the same unit counts as working.
+A resource wait held by another unit, or without a recorded holder, counts as waiting on other work.
+The board preserves phase ETA text and uses the production time zone.
+Staff, run, plan, queue, dependency, ancestry, and merge reads share command caches.
+The board adds no reads to obtain task titles or stopped outcomes.
+The staff current run takes priority over newer unrelated runs.
 
 For `Kind: style` or units named in the production's `Style units` table, the table is
 `| Unit | Status | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |`.
@@ -130,8 +148,9 @@ Staff name conflicts also produce lines. Worker run checks share one process sna
 A process with an identity but no staff row produces no line and cannot use a unit's pane placement.
 A process without an identity reports an unreadable thread when its pane holds staff.
 One staff candidate retains its pane placement with unknown status.
-Morty produces no anomaly when its thread matches `MORTY_NATIVE_ID` in `config/send.conf`.
+Morty produces no anomaly when its native ID is on the producer staff row named `morty`.
 The command sends one message with all anomaly lines to `UNIT_ANOMALIES_TO` in `config/production.conf` (`sdlc`).
+The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
 A failed send adds one anomaly line. It changes neither the table nor the exit code.
 
 Use `agents` to pause, exit, or resume units:

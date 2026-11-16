@@ -46,13 +46,18 @@ Codex review prompts also include section 3's command block.
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   The run's record and log stay until your pass ends; then they are deleted.
    Status 77 means cancelled because the tree changed: resubmit after your
    edits are done; it is not a test failure.
    When a later edit or result makes a run of yours useless, cancel it in
-   the same turn: take `pid` from the run's record (the `.json` beside its
-   log), check that `ps -p <pid> -o args=` still shows
-   `detached_runs.py supervise` with that record's path, then run
-   `kill -TERM -- -<pid>`.
+   the same turn: run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py stop --reason "<why>" <record>`,
+   where `<record>` is the run's `.json` beside its log.
+   The command checks the supervisor and the command identity, then stops the command's process group.
+   The supervisor stays alive and delivers the stopped result with your reason.
+   If the supervisor dies, the next start or worker restore reaps the record and delivers its result.
+   To recover it directly, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py reap --session-dir <run>`.
    ```
 
    Claude workers use `run_in_background: true` and end the turn until the result arrives.

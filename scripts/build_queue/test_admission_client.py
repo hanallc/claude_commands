@@ -30,7 +30,9 @@ from scripts.production.staff_test_support import fixture_member, fixture_worker
 from typing import cast
 from scripts.lib import conf
 from scripts.build_queue import admission_client as client, admission_protocol as wire
-from scripts.build_queue import admission_records as records, admission_service as service, queue_evidence, step_estimator
+from scripts.build_queue import queue_place as shell_place
+from scripts.build_targets import target_config
+from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, ScriptSocket, TimedChunk, only_admitted, reply_bytes,
@@ -49,6 +51,45 @@ def setUpModule() -> None:
 
 
 class ClientTests(unittest.TestCase):
+    def test_placement_status_cli_reads_current_closed_and_unknown_over_the_socket(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire, placement
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            request = placement_request(fixture)
+            destination = request.constraints.candidates[0].destination
+            assignment = placement.PlacementAssignment(request.episode, "attempt-a", destination,
+                request.constraints.source_key, request.owner, request.constraints.session, request.since)
+            claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
+                "claim-a", assignment.episode, assignment.attempt)
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            cases = ((placement.CurrentAssignment(), claim, "current", 0, "claim-a", "-"),
+                (placement.CurrentAssignment(), placement.NoProviderClaim(), "current", 0, "-", "-"),
+                (placement.ClosedAssignment("source changed"), claim, "closed", 1, "claim-a", "source changed"))
+            for state, provider, word, code, claim_id, reason in cases:
+                with self.subTest(state=state), fixture.loop_turn():
+                    fixture.server.assignments[key] = records.SavedPlacementAssignment(assignment, state, provider=provider)
+                with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(["placement-status", "--episode", assignment.episode,
+                        "--attempt", assignment.attempt]), code)
+                owner = assignment.owner
+                self.assertEqual(output.getvalue(), f"{word}\tmac\t{owner.host}:{owner.pid}:{owner.start_time}"
+                    + f"\tsubmitting-session\t{claim_id}\t{reason}\n")
+            with fixture.serving(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(client.main(["placement-status", "--episode", assignment.episode,
+                    "--attempt", "unseen"]), 1)
+                self.assertEqual(client.placement_status("unseen", "unseen"),
+                    status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("unseen", "unseen")))
+            self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+
+    def test_placement_status_cli_returns_two_when_the_service_is_unreachable(self) -> None:
+        with AdmissionFixture() as fixture, mock.patch.dict(os.environ,
+                {"ADMISSION_SOCKET": str(fixture.socket_dir / "missing.sock")}), \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(client.main(["placement-status", "--episode", "episode-a", "--attempt", "attempt-a"]), 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("admission service unavailable: no socket", errors.getvalue())
+
     def test_cancel_placement_cli_removes_the_queued_episode(self) -> None:
         from scripts.build_hold.owning_session import NoOwningSession
         from scripts.build_queue import placement
@@ -74,6 +115,29 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.waiters)
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
+
+    def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
+        for position, label, expected, reason in (
+            (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
+            (2, "compiler · check", "head compiler · check needs 12.3 GiB", ""),
+            (2, "hana · test", "head hana · test needs 12.3 GiB", ""),
+            (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
+            (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
+            (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
+        ):
+            with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
+                waiting = replace(WAIT, position=position, head=label,
+                    snapshot=replace(WAIT.snapshot, head_need=int(12.3 * GIB), head_label=label))
+                with mock.patch.object(client, "CLOCK", fixture.clock), redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput(local_reason=reason)(waiting)
+                self.assertIn(expected, output.getvalue())
+                if reason:
+                    self.assertIn(f"runs on natedev: {reason}", output.getvalue())
+                else:
+                    self.assertNotIn("runs on natedev:", output.getvalue())
+                self.assertNotIn("head  needs", output.getvalue())
+                if position == 1:
+                    self.assertNotIn(f"head {label} needs", output.getvalue())
 
     def service_wait_record(self) -> tuple[dict[str, object], dict[str, object]]:
         raw = cast(dict[str, object], json.loads(wire.encode_reply(replace(WAIT, snapshot=service_snapshot()))))
@@ -252,7 +316,7 @@ class ClientTests(unittest.TestCase):
                 child_environment = dict(os.environ)
                 _ = child_environment.pop("TEST_SENDER_GUARD", None)
                 _ = child_environment.pop("HERDR_BIN", None)
-                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+                child_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
                 message = "The build queue service has not answered. Builds wait."
                 with FakeDaemon(address, receive, repeat=True):
                     result = subprocess.run(command, input=message, text=True, capture_output=True,
@@ -295,6 +359,30 @@ class ClientTests(unittest.TestCase):
             self.assertGreater(len(transport.requests), 1)
             self.assertEqual(transport.requests, [request] * len(transport.requests))
 
+    def test_a_ci_step_waits_through_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        held = wait_reply(records.NatedevHeld("fps", "Phase 3 timing"), 3, "",
+                          "natedev is held by fps for Phase 3 timing; waiting for release")
+        for reason, granted in ((held.reason, True), (records.ReadingUnavailable("natedev hold state is unreadable"), False)):
+            with self.subTest(reason=type(reason).__name__), AdmissionFixture() as fixture:
+                request = fixture.service_request()
+                reply = replace(held, reason=reason)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(reply),
+                    *(TimedChunk(5, reply_bytes(reply)) for _ in range(24)), reply_bytes(GRANTED)))
+                waits: list[wire.Wait] = []
+                with redirect_stderr(io.StringIO()) as output:
+                    result = client.service_admit(request, waits.append, wire.AcquisitionTiming(10, 10, 5))
+                if granted:
+                    self.assertEqual(result, GRANTED)
+                    self.assertEqual(fixture.clock.monotonic(), 120)
+                    self.assertEqual(len(waits), 25)
+                    self.assertEqual(transport.requests, [request])
+                    self.assertNotIn("memory admission check failed", output.getvalue())
+                else:
+                    self.assertEqual(result, wire.Refused("natedev hold state is unreadable"))
+                    self.assertIn("natedev hold state is unreadable); step refused", output.getvalue())
+                self.doCleanups()
+
     def test_runner_wait_recovers_and_cleanup_uses_its_own_timing_without_home_reads(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.service_request()
@@ -335,7 +423,7 @@ class ClientTests(unittest.TestCase):
             with mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
                     request.profile, step_estimator.ReusableEstimate())), \
                  redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()) as output:
-                status = client.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
+                status = shell_place.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
             self.assertEqual(status, 0)
             lines = output.getvalue().splitlines()
             self.assertEqual((lines[0], lines[-1]), ("first", "done"))
@@ -359,7 +447,7 @@ class ClientTests(unittest.TestCase):
             with mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
                     request.profile, step_estimator.ReusableEstimate())), \
                  redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()) as output:
-                status = client.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
+                status = shell_place.main(["admit", "--pid", str(request.owner.pid), "--wait-events", "--", "cargo", "check"])
             self.assertEqual(status, 0)
             self.assertEqual(output.getvalue().splitlines(), ["first", 'holder {"kind":"none"}', "done"])
             self.assertEqual(len(transport.requests), 1)
@@ -583,14 +671,77 @@ class ClientTests(unittest.TestCase):
                     self.assertFalse(any(line.startswith("{") for line in output.getvalue().splitlines()))
                     self.assertFalse(fixture.server.reservations)
 
+    def test_mac_only_build_offers_the_mac(self) -> None:
+        from scripts.build_queue import placement
+
+        real_socket = socket.socket
+        with mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+             AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+            _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+            _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+            _ = write_config_fixture(fixture.root / "mac_test.conf",
+                f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                + "kind.natedev=local\nplatform.natedev=linux\n")
+            request = fixture.request(step="check")
+            fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+                key, fixture.clock.now(), "the test has not published provider evidence")
+            arguments = ["place-step", "--once", "--wait-events", "--mac-only", "--kind", "build",
+                "--pid", str(request.owner.pid), "--episode", request.episode,
+                "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
+                "--assignment-file", str(fixture.root / "assignment.json"), "--", "cargo", "build"]
+            with fixture.serving(), \
+                 mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                     request.profile, step_estimator.ReusableEstimate())), \
+                 redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                with fixture.loop_turn():
+                    constraints = fixture.server.placement_requests[request.episode].constraints
+            self.assertIsInstance(constraints.selection, placement.MacOnlyHost)
+            mac = next(candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+            self.assertIsInstance(mac.eligibility, placement.AllowedHost)
+
+    def test_a_mac_run_kind_reaches_the_service_with_its_command(self) -> None:
+        from scripts.build_queue import placement
+
+        real_socket = socket.socket
+        for kind in placement.MAC_RUN_KINDS:
+            with self.subTest(kind=kind), mock.patch("scripts.build_queue.admission_client.socket.socket", real_socket), \
+                 AdmissionFixture() as fixture, mock.patch.object(client, "CLOCK", fixture.clock):
+                _ = subprocess.run(["git", "init", "-q", str(fixture.root)], capture_output=True, check=True)
+                _ = (fixture.root / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+                _ = write_config_fixture(fixture.root / "mac_test.conf",
+                    f"offload=on\nlinux_only.{fixture.root.name}=\n", template="mac_test")
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                request = fixture.request(step="check")
+                fixture.server.host_probe = lambda key: placement.HostEvidenceUnavailable(
+                    key, fixture.clock.now(), "the test has not published provider evidence")
+                arguments = ["place-step", "--once", "--wait-events", "--target", "mac", "--kind", kind,
+                    "--pid", str(request.owner.pid), "--episode", request.episode,
+                    "--since", str(request.since), "--repo-root", str(fixture.root), "--package", "sample",
+                    "--assignment-file", str(fixture.root / "assignment.json"), "--", "/bin/zsh", "-c", "true"]
+                with fixture.serving(), \
+                     mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                         request.profile, step_estimator.ReusableEstimate())), \
+                     redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
+                    self.assertEqual(client.main(arguments), 78, errors.getvalue())
+                    with fixture.loop_turn():
+                        constraints = fixture.server.placement_requests[request.episode].constraints
+                self.assertEqual(constraints.command_kind, kind)
+
     def test_unit_override_uses_the_shared_request_identity(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()
-            for unit in ("queue-unit", ""):
-                with self.subTest(unit=unit), mock.patch.dict(os.environ, {records.BUILDLOG_UNIT: unit}):
+            for unit, reason in (("queue-unit", ""), ("", ""),
+                                 ("queue-unit", "it edits the merged checkout")):
+                with self.subTest(unit=unit, reason=reason), mock.patch.dict(os.environ,
+                        {records.BUILDLOG_UNIT: unit, "BUILD_QUEUE_LOCAL_REASON": reason}):
                     request = client.step_request(list(original.argv), original.cwd, original.owner,
                         original.since, original.sidecar, original.episode, original.profile)
                     self.assertEqual(request.identity.unit, unit)
+                    self.assertEqual(request.route, target_config.LocalRequired(reason) if reason else records.DIRECT_CARGO)
                     launch = wire.LaunchRequest(request.episode, request.owner, request.since,
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
@@ -605,7 +756,7 @@ class ClientTests(unittest.TestCase):
     def test_priority_commands_from_any_session_send_the_actor(self) -> None:
         for claude, codex, actor in (("ordinary-session", "codex-session", "ordinary-session"),
                                       ("", "codex-session", "codex-session"), ("", "", "user")):
-            for argv in (("priority-set", "unit"), ("priority-clear",), ("admit-head", "urgent")):
+            for argv in (("priority-set", "unit"), ("priority-clear",)):
                 with self.subTest(actor=actor, argv=argv), \
                      mock.patch.dict(os.environ), \
                      mock.patch.object(client, "_mutation", return_value=wire.Ok()) as mutation, \
@@ -618,9 +769,9 @@ class ClientTests(unittest.TestCase):
                         os.environ["CODEX_THREAD_ID"] = codex
                     self.assertEqual(client.main(list(argv)), 0)
                     mutation.assert_called_once()
-                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest | wire.AdmitHeadRequest,
+                    request = cast(wire.PrioritySetRequest | wire.PriorityClearRequest,
                                    mutation.call_args.args[0])
-                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest, wire.AdmitHeadRequest))
+                    self.assertIsInstance(request, (wire.PrioritySetRequest, wire.PriorityClearRequest))
                     self.assertEqual(request.actor, actor)
 
     def test_unusable_config_exits_with_checker_failure_and_names_the_key(self) -> None:
@@ -629,7 +780,7 @@ class ClientTests(unittest.TestCase):
             config = fixture.root / "build_admission.conf"
             write_memory_config(config, estimate_refresh_seconds="invalid")
             with fixture.serving(), redirect_stderr(io.StringIO()) as errors:
-                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
+                status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
             self.assertEqual(status, 2)
             self.assertIn(str(config), errors.getvalue())
             self.assertIn("estimate_refresh_seconds", errors.getvalue())
@@ -676,9 +827,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(records.pressure_text(pressure),
                              "memory pressure: condition not recorded by service; full avg10 8.0; "
                              + "some avg10 15.0; swap 80.0% used")
-            self.assertEqual(queue_evidence.pressure_text(pressure, waits[0].snapshot.policy),
-                             "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
-                             + "condition not recorded by service")
+
 
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
@@ -744,7 +893,7 @@ class ClientTests(unittest.TestCase):
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \
                  mock.patch.object(client, "release", side_effect=observe_release), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()) as output:
-                status = client.main(["admit", "--pid", str(original.owner.pid),
+                status = shell_place.main(["admit", "--pid", str(original.owner.pid),
                                       "--shell-state", str(shell_state), "--", "cargo", "check"])
             self.assertEqual(status, 2)
             self.assertEqual(released, [GRANTED.reservation])
@@ -753,27 +902,41 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("BUILDLOG_MEM_OUTCOME=Granted", shell_state.read_text())
 
     def test_cli_refresh_uses_step_estimate_and_keeps_the_episode_and_first_since(self) -> None:
-        with AdmissionFixture() as fixture:
-            original = fixture.request()
-            updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
-            estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
-                         step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
-            with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
-                 mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
-                 redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
-                status = client.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
-                                      "--", "cargo", "nextest", "run"])
-            self.assertEqual(status, 0)
-            self.assertEqual(estimate.call_count, 2)
-            first, second = transport.requests
-            assert isinstance(first, wire.AdmitRequest)
-            assert isinstance(second, wire.AdmitRequest)
-            self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
-            self.assertEqual(first.since, original.since)
-            self.assertTrue(first.fresh_test)
-            self.assertFalse(second.fresh_test)
-            self.assertEqual(second.profile, updated)
+        for caller in ("verify.sh", "ci_cargo_front.py"):
+            with self.subTest(caller=caller), AdmissionFixture() as fixture:
+                original = fixture.request()
+                runner_request = fixture.service_request(owner=original.owner)
+                updated = replace(original.profile, estimated_at=fixture.clock.now() + 1)
+                transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
+                estimates = [step_estimator.StepEstimate(original.profile, records.FreshTest()),
+                             step_estimator.StepEstimate(updated, step_estimator.ReusableEstimate())]
+                with mock.patch.object(step_estimator, "step_estimate", side_effect=estimates) as estimate, \
+                     mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
+                     redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                    if caller == "verify.sh":
+                        status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--since", str(original.since),
+                                                  "--", "cargo", "nextest", "run"])
+                        self.assertEqual(status, 0)
+                        self.assertEqual(estimate.call_count, 2)
+                    else:
+                        # The CI front uses this path through held_reservation.
+                        self.assertEqual(shell_place.request_place(runner_request, client.WaitOutput()), GRANTED)
+                        estimate.assert_not_called()
+                self.assertEqual(len(transport.attempts), 1)
+                first, second = transport.requests
+                if caller == "verify.sh":
+                    assert isinstance(first, wire.AdmitRequest)
+                    assert isinstance(second, wire.AdmitRequest)
+                    self.assertEqual((first.episode, first.since, first.owner), (second.episode, second.since, second.owner))
+                    self.assertEqual(first.since, original.since)
+                    self.assertTrue(first.fresh_test)
+                    self.assertFalse(second.fresh_test)
+                    self.assertEqual(second.profile, updated)
+                else:
+                    assert isinstance(first, wire.ServiceEstimateRequest)
+                    self.assertEqual(first, runner_request)
+                    self.assertEqual(second, first)
+                self.doCleanups()
 
     def test_build_generation_precedes_history_and_survives_transport_reconnect(self) -> None:
         for expired_cache in (False, True):
@@ -821,8 +984,7 @@ class ClientTests(unittest.TestCase):
             request = fixture.request(step="build")
             granted = replace(GRANTED, need=16 * GIB)
             transport = self.use_transport(fixture,
-                Exchange(reply_bytes(EXPIRED), reply_bytes(wire.BuildHistoryReply(1))),
-                Exchange(reply_bytes(granted)))
+                Exchange(reply_bytes(EXPIRED), reply_bytes(wire.BuildHistoryReply(1)), reply_bytes(granted)))
             def history_peak(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
                 self.assertIsInstance(transport.requests[-1], wire.BuildHistoryRequest)
                 return records.ExpectedPeak(16 * GIB, "fallback", 0)
@@ -833,7 +995,7 @@ class ClientTests(unittest.TestCase):
                     mock.patch.object(step_estimator, "expected_peak", side_effect=history_peak) as history:
                 self.assertEqual(client.admit(request, lambda _wait: None, refresh), granted)
             self.assertEqual(history.call_count, 1)
-            self.assertEqual(len(transport.attempts), 2)
+            self.assertEqual(len(transport.attempts), 1)
             first, generation, refreshed = transport.requests
             self.assertIsInstance(generation, wire.BuildHistoryRequest)
             assert isinstance(first, wire.AdmitRequest) and isinstance(refreshed, wire.AdmitRequest)
@@ -867,7 +1029,7 @@ class ClientTests(unittest.TestCase):
                         mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
                         mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                         redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
-                    status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "build"])
+                    status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                 self.assertEqual(status, 75, errors.getvalue())
                 self.assertEqual(hook_times, [interval], "generation retries must keep the original hook time")
                 self.assertEqual(fixture.clock.monotonic(), interval)
@@ -895,7 +1057,7 @@ class ClientTests(unittest.TestCase):
                             mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
                             mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()):
-                        status = client.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
+                        status = shell_place.main([command, "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
                     self.assertEqual(fixture.clock.monotonic(), 5 if not generation_failure else 8)
                     self.assertEqual(sum(isinstance(request, wire.BuildHistoryRequest)
@@ -923,7 +1085,7 @@ class ClientTests(unittest.TestCase):
                             mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), str(fixture.root))), \
                             mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)), \
                             redirect_stderr(io.StringIO()) as errors, mock.patch("sys.stdout", io.StringIO()) as output:
-                        status = client.main(["launch", "--pid", str(original.owner.pid), "--", "cargo", "build"])
+                        status = shell_place.main(["launch", "--pid", str(original.owner.pid), "--", "cargo", "build"])
                     self.assertEqual(status, 2)
                     self.assertIn("launch wait limit reached without admission", errors.getvalue())
                     self.assertEqual(fixture.clock.monotonic(), 6, "generation retries must use the original launch deadline")
@@ -997,7 +1159,6 @@ class ClientTests(unittest.TestCase):
         mutations: dict[str, Callable[[], object]] = {
             "release": lambda: client.release("stem", 137, records.read_memory_config()),
             "width": lambda: client.width("stem", 3),
-            "admit-head": lambda: client.admit_head("urgent", "director"),
             "priority-set": lambda: client.priority_set("unit", "urgent", "director"),
             "priority-clear": lambda: client.priority_clear("director"),
             "priority-clear-unit": lambda: client.priority_clear("director", "demo"),
@@ -1064,7 +1225,7 @@ class ClientTests(unittest.TestCase):
             write_memory_config(config, silence_seconds="invalid")
             with fixture.serving(), redirect_stderr(io.StringIO()) as errors, \
                     mock.patch("sys.stdout", io.StringIO()) as output:
-                status = client.main(["release", grant.reservation, "137"])
+                status = shell_place.main(["release", grant.reservation, "137"])
             self.assertEqual(status, 0)
             self.assertEqual(errors.getvalue(), "")
             self.assertEqual(wire.parse_record(output.getvalue(), wire.Ok), wire.Ok())
@@ -1097,7 +1258,7 @@ class ClientTests(unittest.TestCase):
             write_memory_config(config, estimate_refresh_seconds="invalid", **{"program_first_peak_gib.cargo": "invalid"})
             original = fixture.request()
             with redirect_stderr(io.StringIO()) as errors:
-                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "clippy"])
+                status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "clippy"])
             self.assertEqual(status, 2)
             self.assertIn(str(config), errors.getvalue())
             self.assertIn("program_first_peak_gib.cargo='invalid'", errors.getvalue())
@@ -1113,11 +1274,10 @@ class ClientTests(unittest.TestCase):
                 original = fixture.request(step="build")
                 encoded = reply_bytes(wire.BuildHistoryReply(7))
                 split = len(encoded) // 2
-                prefix = [] if stage == "initial" else [reply_bytes(EXPIRED)]
-                transport = self.use_transport(fixture,
-                    Exchange(*prefix, TimedChunk(interval / 2, encoded[:split]), TimeoutError(),
-                        TimedChunk(interval / 4, encoded[split:])),
-                    Exchange(reply_bytes(GRANTED)))
+                history = (TimedChunk(interval / 2, encoded[:split]), TimeoutError(), TimedChunk(interval / 4, encoded[split:]))
+                exchanges = ([Exchange(*history), Exchange(reply_bytes(GRANTED))] if stage == "initial"
+                             else [Exchange(reply_bytes(EXPIRED), *history, reply_bytes(GRANTED))])
+                transport = self.use_transport(fixture, *exchanges)
                 hooks: list[float] = []
 
                 def decline() -> bool:
@@ -1132,15 +1292,15 @@ class ClientTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test-decline"}), \
                         mock.patch.object(client, "_leave_queue", side_effect=decline), \
                         mock.patch.object(step_estimator, "git_identity", return_value=(records.UnknownRepository(), original.cwd)), \
-                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)) as history, \
+                        mock.patch.object(step_estimator, "expected_peak", return_value=records.ExpectedPeak(12 * GIB, "fallback", 0)) as peak, \
                         redirect_stderr(io.StringIO()) as errors:
                     request = refresh() if stage == "initial" else original
                     result = client.admit(request, waits.append, refresh)
                 self.assertEqual(result, GRANTED)
                 self.assertEqual(hooks, [interval])
                 self.assertEqual(waits, [] if stage == "initial" else [EXPIRED])
-                self.assertEqual(history.call_count, 1)
-                self.assertEqual(len(transport.attempts), 2)
+                self.assertEqual(peak.call_count, 1)
+                self.assertEqual(len(transport.attempts), 2 if stage == "initial" else 1)
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests), 1)
                 admissions = [item for item in transport.requests if isinstance(item, wire.AdmitRequest)]
                 self.assertTrue(all((item.owner, item.episode, item.since) ==
@@ -1160,9 +1320,9 @@ class ClientTests(unittest.TestCase):
                 first = WAIT if next_reply == "grant" else EXPIRED
                 encoded = reply_bytes(GRANTED if next_reply == "grant" else wire.BuildHistoryReply(7))
                 split = len(encoded) // 2
-                exchange = Exchange(reply_bytes(first) + encoded[:split], TimeoutError(), encoded[split:])
-                exchanges = [exchange] if next_reply == "grant" else [exchange, Exchange(reply_bytes(GRANTED))]
-                transport = self.use_transport(fixture, *exchanges)
+                grant = () if next_reply == "grant" else (reply_bytes(GRANTED),)
+                transport = self.use_transport(fixture,
+                    Exchange(reply_bytes(first) + encoded[:split], TimeoutError(), encoded[split:], *grant))
                 hooks: list[float] = []
                 waits: list[wire.Wait] = []
 
@@ -1183,7 +1343,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(result, GRANTED)
                 self.assertEqual(waits, [first])
                 self.assertEqual(hooks, [interval])
-                self.assertEqual(len(transport.attempts), 1 if next_reply == "grant" else 2)
+                self.assertEqual(len(transport.attempts), 1)
                 self.assertEqual(sum(isinstance(item, wire.BuildHistoryRequest) for item in transport.requests),
                     0 if next_reply == "grant" else 1)
                 self.assertEqual(errors.getvalue(), "")
@@ -1251,7 +1411,7 @@ class ClientTests(unittest.TestCase):
                 "The build queue service has not answered for 10 seconds. Builds wait.\n"
                 + "The service restarts by itself. Read journalctl -u build-admission.service.\n"
                 + "If the user must act, push the phone with this command: "
-                + "sudo systemctl restart build-admission.socket build-admission.service")
+                + "systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service")
             self.assertEqual(commands[1], commands[0])
 
     def test_down_alert_retains_sent_or_waiting_messages_and_retries_only_empty_deliveries(self) -> None:
@@ -1277,7 +1437,7 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--need") + 1], "blocked")
                     values = [command[index + 1] for index, part in enumerate(command) if part == "--value"]
                     self.assertEqual(values, [
-                        "action=On natedev, run: sudo systemctl restart build-admission.socket build-admission.service",
+                        "action=On natedev, run: systemctl reset-failed build-admission.socket build-admission.service && systemctl start build-admission.socket build-admission.service",
                         "body=The builds session did not take the message. Builds wait until the service answers.",
                         "sender=build-admission", "title=Build queue service is down"])
                     scripts = Path(client.__file__).resolve().parents[1]
@@ -1548,6 +1708,169 @@ class ClientTests(unittest.TestCase):
                 self.assertIn("admission service unavailable: no socket", output.getvalue())
                 self.doCleanups()
 
+    def test_placement_status_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
+        # The Mac gate reads this on each cargo call; a busy service must not refuse the step.
+        from scripts.build_queue import admission_wire as status_wire
+
+        unknown = status_wire.PlacementStatusReply(status_wire.UnknownPlacementStatus("episode-a", "attempt-a"))
+        cases: tuple[tuple[str, str], ...] = (
+            ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))
+        for service_state, reason in cases:
+            with self.subTest(service=service_state), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=1)
+                response = (Exchange(TimeoutError(), reply_bytes(unknown)) if service_state == "slow" else
+                            Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                            Exchange(connect_error=ConnectionRefusedError()))
+                transport = self.use_transport(fixture, response)
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    result = client.main(["placement-status", "--episode", "episode-a", "--attempt", "attempt-a"])
+                if service_state == "slow":
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output.getvalue(), "unknown\t-\t-\t-\t-\t-\n")
+                    self.assertIn("admission service not answering", errors.getvalue())
+                    self.assertGreater(fixture.clock.monotonic(), 0.5)
+                    self.assertEqual(transport.requests, [replace(status_wire.PlacementStatusRequest("episode-a", "attempt-a"),
+                        code_version=client.LOADED_ADMISSION_CODE_VERSION)])
+                else:
+                    self.assertEqual(result, 2)
+                    self.assertEqual(errors.getvalue(), f"admission service unavailable: {reason}\n")
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(fixture.clock.monotonic(), 0)
+                    self.assertFalse(transport.requests)
+                self.assertEqual(len(transport.attempts), 1)
+                self.assertFalse(fixture.clock.sleeps)
+                self.doCleanups()
+
+    def test_lint_cancellation_waits_for_slow_answers_and_refuses_dead_services(self) -> None:
+        cases: tuple[tuple[str, str], ...] = (
+            ("slow", ""), ("missing", "no socket"), ("refused", "connect refused"))
+        for service_state, reason in cases:
+            with self.subTest(service=service_state), AdmissionFixture() as fixture:
+                fixture.configure(silence_seconds=1)
+                start = records.process_start_time(os.getpid())
+                assert start is not None
+                submitted = fixture.request(step="lint", owner=wire.Owner(os.getpid(), start))
+                completed = wire.Ok()
+                response = (Exchange(TimeoutError(), reply_bytes(completed)) if service_state == "slow" else
+                            Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                            Exchange(connect_error=ConnectionRefusedError()))
+                transport = self.use_transport(fixture, response)
+                with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                    result = client.main(["cancel-placement", "--episode", submitted.episode,
+                        "--pid", str(submitted.owner.pid), "--reason", "judge lint before local repair"])
+                if service_state == "slow":
+                    self.assertEqual(result, 0)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("admission service not answering", errors.getvalue())
+                    self.assertGreater(fixture.clock.monotonic(), 0.5)
+                    request, = transport.requests
+                    self.assertIsInstance(request, wire.CancelPlacement)
+                    assert isinstance(request, wire.CancelPlacement)
+                    self.assertEqual(request.episode, submitted.episode)
+                    self.assertEqual(request.owner.pid, submitted.owner.pid)
+                    self.assertEqual(request.owner.start_time, submitted.owner.start_time)
+                    self.assertEqual(request.reason, "judge lint before local repair")
+                else:
+                    self.assertEqual(result, 2)
+                    self.assertEqual(errors.getvalue(), f"admission service unavailable: {reason}\n")
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(fixture.clock.monotonic(), 0)
+                    self.assertFalse(transport.requests)
+                self.assertEqual(len(transport.attempts), 1)
+                self.assertFalse(fixture.clock.sleeps)
+                self.doCleanups()
+
+    def test_placement_control_waits_for_slow_answers_after_a_memory_handoff(self) -> None:
+        from scripts.build_queue import placement
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission, placement_request, publish_candidate,
+        )
+
+        for operation in ("claim", "permission", "execution", "cancel", "memory-handoff"):
+            for service_state in ("slow", "missing", "refused"):
+                with self.subTest(operation=operation, service=service_state), PlacementFixture() as fixture:
+                    fixture.configure(silence_seconds=1)
+                    submitted = placement_request(fixture)
+                    _ = publish_candidate(fixture, submitted)
+                    assigned = assignment_for(fixture, submitted)
+                    claim = adopt_assignment(fixture, submitted, assigned)
+                    query: Callable[[], object]
+                    if operation == "claim":
+                        failure = wire.ClaimFailure("failed-claim", assigned, "busy", claim)
+                        request = failure
+                        query = lambda: client.claim_failure(failure)
+                    elif operation in ("permission", "memory-handoff"):
+                        permission = consume_permission("launch-permission", assigned, claim)
+                        request = permission
+                        query = lambda: client.consume_permission(permission)
+                    elif operation == "execution":
+                        execution = wire.ExecutionReport("finished-step", assigned, claim,
+                            placement.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled())
+                        request = execution
+                        query = lambda: client.report_execution(execution)
+                    else:
+                        cancellation = wire.CancelPlacement("cancel-step", assigned.episode, assigned.owner, "lint repair")
+                        request = cancellation
+                        query = lambda: client.cancel_placement(cancellation)
+                    expected, = fixture.server.handle_request(request)
+                    response = (Exchange(TimeoutError(), reply_bytes(expected)) if service_state == "slow" else
+                                Exchange(connect_error=FileNotFoundError()) if service_state == "missing" else
+                                Exchange(connect_error=ConnectionRefusedError()))
+                    exchanges: list[Exchange] = []
+                    waiting = wire.PlacementWait(submitted.episode, submitted.since, 1, (), WAIT)
+                    if operation == "memory-handoff":
+                        exchanges.extend((Exchange(reply_bytes(waiting)), Exchange(reply_bytes(wire.Assignment(assigned)))))
+                    transport = self.use_transport(fixture, *exchanges, response)
+                    with redirect_stderr(io.StringIO()) as errors:
+                        if operation == "memory-handoff":
+                            self.assertEqual(client.request_placement(submitted), waiting)
+                            output = client.WaitOutput()
+                            output(WAIT)
+                            fixture.clock.advance(705)
+                            self.assertEqual(client.request_placement(submitted), wire.Assignment(assigned))
+                            output.finished(left=True)
+                        started = fixture.clock.monotonic()
+                        if service_state == "slow":
+                            self.assertEqual(query(), expected)
+                            self.assertGreater(fixture.clock.monotonic() - started, 0.5)
+                            self.assertEqual(transport.requests[-1], replace(request,
+                                code_version=client.LOADED_ADMISSION_CODE_VERSION))
+                        else:
+                            with self.assertRaises(wire.AdmissionUnavailable) as error:
+                                _ = query()
+                            self.assertEqual(error.exception.reason,
+                                "no socket" if service_state == "missing" else "connect refused")
+                            self.assertEqual(fixture.clock.monotonic(), started)
+                        if operation == "memory-handoff":
+                            self.assertIn("another machine is free after 11 min 45 s: leaving the memory wait",
+                                          errors.getvalue())
+                    self.assertEqual(len(transport.attempts), len(exchanges) + 1)
+                    self.assertEqual(len(transport.requests), len(exchanges) + (service_state == "slow"))
+                    self.assertFalse(fixture.clock.sleeps)
+                    self.doCleanups()
+
+    def test_placement_control_unreachable_limit_bounds_silence_and_repeated_resets(self) -> None:
+        for failure in ("silence", "resets"):
+            for limit in (3, 60):
+                with self.subTest(failure=failure, limit=limit), AdmissionFixture() as fixture:
+                    fixture.configure(unreachable_limit_seconds=limit)
+                    exchanges = ([Exchange(TimeoutError())] if failure == "silence" else
+                                 [Exchange(TimedChunk(1, b'{"kind":'), ConnectionResetError(errno.ECONNRESET, "reset"))
+                                  for _ in range(limit)])
+                    transport = self.use_transport(fixture, *exchanges)
+                    with redirect_stderr(io.StringIO()) as errors:
+                        result = client.main(["cancel-placement", "--episode", "waiting-test",
+                            "--pid", str(os.getpid()), "--reason", "another machine is free"])
+                    self.assertEqual(result, 2)
+                    self.assertEqual(fixture.clock.monotonic(), limit)
+                    duration = "1 min" if limit == 60 else f"{limit} s"
+                    self.assertIn(f"build queue unreachable for {duration}; step stopped", errors.getvalue())
+                    self.assertEqual(len(transport.attempts), len(exchanges))
+                    self.assertTrue(transport.requests)
+                    self.assertTrue(all(request == transport.requests[0] for request in transport.requests))
+                    self.assertFalse(fixture.clock.sleeps)
+                    self.doCleanups()
+
     def test_query_timeout_uses_configuration_for_the_complete_reply(self) -> None:
         with AdmissionFixture() as fixture:
             reply = fixture.server.handle_request(wire.ViewRequest())[0]
@@ -1605,11 +1928,12 @@ class ClientTests(unittest.TestCase):
             updated = replace(request, episode="must-not-replace", since=fixture.clock.now(),
                 owner=wire.Owner(1, "wrong"), profile=replace(request.profile,
                     peak=records.ExpectedPeak(2 * GIB, "measured", 9)), fresh_test=True)
-            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED)), Exchange(reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             refresh = mock.Mock(return_value=updated)
             self.assertEqual(client.admit(request, lambda _wait: None, refresh), GRANTED)
             self.assertEqual(transport.requests[1], replace(request, profile=updated.profile, fresh_test=True))
             self.assertEqual(refresh.call_count, 1)
+            self.assertEqual(len(transport.attempts), 1)
 
     def test_bad_reply_before_first_wait_refuses_without_retry(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1693,7 +2017,7 @@ class ClientTests(unittest.TestCase):
     def test_mutations_resend_the_same_request_id_after_transport_closes(self) -> None:
         mutations: tuple[Callable[[], object], ...] = (
             lambda: client.release("stem", 137, records.read_memory_config()), lambda: client.width("stem", 3),
-            lambda: client.admit_head("urgent", "director"))
+            lambda: client.priority_set("unit", "urgent", "director"))
         for mutation in mutations:
             with self.subTest(mutation=mutation), AdmissionFixture() as fixture:
                 transport = self.use_transport(fixture, Exchange(b""), Exchange(reply_bytes(wire.Ok())))
@@ -1703,13 +2027,11 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(transport.requests[0], transport.requests[1])
                 self.doCleanups()
 
-    def test_cli_sends_one_run_identity_through_estimate_refresh_and_reconnect(self) -> None:
+    def test_cli_sends_one_run_identity_through_estimate_refresh(self) -> None:
         with AdmissionFixture() as fixture:
             run = fixture.run_owner()
             original = fixture.request()
-            transport = self.use_transport(fixture,
-                Exchange(reply_bytes(WAIT), reply_bytes(EXPIRED)),
-                Exchange(reply_bytes(GRANTED)))
+            transport = self.use_transport(fixture, Exchange(reply_bytes(WAIT), reply_bytes(EXPIRED), reply_bytes(GRANTED)))
             calls: list[int] = []
 
             def estimate(*_args: object, **_kwargs: object) -> step_estimator.StepEstimate:
@@ -1722,7 +2044,7 @@ class ClientTests(unittest.TestCase):
                  mock.patch.object(step_estimator, "step_estimate", side_effect=estimate), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()) as output:
-                status = client.main(["admit", "--pid", str(original.owner.pid),
+                status = shell_place.main(["admit", "--pid", str(original.owner.pid),
                                       "--since", str(original.since), "--wait-events", "--", "cargo", "nextest"])
             self.assertEqual(status, 0)
             self.assertEqual(len(calls), 2)
@@ -1749,7 +2071,7 @@ class ClientTests(unittest.TestCase):
                          original.profile, step_estimator.ReusableEstimate())), \
                      mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                      redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
-                    status = client.main(["admit", "--pid", str(original.owner.pid),
+                    status = shell_place.main(["admit", "--pid", str(original.owner.pid),
                                           "--since", str(original.since), "--", "cargo", "nextest"])
                 self.assertEqual(status, 0)
                 request, = transport.requests
@@ -1769,7 +2091,7 @@ class ClientTests(unittest.TestCase):
                      original.profile, step_estimator.ReusableEstimate())), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  redirect_stderr(io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
-                status = client.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
+                status = shell_place.main(["admit", "--pid", str(original.owner.pid), "--", "cargo", "nextest"])
             self.assertEqual(status, 0)
             request, = transport.requests
             assert isinstance(request, wire.AdmitRequest)

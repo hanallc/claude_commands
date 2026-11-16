@@ -14,12 +14,37 @@ import subprocess
 import sys
 from typing import cast, final
 from unittest import mock
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
-from scripts.production import merge_gate
+from scripts.production import merge_gate, merge_gate_suites_test_support
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+@final
+class GateProcessStateTests(unittest.TestCase):
+    def test_process_exit_counts_as_stopped_at_stat_read_or_pidfd_event(self) -> None:
+        fixture = GateSuitesFixture()
+        for initial_state in (FileNotFoundError(), ProcessLookupError(), "1 (fixture) S"):
+            status_read = mock.Mock(side_effect=[initial_state, "1 (fixture) S"])
+            status = mock.Mock(read_text=status_read)
+            opened = mock.Mock(return_value=47)
+            closed = mock.Mock()
+            kernel = mock.Mock(pidfd_open=opened, close=closed)
+            readiness = mock.Mock(select=mock.Mock(return_value=([47], [], [])))
+            with self.subTest(initial_state=initial_state), \
+                    mock.patch.object(merge_gate_suites_test_support, "Path", return_value=status), \
+                    mock.patch.object(merge_gate_suites_test_support, "os", kernel), \
+                    mock.patch.object(merge_gate_suites_test_support, "select", readiness):
+                fixture.assert_process_stopped(1234)
+                status_read.assert_called_once_with()
+                self.assertEqual(opened.call_count, int(isinstance(initial_state, str)))
+                if isinstance(initial_state, str):
+                    closed.assert_called_once_with(47)
+                else:
+                    closed.assert_not_called()
 
 
 @final
@@ -130,7 +155,7 @@ sys.stdin.read(1)
         self.environment["TMPDIR"] = str(parent)
         record = self.state / "nested-folders.json"
         module = self.checkout / "scripts" / "hooks" / "test_first.py"
-        self.write(module, f'''import json
+        program = f'''import json
 from pathlib import Path
 import signal
 import sys
@@ -155,7 +180,11 @@ def hold_nested_gate(request):
 
 build_folders.temporary_build_folder = hold_nested_gate
 merge_gate.run_suites(Path.cwd(), full=True)
-''')
+'''
+        helper = self.bin / "nested-gate.py"
+        self.write(helper, program)
+        shim = self.bin.parent / "scripts/lib/py"
+        self.write(module, "import os\n" + f"os.execv({str(shim)!r}, [{str(shim)!r}, {str(helper)!r}])\n")
         result = self.run_gate("--tests-only", "--module-time-limit-s", "10", own_process=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("killed: still running after 10 s, the module time limit", result.stdout)
@@ -206,12 +235,10 @@ merge_gate.run_suites(Path.cwd(), full=True)
         preamble = f'''import os
 from pathlib import Path
 import sys
-from scripts.lib import build_folders
-
 def cleanup_event(event, arguments):
     if event != "shutil.rmtree" or arguments[1] is None:
         return
-    if not Path(arguments[0]).name.startswith(build_folders.FOLDER_PREFIXES["merge-gate"]):
+    if not Path(arguments[0]).name.startswith("merge-gate"):
         return
     if {number}:
         os.kill(os.getpid(), {number})
@@ -223,6 +250,13 @@ sys.addaudithook(cleanup_event)
             # The entry point converts the default SIGINT exception to status 1.
             expected = 1 if number == signal.SIGINT else -number
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            [folder] = [entry for entry in parent.iterdir() if entry.is_dir()]
+            lock = folder.with_name(folder.name + ".lock")
+            lease = folder.with_name(folder.name + ".lease.json")
+            self.assertEqual(set(parent.iterdir()), {folder, lock, lease})
+            record = cast(dict[str, object], json.loads(lease.read_text()))
+            self.assertIsInstance(record["pid"], int)
+            self.assertEqual(build_folders.build_folder_state(folder), "free")
             recovered = self.run_gate("--tests-only", "--full", own_process=True)
             self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
             self.assertIn("merge undone", result.stderr + recovered.stdout)
@@ -236,13 +270,13 @@ sys.addaudithook(cleanup_event)
     def test_failed_gate_removes_its_folder(self) -> None:
         self.assert_gate_folder_removed("failure")
 
-    def test_sigterm_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigterm_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGTERM")
 
-    def test_sighup_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sighup_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGHUP")
 
-    def test_sigint_during_folder_removal_leaves_no_folder(self) -> None:
+    def test_sigint_during_folder_removal_leaves_a_recorded_folder(self) -> None:
         self.assert_gate_folder_removed("SIGINT")
 
     @gate_suites("hooks")
@@ -327,6 +361,11 @@ merge_gate.start_gate_job = stop_after_start
                 self.write(self.state / "hold-module", "hold")
                 self.write(self.state / "leak-child", "leak")
                 self.write(self.state / "detached-child", "detached")
+                # Each signal gets its own pool, so a failed subtest leaves no token for the next.
+                pool = self.root / f"jobserver-{sig.name}"
+                os.mkfifo(pool)
+                self.addCleanup(os.close, os.open(pool, os.O_RDWR | os.O_NONBLOCK))
+                self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(pool)
                 self.supply_jobserver(b"Q")
                 parent = self.root / f"interrupted-{sig.name}"
                 parent.mkdir()

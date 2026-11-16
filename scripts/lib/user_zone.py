@@ -56,6 +56,11 @@ def zone_label(moment: datetime | None = None) -> str:
     return at.tzname() or user_zone_name()
 
 
+def shown_time(moment: datetime) -> str:
+    """A time as the user reads it on a page: Nov 15, 2026, 08:45 (24-hour, the user's zone)."""
+    return moment.astimezone(user_zone()).strftime("%b %d, %Y, %H:%M")
+
+
 def main() -> int:
     try:
         print(user_zone_name())

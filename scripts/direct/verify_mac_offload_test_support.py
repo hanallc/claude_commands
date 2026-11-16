@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, eligibility
+from scripts.lib.berth_test_support import write_unconfigured_berth
+from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_pressure_reading
+from scripts.lib.build_folders_test_support import tool_folders
 
 import json
 import os
@@ -363,7 +366,7 @@ raise SystemExit(0)
 
 def install_fixed_cargo(path: Path) -> None:
     """Install shell replies for an unchanged Python Cargo stub."""
-    python_source = f"#!{sys.executable}\n" + CARGO_STUB
+    python_source = python_tool_source(CARGO_STUB)
     if path.read_text(encoding="utf-8") != python_source:
         return
     fallback = path.with_name(path.name + "-python")
@@ -703,10 +706,17 @@ if os.environ.get("TEST_RUNNER_HOLD") == "1":
 mode = os.environ.get("TEST_RUNNER_MAC", "declined")
 reason = os.environ.get("TEST_RUNNER_REASON", "")
 runner_status = int(os.environ.get("TEST_RUNNER_STATUS", "75"))
+fix = ""
 answer = root / "runner-answer"
 if answer.exists():
     mode, reason, status_text = answer.read_text().splitlines()
     runner_status = int(status_text)
+# runner-answer-<verb> answers one verb: mode, reason, status, then an optional fix= word.
+verb_answer = root / ("runner-answer-" + (arguments[arguments.index("--verb") + 1] if "--verb" in arguments else ""))
+if verb_answer.exists():
+    mode, reason, status_text, *fix_words = verb_answer.read_text().splitlines()
+    runner_status = int(status_text)
+    fix = fix_words[0] if fix_words else ""
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
@@ -728,7 +738,8 @@ else:
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
-        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else ""),
+        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else "")
+        + ("fix=" + fix + "\n" if fix else ""),
         encoding="utf-8",
     )
 if mode == "declined":
@@ -740,37 +751,59 @@ raise SystemExit(runner_status)
 '''
 
 
+# The targets and record wrappers have a top-level main, so verify_helper runs them inside its process.
+# Each loads its real program once for each process, as verify_helper loads build_targets.py and record.py.
 TARGETS_WRAPPER = r'''
+import importlib.util
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
 import time
+from types import ModuleType
 
 with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.lib.atomic_file import write_text_atomic
 
-command = sys.argv[1]
-root = Path(os.environ["TEST_RUNNER_STATE"])
-if command == "wait-local":
-    write_text_atomic(root / "local-wait-args", json.dumps(sys.argv[2:]))
-if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
-    with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
-        output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
-    write_text_atomic(root / "local-wait-added", "added\n")
-status = 0
-try:
-    runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
-except SystemExit as result:
-    status = result.code or 0
-event = {"command": command, "status": status, "at": time.monotonic(),
-         "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
-with (root / "routing-events.jsonl").open("a") as output:
-    output.write(json.dumps(event) + "\n")
-if command == "register-local" and status == 10:
-    write_text_atomic(root / "registered", "registered\n")
-raise SystemExit(status)
+REAL_TARGETS: dict[Path, ModuleType] = {}
+
+
+def real_targets() -> object:
+    path = Path(os.environ["TEST_REAL_TARGETS"])
+    if path not in REAL_TARGETS:
+        specification = importlib.util.spec_from_file_location("fixture_build_targets", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        REAL_TARGETS[path] = module
+    try:
+        return REAL_TARGETS[path].main() or 0
+    except SystemExit as result:
+        return result.code or 0
+
+
+def main() -> object:
+    command = sys.argv[1]
+    root = Path(os.environ["TEST_RUNNER_STATE"])
+    if command == "wait-local":
+        write_text_atomic(root / "local-wait-args", json.dumps(sys.argv[2:]))
+    if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
+        with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
+            output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
+        write_text_atomic(root / "local-wait-added", "added\n")
+    status = real_targets()
+    event = {"command": command, "status": status, "at": time.monotonic(),
+             "pid": int(sys.argv[sys.argv.index("--pid") + 1]) if "--pid" in sys.argv else 0}
+    with (root / "routing-events.jsonl").open("a") as output:
+        output.write(json.dumps(event) + "\n")
+    if command == "register-local" and status == 10:
+        write_text_atomic(root / "registered", "registered\n")
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
@@ -855,24 +888,46 @@ raise SystemExit(0 if free else 1)
 
 
 RECORD_WRAPPER = r'''
+import importlib.util
 import json
 import os
 from pathlib import Path
-import runpy
 import sys
+from types import ModuleType
 
-if sys.argv[1:2] == ["call"]:
-    event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
-             "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
-             "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
-             "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
-             "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
-             "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
-             "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
-    with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
-        output.write(json.dumps(event) + "\n")
-with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-runpy.run_path(os.environ["TEST_REAL_RECORD"], run_name="__main__")
+REAL_RECORDS: dict[Path, ModuleType] = {}
+
+
+def real_record() -> object:
+    path = Path(os.environ["TEST_REAL_RECORD"])
+    if path not in REAL_RECORDS:
+        with open(path.resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+        specification = importlib.util.spec_from_file_location("fixture_record", path)
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[specification.name] = module
+        specification.loader.exec_module(module)
+        _ = sys.modules.setdefault("scripts.buildlog.record", module)
+        REAL_RECORDS[path] = module
+    return REAL_RECORDS[path].main(sys.argv[1:])
+
+
+def main() -> object:
+    if sys.argv[1:2] == ["call"]:
+        event = {"target": os.environ.get("BUILDLOG_TARGET", ""),
+                 "hold_wait_s": float(os.environ.get("BUILDLOG_HOLD_WAIT_S", "0")),
+                 "mem_wait_s": os.environ.get("BUILDLOG_MEM_WAIT_S", "0"),
+                 "copy": os.environ.get("BUILDLOG_MAC_COPY", ""),
+                 "copy_s": os.environ.get("BUILDLOG_MAC_COPY_S", ""),
+                 "copy_count": os.environ.get("BUILDLOG_MAC_COPY_COUNT", ""),
+                 "copy_natedev_s": os.environ.get("BUILDLOG_MAC_COPY_NATEDEV_S", "")}
+        with (Path(os.environ["TEST_RUNNER_STATE"]) / "routing-records.jsonl").open("a") as output:
+            output.write(json.dumps(event) + "\n")
+    return real_record()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
@@ -1059,6 +1114,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         log = scripts / "buildlog"
         log.mkdir()
         self.write_executable(log / "record.py", RECORD_WRAPPER)
+        copy_runtime(claude, configuration=False)
         self.bin_directory.mkdir()
         self.runner_state.mkdir()
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
@@ -1070,6 +1126,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
@@ -1135,12 +1192,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 for name, value in os.environ.items()
                 if name
                 not in {
-                    "UNIT_RUN_DIR",
-                    "UNIT_SESSION_DIR",
-                    "UNIT_TEAM_ROLE",
                     "CODEX_THREAD_ID",
                     "CODEX_SESSION_ID",
-                    "UNIT_DETACHED_RUN",
                     "BUILDLOG_MAC",
                     "BUILDLOG_MAC_REASON",
                     "BUILDLOG_LOCAL_REASON",
@@ -1148,7 +1201,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     "BASH_ENV",
                     "ENV",
                 }
-                and not name.startswith("BASH_FUNC_")
+                # Fixture calls must not update the outer run or use its folders.
+                and not name.startswith(("BASH_FUNC_", "UNIT_"))
             },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
@@ -1158,6 +1212,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "PACKAGE_ROOT": str(self.root),
             "CARGO_TARGET_DIR": str(self.root / "target"),
             "CARGO_HOME": str(self.root / "cargo-home"),
+            # No jobserver pool: a test step takes no live /dev/steve token.
+            "CARGO_MAKEFLAGS": f"--jobserver-auth=fifo:{self.root / 'no-pool'}",
             "TMPDIR": str(self.root / "tmp"),
             "XDG_RUNTIME_DIR": str(self.root / "runtime"),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -1202,7 +1258,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        self.environment["COPIES_CONFIG"] = copies_environment(self.root)["COPIES_CONFIG"]
+        private = copies_environment(self.root)
+        configuration = Path(self.environment["CONF_DIR"])
+        if configuration != Path(private["CONF_DIR"]):
+            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
 
@@ -1210,9 +1270,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # Private tools may start as links; replacing one must never edit its target.
         if path.is_symlink():
             path.unlink()
-        _ = path.write_text(source if source.startswith("#!") else f"#!{sys.executable}\n" + source,
-                            encoding="utf-8")
-        path.chmod(0o755)
+        if source.startswith("#!") and "python" not in source.splitlines()[0]:
+            _ = path.write_text(source, encoding="utf-8")
+            path.chmod(0o755)
+        else:
+            write_python_tool(path, source)
 
     def assigned_remote(self, target: str, verb: str, kind: str = "test") -> Path:
         """Request a real assignment for a private runner boundary."""
@@ -1228,7 +1290,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 "--result", str(path.with_suffix(".result"))],
                 namespace=offload.CliArguments())
             request = offload.submit_direct_placement(offload.request_from_arguments(args), time.time(),
-                                                       offload.read_config(settings))
+                                                       eligibility.read_config(settings))
             assert isinstance(request.placement, offload.AssignedOffloadRequest)
             admission_client.write_assignment(path, admission_protocol.Assignment(request.placement.assignment))
         return path
@@ -1246,10 +1308,10 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         if not library.is_symlink():
             library.symlink_to(VERIFY.parent.parent / "lib", target_is_directory=True)
         functions = shell_functions(VERIFY,
-            "verify_helper",
+            "collect_child", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "release_token", "stop_token_renewer",
-            "step_state", "publish_step_state", "tree_key", "set_verdict_keys", "after_tree_change",
+            "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
             "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "cancel_tree_run",
             "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
@@ -1266,7 +1328,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         script = direct / "verify.sh"
         setup = r'''
 set -euo pipefail
-PY=$TEST_REAL_PYTHON
+PY=$TEST_REAL_DIRECT/../lib/py
 CMD=test PKG=sample ARGS=(sample) NEXTEST_ARGS=(-p sample --no-tests=warn)
 FILTER_RUN=${TEST_DIRECT_FILTER:-0}
 if [[ "$FILTER_RUN" == 1 ]]; then ARGS+=(--filter alpha); NEXTEST_ARGS+=(--filter-expr 'test(alpha)'); fi
@@ -1285,8 +1347,7 @@ PHASE_TOKEN_OBSERVATION="" PHASE_TOKEN_HOLDER=""
 PLACEMENT_WAIT_MEMORY=0 PLACEMENT_RETRY_NOTICE_SHOWN=0 STEP_DEFER_LOCAL=0
 CACHE_DIR=$UNIT_RUN_DIR/verify_cache
 MAC_RUNNER=$VERIFY_MAC_RUNNER MAC_TEST_SCRIPT=$VERIFY_MAC_TEST_SCRIPT
-MAC_IDLE_SCRIPT=$TEST_REAL_DIRECT/../buildlog/mac_idle.py
-MAC_IDLE_MARKER="" BUILDLOG_MAC_IDLE_HOOK=""
+BUILDLOG_MAC_IDLE_HOOK=""
 MAC_LEAVE_SETTINGS=$MAC_TEST_CONFIG MAC_LEAVE_REASON=""
 MAC_RETRY_AFTER=0 MAC_RETRY_NOTICE_SHOWN=0
 SSH_RETIRED_SETTINGS=() SSH_RETRY_SETTINGS=() SSH_RETRY_DEADLINES=()
@@ -1576,7 +1637,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         from scripts.build_queue import admission_client
 
         def delivered() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.wait"):
+            for path in (wait for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for wait in hold.glob("placement-*.json.wait")):
                 try:
                     notice = wire.parse_record(path.read_text(), admission_client.PlacementWaitNotice)
                 except (OSError, ValueError):
@@ -1615,6 +1677,10 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         _ = temporary.write_text(f"{mode}\n{reason}\n{status}\n")
         _ = temporary.replace(answer)
 
+    def set_verb_answer(self, verb: str, mode: str, status: int, fix: str = "") -> None:
+        """Answer one Mac verb; fix is the fix= word of a mend-fix result."""
+        _ = (self.runner_state / f"runner-answer-{verb}").write_text(f"{mode}\n\n{status}\n{fix}\n")
+
     def runner_episode(self) -> str:
         """Read the episode from the actual runner assignment."""
         from scripts.build_queue import admission_client
@@ -1633,7 +1699,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                   for saved in admission.server.assignments.values()),
                         "a settled remote attempt", (process,))
         def delivered_retry_wait() -> bool:
-            for path in (self.root / "tmp").glob(f"verify-hold.{process.pid}.*/placement-*.json.queued"):
+            for path in (queued for hold in tool_folders(self.root / "tmp", "verify", pid=process.pid)
+                         for queued in hold.glob("placement-*.json.queued")):
                 try:
                     queued = wire.parse_record(path.read_text(), admission_client.QueuedPlacementEpisode)
                 except (OSError, ValueError):

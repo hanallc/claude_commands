@@ -28,7 +28,7 @@ The ledger preserves those costs after builder removal.
 The current resource inventory excludes the removed builder's ongoing storage costs.
 
 The state folder is `~/.local/state/build-targets/aws`.
-`gate-deployment.json` records the bucket and regional launch resources.
+`gate-deployment.json` records the bucket, the deployed `instance_types` and regional launch resources.
 `deployment.json` records foundation ownership.
 The configured region list alone does not prove that all regional stacks exist.
 Preserve the ledger, deployment records, launch records, and cleanup records during recovery.
@@ -58,14 +58,16 @@ Boxes receive signed URLs and no scaler credential file.
 
 ## Regions, prices, and quotas
 
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, and `eu-south-2`.
+The gate regions in `regions` are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1` and `eu-south-1`.
+The price reads in `spot_candidate_regions` add `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
 `us-east-2` is the home region for shared artifacts.
-Before European deployment:
+Before deployment:
 
-1. Enable `eu-south-2` on the AWS Account page.
-2. Confirm that its status is `ENABLED`.
-3. Add both European regions to the Organizations `RegionFloor` policy.
-4. Preserve the home and US region permissions.
+1. Enable `eu-south-1` and `eu-south-2` on the AWS Account page.
+2. Confirm that each status is `ENABLED`.
+3. Allow all 19 regions in the `RegionFloor` statement of the Organizations policy `AdvancedModeRegionRestrictionSecurityControlPolicy`: `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, `eu-south-1`, `ca-central-1`, `sa-east-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-central-1`, `ap-south-1`, `ap-northeast-1`, `ap-northeast-2`, `ap-northeast-3`, `ap-southeast-1` and `ap-southeast-2`.
+4. Make sure that no other statement in that policy denies EC2 in one of these regions.
+5. Preserve the current region permissions.
 
 Use these commands at your terminal:
 
@@ -75,16 +77,16 @@ python3 scripts/aws_target/deploy.py quota-request
 python3 scripts/aws_target/deploy.py quota-status
 ```
 
-Read the local hourly snapshot without an AWS call or a passphrase:
+Publish the AWS prices page from the local hourly snapshot without an AWS call or a passphrase:
 
 ```sh
-python3 scripts/aws_target/deploy.py spot-table
+python3 scripts/aws_target/aws_page.py publish
 ```
 
-The rows show configured Standard and GPU machine types.
-The columns show candidate regions and the lowest zone price in USD/h.
-A `-` means the snapshot has no offer for that type and region.
-Wide tables use separate groups of region columns.
+The command prints the page link. The console also links the page.
+The rows show candidate regions.
+The columns show configured Standard and GPU machine types and the lowest zone price in USD/h.
+A `not sold here` cell means AWS sells no Spot of that type in that region.
 Each region shows its snapshot age, both applied quotas, and the number of boxes each quota fits.
 GPU types use the G and VT quota; other configured types use the Standard quota.
 Old snapshots show a stale mark after `price_max_age_seconds`.
@@ -105,11 +107,13 @@ The existing price rows still support the gate ranking fallback.
 After this change reaches the installed scripts:
 
 1. Run `python3 scripts/aws_target/aws_target.py snapshot` to create the first snapshot.
-2. Run `python3 scripts/aws_target/deploy.py spot-table`, or `/aws_prices` in a session, to inspect the snapshot.
+2. Run `python3 scripts/aws_target/aws_page.py publish` and open the AWS prices page to inspect the snapshot.
 
 Later reads run through the existing timer.
-`GateGpuTrialScalerPolicy` already allows `ec2:DescribeSpotPriceHistory` and `service-quotas:GetServiceQuota` in every candidate region.
-No `deploy.py up` command is required for this change.
+`GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota` in every candidate region.
+The deployed stack gets this policy only from `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
+Until the user runs that command, each hourly read logs the refused read and sends the `aws.snapshot_failed` alert.
+The command reads prices and quotas at its end; `aws_page.py publish` then shows them at once.
 The snapshot makes only these two read calls.
 It does not use Cost Explorer or create resources.
 
@@ -120,7 +124,8 @@ It prints no resource identities.
 
 `quota-request` requests Standard Spot quota in each configured gate region.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-It requests G and VT Spot quota in each candidate region.
+It requests G and VT Spot quota in each configured gate region.
+A region with only a price read gets no quota request.
 It uses `gpu_spot_quota_request_vcpus` from the same file.
 It skips sufficient quotas and existing open requests.
 A regional failure prints its error code and permits other regions to continue.
@@ -190,6 +195,12 @@ It requires the saved foundation ownership record.
 It does not activate the removed builder route.
 The home stack supplies the bucket, role, instance profile, and home launch resources.
 Each additional region has a separate gate stack and expiry function.
+A regional stack holds only the security group, the launch template and the expiry function.
+The home stack's two scaler policies cover every gate region, so regional stacks create no IAM policy.
+The scaler user then holds 2 gate policies and keeps a free slot for the budget block policy.
+AWS attaches at most 10 managed policies to one IAM user.
+When a regional stack fails, `up` prints the failed resource events of that run.
+`up` deletes a regional stack in `ROLLBACK_COMPLETE` before it deploys that stack again.
 Deployment records each completed regional stack in `gate-deployment.json`.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
@@ -222,10 +233,9 @@ Failed regional reads retain applicable hourly prices from `spot-prices.json`.
 A gate's live read does not change the hourly file.
 
 The worker places variants under a capacity cooldown last.
-It prefers larger vCPU counts within each group.
-Within one size, it prefers the lowest expected cost across regions and zones.
-Expected cost includes compute, remote transfer, and the configured regional delay cost.
-Equal costs preserve configured order.
+Within each group, it prefers the lowest expected USD per run across types, regions and zones.
+Expected cost includes compute for the median box time by type and region, remote transfer, the configured regional delay cost and the expected refusal wait.
+Equal costs preserve the `instance_types` order.
 The worker saves its ranking and price evidence before launch.
 A resumed launch keeps that ranking and its client tokens.
 Capacity refusals select the next variant.
@@ -402,3 +412,57 @@ The report retains both statuses, wall times, and largest-process peak RSS value
 Different statuses on one machine mean `flaky`.
 A flaky natedev test makes the comparison `inconclusive`.
 Missing measurements mean `incomplete`.
+
+## Prepare the separate Hana workload
+
+Only the user runs these commands.
+Hana setup does not change the merge-gates stack.
+The setup command needs no active target or slot capacity.
+`enabled=off` remains unchanged.
+
+1. Obtain the reviewed Hana NixOS image from the Natedev owner.
+2. Set `ami_id`, `ami_owner_id`, `vpc_id`, and `subnet_id` in `config/hana_aws.conf`.
+3. Confirm that the subnet belongs to `availability_zone` and has a public HTTPS route.
+4. Run `scripts/aws_target/deploy.py prepare --workload hana`.
+5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource plan.
+6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
+7. Confirm that the command reports a stopped box.
+
+The local plan makes no AWS call.
+Approved setup uses the existing encrypted admin session and progress display.
+It reserves compute and storage costs before requesting resources.
+Setup permission does not enable command permission.
+The separate stack creates the instance, retained data volume, launch template, security group, private control bucket, and scaler policy.
+The root disk keeps its data while the box is stopped. AWS deletes the root disk when the box is terminated.
+The Spot request is persistent and uses interruption behavior `stop`.
+Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
+Repeat approved setup after a timeout to read the existing stack and confirm its stop.
+An expired reservation cannot authorize another stack request.
+Changed resource inputs require a separate replacement review.
+
+The image must include the independent Hana guard, watchdog, data mount, and root receiver.
+The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.
+The image must start the guard and receiver on every boot.
+The receiver reads the current user data through IMDSv2 on every boot.
+Normal first-boot user-data execution does not provide this behavior.
+The image must block IMDS access from every non-root user.
+The root receiver uses runtime signed object URLs, rather than guest AWS credentials.
+The image must initialize the new data disk once and mount its retained filesystem before tool setup.
+It must identify the `/dev/sdf` attachment correctly on NVMe instances.
+The image must include Python, TLS trust, the unprivileged `hana-runner` user, and the reviewed systemd resource bounds.
+Do not install AWS credentials, repository credentials, SSH keys, or a broad instance role.
+No `/etc/nixos` file changes are part of this repository change.
+
+The scaler policy grants these actions:
+
+1. `ec2:StartInstances` and `ec2:StopInstances` for Hana-tagged instances in this deployment.
+2. `ec2:ModifyInstanceAttribute` for only their `userData` attribute.
+3. `ec2:DescribeInstances`, `ec2:DescribeSpotInstanceRequests`, and `ec2:DescribeInstanceAttribute` for lifecycle reads.
+4. `s3:GetObject` and `s3:PutObject` for only this deployment's control objects.
+
+EC2 describe actions need a wildcard resource.
+The [EC2 IAM reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html) defines the action resources and attribute condition.
+The [Spot request status reference](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-request-status.html) defines the interruption status codes.
+A stopped instance does not prove that a lost start request has settled.
+The provider retains that uncertain operation until it can confirm an outcome.
+It never repeats an uncertain start automatically.

@@ -37,6 +37,7 @@ codex_service_tier=fast
 
 Options sections hold launch flags instead of agent rows.
 `[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
+It can also set `claude_account` and `claude_account.<subtask>`: the Claude launch account, `workers` (the default) or `caller`. `agent_exec.sh` runs a `caller` task on the caller's own account; `[direct.options] claude_account.simplify=caller` keeps the /simplify review there.
 The editor excludes options sections from family enumeration.
 
 A family is `codex` or `claude`.
@@ -51,7 +52,7 @@ A direct change to an unsupported family refuses without writing.
 | Function | Sub-tasks |
 | --- | --- |
 | `direct` | `impl`, `test`, `fix`, `review`, plus the Claude `simplify` task |
-| `cli` | `commit_prep`, `merge_branch`, `interactive` |
+| `cli` | `merge_branch`, `interactive` |
 | `production` | `director` |
 | `design_roles` | `designer`, `reviewer` |
 
@@ -64,10 +65,12 @@ A Claude launch turns that word into the newest model of the family; see [Claude
 ### Registry publication
 
 `store_registry(registry, before, after, description, *, additive_catalog=False)` owns every registry publication.
-It replays the changed rows against the latest text under an exclusive writer lock.
+It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
-It returns the published text while it still holds the lock.
-The `store` command builds `configuration_shell` from that text without a second read.
+The live write never waits for the main push lock, so the new value is in effect at once.
+Publication follows the write. A failed publication keeps the rows live and fails with `the rows are live; main does not have them yet`, as `/tune` exits 2 after its live write.
+The notes timer then publishes them through `publish_pending`.
+It returns the live text after publication. The `store` command builds `configuration_shell` from that text without a second read.
 
 Publication applies only to the real registry under the Git root of `~/.claude`.
 `MODELS_CONFIG_PUBLISH=0` disables publication.
@@ -76,17 +79,26 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock) before the registry writer lock.
+Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock), after the live write, before the registry writer lock.
 The hold covers fetch, row replay, commit, push retries, and local reconciliation.
 Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
-The commit uses local HEAD as its parent, so a push can include pre-existing local commits.
+The commit goes only onto origin/main. A checkout with local commits that origin does not have refuses publication, so a push never carries another commit.
 The writer stages, commits, stashes, resets, or rebases no other path.
 
 A rejected push fetches and replays the same row changes, for at most three attempts.
 Repeating an interrupted edit publishes all pending local rows, even when the requested value already matches. Recovery recognizes an accepted push without another commit.
+Pending rows replay onto the fetched registry, so a registry commit from another writer does not block them.
+
+`MODELS_CONFIG_PUBLISH=later` writes the shared registry live and skips the publication.
+It never waits for main, so a landing that holds main never delays the caller.
+The quota alert's `edit_registry` uses this mode for its role routing.
+`sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
+`publish_pending(registry)` commits and pushes the rows that HEAD does not have.
+It returns `False` at once when another process holds the main push lock.
+Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.
@@ -125,8 +137,9 @@ The [progress recorder](unit-progress-history.md#configuration-digest) uses the 
 
 ### Python launch settings
 
-`models_registry.launch_settings(section, key) -> LaunchSettings` gives Python callers the shell resolver's result.
-It builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result.
+`models_registry.launch_settings(section, key, family="assigned", *, configuration=None) -> LaunchSettings` gives Python callers the shell resolver's result.
+A `claude` or `codex` family reads that family's row through `_agents_resolve_in_family`, whatever the assignment is.
+Without `configuration`, it builds a `LaunchModelConfiguration` in Python from `_snapshot`, so an inherited `MODELS_LAUNCH_CONFIGURATION` decides the result. A writer passes its candidate text as `configuration`.
 It starts one `bash`, which sources `models_config.sh` and reads `configuration_shell` output from stdin.
 Bash loads that table with `_models_table_load` and runs the real `agents_resolve`. No Python registry process starts.
 The child environment sets `MODELS_CONFIG_TIER_ONLY=1`, so this path never synchronizes the Codex catalog.
@@ -248,8 +261,7 @@ It sends prompt contents through stdin, avoiding the command-line argument size 
 | Claude | Uses print mode with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and retains stream-json events in the log. |
 
 Write mode uses unrestricted write permissions.
-Readonly mode selects the read-only Codex sandbox or Claude plan permissions.
-`direct.simplify` also disables Claude editing tools.
+Readonly mode selects the read-only Codex sandbox, or Claude plan permissions with the editing tools disabled.
 `claude_result.py` writes the final answer to the output file.
 An `is_error` result or nonempty errors array produces `ERROR: <reason>` and exit 1.
 Otherwise the launcher preserves the agent's exit status.

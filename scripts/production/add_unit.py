@@ -26,7 +26,7 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import remote
-from scripts.lib import git_exclude, models_registry
+from scripts.lib import git_exclude, git_files, models_registry
 from scripts.lib.transcripts import open_transcript, transcript_paths
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -870,14 +870,13 @@ def launch_session(
 
 def opening_record(production: Production, unit: str) -> Path:
     """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
-    checkout = production.checkout
-    directory = checkout / ".git"
-    if directory.is_file():
-        pointer = directory.read_text(encoding="utf-8").strip()
-        if not pointer.startswith("gitdir: "):
-            raise Refusal(f"invalid Git directory pointer: {directory}")
-        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
-    return directory / "add-unit-openings" / f"{unit}.json"
+    try:
+        git_dir = git_files.at(production.checkout).git_dir
+    except git_files.NotACheckout:
+        git_dir = production.checkout / ".git"
+    except git_files.UnreadableGitFiles as error:
+        raise Refusal(f"invalid Git directory: {error}") from error
+    return git_dir / "add-unit-openings" / f"{unit}.json"
 
 
 def pending_opening(production: Production, unit: str, session_id: str) -> bool:
@@ -1072,9 +1071,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
                                     or conversation.account != target):
                 raise Refusal("--source-fallback must name the pane launch's source account")
             if isinstance(conversation, unit_move.UnitConversation) and (not target or target == conversation.account):
-                prepared = accounts.prepared_account(conversation.account, resume=True)
-                if isinstance(prepared, accounts.AccountRefused):
-                    raise Refusal(prepared.reason)
+                _ = accounts.prepare_claude_launch(conversation.account, resume=True)
                 return accounts.NamedAccount(conversation.account, accounts.claude_account_dir(conversation.account))
         elif source_fallback:
             raise Refusal("--source-fallback requires a resumed session and its pane launch account")
@@ -1383,7 +1380,7 @@ def _main(argv: list[str]) -> int:
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+                    f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
             resume_model = model_for_resume(request, cast(str, args.model))
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))

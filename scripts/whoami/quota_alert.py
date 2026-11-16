@@ -44,7 +44,7 @@ from scripts.lib import conf, models_registry  # noqa: E402
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
-from scripts.whoami import usage_store
+from scripts.whoami import quota_state, usage_store
 
 from scripts.notify import review
 
@@ -180,6 +180,37 @@ def _reading_for_account(readings: CodexAlertPassReadings, identity: agent_accou
     return reading
 
 
+def _credits_pay_after(refusal: refusals.AccountRefusal, readings: CodexAlertPassReadings,
+                       selected: agent_accounts.KnownCodexAccount) -> bool:
+    """Credits are on, and a reading taken after the refusal shows a credit balance."""
+    if not isinstance(agent_accounts.codex_credits_setting(selected.label), agent_accounts.CreditsOn):
+        return False
+    for checked in readings.checked_homes:
+        balance = checked.report.credit_balance
+        if (checked.home != selected.home or checked.observed_at <= refusal.at or checked.report.problem
+                or not checked.report.email or checked.report.email.casefold() != selected.login.casefold()
+                or balance is None):
+            continue
+        if balance == "unlimited":
+            return True
+        try:
+            amount = float(balance)
+        except ValueError:
+            continue
+        if math.isfinite(amount) and amount > 0:
+            return True
+    return False
+
+
+def _refusal_blocks_return(readings: CodexAlertPassReadings, selected: agent_accounts.KnownCodexAccount,
+                           now: datetime) -> bool:
+    """An unresolved refusal keeps work off the account until allowance returns or credits pay."""
+    refusal = refusals.load().get(refusals.key("codex", selected.login))
+    return (refusal is not None
+            and not refusals.resolved(refusal, _reading_for_account(readings, selected, now), now)
+            and not _credits_pay_after(refusal, readings, selected))
+
+
 def _refusal_window(window: refusals.KnownWindow | refusals.UnknownWindow,
                     reading: refusals.FreshReading | refusals.StaleReading | refusals.NoReading,
                     at: datetime) -> refusals.KnownWindow | refusals.UnknownWindow:
@@ -255,7 +286,7 @@ from scripts.production.showrunners import (
 
 
 Config = ShowrunnerSettings
-STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "quota_alert.json"
+STATE = quota_state.state_path()
 SESSIONS = Path.home() / ".claude" / "sessions"
 PROTOCOL = Path.home() / ".claude" / "docs" / "quota_alerts.md"
 AGENTS = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
@@ -264,6 +295,7 @@ REGISTRY = models_registry.registry_path()
 # The session whose user is shown a switch on their next prompt.
 OWNER = "natedev"
 NO_WORKER_MODE_SENDER = "quota-alert"
+NO_WORKER_MODE_FYI = "FYI, no action:"
 KILL_GRACE = 10
 
 
@@ -661,22 +693,65 @@ def _write_state(state: State) -> None:
     os.replace(tmp, STATE)
 
 
-def _broadcast_worker_mode(active: bool) -> None:
-    """Start one notice unit after the state lock closes."""
+def _start_detached(what: str, script: str, arguments: Callable[[], list[str]]) -> None:
+    """Start one transient unit for a script; a failed start prints one line."""
     try:
-        account_config = conf.read("accounts")
-        text = account_config.text("no_worker_mode_on") if active else account_config.text("no_worker_mode_off")
         scripts = Path(__file__).resolve().parents[1]
         command = [os.environ.get("SHUTDOWN_SYSTEMD_RUN", "systemd-run"), "--user", "--collect", "--quiet", "--no-block",
                    "--working-directory=" + str(scripts.parent), "--", str(scripts / "lib/py"),
-                   str(scripts / "production/broadcast.py"), "--from", NO_WORKER_MODE_SENDER,
-                   "--showrunners", text, "--units", text]
+                   str(scripts / script), *arguments()]
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"quota-alert: no-worker mode broadcast failed: {' '.join(str(error).split())}")
+        print(f"quota-alert: {what} failed: {' '.join(str(error).split())}")
     else:
         if result.returncode:
-            print(f"quota-alert: no-worker mode broadcast failed: exit {result.returncode}")
+            print(f"quota-alert: {what} failed: exit {result.returncode}")
+
+
+def _worker_mode_text(active: bool) -> str:
+    return quota_state.no_worker_notice() if active else conf.read("accounts").text("no_worker_mode_off")
+
+
+def _broadcast_worker_mode(active: bool) -> None:
+    """Announce the mode after the state lock closes; when it goes on, also stop the Codex workers.
+
+    Each producer in `no_worker_mode_fyi` gets one copy marked as information only.
+    """
+    def notice() -> list[str]:
+        text = _worker_mode_text(active)
+        return ["--from", NO_WORKER_MODE_SENDER, "--showrunners", text, "--units", text]
+
+    _start_detached("no-worker mode broadcast", "production/broadcast.py", notice)
+    try:
+        producers = conf.read("accounts").text("no_worker_mode_fyi").split()
+    except conf.Unusable as error:
+        print(f"quota-alert: no-worker mode FYI failed: {' '.join(str(error).split())}")
+        producers = []
+    for producer in producers:
+        _start_detached(f"no-worker mode FYI to {producer}", "message/send.py", _fyi(producer, active))
+    if active:
+        _start_detached("Codex worker stop", "production/worker_capacity.py", lambda: ["stop"])
+
+
+def _fyi(producer: str, active: bool) -> Callable[[], list[str]]:
+    def arguments() -> list[str]:
+        return ["--to", producer, "--from", NO_WORKER_MODE_SENDER,
+                "--text", f"{NO_WORKER_MODE_FYI} {_worker_mode_text(active)}"]
+    return arguments
+
+
+def _start_no_worker_mode(state: State, readiness: agent_accounts.CodexWorkReadiness,
+                          destination: accounts.PickedAccount | accounts.NoAccountWithRoom) -> bool:
+    """Enter only when the workers account is exhausted and no other account can work."""
+    from scripts.accounts import accounts
+
+    if (not isinstance(readiness, agent_accounts.CodexWorkExhausted)
+            or not isinstance(destination, accounts.NoAccountWithRoom)):
+        return False
+    if socket.gethostname().split(".", 1)[0] != role_map.ROLE_MAP_HOST:
+        return False
+    state["no_worker_mode"] = True
+    return True
 
 
 @contextmanager
@@ -744,29 +819,16 @@ def state_file() -> Generator[State]:
 
 
 
-def ahead(resets: str | None, *, now: datetime) -> bool:
-    """Whether a note's reset is still to come."""
-    reset = reset_time(resets)
-    return isinstance(reset, note_file.KnownReset) and reset.value > now
-
-
-def remaining(note: AgentNote) -> float | None:
-    try:
-        return float(note.get("weekly_remaining_usage") or "")
-    except ValueError:
-        return None
-
-
 def percent(note: AgentNote) -> str:
-    value = remaining(note)
+    value = note_file.remaining(note)
     return "unknown" if value is None else f"{value:g}%"
 
 
 def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
     """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note_file.in_use(note) and ahead(note.get("resets"), now=now)
-            and (value := remaining(note)) is not None and value <= threshold]
+            if note_file.in_use(note) and note_file.ahead(note.get("resets"), now=now)
+            and (value := note_file.remaining(note)) is not None and value <= threshold]
 
 
 def recovered(name: str, notes: list[AgentNote], threshold: float,
@@ -810,14 +872,14 @@ def recovered(name: str, notes: list[AgentNote], threshold: float,
                 pass
         if note is None:
             return False
-        value = remaining(note)
+        value = note_file.remaining(note)
         if value is not None and math.isfinite(value) and value > threshold:
             return True
         reset = reset_time(note.get("resets"))
         return isinstance(reset, note_file.KnownReset) and reset.value <= now
     if note is None or not note_file.in_use(note):
         return True
-    value = remaining(note)
+    value = note_file.remaining(note)
     return value is not None and value > threshold
 
 
@@ -849,13 +911,16 @@ def registry_assignments() -> dict[str, str]:
 def edit_registry(editor: str, *args: str) -> str | None:
     """Run a validated registry editor and return its failure cause.
 
+    The edit is live at once and never waits for main; publish_registry() pushes it later.
     A timeout stops the process group before the caller reads the result.
     """
     command = ["bash", "-c", f'source "$0" && {editor} "$@"', str(AGENTS), *args]
     timeout = conf.read("accounts").whole("quota_edit_timeout_seconds")
+    publish = "0" if os.environ.get("MODELS_CONFIG_PUBLISH") == "0" else "later"
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY)}, start_new_session=True)
+                                   env={**os.environ, "MODELS_CONFIG_FILE": str(REGISTRY),
+                                        "MODELS_CONFIG_PUBLISH": publish}, start_new_session=True)
     except OSError as error:
         return str(error)
     with process:
@@ -1040,6 +1105,7 @@ def switch_back(
     policy_fallback = isinstance(fallback, AccountCodexQuotaFallback) and isinstance(fallback.hold, CreditsOffHold)
     if (isinstance(fallback, AccountCodexQuotaFallback) and isinstance(fallback.hold, CreditsOffHold)
             and now < fallback.hold.until
+            and isinstance(agent_accounts.codex_credits_setting(fallback.owner.label), agent_accounts.CreditsOff)
             and (not isinstance(selected, agent_accounts.KnownCodexAccount)
                  or selected.home == fallback.owner.home and selected.login.casefold() == fallback.owner.login.casefold())):
         owner_report = selected_codex_report(readings, now)
@@ -1049,9 +1115,7 @@ def switch_back(
 
     selected_can_work = isinstance(codex_can_work(selected_codex_report(readings, now), now, agent_accounts.codex_credits_setting(readings.workers.label)), CodexWorkAvailable)
     if isinstance(selected, agent_accounts.KnownCodexAccount):
-        refusal = refusals.load().get(refusals.key("codex", selected.login))
-        selected_can_work = selected_can_work and (refusal is None or
-            refusals.resolved(refusal, _reading_for_account(readings, selected, now), now))
+        selected_can_work = selected_can_work and not _refusal_blocks_return(readings, selected, now)
     if not selected_can_work:
         if workers_entry_pending():
             return NoCodexFallbackRestoration()
@@ -1081,10 +1145,8 @@ def switch_back(
             readings = CodexAlertPassReadings(accounts.CodexWorkersAccount(chosen.label, chosen.dir),
                 agent_accounts.codex_account(chosen.dir), readings.checked_homes)
     selected = readings.selected_account
-    if isinstance(selected, agent_accounts.KnownCodexAccount):
-        refusal = refusals.load().get(refusals.key("codex", selected.login))
-        if refusal is not None and not refusals.resolved(refusal, _reading_for_account(readings, selected, now), now):
-            return NoCodexFallbackRestoration()
+    if isinstance(selected, agent_accounts.KnownCodexAccount) and _refusal_blocks_return(readings, selected, now):
+        return NoCodexFallbackRestoration()
     if isinstance(readings.workers, NoWorkersHome):
         return NoCodexFallbackRestoration()
     if not isinstance(
@@ -1194,7 +1256,7 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
     from scripts.notify.push_texts import render
     from scripts.accounts import accounts
 
-    left = remaining(note)
+    left = note_file.remaining(note)
     if left is None or not 0 < left <= 2:
         return QuotaStatusNote(note.label, "no Codex account-move reminder outside 0–2% weekly usage left")
     at = now or datetime.now(timezone.utc)
@@ -1830,6 +1892,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
     values["until"] = reset_display(refusals.KnownReset(until))
     note = CodexQuotaAccountNote(note_file.note_path(label), {"weekly_remaining_usage": "0", "resets": reset.isoformat()}, label)
     switched = switch_to_claude(state, note, stamp, owner, hold=CreditsOffHold(until))
+    _ = _start_no_worker_mode(state, codex_can_work(report, now, credits), chosen)
     if isinstance(switched, CodexWorkSwitchFailed):
         values["outcome"] = "work could not move"
         values["fallback"] = (f"The switch to Claude failed because {_work_routing_failure_cause(switched.cause)}. "
@@ -1919,14 +1982,6 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
     stamp = now.isoformat(timespec="seconds")
     pushes: list[tuple[QuotaNote, Literal["phone", "forecast_phone"], str]] = []
     log: list[str] = []
-    warnings: set[str] = set()
-    for home in readings.checked_homes:
-        account = agent_accounts.codex_account(home.home)
-        if isinstance(account, agent_accounts.KnownCodexAccount):
-            setting = agent_accounts.codex_credits_setting(account.label)
-            if isinstance(setting, agent_accounts.CreditsOn) and setting.warning:
-                warnings.add(setting.warning)
-    log.extend(sorted(warnings))
     workers_queued = workers_entry_pending()
     with state_file() as state:
         fallback = state["fallback"]
@@ -1976,6 +2031,9 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             if isinstance(reconsidered, WorkersMovedWithoutNotice):
                 del episodes[label]
                 return log
+        if isinstance(setting, agent_accounts.CreditsOn) and episode["credits"] == "off":
+            episode["credits"] = "on"
+            _ = episode.pop("credits_off_fallback", None)
         if (at_zero and isinstance(setting, agent_accounts.CreditsOff)
                 and (episode["credits"] == "on"
                      or episode.get("credits_off_fallback") == "waiting_for_next_entry" and not workers_queued)):
@@ -2056,7 +2114,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
                     if isinstance(reset, note_file.KnownReset):
                         episodes[name]["weekly_reset"] = reset.value.isoformat()
             episode = episodes[name]
-            if note.tool == "codex" and remaining(note) == 0:
+            if note.tool == "codex" and note_file.remaining(note) == 0:
                 episode["reached_zero"] = True
             if episode.get("push") == "due":
                 push = (claude_next_move_push(note, selection) if note.tool == "claude"
@@ -2184,10 +2242,12 @@ class RoutedRefusal:
 
 def stopped_worker_relay(worker: str, outcome: RefusalOutcome) -> str:
     """The director's notice for a worker whose pass a quota refusal stopped."""
+    if isinstance(outcome, NoWorkerModeStarted):
+        return (f"Codex refused worker {worker} for quota. No-worker mode started. "
+                + "The stop of the Codex workers ends its pass as canceled. Do not rerun its assign command.")
     happened = (f"Workers moved to {outcome.account}, and the move resumes the pass. "
                 if isinstance(outcome, WorkersMoved) else
-                f"Workers wait for the reset at {outcome.reset}. " if isinstance(outcome, WorkersWaitForReset) else
-                "No-worker mode started. " if isinstance(outcome, NoWorkerModeStarted) else "")
+                f"Workers wait for the reset at {outcome.reset}. " if isinstance(outcome, WorkersWaitForReset) else "")
     return f"Codex refused worker {worker} for quota. Its pass stays open. {happened}Do not rerun its assign command."
 
 
@@ -2262,6 +2322,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                      and not isinstance(readings.workers, NoWorkersHome)
                      and selected.home == readings.workers.home)
         if owns_role and not isinstance(readings.workers, NoWorkersHome):
+            readiness = codex_can_work(selected_codex_report(readings, now), now,
+                                       agent_accounts.codex_credits_setting(readings.workers.label))
             entries = moves.read_moves()
             if (isinstance(reset, refusals.KnownReset) and (pending_head
                     or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
@@ -2280,6 +2342,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             elif pending_head:
                 return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)
             else:
+                if isinstance(readiness, CodexWorkAvailable):
+                    return RoutedRefusal([f"{name} refused work; its allowance or paid credits can still serve workers. Nothing switched to Claude."], outcome)
                 chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
                 if isinstance(chosen, accounts.PickedAccount):
                     move_id = uuid.uuid4().hex
@@ -2311,8 +2375,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                             move_id=uuid.uuid4().hex, earliest_reset=chosen.earliest_reset.at.isoformat()
                             if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
                     no_room = accounts.no_room_line("codex", chosen)
-                    if socket.gethostname().split(".", 1)[0] == role_map.ROLE_MAP_HOST:
-                        state["no_worker_mode"] = True
+                    if _start_no_worker_mode(state, readiness, chosen):
                         outcome = NO_WORKER_MODE_STARTED
         if pending_head and not transition_line:
             return RoutedRefusal([f"workers next entry is pending; {name} refusal recorded without a fallback move"], outcome)

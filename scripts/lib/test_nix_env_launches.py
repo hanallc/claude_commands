@@ -244,7 +244,8 @@ class ShellLaunchTests(NixFixture):
         self.scripts = self.home / ".claude/scripts"
         _ = shutil.copytree(ROOT / "scripts/lib", self.scripts / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/agent_exec.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh", "make_a_worktree/direnv_allow.sh"):
+        for relative in ("agents/agent_exec.sh", "agents/worker_lifecycle.py", "cli_agent/cli_agent.sh",
+                         "make_a_worktree/direnv_allow.sh", "buildlog/__init__.py", "buildlog/store.py"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if relative == "agents/agent_exec.sh":
@@ -255,7 +256,7 @@ class ShellLaunchTests(NixFixture):
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
         _ = (self.scripts / "agents/models_config.sh").write_text(
             (ROOT / "scripts/agents/models_config.sh").read_text()
-            + "\nagents_resolve() { AGENT_FAMILY=claude; AGENT_MODEL=fixture; }\n"
+            + "\nagents_resolve() { AGENT_FAMILY=claude; AGENT_MODEL=fixture; AGENT_CLAUDE_ACCOUNT=workers; }\n"
             + "agents_claude_args() { echo '--model fixture'; }\n")
         registry = write_registry(self.root / "models.conf")
         self.env.update(MODELS_CONFIG_FILE=str(registry), MODELS_CONFIG_PUBLISH="0", MODELS_CONFIG_TIER_ONLY="1")
