@@ -2,7 +2,7 @@
 
 ## Current model
 
-AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
+AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
@@ -329,7 +329,7 @@ Teardown still checks retained claims before deletion.
 
 ## Paired speed trials
 
-Run `python3 -m scripts.aws_target.gate_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
+Run `python3 -m scripts.aws_target.aws_trial --base <ref> --changed <ref> --modules <folder>/<file.py> --rounds 3`.
 Both refs can name local commits in `~/.claude`.
 The trial pushes each commit to a fresh `gate-trial-<expires>-<id>-base|changed` branch with a plain push.
 The expires field records the trial's fixed expiry epoch in seconds.
@@ -339,7 +339,7 @@ The trial installs no signal handler.
 Ctrl-C and terminal command exceptions stop the paired service.
 SIGTERM or SIGHUP to the terminal can skip branch cleanup.
 The separate trial service then runs to its normal end and cleans its boxes.
-The paired unit uses `ExecStopPost` with `gate_trial --paired-cleanup <folder>`.
+The paired unit uses `ExecStopPost` with `aws_trial --paired-cleanup <folder>`.
 After a service stop, systemd runs this cleanup after killing the coordinator and its children.
 Cleanup requests termination for all recorded boxes before searching uncertain launches.
 Cleanup requests termination for each discovered box before the next search.
@@ -435,7 +435,7 @@ The command terminates boxes after results, errors, or cancellation.
 Uncertain launches retain their requests and reservations for reconciliation and expiry cleanup.
 
 The paired trial replaces the size/start trials.
-The twelve `gate_trial_*` settings are removed.
+The old size/start trial settings are removed.
 The paired trial uses the existing `cloud_gate.conf` settings.
 
 ## Cloud gate region fallback
