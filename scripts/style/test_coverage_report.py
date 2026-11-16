@@ -27,6 +27,12 @@ from scripts.style import style_ledger
 from scripts.style import style_rules
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, unit_membership
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 @dataclass(frozen=True)
 class ReportRuleRow:

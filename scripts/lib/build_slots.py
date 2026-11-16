@@ -170,15 +170,9 @@ def _pool(source: Path) -> RepositoryPool:
     return RepositoryPool(main, repository, machine, root, slot_cargo_root(settings))
 
 
-def _maximum(pool: RepositoryPool, report: Callable[[str], None]) -> int:
+def _maximum(pool: RepositoryPool) -> int:
     settings = conf.read_or_repository("build_folders")
-    key = f"slots.{pool.machine}.{pool.repository}.max"
-    maximum = configured_maximum(settings, pool.machine, pool.repository)
-    if key in settings.values():
-        return maximum
-    report(f"slots: {pool.repository} on {pool.machine} has no maximum of its own; it uses {maximum}. "
-           + f"Set {key} with /tune.")
-    return maximum
+    return configured_maximum(settings, pool.machine, pool.repository)
 
 
 def _rescue(path: Path) -> None:
@@ -230,7 +224,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
               purpose: str, report: Callable[[str], None]) -> Generator[Slot]:
     """Take the lowest free slot and reset its source under the exclusive lock."""
     pool = _pool(source)
-    maximum = _maximum(pool, report)
+    maximum = _maximum(pool)
     checkout = build_folders.SlotCheckout(pool.source, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
     for number in range(1, maximum + 1):
         spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,

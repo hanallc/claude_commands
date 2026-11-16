@@ -31,6 +31,12 @@ from scripts.production import change_review, staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
 import os

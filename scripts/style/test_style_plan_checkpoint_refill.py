@@ -25,6 +25,12 @@ from scripts.whoami import quota_state
 
 from scripts.style.style_plan_test_support import StylePlanFixture
 
+from scripts.style.style_reader_test_support import oracle_reader
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(oracle_reader())
+
 
 @final
 class StylePlanTests(StylePlanFixture):
