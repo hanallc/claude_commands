@@ -4422,3 +4422,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Each of the 371 dataclasses with no docstring in the 26 files of the `mac_test`, `admission_protocol`, `offload`, `eligibility` and `buildlog.sync` import closure has a one-line docstring, so `dataclasses` builds no default `__doc__` with `inspect.signature`. A class whose body was only `pass` holds only its docstring. No code changed.
 - Import A/B, 30 paired rounds on natedev: `mac_test` + `admission_protocol` import CPU 93.2 -> 78.3 ms (16% less).
 - Commit 304e400f5. The fieldless shared base stays in the backlog.
+### Phase 311 — test_offload checks each verb's remote words in process, with one end-to-end run per test  · status: done
+**Depends on:** Phase 310
+**Owner:** natest (builds gave a go on 11-15 at 19:00 EST; base a4db0246f; no open unit branch touches the phase file).
+
+#### As-built
+
+- Five tests in `mac_test/test_offload.py` keep one full `self.command` run each. Their other cases call `remote_test_command`, `claim_arguments`, `claimed_run` with `write_result`, `ssh_prefix`, `request_mirror` and `remote_rsync` directly.
+- The settings test keeps real settings parsing and placement; only `run_offload` is replaced. The byte-count cases keep the real `capture_copy` parsing and `persist_attempt`, with mocked child processes.
+- Paired module_cost in one copy, 3 rounds after a warm-up (natedev, loaded): 31.4 / 40.2 / 34.9 CPU s before, 21.0 / 19.3 / 18.8 after; about 300 fewer processes per run.
+- Commit abc3df056.

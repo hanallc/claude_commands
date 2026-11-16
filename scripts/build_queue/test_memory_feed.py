@@ -1445,23 +1445,49 @@ process.stdout.write(JSON.stringify({
                          ["natedev or Mac", "natedev only (step writes the tree)",
                           "natedev only (a direct cargo command runs where it starts)"])
 
-    def test_swapped_memory_of_other_programs_shows_as_free_ram_when_it_comes_back(self) -> None:
+    def test_head_room_rows_are_inside_the_queue_cap_and_add_up(self) -> None:
         gib = admission_records.GIB
-        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 0, 8 * gib, 7 * gib, 64 * gib, (), agent_swap_demand=10 * gib)
-        check = admission_records.RoomCheck(16 * gib, 7 * gib, False, basis=admission_records.DoesNotFit())
-        shown = memory_feed.head_room(check, room)
-        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]], [
-            ("Free RAM", 28.0), ("− Safety net", 3.0), ("− Swap coming back", 10.0), ("− Build reserved", 8.0),
-            ("= Free", 7.0), ("need", 16.0)])
-        self.assertEqual(shown["note"], f"Other programs have 10.0 GiB of memory in swap. {memory_feed.SWAP_RETURN_NOTE}")
+        self.ram_fixture()
+        tools = memory_feed.BuildToolRam(rust_analyzer=gib, sccache=0, other=0)
+        room = admission_records.MemoryRoom(28 * gib, 3 * gib, 2 * gib, 8 * gib, 7 * gib, 17 * gib, (), agent_swap_demand=10 * gib)
+        ram = memory_feed.ram_blocks(room, tools, 100.0, 1)
+        for ahead in (0, 2):
+            with self.subTest(ahead=ahead):
+                check = admission_records.RoomCheck(16 * gib, (7 - ahead) * gib, False, basis=admission_records.DoesNotFit())
+                shown = memory_feed.head_room(check, room, ram)
+                rows = [(row["label"], row["gib"]) for row in shown["rows"]]
+                self.assertEqual(rows, [("Queue cap", 18.0), ("− Builds", 3.0), ("− Build reserved", 8.0),
+                                        *([("− Held for builds ahead in line", 2.0)] if ahead else []),
+                                        ("= Free for builds", 7.0 - ahead)])
+                self.assertEqual(rows[0][1] - sum(amount for _, amount in rows[1:-1]), rows[-1][1])
+                self.assertEqual(rows[0][1], memory_feed.gib(ram["cap_bytes"]))
+                self.assertEqual(shown["cap_text"], "Queue cap: 18.0 GiB. It is RAM less the programs that run now, "
+                                 + "the 3.0 GiB safety net and the 10.0 GiB of swap coming back. Those three are outside the cap.")
+                self.assertEqual(shown["note"], f"{memory_feed.BUILD_RESERVED_NOTE} "
+                                 + f"Other programs have 10.0 GiB in swap. {memory_feed.SWAP_RETURN_NOTE}")
+        short = replace(room, available=16 * gib, signed_room=-5 * gib)
+        check = admission_records.RoomCheck(16 * gib, -5 * gib, False, basis=admission_records.DoesNotFit())
+        shown = memory_feed.head_room(check, short, memory_feed.ram_blocks(short, tools, 100.0, 1))
+        self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
+                         [("Queue cap", 6.0), ("− Builds", 3.0), ("− Build reserved", 3.0), ("= Free for builds", 0.0)])
+        self.assertIn("Running builds need 8.0 GiB reserved. Free RAM covers 3.0 GiB of it.", shown["note"])
+        no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
+        check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
+        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
+        self.assertEqual(memory_feed.head_room(check, no_swap, no_swap_ram)["note"], memory_feed.BUILD_RESERVED_NOTE)
+        run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
+        unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
+        self.assertEqual((unavailable["cap_text"], unavailable["rows"]),
+                         ("Queue cap unavailable: memory use is unavailable for organon: no cgroup", []))
+        unread = memory_feed.head_room(check, admission_records.ReadingUnavailable("meminfo is missing"), ram)
+        self.assertEqual((unread["cap_text"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB
         reading = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
         room = admission_records.RoomCheck(20 * gib, 15 * gib, False, basis=admission_records.DoesNotFit())
-        expected_rows = [[("Free RAM", 30.0), ("− Safety net", 3.0), ("− Swap coming back", 0.0),
-                          ("− Build reserved", 9.0), ("− Held for earlier steps", 3.0),
-                          ("= Free", 15.0), ("need", 20.0)]]
+        expected_rows = [[("Queue cap", 28.0), ("− Builds", 1.0), ("− Build reserved", 9.0),
+                          ("− Held for builds ahead in line", 3.0), ("= Free for builds", 15.0)]]
         states: tuple[tuple[Literal["admit", "hold"], admission_records.HeadCause], ...] = (
             ("admit", admission_records.NeedsMemory()), ("hold", admission_records.NeedsMemory()),
             ("hold", admission_records.StartSpacingWait(110)), ("hold", admission_records.GpuSlotWait(1, 1)))
@@ -1478,6 +1504,39 @@ process.stdout.write(JSON.stringify({
                          for waiter in page["waiters"] if "head_room" in waiter]
                 self.assertEqual(shown, expected_rows if state == "hold" else [])
                 self.assertNotIn("admission_check", page)
+                first = page["waiters"][0]
+                self.assertEqual((first.get("place"), first.get("why")),
+                                 (1, "only 15.0 GiB is free for builds. It starts when 20.0 GiB is free."))
+
+    def test_each_wait_reason_says_why_in_the_same_form(self) -> None:
+        gib = admission_records.GIB
+        waiting = with_wait_reason(reservation_reading(), admission_records.NeedsMemory()).view.waiting
+        decision = admission_records.AdmissionDecision("hold", 0, 0, 0, 0)
+        cases: tuple[tuple[admission_records.WaitReason, str], ...] = (
+            (admission_records.NeedsMemory(need=4 * gib, free=gib),
+             "only 1.0 GiB is free for builds. It starts when 4.0 GiB is free."),
+            (admission_records.BehindHead("first", 0, "fixture"), "it is behind the first build in line, which gets memory first."),
+            (admission_records.TokenWaitingWaiter(0), "another build runs in the same work folder. One build at a time can use a folder."),
+            (admission_records.StartSpacingWait(0), "the queue waits a short time between two starts. It starts after that time."),
+            (admission_records.MemoryPressure(1.0), "memory pressure is high. It starts when the pressure goes down."),
+            (admission_records.GpuSlotWait(1, 1), "1 of 1 GPU test slots are in use. It starts when a GPU test ends."),
+            (admission_records.EstimateExpired(0), "its memory estimate expired. The queue reads a new estimate before it starts."),
+            (admission_records.NatedevHeld("research", "a disk walk"), "natedev is held by research for a disk walk. It starts when the hold ends."),
+            (admission_records.ReadingUnavailable("meminfo is missing"),
+             "a memory reading is unavailable: meminfo is missing. It starts when the reading comes back."),
+            (admission_records.PressureUnavailable("PSI is missing"),
+             "a memory reading is unavailable: PSI is missing. It starts when the reading comes back."),
+            (admission_records.ReadyForAdmission(), "nothing. It starts at the next check."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.ReadyForAdmission()),
+             "the build at number 1 in line starts first."),
+            (admission_records.HeadAdmissionStatus(decision, 0, 0, cause=admission_records.MemoryPressure(1.0)),
+             "memory pressure is high. It starts when the pressure goes down."))
+        for reason, expected in cases:
+            with self.subTest(reason=type(reason).__name__):
+                self.assertEqual(memory_feed.wait_why(reason, waiting, None), expected)
+        check = admission_records.RoomCheck(6 * gib, -2 * gib, False, basis=admission_records.DoesNotFit())
+        self.assertEqual(memory_feed.wait_why(admission_records.NeedsMemory(), waiting, check),
+                         "only 0.0 GiB is free for builds. It starts when 6.0 GiB is free.")
 
     def test_mac_idle_alert_reaches_the_feed_and_clears_with_the_watch_state(self) -> None:
         _ = write_idle_config(self.root)

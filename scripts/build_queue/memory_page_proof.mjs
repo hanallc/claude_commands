@@ -981,8 +981,7 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             assert.equal(absentCells.unit,'');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
 
-            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],
-              ['spacing','another step just started; the queue waits a few seconds between starts'],['head','behind']]) {
+            for (const [name, expected] of [['pressure','/private/proc/pressure/memory'],['spacing','between two starts'],['head','behind']]) {
               await show(readings[name]);
               const state=await evaluate(`({list:document.querySelector('#priority-line,#head-line,#wait-reasons'),
                 hover:tipText('wait:0',latest)[1], rows:document.querySelectorAll('.wrow[data-run]').length})`);
@@ -1011,33 +1010,37 @@ try {
             for(const name of ['head_memory','head_shortfall','head_swap_shortfall']) {
               await show(readings[name]);
               const headProof=await evaluate(`(() => {
-                const rows=latest.waiters[0].head_room.rows.filter(row=>row.label!=='need'&&!row.label.includes('Held for earlier steps'));
-                const group=document.querySelector('#v-g-free').closest('.legend-group');
-                const legend=Object.fromEntries([...group.querySelectorAll('.row,.group-head')].map(row=>[
-                  row.querySelector('.name').textContent,{
-                    value:row.querySelector('.v').textContent,note:row.querySelector('.note')?.textContent||''}]));
+                const rows=latest.waiters[0].head_room.rows.filter(row=>!/ahead in line|Free for builds/.test(row.label));
+                const group=document.querySelector('.cap-group');
+                const legend=Object.fromEntries([...group.querySelectorAll('.row')].map(row=>[
+                  row.querySelector('.name').textContent,{value:row.querySelector('.v').textContent}]));
                 return {removed:document.querySelector('#head-line,#admission-terms,#admission-check-rows')===null,
                   values:Object.fromEntries(rows.map(row=>[row.label.replace(/^[−=] /,''),f1(row.gib)+' GiB'])),
-                  hover:tipText('wait:0',latest)[1],room:tipText('room',latest).join('\\n'),legend,
+                  all:latest.waiters[0].head_room.rows.map(row=>row.gib),
+                  hover:tipText('wait:0',latest)[1],legend,reservedNote:document.querySelector('#reserved-note').textContent,
                   covered:document.querySelector('#v-reserved').textContent,
-                  free:document.querySelector('#v-g-free').textContent,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
               assert.ok(headProof.removed,'The removed Head line returns.');
+              assert.deepEqual(Object.keys(headProof.values),['Queue cap','Builds','Build reserved']);
               for(const [label,value] of Object.entries(headProof.values)) {
                 assert.ok(headProof.hover.includes(label+': '+value),'The head tooltip omits the term: '+label);
                 const row=headProof.legend[label];
-                assert.ok(row,'The legend omits the head term: '+label);
-                assert.ok(row.value===value||row.note.includes('Needs '+value+';'),
-                  'The legend amount differs from the head tooltip: '+label);
-                assert.ok(headProof.room.includes(label+(label==='Free'?' · ':': ')+value),
-                  'The room tooltip differs from the head tooltip: '+label);
+                assert.ok(row,'The queue cap legend omits the head term: '+label);
+                assert.ok(row.value===value||label==='Build reserved'&&headProof.reservedNote.includes('Needs '+value+';'),
+                  `The legend amount differs from the head tooltip in ${name}: ${label} ${value} vs ${row.value}`);
               }
-              assert.equal(headProof.values['Free RAM'],headProof.free);
-              assert.equal(headProof.values['Safety net'],(readings[name].ram.safety_target_bytes/gib).toFixed(1)+' GiB');
-              assert.equal(headProof.values['Swap coming back'],(readings[name].ram.swap_target_bytes/gib).toFixed(1)+' GiB');
-              assert.equal(headProof.values['Build reserved'],(readings[name].ram.build_target_bytes/gib).toFixed(1)+' GiB');
-              assert.notEqual(headProof.values['Build reserved'],headProof.covered,'The fixture has no uncovered build reserve.');
+              const [cap,...terms]=headProof.all;
+              assert.ok(Math.abs(cap-terms.slice(0,-1).reduce((a,b)=>a+b,0)-terms.at(-1))<0.3,
+                'The head rows do not add up: '+headProof.all.join(', '));
+              const safety=(readings[name].ram.safety_target_bytes/gib).toFixed(1), swap=(readings[name].ram.swap_target_bytes/gib).toFixed(1);
+              assert.ok(headProof.hover.includes(`the ${safety} GiB safety net and the ${swap} GiB of swap coming back`),
+                'The cap line omits the safety net or the swap: '+headProof.hover);
+              const ram=readings[name].ram, target=(ram.build_target_bytes/gib).toFixed(1), covered=(ram.build_covered_bytes/gib).toFixed(1);
+              assert.equal(headProof.values['Build reserved'],covered+' GiB');
+              assert.ok(ram.build_target_bytes>ram.build_covered_bytes,'The fixture has no uncovered build reserve.');
+              assert.ok(headProof.hover.includes(`Running builds need ${target} GiB reserved. Free RAM covers ${covered} GiB of it.`),
+                'The head tooltip omits the uncovered build reserve: '+headProof.hover);
               if(name==='head_swap_shortfall') assert.ok(readings[name].ram.swap_target_bytes>readings[name].ram.swap_covered_bytes);
               assert.ok(headProof.scroll<=headProof.client,'The admission requirements overflow the page.');
               if(name==='head_memory'&&theme==='dark'&&width===1400) {
@@ -1045,9 +1048,9 @@ try {
                   const card=document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
                   const legend=document.querySelector('.legend-box').getBoundingClientRect();
                   const row=document.querySelector('.walk-table tr[data-tip="wait:0"]').getBoundingClientRect();
+                  const groups=[...document.querySelectorAll('.legend-group')].map(group=>group.getBoundingClientRect());
                   showTip('wait:0',card.right-140,row.top);
                   const popup=document.querySelector('#tip');
-                  const groups=[...document.querySelectorAll('.legend-group')].map(group=>group.getBoundingClientRect());
                   const legendRight=Math.max(...groups.map(group=>group.right));
                   const beside=card.right-legendRight>=popup.offsetWidth+24;
                   const top=beside?legend.top+36:Math.max(...groups.map(group=>group.bottom))+18;
@@ -1056,7 +1059,7 @@ try {
                   if(groups.some(group=>group.left<tip.right&&group.right>tip.left&&group.top<tip.bottom&&group.bottom>tip.top)) {
                     throw new Error('The head tooltip covers a legend group.');
                   }
-                  return {x:card.left,y:card.top+scrollY,width:card.width,
+                  return {x:card.left,y:card.top+scrollY,width:Math.max(card.right,tip.right+8)-card.left,
                     height:Math.max(row.bottom,tip.bottom)-card.top+8,scale:1};
                 })()`);
                 const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
@@ -1589,18 +1592,24 @@ try {
           const owner={name:'hana nextest',showrunner:'hana',unit:'research',runner:'unit director',worker:'',detail:'research',
             pid:4242,need:16.3,since:now-16*60,reason:'free memory',fits:false};
           const priority="queue priority: research (the user's bump)";
-          const room={rows:[{label:'Free RAM',gib:28.4},{label:'− Safety net',gib:3.0},
-            {label:'− Swap coming back',gib:9.8},{label:'− Build reserved',gib:8.5},
-            {label:'= Free',gib:7.1},{label:'need',gib:16.3}],
-            note:'Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.'};
+          const note='Other programs have 9.8 GiB of memory in swap. It comes back into RAM when they run, so the queue holds RAM for it.';
+          const oldRoom={rows:[{label:'free RAM',gib:28.4},{label:'− safety net',gib:3.0},
+            {label:'− swap coming back',gib:9.8},{label:'− build reserved',gib:8.5},
+            {label:'= free',gib:7.1},{label:'needs',gib:16.3}],note};
+          const room={cap_text:'Queue cap: 17.1 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
+            'and the 9.8 GiB of swap coming back. Those three are outside the cap.',
+            rows:[{label:'Queue cap',gib:17.1},{label:'− Builds',gib:1.5},{label:'− Build reserved',gib:8.5},
+            {label:'= Free for builds',gib:7.1}],note:'Build reserved is memory that running builds used at their next points in earlier runs. '+
+            'Other programs have 9.8 GiB in swap. It can come back into RAM when they run, so it is outside the cap.'};
           const behind={...owner,name:'trunk nextest',unit:'trunk',detail:'trunk',pid:4243,need:2.0,
             reason:'behind #1: the first step in line gets memory first',runs_on:'natedev or Mac'};
+          const head={...owner,place:1,why:'only 7.1 GiB is free for builds. It starts when 16.3 GiB is free.'};
+          const second={...behind,place:2,why:'it is behind the first build in line, which gets memory first.'};
           const cloud=structuredClone(readings.cloud.waiters.find(row=>row.kind==='cloud')||readings.step_owners.waiters.find(row=>row.kind==='cloud'));
           Object.assign(cloud,{since:now-3*60,name:'claude gate',unit:'builds',reason:'waits for a cloud slot: 9 of 9 in use',
             runs_on:'AWS (natedev only when AWS cannot start the gate)'});
-          const old={...owner,priority_text:priority,mac_text:'Mac: natedev only, creates a Linux install',
-            head_text:'Head: need 16.3 GiB > room 7.1 GiB (free 28.4 GiB − safety 3.0 GiB − 9.8 GiB swapped outside builds − kept aside 8.5 GiB) · cloud 2 of 9 slots'};
-          const cases=[['before','before.html',[old]],['after','memory_live.html',[{...owner,priority_text:priority,runs_on:'natedev only',head_room:room},behind,cloud]]];
+          const cases=[['before','before.html',[{...owner,priority_text:priority,runs_on:'natedev only',head_room:oldRoom},behind,cloud]],
+            ['after','memory_live.html',[{...head,priority_text:priority,runs_on:'natedev only',head_room:room},second,cloud]]];
           for (const theme of ['light','dark']) {
             await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
             for (const [version,path,waiters] of cases) {
@@ -1611,8 +1620,11 @@ try {
                 const tooltip=await evaluate(`document.querySelector('#tip').innerText`);
                 if (version==='after') {
                   assert.ok(!tooltip.includes('Head'),tooltip);
-                  assert.ok(/\nreason\s/.test(tooltip),tooltip);
+                  assert.ok(index<2 ? tooltip.includes('Why it waits: ') : /\nreason\s/.test(tooltip),tooltip);
                   assert.ok(tooltip.includes('can run on'),tooltip);
+                  assert.equal(tooltip.includes('= Free for builds'),index===0,tooltip);
+                  assert.equal(tooltip.includes('Those three are outside the cap.'),index===0,tooltip);
+                  assert.ok(!/needs\s/.test(tooltip),tooltip);
                 }
                 await capture(`${version}-${theme}-wait-${index+1}`,'#tip');
                 comparisons.push({version,theme,index,tooltip});
@@ -1693,10 +1705,13 @@ try {
             progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
-            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',
+            ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
+            why:'only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.',
             head_text:review.head_text,priority_text:review.priority_text,
-            head_room:{rows:[{label:'Free RAM',gib:8.5},{label:'− Safety net',gib:3.0},
-              {label:'− Swap coming back',gib:6.0},{label:'= Free',gib:0.0},{label:'need',gib:1.9}],note:''}}];
+            head_room:{cap_text:'Queue cap: 0.0 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net '+
+              'and the 6.0 GiB of swap coming back. Those three are outside the cap.',
+              rows:[{label:'Queue cap',gib:0.0},{label:'− Builds',gib:0.0},{label:'− Build reserved',gib:0.0},
+              {label:'= Free for builds',gib:0.0}],note:''}}];
           review.ci_ram = 0.125;
           review.taken = review.cap - review.room;
           for (const theme of ['light','dark']) {
@@ -1770,7 +1785,7 @@ try {
                   assert.equal(layout.tables,1);
                   assert.equal(layout.lists,0);
                   assert.equal(layout.layout,width===1400?'beside':'stacked');
-                  for(const value of ['First in line',review.priority_text,'free memory'])
+                  for(const value of ['= Free for builds',review.priority_text,'Why it waits: '])
                     assert.equal(layout.head.split(value).length-1,1);
                   responsive.push({width,...layout});
                 }
@@ -1792,11 +1807,14 @@ try {
           await evaluate(`showTip('row:${index}',700,420)`);
           const state=await evaluate(`(() => {
             const tip=document.querySelector('#tip');
-            return {title:tip.querySelector('b').textContent,width:tip.getBoundingClientRect().width,
+            const head=tip.querySelector('b');
+            return {title:head.firstElementChild?.textContent||head.textContent,
+              duration:head.children[1]?.textContent,width:tip.getBoundingClientRect().width,
               scroll:tip.scrollWidth,client:tip.clientWidth};
           })()`);
           if(version==='after') {
             assert.equal(state.title,'fps nextest · 2.1 GiB');
+            assert.equal(state.duration,'10 min');
             assert.ok(state.width<=24*16+22,JSON.stringify(state));
             assert.ok(state.scroll<=state.client,JSON.stringify(state));
           }
