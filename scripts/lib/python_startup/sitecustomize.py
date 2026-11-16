@@ -21,6 +21,9 @@ from types import CodeType, ModuleType
 
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
+TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
+                     "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/boot_identity.py",
+                     "scripts/lib/conf.py", "config/build_folders.conf")
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
 DATACLASS_CODE_FLAGS = 0

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.checkout_test_support import copy_startup
+from scripts.lib.checkout_test_support import copy_test_runner
 
 from dataclasses import dataclass
 import json
@@ -399,7 +399,9 @@ try:
     with os.scandir(descriptor) as entries: list(entries)
 finally:
     os.close(descriptor)""", ["listed"]),
-            ("outside removal", "shutil.rmtree(tempfile.mkdtemp(dir=OUTSIDE))", []),
+            ("outside removal", """path = OUTSIDE / 'removal-probe'
+path.mkdir()
+shutil.rmtree(path)""", []),
             ("git prefixes", "subprocess.check_output(['git', 'ls-files', '-z', '--', 'scripts/', 'commands/', 'docs/'], cwd=ROOT)",
              ["commands/", "docs/", "scripts/"]),
             ("git C", "subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--', 'docs/'], cwd=OUTSIDE)", ["docs/"]),
@@ -446,7 +448,7 @@ finally:
             for name, action, expected in cases:
                 with self.subTest(case=name):
                     output = outside / "times.json"
-                    source = ("import os, shutil, subprocess, sys, tempfile, unittest\nfrom pathlib import Path\nfrom unittest import mock\n"
+                    source = ("import os, shutil, subprocess, sys, unittest\nfrom pathlib import Path\nfrom unittest import mock\n"
                               + f"ROOT = Path({str(root)!r})\nOUTSIDE = Path({str(outside)!r})\n"
                               + "class Listing(unittest.TestCase):\n    def test_listing(self):\n"
                               + textwrap.indent(action, "        ") + "\n")
@@ -641,11 +643,8 @@ class FixtureCPU(unittest.TestCase):
         self.assertIn("DeprecationWarning: fixture warning", self.outcomes.timed.stderr)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            copy_startup(root)
             runner = root / "scripts/test_times/module_run.py"
-            runner.parent.mkdir(parents=True, exist_ok=True)
-            _ = runner.write_text(RUNNER.read_text())
-            _ = (root / "scripts/lib/descendants.py").write_text((RUNNER.parents[1] / "lib/descendants.py").read_text())
+            copy_test_runner(root)
             folder = root / "scripts" / "fixture"
             folder.mkdir(parents=True)
             _ = (folder / "sibling.py").write_text("VALUE = 42\n", encoding="utf-8")
