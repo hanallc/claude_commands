@@ -220,14 +220,16 @@ class ImagesTests(ImagesFixture):
         self.assertIn("last.owner === card.dataset.owner", source)
         self.assertIn("link.href = '#' + row.card.id;", source)
         self.assertIn("document.getElementById('image-' + start.get('image'))", source)
-        self.assertIn("if (target.hidden) {", source)
+        self.assertIn(f'<article id="image-{older["id"]}"', source)
         self.assertIn("Newer shot", source)
         self.assertIn("shot-owner (unit)", source)
         self.assertIn("Phase console-images", source)
         self.assertIn(f'src="/images/{newer['id']}/image.png"', source)
         token = images.request_token(images.console_token(self.root), newer["id"])
         self.assertIn(f'name="token" value="{token}"', source)
-        self.assertIn('<option value="week" selected>', source)
+        self.assertNotIn('data-image-filter', source)
+        self.assertNotIn('image-window', source)
+        self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
         self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
@@ -245,7 +247,9 @@ class ImagesTests(ImagesFixture):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_updates_keep_zoom_and_feedback_working_after_an_older_script_reloads(self) -> None:
-        _ = self.register()
+        older = self.register()
+        older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
+        image_store.write_record(images.images_root(self.root) / older["id"], older)
         current = images.render(self.root).decode()
         marker = f'data-script="{images.SCRIPT_VERSION}"'
         self.assertEqual(current.count(marker), 1)
@@ -266,6 +270,9 @@ class ImagesTests(ImagesFixture):
  for (let step = 0; step < 100 && list() === before; step++) await wait(20);
  check(list() !== before, 'the update puts in a new list');
  const card = list().querySelector('article'), form = card.querySelector('form');
+ check(!document.querySelector('[data-image-filter], #image-window'), 'the page has no age filter');
+ check(!card.hidden && Date.now() - Date.parse(card.querySelector('time').dateTime) > 7*86400000,
+       'the image older than seven days stays visible after an update');
  const link = card.querySelector('a[data-image-zoom]');
  const zoom = document.querySelector('[data-image-zoom-dialog]');
  link.click();
@@ -383,7 +390,7 @@ class ImagesTests(ImagesFixture):
         path = f"/images/{record['id']}/image.png"
         token = images.request_token("token", record["id"])
         self.assertEqual(card, (
-            f'<article id="image-{record['id']}" data-image="{record['id']}" data-registered="1794712140"'
+            f'<article id="image-{record['id']}" data-image="{record['id']}"'
             + f' data-owner="{record['owner']}" data-owner-name="shot-owner">'
             + '<h2 class="caption">Look at &lt;the&gt; cards</h2><dl class="image-details">'
             + '<dt>Owner:</dt><dd>shot-owner (unit)</dd><dt>For  :</dt><dd>Phase console-images</dd>'
