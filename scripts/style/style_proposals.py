@@ -13,7 +13,6 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 import tomllib
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping
@@ -42,6 +41,7 @@ from scripts.production.proposal_issue import (GOAL, INHERITED_FIELDS, STAR, App
                             UnansweredDecision, staff_reference, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from scripts.style.unit_files import file_text, git, unit_file_holders
 from scripts.style.unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
+from scripts.lib import build_folders
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.user_zone import user_zone
 
@@ -398,8 +398,8 @@ class DecisionWriter:
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
         caller = staff.snapshot().by_current_session(staff.caller_identity())
         proposed_by = caller.id if caller is not None and caller.kind == "unit" else self.standing.name
-        with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
-            body = Path(scratch) / "body.md"
+        with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder("style-decision-")) as scratch:
+            body = scratch / "body.md"
             _ = body.write_text(self.text(key, findings))
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
                              "--proposed-by", proposed_by, "--extra-tags", "style",
