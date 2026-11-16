@@ -319,7 +319,7 @@ The user, 2026-11-04, change review C948 (`buildlog costs`), through builds: the
 - `PageData(charts: ChartSet, top: TopCosts)`. `TopCosts(start, end, recent_days, rows: tuple[TopCost, ...] | NoDataYet)`: `start` and `end` bound the recent window, in the user zone. `TopCost(machine, cause, recent: ChartCost, window: WindowValue, action: CostAction)`. `CostAction(action, owner)`.
 - `WindowValue = WindowMatchesRecent | WindowDiffers(value: ChartCost)`. An unknown recent value is a match. A known recent value with an unknown window value is `WindowDiffers(window)`. Otherwise per-day rates differ when the gap is above 0.5 of the recent rate. An upper bound keeps its unknown part per day.
 - Rows rank the six causes (`COST_KEYS`) by recent seconds and keep `CostUnavailable`, `NoDataYet` and `MacIdleUpperBound` as they are.
-- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=2` and `COST_ACTION_*`/`COST_OWNER_*` for each cause, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
+- `config/buildlog.conf` holds `TOP_COST_RECENT_DAYS=7`, read at use. `TOP_COST_RECENT_DAYS` greater than `days` raises `conf.Unusable` that names the key and the days.
 - `collect_charts` and `page_data` share `read_snapshot` and `chart_series`.
 
 **Files:**
@@ -1823,7 +1823,7 @@ Name each action only from the data the page has. Drop the h/day sum plots, or m
   - Any other cause: "No action known."
   - The step kind that paid the largest part of the cost ("hana nextest paid 34% of it").
 - `scripts/buildlog/costs.py`: each contribution carries its `StepKind` (repository and step).
-- `scripts/buildlog/charts.py`: `TopCost` carries each day of the window, the largest share and the action. The 12 `COST_ACTION_*`/`COST_OWNER_*` keys are no longer read; builds takes their deletion to the user.
+- `scripts/buildlog/charts.py`: `TopCost` carries each day of the window, the largest share and the action. The 12 `COST_ACTION_*`/`COST_OWNER_*` keys are deleted; the user approved it on 2026-11-15.
 - `scripts/build_queue/memory_feed.py`: each top cost sends its daily range, share and action text.
 - `scripts/build_queue/memory_live.html`: the Build history card starts with "Top 3 costs" for the last `TOP_COST_RECENT_DAYS` days. Then the Hana phase time plot. The cause and machine plots are under "Details: costs by cause and by machine".
 - Tests: `test_charts` (memory holder, failed test, failed step, no action), `test_memory_feed` (the sent text), `memory_page_proof.mjs` (the sentences and the Details state).
