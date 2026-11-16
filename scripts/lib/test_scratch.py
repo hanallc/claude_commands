@@ -58,7 +58,9 @@ class ScratchTests(unittest.TestCase):
             "HOME": str(self.base),
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
-            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))
+            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json"),
+            # An absent session root: a run without the test-run folder must not reach the live root.
+            session_folder.ROOT_ENV: str(self.base / "session")}))
         _ = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
         def registered_plan(unit: str) -> Path:
             return self.base / "registered-plans" / f"{unit}.md"

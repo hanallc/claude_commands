@@ -29,7 +29,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.buildlog.store import host_name
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lint import tmp_sweep, folder_audit, sweep
-from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch
+from scripts.lib import build_folders, cargo_output, conf, copy_record, scratch, session_folder
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_send
 
@@ -130,6 +130,9 @@ class FolderAuditTests(unittest.TestCase):
                                                                 "SCRATCH_ROOT": str(self.root / "scratch"),
                                                                 "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
                                                                 "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+                                                                # An absent session root: a run without the
+                                                                # test-run folder must not reach the live root.
+                                                                session_folder.ROOT_ENV: str(self.root / "session"),
                                                                 **copies_environment(self.root)}))
         _ = write_config_fixture(self.root / "config/hana_instances.conf", "clone_max_hours=2.5\n")
         _ = write_config_fixture(self.root / "config/mac_test.conf", "free_floor_gib=8\n")
