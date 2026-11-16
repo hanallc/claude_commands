@@ -1380,7 +1380,7 @@ def _main(argv: list[str]) -> int:
             problems = accounts.check(unit_account.label)
             if problems:
                 raise Refusal(
-                    f"unit account {unit_account.label}: {problems[0]}; /showrunner:accounts"
+                    f"unit account {unit_account.label}: {problems[0]}; see Hana console, Accounts"
                 )
             resume_model = model_for_resume(request, cast(str, args.model))
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))

@@ -1,9 +1,8 @@
 {
   "name": "unit-board",
   "version": "0.1.0",
-  "description": "The accounts pane.",
+  "description": "No pane.",
   "author": {
     "name": "Nate"
-  },
-  "types": "./types/index.d.ts"
+  }
 }
