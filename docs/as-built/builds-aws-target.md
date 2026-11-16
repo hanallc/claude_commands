@@ -674,6 +674,8 @@ A type and region without a bill read shows `not billed`. Only types with hours 
 An unreadable cost ledger shows a note in place of the billed hours.
 
 The AWS prices page shows the same tables, published by `aws_page.publish`.
+The hourly buildlog run publishes it. After each push to main, `.claude/config/post_push.sh` publishes it again
+when the push changes the page code and the pushing checkout is at the pushed commit, as the promotion step's ~/.claude is.
 The user asked for these page changes on 2026-11-14 through builds:
 1. A switch above the two price cards shows `Spot price` or `Cost per gate`; the user asked for it on 2026-11-15 through builds.
    `Cost per gate` shows a second switch, `Merge gates`, `Targeted runs` or `Both`, and it sets both cards.
