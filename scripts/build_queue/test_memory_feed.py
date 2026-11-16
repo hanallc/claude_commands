@@ -43,6 +43,8 @@ from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
 
+REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
+
 
 class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
@@ -121,6 +123,89 @@ class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_the_token_pool_names_its_memory_pause(self) -> None:
+        gib = admission_records.GIB
+        pool = memory_feed.token_pool(13 * gib)
+        self.assertEqual(pool, {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12 * gib, "paused": False})
+        self.assertEqual(memory_feed.token_wait_stage(pool), "waiting for jobserver tokens")
+        paused = memory_feed.token_pool(11 * gib)
+        self.assertEqual(memory_feed.token_wait_stage(paused), "waiting for jobserver tokens (memory under 12 GiB)")
+        for output, error in (("12288\n4\n", None), ("12288\nfour\n31\n", None), ("", ValueError("stevie exited 1: no device"))):
+            with self.subTest(output=output, error=error), mock.patch.object(memory_feed, "stevie_output",
+                    side_effect=error, return_value=output):
+                unavailable = memory_feed.token_pool(11 * gib)
+                self.assertEqual(unavailable["kind"], "TokenPoolUnavailable")
+                self.assertEqual(memory_feed.token_wait_stage(unavailable), "waiting for jobserver tokens")
+
+    def test_the_newest_steve_dump_gives_the_tokens_of_each_process(self) -> None:
+        journal = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 20 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 9 tokens:
+            1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31
+            1763270010.000001 natedev steve[1304]:   PID 60 (cargo nextest run (x)) holds 3 tokens:
+            1763270010.000002 natedev steve[1304]:     job 0x2b running for 1.5s
+            1763270010.000003 natedev steve[1304]:   PID 61 holds 2 tokens:
+            1763270010.000004 natedev steve[1304]:   1 processes waiting for a job token (in order):
+            1763270010.000005 natedev steve[1304]:     PID 62 is performing a blocking read
+            1763270011.000000 natedev steve[1304]: Warning: PID 63 (build-script-main) returned incorrect token value 0x2b
+            1763270011.000001 natedev steve[1304]:   PID 64 holds 7 tokens:
+            """)
+        self.assertEqual(memory_feed.token_holders(journal), memory_feed.TokenHolders({60: 3, 61: 2}))
+        self.assertIsInstance(memory_feed.token_holders("1763270011.0 natedev steve[1304]: Device closed by PID 5\n"),
+                              memory_feed.TokenHoldersUnknown)
+
+    def test_tokens_go_to_the_nearest_running_step_above_each_holder(self) -> None:
+        proc = self.root / "proc"
+        for pid, parent in ((300, 200), (200, 100), (100, 1), (400, 1)):
+            (proc / str(pid)).mkdir()
+            _ = (proc / str(pid) / "stat").write_text(f"{pid} (rustc (x) y) S {parent} 0 0\n")
+        holders = memory_feed.TokenHolders({300: 2, 200: 1, 400: 5, 999: 4})
+        self.assertEqual(memory_feed.tokens_by_run(holders, {100, 200}), {200: 3})
+
+    def test_local_running_rows_carry_their_tokens_only_when_counts_are_known(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            unknown = memory_feed.reading()
+
+        def rows(page: memory_feed.MemoryPage) -> list[dict[str, object]]:
+            return [cast(dict[str, object], cast(object, row)) for row in page["walk"]]
+
+        def local(row: dict[str, object]) -> bool:
+            return row.get("machine") == "fixture" and not row.get("ci") and isinstance(row.get("pid"), int)
+
+        pids = [row["pid"] for row in rows(unknown) if local(row)]
+        self.assertTrue(pids)
+        self.assertTrue(all("tokens" not in row for row in rows(unknown)))
+        self.assertEqual(unknown["token_counts"], memory_feed.NO_TOKEN_DUMP_YET.reason)
+        self.assertEqual(unknown["tokens"], {"kind": "TokenPool", "total": 31, "free": 4,
+                                             "memory_floor_bytes": 12 * admission_records.GIB,
+                                             "paused": unknown["available"] < 12})
+        pid = pids[0]
+        assert isinstance(pid, int)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            known = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 6}))
+        self.assertEqual(known["token_counts"], "")
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row)},
+                         {other: 6 if other == pid else 0 for other in pids})
+        self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
+
+    def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertEqual(page["token_counts"], "Job type reload is not applicable for unit steve.service.")
+
+    def test_a_denied_token_dump_gives_a_plain_reason(self) -> None:
+        denied = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "",
+                                             "Failed to reload steve.service: Access denied.\nSee system logs for details.")
+        failed = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "", "Unit steve.service not loaded.\nMore text.")
+        for result, expected in ((denied, memory_feed.STEVE_DUMP_DENIED_REASON),
+                                 (failed, "systemctl reload steve exited 1: Unit steve.service not loaded."),
+                                 (subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 0, "", ""), "")):
+            with self.subTest(expected=expected), mock.patch.object(subprocess, "run", return_value=result):
+                self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
         mac_machine = "private-mac-host"
@@ -230,6 +315,11 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
+        # The live jobserver and its journal stay out of the tests: 12 GiB floor, 4 free of 31 tokens.
+        _ = self.enterContext(mock.patch.object(memory_feed, "stevie_output", return_value="12288\n4\n31\n"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "request_token_dump",
+            return_value="Job type reload is not applicable for unit steve.service."))
+        _ = self.enterContext(mock.patch.object(memory_feed, "steve_journal", return_value=""))
         _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
         _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=self.root / "mac-builds.json"))
@@ -674,7 +764,7 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()

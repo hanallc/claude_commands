@@ -1888,3 +1888,16 @@ As built:
 - `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
 - `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
 - Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+### Tokens — The Builds page shows the jobserver tokens · status: done
+
+From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
+
+As built:
+
+- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
+- In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
+- The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid.
+- Until natedev's polkit rule (nixos 2ed52e5) is live, the reload is refused. The column shows "—", and the header hover says "natedev does not yet let the feed ask steve which build holds each token." CI, Mac and AWS rows always show "—".
+- Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).

@@ -354,7 +354,7 @@ try {
               };
               return metrics;
             })()`);
-            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.deepEqual(proof.headings, ['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(proof.runningSlots.length>0 && proof.runningSlots.every(slot=>slot==='—'));
             assert.equal(proof.queuedSlots,0);
             assert.equal(proof.answer,'Free for the next step');
@@ -440,9 +440,11 @@ try {
             const slotReview=structuredClone(base);
             const running=slotReview.walk.find(row=>row.queued&&!row.ci);
             slotReview.walk=[
-              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2},
+              {...running,name:'hana nextest',unit:'queue',machine:'natedev',slot:2,tokens:6},
               {...running,name:'tools nextest',unit:'tests',machine:'natedev',pid:51,slot:'—'},
             ];
+            slotReview.tokens={kind:'TokenPool',total:31,free:4,memory_floor_bytes:12*2**30,paused:false};
+            slotReview.token_counts='';
             slotReview.waiters=[];
             slotReview.ram.build_tools_bytes=0;
             await show(slotReview);
@@ -452,13 +454,17 @@ try {
               const box=table.getBoundingClientRect();
               const bottom=rows.at(-1).getBoundingClientRect().bottom;
               return {slots:rows.map(row=>row.querySelector('.slot').textContent),
-                lastColumns:rows.map(row=>[...row.children].slice(-2).map(cell=>cell.className)),
+                tokens:rows.map(row=>row.querySelector('.tokens').textContent),
+                pool:document.getElementById('walk-tokens').textContent,
+                lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:{x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1}};
             })()`);
             assert.deepEqual(slotColumn.slots,['2','—']);
-            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot'],['vcpus','slot']]);
+            assert.deepEqual(slotColumn.tokens,['6','—']);
+            assert.equal(slotColumn.pool,'Tokens: 31 total, 4 free');
+            assert.deepEqual(slotColumn.lastColumns,[['vcpus','slot','tokens'],['vcpus','slot','tokens']]);
             assert.equal(slotColumn.overflow,false);
             if(theme==='dark'&&width===1400) {
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:slotColumn.clip});
@@ -630,7 +636,7 @@ try {
                 slots:tipText('wait:'+latest.waiters.findIndex(row=>row.kind==='cloud'),latest).join(' '),
                 scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
             })()`);
-            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+            assert.deepEqual(cloudProof.headings,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
             assert.ok(cloudProof.statusInTable,'Cloud work is absent from the main table.');
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
@@ -1261,7 +1267,7 @@ try {
               assert.equal(state.unit,'CI');
               assert.equal(state.waitingUnit,'CI');
               assert.match(state.small,/hana CI.*hana-mac-1.*test-hana/);
-              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot']);
+              assert.deepEqual(state.headers,['Stage','Done','Step','Dur','Unit','Pid','Target','vCPU','Slot','Tokens']);
               assert.deepEqual(state.waiting,['#','Done','Step','Waiting','Unit','Pid','Target','vCPU']);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
               assert.ok(state.tip.includes('CI') && state.tip.includes('hana-mac-1'));
