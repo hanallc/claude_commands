@@ -1649,6 +1649,7 @@ From the user (via sdlc and builds), 2026-11-15, for the AWS prices page: "it ne
 - The tables keep their row order; only the filter chips change.
 - `test_control`: the page data regions follow the key, and a mixed list sorts into the group order.
 - Proof: `phases/93/proof/before-1400-dark.png` and `after-1400-dark.png`, from the live AWS state.
+- Follow-up (user, 2026-11-15): a Geography row above Regions selects all regions of one geography (`us`, `eu`, `ap`, `ca`, `sa`), with `all` and `none` chips. `geographyOf` takes the region prefix. A geography chip reads pressed, mixed or not pressed from its regions, and the two rows update each other. The chips use lower case.
 
 ### Phase 94 — A cargo-liner step names only what keeps it off the Mac · status: done
 
@@ -1670,7 +1671,7 @@ From the user (via builds), 2026-11-15: "this said that the mac was busy with a 
 - Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
 - Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
 
-### Phases 95–99 — The Disks page · status: planned
+### Phases 95–99 — The Disks page · status: in progress (95 and 96 done)
 
 From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
 1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
@@ -1703,6 +1704,17 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 7. The measure writes `disks.json` atomically, with `measured_at`, in the page folder.
 8. Tests: the tree from a fixture `du` output, the Other sizes, the chain collapse, the lock, and the timeout.
 
+##### Phase 95 as-built
+
+- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.timeout_seconds`.
+- `scripts/disks/measure.py`:
+  - `du_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 ionice -c3 du -x -B1 --threshold=<keep_bytes> <mount>`. du exit 1 with output counts as a measure; some folders cannot be read.
+  - `folder_tree`: each folder hangs from its nearest listed ancestor, largest first. `other` is the size less the listed children. `collapse` joins a folder with its only child while the folder's own files are below `keep_bytes`, as `home/natepiano`. The drive root never joins.
+  - `drive_floors`: the home disk floor from `disk.read_floor`, and the other floors from `sweep.filesystem_floors`, matched by device.
+  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. A timeout, a start failure or a failed du gives the drive an `error`, and the next drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
+- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, the timeout, a failed du, the lock).
+- First real measure on natedev: 261 seconds for `/build` and `/`.
+
 #### Phase 96 — Drive cards: slider and walk
 
 1. `disks.html` reads `disks.json` and shows the two drive cards of mockup 2: the used bar with the floor mark, the slider and the folder table.
@@ -1710,6 +1722,18 @@ Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. T
 3. A click opens or closes a folder's children, at any depth. Each row shows Size, "Of parent" and a walk bar inside its parent's span.
 4. The status line names the measure time and its age.
 5. Tests: the page renders the fixture data at desktop and phone widths in light and dark mode, with no clipped text.
+
+##### Phase 96 as-built
+
+- `scripts/disks/disks.html` reads `disks.json` (no cache) and shows one card for each drive, in the order of `drives`.
+  - The card head gives the name from `name.<mount>` and the mount, free of total, the used bar with the floor mark, and "Cleanup starts below <floor> free (<percent>)." A drive with no floor reads "The cleanup floor is unknown." A drive with no tree shows its error.
+  - The slider runs on a log scale from `slider.min_gib` to the largest top folder. It starts at `slider.default_gib`. The largest top folder starts open.
+  - `treeRows`: children below the limit join one row, "Other · N folders", with the folder's own files ("and files" when they reach `keep_bytes`). One small child shows by its name. Own files alone read "Files and small folders". Each row starts where the row before it ends, so the walk bars of a folder fill its span.
+  - A click, Enter or Space opens or closes a folder at any depth. A long name wraps; no text is cut. Below 560 px the "Of parent" column hides.
+  - The status line reads "Sizes from <time>, <age>." The dot turns gray after `cache_seconds`.
+- `scripts/disks/disks_page.py`: `publish` writes the page with `page_frame.STYLE` and the page settings; `page_url`; `main` takes `publish` or `link`. `measure.py` publishes the page after each measure.
+- `config/disks.conf`: `name./build=Build drive`, `name./=System drive`. `slider.min_gib` is at least 0.25, the measure's least folder.
+- Tests: `scripts/disks/test_disks_page.py` (publish, the fold, the offsets, the text, the slider). Chrome check: no cut text and no page wider than the window at 1400, 800 and 390 px, light and dark; a click, Enter and the slider work.
 
 #### Phase 97 — Measure on open; console entry
 
