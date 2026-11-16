@@ -258,7 +258,7 @@ The launch path uses Spot only; it has no on-demand choice.
 Run a paired trial from the scripts repository:
 
 ```sh
-python3 -m scripts.aws_target.gate_trial --base BASE --changed CHANGED --modules scripts/PATH/test_MODULE.py --rounds 3
+python3 -m scripts.aws_target.aws_trial --base BASE --changed CHANGED --modules scripts/PATH/test_MODULE.py --rounds 3
 ```
 
 The command pushes temporary branches through the invoking terminal's Git credentials.
