@@ -4454,3 +4454,45 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout` keeps one full `mac_run.sh` run for the success case. The two kept-checkout cases call `cleanup_mac_run` through `shell_functions` with `on_mac` stubbed.
 - The scratch-clone loop stays: no function exposes its purpose and owner words.
 - Paired natedev CPU: 35.5/32.0/33.6 to 29.5/34.0/28.1 s (median saving 5.5 s). Commit c8599345f.
+
+### Phase 314 — A queued program starts through a small wrapper that loads only what it uses  · status: done
+**Depends on:** Phase 313
+**Owner:** natest (builds gave a standing go on 11-16 at 06:15 EST: the next worst work by AWS CPU, no floor).
+
+#### Work Order
+
+**Goal:** the wrapper that starts each queued program (`queue_place.py --program-start` and `--scope-start`) loads only the code it uses. A queued program start costs about 0.05 CPU s, not about 0.2 s, in tests and in production.
+
+**Base:** queue probebackoff 687230599, merged at the phase start (builds, 11-16 07:20 EST).
+
+**Measure:** `module_cost.py --commands` at 717c9fbda on natedev:
+- `style/test_bulk_run.py` (23.3 CPU s): 24 real queued `cargo` starts cost 3.56 s (0.15 s each). With CPU logged inside the fake `cargo`, each start uses 0.21-0.24 s of its own CPU and the fake itself only 0.02 s. The rest is the wrapper import before `execvp`.
+- `build_queue/test_queue_place.py` (18.3 CPU s): 53 `python3 -c` program starts cost 12.4 s (0.23 s each). The programs are small; the wrapper import is the cost.
+- `python3 -X importtime -c "import scripts.build_queue.queue_place"`: about 200-400 ms; `admission_protocol` alone about 110 ms, `admission_records` about 80 ms. `admission_wire` alone about 36 ms; `atomic_file` about 18 ms.
+- Target: the wrapper import under 60 ms; about 8-12 CPU s less over the two modules.
+
+**Spec:**
+1. Make a new module `scripts/build_queue/program_start.py`. Move into it, without change of behavior: `ProgramStart`, `program_start`, `scope_start`, and the `--program-start` and `--scope-start` branches of `queue_place.main` (as this module's own `main`). Move the existing `pthread_sigmask` unblock call as it is; add no other signal code.
+2. The new module imports only the standard library, `scripts.lib.atomic_file` and `scripts.build_queue.admission_wire` (for `Owner` and `encode_record`). It may also import `scripts.lib.process_start`. It must not import `admission_records`, `admission_protocol`, `admission_client`, `placement`, `memory_admit`, `store` or `queue_place`.
+3. No re-export layer (builds, 11-16 07:20 EST). For the start identity, use the existing light `scripts.lib.process_start.process_start` (a `Started` value is live; every other value is not); do not move `admission_records.process_start_time`. The wrapper refuses with its own exception class in `program_start.py`; `queue_place.QueuePlaceRefused` stays where it is. If a test asserts the wrapper's refusal text, keep that text.
+4. `QueuePlace.popen` starts `[sys.executable, <program_start.py path>, "--program-start" | "--scope-start", ...]`. Keep the argument order, so the wrapper is still two items before the action word.
+5. Point every caller of the moved names at `program_start.py` in this phase (`cleanup_program_starts`, `test_queue_place`, any other). `queue_place.py` keeps no alias for a moved name. Keep an old name only where a real caller outside this repository needs it, and name that caller.
+6. In `scripts/build_queue/test_queue_place.py`, the private scope wrapper child (`private_scope_start`, started at line 304) must not import the test module. Move `private_scope_start` to a light test support module that imports the new module, and start it from there.
+7. Add no test method. Remove no assertion. Every behavior check stays.
+
+**Files:**
+- `scripts/build_queue/program_start.py` (new).
+- `scripts/build_queue/queue_place.py`.
+- `scripts/build_queue/admission_records.py` (only if `process_start_time` moves).
+- `scripts/build_queue/test_queue_place.py`, and one new light test support file for `private_scope_start`.
+
+**Workers:** 1 writer; the split is not useful (one module boundary).
+
+**Constraints from prior phases:** Box result format: not touched. No signal handlers, masks or dispositions in new code; do not change any trap. Phase 307 found that `place-step` needs every queue record type; this phase does not touch `place-step` or the `admit`, `launch` and `release` actions.
+
+**Acceptance gate:**
+1. `python3 -X importtime scripts/build_queue/program_start.py` (or the equivalent import) shows the module and its imports under 60 ms; name the number.
+2. These modules pass on natedev: every `build_queue/test_*` module, `style/test_bulk_run`, `lint/test_memory_admit`, `build_hold/test_cargo_wrapper`, `mac_test/test_offload`, and every module that imports `QueuePlaceRefused`, `process_start_time` or `ProgramStart`.
+3. basedpyright adds no finding on each touched Python file.
+4. A paired `module_cost.py` in one copy (swap the changed files, warm-up round, 3 rounds) on `build_queue/test_queue_place.py` and `style/test_bulk_run.py` shows the CPU cut.
+5. Trial merges with origin/main and the open unit branches are clean.

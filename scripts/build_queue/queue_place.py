@@ -25,6 +25,7 @@ from typing import BinaryIO, TypedDict, Unpack
 from scripts.lib import build_folders, atomic_file, cancellation, conf
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
+from scripts.build_queue import program_start as startup
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
@@ -182,30 +183,8 @@ class StartedProgram:
     record: Path
 
 
-@dataclass(frozen=True)
-class ProgramStart:
-    holder: wire.Owner
-    program: wire.Owner
-    scope: str
-
-
 def program_starts() -> Path:
     return store.root() / "program-starts"
-
-
-def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scope: str = "") -> None:
-    """Publish ownership before execution and reject a dead holder."""
-    if admission_records.process_start_time(holder.pid) != holder.start_time:
-        raise QueuePlaceRefused("the queue place holder exited before program startup")
-    start = admission_records.process_start_time(os.getpid())
-    if start is None:
-        raise QueuePlaceRefused("the program has no live process identity")
-    atomic_file.write_text_atomic(record, wire.encode_record(ProgramStart(holder, wire.Owner(os.getpid(), start), scope)))
-    if admission_records.process_start_time(holder.pid) != holder.start_time:
-        record.unlink(missing_ok=True)
-        raise QueuePlaceRefused("the queue place holder exited during program publication")
-    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
-    os.execvp(argv[0], list(argv))
 
 
 @contextmanager
@@ -244,7 +223,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             atomic_file.remove_dead_temporary_files(directory / target)
     for path in directory.glob("*.json"):
         try:
-            record = wire.parse_record(path.read_text(), ProgramStart)
+            record = wire.parse_record(path.read_text(), startup.ProgramStart)
         except FileNotFoundError:
             continue
         if admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
@@ -267,20 +246,6 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
                             pass
                     time.sleep(configuration.program_sample_seconds)
         path.unlink(missing_ok=True)
-
-
-def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *, record: Path) -> None:
-    """Publish the scope and confirm its holder before the program starts."""
-    if admission_records.process_start_time(holder_pid) != holder_start:
-        raise QueuePlaceRefused("the queue place holder exited before scope startup")
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if line.startswith("0::") and "/builds.slice/" in line:
-            scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            atomic_file.atomic_sample(sidecar, str(scope) + "\n")
-            if admission_records.process_start_time(holder_pid) != holder_start:
-                raise QueuePlaceRefused("the queue place holder exited during scope publication")
-            program_start(record, wire.Owner(holder_pid, holder_start), argv, scope=sidecar.read_text().strip())
-    raise QueuePlaceRefused("the program did not enter its memory scope")
 
 
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
@@ -372,7 +337,7 @@ class QueuePlace:
         directory = program_starts()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         record = directory / (uuid.uuid4().hex + ".json")
-        wrapper = [sys.executable, str(Path(__file__).resolve())]
+        wrapper = [sys.executable, str(Path(__file__).with_name("program_start.py").resolve())]
         command = ([*prefix, *wrapper, "--scope-start", str(self.sidecar), str(holder_pid), holder_start, str(record), *argv]
                    if prefix else [*wrapper, "--program-start", str(record), str(holder_pid), holder_start, *argv])
         with cancellation.defer_cleanup_signals():
@@ -692,12 +657,9 @@ def shell_wait(args: ShellArguments) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run a program in its queue place, or serve a shell step's admit, launch or release."""
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) >= 5 and argv[0] == "--scope-start":
-        scope_start(Path(argv[1]), int(argv[2]), argv[3], argv[5:], record=Path(argv[4]))
-        return 0
-    if len(argv) >= 5 and argv[0] == "--program-start":
-        program_start(Path(argv[1]), wire.Owner(int(argv[2]), argv[3]), argv[4:])
-        return 0
+    # A run that loaded queue_place.py before this change still calls these actions.
+    if argv[:1] in (["--program-start"], ["--scope-start"]):
+        return startup.main(argv)
     if argv[:1] and argv[0] in SHELL_ACTIONS:
         args = shell_arguments(argv)
         if args.command == "release":
