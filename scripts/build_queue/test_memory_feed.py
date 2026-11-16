@@ -155,6 +155,18 @@ class MemoryFeedTests(unittest.TestCase):
         self.assertIsInstance(memory_feed.token_holders("1763270011.0 natedev steve[1304]: Device closed by PID 5\n"),
                               memory_feed.TokenHoldersUnknown)
 
+    def test_an_incomplete_steve_dump_gives_way_to_the_complete_one_before_it(self) -> None:
+        complete = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 25 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 6 tokens:
+            """)
+        cut = "1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31\n"
+        self.assertEqual(memory_feed.token_holders(complete + cut), memory_feed.TokenHolders({50: 6}))
+        self.assertEqual(memory_feed.token_holders(cut + "1763270010.000001 natedev steve[1304]:   PID 60 holds 3 tokens:\n"),
+                         memory_feed.TokenHoldersUnknown("Each steve token dump in the journal window was incomplete."))
+        self.assertEqual(memory_feed.token_holders("1763270000.0 natedev steve[1304]: steve: currently 31 tokens available out of 31\n"),
+                         memory_feed.TokenHolders({}))
+
     def test_tokens_go_to_the_nearest_running_step_above_each_holder(self) -> None:
         proc = self.root / "proc"
         for pid, parent in ((300, 200), (200, 100), (100, 1), (400, 1)):
@@ -1017,7 +1029,8 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
+              # Each cycle reads the clock once, then once more after its token dump request.
+              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
               mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
               mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
@@ -1065,11 +1078,40 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+
+    def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
+        clock = [0.0]
+        requests: list[float] = []
+
+        def slow_journal(dump_seconds: int) -> memory_feed.TokenHoldersUnknown:
+            del dump_seconds
+            clock[0] += 4
+            return memory_feed.NO_TOKEN_DUMP_YET
+
+        def request() -> str:
+            requests.append(clock[0])
+            return ""
+
+        def sleep(seconds: float) -> None:
+            del seconds
+            clock[0] += 9
+            if clock[0] > 30:
+                raise FeedStopped
+
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+              mock.patch.object(memory_feed, "newest_token_holders", side_effect=slow_journal),
+              mock.patch.object(memory_feed, "request_token_dump", side_effect=request),
+              mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(time, "sleep", side_effect=sleep)):
+            with self.assertRaises(FeedStopped):
+                _ = memory_feed.main([])
+        # Each journal read takes 4 s and each cycle sleeps 9 s; requests stay at least 10 s apart.
+        self.assertEqual(requests, [4.0, 26.0])
 
     def test_report_dates_use_the_configured_user_zone(self) -> None:
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):

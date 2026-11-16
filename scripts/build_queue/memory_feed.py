@@ -1152,19 +1152,28 @@ def steve_journal(since_seconds: int) -> str:
 
 
 def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
-    """Parse the newest complete dump; a dump is the header line and the indented lines after it."""
+    """Parse the newest complete dump; a dump is the header line and the indented lines after it.
+
+    A dump is complete when its holder lines add up to the tokens its header says are taken.
+    The journal can drop or cut lines, so an incomplete dump gives way to the one before it.
+    """
     messages = [line.split(": ", 1)[1] for line in journal.splitlines() if ": " in line]
     starts = [index for index, message in enumerate(messages) if STEVE_DUMP_HEADER.fullmatch(message)]
     if not starts:
         return TokenHoldersUnknown("steve wrote no token dump in the journal window.")
-    held: dict[int, int] = {}
-    for message in messages[starts[-1] + 1:]:
-        holder = STEVE_DUMP_HOLDER.fullmatch(message)
-        if holder:
-            held[int(holder[1])] = held.get(int(holder[1]), 0) + int(holder[2])
-        elif not STEVE_DUMP_DETAIL.fullmatch(message):
-            break
-    return TokenHolders(held)
+    for start in reversed(starts):
+        header = STEVE_DUMP_HEADER.fullmatch(messages[start])
+        assert header is not None
+        held: dict[int, int] = {}
+        for message in messages[start + 1:]:
+            holder = STEVE_DUMP_HOLDER.fullmatch(message)
+            if holder:
+                held[int(holder[1])] = held.get(int(holder[1]), 0) + int(holder[2])
+            elif not STEVE_DUMP_DETAIL.fullmatch(message):
+                break
+        if sum(held.values()) == int(header[2]) - int(header[1]):
+            return TokenHolders(held)
+    return TokenHoldersUnknown("Each steve token dump in the journal window was incomplete.")
 
 
 def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknown:
@@ -2171,7 +2180,8 @@ def main(argv: Sequence[str]) -> int:
                 refused = request_token_dump()
                 if refused:
                     holders = TokenHoldersUnknown(refused)
-                next_tokens_at = now + configuration.token_dump_seconds
+                # Count from after the request, so slow reads before it never shorten the interval.
+                next_tokens_at = time.monotonic() + configuration.token_dump_seconds
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:
