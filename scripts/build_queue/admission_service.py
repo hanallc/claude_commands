@@ -1760,7 +1760,8 @@ class AdmissionServer:
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
             if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
-            if isinstance(counter, progress.NoCounter) and row["step"] != "merge-gate" and self.boot_id:
+            if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
+                    and row["step"] != "merge-gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
