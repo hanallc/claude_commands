@@ -956,6 +956,33 @@ class CountsRowTests(unittest.TestCase):
                          "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
                          + "\x1b[38;5;141m\x1b[1m1\x1b[22m proposal\x1b[0m")
 
+    def test_a_producer_session_counts_its_own_questions_without_a_timer(self) -> None:
+        producer = staff.StaffRow(staff.StaffId("dd65ec85-c812-4a59-bfa1-2a8c31b8f510"), "producer", "dwight",
+                                  staff.StaffRoot(), current_session=staff.StaffId("9616a9a0-bb22-486c-89fd-514d3d7e0804"))
+        record = self.home / ".local/state/staff/staff.json"
+        _ = record.write_text(staff_text(producer))
+        folder = self.home / ".local/state/showrunner" / producer.id / "questions"
+        folder.mkdir(parents=True)
+        question = folder / "question-project.md"
+        item = {"since": "2000-01-01T08:00", "text": "Choose the next project", "question": "Which project comes next?",
+                "asked_by": producer.id}
+        _ = question.write_text("---\nrecord_type: question\nstatus: open\n"
+                                 + f"production_id: {producer.id}\nasked_by: {producer.id}\n"
+                                 + f"registration: {json.dumps(item)}\n---\n")
+        cache = self.cache.with_name(producer.id)
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                self.assertEqual(self.lines(producer.current_session, shell=shell)[-1], "For you: 1 question")
+                line, due, *sources = cache.read_text().splitlines()
+                self.assertEqual((line, due), ("For you: 1 question", ""))
+                self.assertIn(str(question), sources)
+                built = cache.stat().st_mtime_ns
+                self.assertEqual(self.lines(producer.current_session, shell=shell)[-1], line)
+                self.assertEqual(cache.stat().st_mtime_ns, built)
+                self.assertFalse(any(line.startswith("For you:") for line in self.lines(producer.id, shell=shell)))
+        _ = question.write_text(question.read_text().replace("status: open", "status: closed"))
+        self.assertFalse(any(line.startswith("For you:") for line in self.lines(producer.current_session)))
+
     def test_a_unit_session_shows_its_source_counts_and_refreshes_only_its_cache(self) -> None:
         unit = replace(UNIT, current_session=staff.StaffId("73073af3-56ea-48e9-8548-a39963c92e53"))
         other = replace(UNIT, id=staff.StaffId("c5214833-d70b-4058-983f-c851b92d0350"), name="other",

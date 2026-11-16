@@ -520,6 +520,11 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
   `QuestionRecord(path, owner, asker, item, status)` stores the canonical question.
   `question_folder` uses the owner row's document to resolve its Proposals folder.
   Without that field, it uses `<SHOWRUNNER_STATE_DIR>/<showrunner staff id>/questions`.
+  A producer runs `update_registration.py ask --ask "<question>" --context "<why now>"` without `--production` or `--unit`.
+  `ProducerQuestions` retains its staff owner and user time zone without a production document.
+  Its records use `<SHOWRUNNER_STATE_DIR>/<producer staff id>/questions` and pass the same question review.
+  Its status count, `/next question`, and Questions page filter read those records.
+  Answers and follow-ups use the existing retry, alert, and recovery paths to the producer's current session.
   A missing showrunner owner gives `QuestionOwnerUnavailable`.
   A unit rename rewrites no question record.
   `questions-table` lists the open questions for `/showrunner:questions`.
