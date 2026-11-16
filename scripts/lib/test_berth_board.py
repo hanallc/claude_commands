@@ -12,7 +12,7 @@ from unittest import mock
 from scripts.lib.berth_board import Board, BoardUnavailable, read_board
 
 
-def snapshot(identity: str, status: str = "blocking") -> dict[str, object]:
+def snapshot(identity: str, status: str = "blocking", lifecycle: dict[str, object] | None = None) -> dict[str, object]:
     # The wire shapes are from cargo-berth's board/rows.rs and ledger/journal.rs.
     return {
         "reservation_id": identity,
@@ -21,13 +21,13 @@ def snapshot(identity: str, status: str = "blocking") -> dict[str, object]:
             "kind": "attached", "reference": "refs/heads/product-worker",
         }, "liveness": "live"},
         "scopes": [{"kind": "file", "path": "Cargo.toml"}, {"kind": "tree", "path": "src/module"}],
-        "lifecycle": {"stage": "active"}, "edit_blocking_status": status,
+        "lifecycle": lifecycle or {"stage": "active"}, "edit_blocking_status": status,
     }
 
 
-def envelope(*, populated: bool = True) -> dict[str, object]:
+def envelope(*, populated: bool = True, lifecycle: dict[str, object] | None = None) -> dict[str, object]:
     position = {"generation": 1, "journal_byte_offset": 123}
-    blocking = snapshot("product-1")
+    blocking = snapshot("product-1", lifecycle=lifecycle)
     clear = snapshot("released-1", "clear")
     data: dict[str, object] = {
         "targets": [{"ref": "refs/heads/main", "commit": "abc", "reservations": ["product-1"]}] if populated else [],
@@ -70,6 +70,15 @@ class BerthBoardTests(unittest.TestCase):
             self.assertFalse(reservations["released-1"].blocks(path), path)
         for path in ("Cargo.toml/child", "src/modules/lib.rs", "src/other.rs"):
             self.assertFalse(blocking.blocks(path), path)
+
+    def test_outstanding_reservation_carries_its_protected_tip(self) -> None:
+        result = self.read(envelope(lifecycle={"stage": "outstanding", "protected_tip": "34de61b0d"}))
+        if not isinstance(result, Board):
+            self.fail(str(result))
+        reservations = {entry.reservation_id: entry for entry in result.reservations()}
+        outstanding = reservations["product-1"]
+        self.assertEqual((outstanding.lifecycle, outstanding.protected_tip), ("outstanding", "34de61b0d"))
+        self.assertEqual(reservations["released-1"].protected_tip, "")
 
     def test_empty_envelope_is_available_even_when_process_reports_another_status(self) -> None:
         for exit_code in (0, 1):

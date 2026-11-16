@@ -75,6 +75,7 @@
 # UNIT_RUN_DIR, UNIT_SESSION_DIR or --session-dir enables saved results.
 # In that session, reuse a pass only when the tree and inputs still match.
 # Filtered runs have separate results. Failed tests always run again.
+# A run that a signal or a hold stop ends saves no pass.
 # Test keys include configured result variables and each --env value.
 # Tests use fixed terminal values from direct.conf on every target.
 # --no-cache ignores saved results. --target also ignores saved results.
@@ -101,6 +102,7 @@
 # In that session, reuse a pass or failure when the tree and inputs match.
 # A plain package lint result can answer another package in the workspace.
 # Do not save a result if edits change the tree after judgment.
+# Do not save a result from a run that a signal or a hold stop ends.
 # --no-cache ignores saved results.
 # End help.
 #
@@ -1784,6 +1786,7 @@ RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
+PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -2616,6 +2619,18 @@ PLACEMENT_GRANT_FILE=""
 PLACEMENT_PROVIDER=""
 MAC_BACKOFF_PROBED=0
 
+# A placement that fails before its step starts leaves the run without a
+# verdict. 78 (wait) and the left-queue status are not failures. A refusal (2)
+# prints its own reason; any other status is a crash of the placement tooling.
+placement_failed() {
+    case "$1" in
+        78|"$LINT_LEFT_QUEUE_STATUS") return 0 ;;
+        2) ;;
+        *) printf 'verify.sh: step placement failed with status %s before the step started; this is a tooling failure, not a result of the tree\n' "$1" >&2 ;;
+    esac
+    PLACEMENT_FAILED=1
+}
+
 placement_once() {
     local token=none reply line route="" status=0 monitor=0
     local LINT_QUEUE_LEAVE_HOOK="" BUILDLOG_MAC_IDLE_HOOK=""
@@ -2688,11 +2703,18 @@ placement_once() {
             *) route=$line ;;
         esac
     done <<< "$reply"
-    (( status == 0 )) || return "$status"
+    if (( status != 0 )); then
+        placement_failed "$status"
+        return "$status"
+    fi
     IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
         PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$route"
     local metadata
-    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
+    metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || {
+        status=$?
+        placement_failed "$status"
+        return "$status"
+    }
     IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
     return 0
 }
@@ -3096,11 +3118,12 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), or a kill. A fix pass
-# that still changes the tree at the limit can leave more fixes for the next call.
+# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
+# placement that failed before its step started. A fix pass that still changes
+# the tree at the limit can leave more fixes for the next call.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
-    (( CLIPPY_FIX_LIMIT_REACHED == 0 )) || return 1
+    (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
@@ -3920,8 +3943,29 @@ verify_cleanup() {
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
-# status the trap receives; a lint failure record keeps it.
-trap 'EXIT_STATUS=$?; [[ ${EXIT_STATUS} -eq 0 ]] && verify_cleanup completed || verify_cleanup error; finish_verify_run "$EXIT_STATUS"; exit "${EXIT_STATUS}"' EXIT
+# status the trap receives; a lint failure record keeps it. $2 is the command
+# that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
+# hold stop ends the run-log readers, runs this trap with the status of the
+# last command, often 0. Only an exit command completes a run, so any other
+# command records the run as interrupted (status 128: the signal is
+# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
+# so one failed cleanup command does not end the trap with its status.
+verify_exit() {
+    EXIT_STATUS=$1
+    set +e
+    if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
+        EXIT_STATUS=128
+        interrupt_hold_wait
+        verify_cleanup interrupted
+    elif (( EXIT_STATUS == 0 )); then
+        verify_cleanup completed
+    else
+        verify_cleanup error
+    fi
+    finish_verify_run "$EXIT_STATUS"
+    exit "$EXIT_STATUS"
+}
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
 verify_interrupted() {
     trap - EXIT
     # A process-group stop can deliver the same signal more than once.
@@ -4414,3 +4458,5 @@ clean_tree()
         exit 2
         ;;
 esac
+# The EXIT trap counts only an exit command as a finished run.
+exit
