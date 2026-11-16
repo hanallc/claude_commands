@@ -271,7 +271,7 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
-SCRIPT = page_frame.MOTION_SCRIPT + r"""(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
 const motion = createCardMotion();
 const menu = document.getElementById('image-window');
 const empty = document.querySelector('[data-empty]');
@@ -349,7 +349,6 @@ function bind(root) {
   }));
 }
 async function refresh() {
-  if (document.visibilityState !== 'visible' || window.frameElement?.hidden === true) return;
   if (sending) return;
   try {
     const response = await fetch(location.pathname, {cache: 'no-store'});
@@ -386,10 +385,7 @@ const start = new URLSearchParams(location.hash.slice(1));
 if (start.get('show') in spans) menu.value = start.get('show');
 menu.addEventListener('change', () => { motion.finish(); apply(); });
 addEventListener('hashchange', openImageLink);
-addEventListener('message', event => {
-  if (event.source === parent && event.origin === location.origin && event.data === 'console-shown') refresh();
-});
-document.addEventListener('visibilitychange', refresh);
+createPageRefresh(refresh);
 bind(list);
 // An image link opens its image with a longer period when the image is older.
 const linkedImage = start.get('image');
