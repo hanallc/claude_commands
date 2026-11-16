@@ -34,8 +34,8 @@ stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="tru
 <path d="M20 6 9 17l-5-5"/></svg></button>'''
 
 COPY_STYLE = '''
-.code-block{position:relative}
-.code-block pre{padding-right:48px}
+.code-block{position:relative;margin:16px 0}
+.code-block pre{margin:0;padding-right:48px}
 .code-block [data-copy-code]{position:absolute;top:6px;right:6px;display:grid;place-items:center;
 box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
 background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}
