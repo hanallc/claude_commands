@@ -4511,39 +4511,10 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 **Depends on:** Phase 317
 **Owner:** natest writes; sdlc owns (gate rename plan chunk 4 items 1, 2 and 5; decision 7; sdlc agreed the move under the land queue lock and the gate locks, 11-16 through builds). The stored step names (chunk 4 item 3) are the next phase: they need report and queue to agree the record migration and the user go for config key renames.
 
-#### Work Order
+#### As-built
 
-**Goal:** the gate and the land queue read and write `~/.local/state/gate`; a one-off program moves the live folder once, at deploy, with no symlink and no dual read.
-
-**Source:** gate rename plan at fd66bc22c, chunk 4 and decision 7; memory rule "migrate once at deploy" (the conversion program lives outside the repository, runs once, then is deleted).
-
-**Spec:**
-1. Put the default folder in one place: `land_runs.py` holds `~/.local/state/gate`. `land_runs.state_dir()` and both `GATE_PASSED_DIR` defaults in `gate.py` (about lines 1225 and 1938) use it. No other copy of the path stays in `scripts/`.
-2. Write the one-off move program outside the repository, at `/tmp/claude/scratch/natest-probe/p89/move_gate_state.py`. It does these steps in order:
-   1. Refuse with exit 2 when both `~/.local/state/merge-gate` and `~/.local/state/gate` exist. Do nothing and exit 0 when only the new folder exists or neither exists.
-   2. Take `land_queue.json.lock` exclusive, so no new land starts.
-   3. Wait for each lock file under `active-runs/` with `LOCK_EX`, so each running gate ends first. Wait for `nightly-red/lock` the same way.
-   4. Remove `typecheck-venv` (its files hold absolute paths; the next gate builds it again).
-   5. Rename the folder with one `os.rename` (same file system).
-   6. Print each step with its time, and the folder it found.
-3. Before you write the program, list each stored record under the folder that holds an absolute path to the folder (for example `lands/`, `push-recovery/`, `land_queue.json`). Report the list. If one exists, the program rewrites that path after the rename, in the same lock.
-4. Prove the program on a copy: copy the live folder to a scratch folder, run the program against the copy with the paths given as arguments, and show the gate reads the moved copy (`GATE_STATE_DIR` set to the new copy). Make no change to the live folder.
-5. Update `docs/as-built/merge-gate-and-test-speed.md` where it names `~/.local/state/merge-gate`. Do not change the prose "merge gate" (chunk 5) or stored step names (next phase).
-6. Do not edit `/etc/nixos`. No signal handlers, masks or dispositions. Remove no assertion. Every behavior check stays.
-
-**Files:**
-- `scripts/production/land_runs.py`
-- `scripts/production/gate.py`
-- `docs/as-built/merge-gate-and-test-speed.md`
-
-**Workers:** 1 writer. The path change is three lines and one program; nothing splits.
-- impl: every file above, and the one-off program outside the repository.
-- test: opens as impl.
-
-**Constraints from prior phases:** Phase 316: `gate.py` is the gate; `merge_gate.py` and `targeted_test.py` are entry points until chunk 6. Phase 317: variables are `GATE_*` (`GATE_STATE_DIR`, `GATE_PASSED_DIR`); `config/gate.conf` is the config; `config/merge_gate.conf` is a symlink until chunk 6.
-
-**Acceptance gate:**
-1. `git grep -n 'state/merge-gate' -- scripts config commands` finds nothing.
-2. The copy proof in Spec item 4 passes and its output is in the reply.
-3. test_land_runs, test_land_queue, test_gate_ledger and test_gate_holds pass on natedev, in batches of 4 under the hold rules.
-4. basedpyright adds no finding on each touched Python file.
+- `land_runs.DEFAULT_STATE_DIR` is `~/.local/state/gate`. `land_runs.state_dir()`, `PassedTreeLedger.path` and `push_record_path` use it as the default; `GATE_PASSED_DIR` and the state-folder variable still override it.
+- The as-built doc names `~/.local/state/gate`.
+- The live folder moves once at deploy by a program outside the repository (`move_gate_state.py`). It refuses without a natedev drain hold. It waits for each process of the user that holds a file or the cwd in the old folder, lock waiters included (review F001). It skips a process whose descriptors it cannot read, with one printed line. It refuses when a record holds the old path (review F002). It removes `typecheck-venv`, then does one `os.rename`.
+- Deploy: drain hold on natedev after the merge to main, run the program, release the hold, delete the program. An old worktree's tests-only run can make a stray `merge-gate` folder; nothing reads it, and chunk 6 deletes it.
+- Checkpoint acb4ca780; main merged at eb427e1e1.
