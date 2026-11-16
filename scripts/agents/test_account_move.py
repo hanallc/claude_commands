@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -215,6 +216,8 @@ class AccountMoveTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": os.environ["NOTIFIER_STATE_DIR"],
             "NOTIFIER_SESSIONS_DIR": str(self.root / "registry"),
             "USER_ZONE": "UTC",
+            # A set interpreter keeps scripts/lib/py from caching its choice under HOME.
+            "CLAUDE_PYTHON": sys.executable,
         }
         before = self.disk_state()
         result = subprocess.run(

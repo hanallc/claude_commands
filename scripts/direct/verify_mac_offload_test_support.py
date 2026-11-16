@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
+from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -1125,6 +1126,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         blocker = "#!/bin/sh\nexit 99\n"
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
+        write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(

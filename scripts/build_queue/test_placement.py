@@ -513,6 +513,30 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(reply.permission, placement.PermissionConsumed)
                 self.assertEqual(len(fixture.server.assignments), 1)
 
+    def test_a_released_claim_waits_for_its_settlement_instead_of_a_final_status(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            authorized, = fixture.connect(consume_permission("consume-declined", assignment, claim)).replies()
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            _ = fixture.connect(wire.ExecutionReport("declined", assignment, claim, placement.ExecutionNotStarted(),
+                placement.AttemptDeclined("no_tests"), placement.DispatchPathSettled())).replies()
+            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            fixture.clock.advance(1)
+            # The release evidence arrives after the pass that settles reports.
+            with mock.patch.object(fixture.server, "_settle_attempt_reports"):
+                _ = publish_candidate(fixture, request)
+                waiting, = fixture.server.handle_request(request)
+            self.assertIsInstance(waiting, wire.PlacementWait)
+            self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+            _ = fixture.run_pass()
+            settled = fixture.server.assignments[key]
+            self.assertEqual(settled.state, placement.ClosedAssignment("no_tests"))
+            self.assertNotEqual(settled.retry, placement.DoNotRetry("attempt is not settled"))
+            self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+
     def test_an_empty_scan_cannot_close_a_pending_dispatch_before_or_after_restart(self) -> None:
         cases: tuple[tuple[str, placement.AttemptOutcome], ...] = tuple(
             (pending, outcome) for pending in ("claim", "start", "cleanup")

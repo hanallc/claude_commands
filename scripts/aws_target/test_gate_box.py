@@ -455,7 +455,10 @@ class GateResourcesTests(unittest.TestCase):
         current = self.template()
         # The retired builder pieces must stay removed; every other Rust resource must stay unchanged.
         retired = {'InstanceRole', 'InstanceProfile', 'SecurityGroup', 'LaunchTemplate', 'Instance', 'DataVolume',
-                   'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy', 'InstanceId', 'DataVolumeId'}
+                   'DataAttachment', 'ScalerPolicy', 'StopRole', 'BudgetStop', 'StopPolicy', 'InstanceId', 'DataVolumeId',
+                   'InstanceType', 'AmiId', 'AvailabilityZone', 'SubnetId', 'RootVolumeGiB', 'DataVolumeGiB', 'DataVolumeIops',
+                   'DataVolumeThroughput', 'SpotMaxPrice', 'Bootstrap', 'EnableCompute', 'ExistingDataVolumeId',
+                   'ComputeEnabled', 'ExistingDataInput'}
         for section in ('Resources', 'Parameters', 'Outputs'):
             rows = ledger.mapping(current[section])
             self.assertFalse(retired & set(rows), section)

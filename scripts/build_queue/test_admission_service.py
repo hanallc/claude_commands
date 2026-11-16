@@ -10,7 +10,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NoLiveBuildRun, Sco
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture, fake_memory_readings, write_pressure_reading
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import datetime
 import io
@@ -4569,6 +4569,58 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(service.main(), 0)
             self.assertFalse(socket_path.exists())
 
+    def test_a_source_change_under_systemd_runs_the_new_code_in_place_on_the_same_socket(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            fixture.configure(source_check_seconds=1, source_settle_seconds=1)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, \
+                    socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notices:
+                listener.bind(str(fixture.socket_path))
+                listener.listen()
+                inherited = os.dup(listener.fileno())
+                notify_path = fixture.socket_dir / "notify.sock"
+                notices.bind(str(notify_path))
+                notices.setblocking(False)
+
+                def serve(server: service.AdmissionServer) -> None:
+                    server.start()
+                    source = fixture.root / "loaded-source.py"
+                    _ = source.write_text("old")
+                    info = source.stat()
+                    server.sources = {source: (info.st_ino, info.st_mtime_ns)}
+                    source.unlink()
+                    server.next_source_check = fixture.clock.monotonic()
+                    for _turn in range(3):
+                        if not server.stopped:
+                            server.run_once(0)
+                            fixture.clock.advance(1)
+                    self.assertTrue(server.stopped)
+
+                execv = mock.Mock(side_effect=OSError("stop before replacement"))
+                with mock.patch.dict(os.environ, {"LISTEN_FDS": "1", "LISTEN_PID": str(os.getpid()),
+                                                  "NOTIFY_SOCKET": str(notify_path)}), \
+                     mock.patch.object(service, "LISTEN_FD", inherited), \
+                     mock.patch.object(service, "SystemClock", return_value=fixture.clock), \
+                     mock.patch.object(service, "SystemReadings", return_value=fixture.readings), \
+                     mock.patch.object(service, "SystemProc", return_value=fixture.proc), \
+                     mock.patch.object(service.AdmissionServer, "serve_forever", serve), \
+                     mock.patch.object(os, "execv", execv), \
+                     mock.patch.object(sys, "argv", ["admission_service", "serve", "--state-dir", str(fixture.state_dir)]):
+                    with self.assertRaisesRegex(OSError, "stop before replacement"):
+                        _ = service.main()
+                execv.assert_called_once_with(sys.executable, sys.orig_argv)
+                self.assertTrue(os.get_inheritable(inherited))
+                os.close(inherited)
+                messages: list[str] = []
+                with suppress(BlockingIOError):
+                    while True:
+                        messages.append(notices.recv(4096).decode())
+                states = [message for message in messages if not message.startswith("WATCHDOG=")]
+                self.assertEqual(len(states), 2)
+                self.assertEqual(states[0], "READY=1")
+                self.assertRegex(states[1], r"^RELOADING=1\nMONOTONIC_USEC=\d+$")
+            self.assertTrue(fixture.socket_path.exists())
+
     def test_each_pass_matches_the_shared_rule_and_view_uses_its_frozen_limits(self) -> None:
         for free in (0, 10 * GIB, 60 * GIB):
             with self.subTest(free=free), AdmissionFixture() as fixture:
@@ -6229,7 +6281,7 @@ class CutoverServiceTests(unittest.TestCase):
     def test_serve_without_state_dir_uses_the_buildlog_admission_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            server = mock.MagicMock()
+            server = mock.MagicMock(replace_in_place=False)
             with mock.patch.object(store, "root", return_value=root), \
                  mock.patch.object(service, "AdmissionServer", return_value=server) as made, \
                  mock.patch.object(sys, "argv", ["admission_service", "serve"]):
