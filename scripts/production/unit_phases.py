@@ -785,6 +785,14 @@ def read_work_queue(staff_id: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQu
         return UnreadableWorkQueue()
 
 
+def local_worktree_exists(tree: staff.PresentWorktree) -> bool:
+    """Confirm that the worktree folder exists on this machine."""
+    try:
+        return tree.machine == remote.local_machine() and tree.path.is_dir()
+    except OSError:
+        return False
+
+
 def fallback_plan(member: staff.StaffRow, run: NewestUnitRun, opened: OpenUnitRun | NoOpenUnitRun,
                   record: object, *, read_plan: Callable[[Path], list[plan_history.PlanPhase]]) -> BoardPlanRecord:
     """Read unfinished plan headings against the newest run's open phases."""
@@ -1387,7 +1395,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             merge_times[key] = max(merge_times.get(key, at), at)
     events: dict[Path, list[dict[str, object]]] = {}
     plans: dict[Path, list[plan_history.PlanPhase]] = {}
-    plan_failures: dict[Path, str] = {}
+    plan_failures: dict[Path, OSError | UnicodeError] = {}
     queues: dict[staff.StaffId, UnitWorkQueue | UnreadableWorkQueue] = {}
     wait_states: dict[str, waits_on.WaitState] = {}
     main_states: dict[str, bool] = {}
@@ -1404,7 +1412,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                 plans[path] = plan_history.plan_phases(path)
             except (OSError, UnicodeError) as error:
                 plans[path] = []
-                plan_failures[path] = str(error)
+                plan_failures[path] = error
         return plans[path]
 
     def read_queue(identity: staff.StaffId) -> UnitWorkQueue | UnreadableWorkQueue:
@@ -1458,7 +1466,12 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
                     record = fallback_plan(member, run, opened, record, read_plan=read_plan)
                 plan_path = record_fields(record).get("plan", "")
                 if Path(plan_path) in plan_failures:
-                    record = {**record_fields(record), "unavailable": plan_failures[Path(plan_path)]}
+                    error = plan_failures[Path(plan_path)]
+                    if (isinstance(error, FileNotFoundError) and isinstance(member.worktree, staff.PresentWorktree)
+                            and local_worktree_exists(member.worktree)):
+                        record = {"plan": plan_path}
+                    else:
+                        record = {**record_fields(record), "unavailable": str(error)}
                 if isinstance(opened, OpenUnitRun):
                     plan_path = record_fields(record).get("plan", "")
                     built = phase_table.build_run(Path(plan_path), run_events)
@@ -1572,6 +1585,8 @@ def production_records(doc: Path) -> dict[str, object]:
                 if path not in plans:
                     try:
                         plans[path] = phase_table.build_plan(path, resolver=resolver)
+                    except phase_table.RemovedPlan as error:
+                        plans[path] = {"plan": str(path)} if local_worktree_exists(tree) else {"unavailable": str(error)}
                     except phase_table.NoPlan as error:
                         plans[path] = {"unavailable": str(error)}
                 records[member.name] = plans[path]

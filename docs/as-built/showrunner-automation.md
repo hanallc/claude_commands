@@ -778,6 +778,9 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     The block has no Next row.
     Only events from an open phase can supply a finished-step fallback.
     Unreadable sources never produce `Nothing to do`.
+    A missing plan file in an existing local worktree is an absent plan.
+    A missing plan file keeps its unavailable state when the worktree is missing or remote.
+    Other plan read errors keep the plan unavailable.
     An unexplained task names the missing step and the latest matching finished step with its time, when recorded.
     Also names each additional current task.
     The first queue entry supplies Next; otherwise, the first unfinished plan phase supplies Next.

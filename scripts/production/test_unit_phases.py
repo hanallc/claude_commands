@@ -31,6 +31,7 @@ from scripts.lib.git_test_support import commit_repository, write_fixture_git_co
 from scripts.message import sessions
 from scripts.production import showrunners
 from scripts.production import unit_lookup
+from scripts.production import session_staff, unit_config
 from scripts.production import waits_on
 from scripts.herdr.herdr import HerdrPlace
 from scripts.production import unit_phases
@@ -429,6 +430,83 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertIn(("Later", "Delivery 3 (3)", "Not started"), rows)
                 if source != unit_phases.PlanSource.READABLE:
                     self.assertNotIn("Nothing queued", rendered)
+
+    def test_configured_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
+        owner = fixture_member("showrunner", name="sdlc")
+        config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plan.md")), unit_config.NoAppPort(), ())
+        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
+            ("removed", "natedev", True, FileNotFoundError("plan removed")),
+            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
+            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
+            ("permission", "natedev", True, PermissionError("plan denied")),
+            ("read-error", "natedev", True, OSError("plan read failed")),
+            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
+        )
+        for name, machine, exists, error in cases:
+            with self.subTest(name=name):
+                tree = self.root / name
+                if exists:
+                    tree.mkdir()
+                member = fixture_member("unit", name=name, parent=owner.id,
+                    worktree=staff.PresentWorktree(machine, tree))
+                with (patch.object(unit_lookup, "doc_units", return_value=[member]),
+                      patch.object(session_staff.RowResolver, "unit_config", return_value=config),
+                      patch.object(plan_history, "plan_phases", side_effect=error) as read):
+                    records = unit_phases.production_records(self.root / "production.md")
+                read.assert_called_once_with(tree / "docs/plan.md")
+                absent = name == "removed"
+                self.assertEqual(unit_phases.task_facts(records[name], ()).plan_source,
+                                 unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE)
+                rendered = self.blocks([member], records, statuses=["busy"])
+                label = f" ({machine})" if machine != "natedev" else ""
+                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
+                if absent:
+                    self.assertEqual(detail_rows(rendered, name),
+                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                else:
+                    self.assertNotIn("Nothing to do", rendered)
+                    self.assertIn("unavailable", unit_phases.record_fields(records[name]))
+
+    def test_fallback_missing_plans_are_absent_only_in_existing_local_worktrees(self) -> None:
+        owner = fixture_member("showrunner", name="sdlc")
+        original_facts = unit_phases.task_facts
+        cases: tuple[tuple[str, str, bool, OSError | UnicodeError], ...] = (
+            ("removed", "natedev", True, FileNotFoundError("plan removed")),
+            ("missing-tree", "natedev", False, FileNotFoundError("worktree missing")),
+            ("remote-tree", "mac", True, FileNotFoundError("remote plan unreadable here")),
+            ("permission", "natedev", True, PermissionError("plan denied")),
+            ("read-error", "natedev", True, OSError("plan read failed")),
+            ("encoding", "natedev", True, UnicodeError("plan encoding failed")),
+        )
+        for name, machine, exists, error in cases:
+            with self.subTest(name=name):
+                tree = self.root / name
+                if exists:
+                    tree.mkdir()
+                member = fixture_member("unit", name=name, parent=owner.id,
+                    worktree=staff.PresentWorktree(machine, tree))
+                _ = self.write_run(member, name, (), plan="docs/plan.md")
+                sources: list[unit_phases.PlanSource] = []
+
+                def facts(record: object, events: Sequence[dict[str, object]]) -> unit_phases.UnitTaskFacts:
+                    found = original_facts(record, events)
+                    sources.append(found.plan_source)
+                    return found
+
+                with (patch.object(plan_history, "plan_phases", side_effect=error) as read,
+                      patch.object(unit_phases, "task_facts", side_effect=facts)):
+                    rendered = self.blocks([member], {name: {"unavailable": "configured plan unavailable"}},
+                                           statuses=["busy"])
+                read.assert_called_once_with(tree / "docs/plan.md")
+                absent = name == "removed"
+                self.assertEqual(sources, [unit_phases.PlanSource.ABSENT if absent else unit_phases.PlanSource.UNAVAILABLE])
+                label = f" ({machine})" if machine != "natedev" else ""
+                self.assertIn(f"**{name}**{label} — {'idle' if absent else 'unknown'}", rendered)
+                if absent:
+                    self.assertEqual(detail_rows(rendered, name),
+                        [DetailRow("Now", "Nothing to do", "No plan or queued work")])
+                else:
+                    self.assertNotIn("Nothing to do", rendered)
 
     def test_workers_join_the_open_pass_by_id_before_assignment(self) -> None:
         member = self.member("roles")

@@ -47,6 +47,9 @@ Otherwise, its only current row is `Now | Nothing to do | No plan or queued work
 The block has no Next row.
 Only events from an open phase can supply a finished-step fallback.
 Unreadable sources never produce `Nothing to do`.
+A missing plan file in an existing local worktree is an absent plan.
+A missing plan file keeps its unavailable state when the worktree is missing or remote.
+Other plan read errors keep the plan unavailable.
 Each current task has one row.
 Several actors share its State cell, joined by semicolons; equal states appear once.
 No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
