@@ -2764,6 +2764,8 @@ MIGRATIONS = {
         DELETE FROM refill_dependencies WHERE consumer_table='refill_cells'
             AND source_kind IN ('judgment_cell','rule_generations','scope_membership','history','removal_barriers');
     """ + _replaced_triggers(_judgment_version_triggers()),
+    # Module ownership now keeps declarations without token indexes or inline module positions.
+    47: "DELETE FROM refill_inputs WHERE input_kind='footprint_modules';",
 }
 
 
@@ -2944,6 +2946,8 @@ class Ledger:
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
         self._rust_codes: dict[str, RustCode | NotTokenized] = {}
         self._reader_blob_facts: dict[str, style_reader.BlobFacts | style_reader.UnreadableFact] = {}
+        self.reader_module_declarations: dict[str, approved_renames.ModuleDeclarations | approved_renames.UnreadableDeclarationText] = {}
+        self.crate_root_folders: dict[PurePosixPath, bool] = {}
         self._reader_prepared_commits: set[str] = set()
         self._reader_name_sites: dict[str, tuple[declarations.NameSites | declarations.UnreadableBody, ...]] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}

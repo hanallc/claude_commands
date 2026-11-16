@@ -11,7 +11,7 @@ from threading import Barrier
 import unittest
 from unittest.mock import patch
 
-from scripts.style import declarations, style_config, style_reader, style_reader_oracle
+from scripts.style import declarations, style_config, style_plan, style_reader, style_reader_oracle
 
 
 class ReaderClientTests(unittest.TestCase):
@@ -30,6 +30,9 @@ class ReaderClientTests(unittest.TestCase):
                        "two.rs": "fn host() { let n = 1; }\n",
                        "crlf.rs": "fn work() {\r\n    work();\r\n}\r\n",
                        "separators.rs": "fn work() { // comment\rwork(); }\n",
+                       "modules.rs": ('mod left { mod shared; } mod right { mod shared; }\n'
+                                      'mod nested { #[path = "other.rs"] mod r#type; }\n'
+                                      '#[cfg_attr(test, path = "unknown.rs")] mod conditional;\n'),
                        "broken.rs": "fn host() { /* unfinished"}
             for name, text in sources.items():
                 _ = (repo / name).write_bytes(text.encode())
@@ -63,6 +66,7 @@ class ReaderClientTests(unittest.TestCase):
                         if isinstance(body := declarations.item_body(expected, item), declarations.ReadableBody)
                         else declarations.UnreadableBody() for item in expected.declared_items))
                     self.assertEqual(isinstance(reading.code, style_reader.UnreadableFact), name == "broken.rs")
+                    self.assertEqual(style_plan.reader_module_declaration_text(reading), style_plan.module_declaration_text(text))
             self.assertEqual(facts[missing], style_reader.UnreadableFact(style_reader.UnreadableReason.MISSING_BLOB))
             replaced = facts[blobs["bytes.rs"]]
             self.assertIsInstance(replaced, style_reader.BlobFacts)

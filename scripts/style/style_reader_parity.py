@@ -86,6 +86,13 @@ def refill_readings(settings: Path) -> dict[str, str]:
         invalid_path = "crates/alpha/vendor/invalid.rs"
         ignored_path = "crates/alpha/vendor/ignored.rs"
         fixture.write(ignored_path, "mod child;\nfn ignored() {}\n")
+        module_sources = {
+            "crates/alpha/vendor/scopes.rs": "mod left { mod shared; } mod right { mod shared; }\n",
+            "crates/alpha/vendor/paths.rs": ('mod nested { #[path = "other.rs"] mod r#type; }\n'
+                                           '#[cfg_attr(test, path = "unknown.rs")] mod conditional;\n'),
+        }
+        for path, text in module_sources.items():
+            fixture.write(path, text)
         _ = (fixture.repo / invalid_path).write_bytes(b"fn work() {} // \xff\n")
         recovery_source = "fn recovered() {}\n"
         recovery_file = fixture.root / "recovered.rs"
@@ -124,10 +131,11 @@ def refill_readings(settings: Path) -> dict[str, str]:
                     findings = reader.named_held(identities)
                     sites = reader.finding_sites(findings, tip)
                     edited = style_plan.EditedFiles(fixture.repo, reader, style_plan.NoUnitBranch())
-                    edited.read({tip: (PARENT_FILE,)})
+                    edited.read({tip: (PARENT_FILE, *module_sources)})
                     files = tuple(edited.of(current) for current in findings)
                     blob = fixture.git("rev-parse", f"{tip}:{PARENT_FILE}")
                     modules = edited.declaration_text(blob)
+                    module_rows = tuple(edited.declaration_text(inventory.blobs[path]) for path in module_sources)
                     declared = cast(Callable[[str, str], declarations.DeclaredFile], getattr(reader, "_declared_file"))(tip, PARENT_FILE)
                     item = next(item for item in declared.declared_items if item.declaration.name == "work")
                     body = declarations.item_body(declared, item)
@@ -165,7 +173,7 @@ def refill_readings(settings: Path) -> dict[str, str]:
                         if tuple(item.declaration.name for item in recovered.declared_items) != ("recovered",):
                             raise AssertionError("the restored blob did not provide its declaration")
                 readings[source.value] = encode_proof((tickets, followed, sites, files, modules, declared.declared_items,
-                                                        names, code_identity, invalid.declared_items, links))
+                                                        names, code_identity, invalid.declared_items, links, module_rows))
             with closing(sqlite3.connect(copy)) as connection:
                 forbidden = cast(list[tuple[str]], connection.execute(
                     "SELECT fact_kind FROM refill_objects WHERE fact_kind IN ('tree','tree_entry') "
