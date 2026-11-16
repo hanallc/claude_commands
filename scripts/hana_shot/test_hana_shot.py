@@ -1092,7 +1092,9 @@ class LaunchRecordRecoveryTests(HanaShotTest):
     def test_record_whose_pid_runs_another_program_does_not_count_toward_the_local_app_cap(self) -> None:
         self.app_record(self.port + 1, live=True)
         self.app_record(self.port + 2, live=True, binary=SLEEP_PATH[:-1])
-        for platform in ("linux", "darwin"):
+        # The Linux read needs a real /proc; the macOS read (ps) runs on both hosts.
+        platforms = ("linux", "darwin") if Path("/proc/self/cmdline").exists() else ("darwin",)
+        for platform in platforms:
             with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform):
                 self.assertEqual(hana_shot.live_launch_count(self.state_path.parent), 1)
 
