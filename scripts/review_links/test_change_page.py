@@ -377,12 +377,12 @@ class ReviewTextTests(unittest.TestCase):
         parts = update_registration.QuestionParts(ask="Keep the name?", context="First paragraph.\n\nSecond paragraph.",
             items=["First item", "Second item"], recommend="Keep it", choices=["Keep it", "Change it"])
         cases: tuple[tuple[str, update_registration.OutstandingItem, str, int], ...] = (
-            ("parts", update_registration.OutstandingItem(since="now", text="Keep the name?", parts=parts), "Keep the name?", 2),
-            ("reviewed only", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+            ("parts", update_registration.OutstandingItem(since="2026-11-15T20:05", text="Keep the name?", parts=parts), "Keep the name?", 2),
+            ("reviewed only", update_registration.OutstandingItem(since="2026-11-15T20:05", text=MEMORY_BAR_RAW,
                 reviewed=MEMORY_BAR_REVIEWED), MEMORY_BAR_ASK, 3),
-            ("raw one line", update_registration.OutstandingItem(since="now", text="Stored summary",
+            ("raw one line", update_registration.OutstandingItem(since="2026-11-15T20:05", text="Stored summary",
                 question="Keep the name? First paragraph. Second paragraph."), "Keep the name?", 0),
-            ("raw choices", update_registration.OutstandingItem(since="now", text=MEMORY_BAR_RAW,
+            ("raw choices", update_registration.OutstandingItem(since="2026-11-15T20:05", text=MEMORY_BAR_RAW,
                 question=MEMORY_BAR_RAW), MEMORY_BAR_ASK, 3),
         )
         owner = staff.StaffId("owner")
@@ -394,6 +394,9 @@ class ReviewTextTests(unittest.TestCase):
                 self.assertEqual(section.count(title), 1)
                 self.assertIn(f'<h1>{title}</h1>', section)
                 self.assertEqual(section.count('name="choice"'), choices)
+                self.assertNotIn("Asked by", section)
+                self.assertIn('<dl class="change-details"><dt>source:</dt><dd>asker</dd>'
+                              + '<dt>date:</dt><dd>2026-11-15</dd><dt>time:</dt><dd>20:05</dd></dl>', section)
                 if name in ("parts", "raw one line"):
                     self.assertIn('<p>First paragraph.</p><p>Second paragraph.</p>', section)
                 if name == "raw choices":
@@ -1628,6 +1631,32 @@ class ChangePageTests(unittest.TestCase):
         self.assertNotIn('because it names the contents', body)
         self.assertEqual(question.record.path.read_bytes(), before)
 
+    def test_question_footers_show_current_sources_and_user_zone_times(self) -> None:
+        runner = next(row for row in staff.snapshot().rows if row.name == "page-owner")
+        producer = fixture_member("producer", name="question-producer")
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        for asker, source in ((self.unit, "page-owner · builder-unit"), (runner, "page-owner"),
+                              (producer, "question-producer")):
+            with self.subTest(asker=asker.kind):
+                key = self.file_user_question(f"Question from {asker.name}?", asker=asker)
+                question = next(item for item in change_browser.prepare(browser, change_page.DeliveryStatus(self.root)).questions
+                                if item.key == key)
+                record = replace(question.record, item={**question.record.item, "since": "2026-11-15T20:05"})
+                update_registration.write_question_record(record)
+                footer = ('<dl class="change-details">' + f'<dt>source:</dt><dd>{source}</dd>'
+                          + '<dt>date:</dt><dd>2026-11-15</dd><dt>time:</dt><dd>20:05</dd></dl>')
+                body = self.browser("questions")[2]
+                section = next(part for part in body.split('<section ') if f'data-key="{key}"' in part)
+                section = section.split('</section>', 1)[0]
+                self.assertIn(footer, section)
+                self.assertNotIn("Asked by", section)
+                self.assertLess(section.index('</form>'), section.index(footer))
+                unrouted = replace(question, tab="unrouted", record=record)
+                section = change_browser.question_section(unrouted, browser, 4)
+                self.assertNotIn('<form', section)
+                self.assertIn(footer, section)
+                self.assertLess(section.index('No showrunner owns this question.'), section.index(footer))
+
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
         owner = fixture_member("showrunner", name="another", doc=staff.LiveDoc(local_machine(), self.production))
@@ -1661,7 +1690,8 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Which layout gives each review card enough space for its controls?", body)
         self.assertNotIn("Choose the layout", body)
         self.assertIn("Compact &lt;layout&gt;", body)
-        self.assertIn("Asked by builder-unit", body)
+        self.assertIn('<dt>source:</dt><dd>page-owner · builder-unit</dd>', body)
+        self.assertNotIn("Asked by", body)
         self.assertNotIn("The old and new comments agree with the tests", body)
         self.assertEqual(forms.tabs[question], "page-owner")
         self.assertEqual(forms.outcomes[question], ["answer", "followup", "skip"])
@@ -3143,7 +3173,8 @@ class ChangePageTests(unittest.TestCase):
    check(waiting().length===2 && rows.length===2,'the page holds only the waiting questions');
    const question=current;
    check(!question.querySelector('.kind') && question.firstElementChild.tagName==='H1','question title replaces the Question label');
-   check(question.textContent.includes('Asked by builder-unit'),'question keeps the asker');
+   check(question.querySelector('.change-details').textContent.includes('source:page-owner · builder-unit'),'question keeps the asker');
+   check(!question.textContent.includes('Asked by'),'the question has no Asked by line');
    const form=question.querySelector('form'),box=form.querySelector('textarea');
    check(form.querySelector('label[for="'+box.id+'"]').textContent==='Your answer','the box label is Your answer');
    check(form.querySelector('.answer-help').textContent.startsWith('A choice fills this.'),'the box has its help line');
