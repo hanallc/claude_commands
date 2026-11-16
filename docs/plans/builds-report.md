@@ -1864,12 +1864,40 @@ As built:
 - A waiting build says its place in line, "It needs N GiB to start." and
   "Why it waits: …". `memory_feed.wait_why` writes one sentence for each
   wait reason, in the same form.
-- The waiting build that gets memory next shows the queue cap first. One
-  line says the cap is RAM less the programs that run now, the safety net
-  and the swap coming back. The table then goes "Queue cap", "− Builds",
-  "− Build reserved", "− Held for builds ahead in line" (only above 0) and
-  "= Free for builds". The rows add up. The cap and Builds count the build
-  tools, as the memory bar legend does. The user set what is inside the
-  cap on 2026-11-15; queue gave the words.
+- The waiting build that gets memory next shows a table: "Queue cap",
+  "− Builds", "− Build reserved", "− Held for builds ahead in line" (only
+  above 0) and "= Free for builds". Each row is the memory bar legend's
+  amount, so the rows add up and the cap and Builds count the build tools.
+  One note follows: "Build reserved is memory that running builds used at
+  their next points in earlier runs."
+- The queue cap hover says the cap is RAM less the programs that run now,
+  the safety net and the swap coming back, and that those three are
+  outside the cap. The user set what is inside the cap and where it is
+  explained on 2026-11-15; queue gave the words.
 - An unavailable cap shows "Queue cap unavailable: <reason>" and no table.
 - "can run on" and "Mac" are fields in the running and the waiting boxes.
+
+#### Builds page weight (C1672)
+
+From builds, relaying the user on C1672: the memory and the queue should be always visible and fast.
+
+As built:
+
+- Cause: `charts.chart_series` made a chart machine of each buildlog source folder. Each cloud gate host has its own folder, so about 1475 hosts gave 6 causes × 8 days of empty rows: 19.8 MB of the 19.9 MB `memory.json`.
+- `charts.chart_series` now takes only configured targets and machines with a step in the window.
+- `memory_feed.main` writes `report.json` beside `memory.json`, only when the report text changes. It writes `report.json` first. `memory.json` carries `report_version`, a sha256 prefix of that text, in place of `report`.
+- `memory_live.html` reads `memory.json` each 3 s as before. It reads `report.json` only when `report_version` changes.
+- Tests: `test_charts` (a folder with no step is no machine), `test_memory_feed` (one `report.json` write for two equal reads, written before `memory.json`), `memory_page_proof.mjs` (serves `report.json`).
+
+### Tokens — The Builds page shows the jobserver tokens · status: done
+
+From builds, relaying the user: "sometime i see the build is waiting for a token - what token? if they are used - we should show them in a column next to slots on the running on the builds page". The build folders are already named slots, so the user approved the name "tokens" on 2026-11-16.
+
+As built:
+
+- `memory_feed.token_pool` reads `stevie -a -t -j` (floor MiB, free, total). The pool is paused while the admission's MemAvailable is under the floor.
+- The Running header shows "Tokens: N total, M free", or "Tokens: unavailable". Its hover says what a token is, that hana CI has its own pool, and the memory floor.
+- In the memory pause, a token wait stage reads "waiting for jobserver tokens (memory under 12 GiB)". A remote row keeps the plain stage.
+- The Running table has a Tokens column after Slot. Each `token_dump_seconds` (config, 10 s), the feed reads the newest steve dump from the journal, then runs `systemctl --no-ask-password reload steve` for the next one. Each holder pid counts for its nearest ancestor that is a local, non-CI run pid. A dump counts only when its holder lines add up to the taken tokens; an incomplete dump gives way to the one before it. The next request time starts after the request, so slow reads never shorten the interval.
+- Until natedev's polkit rule (nixos 2ed52e5) is live, the reload is refused. The column shows "—", and the header hover says "natedev does not yet let the feed ask steve which build holds each token." CI, Mac and AWS rows always show "—".
+- Tests: `test_memory_feed` (pool, pause text, dump parse, ancestor count, refused reason), `test_memory_hover` (column and header), `memory_page_proof.mjs` (column values, pool line, no overflow).

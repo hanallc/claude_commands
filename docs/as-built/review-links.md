@@ -229,7 +229,7 @@ A failed load changes nothing; the next interval tries again.
 Button borders use light and dark colors with at least 3:1 contrast against the button fill and page background.
 The page shows one card at a time.
 The compact **Showrunner:** menu starts with **All (n)** and then lists each showrunner with its waiting count.
-All is the default and includes every showrunner in the existing item order.
+All is the default and lists each root showrunner's queue in turn.
 The menu keeps the existing showrunner order.
 The menu stays on one line at phone and desktop widths.
 The URL fragment records the showrunner and card.
@@ -262,6 +262,9 @@ A row without an image retains its text width and position.
 It stores a single image or a before and after pair with one record.
 `image_store.read_record` checks the optional `before` and `feedback_at` fields.
 Change images live in `change-images/<id>/`, separate from the Images page's `images/` store.
+`| image <id>` accepts an id from either store.
+`change_review._row_image` copies an Images page file into the change store and puts the new id in the row.
+It copies the after image for a pair. The source stays in the Images page store until its owner deletes it.
 `change_review.record_verdict` clears the cell and deletes its image for landing and return verdicts.
 The snapshot sweep skips both image stores during normal snapshot deletion.
 It deletes change images only when no To review row names them and their age exceeds `change_image_unclaimed_days`.
@@ -335,19 +338,34 @@ Answers to questions and changes both post to `changes.html`.
 
 ### Accounts page
 
-`/console/accounts.html` shows the accounts board that `/showrunner:accounts` shows.
+Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server renders it for each request in a child process (`accounts_page.py`).
+The server keeps the last good page and its render times under one lock.
+The first request waits for a render in a child process (`accounts_page.py`).
+A later request returns the kept page at once and starts one background render.
+A request during a render returns the kept page and starts no second render.
+Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
-A failed or late render gives 503 with **The Accounts page is not available.**
+A failed or late first render gives 503 with **The Accounts page is not available.**
+A failed background render keeps the last good page and writes one line to stderr.
+Failed renders add no render time.
 
 - The table comes from `accounts.status_board()`: the board columns, rows, total row and tones.
 - The upcoming moves and the problems follow the table.
 - The page reads the stored usage only, as `accounts.py status --stored` does.
 
 The page reads its color tokens and base type from `console_theme.py`, and its main column and title from `page_frame.STYLE`.
-It refreshes when the console shows it again and when the tab becomes visible.
+It refreshes every 15 seconds through `page_refresh_seconds` while the page is visible.
+It also refreshes when the console shows it again and when the tab becomes visible.
+Changes, Images and Accounts use the same refresh helper in `page_frame.py`.
+Images has no interval timer.
+
+The line under the Accounts title shows the data age in whole seconds and the browser wait in seconds.
+It then shows the last render time and the median of at most 10 successful renders.
+The browser computes the data age from the render finish time and clamps negative ages to zero.
+The browser measures the first wait from request start to response end in its navigation entry.
+For a refresh, it measures the wait around `fetch` and the response body read.
 
 ### Images page
 
@@ -568,9 +586,17 @@ The selected type tab joins the content panel.
 Its keyboard focus outline stays inside the tab edges.
 Builds rows can remain in the natedev list while the builds filter shows them.
 
-Each showrunner group orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
-The page keeps row entries during ordering and does not format the text that `/next` prints.
-The existing urgency order, pin, dependencies, and moved rows determine its order.
+Each showrunner view uses `next_item.change_queue` and `urgency.queue_order`, as `/next change` does without `--all-below`.
+The page shares its list reads and staff routing with `change_review.change_queue`.
+All lists each root's `/next change --all-below` order in turn through `urgency.queue_order`.
+It keeps each root queue's pin, moved rows, and dependencies.
+The page reads `changes_first_root` from `config/review_links.conf` at each render.
+The named root goes first, and other roots follow by name.
+The default is `natedev`.
+A name outside the live roots leaves the root order unchanged.
+Rows outside these queues go last.
+The server supplies each view's order for the first card, waiting list, and Skip for now.
+The browser uses these orders without sorting rows.
 Queue keys and prerequisites retain their list-based IDs.
 The `change` line and `/next` show the responsible showrunner's ID, such as `sdlc/C1514`.
 The shared staff resolver supplies the prefix used by the showrunner filter.

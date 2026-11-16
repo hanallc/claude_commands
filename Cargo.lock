@@ -1257,9 +1257,11 @@ name = "style_reader"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

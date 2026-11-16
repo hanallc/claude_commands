@@ -2621,3 +2621,19 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 **Files:** `config/build_admission.conf`, `scripts/lint/fixtures/build_admission.conf`, `scripts/build_queue/admission_records.py`, `scripts/lint/memory_admit.py`, `scripts/build_queue/memory_feed.py`, `scripts/build_queue/memory_live.html`, `scripts/build_queue/queue_view.py`, and their tests.
 
 **Gotchas:** a hana test run by plain cargo (not nextest) gets the step name from the caller; queue names the step from the cargo subcommand after #93 reaches main. The lint fixture config lists hana, so `admission_policy_fixture()` has the slot on.
+
+### Phase 129 — A hold stop ends the command group and the supervisor delivers the stopped result  · status: done
+
+#### As-built
+
+- Cause: a hold sent TERM to the detached supervisor's process group. The supervisor uses the default TERM disposition, so it died with the command. Its record stayed running, and no result reached the worker until a reap.
+- `detached_runs._run` starts the command with `start_new_session=True`. The record saves `command_group` beside `command_pid` and `command_started`.
+- `detached_runs.command_group(path)` reads the group of a running record. `stop_command(path, reason)` saves the stop reason and sends TERM to that group while the supervisor and the command leader are current. The `stop --reason <text> <record>` verb calls it.
+- `hold_enforcer.stop_waiting_run` also checks the command leader start and sends TERM to the recorded command group. A record with no group yet is a changed identity, and nothing is signalled.
+- The supervisor stays alive, records 128+n and delivers the result. A non-zero result with a stop reason reads `STOPPED (exit <n>)` with a `Stop reason:` line.
+- The orphan reaper waits while the recorded command group has live members.
+- No signal handler, mask or disposition is added.
+
+**Files:** `scripts/agents/detached_runs.py`, `scripts/build_hold/hold_enforcer.py`, their tests, `scripts/direct/test_verify_tree_cancel_lint.py`, `commands/unit/direct.md`, `docs/direct/write_prompt_contract.md` and three as-built docs.
+
+**Gotchas:** `kill -TERM -- -<supervisor pid>` now ends only the supervisor; use the `stop` verb. A `timeout` child that leaves the command group needs its own group stop.

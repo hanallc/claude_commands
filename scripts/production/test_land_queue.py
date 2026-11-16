@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.production import land_queue
+from scripts.production import land_queue, unit_phases
+from zoneinfo import ZoneInfo
 
 
 class LandQueueTests(unittest.TestCase):
@@ -66,6 +67,23 @@ class LandQueueTests(unittest.TestCase):
             self.assertEqual(status, 1, argv)
             self.assertTrue(error.startswith("land_queue: "), argv)
         self.assertEqual(self.run_line("list")[1], "1. sdlc one: aaaaaaaaa\n")
+
+    def test_carried_queue_work_names_its_recorded_production(self) -> None:
+        batch = self.batch("carrier", "queue bf4-limits " + "a" * 40)
+        for label, expected in (("builds batch638", "builds bf4-limits"),
+                                ("other batch638", "other bf4-limits"),
+                                ("queue bf4-limits", "bf4-limits"),
+                                ("batch638", "bf4-limits"), ("", "bf4-limits")):
+            with self.subTest(label=label):
+                with land_queue.edited() as items:
+                    items[:] = [{"label": label, "batch": batch, "commits": [], "added": ""}]
+                places = land_queue.places()
+                assert not isinstance(places, land_queue.NoLine)
+                place = places["a" * 40]
+                self.assertEqual(place.owner, "queue bf4-limits")
+                state = land_queue.land_state(land_queue.LandView({}, places, {}, frozenset(), {"b" * 40: place}), "b" * 40)
+                self.assertEqual(unit_phases.land_text(state, now=0, zone=ZoneInfo("UTC")),
+                                 f"merges with {expected}; 1st in the merge line")
 
     def test_an_unreadable_line_has_no_places(self) -> None:
         _ = land_queue.line_path().write_text("not json")

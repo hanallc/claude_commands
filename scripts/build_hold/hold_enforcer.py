@@ -391,12 +391,19 @@ def stop_waiting_run(
         current = build_hold.process_start_time(identity.pid, proc_root) == identity.start_time
         if isinstance(detached, DetachedRun):
             supervisor = detached.supervisor.identity
-            current = current and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+            command = detached_runs.command_group(detached.path)
+            current = (current and build_hold.process_start_time(supervisor.pid, proc_root) == supervisor.start_time
+                       and command is not None
+                       and build_hold.process_start_time(command.group, proc_root) == command.started)
         return current
 
     def signal_run() -> None:
         if isinstance(detached, DetachedRun):
-            signal_group(detached.supervisor.identity.pid, signal.SIGTERM)
+            # The command leads its own group; the supervisor stays alive to deliver the stopped result.
+            command = detached_runs.command_group(detached.path)
+            if command is None:
+                raise ProcessLookupError(f"{detached.path.name}: no running command group")
+            signal_group(command.group, signal.SIGTERM)
         else:
             signal_process(identity.pid, signal.SIGTERM)
 

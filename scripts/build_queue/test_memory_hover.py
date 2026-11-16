@@ -144,7 +144,7 @@ class MemoryHoverTests(unittest.TestCase):
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True), counter,
             progress.NoMatchingProfile("no profile"), admission_policy_fixture())
         inputs = memory_tests.ProgressKeepAsideTests.inputs((row,), (adjusted,))
-        stage = memory_feed.row_progress(inputs.running)
+        stage = memory_feed.row_progress(inputs.running, progress.TOKEN_WAIT_REASON)
         self.assertEqual(stage, {"kind": "TokenWaitProgress", "stage": "waiting for jobserver tokens", "tokens": 4})
         data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
                 "walk": [{"name": "hana nextest", "queued": True, "progress": stage}]}
@@ -154,6 +154,27 @@ class MemoryHoverTests(unittest.TestCase):
         assert cells is not None
         self.assertEqual(cells[0].text, "waiting for jobserver tokens")
         self.assertEqual(cells[1].text, "—")
+
+    def test_the_running_table_shows_tokens_and_the_header_shows_the_pool(self) -> None:
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "waiters": [],
+                "walk": [{"name": "hana nextest", "queued": True, "pid": 10, "tokens": 3, "progress": {"kind": "NoProgress"}},
+                         {"name": "mac nextest", "queued": True, "pid": 11, "progress": {"kind": "NoProgress"}}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual(root.findtext(".//th[@class='tokens']"), "Tokens")
+        self.assertEqual(root.findtext(".//tr[@data-tip='row:0']/td[@class='tokens']"), "3")
+        self.assertEqual(root.findtext(".//tr[@data-tip='row:1']/td[@class='tokens']"), "—")
+        gib = 1024 ** 3
+        for pool, expected in (({"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12 * gib, "paused": True},
+                                "Tokens: 31 total, 4 free"),
+                               ({"kind": "TokenPoolUnavailable", "reason": "stevie exited 1"}, "Tokens: unavailable")):
+            with self.subTest(pool=pool):
+                self.assertEqual(self.page_expression("tokenPoolText(data.tokens)", {"tokens": pool}), expected)
+        tip = cast(list[str], self.page_expression("TIPS.tokens(data)", {"token_counts": "steve cannot be asked.",
+            "tokens": {"kind": "TokenPool", "total": 31, "free": 0, "memory_floor_bytes": 12 * gib, "paused": True}}))
+        self.assertEqual(tip[0], "Tokens · 31 total, 0 free")
+        self.assertIn("Free RAM is under 12.0 GiB, so the pool gives no new token", tip[1])
+        self.assertIn("not known now: steve cannot be asked.", tip[1])
 
     def test_the_mac_memory_note_follows_all_tooltip_fields(self) -> None:
         data = {"read_at": 200, "walk": [{"kind": "mac-build", "machine": "mac", "name": "hana nextest",
@@ -178,7 +199,7 @@ class MemoryHoverTests(unittest.TestCase):
         assert isinstance(room, admission_records.MemoryRoom)
         self.assertTrue(memory_feed.need_in_next_part(inputs.running))
         self.assertFalse(memory_feed.need_in_next_part(()))
-        module_counter = memory_feed.row_progress(inputs.running)
+        module_counter = memory_feed.row_progress(inputs.running, progress.TOKEN_WAIT_REASON)
         assert module_counter["kind"] == "RowProgress"
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
@@ -367,7 +388,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot"])
+                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:{index}']")
@@ -375,8 +396,9 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(row[0].get("class"), "place")
                     self.assertEqual(row[0].text, expected)
                     self.assertEqual(row.findtext("td[@class='slot']"), "2" if index == 0 else "3" if index == 2 else "—")
-                    self.assertEqual(row[-1].get("class"), "slot")
-                    self.assertEqual(row[-2].get("class"), "vcpus")
+                    self.assertEqual(row[-1].get("class"), "tokens")
+                    self.assertEqual(row[-2].get("class"), "slot")
+                    self.assertEqual(row[-3].get("class"), "vcpus")
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
@@ -391,7 +413,7 @@ class MemoryHoverTests(unittest.TestCase):
                         self.assertEqual(row[0].text, expected)
                         self.assertIsNone(row.find("td[@class='slot']"))
                 for row in table.findall("./tbody/tr"):
-                    self.assertEqual(len(row), len(headers) - int(row.get("class", "").startswith(("wait", "queue-head"))))
+                    self.assertEqual(len(row), len(headers) - 2 * int(row.get("class", "").startswith(("wait", "queue-head"))))
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
@@ -470,11 +492,8 @@ class MemoryHoverTests(unittest.TestCase):
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
         priority = "queue priority: port (the user's bump)"
-        cap_text = ("Queue cap: 7.5 GiB. It is RAM less the programs that run now, the 3.0 GiB safety net "
-                    + "and the 2.0 GiB of swap coming back. Those three are outside the cap.")
-        note = (f"{memory_feed.BUILD_RESERVED_NOTE} Other programs have 2.0 GiB in swap. "
-                + "It can come back into RAM when they run, so it is outside the cap.")
-        room: memory_feed.HeadRoom = {"cap_text": cap_text, "rows": [
+        note = memory_feed.BUILD_RESERVED_NOTE
+        room: memory_feed.HeadRoom = {"unavailable": "", "rows": [
             {"label": "Queue cap", "gib": 7.5}, {"label": "− Builds", "gib": 1.5},
             {"label": "− Build reserved", "gib": 6.0}, {"label": "= Free for builds", "gib": 0.0}], "note": note}
         data = {"read_at": 200, "waiters": [
@@ -491,7 +510,7 @@ class MemoryHoverTests(unittest.TestCase):
         expected = ("\n".join((
             "It is first in line.", "It needs 1.9 GiB to start.",
             "Why it waits: only 0.0 GiB is free for builds. It starts when 1.9 GiB is free.",
-            "can run on: natedev only", cap_text, "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
+            "can run on: natedev only", "Queue cap: 7.5 GiB", "− Builds: 1.5 GiB",
             "− Build reserved: 6.0 GiB", "= Free for builds: 0.0 GiB", note, priority)),
             "It is number 2 in line.\nIt needs 2.0 GiB to start.\n"
             + "Why it waits: it is behind the first build in line, which gets memory first.\ncan run on: natedev or Mac",
@@ -504,7 +523,8 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertNotIn("Head", hover[1])
                 html = str(self.page_expression(f"tooltipHtml('wait:{index}', data)", data, walk=True))
                 self.assertEqual(html.count("= Free for builds"), int(index == 0))
-                self.assertEqual(html.count("Those three are outside the cap."), int(index == 0))
+                self.assertEqual(html.count(note), int(index == 0))
+                self.assertNotIn("outside the cap", html)
                 self.assertEqual(html.count(priority), int(index == 0))
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         for removed in ("priority-line", "head-line", "wait-reasons", "row-time", ".wait-reason"):
@@ -607,6 +627,15 @@ function fitLabels() {}
         self.assertIn("private memory.stat is missing", str(hover))
         self.assertNotIn("NaN", str(hover))
 
+    def test_the_queue_cap_tooltip_names_what_is_outside_the_cap(self) -> None:
+        # The user, 11-15: the queue cap explanation goes on the queue cap hover, not in the waiting build's box.
+        gib = 1024 ** 3
+        hover = cast(list[str], self.page_expression("tipText('cap', data)", {"cap": 15.0, "ram": {
+            "safety_target_bytes": 3 * gib, "swap_target_bytes": 11 * gib, "build_covered_bytes": 10 * gib,
+            "room_bytes": 0}}))
+        self.assertIn("It is RAM less the programs that run now, the 3.0 GiB safety net and the 11.0 GiB "
+                      + "of swap coming back. Those three are outside the cap.", hover[1])
+
     def test_missing_pressure_keeps_the_other_limit_readings(self) -> None:
         result = self.page_expression("[level(data), tipText('g-full', data), tipText('cap', data)]", {
             "psi":{"some":{"kind":"PressureNotRecorded", "reason":"private PSI is missing"}, "full":1},
@@ -684,7 +713,9 @@ function fitLabels() {}
             "unattributed": ["Not attributed · 2.0 GiB", "RAM that the readings do not explain.\n" +
                              "Kernel memory with no counter, such as driver memory: 1.5 GiB.\n" +
                              "Memory with no program name: 0.5 GiB."],
-            "cap": ["Queue cap · 31.0 GiB", "What builds may use.\nBuilds: 7.0 GiB.\n+ Build reserved: 6.0 GiB.\n" +
+            "cap": ["Queue cap · 31.0 GiB", "What builds may use.\nIt is RAM less the programs that run now, the 4.0 GiB "
+                    + "safety net and the 2.0 GiB of swap coming back. Those three are outside the cap.\n"
+                    + "Builds: 7.0 GiB.\n+ Build reserved: 6.0 GiB.\n" +
                     "+ Free: 18.0 GiB.\nA step starts when the memory it needs fits in free."],
             "budget": ["RAM · 64.0 GiB", "The bar divides this machine's RAM into builds, free RAM and everything else.\n" +
                        "Free RAM includes cache that Linux can take back."],

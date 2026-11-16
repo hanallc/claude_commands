@@ -36,12 +36,14 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import conf, test_hang_guard
+from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
+
+REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 
 
 class FeedStopped(Exception):
@@ -121,6 +123,101 @@ class MemoryFeedTests(unittest.TestCase):
     root: Path = Path()
     output: Path = Path()
     configuration: Path = Path()
+
+    def test_the_token_pool_names_its_memory_pause(self) -> None:
+        gib = admission_records.GIB
+        pool = memory_feed.token_pool(13 * gib)
+        self.assertEqual(pool, {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 12 * gib, "paused": False})
+        self.assertEqual(memory_feed.token_wait_stage(pool), "waiting for jobserver tokens")
+        paused = memory_feed.token_pool(11 * gib)
+        self.assertEqual(memory_feed.token_wait_stage(paused), "waiting for jobserver tokens (memory under 12 GiB)")
+        for output, error in (("12288\n4\n", None), ("12288\nfour\n31\n", None), ("", ValueError("stevie exited 1: no device"))):
+            with self.subTest(output=output, error=error), mock.patch.object(memory_feed, "stevie_output",
+                    side_effect=error, return_value=output):
+                unavailable = memory_feed.token_pool(11 * gib)
+                self.assertEqual(unavailable["kind"], "TokenPoolUnavailable")
+                self.assertEqual(memory_feed.token_wait_stage(unavailable), "waiting for jobserver tokens")
+
+    def test_the_newest_steve_dump_gives_the_tokens_of_each_process(self) -> None:
+        journal = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 20 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 9 tokens:
+            1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31
+            1763270010.000001 natedev steve[1304]:   PID 60 (cargo nextest run (x)) holds 3 tokens:
+            1763270010.000002 natedev steve[1304]:     job 0x2b running for 1.5s
+            1763270010.000003 natedev steve[1304]:   PID 61 holds 2 tokens:
+            1763270010.000004 natedev steve[1304]:   1 processes waiting for a job token (in order):
+            1763270010.000005 natedev steve[1304]:     PID 62 is performing a blocking read
+            1763270011.000000 natedev steve[1304]: Warning: PID 63 (build-script-main) returned incorrect token value 0x2b
+            1763270011.000001 natedev steve[1304]:   PID 64 holds 7 tokens:
+            """)
+        self.assertEqual(memory_feed.token_holders(journal), memory_feed.TokenHolders({60: 3, 61: 2}))
+        self.assertIsInstance(memory_feed.token_holders("1763270011.0 natedev steve[1304]: Device closed by PID 5\n"),
+                              memory_feed.TokenHoldersUnknown)
+
+    def test_an_incomplete_steve_dump_gives_way_to_the_complete_one_before_it(self) -> None:
+        complete = textwrap.dedent("""\
+            1763270000.000000 natedev steve[1304]: steve: currently 25 tokens available out of 31
+            1763270000.000001 natedev steve[1304]:   PID 50 (cargo build) holds 6 tokens:
+            """)
+        cut = "1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31\n"
+        self.assertEqual(memory_feed.token_holders(complete + cut), memory_feed.TokenHolders({50: 6}))
+        self.assertEqual(memory_feed.token_holders(cut + "1763270010.000001 natedev steve[1304]:   PID 60 holds 3 tokens:\n"),
+                         memory_feed.TokenHoldersUnknown("Each steve token dump in the journal window was incomplete."))
+        self.assertEqual(memory_feed.token_holders("1763270000.0 natedev steve[1304]: steve: currently 31 tokens available out of 31\n"),
+                         memory_feed.TokenHolders({}))
+
+    def test_tokens_go_to_the_nearest_running_step_above_each_holder(self) -> None:
+        proc = self.root / "proc"
+        for pid, parent in ((300, 200), (200, 100), (100, 1), (400, 1)):
+            (proc / str(pid)).mkdir()
+            _ = (proc / str(pid) / "stat").write_text(f"{pid} (rustc (x) y) S {parent} 0 0\n")
+        holders = memory_feed.TokenHolders({300: 2, 200: 1, 400: 5, 999: 4})
+        self.assertEqual(memory_feed.tokens_by_run(holders, {100, 200}), {200: 3})
+
+    def test_local_running_rows_carry_their_tokens_only_when_counts_are_known(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            unknown = memory_feed.reading()
+
+        def rows(page: memory_feed.MemoryPage) -> list[dict[str, object]]:
+            return [cast(dict[str, object], cast(object, row)) for row in page["walk"]]
+
+        def local(row: dict[str, object]) -> bool:
+            return row.get("machine") == "fixture" and not row.get("ci") and isinstance(row.get("pid"), int)
+
+        pids = [row["pid"] for row in rows(unknown) if local(row)]
+        self.assertTrue(pids)
+        self.assertTrue(all("tokens" not in row for row in rows(unknown)))
+        self.assertEqual(unknown["token_counts"], memory_feed.NO_TOKEN_DUMP_YET.reason)
+        self.assertEqual(unknown["tokens"], {"kind": "TokenPool", "total": 31, "free": 4,
+                                             "memory_floor_bytes": 12 * admission_records.GIB,
+                                             "paused": unknown["available"] < 12})
+        pid = pids[0]
+        assert isinstance(pid, int)
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            known = memory_feed.reading(holders=memory_feed.TokenHolders({pid: 6}))
+        self.assertEqual(known["token_counts"], "")
+        self.assertEqual({row["pid"]: row["tokens"] for row in rows(known) if local(row)},
+                         {other: 6 if other == pid else 0 for other in pids})
+        self.assertTrue(all("tokens" not in row for row in rows(known) if not local(row)))
+
+    def test_the_feed_shows_why_token_counts_are_unknown_when_steve_refuses_a_dump(self) -> None:
+        reading = reservation_reading()
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            self.assertEqual(memory_feed.main(["--once"]), 0)
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertEqual(page["token_counts"], "Job type reload is not applicable for unit steve.service.")
+
+    def test_a_denied_token_dump_gives_a_plain_reason(self) -> None:
+        denied = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "",
+                                             "Failed to reload steve.service: Access denied.\nSee system logs for details.")
+        failed = subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 1, "", "Unit steve.service not loaded.\nMore text.")
+        for result, expected in ((denied, memory_feed.STEVE_DUMP_DENIED_REASON),
+                                 (failed, "systemctl reload steve exited 1: Unit steve.service not loaded."),
+                                 (subprocess.CompletedProcess(memory_feed.STEVE_DUMP_COMMAND, 0, "", ""), "")):
+            with self.subTest(expected=expected), mock.patch.object(subprocess, "run", return_value=result):
+                self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
         mac_machine = "private-mac-host"
@@ -230,6 +327,11 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
+        # The live jobserver and its journal stay out of the tests: 12 GiB floor, 4 free of 31 tokens.
+        _ = self.enterContext(mock.patch.object(memory_feed, "stevie_output", return_value="12288\n4\n31\n"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "request_token_dump",
+            return_value="Job type reload is not applicable for unit steve.service."))
+        _ = self.enterContext(mock.patch.object(memory_feed, "steve_journal", return_value=""))
         _ = self.enterContext(mock.patch.object(memory_feed, "CGROUP", self.root / "cgroup"))
         _ = self.enterContext(mock.patch.object(charts, "page_data", return_value=report_fixture()))
         _ = self.enterContext(mock.patch.object(queue_view, "mac_reading_path", return_value=self.root / "mac-builds.json"))
@@ -678,7 +780,7 @@ process.stdout.write(JSON.stringify({
         with mock.patch.object(conf, "read", wraps=conf.read) as read:
             configuration = memory_feed.read_configuration()
         self.assertIn(mock.call("memory_feed"), read.call_args_list)
-        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6))
+        self.assertEqual(configuration, memory_feed.FeedConfiguration(self.output, 0.125, 7, 6, 300, configuration.colors, 6, 10))
 
     def test_configuration_expands_the_output_folder(self) -> None:
         original = self.configuration.read_text()
@@ -785,8 +887,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(page["available"], 30)
         self.assertEqual(page["walk"], [])
         self.assertEqual(page["limits"], {"some": 25, "full": 5})
-        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json"})
-        for name in ("memory_live.html", "memory.json"):
+        self.assertEqual(set(path.name for path in self.output.iterdir()), {"memory_live.html", "memory.json", memory_feed.REPORT_NAME})
+        for name in ("memory_live.html", "memory.json", memory_feed.REPORT_NAME):
             with self.subTest(name=name):
                 self.assertEqual((self.output / name).stat().st_mode & 0o777, 0o644)
 
@@ -931,8 +1033,10 @@ process.stdout.write(JSON.stringify({
         report_calls_per_cycle: list[int] = []
         with (mock.patch.object(admission_client, "view", return_value=captured_reading()) as queue,
               mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
-              mock.patch.object(time, "monotonic", side_effect=[0.0, 100.0, 301.0]),
-              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped])):
+              # Each cycle reads the clock once, then once more after its token dump request.
+              mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 100.0, 100.0, 301.0, 301.0]),
+              mock.patch.object(time, "sleep", side_effect=[None, None, FeedStopped]),
+              mock.patch.object(memory_feed, "write_text_atomic", wraps=atomic_file.write_text_atomic) as write):
             def view() -> admission_records.QueueRead:
                 report_calls_per_cycle.append(provider.call_count)
                 return captured_reading()
@@ -943,6 +1047,15 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(queue.call_count, 3)
         self.assertEqual(report_calls_per_cycle, [1, 1, 2])
         self.assertEqual(provider.call_args_list, [mock.call(7, n=3), mock.call(7, n=3)])
+        # The second report read has the same text, so only the first one writes report.json.
+        written = [cast(Path, call.args[0]).name for call in write.call_args_list]
+        self.assertEqual(written.count(memory_feed.REPORT_NAME), 1)
+        self.assertLess(written.index(memory_feed.REPORT_NAME), written.index("memory.json"))
+        report_text = (self.output / memory_feed.REPORT_NAME).read_text()
+        page = cast(dict[str, object], json.loads((self.output / "memory.json").read_text()))
+        self.assertNotIn("report", page)
+        self.assertEqual(page["report_version"], memory_feed.report_file(memory_feed.report_reading(7)).version)
+        self.assertEqual(report_text, memory_feed.report_file(memory_feed.report_reading(7)).text)
 
     def test_mac_readings_follow_the_configured_refresh_window(self) -> None:
         for interval, expected in ((30, [710001, 710001, 710002]), (60, [710001, 710001, 710001])):
@@ -969,11 +1082,40 @@ process.stdout.write(JSON.stringify({
 
                 with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
                       mock.patch.object(queue_view, "refresh_mac_builds", side_effect=refresh),
-                      mock.patch.object(time, "monotonic", side_effect=[0.0, 29.0, 30.0]),
+                      mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 29.0, 29.0, 30.0]),
                       mock.patch.object(time, "sleep", side_effect=after_cycle)):
                     with self.assertRaises(FeedStopped):
                         _ = memory_feed.main([])
                 self.assertEqual(published, expected)
+
+    def test_token_dump_requests_keep_the_interval_after_slow_reads(self) -> None:
+        clock = [0.0]
+        requests: list[float] = []
+
+        def slow_journal(dump_seconds: int) -> memory_feed.TokenHoldersUnknown:
+            del dump_seconds
+            clock[0] += 4
+            return memory_feed.NO_TOKEN_DUMP_YET
+
+        def request() -> str:
+            requests.append(clock[0])
+            return ""
+
+        def sleep(seconds: float) -> None:
+            del seconds
+            clock[0] += 9
+            if clock[0] > 30:
+                raise FeedStopped
+
+        with (mock.patch.object(admission_client, "view", return_value=captured_reading()),
+              mock.patch.object(memory_feed, "newest_token_holders", side_effect=slow_journal),
+              mock.patch.object(memory_feed, "request_token_dump", side_effect=request),
+              mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(time, "sleep", side_effect=sleep)):
+            with self.assertRaises(FeedStopped):
+                _ = memory_feed.main([])
+        # Each journal read takes 4 s and each cycle sleeps 9 s; requests stay at least 10 s apart.
+        self.assertEqual(requests, [4.0, 26.0])
 
     def test_report_dates_use_the_configured_user_zone(self) -> None:
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
@@ -1151,8 +1293,8 @@ process.stdout.write(JSON.stringify({
         with (mock.patch.object(charts, "page_data") as provider,
               mock.patch.object(admission_client, "view", return_value=reservation_reading())):
             page = memory_feed.reading()
+            text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
-        text = memory_feed.page_json(page)
         self.assertIn("history_days", text)
         self.assertIn("TOP_COST_RECENT_DAYS", text)
         self.assertTrue(page["walk"])
@@ -1512,26 +1654,19 @@ process.stdout.write(JSON.stringify({
                                         ("= Free for builds", 7.0 - ahead)])
                 self.assertEqual(rows[0][1] - sum(amount for _, amount in rows[1:-1]), rows[-1][1])
                 self.assertEqual(rows[0][1], memory_feed.gib(ram["cap_bytes"]))
-                self.assertEqual(shown["cap_text"], "Queue cap: 18.0 GiB. It is RAM less the programs that run now, "
-                                 + "the 3.0 GiB safety net and the 10.0 GiB of swap coming back. Those three are outside the cap.")
-                self.assertEqual(shown["note"], f"{memory_feed.BUILD_RESERVED_NOTE} "
-                                 + f"Other programs have 10.0 GiB in swap. {memory_feed.SWAP_RETURN_NOTE}")
+                self.assertEqual((shown["unavailable"], shown["note"]), ("", memory_feed.BUILD_RESERVED_NOTE))
         short = replace(room, available=16 * gib, signed_room=-5 * gib)
         check = admission_records.RoomCheck(16 * gib, -5 * gib, False, basis=admission_records.DoesNotFit())
         shown = memory_feed.head_room(check, short, memory_feed.ram_blocks(short, tools, 100.0, 1))
         self.assertEqual([(row["label"], row["gib"]) for row in shown["rows"]],
                          [("Queue cap", 6.0), ("− Builds", 3.0), ("− Build reserved", 3.0), ("= Free for builds", 0.0)])
-        self.assertIn("Running builds need 8.0 GiB reserved. Free RAM covers 3.0 GiB of it.", shown["note"])
-        no_swap = replace(room, agent_swap_demand=0, cap=27 * gib, signed_room=17 * gib)
-        check = admission_records.RoomCheck(16 * gib, 17 * gib, False, basis=admission_records.DoesNotFit())
-        no_swap_ram = memory_feed.ram_blocks(no_swap, tools, 100.0, 1)
-        self.assertEqual(memory_feed.head_room(check, no_swap, no_swap_ram)["note"], memory_feed.BUILD_RESERVED_NOTE)
+        self.assertEqual(shown["note"], memory_feed.BUILD_RESERVED_NOTE)
         run = admission_records.RunMemory("organon", gib, admission_records.RunUseUnavailable("no cgroup"))
         unavailable = memory_feed.head_room(check, replace(room, cap=admission_records.CapUnavailable((run,))), ram)
-        self.assertEqual((unavailable["cap_text"], unavailable["rows"]),
+        self.assertEqual((unavailable["unavailable"], unavailable["rows"]),
                          ("Queue cap unavailable: memory use is unavailable for organon: no cgroup", []))
         unread = memory_feed.head_room(check, admission_records.ReadingUnavailable("meminfo is missing"), ram)
-        self.assertEqual((unread["cap_text"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
+        self.assertEqual((unread["unavailable"], unread["rows"]), ("Queue cap unavailable: meminfo is missing", []))
 
     def test_only_a_head_that_memory_holds_shows_its_room_rows(self) -> None:
         gib = admission_records.GIB
@@ -2174,9 +2309,8 @@ process.stdout.write(JSON.stringify({
     def test_one_report_call_supplies_both_sections(self) -> None:
         with (mock.patch.object(charts, "page_data", return_value=report_fixture()) as provider,
               mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
+            report = memory_feed.report_reading(7)
         provider.assert_called_once_with(7, n=3)
-        report = page["report"]
         assert isinstance(report, memory_feed.ReportSections)
         row = report.top[0]
         self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
@@ -2189,10 +2323,8 @@ process.stdout.write(JSON.stringify({
         assert not isinstance(report.top.rows, charts.NoDataYet)
         row = replace(report.top.rows[0], share=cost_actions.NoShare.VALUE,
                       days=(charts.MeasuredCost(30), charts.CostUnavailable("1 applicable waits missing")))
-        with (mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))),
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
-        sections = page["report"]
+        with mock.patch.object(charts, "page_data", return_value=replace(report, top=replace(report.top, rows=(row,)))):
+            sections = memory_feed.report_reading(7)
         assert isinstance(sections, memory_feed.ReportSections)
         self.assertEqual((sections.top[0]["range"], sections.top[0]["share"]), ([], ""))
 
@@ -2206,15 +2338,13 @@ process.stdout.write(JSON.stringify({
                 with (provider,
                       mock.patch.object(admission_client, "view", return_value=reservation_reading())):
                     page = memory_feed.reading()
-                text = memory_feed.page_json(page)
+                    text = memory_feed.report_file(memory_feed.report_reading(7)).text
                 self.assertTrue(page["walk"])
                 self.assertIn(failure.reason if isinstance(failure, charts.IndexUnavailable) else str(failure), text)
 
     def test_an_empty_report_keeps_its_recent_window(self) -> None:
-        with (mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)),
-              mock.patch.object(admission_client, "view", return_value=captured_reading())):
-            page = memory_feed.reading()
-        text = memory_feed.page_json(page)
+        with mock.patch.object(charts, "page_data", return_value=report_fixture(empty=True)):
+            text = memory_feed.report_file(memory_feed.report_reading(7)).text
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
@@ -2319,6 +2449,7 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        reports: dict[str, memory_feed.ReportFile] = {}
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
@@ -2377,6 +2508,7 @@ def write_browser_fixture(folder: Path) -> None:
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):
                 pages[name] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+                reports[name] = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
         mac_builds = tuple(queue_view.MacBuild(pid, path, base.explanation.now - 120 + index,
             command, repository, queue_view.MacBuilding(), int(used * admission_records.GIB),
             queue_view.mac_command_jobs(command), progress_profile.ProgressCounter("build:1", done, 1000), unit)
@@ -2409,6 +2541,11 @@ def write_browser_fixture(folder: Path) -> None:
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(
                   base.explanation.now, (placed,)))):
             pages["macroute_running"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
+        # The proof serves each reading's report as report.json and shows it with its reading.
+        default_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days))
+        for name, page in pages.items():
+            report = reports.get(name, default_report)
+            cast(dict[str, object], page).update(report_version=report.version, report=cast(object, json.loads(report.text)))
         _ = (folder / "fixtures.json").write_text(json.dumps(pages))
     finally:
         _ = fixture.doCleanups()
