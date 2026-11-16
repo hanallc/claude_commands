@@ -65,9 +65,9 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(markup.pages, ["accounts", "aws", "builds", "changes", "disks", "images", "questions"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 17)
-        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 7)
-        self.assertEqual(source.count('<span class="new-mark" hidden>'), 6)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 19)
+        self.assertEqual(source.count('class="lucide lucide-sparkle"'), 8)
+        self.assertEqual(source.count('<span class="new-mark" hidden>'), 7)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
