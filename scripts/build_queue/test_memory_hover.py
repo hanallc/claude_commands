@@ -247,8 +247,10 @@ class MemoryHoverTests(unittest.TestCase):
         for keep_text, queued, expected in (
             ("need 11.3 GiB\nfull need: no matching anonymous profile", True,
              "full need: no matching anonymous profile. The queue holds this memory for the run."),
-            ("Memory the compiler cache holds outside the build queue", False,
-             "Memory the compiler cache holds outside the build queue. Host free memory already accounts for this use."),
+            ("Memory the compiler cache holds. The queue does not start it.", False,
+             "Memory the compiler cache holds. The queue does not start it. Host free memory already accounts for this use."),
+            ("Memory these processes hold. The queue did not start them.", False,
+             "Memory these processes hold. The queue did not start them. Host free memory already accounts for this use."),
             ("", False, "It reserves no memory. Host free memory already accounts for this use."),
         ):
             with self.subTest(keep_text=keep_text, queued=queued):
@@ -319,11 +321,11 @@ class MemoryHoverTests(unittest.TestCase):
         for waiting in (False, True):
             with self.subTest(waiting=waiting):
                 running: list[dict[str, object]] = [
-                    {"name": "local build", "queued": True,
+                    {"name": "local build", "queued": True, "slot": 2,
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                     {"name": "merge gate", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
-                    {"name": "Mac builds", "kind": "cloud", "machine": "mac",
+                    {"name": "Mac builds", "kind": "cloud", "machine": "mac", "slot": 3,
                      "progress": {"kind": "NoProgress"}},
                     {"name": "cloud test", "kind": "cloud", "machine": "aws",
                      "progress": {"kind": "RowProgress", "phase": "testing"}},
@@ -349,13 +351,16 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU"])
+                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:{index}']")
                     assert row is not None
                     self.assertEqual(row[0].get("class"), "place")
                     self.assertEqual(row[0].text, expected)
+                    self.assertEqual(row.findtext("td[@class='slot']"), "2" if index == 0 else "3" if index == 2 else "—")
+                    self.assertEqual(row[-1].get("class"), "slot")
+                    self.assertEqual(row[-2].get("class"), "vcpus")
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
@@ -368,8 +373,9 @@ class MemoryHoverTests(unittest.TestCase):
                         row = table.find(f"./tbody/tr[@data-tip='wait:{index}']")
                         assert row is not None
                         self.assertEqual(row[0].text, expected)
+                        self.assertIsNone(row.find("td[@class='slot']"))
                 for row in table.findall("./tbody/tr"):
-                    self.assertEqual(len(row), len(headers))
+                    self.assertEqual(len(row), len(headers) - int(row.get("class", "").startswith(("wait", "queue-head"))))
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):

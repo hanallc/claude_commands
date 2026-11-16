@@ -54,7 +54,7 @@ from scripts.build_queue.scope_activity import LiveBuildRun, NotServiceSlice, Ru
 from scripts.build_queue import admission_records, target_availability
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
-from scripts.lib import conf
+from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import console_theme, page_frame, review_link
@@ -406,6 +406,7 @@ class RunRow(RowQueueNotes):
     admitted: NotRequired[bool]
     machine: NotRequired[str]
     vcpus: NotRequired[int | queue_view.UnknownCpuCount]
+    slot: NotRequired[int | Literal["—"]]
     age: NotRequired[str]
     between_steps: NotRequired[bool]
     name: str
@@ -495,6 +496,7 @@ class MacBuildRow(RowQueueNotes):
     stage: queue_view.MacBuildStage
     progress: RowProgress | NoProgress
     vcpus: int | queue_view.MacJobsUnavailable
+    slot: int | Literal["—"]
 
 
 class MacReadingUnavailableRow(RowQueueNotes):
@@ -846,8 +848,27 @@ def mac_build_units(builds: Sequence[queue_view.MacBuild],
     return result
 
 
+def build_slot_number(folder: str, machine: str, roots: Mapping[str, str], *, home: str) -> int | Literal["—"]:
+    """Read the slot number from a direct child of the machine's configured root."""
+    root = build_slots.slot_root(roots, machine)
+    if not root or not folder:
+        return "—"
+    uses_home = root == "~" or root.startswith("~/") or re.search(r"\$(?:HOME\b|\{HOME\})", root)
+    if uses_home and not home:
+        return "—"
+    root = re.sub(r"\$(?:HOME\b|\{HOME\})", lambda _: home, root)
+    if root == "~" or root.startswith("~/"):
+        root = home + root[1:]
+    # Compare the Mac root unresolved; the page cannot resolve Mac paths locally.
+    configured = Path(os.path.realpath(root) if machine == host_name() else os.path.normpath(root))
+    run_folder = Path(os.path.normpath(folder))
+    match = re.fullmatch(r".+-slot([1-9][0-9]*)", run_folder.name)
+    return int(match[1]) if match and run_folder.parent == configured else "—"
+
+
 def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading,
-                 identity: unit_labels.UnitLabels, *, names: StepNames) -> MacBuildRow:
+                 identity: unit_labels.UnitLabels, *, names: StepNames,
+                 slot_roots: Mapping[str, str], slot_machine: str) -> MacBuildRow:
     """Keep Mac memory and its stage separate from natedev admission values."""
     label = ci_step_label(build.ci_runner, build.ci_job) if build.origin is queue_view.MacBuildOrigin.CI else ""
     gate = queue_view.gate_label_text(build)
@@ -859,6 +880,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
+            "slot": build_slot_number(build.folder, slot_machine, slot_roots, home=reading.home),
             "progress": ({"kind": "RowProgress", "phase": "testing" if build.counter.phase.startswith("test:") else "building",
                           "done": build.counter.done, "total": build.counter.total, "percent": build.counter.percent,
                           "unit": "tests" if build.counter.phase.startswith("test:") else "units"}
@@ -1426,7 +1448,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                program_rows: int) -> RamBlocks:
     """Give each bar block one amount: covered reserves, program RAM, the kernel, the cache and the rest.
 
-    The queued builds, CI, reservation and room blocks are the queue cap terms; they add to the cap.
+    Build tools, queued builds, CI, reserved memory and free memory add to the queue cap.
     """
     available, safety, swap, build = room.available, room.safety, room.agent_swap_demand, room.kept
     safety_covered = min(safety, available)
@@ -1511,6 +1533,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
     snapshots = target_availability.read_snapshots()
+    slot_roots = conf.read_or_repository("build_folders").values()
+    mac_reading = queue_view.read_mac_builds()
+    mac_machine = conf.read_or_repository("machines").words("mac.hosts")[0]
+    slot_homes = {mac_machine: mac_reading.home, host_name(): str(Path.home())}
     labels = unit_labels.unit_labels_for(
         [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
          *target_availability.holder_sessions(snapshots)], os.environ)
@@ -1566,6 +1592,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
         walk.append({"name": name, **page_owner_labels(identity, ci_label=ci_label), "between_steps": step is None,
                      "state": "", "pid": pid, "detail": detail, "used": use,
+                     "slot": build_slot_number(metadata.folder, admission_records.execution_host(metadata, host_name()), slot_roots,
+                        home=slot_homes.get(admission_records.execution_host(metadata, host_name()), ""))
+                        if metadata is not None else "—",
                      "counted": use + gib(hold.bytes) if isinstance(use, float) else use, "reserved": gib(hold.bytes),
                      "started_at": metadata.started_at if metadata is not None else 0,
                      "progress": row_progress(steps_by_owner.get(hold.memory.owner, ())),
@@ -1590,7 +1619,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at, "progress": row_progress((step,)),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
-                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount()}
+                "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
+                "slot": build_slot_number(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
+                    home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
             continue
         if isinstance(memory, (admission_records.UnownedSliceMemory, admission_records.CompilerServiceMemory)):
@@ -1606,9 +1637,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                     ci_name = "hana CI"
                     description = memory.diagnostic
                 else:
-                    description = "Memory the compiler cache holds outside the build queue"
+                    description = "Memory the compiler cache holds. The queue does not start it."
             else:
-                description = "Memory these processes hold outside the build queue"
+                description = "Memory these processes hold. The queue did not start them."
                 if isinstance(memory, admission_records.UnownedSliceMemory) and isinstance(memory.activity, ScopeProcesses):
                     name = memory.activity.program
             row: RunRow = {"name": name, "showrunner": "", "unit": unit, "state": state, "pid": (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid), "detail": detail, "used": gib(memory.bytes),
@@ -1635,7 +1666,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         amount = sum(row["used"] for row in members if isinstance(row["used"], float))
         walk.append({"name": f"{name} ({len(members)})", "showrunner": "", "unit": "", "state": "", "pid": admission_records.PidNotRecorded(), "detail": "each under 0.5 GiB",
                      "used": amount, "counted": 0.0, "reserved": 0.0, "started_at": 0,
-                     "queued": False, "keep_text": "Memory these processes hold outside the build queue",
+                     "queued": False, "keep_text": "Memory these processes hold. The queue did not start them.",
                      "progress": {"kind": "NoProgress", "reason": "group has no admission counter"},
                      "group": name, "ci": False, "parts": [{"who": row["detail"], "pid": row["pid"],
                          "gib": row["used"], "age": row.get("age", "")}
@@ -1668,7 +1699,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "runs_on": "" if ci_label else local_runs_on(
                             routes.fit(waiter.step, waiter.folder, waiter.package))})
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
-    mac_reading = queue_view.read_mac_builds()
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
         work_rows.append({"kind": "mac-unavailable", "name": "Mac builds", "unit": "—",
@@ -1677,7 +1707,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             "stage": queue_view.MacStageUnavailable(), "vcpus": queue_view.MacJobsUnavailable(), "status": mac_status})
     else:
         mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
-        work_rows.extend(mac_work_row(build, mac_reading, mac_units.get(build.pid, unit_labels.UnitLabels("")), names=names)
+        work_rows.extend(mac_work_row(build, mac_reading, mac_units.get(build.pid, unit_labels.UnitLabels("")),
+                                     names=names, slot_roots=slot_roots, slot_machine=mac_machine)
                          for build in mac_reading.builds)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters)
