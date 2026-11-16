@@ -192,7 +192,8 @@ class ConsoleTests(unittest.TestCase):
     def test_one_news_request_reads_the_change_lists_once_for_both_pages(self) -> None:
         change = change_browser.WaitingChange("a/C1", "a", UnavailableProduction(Path("fixture.md")), {"#": "C1"})
         question = cast(change_browser.WaitingQuestion, cast(object, SimpleNamespace(key="question/q1")))
-        reviews = change_browser.PreparedReviews((change,), {}, (question,), (), cast(staff.StaffSnapshot, cast(object, None)))
+        reviews = change_browser.PreparedReviews(
+            changes=(change,), queues={}, orders={}, questions=(question,), question_tabs=(), record=staff.StaffSnapshot(()))
         with patch.object(change_browser, "console_reviews", return_value=reviews) as read:
             self.assertEqual(console.news(self.root / "snapshots", console.read_pages(), "changes"), ())
         self.assertEqual(read.call_count, 1)

@@ -4332,7 +4332,7 @@ BoardTone = Literal["default", "success", "error", "warning", "inactive"]
 
 
 class BoardSpan(TypedDict):
-    """One styled piece of a board cell; the console Accounts page and the unit-board plugin draw it as it is."""
+    """One styled piece of a board cell; the console Accounts page draws it as it is."""
     text: str
     tone: BoardTone
     kind: Literal["fact", "bold"]
@@ -4345,7 +4345,7 @@ class BoardColumn(TypedDict):
 
 
 class BoardRow(TypedDict):
-    """The cells of one table line, and the same facts for a pane too narrow for the table."""
+    """The cells of one table line, and the same facts as a list of short lines."""
     cells: dict[str, list[BoardSpan]]
     facts: list[list[BoardSpan]]
 
@@ -5686,15 +5686,20 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
     return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
 
 
+def _session_counts_failure() -> Path:
+    return _session_counts_cache().with_name("peer_session_counts_failed.json")
+
+
 def _fetch_session_counts() -> int:
-    """Fetch only the other machine's local counts through the shared transport."""
+    """Fetch the other machine's counts; a failed read keeps the last good copy for its age limit."""
     try:
         machine = remote.other_machine()
         text = role_map.ssh_role_map(("session-counts-read",), machine=machine)
         _ = _decode_session_counts(text, machine)
         atomic_file.write_text_atomic(_session_counts_cache(), text)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        atomic_file.write_text_atomic(_session_counts_failure(), json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(), "reason": f"{type(error).__name__}: {error}"}))
         return 1
     return 0
 
@@ -5733,10 +5738,7 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
-    if not available:
-        peer_accounts = {}
+    _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
