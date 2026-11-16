@@ -26,7 +26,7 @@ from typing import BinaryIO, cast
 from uuid import uuid4
 
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, conf, git_files, git_rescue
+from scripts.lib import build_folders, conf, copy_record, git_files, git_rescue
 
 
 SLOT_NAME = re.compile(r"(.+)-slot([1-9][0-9]*)")
@@ -175,6 +175,44 @@ def _maximum(pool: RepositoryPool) -> int:
     return configured_maximum(settings, pool.machine, pool.repository)
 
 
+def _slot_repository(source: Path) -> Path:
+    """Follow registered copies to a repository that can own persistent worktrees."""
+    seen: set[Path] = set()
+    while True:
+        record_path = copy_record.record_path(source)
+        # Session folders also hold task clones outside the configured scratch root.
+        record = copy_record.read_record(record_path if record_path is not None else source / copy_record.RECORD)
+        if isinstance(record, copy_record.NotRegistered):
+            return source
+        if source in seen:
+            raise SlotGitFailure(f"slots: copy sources form a cycle at {source}; cannot create a persistent slot")
+        seen.add(source)
+        original = record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None
+        if not isinstance(original, str) or not original or not Path(original).is_dir():
+            raise SlotGitFailure(f"slots: {source} has no available persistent source; create its pool from the original repository")
+        source = source_checkout(Path(original))
+
+
+@contextmanager
+def _slot_commit(path: Path, source: Path, commit: str, descriptor: int) -> Generator[None]:
+    """Keep an imported commit reachable only while its slot lease remains held."""
+    if git_files.at(path).common_dir == git_files.at(source).common_dir:
+        yield
+        return
+    reference = f"refs/build-slots/{path.name}"
+    previous = _git(path, "rev-parse", "HEAD", pass_fds=(descriptor,))
+    branches = _git(path, "for-each-ref", "--format=%(objectname)", "refs/heads", "refs/remotes",
+                    pass_fds=(descriptor,)).splitlines()
+    try:
+        _ = _git(path, "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--",
+                 str(source), f"{commit}:{reference}", pass_fds=(descriptor,))
+        if not _git(path, "merge-base", reference, previous, *branches, accepted=(0, 1), pass_fds=(descriptor,)):
+            raise SlotRepositoryMismatch(path, source)
+        yield
+    finally:
+        _ = _git(path, "update-ref", "-d", reference, pass_fds=(descriptor,))
+
+
 def _rescue(path: Path) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     name = f"{path.name}-{stamp}"
@@ -226,25 +264,27 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
     pool = _pool(source)
     maximum = _maximum(pool)
     checkout = build_folders.SlotCheckout(pool.source, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
+    repository = _slot_repository(pool.source)
+    creation = (checkout if repository == pool.source else
+                build_folders.SlotCheckout(repository, _git(repository, "rev-parse", "HEAD^{commit}")))
     for number in range(1, maximum + 1):
         spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
                                             repository=pool.repository, slot=number, showrunner=showrunner,
-                                            unit=unit, work=work, purpose=purpose, slot_checkout=checkout,
+                                            unit=unit, work=work, purpose=purpose, slot_checkout=creation,
                                             machine=pool.machine)
         with ExitStack() as held:
             try:
                 path = held.enter_context(build_folders.slot_build_folder(spec))
             except BlockingIOError:
                 continue
-            if git_files.at(path).common_dir != git_files.at(pool.source).common_dir:
-                raise SlotRepositoryMismatch(path, pool.source)
             descriptor = build_folders.build_folder_lock_fd(path)
+            _ = held.enter_context(_slot_commit(path, pool.source, checkout.commit, descriptor))
             (git_files.at(path).git_dir / "index.lock").unlink(missing_ok=True)
             target = path / "target"
             if target.is_symlink():
                 target.unlink()
                 target.mkdir()
-            _exclude_slot_target(pool.source, path, descriptor)
+            _exclude_slot_target(path, path, descriptor)
             _rescue(path)
             _ = _git(path, "update-index", "--really-refresh", accepted=(0, 1), pass_fds=(descriptor,))
             _ = _git(path, "checkout", "--force", "--detach", checkout.commit, pass_fds=(descriptor,))
