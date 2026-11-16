@@ -838,9 +838,18 @@ try {
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
-            assert.equal(overHeader.sum,shortReading.cap.toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
+            // Taken counts the full reserve, so it reads 1 GiB more than the cap.
+            assert.equal(overHeader.sum,(shortReading.cap+1).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 1.0 GiB over cap');
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
-            assert.ok(overHeader.hover.includes('Over cap: 1.0 GiB of build reserves do not fit under the cap.'),overHeader.hover);
+            assert.ok(overHeader.hover.includes('= Taken: '+(shortReading.cap+1).toFixed(1)+' GiB.\nThat is 1.0 GiB over the '+shortReading.cap.toFixed(1)+' GiB queue cap, so nothing is free.'),overHeader.hover);
+            // Every number adds up as the user reads it: Taken = Builds + Build reserved, and over cap = Taken - Queue cap.
+            const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
+            const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
+            const tip={builds:number(overHeader.hover,/Builds: ([0-9.]+) GiB/),reserved:number(overHeader.hover,/Build reserved: ([0-9.]+) GiB/),
+              taken:number(overHeader.hover,/= Taken: ([0-9.]+) GiB/),over:number(overHeader.hover,/That is ([0-9.]+) GiB over/),cap:number(overHeader.hover,/over the ([0-9.]+) GiB queue cap/)};
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
             proof.overHeader=overHeader;
