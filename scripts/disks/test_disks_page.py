@@ -42,6 +42,9 @@ class DisksPageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
         self.assertIn(page_frame.STYLE, page)
+        self.assertIn('</h1><p class="page-status"', page)
+        self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
+        self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
         self.assertNotIn("__", page.split("<script>", 1)[0].split("</style>", 1)[1])
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)

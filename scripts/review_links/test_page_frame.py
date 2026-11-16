@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 from typing import cast, override
 
-from scripts.review_links import page_frame
+from scripts.review_links import console, page_frame
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -46,6 +46,27 @@ class PageStatusTests(unittest.TestCase):
         limits = {key for key in conf.read_or_repository("console").values() if key.startswith("status.") and key.endswith(".age_limit_seconds")}
         self.assertEqual(limits, {f"status.{page}.age_limit_seconds" for page in (
             "accounts", "aws", "builds", "changes", "disks", "images", "investigations", "questions")})
+
+    def test_age_uses_seconds_then_whole_minutes_on_every_page(self) -> None:
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        for page in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'questions'):
+            with self.subTest(page=page):
+                match = re.search(r'data-status-options="([^"]+)"', page_frame.title(page.title(), page))
+                assert match is not None
+                source = self.environment(html.unescape(match[1])) + page_frame.REFRESH_SCRIPT + r'''
+(async()=>{
+ const refresh=createPageRefresh(async()=>({readAt:now/1000,renderSeconds:.03}));
+ await refresh.refresh();
+ const start=now;
+ for(const [seconds,expected] of [[0,'0 s ago'],[59,'59 s ago'],[60,'1 min ago'],[119,'1 min ago'],[7200,'120 min ago']]){
+  now=start+seconds*1000;refresh.changed();
+  if(parts.age.textContent!==expected) throw new Error(parts.age.textContent+' != '+expected);
+ }
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+                done = subprocess.run([node, '-e', source], text=True, capture_output=True, timeout=20)
+                self.assertEqual((done.returncode, done.stdout.strip()), (0, 'PASS'), done.stderr)
 
     def test_invalid_initial_facts_report_failed_without_an_unhandled_rejection(self) -> None:
         markup = page_frame.title("AWS", "aws")
@@ -258,6 +279,30 @@ window.fetch=async(url,options={})=>{
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
   check(part('render').textContent==='render 0.42 s','the real loader supplies render time');
+  check(!part('trip').hidden && /^round trip [\d.]+ s$/.test(part('trip').textContent),
+   'the Live line shows round trip before render time');
+  const positions=[...line.children].filter(node=>!node.hidden && !node.matches('[data-status-announcement]'));
+  check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
+   positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
+  const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
+  const mainBox=document.querySelector('main').getBoundingClientRect(),width=document.documentElement.clientWidth;
+  check(mainBox.width===Math.min(width,1124) && Math.abs(mainBox.left-(width-mainBox.right))<1,
+   'the page uses the shared centered column');
+  check(titleBox.x===mainBox.x+32 && titleBox.y+scrollY===32,'the title starts at the shared column edge');
+  check(lineBox.x===titleBox.x && lineBox.y===titleBox.bottom+8,'the line follows the title in the same column');
+  check(lineBox.width===titleBox.width && lineBox.height===21,'the line uses the full title width and shared height');
+  check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
+   'the title uses the shared size and weight');
+  check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&
+   getComputedStyle(line).marginBottom==='20px','the line uses the shared font and lower space');
+  const ink=document.createElement('span');ink.style.color='var(--ink)';line.append(ink);
+  check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
+  check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,
+   'the line uses the page background without a separate band');
+  const content=document.querySelector('[data-review-content],[data-investigations],[data-image-layout]');
+  if(content) check(content.getBoundingClientRect().x===titleBox.x,'the page content starts at the title edge');
+  const icon=line.querySelector('[data-status-icon=Live] svg').getBoundingClientRect();
+  check(icon.width===16 && icon.height===16,'the Live icon uses the shared size');
   const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations]');
   if(root) check(root.dataset.loaded==='true','the real loader replaces page content');
   if(expectedPeriod) check(!!requestTimer(),'the real request period runs');
@@ -343,6 +388,15 @@ window.fetch=async(url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
     page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
+    match = re.search(r'<title>([^<]+)</title>', markup)
+    assert match is not None
+    identity = match[1].split()[0].lower()
+    with patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}):
+        settings = conf.read("console").values()
+        pages = tuple(console.ConsolePage(name, settings[f"page.{name}.label"], settings[f"page.{name}.icon"],
+                                         settings[f"page.{name}.title"], console.AvailablePage('/page'))
+                      for name in ('accounts', 'aws', 'builds', 'changes', 'disks', 'images', 'investigations', 'questions'))
+        shell = console.render(pages, console.UnavailablePage()).replace(b'</body>', b'<img hidden src="/complete"></body>')
     results: list[list[str]] = []
     complete = threading.Event()
 
@@ -353,13 +407,18 @@ window.fetch=async(url,options={})=>{
             self.end_headers()
             if self.path == '/complete':
                 _ = complete.wait(TEST_HANG_GUARD_SECS)
-            elif self.path == '/':
-                _ = self.wfile.write(b'<iframe src="/page"></iframe><img hidden src="/complete">')
+            elif self.path.startswith('/?page='):
+                _ = self.wfile.write(shell)
             else:
                 _ = self.wfile.write(page)
 
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers['Content-Length']))
+            if self.path != '/results':
+                self.send_response(200)
+                self.end_headers()
+                _ = self.wfile.write(b'{"new":[]}')
+                return
             results.append(cast(list[str], json.loads(body)))
             complete.set()
             self.send_response(204)
@@ -376,8 +435,9 @@ window.fetch=async(url,options={})=>{
             profile = Path(temporary) / 'profile'
             profile.mkdir()
             done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                   '--window-size', '1600,900',
                                    '--screenshot', str(Path(temporary) / 'page.png'),
-                                   f'http://127.0.0.1:{server.server_port}/'],
+                                   f'http://127.0.0.1:{server.server_port}/?page={identity}'],
                                   capture_output=True, text=True, timeout=45)
             case.assertEqual(done.returncode, 0, done.stderr)
         finally:

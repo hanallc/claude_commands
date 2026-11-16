@@ -243,6 +243,8 @@ class ImagesTests(ImagesFixture):
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
         source = images.render(self.root).decode()
+        self.assertIn('</h1><p class="page-status"', source)
+        self.assertLess(source.index('data-page-status '), source.index('<div data-image-layout'))
         assert_status_states(self, source, 0)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")

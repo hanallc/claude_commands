@@ -96,8 +96,15 @@ Its title is **Hana console**, followed by the selected page title.
 
 The left navigation has icons and labels for Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions, in alphabetical order.
 The desktop has no top bar: each page shows its title once, as its own heading.
-Every page uses `page_frame.STYLE`. The content column is centered in the frame, 32px below its top edge, with at least 32px at each side.
+Every page uses `page_frame.STYLE`.
+Each page centers its main column in the console frame, with a maximum width of 1124px.
+The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
+The title, status line and content use the same centered column on all eight pages.
+Cards and form controls keep their page styles.
+Every page uses the shared background and text colors.
+The status line has the same background as the page.
+The frame reserves scrollbar space, so short and long pages keep the same column position.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
@@ -109,7 +116,7 @@ Builds and Disks keep the shown data time when a later read or measure fails.
 A first read shows only Reading until data arrives.
 A slow read retains the last data time and timings.
 The age increases each second without a request.
-After one minute, the age includes the data time and zone.
+After one minute, the line shows the age in whole minutes, without a clock time or zone.
 Round trip covers request start through the first frame after the data appears.
 Render time comes from the server or the data writer.
 The browser does not estimate render time.
@@ -131,7 +138,7 @@ The Changes and Questions pages show Paused while text or an active save holds a
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-AWS, Builds, Changes, Images, Investigations, Questions and Rebuilds put the title in the same place.
+Accounts, AWS, Builds, Changes, Disks, Images, Investigations and Questions put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
