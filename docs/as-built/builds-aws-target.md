@@ -35,6 +35,24 @@ These files do not provision a machine or add a deployment command.
 Phase D must install and enable the units before the box accepts work.
 `config/hana_aws.conf` keeps placement disabled and supplies all safety timing and resource values.
 
+`scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
+It writes nine files by base name and applies each `GuestFile` mode.
+Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
+Phase F2 supplies the tool setup service.
+
+The NixOS build uses the renderer from its pinned `claude-commands` input.
+`scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
+The filter excludes unrelated repository changes from the image inputs.
+The NixOS integration replaces the manually copied guest files.
+
+Run this command from the repository root:
+
+```sh
+python3 -E -m scripts.aws_target.hana_render --device /dev/sdf <out_dir>
+```
+
+`-E` ignores `PYTHONPATH`, so the listed files alone supply the imports.
+
 The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
 It has no ordering or requirement dependency on the data disk, network, or tool setup.
 Tool setup runs after the guard and requires the bounded data mount.
