@@ -429,12 +429,10 @@ class UnitPhasesTests(unittest.TestCase):
                 _ = self.write_run(member, "activity", [("board", "Readable board")], actors)
                 rendered = self.blocks([member], {}, workers=workers)
                 current = [row for row in detail_rows(rendered, "activity") if row.work == "Readable board (board)"]
-                expected = "Fix worker runs it" + ("" if duplicate else " Director reviews the fixes")
+                expected = "Fix worker runs it" + ("" if duplicate else "; director reviews the fixes")
                 self.assertEqual(current, [DetailRow("Now", "Readable board (board)", expected)])
                 self.assertEqual(rendered.count("Fix worker runs it"), 1)
-                if not duplicate:
-                    self.assertIn("| Now | Readable board (board) | Fix worker runs it |", rendered)
-                    self.assertIn("| Now |  | Director reviews the fixes |", rendered)
+                self.assertNotIn("| Now |  |", rendered)
         tail.append(self.phase_event("activity_finished", "board", activity_instance_id="new",
                                     timestamp_epoch=datetime(2026, 11, 15, 17, 57, tzinfo=UTC).timestamp()))
         _ = self.write_run(member, "activity", [("board", "Readable board")], tail)
@@ -457,6 +455,24 @@ class UnitPhasesTests(unittest.TestCase):
                 idle = self.blocks([member], {}, statuses=["idle"])
                 self.assertIn(("Now", title + " (39)", "Director's current step not recorded"),
                               detail_rows(idle, "inline"))
+
+    def test_queue_work_is_a_short_title_with_a_capital_only_for_a_plain_word(self) -> None:
+        cases = [
+            ("startlock: detached_runs.py completion callback must not take .start.lock again (recursive); "
+             + "test a cancelled run (sdlc ee7cfccd; after acctload)",
+             "detached_runs.py completion callback must not take .start.lock again (startlock)"),
+            ("acctcolor: one #rrggbb color per account in statusline.conf account.<label>; every reader accepts it",
+             "One #rrggbb color per account in statusline.conf account.<label> (acctcolor)"),
+            ("acctchooser: swatch and picker popup on the console Accounts page (Try, Save, Cancel); Save through tune.change",
+             "Swatch and picker popup on the console Accounts page (acctchooser)"),
+            ("Review delivery", "Review delivery"),
+        ]
+        for text, work in cases:
+            with self.subTest(text=text):
+                land = land_queue.LandView({}, land_queue.NoLine(), {}, frozenset(), {})
+                item = unit_phases.queued_text(unit_queue.QueuedItem(text), None, land,
+                                               now=0, zone=ZoneInfo("America/New_York"))
+                self.assertEqual(item, unit_phases.WorkItem(work, "Ready"))
 
     def test_no_task_is_shown_once_its_step_or_phase_has_closed(self) -> None:
         member = self.member("closed")

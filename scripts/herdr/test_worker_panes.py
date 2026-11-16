@@ -1730,21 +1730,118 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(len(self.world.launches), 2)
 
     def test_fresh_codex_publishes_the_first_turn_report_and_sends_no_second_turn(self) -> None:
-        first = self.start("reviewer", "review")
-        self.assertIsInstance(first, worker_panes.OpenWorker)
-        assert isinstance(first, worker_panes.OpenWorker)
-        report = cast(dict[str, str], self.world.locations[first.pane]["agent_session"])
-        self.assertEqual(first.row.current_session, report["value"])
-        self.assertIn("--no-daemon", self.world.requests[0][1])
-        prompts = self.prompts()
-        self.assertEqual(len(prompts), 1)
-        self.assertIn("Reply with ready. Do not use tools.", prompts[0][-1])
-        before = self.staff_state()
-        again = self.start("reviewer", "review")
-        self.assertEqual(again, first)
-        self.assertEqual(self.staff_state(), before)
-        self.assertEqual(self.prompts(), prompts)
-        self.assertEqual(len(self.world.launches), 1)
+        cases = (("current", "OpenWorker", "none", "yes"),
+                 ("cached", "OpenWorker", "none", "yes"),
+                 ("starting", "ClosedWorker", "starting", "no"),
+                 ("stopped", "StoppedWorker", "none", "yes"),
+                 ("missing", "ClosedWorker", "none", "no"))
+        for mode, state_kind, scan_reason, parent_tab in cases:
+            with self.subTest(mode=mode), ExitStack() as scope:
+                name = "reviewer-" + mode
+                reports: list[str] = []
+                launch_count = len(self.world.launches)
+                prompt_count = len(self.prompts())
+                read = self.world.result
+                run = self.world.run
+                launch = self.world.launch
+                native = self.world.native_process
+
+                def published() -> bool:
+                    return any(row.name == name for row in staff.snapshot().find(kind="worker", parent=self.parent.id))
+
+                def reply(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    payload = read(*arguments, deadline=deadline)
+                    pane_id = next((identity for identity, pane in self.world.locations.items()
+                                    if pane.get("label") == "unit-" + name), "")
+                    if arguments[:2] == ("pane", "list"):
+                        panes = [dict(herdr.json_object(item, "fixture pane"))
+                                 for item in herdr.json_items(payload["panes"], "fixture panes")]
+                        for pane in panes:
+                            if pane["pane_id"] == pane_id:
+                                reports.append(herdr.pane_session(pane))
+                                if mode == "starting" and published():
+                                    for field in ("agent_session", "session_id"):
+                                        if field in pane:
+                                            del pane[field]
+                        if published():
+                            if mode == "starting":
+                                panes = [pane for pane in panes if pane["pane_id"] != "w1:p0"]
+                            elif mode == "missing":
+                                panes = [pane for pane in panes if pane["pane_id"] != pane_id]
+                        return {**payload, "panes": panes}
+                    if (mode == "stopped" and published() and arguments[:2] == ("pane", "process-info")
+                            and arguments[-1] == pane_id):
+                        info = dict(herdr.json_object(payload["process_info"], "fixture processes"))
+                        info.update(foreground_process_group_id=info["shell_pid"], foreground_processes=[])
+                        return {**payload, "process_info": info}
+                    return payload
+
+                def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                    if mode == "cached" and arguments[:2] == ("pane", "list"):
+                        return super(PaneWorld, self.world).result(*arguments, deadline=deadline)
+                    return reply(*arguments, deadline=deadline)
+
+                def transport(*arguments: str, deadline: float = math.inf) -> str:
+                    if mode == "cached" and arguments[:2] == ("pane", "list"):
+                        return json.dumps({"result": reply(*arguments, deadline=deadline)})
+                    return run(*arguments, deadline=deadline)
+
+                def started(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                            prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                            opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *, agent: str,
+                            reported_unknown: str = "",
+                            agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+                    launched = launch(session, destination, prepared, kind, arguments, opening, timeout_ms,
+                                      agent=agent, reported_unknown=reported_unknown, agent_name=agent_name)
+                    if mode == "cached":
+                        _ = scope.enter_context(herdr.observation_snapshot())
+                    return launched
+
+                def process(pid: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+                    observed = self.world.processes[pid]
+                    if kind == "codex" and observed.environment.get("UNIT_TEAM_ROLE") == name and not reported:
+                        raise herdr.CodexPaneStarting(herdr.StartingCodexPane(pid))
+                    return native(pid, kind, reported)
+
+                _ = scope.enter_context(patch.object(self.world, "result", side_effect=result))
+                _ = scope.enter_context(patch.object(self.world, "run", side_effect=transport))
+                _ = scope.enter_context(patch.object(herdr, "launch_prepared_agent", side_effect=started))
+                _ = scope.enter_context(patch.object(herdr, "native_process", side_effect=process))
+                _ = scope.enter_context(patch.object(time, "monotonic", return_value=100.0))
+                _ = scope.enter_context(patch.object(time, "sleep", side_effect=AssertionError("worker start must not sleep")))
+                _ = scope.enter_context(patch.object(Event, "wait", side_effect=AssertionError("worker start must not wait")))
+                with redirect_stderr(io.StringIO()) as notes:
+                    first = self.start(name, "review")
+                self.assertEqual(len(self.world.launches), launch_count + 1)
+                prompts = self.prompts()
+                self.assertEqual(len(prompts), prompt_count + 1)
+                self.assertIn("Reply with ready. Do not use tools.", prompts[-1][-1])
+                self.assertIn("--no-daemon", self.world.requests[-1][1])
+                self.assertEqual(self.world.closed, [])
+                if state_kind != "OpenWorker":
+                    self.assertIsInstance(first, worker_panes.UncertainWorker)
+                    assert isinstance(first, worker_panes.UncertainWorker)
+                    self.assertIn("agent launch is incomplete", first.reason)
+                    self.assertIn("state=" + state_kind, first.reason)
+                    self.assertIn("scan=" + scan_reason, first.reason)
+                    self.assertIn("parent_tab=" + parent_tab, first.reason)
+                    self.assertEqual(len(first.reason.splitlines()), 1)
+                    self.assertIn(first.reason, notes.getvalue())
+                    self.assertEqual(staff.by_id(first.row.id), first.row)
+                    continue
+                self.assertIsInstance(first, worker_panes.OpenWorker)
+                assert isinstance(first, worker_panes.OpenWorker)
+                report = cast(dict[str, str], self.world.locations[first.pane]["agent_session"])
+                self.assertEqual(first.row.current_session, report["value"])
+                if mode == "cached":
+                    self.assertIn("", reports)
+                    self.assertEqual(reports[-1], first.row.current_session)
+                before = self.staff_state()
+                again = self.start(name, "review")
+                self.assertEqual(again, first)
+                self.assertEqual(self.staff_state(), before)
+                self.assertEqual(self.prompts(), prompts)
+                self.assertEqual(len(self.world.launches), launch_count + 1)
 
     def test_codex_start_interrupted_before_the_first_turn_reuses_the_same_terminal(self) -> None:
         self.world.interrupt = "agent"
@@ -1826,13 +1923,29 @@ class WorkerPaneTests(StaffTestCase):
                          cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
 
     def test_first_turn_wait_starts_after_the_session_report_is_available(self) -> None:
-        self.world.report_reads_before_publish = 2
-        result = self.start("reviewer", "review")
-        self.assertIsInstance(result, worker_panes.OpenWorker)
-        assert isinstance(result, worker_panes.OpenWorker)
-        self.assertEqual(result.row.current_session,
-                         cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
-        self.assertEqual(self.world.report_reads_at_wait, [0])
+        for pending_reads in (1, 2):
+            with self.subTest(pending_reads=pending_reads):
+                self.world.report_reads_before_publish = pending_reads
+                before = len(self.world.report_reads_at_wait)
+                prompt_count = len(self.prompts())
+                elapsed = 0.0
+
+                def advance(seconds: float) -> bool:
+                    nonlocal elapsed
+                    self.assertGreater(seconds, 0)
+                    self.assertLessEqual(seconds, 0.1)
+                    elapsed += seconds
+                    return False
+
+                with (patch.object(time, "monotonic", side_effect=lambda: elapsed),
+                      patch.object(Event, "wait", side_effect=advance)):
+                    result = self.start(f"reviewer-{pending_reads}", "review")
+                self.assertIsInstance(result, worker_panes.OpenWorker)
+                assert isinstance(result, worker_panes.OpenWorker)
+                self.assertEqual(result.row.current_session,
+                                 cast(dict[str, str], self.world.locations[result.pane]["agent_session"])["value"])
+                self.assertEqual(self.world.report_reads_at_wait[before:], [0])
+                self.assertEqual(len(self.prompts()), prompt_count + 1)
 
     def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
         path = self.root / "conf/direct.conf"
@@ -1864,7 +1977,9 @@ class WorkerPaneTests(StaffTestCase):
                 return herdr.NativeAgentProcess(herdr.LaunchArgument(row.current_session), process.started, process.environment)
             return process
 
-        with patch.object(herdr, "native_process", side_effect=resumed_process):
+        with (patch.object(herdr, "native_process", side_effect=resumed_process),
+              patch.object(time, "sleep", side_effect=AssertionError("resume must not wait for a report")),
+              patch.object(Event, "wait", side_effect=AssertionError("resume must not wait for a report"))):
             opened = self.start("reviewer", "review")
         self.assertIsInstance(opened, worker_panes.OpenWorker)
         assert isinstance(opened, worker_panes.OpenWorker)

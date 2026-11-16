@@ -113,8 +113,9 @@ A replacement process in that terminal stays open.
 
 `scripts/agents/detached_runs.py` starts and supervises long commands.
 Records and logs live under `<run>/detached_runs/`.
-`detached_run_process.py` proves supervisor identity before a caller signals its process group.
-The command shares that group through the systemd scope prefix.
+`detached_run_process.py` proves supervisor identity before a caller stops a run.
+The command runs in its own session, and the record saves its process group.
+`detached_runs.py stop` signals that group, so the supervisor stays alive and delivers the result.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.
