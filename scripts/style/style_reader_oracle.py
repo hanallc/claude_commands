@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import BinaryIO, NotRequired, Protocol, TypedDict, cast
 
-from scripts.style import declarations, style_footprint, style_plan, style_ledger
+from scripts.style import approved_renames, declarations, style_footprint, style_plan, style_ledger
 
 
 type Json = str | int | bool | None | list[Json] | dict[str, Json]
@@ -137,15 +137,15 @@ def body_token_value(file: declarations.DeclaredFile, text: str) -> Json:
             for token, line, start in zip(reading.tokens, reading.lines, reading.starts, strict=True)]
 
 
-def module_scan_value(reading: style_plan.ModuleDeclarationText) -> Json:
+def module_scan_value(reading: approved_renames.ModuleDeclarations) -> Json:
     items: list[Json] = []
     for item in reading.declarations:
         path: Json = "default"
-        if isinstance(item.path, style_plan.LiteralModulePath):
+        if isinstance(item.path, approved_renames.LiteralModulePath):
             path = {"literal": item.path.value}
-        elif isinstance(item.path, style_plan.UncertainDeclarationPath):
+        elif isinstance(item.path, approved_renames.UncertainDeclarationPath):
             path = "uncertain"
-        items.append({"name": item.name, "scope": [scope.name for scope in item.scope], "path": path})
+        items.append({"name": item.name, "scope": list(item.scope), "path": path})
     return {"declarations": items}
 
 
@@ -306,7 +306,7 @@ def answer(request: Request) -> None:
                             value = posix_words
                     case "module_scan":
                         scan = style_plan.module_declaration_text(text)
-                        if isinstance(scan, style_plan.UnreadableDeclarationText):
+                        if isinstance(scan, approved_renames.UnreadableDeclarationText):
                             emit(blob, fact, None, unreadable="token_spans")
                             continue
                         value = module_scan_value(scan)

@@ -46,10 +46,12 @@ from scripts.style import coverage_report
 from scripts.style import bulk_rename
 from scripts.style import finding_sites
 from scripts.style import mechanical_classes
-from scripts.style.approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
-                              MissingFile, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing,
-                              file_rename, inline_modules)
+from scripts.style.approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations,
+                              DefaultModulePath, FileRename, Folder, InlineModule, LiteralModulePath, MissingFile, ModuleDeclaration,
+                              ModuleDeclarations, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied,
+                              UncertainDeclarationPath, UncertainScan, UnreadableDeclarationText, applied_check, approved_rename,
+                              binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing, file_rename,
+                              inline_modules, module_name)
 from scripts.style import rules, style_config
 from scripts.style import style_ledger
 from scripts.style import style_reader
@@ -692,10 +694,22 @@ UNREAD_PATH_STRING = re.compile(r'(?<![\w])path(?:\s|/\*.*?\*/|//[^\n]*)*=(?:\s|
                                 re.DOTALL)
 
 
-def crate_root(repo: Path, file: str) -> PurePosixPath | NoCrateRoot:
+@dataclass(frozen=True)
+class UncachedCrateRoots:
+    """The caller has no refill cache for working tree folders."""
+
+
+_UNCACHED_CRATE_ROOTS = UncachedCrateRoots()
+
+
+def crate_root(repo: Path, file: str, *,
+               folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS) -> PurePosixPath | NoCrateRoot:
     """The nearest folder above the module file that holds a crate root file."""
+    checked: dict[PurePosixPath, bool] = {} if isinstance(folders, UncachedCrateRoots) else folders
     for folder in PurePosixPath(file).parents:
-        if any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs")):
+        if folder not in checked:
+            checked[folder] = any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs"))
+        if checked[folder]:
             return folder
     return NoCrateRoot()
 
@@ -713,12 +727,6 @@ def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
         if isinstance(table, dict) and isinstance(name := cast(dict[str, object], table).get("name"), str):
             return Library(name.replace("-", "_"))
     return NoLibrary()
-
-
-def module_name(file: str) -> str:
-    """The name a `mod` line declares the module file by: its folder's name for a `mod.rs`, else its stem."""
-    path = PurePosixPath(file)
-    return path.parent.name if path.name == "mod.rs" else path.stem
 
 
 @dataclass(frozen=True)
@@ -976,7 +984,9 @@ def _head_spans(before: str) -> tuple[style_footprint.TokenSpan, ...] | NoRename
 
 
 def _module_renames(repo: Path, path: str, before: str, old: tuple[style_footprint.TokenSpan, ...],
-                    moves: tuple[FileRename, ...]) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
+                    moves: tuple[FileRename, ...], *,
+                    folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS
+                    ) -> _ModuleRenames | NoRenamedText | UncertainModulePath:
     """Rename each module site of an approved file rename in the HEAD text of the Rust file at path, from its spans old.
 
     The scan reads the file's `plain_words`, and a raw site keeps its `r#`, so `mod r#lock;` takes
@@ -986,7 +996,7 @@ def _module_renames(repo: Path, path: str, before: str, old: tuple[style_footpri
 
     def scans() -> Generator[RenamedModuleScan | NoRenamedText]:
         for moved in moves:
-            root = crate_root(repo, moved.old)
+            root = crate_root(repo, moved.old, folders=folders)
             if isinstance(root, NoCrateRoot):
                 yield NoRenamedText()
                 return
@@ -1023,7 +1033,8 @@ def module_renames_from_scans(path: str, before: str, old: tuple[style_footprint
     return _ModuleRenames(words, tuple(renamed), comments, module_sites)
 
 
-def module_site_readings(repo: Path, path: str, before: str, moves: tuple[FileRename, ...]
+def module_site_readings(repo: Path, path: str, before: str, moves: tuple[FileRename, ...], *,
+                         folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS
                          ) -> tuple[ModuleSiteReading | NoRenamedText | UncertainModulePath, ...]:
     """Whether the Rust file at path names a module of each move, without the renamed code that `renamed_text` builds.
 
@@ -1034,7 +1045,7 @@ def module_site_readings(repo: Path, path: str, before: str, moves: tuple[FileRe
         return tuple(old for _ in moves)
     readings: list[ModuleSiteReading | NoRenamedText | UncertainModulePath] = []
     for moved in moves:
-        renames = _module_renames(repo, path, before, old, (moved,))
+        renames = _module_renames(repo, path, before, old, (moved,), folders=folders)
         readings.append(ModuleSiteReading(renames.module_sites) if isinstance(renames, _ModuleRenames) else renames)
     return tuple(readings)
 
@@ -1061,66 +1072,8 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     return RenamedText(style_footprint.canonical_code(tuple(renamed), renames.comments), renames.module_sites)
 
 
-@dataclass(frozen=True)
-class DefaultModulePath:
-    """The file module has no path attribute."""
-
-
-@dataclass(frozen=True)
-class LiteralModulePath:
-    """One plain path string belongs to a file module item."""
-
-    value: str
-
-
-@dataclass(frozen=True)
-class UncertainDeclarationPath:
-    """The module's path attribute can name any module file."""
-
-
-@dataclass(frozen=True)
-class ModuleDeclaration:
-    """A module item has a name, an inline scope, and a path form."""
-
-    name: str
-    scope: tuple[InlineModule, ...]
-    path: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
-
-
-@dataclass(frozen=True)
-class ModuleDeclarationText:
-    """A readable file's declaration syntax is independent of the requested module file."""
-
-    words: tuple[str, ...]
-    starts: frozenset[int]
-    modules: tuple[InlineModule, ...]
-    declarations: tuple[ModuleDeclaration, ...]
-
-    def declares(self, path: str, module: style_footprint.CrateModule, parent: tuple[str, ...], file: str) -> bool:
-        """Read the kept items for one module file without scanning its owner's text again."""
-        name, filename = module_name(file), PurePosixPath(file).name
-        for declaration in self.declarations:
-            if isinstance(declaration.path, UncertainDeclarationPath):
-                return True
-            if isinstance(declaration.path, LiteralModulePath):
-                named = declaration.path.value
-                if named.rsplit("/", 1)[-1] != filename:
-                    continue
-                if declaration.scope or posixpath.normpath(str(PurePosixPath(path).parent / named)) == file:
-                    return True
-            elif (declaration.name == name and not isinstance(module, style_footprint.OutsideCrate)
-                  and module + tuple(scope.name for scope in declaration.scope) == parent):
-                return True
-        return False
-
-
-@dataclass(frozen=True)
-class UnreadableDeclarationText:
-    """The token scan cannot read this file's declarations."""
-
-
-def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDeclarationText:
-    """Scan one file text and keep its words, item starts, inline modules, and declaration paths."""
+def module_declaration_text(text: str) -> ModuleDeclarations | UnreadableDeclarationText:
+    """Scan source and keep only its module declarations."""
     try:
         spans = style_footprint.token_spans(text)
     except style_footprint.UnreadableTokenSpans:
@@ -1141,22 +1094,20 @@ def module_declaration_text(text: str) -> ModuleDeclarationText | UnreadableDecl
                 and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
                 and words[owner + 2:owner + 3] == (";",)):
             paths[owner] = LiteralModulePath(named)
-    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""), enclosing(modules, owner),
+    declarations = tuple(ModuleDeclaration(next(iter(words[owner + 1:owner + 2]), ""),
+                                           tuple(module.name for module in enclosing(modules, owner)),
                                            paths.get(owner, DefaultModulePath()))
                          for owner in sorted(paths.keys() | {index for index, word in enumerate(words)
                                                               if word == "mod" and index in starts
                                                               and words[index + 2:index + 3] == (";",)}))
-    return ModuleDeclarationText(words, starts, modules, declarations)
+    return ModuleDeclarations(declarations)
 
 
-def reader_module_declaration_text(facts: style_reader.BlobFacts) -> ModuleDeclarationText | UnreadableDeclarationText:
-    """Restore module syntax from shared reader tokens without scanning source."""
+def reader_module_declaration_text(facts: style_reader.BlobFacts) -> ModuleDeclarations | UnreadableDeclarationText:
+    """Restore module declarations directly from the reader's module scan."""
     reading = facts.module_scan()
     if isinstance(reading, style_reader.UnreadableFact):
         return UnreadableDeclarationText()
-    words = plain_words(facts.tokens())
-    starts = style_footprint.code_item_starts(words)
-    modules = inline_modules(words, starts)
     declarations: list[ModuleDeclaration] = []
     for row in reading.declarations:
         location: DefaultModulePath | LiteralModulePath | UncertainDeclarationPath
@@ -1166,17 +1117,15 @@ def reader_module_declaration_text(facts: style_reader.BlobFacts) -> ModuleDecla
             location = DefaultModulePath()
         else:
             location = UncertainDeclarationPath()
-        scope = next((enclosing(modules, index) for index, word in enumerate(words)
-                      if word == "mod" and words[index + 1:index + 2] == (row.name,)
-                      and tuple(module.name for module in enclosing(modules, index)) == row.scope), ())
-        declarations.append(ModuleDeclaration(row.name, scope, location))
-    return ModuleDeclarationText(words, starts, modules, tuple(declarations))
+        declarations.append(ModuleDeclaration(row.name, row.scope, location))
+    return ModuleDeclarations(tuple(declarations))
 
 
-def declares_module(repo: Path, path: str, text: str | ModuleDeclarationText | UnreadableDeclarationText, file: str) -> bool:
+def declares_module(repo: Path, path: str, text: str | ModuleDeclarations | UnreadableDeclarationText, file: str, *,
+                     folders: dict[PurePosixPath, bool] | UncachedCrateRoots = _UNCACHED_CRATE_ROOTS) -> bool:
     """Read kept declaration syntax, or scan text supplied directly by a caller."""
     reading = module_declaration_text(text) if isinstance(text, str) else text
-    root = crate_root(repo, file)
+    root = crate_root(repo, file, folders=folders)
     if isinstance(reading, UnreadableDeclarationText) or isinstance(root, NoCrateRoot):
         return True
     module = style_footprint.crate_module(file, root)
@@ -2804,7 +2753,7 @@ class EditedFiles:
         self.readings: dict[FileRename, tuple[tuple[str, ModuleSiteReading | NoRenamedText | UncertainModulePath], ...]] = {}
         # The file moves of prepared findings with no saved footprint; the first module reading reads them all.
         self.pending: dict[FileRename, None] = {}
-        self.declarations: dict[str, ModuleDeclarationText | UnreadableDeclarationText] = {}
+        self.declarations: dict[str, ModuleDeclarations | UnreadableDeclarationText] = {}
         self.edited: dict[str, tuple[str, ...]] = {}
         self.named: dict[str, tuple[tuple[str, str], ...]] = {}
         self.footprints: dict[str, FindingFootprint] = {}
@@ -2881,27 +2830,29 @@ class EditedFiles:
             computed = (finding.path, *named_files)
         elif approved_renames.edits_module_owners(finding.kind, finding.path, finding.after):
             owners = (path for path, blob in self.declaring_versions(module_name(finding.path))
-                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path))
+                      if path != finding.path and declares_module(self.repo, path, self.declaration_text(blob), finding.path,
+                                                                 folders=self.ledger.crate_root_folders))
             computed = (finding.path, *owners)
         else:
             computed = (finding.path,)
         self.edited[finding.finding_id] = tuple(dict.fromkeys((*computed, *self.ledger.finding_needs(finding.finding_id))))
         return self.edited[finding.finding_id]
 
-    def declaration_text(self, blob: str) -> ModuleDeclarationText | UnreadableDeclarationText:
+    def declaration_text(self, blob: str) -> ModuleDeclarations | UnreadableDeclarationText:
         """Keep one declaration scan for each blob read during this refill."""
         self.required_blobs.add(blob)
-        if blob not in self.declarations:
-            if self.ledger.reader_source == style_config.ReaderSource.RUST:
+        if self.ledger.reader_source == style_config.ReaderSource.RUST:
+            if blob not in self.ledger.reader_module_declarations:
                 try:
-                    self.declarations[blob] = reader_module_declaration_text(self.ledger.blob_facts(blob))
+                    self.ledger.reader_module_declarations[blob] = reader_module_declaration_text(self.ledger.blob_facts(blob))
                 except style_reader.ReaderError as error:
                     raise style_ledger.CheckCouldNotRun(str(error)) from error
-            else:
-                self.declarations[blob] = self.ledger.finding_source_fact(
-                    "footprint_modules", blob, lambda: module_declaration_text(self.texts[blob]),
-                    lambda source: cast(ModuleDeclarationText | UnreadableDeclarationText,
-                                        decode_proof(source, proof_types(globals(), vars(approved_renames)))))
+            return self.ledger.reader_module_declarations[blob]
+        if blob not in self.declarations:
+            self.declarations[blob] = self.ledger.finding_source_fact(
+                "footprint_modules", blob, lambda: module_declaration_text(self.texts[blob]),
+                lambda source: cast(ModuleDeclarations | UnreadableDeclarationText,
+                                    decode_proof(source, proof_types(globals(), vars(approved_renames)))))
         return self.declarations[blob]
 
     def uncertain(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
@@ -3023,7 +2974,8 @@ class EditedFiles:
         if self.ledger.reader_source == style_config.ReaderSource.RUST:
             readings = self._reader_module_sites(movers)
         else:
-            readings = {(path, text): dict(zip(file_moves, module_site_readings(self.repo, path, text, tuple(file_moves)), strict=True))
+            readings = {(path, text): dict(zip(file_moves, module_site_readings(
+                        self.repo, path, text, tuple(file_moves), folders=self.ledger.crate_root_folders), strict=True))
                         for (path, text), file_moves in movers.items()}
         for moved, files in declaring.items():
             self.readings[moved] = tuple((file[0], readings[file][moved]) for file in files)
@@ -3040,7 +2992,7 @@ class EditedFiles:
             contexts: list[style_reader.ModuleMove] = []
             readings[path, text] = {}
             for moved in moves:
-                root = crate_root(self.repo, moved.old)
+                root = crate_root(self.repo, moved.old, folders=self.ledger.crate_root_folders)
                 if isinstance(root, NoCrateRoot):
                     readings[path, text][moved] = NoRenamedText()
                     continue
@@ -3074,7 +3026,7 @@ class EditedFiles:
         return readings
 
     def _declaring_files(self, moved: FileRename) -> tuple[tuple[str, str], ...]:
-        root = crate_root(self.repo, moved.old)
+        root = crate_root(self.repo, moved.old, folders=self.ledger.crate_root_folders)
         library = crate_library(self.repo, root) if isinstance(root, PurePosixPath) else NoLibrary()
         return tuple((path, text) for path, text in self.declaring(moved.old_stem)
                      if not (isinstance(root, PurePosixPath)
