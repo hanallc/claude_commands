@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
+from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -324,6 +325,8 @@ class PlacementRequest(CallerCode):
     local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
     prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())
     purpose: placement.PlacementPurpose = field(default_factory=lambda: placement.NormalStep())
+    # Where the caller lets the step run. The queue stores it on the waiter for the Builds page.
+    route: target_config.StepRoute = target_config.ANY_ELIGIBLE_TARGET
 
 
 @dataclass(frozen=True)

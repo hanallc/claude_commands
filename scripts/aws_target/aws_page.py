@@ -1,4 +1,4 @@
-"""Publish the AWS page: the /aws_spend totals and the /aws_prices tables as data for the admin console."""
+"""Publish the AWS page: the /aws_spend totals and the spot_table tables as data for the admin console."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,14 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
+# The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
+REGION_GROUPS = ('us', 'eu', 'ap', 'ca', 'sa')
+
+
+def region_filter_key(region: str) -> tuple[int, str]:
+    """Sort a region into its group, then by name; a region outside the groups comes last."""
+    group = region.split('-', 1)[0]
+    return (REGION_GROUPS.index(group) if group in REGION_GROUPS else len(REGION_GROUPS), region)
 
 
 class TableData(TypedDict):
@@ -131,7 +139,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int) -> Page
     return {
         'read_at': now,
         'spend': spend,
-        'regions': list(regions),
+        'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_data(table) for table in tables.prices],
         'quotas': [table_data(table) for table in tables.quotas],

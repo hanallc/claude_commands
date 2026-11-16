@@ -384,6 +384,43 @@ class HoldEnforcerTests(unittest.TestCase):
         stop.assert_not_called()
         self.assertIn("claims unreadable; clear waits", errors.getvalue())
 
+    def test_a_hold_keeps_a_gate_whose_build_waits_for_or_runs_on_the_mac_or_aws(self) -> None:
+        # The fps hold on 2026-11-15 stopped a Mac-only lint that waited for the Mac
+        # and a lint whose Mac step had passed and whose claim had ended.
+        state = step_record.StepState
+        cases = (
+            ("Mac only, waiting for placement", ("mac",), state.WAITING_HOLD, True),
+            ("waiting for the Mac", ("mac", "natedev"), state.WAITING_MAC, True),
+            ("on the Mac, claim ended", ("mac", "natedev"), state.ON_MAC, True),
+            ("waiting for AWS", ("aws", "natedev"), state.WAITING_SSH, True),
+            ("on AWS", ("aws", "natedev"), state.ON_SSH, True),
+            ("waiting for natedev", ("mac", "natedev"), state.WAITING_HOLD, False),
+            ("on natedev", ("mac", "natedev"), state.ON_NATEDEV, False),
+        )
+        holders = build_hold.natedev_holds(self.holders).in_force
+        for name, targets, step_state, kept in cases:
+            with self.subTest(name):
+                _ = self.process(10, "bash", session="gate",
+                                 argv=("bash", "verify.sh", "lint", "hana", "--mac", "lint on the Mac"))
+                step_record.write(step_record.StepRecord(
+                    "gate-call", 10, step_record.process_start(10), self.root, "lint",
+                    step_record.NamedPackage("hana"), step_record.AnyTarget(targets, ("mac",)), step_state,
+                    "2026-11-15T17:45:00+00:00"))
+                table = self.table()
+                with mock.patch.object(target_config, "read_targets", return_value=()):
+                    claims = self.claim_reader(self.proc)
+                assert isinstance(claims, build_hold.LiveClaims)
+                self.assertEqual(table[10].identity in claims.identities, kept)
+                signals: list[tuple[int, int]] = []
+                with redirect_stdout(io.StringIO()):
+                    hold_enforcer.stop_queued_runs(table, holders, self.uid, 999, claims.identities, self.proc,
+                                                   signal_process=lambda pid, signum: signals.append((pid, signum)))
+                self.assertEqual(signals, [] if kept else [(10, signal.SIGTERM)])
+                runs = hold_enforcer.classify_drain_runs(table, frozenset(), claims)
+                assert not isinstance(runs, build_hold.ClaimsUnreadable)
+                run, = runs
+                self.assertIsInstance(run, hold_enforcer.WorkingRun if kept else hold_enforcer.WaitingRun)
+
     def test_drain_keeps_first_scan_entries_and_bounds_second_scan_additions(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.build_hold.owning_session import NoOwningSession

@@ -47,6 +47,40 @@ class LocalRequired:
 
 Routing = AnyEligibleTarget | LocalRequired
 ANY_ELIGIBLE_TARGET = AnyEligibleTarget()
+# verify.sh --local pins a step to natedev.
+LOCAL_CALLER = LocalRequired("local caller")
+# A step that writes the tree runs on natedev.
+WRITES_TREE = LocalRequired("step writes the tree")
+
+
+@dataclass(frozen=True)
+class MacOnly:
+    """verify.sh --mac-only: the step runs only on the Mac."""
+
+
+@dataclass(frozen=True)
+class PinnedTarget:
+    """verify.sh --target or --mac: the step runs only on the named target."""
+
+    target: str
+
+
+# Where a step can run, as the caller asked. The placement request carries it to the queue's waiter record.
+StepRoute = AnyEligibleTarget | LocalRequired | MacOnly | PinnedTarget
+MAC_ONLY = MacOnly()
+
+
+def step_route(*, local: bool, mac_only: bool, target: str, writes_tree: bool) -> StepRoute:
+    """Apply the placement client's order: tree writes and --local stay on natedev, then --mac-only, then a pin."""
+    if writes_tree:
+        return WRITES_TREE
+    if local:
+        return LOCAL_CALLER
+    if mac_only:
+        return MAC_ONLY
+    if target:
+        return PinnedTarget(target)
+    return ANY_ELIGIBLE_TARGET
 
 
 @dataclass(frozen=True)

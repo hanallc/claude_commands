@@ -20,6 +20,7 @@ from scripts.build_queue import placement
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
+from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -551,6 +552,8 @@ class Waiter(TypedDict):
     need_runs: NotRequired[int]
     need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
+    # Where the caller lets the step run; absent means any eligible target.
+    route: NotRequired[StepRoute]
 
 
 @dataclass(frozen=True)
@@ -835,6 +838,13 @@ class ReadingUnavailable:
 class EstimateExpired:
     estimated_at: float
 
+
+@dataclass(frozen=True)
+class NatedevHeld:
+    """A CI step waits for the release of a natedev hold."""
+    holder: str
+    purpose: str
+
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
              | BehindHead | GpuSlotWait | ReadyForAdmission)
 
@@ -847,7 +857,12 @@ class HeadAdmissionStatus:
     cause: HeadCause = field(kw_only=True)
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
-              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter)
+              | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
+              | NatedevHeld)
+
+
+def held_text(wait: NatedevHeld) -> str:
+    return f"natedev is held by {wait.holder} for {wait.purpose}; waiting for release"
 
 
 def gpu_slot_text(wait: GpuSlotWait) -> str:
@@ -892,6 +907,7 @@ class WaitingStep:
     project: str = ""
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
+    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -910,6 +926,7 @@ class RunningStep:
     execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
+    route: StepRoute = field(default=ANY_ELIGIBLE_TARGET, kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1362,6 +1379,11 @@ def pressure_text(pressure: MemoryPressure) -> str:
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
 
+def waiter_route(row: Waiter) -> StepRoute:
+    """The route the placement request carried, or any eligible target for a row without one."""
+    return row.get("route", ANY_ELIGIBLE_TARGET)
+
+
 def stored_waiter(row: Waiter) -> Waiter:
     """Keep only waiter fields in durable rows and published rows."""
     return cast(Waiter, cast(object, {name: value for name, value in row.items() if name in Waiter.__annotations__}))
@@ -1457,6 +1479,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "estimate expired"
         case ReadingUnavailable():
             return reason.reason
+        case NatedevHeld():
+            return held_text(reason)
         case MemoryPressure():
             return "memory pressure"
         case PressureUnavailable():

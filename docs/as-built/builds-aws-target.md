@@ -6,7 +6,7 @@ AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU s
 Normal build jobs use `mac` and `natedev`, in that order.
 AWS has no permanent builder or build offload route.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+`regions` in `cloud_gate.conf` holds all 19 regions of `spot_candidate_regions`.
 The saved deployment record identifies the regions available for launch.
 Boxes boot the official NixOS image and fetch their tools at boot.
 GPU trial boxes then import the prepared GPU system and reboot.
@@ -442,7 +442,8 @@ The paired trial uses the existing `cloud_gate.conf` settings.
 
 The deployed region list comes from `regions` in `cloud_gate.conf`.
 The list must start with the home region and must not repeat a region.
-The list contains `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+The list holds every region of `spot_candidate_regions`, so a region that becomes the cheapest gets the next gate.
+The user, 2026-11-15: "i want all regions availble so if one becomes cheaper then it will immediatelyh start being used".
 `us-east-2` remains the home region for shared artifacts.
 The list can include other regions that the account policy permits.
 The gate ranks deployed types and public zones by the expected USD per run before launch.
@@ -623,13 +624,14 @@ It normalizes that line's whitespace and redacts it again.
 A successful regional read removes previous prices for types or zones absent from the new reply.
 The snapshot does not change `controller.json`.
 
-`python3 scripts/aws_target/deploy.py spot-table` reads only the local snapshot, cost ledger and configuration.
-It prints two price tables: the standard types, then the GPU types.
+`spot_table.spot_tables` reads only the local snapshot, cost ledger and configuration.
+It is the one source of the price tables of the AWS page; no terminal output remains.
+The user, 2026-11-15, removed the `/aws_prices` command and its `deploy.py spot-table` output because the page shows the prices.
+It gives two price tables: the standard types, then the GPU types.
 Each has candidate regions as rows and machine types as columns.
 The user asked for this layout on 2026-11-15 through builds, because the regions outnumber the types.
 Each cell shows the lowest zone price in USD/h.
 A type that a region does not sell shows `—` (`spot_table.NOT_SOLD`), in `Table.not_sold`.
-One line `— not sold here` under the price tables names it.
 Another empty cell says `no snapshot` or `read failed`.
 Cached prices and quotas remain visible after a read failure.
 Their price cells include `read failed`, and the regional detail gives the last good age.
@@ -637,17 +639,15 @@ Old prices include `old <minutes> min` in their cells.
 Each failed region shows the saved error time, age, failed read, error class, and AWS error line.
 Each region without evidence says `no snapshot was ever taken`.
 The table never uses a bare `-` for an unavailable value.
-It splits wide tables into groups of columns to fit the terminal.
 Each region shows its snapshot age and a stale mark after `price_max_age_seconds`, under the prices.
-The `/aws_prices` command runs `spot-table` and shows its lines unchanged.
 Below the prices, two quota tables show the Standard quota and the G and VT quota in vCPUs.
 Each also shows the number of boxes of its types that fit: standard types in the first, GPU types in the second.
 One region read writes the prices and both quotas together, so the quota cells show no age.
 The box counts divide the quota by the existing type-size vCPU calculation and round downward.
 An absent snapshot explains missing quotas and box counts without creating files.
 The standard rows are `instance_types`, then `price_compare_instance_types`; the GPU rows are `gpu_instance_types`.
-The hourly snapshot reads prices for all three lists, so `/aws_prices` can compare types the gates do not use yet.
-Below the quotas, `/aws_prices` shows one block for each standard type, with one line for each candidate region.
+The hourly snapshot reads prices for all three lists, so the page can compare types the gates do not use yet.
+Below the quotas, the page shows one run table for each standard type, with one line for each candidate region.
 The user asked for this layout on 2026-11-14 through builds. Each line shows:
 1. The lowest zone Spot price in USD/h.
 2. The median merge gate box time in minutes with one decimal, such as `7.5`, from launch to finish, boot included.
@@ -665,7 +665,6 @@ The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.
 A launch row without a region ran in the home region, `region` in `aws_target.conf`.
 The next line names the cheapest merge gate by estimate.
-These blocks do not split for a narrow terminal.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
@@ -689,11 +688,15 @@ The user asked for these page changes on 2026-11-14 through builds:
 2. Each column has a three-color scale: green at the minimum, white at the median and red at the maximum.
    In dark mode the middle is the card color. A ban cell, a dash and a column with fewer than two values have no color.
    A white box marks the lowest and the highest cell of each type column, in both themes; the user asked for it on 2026-11-15 through builds.
-   A thin dark edge around the white box keeps it visible on the light page. Equal cells all have the box.
+   The box is 1 px white inside a 1 px dark edge, which keeps it visible on the light page. Equal cells all have the box.
    A column with only two values has no box, because the colors already show which is which.
-   The cheapest cell of each table is bold. One legend line explains the colors, the box and the bold.
+   The lowest and the highest cell of each table have only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes.
+   The user asked for it on 2026-11-15 through builds. A legend line above the cards explains the colors.
+   A legend line under each price card that has a box names both outlines.
    Builds removed the vCPU group mark on 2026-11-15.
 3. Each standard and GPU table is its own card. The two cards sit side by side and stack below 760 px.
+   The content fills the window width, less a 16 px gutter on each side; the user asked for it on 2026-11-15 through builds.
+   The region chips have 6 px padding and a 4 px gap, so the 21 chips fit one row in a 1920 px window.
    The user asked for the side by side cards on 2026-11-15 through builds.
 4. A header of the form `name (unit)` shows the unit on a smaller second line.
 5. The run kind filter also selects the refused and launched cards. The billed hours card does not change with it.
@@ -703,10 +706,12 @@ The user asked for these page changes on 2026-11-14 through builds:
 
 A region filter at the top of the page shows all regions by default; the user asked for it on 2026-11-14 through builds.
 1. A chip for each region toggles it. `All` shows every region again.
+   The chips show the groups `us`, `eu`, `ap`, `ca` and `sa` in that order, each A to Z; a region outside them comes last.
+   `aws_page.region_filter_key` sets the order; the user asked for it on 2026-11-15 through sdlc and builds.
    `None` at the end clears every region, so one click then shows only that region; the user asked for it on 2026-11-15 through builds.
    With no region chosen, each card says `No region chosen.` A reload with no region saved shows every region.
 2. Every section follows it: tables with a region column drop the other columns, and tables with a region row drop the other rows.
-3. The colors, the white box and the bold use only the chosen regions. `Table.values` holds the number of each cell.
+3. The colors and both outlines use only the chosen regions. `Table.values` holds the number of each cell.
    One region shows no color and no box.
 4. The cheapest line names the cheapest estimate in the chosen regions (`RunCosts.estimates`, cheapest first).
 5. A snapshot line for one region shows only when that region is chosen.
@@ -729,7 +734,7 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Billed hours with no box hours are also over.
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
-`run_cost.hours_checks` sums the days with a bill read for each type and region, for the `/aws_prices` table.
+`run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
 `HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
 Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
@@ -789,18 +794,26 @@ That cost includes the hourly Spot price times the expected box hours and the re
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
+`unmeasured_region_extra_seconds` holds a JSON map from region names to seconds.
+A region without its own runs borrows box time from the other regions and adds its seconds from this map.
+The seeds come from the 2026-11-14 runs: Europe 15 s, Canada 10 s, South America and Asia Pacific 30 s.
+After the first run in a region, its own median box time replaces the borrowed time and the extra.
 `gate_wait_usd_per_minute=0` disables the wait cost until the delay trial and builds review set it.
 It also includes the expected refusals: refused requests per launch for the type and region, times the median wait of one refusal, times `gate_wait_usd_per_minute`.
 Refusals count the zone and quota codes below over the last `run_cost_days` days; `UnauthorizedOperation` does not count.
 Expected box time is the median box time, launch to finish, for the type, region and mode over the last `run_cost_days` days.
 A region without its own runs uses the type's runs in all regions; a type without runs uses all runs of the mode.
 Without any runs, it uses `lifetime_minutes`.
-`/aws_prices` shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+The AWS page shows the same expected cost and refusals per launch, without the remote transfer and regional delay.
+Its expected cost includes the unmeasured seconds.
 `remote_region_transfer_usd=0.00015` applies when the region differs from the home region.
 Local measurements cover 692 gates with a source bundle, request, and result.
 Their median sizes are 10,157, 32,926, and 7,051,583 bytes, respectively.
 The median combined size is 7,107,672 bytes.
 At $0.02 per decimal GB, this costs $0.00014215344; the configured value rounds upward.
+`region_transfer_usd` holds a JSON map from far regions to their transfer USD per gate.
+Each value is about 10 MB per gate, the 2026-11-14 bill, at that region's inter-region transfer price.
+A region outside the map uses `remote_region_transfer_usd`.
 Equal costs keep configured order.
 Missing or stale prices follow fresh prices.
 Without applicable fresh prices, the gate preserves configured order except for capacity cooldowns.

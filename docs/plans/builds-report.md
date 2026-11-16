@@ -1580,3 +1580,179 @@ From the user (via builds, 2026-11-15): "we should white box outline both the lo
 - A column with only two values in view has no box, because the colors already show which is which.
 - From the user (via builds, 2026-11-15): "the filter on the aws page - we need a None at the end that turns all fiters off so i can quickly just select one or two i want to look at". From builds (not the user): add it to this phase. The region filter has a `None` chip after the last region. It clears every region, and each card then says "No region chosen." A region chip can now turn off the last chosen region. The view and run kind switches choose one value each, so they have no `None`.
 - Proof: `phases/87/proof/before-*` (the live phase 86 shots) and `after-*` (Spot dark and light, each run kind, two regions, the full page, phone width, and the region filter with All, None, None then one region, and None then two regions).
+
+### Phase 88 — The AWS prices page fills the window and outlines the lowest and highest of each table · status: done
+
+From the user (via builds, 2026-11-15): "the filter for regions shouldn't take 3 rows - it should be either smaller fonts or we should make the content section wider to fit - probably the latter is fine - i don't mind dense information". Also: "on the cost lowest and highest- it looks as if you did a per instance type - which is fine - but we should have a different outline for overall lowest and overall highest as well". From builds (not the user): fill the window width, tighten the chips so 21 fit one row at 1920 px with the same font, and give the overall lowest and highest of each table a stronger outline, with one legend line under each table.
+
+#### As-built
+
+- `aws_prices.html`: `main` has no maximum width. The region chips have 6 px padding and a 4 px gap, and the label gap is 8 px. The 21 chips need about 1857 px, so they fit one row at 1920 px; at 1400 px they take two rows.
+- `scaleCells` returns `extremes`, the lowest and the highest cells of each table with two or more different values. An `extreme` cell has only a 2 px gold outline (`--extreme`, `#f5b400`), the same in both themes; gold differs from white and from the green and red scale. It replaces the bold `best` mark. The per-type box is now 1 px white inside the 1 px dark edge. From builds (not the user): the sizes and the one outline color.
+- Each price card with a box has a legend line under its table: "Lowest and highest of each type" and "Lowest and highest of the table". The legend line above the cards explains only the colors.
+- The price cells have 10 px padding at the right, so a number does not touch an outline.
+- Proof: `phases/88/proof/after-*` (1920 px Spot and cost, dark and light, two full pages, 1400 px Spot, and phone width). The before shots are the phase 87 after shots.
+
+### Phase 89 — The Builds page shows a jobserver token wait as a stage · status: done
+
+From builds (not the user), from a defect the user saw at 11:00 EST (via sdlc, from cargo-liner): a `port nextest` step built its tests in 29 s, printed `nextest: waiting for 4 more jobserver tokens`, and waited about 11 min while `widget nextest` held the tokens. Its Builds page Running row showed `Stage —` and `Done —`. Fix: show the wait as the stage `waiting for jobserver tokens` on the Builds page and in `/build:queue`, set from the place that prints the line.
+
+#### As-built
+
+- `progress_profile`: `token_wait_line` prints the wait line, and `TOKEN_WAIT_LINE` reads it. `nextest_tokens.py` prints the line with `token_wait_line`. `CounterParser` reads it as `NoCounter("waiting for jobserver tokens", TokenWait(K))`. The next line, which reports the tokens taken, ends the wait.
+- `NoCounter.token_wait` (`TokenWait | NoTokenWait`) is an optional field, so the counter wire union does not change for pinned clients. An older snapshot reads as `NoTokenWait`.
+- `admission_service`: a token wait from the step log skips the Cargo capture fallback. Before, that fallback replaced the wait with "missing or competing Cargo captures".
+- `memory_feed.row_progress` returns `TokenWaitProgress` (`stage`, `tokens`) for a natedev row. `memory_live.html` shows its `stage` in the Stage column; `Done` stays `—`. At phone width the stage wraps in its cell.
+- `/build:queue` prints only the Builds page link; `build_queue.py --json` shows the wait in the running step's `measured.counter.token_wait`.
+- Proof: `phases/89/proof/before-*` and `after-*` (the Running table at 1400 px dark and light, and at phone width), from a fixture of the live feed with one natedev nextest row in the wait.
+
+### Phase 90 — The phone Builds table shows every cell in full · status: done
+
+From builds (not the user), 2026-11-15, from a phase 89 note: the phone-width Running table cut off Pid, Target and vCPU and ended step names in an ellipsis. Fix it so each needed column shows in full, under the UX guide, and add a page proof that fails on a cut cell at 390 px.
+
+#### As-built
+
+- `memory_live.html`: the stacked table shows full cell text. When it is wider than the card, `fitWalkDetails` adds `compact`. Each row is then a two-line subgrid row: Step, Stage and Done, then Dur, Unit, Pid, Target and vCPU. Target takes the free width, so Stage fits on one line when the card has room.
+- `--table-label` and the phone `token-wait` rule are gone; the compact layout wraps the stage only when it does not fit.
+- The chart row names wrap in the stacked layout. The row height match now includes the room row and the queue header.
+- `memory_page_proof.mjs`: in the stacked layout no table cell or chart name may be cut, and only 390 px uses two lines. Row offsets measure from the header row. The proof fails at 900 px on the old page.
+- Proof: `phases/90/proof/before-*` and `after-*` (the Running card at 390 px light and dark, and at 900 px dark), from a fixture of the live feed.
+
+### Phase 91 — The cap line crosses no text, and the table room row is gone · status: done
+
+From builds (not the user), 2026-11-15: in the 390 px view the red cap line runs through row text ("setup · bo|ot", "waits for a| cloud slot: 9 of 9 in use"). The "Next step room" table row shows only dashes. Make the line pass behind no text, and give that row its value or remove it.
+
+#### As-built
+
+- `memory_live.html`: `cutCapLine` draws the cap line as `.cap-part` parts. It leaves a 3 px gap around each line of chart text that the line would cross: cloud status text, bar labels and the queue title. Text clipped by an ellipsis does not count.
+- The cap line has no `left` transition. Each layout measure moved the line, so the bar labels and the line parts were measured in mid-move.
+- The table room row has no dashes. The stacked table leaves it out, and its queue header takes the top divider. Beside the chart, the row is empty and keeps the rows aligned.
+- `memory_page_proof.mjs`: it fails when chart text shows on the cap line, or when the table room row shows text. The row offset check applies only beside the chart. The cap pixel check reads the longest line part.
+- Proof: `phases/91/proof/before-*` and `after-*` (the Running card at 390 px light and dark, 900 px dark and 1400 px dark), from a fixture of the live feed. Before: text on the line at all four widths. After: none.
+
+### Phase 92 — A placed Mac row shows only its step name · status: done
+
+From builds (not the user), 2026-11-15: the lfo row shows its step name as "lfo nextest · placement v20261115T162519-1093145-12392-step-2/709e465c…", a raw internal id over five lines in the chart and the table. Show the readable step name only.
+
+#### As-built
+
+- `memory_feed.mac_work_row`: a placed Mac run's name leaves out `placement <id>`. The id stays in the row's `gate_label`. A `user`, `hana-ci` or `unplaced` run still adds that one word to its name, because it marks an exception.
+- `test_memory_feed`: a placed run's name has no `placement`, and its `gate_label` keeps the id.
+
+### Phase 93 — The AWS prices region filter sorts by group, then A to Z · status: done
+
+From the user (via sdlc and builds), 2026-11-15, for the AWS prices page: "it needs top sort the filters alphabetically within the following groups us eu ap ca sa". sdlc reads it as: the region filters show in the group order us, eu, ap, ca, sa, and each group sorts its regions alphabetically.
+
+#### As-built
+
+- `aws_page.page_data`: `regions` sorts by `region_filter_key`, which takes the group from `REGION_GROUPS` (`us`, `eu`, `ap`, `ca`, `sa`), then the region name. A region outside the groups comes last, A to Z.
+- The tables keep their row order; only the filter chips change.
+- `test_control`: the page data regions follow the key, and a mixed list sorts into the group order.
+- Proof: `phases/93/proof/before-1400-dark.png` and `after-1400-dark.png`, from the live AWS state.
+- Follow-up (user, 2026-11-15): a Geography row above Regions selects all regions of one geography (`us`, `eu`, `ap`, `ca`, `sa`), with `all` and `none` chips. `geographyOf` takes the region prefix. A geography chip reads pressed, mixed or not pressed from its regions, and the two rows update each other. The chips use lower case.
+
+### Phase 94 — A cargo-liner step names only what keeps it off the Mac · status: done
+
+From the user (via builds), 2026-11-15: "this said that the mac was busy with a hana run - but the mac can always run one cargo-liner run - so this is a bug - this cargo-liner should be already running on the mac - the only thing that should block cargo liner on the mac is a mac hold, mac unavailable, or mac already has a cargo-liner run".
+
+#### As-built
+
+- `target_config.StepRoute`: where the caller lets a step run. It is `AnyEligibleTarget`, `LocalRequired` (`LOCAL_CALLER` for `verify.sh --local`, `WRITES_TREE` for a step that writes the tree), `MacOnly` or `PinnedTarget(target)`.
+- `target_config.step_route` chooses the route in the placement client's order: a tree write, then `--local`, then `--mac-only`, then `--target`.
+- `admission_wire.PlacementRequest.route` carries the route. `admission_client` sets it from its flags. An older request without it reads as any eligible target.
+- `admission_service._placement_row` stores the route in the waiter record. `admission_records.waiter_route` reads it back. `WaitingStep` and `RunningStep` carry `route`, and `memory_admit` fills it from the waiter record.
+- The merge with queue's batch613 (the Slot column) took queue's waiting-step tooltip: one field on each line, and a "can run on" field from `memory_feed.local_runs_on`. The route lines and the repository filter of the Mac state line went out with the old tooltip.
+- `memory_feed.step_runs_on` names a route that limits the step before the Mac routes:
+  - `LOCAL_CALLER` reads "natedev only (the run asks for it)". Another `LocalRequired` reads "natedev only (<reason>)".
+  - A Mac-only step, or a step pinned to the Mac, reads "Mac only". A step pinned to another target reads "<target> only".
+  - A step either host can take reads `local_runs_on` of `MacRoutes.fit`, for example "natedev or Mac".
+- `target_availability.MacRoutes.is_mac` says whether a pinned target name is the Mac target.
+- A Mac-only step keeps the Mac line that the user approved (pair 2daec4c4c81a), in queue's field style. `MacRoutes.holds(folder)` names what keeps the folder's repository off the Mac: a block, an unreachable or unreadable Mac, or a live claim of this repository or of the whole Mac. A Mac free for this repository gives no line. `memory_feed.target_notes` gives `runs_on`, and `mac_state` only for `mac_only_route`, to the waiting row and to the queued run row. `memory_live.html` `targetFields` shows it as a "Mac" field below "can run on". The repository lookup runs git once for each Mac-only waiting folder in a page reading, only while the Mac runs a claim.
+- Tests: `test_memory_feed` (each route before the Mac routes, the Mac field on the waiting and queued run rows), `test_target_availability` (each Mac state, the repository filter, a whole-Mac claim), `test_memory_hover` (the Mac field below "can run on"), `test_targets` (the `step_route` order) and `test_placement` (local, pinned and routed steps keep their route in the waiting and running views).
+- Proof: `phases/94/proof2/` pairs `before-local`/`local` and `before-either`/`either-busy`. They show the tooltip before the merge.
+
+### Phases 95–99 — The Disks page · status: in progress (95 and 96 done)
+
+From builds (item 11), 2026-11-15: build the Disks page from the approved mockup 2. Builds' conditions:
+1. Show real folders as they are, before and after the cutover. Read the slot and session roots from config. Hard-code no path and no threshold.
+2. The cache time, the default slider value and the measure limits are config values.
+3. The measure runs at the lowest disk priority under a memory cap, one at a time, and never blocks the page.
+4. Slot "Used by" reads the lease and lock. "deleted tonight" uses the 7-day config value. Sessions read held folders from the hold records.
+5. A part that depends on code not yet merged shows nothing until that code exists.
+
+Proof: one dark desktop shot for the user when the drive cards are live, and one when each later card shows data. I check light and phone widths myself.
+
+Files: a new `scripts/disks/` folder (report owns it) and `config/disks.conf`. The page and its data live in the review root, as the AWS prices page does.
+
+| Phase | Deliverable | Hours | Depends on |
+| --- | --- | ---: | --- |
+| 95 | Measure and data file | 2 | None |
+| 96 | Drive cards: slider and walk | 3 | 95 |
+| 97 | Measure on open; console entry | 1 | 96; owner review of `serve.py` and `console.conf` |
+| 98 | Slots card | 2 | 96; shows nothing until the slot roots exist |
+| 99 | Sessions card | 1.5 | 96; shows nothing until the session root and hold records exist |
+| **Total** | | **9.5** | |
+
+#### Phase 95 — Measure and data file
+
+1. `config/disks.conf` keys: `drives.<machine>` (the mount points, natedev `/build` and `/`), `cache_seconds=600`, `slider.default_gib=10`, `slider.min_gib=1`, `measure.keep_bytes` (the smallest folder the data keeps, below the slider minimum), `measure.memory_max=2G`, `measure.timeout_seconds`.
+2. `scripts/disks/measure.py` measures one drive at a time. It runs `du -x -B1 --threshold=<keep_bytes>` under `systemd-run --user --scope -p MemoryMax=<memory_max>`, `nice -n 19` and `ionice -c3`.
+3. A file lock lets only one measure run. A second request while one runs does nothing.
+4. The result is a tree for each drive: path, size and children. The size of a folder's "Other" is its size minus its named children, so each level adds up to its parent.
+5. A chain of single large children collapses into one row, such as `/home/natepiano`.
+6. Free and total space come from `scripts/buildlog/filesystem`. The floor line comes from the sweep's floor settings in `lint.conf`.
+7. The measure writes `disks.json` atomically, with `measured_at`, in the page folder.
+8. Tests: the tree from a fixture `du` output, the Other sizes, the chain collapse, the lock, and the timeout.
+
+##### Phase 95 as-built
+
+- `config/disks.conf`: `output_folder` (`ysbjmg` under the review root), `drives` with the host key `drives.natedev=/build /`, `cache_seconds`, `slider.default_gib`, `slider.min_gib`, `measure.keep_bytes` (256 MiB), `measure.memory_max`, `measure.timeout_seconds`.
+- `scripts/disks/measure.py`:
+  - `du_command` runs `systemd-run --user --scope --quiet -p MemoryMax=<max> -- nice -n 19 ionice -c3 du -x -B1 --threshold=<keep_bytes> <mount>`. du exit 1 with output counts as a measure; some folders cannot be read.
+  - `folder_tree`: each folder hangs from its nearest listed ancestor, largest first. `other` is the size less the listed children. `collapse` joins a folder with its only child while the folder's own files are below `keep_bytes`, as `home/natepiano`. The drive root never joins.
+  - `drive_floors`: the home disk floor from `disk.read_floor`, and the other floors from `sweep.filesystem_floors`, matched by device.
+  - `measure` takes `disks.lock` without a wait; a busy lock exits 3. A timeout, a start failure or a failed du gives the drive an `error`, and the next drive still runs. `disks.json` holds `measured_at`, `keep_bytes` and the drives, with total, used, free, floor and tree.
+- Tests: `scripts/disks/test_measure.py` (the tree, Other, the collapse, the root, the command, a measure, the timeout, a failed du, the lock).
+- First real measure on natedev: 261 seconds for `/build` and `/`.
+
+#### Phase 96 — Drive cards: slider and walk
+
+1. `disks.html` reads `disks.json` and shows the two drive cards of mockup 2: the used bar with the floor mark, the slider and the folder table.
+2. Each card has its own slider, on a log scale from `slider.min_gib` to the largest top folder. The start value is `slider.default_gib`.
+3. A click opens or closes a folder's children, at any depth. Each row shows Size, "Of parent" and a walk bar inside its parent's span.
+4. The status line names the measure time and its age.
+5. Tests: the page renders the fixture data at desktop and phone widths in light and dark mode, with no clipped text.
+
+##### Phase 96 as-built
+
+- `scripts/disks/disks.html` reads `disks.json` (no cache) and shows one card for each drive, in the order of `drives`.
+  - The card head gives the name from `name.<mount>` and the mount, free of total, the used bar with the floor mark, and "Cleanup starts below <floor> free (<percent>)." A drive with no floor reads "The cleanup floor is unknown." A drive with no tree shows its error.
+  - The slider runs on a log scale from `slider.min_gib` to the largest top folder. It starts at `slider.default_gib`. The largest top folder starts open.
+  - `treeRows`: children below the limit join one row, "Other · N folders", with the folder's own files ("and files" when they reach `keep_bytes`). One small child shows by its name. Own files alone read "Files and small folders". Each row starts where the row before it ends, so the walk bars of a folder fill its span.
+  - A click, Enter or Space opens or closes a folder at any depth. A long name wraps; no text is cut. Below 560 px the "Of parent" column hides.
+  - The status line reads "Sizes from <time>, <age>." The dot turns gray after `cache_seconds`.
+- `scripts/disks/disks_page.py`: `publish` writes the page with `page_frame.STYLE` and the page settings; `page_url`; `main` takes `publish` or `link`. `measure.py` publishes the page after each measure.
+- `config/disks.conf`: `name./build=Build drive`, `name./=System drive`. `slider.min_gib` is at least 0.25, the measure's least folder.
+- Tests: `scripts/disks/test_disks_page.py` (publish, the fold, the offsets, the text, the slider). Chrome check: no cut text and no page wider than the window at 1400, 800 and 390 px, light and dark; a click, Enter and the slider work.
+
+#### Phase 97 — Measure on open; console entry
+
+1. The page asks for a measure when `disks.json` is older than `cache_seconds`. It shows the old data at once and the line "Measuring…".
+2. The request goes to a new POST route in `scripts/review_links/serve.py`. The route starts `measure.py` in the background and returns at once. The page reads `disks.json` again until `measured_at` changes.
+3. `config/console.conf` gets `page.disks.*` (label Disks). These are new keys.
+4. `serve.py` and `console.conf` are not report's files. The owner reviews the change, or makes it.
+5. Proof: one dark desktop shot of the live page.
+
+#### Phase 98 — Slots card
+
+1. The card reads `roots.slots.<machine>` and `roots.slot_cargo.<machine>` from `build_folders.conf`. With no such key, the card does not show.
+2. Each `<repository>-slotN` row shows one Size (checkout plus compiled output), Last used, and Used by.
+3. Used by comes from `build_folders.build_folder_state` and the lease record: showrunner, unit and purpose. A free slot shows "—".
+4. "deleted tonight" shows when the last use is older than the nightly delete's day count, read from config. With no such key, the tag does not show.
+5. The slot sizes come from the same measure as the drive cards.
+
+#### Phase 99 — Sessions card
+
+1. The card reads the session root from config when verify adds it. With no such key, the card does not show.
+2. Each session row shows its size, the held folders from verify's hold records, and its state.
+3. An ended session shows when its folder is deleted, from the same records.

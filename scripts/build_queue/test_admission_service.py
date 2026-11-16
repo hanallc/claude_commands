@@ -1799,6 +1799,27 @@ class RunnerAuthorizationTests(unittest.TestCase):
             finally:
                 folder.chmod(0o755)
 
+    def test_a_ci_step_waits_during_a_natedev_hold_and_starts_after_the_release(self) -> None:
+        # CI run 43737288332 refused four steps 60 s into the fps hold on 2026-11-15.
+        from scripts.build_hold import build_hold
+        from scripts.build_targets import build_targets
+
+        holder = build_hold.Holder("fps", datetime.now(user_zone()), "Phase 3 timing", build_hold.UnknownReleaseEta(), "fps")
+        held = records.NatedevHeld("fps", "Phase 3 timing")
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            request = fixture.service_request()
+            with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
+                waiting, = fixture.server.handle_request(request)
+                assert isinstance(waiting, wire.Wait)
+                self.assertEqual(waiting.reason, held)
+                self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                step, = view.reading.view.waiting
+                self.assertEqual(step.reason, held)
+            fixture.allow_next_start()
+            fixture.release(only_admitted(fixture.server.handle_request(request)))
+
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
             fixture.configure(**{"program_first_peak_gib.cargo": 4})
@@ -1887,6 +1908,31 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 self.assertIsInstance(measured, records.ProgressAdjustedMemory)
                 if isinstance(measured, records.ProgressAdjustedMemory):
                     self.assertEqual(measured.counter, counter)
+            fixture.release(grant)
+
+    def test_a_token_wait_in_the_step_log_is_the_step_counter(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            uid = os.getuid() + 10000
+            owner = fixture.account_owner(uid)
+            write_process(fixture.proc.path, owner.pid, 2 * GIB, start=owner.start_time)
+            status = fixture.proc.path / str(owner.pid) / "status"
+            _ = status.write_text(status.read_text() + f"Uid: {uid} {uid} {uid} {uid}\n")
+            sidecar = fixture.root / "runner-wait/cargo.cgroup"
+            sidecar.parent.mkdir(mode=0o755)
+            _ = sidecar.write_text("")
+            _ = progress.progress_path(sidecar, "log").write_text(
+                "Finished `test` profile in 29s\n" + progress.token_wait_line(4) + "\n")
+            request = replace(fixture.service_request(owner=owner), episode=f"uid:{uid}:wait", sidecar=str(sidecar))
+            with fixture.peer_account(uid):
+                grant = only_admitted(fixture.server.handle_request(request))
+            # The capture fallback runs only with a boot identity.
+            fixture.server.boot_id = "fixture-boot"
+            _ = fixture.run_pass()
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            measured = reply.reading.view.running[0].measured
+            assert isinstance(measured, records.ProgressAdjustedMemory)
+            self.assertEqual(measured.counter, progress.NoCounter(progress.TOKEN_WAIT_REASON, progress.TokenWait(4)))
             fixture.release(grant)
 
     def test_runner_cannot_change_priority_or_admit_the_head(self) -> None:
