@@ -1152,14 +1152,14 @@ function renderReport(report) {
     const machine = $("history-machine").value, cause = $("history-cause").value;
     const unit = $("history-unit").value;
     const unitText = unit === "daily" ? "h/day" : "h/finished phase";
-    const phases = ["median", "p90"].map(key => ({label: key, values: data.buckets.map(bucket =>
+    const phases = [["median", "half of phases take up to"], ["p90", "most phases take up to"]].map(([key, label]) => ({label, values: data.buckets.map(bucket =>
       bucket.phase.state === "measured" ? {state: "measured", value: bucket.phase[key] / 3600}
         : {state: "unavailable", reason: bucket.phase.reason})}));
     const causes = data.causes.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
     const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
-    $("history-phase").innerHTML = reportPlot("Hana phase time", data.buckets, phases, "h/phase");
+    $("history-phase").innerHTML = reportPlot("Hana phase time, without waits for the user or the showrunner", data.buckets, phases, "h/phase");
     $("history-plots").innerHTML = reportPlot("Costs by cause", data.buckets, causes, unitText) +
       reportPlot("Costs by machine", data.buckets, machines, unitText);
     for (const table of document.querySelectorAll("#history-charts details.table-view")) {

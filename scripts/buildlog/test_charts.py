@@ -445,6 +445,17 @@ class ChartTests(ChartFixture):
                 self.assertEqual(row["daily"], {"state": "unavailable", "reason": "no complete indexed mac monthly log covers this day"})
             path.unlink(missing_ok=True)
 
+    def test_phase_time_leaves_out_recorded_waits_for_the_user_or_a_supplier(self) -> None:
+        start = fixtures.START.timestamp()
+        self.fixture.progress([
+            {"event_type": "phase_finished", "phase_instance_id": "paused", "working_dir": "/r/hana",
+             "timestamp_epoch": start + 7200, "phase_started_at": start, "phase_active_seconds": 1800},
+            # A record from before the active count keeps its wall time.
+            {"event_type": "phase_finished", "phase_instance_id": "old", "working_dir": "/r/hana",
+             "timestamp_epoch": start + 3600, "phase_started_at": start}])
+        times = {event.phase_instance_id: event.active_s for event in moments.progress_events()}
+        self.assertEqual(times, {"paused": 1800.0, "old": 3600.0})
+
     def test_bucket_sums_match_shared_costs_and_each_source_reads_once(self) -> None:
         self.fixture.progress([{"event_type":"phase_finished", "phase_instance_id":"one", "working_dir":"/r/hana",
                                 "timestamp_epoch":fixtures.START.timestamp()+1, "phase_started_at":fixtures.START.timestamp()}])

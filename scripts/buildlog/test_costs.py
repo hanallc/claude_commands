@@ -79,9 +79,9 @@ class CostTests(unittest.TestCase):
         self.progress([("/r/hana", 60), ("/r/hana", 120), ("/r/tool-based-ui", 180), ("/r/other", 240)])
         with closing(self.fixture.connection()) as connection:
             result = costs.collect_costs(connection, fixtures.START, fixtures.END)
-        durations = [phase.wall_s for phase in result.phases if isinstance(phase.wall_s, float)]
-        hana = [phase.wall_s for phase in result.phases
-                if moments.hana_name(phase.working_dir) and isinstance(phase.wall_s, float)]
+        durations = [phase.active_s for phase in result.phases if isinstance(phase.active_s, float)]
+        hana = [phase.active_s for phase in result.phases
+                if moments.hana_name(phase.working_dir) and isinstance(phase.active_s, float)]
         self.assertEqual((len(hana), moments.nearest_rank(hana, 50), moments.nearest_rank(hana, 90)), (3, 120, 180))
         self.assertEqual((len(durations), moments.nearest_rank(durations, 50), moments.nearest_rank(durations, 90)), (4, 120, 240))
         self.assertEqual(len(result.phases), 4)
@@ -92,7 +92,7 @@ class CostTests(unittest.TestCase):
         self.fixture.progress([event, event, {**event, "phase_instance_id": "outside", "timestamp_epoch": fixtures.END.timestamp()}])
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertIsInstance(phases[0].wall_s, moments.PhaseStartUnavailable)
+        self.assertIsInstance(phases[0].active_s, moments.PhaseStartUnavailable)
 
     def test_finish_wall_time_needs_no_start_event_or_event_field_substring(self) -> None:
         self.fixture.progress([
@@ -106,7 +106,7 @@ class CostTests(unittest.TestCase):
         ], filename="old.jsonl")
         phases = costs.finished_phases(fixtures.START, fixtures.END)
         self.assertEqual(len(phases), 1)
-        self.assertEqual(phases[0].wall_s, 3600)
+        self.assertEqual(phases[0].active_s, 3600)
 
     def test_costs_rank_all_hosts_and_divide_by_all_finished_phases(self) -> None:
         self.progress([("/r/hana", 60), ("/r/other", 120)])

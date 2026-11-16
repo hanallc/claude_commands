@@ -326,7 +326,7 @@ def chart_data(series: ChartSet) -> dict[str, object]:
     buckets: list[dict[str, object]] = []
     for bucket in series.buckets:
         hana = [phase for phase in bucket.costs.phases if moments.hana_name(phase.working_dir) and phase.host == "natedev"]
-        durations = [phase.wall_s for phase in hana if isinstance(phase.wall_s, float)]
+        durations = [phase.active_s for phase in hana if isinstance(phase.active_s, float)]
         phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations)}
         if durations:
             phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))

@@ -2011,7 +2011,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual((row["machine"], row["cause"], row["range"]), ("fixture", "Memory wait", [30 / 3600, 60 / 3600]))
         self.assertEqual(row["share"], "fixture nextest paid 75% of it.")
         self.assertEqual(row["action"], "Action: lower the memory peak of fixture nextest. It holds the most build memory: "
-                                        + "12 GiB·h/day, peak p90 3.0 GiB.")
+                                        + "12 GiB·h/day. Most runs peak at 3.0 GiB or less.")
 
     def test_an_unmeasured_day_sends_no_range_and_no_share(self) -> None:
         report = report_fixture()

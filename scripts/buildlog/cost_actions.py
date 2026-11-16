@@ -140,7 +140,7 @@ def action_text(action: CostAction) -> str:
     match action:
         case LowerMemoryPeak(kind, gib_hours, peak):
             return (f"Action: lower the memory peak of {kind.name}. It holds the most build memory:"
-                    f" {gib_hours:.0f} GiB·h/day, peak p90 {peak / GIB:.1f} GiB.")
+                    f" {gib_hours:.0f} GiB·h/day. Most runs peak at {peak / GIB:.1f} GiB or less.")
         case FixTest(repo, test, failures):
             where = f" in {repo}" if repo else ""
             return f"Action: fix the test {test}{where}. It failed {failures} {'time' if failures == 1 else 'times'}."

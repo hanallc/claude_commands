@@ -204,7 +204,8 @@ class ProgressFinish:
     phase_instance_id: str
     working_dir: str
     host: str
-    wall_s: float | PhaseStartUnavailable
+    # Phase time without waits for the user or a supplier; wall time for a record written before that count.
+    active_s: float | PhaseStartUnavailable
 
 
 def progress_events() -> tuple[ProgressFinish, ...]:
@@ -240,9 +241,11 @@ def progress_events() -> tuple[ProgressFinish, ...]:
                             or isinstance(at, bool) or not isinstance(instance, str)
                             or not isinstance(directory, str) or not isinstance(host, str)):
                         continue
-                    wall = (float(at - started) if isinstance(started, (int, float))
-                            and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
-                    events[instance] = ProgressFinish(float(at), instance, directory, host, wall)
+                    active = event.get("phase_active_seconds")
+                    seconds = (float(active) if isinstance(active, (int, float)) and not isinstance(active, bool) and active >= 0
+                               else float(at - started) if isinstance(started, (int, float))
+                               and not isinstance(started, bool) and started <= at else PhaseStartUnavailable())
+                    events[instance] = ProgressFinish(float(at), instance, directory, host, seconds)
         except OSError:
             continue
     return tuple(events.values())
