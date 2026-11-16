@@ -1109,6 +1109,14 @@ function reportPlot(title, buckets, series, unit) {
   return `<h3>${esc(title)}</h3><svg class="report-chart" viewBox="0 0 900 220" role="img" aria-label="${esc(title)}"><line class="grid" x1="48" x2="848" y1="180" y2="180"/><line class="grid" x1="48" x2="848" y1="30" y2="30"/><text x="4" y="184">0</text><text x="4" y="34">${maximum.toFixed(1)}</text><text x="48" y="16">${esc(unit)}</text>${lines}${labels}${!points.length ? '<text x="450" y="100" text-anchor="middle">No measured data</text>' : ""}</svg>` +
     `<div class="report-key">${series.map((line, slot) => `<span style="--series:${colors[slot % colors.length]}">${esc(line.label)}</span>`).join("")}</div>${table}`;
 }
+function phaseTimeHtml(buckets, phases) {
+  const title = "Hana phase time, without waits for the user or the showrunner";
+  if (buckets.some(bucket => bucket.phase.state === "measured")) return reportPlot(title, buckets, phases, "h/phase");
+  const line = buckets.some(bucket => bucket.phase.unrecorded > 0)
+    ? "Shown from the first phase that ends with a wait record. Earlier phases have no wait record."
+    : "No Hana phase ended in this range.";
+  return `<h3>${esc(title)}</h3><p class="report-window">${esc(line)}</p>`;
+}
 const reportView = {machine: "", cause: "", unit: "daily", details: false, tables: new Set()};
 let reportStamp = "";
 function captureReportView() {
@@ -1159,7 +1167,7 @@ function renderReport(report) {
       sumReportCosts(bucket.rows.filter(row => row.cause === label && (!machine || row.machine === machine)).map(row => row[unit])))}));
     const machines = data.machines.map(label => ({label, values: data.buckets.map(bucket =>
       sumReportCosts(bucket.rows.filter(row => row.machine === label && row.cause === cause).map(row => row[unit])))}));
-    $("history-phase").innerHTML = reportPlot("Hana phase time, without waits for the user or the showrunner", data.buckets, phases, "h/phase");
+    $("history-phase").innerHTML = phaseTimeHtml(data.buckets, phases);
     $("history-plots").innerHTML = reportPlot("Costs by cause", data.buckets, causes, unitText) +
       reportPlot("Costs by machine", data.buckets, machines, unitText);
     for (const table of document.querySelectorAll("#history-charts details.table-view")) {

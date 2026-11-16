@@ -325,7 +325,7 @@ try {
                 machine:table.querySelector('td.machine')?.textContent,
                 capText:text('#cap-value'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
-                reportPoints:[...document.querySelectorAll('#history-charts svg circle')].filter(point=>point.getClientRects().length).map(point=>({
+                reportPoints:[...document.querySelectorAll('#history-charts svg circle')].filter(point=>point.getClientRects().length&&!point.closest('details:not([open])')).map(point=>({
                   box:rect(point),color:getComputedStyle(point).fill})),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
@@ -1011,6 +1011,11 @@ try {
                 assert.match(state.top,/2026/);
               }
             }
+            await show(readings.unrecorded_report);
+            const phaseTime=await evaluate(`({text:document.querySelector('#history-phase').textContent,
+              plots:document.querySelectorAll('#history-phase svg, #history-phase details').length})`);
+            assert.equal(phaseTime.plots,0,'A phase time plot without measured days shows a plot or a table.');
+            assert.match(phaseTime.text,/Shown from the first phase that ends with a wait record\. Earlier phases have no wait record\./);
             await show(readings.shrink);
             assert.equal(await evaluate("document.querySelectorAll('.queue-head').length"),0);
             await evaluate(`showTip('row:${readings.shrink.walk.length-1}',200,200)`);

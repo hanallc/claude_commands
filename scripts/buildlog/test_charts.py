@@ -402,8 +402,8 @@ class ChartTests(ChartFixture):
         with closing(self.fixture.connection(fixtures.build("record", 10, target="natedev", mem_wait_s=3600))) as connection:
             series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
         buckets = cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
-        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "state": "unavailable", "reason": "no valid durations"})
-        self.assertEqual(buckets[1]["phase"], {"finished": 0, "valid": 0, "missing": 0, "state": "unavailable", "reason": "no finished phases"})
+        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "unrecorded": 0, "state": "unavailable", "reason": "no valid durations"})
+        self.assertEqual(buckets[1]["phase"], {"finished": 0, "valid": 0, "missing": 0, "unrecorded": 0, "state": "unavailable", "reason": "no finished phases"})
         self.assertEqual(charts.cost_value(series.buckets[1], "natedev", "Memory wait", per_phase=True),
                          charts.CostUnavailable("no finished phases"))
         self.assertEqual(charts.cost_value(series.buckets[0], "natedev", "Memory wait", per_phase=True), charts.MeasuredCost(3600))
@@ -464,7 +464,7 @@ class ChartTests(ChartFixture):
         with closing(self.fixture.connection(fixtures.build("record", 10, target="natedev"))) as connection:
             series = charts.collect_charts(connection, fixtures.START, fixtures.END, ZoneInfo("UTC"))
         buckets = cast(list[dict[str, object]], charts.chart_data(series)["buckets"])
-        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "state": "unavailable",
+        self.assertEqual(buckets[0]["phase"], {"finished": 1, "valid": 0, "missing": 1, "unrecorded": 1, "state": "unavailable",
                                                "reason": "phases ended before waits were recorded"})
 
     def test_bucket_sums_match_shared_costs_and_each_source_reads_once(self) -> None:

@@ -73,12 +73,13 @@ def queued_reading(reading: admission_records.QueueRead, units: tuple[str, ...])
     return with_queue_priority(current, units) if units else current
 
 
-def report_fixture(*, empty: bool = False) -> charts.PageData:
+def report_fixture(*, empty: bool = False, unrecorded: bool = False) -> charts.PageData:
     end = datetime(2026, 11, 8, tzinfo=UTC)
     start = end - timedelta(days=7)
     ranked = () if empty else (costs.RankedCost("fixture", "Memory wait", 120),)
-    phases = () if empty else (moments.ProgressFinish(end.timestamp() - 1, "fixture-phase",
-        "/fixture/hana", "natedev", 600.0),)
+    # Two phase times keep the median and the p90 points apart, so the page proof reads one point alone.
+    phases = () if empty else tuple(moments.ProgressFinish(end.timestamp() - 1, f"fixture-phase-{seconds}",
+        "/fixture/hana", "natedev", moments.WaitsNotRecorded() if unrecorded else seconds) for seconds in (600.0, 6000.0))
     build_costs = costs.BuildCosts(start, end, phases, ranked, costs.MacIdleEstimate(0, 0, 0, 0, 0))
     bucket = charts.DailyBucket(start, end, False, build_costs, frozenset({"fixture"}),
         {} if empty else {"fixture": start.timestamp()})
@@ -2180,6 +2181,7 @@ def write_browser_fixture(folder: Path) -> None:
             pages["mac_idle"] = json.loads(memory_feed.page_json(memory_feed.reading(configuration)))
         (fixture.root / "mac-idle" / "alert.json").unlink()
         for name, report in (("empty_report", report_fixture(empty=True)),
+                             ("unrecorded_report", report_fixture(unrecorded=True)),
                              ("missing_report", charts.IndexUnavailable("private index is missing"))):
             with (mock.patch.object(charts, "page_data", return_value=report),
                   mock.patch.object(admission_client, "view", return_value=base)):

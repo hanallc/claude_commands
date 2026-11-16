@@ -1844,6 +1844,10 @@ As built:
 - `moments.progress_events` reads `phase_active_seconds`. A record from before
   this change is `WaitsNotRecorded`, because its wall time can hold waits.
   A day with only such records reads `phases ended before waits were recorded`.
+- When no day in the range is measured, the card shows no plot and no table.
+  One line names why: "Shown from the first phase that ends with a wait
+  record. Earlier phases have no wait record." or "No Hana phase ended in
+  this range."
 - The plot title is "Hana phase time, without waits for the user or the
   showrunner". The legend says "half of phases take up to" and "most phases
   take up to". The memory action says "Most runs peak at N GiB or less."

@@ -327,13 +327,14 @@ def chart_data(series: ChartSet) -> dict[str, object]:
     for bucket in series.buckets:
         hana = [phase for phase in bucket.costs.phases if moments.hana_name(phase.working_dir) and phase.host == "natedev"]
         durations = [phase.active_s for phase in hana if isinstance(phase.active_s, float)]
-        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations)}
+        unrecorded = sum(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
+        phase: dict[str, object] = {"finished": len(hana), "valid": len(durations), "missing": len(hana)-len(durations),
+                                    "unrecorded": unrecorded}
         if durations:
             phase.update(state="measured", median=moments.nearest_rank(durations, 50), p90=moments.nearest_rank(durations, 90))
         else:
             phase.update(state="unavailable", reason=(
-                "phases ended before waits were recorded"
-                if any(isinstance(item.active_s, moments.WaitsNotRecorded) for item in hana)
+                "phases ended before waits were recorded" if unrecorded
                 else "no valid durations" if hana else "no finished phases"))
         rows: list[dict[str, object]] = []
         days = (bucket.end-bucket.start).total_seconds()/86400
