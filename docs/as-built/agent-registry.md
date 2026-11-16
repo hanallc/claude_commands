@@ -37,6 +37,7 @@ codex_service_tier=fast
 
 Options sections hold launch flags instead of agent rows.
 `[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
+It can also set `claude_account` and `claude_account.<subtask>`: the Claude launch account, `workers` (the default) or `caller`. `agent_exec.sh` runs a `caller` task on the caller's own account; `[direct.options] claude_account.simplify=caller` keeps the /simplify review there.
 The editor excludes options sections from family enumeration.
 
 A family is `codex` or `claude`.
@@ -260,8 +261,7 @@ It sends prompt contents through stdin, avoiding the command-line argument size 
 | Claude | Uses print mode with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and retains stream-json events in the log. |
 
 Write mode uses unrestricted write permissions.
-Readonly mode selects the read-only Codex sandbox or Claude plan permissions.
-`direct.simplify` also disables Claude editing tools.
+Readonly mode selects the read-only Codex sandbox, or Claude plan permissions with the editing tools disabled.
 `claude_result.py` writes the final answer to the output file.
 An `is_error` result or nonempty errors array produces `ERROR: <reason>` and exit 1.
 Otherwise the launcher preserves the agent's exit status.

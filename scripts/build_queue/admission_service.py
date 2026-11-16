@@ -983,6 +983,10 @@ def _refreshes(first: wire.Request | NoRequest, request: wire.Request) -> bool:
             and (request.episode, request.owner, request.since) == (first.episode, first.owner, first.since))
 
 
+# systemd passes the first inherited socket at this descriptor.
+LISTEN_FD = 3
+
+
 def _notify(message: str) -> None:
     address = os.environ.get("NOTIFY_SOCKET", "")
     if address:
@@ -1166,11 +1170,18 @@ class AdmissionServer:
         self.reading_events: int = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.epoll.register(self.reading_events, select.EPOLLIN)
         self.listener: socket.socket | NoConnection = NoConnection()
+        self.inherited_listener: bool = False
+        # A source change under systemd runs the new code in this process and keeps the socket.
+        self.replace_in_place: bool = False
         self.stopped: bool = False
         self.closed: bool = False
         self.next_pass: float = float("inf")
         self.next_source_check: float = float("inf")
-        self.sources: dict[Path, tuple[int, int] | SourceMissing] = self._source_stamps()
+        # The service watches each loaded module under this folder and stops when one changes.
+        self.source_root: Path = Path(__file__).resolve().parents[1]
+        self.source_module_count: int = len(sys.modules)
+        self.sources: dict[Path, tuple[int, int] | SourceMissing] = {
+            path: self._stamp(path) for path in self._source_paths()}
         self.source_change_at: float | SourcesUnchanged = SourcesUnchanged()
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1570,7 +1581,8 @@ class AdmissionServer:
             return self.system_reader.latest.lifetimes.get(record.episode, gate.LiveOwnerProcess())
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
-    def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int) -> records.QueueInputs:
+    def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
+                sweep_seconds: float) -> records.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -1642,7 +1654,7 @@ class AdmissionServer:
         if between:
             inputs = replace(inputs, running=(*inputs.running, *between))
         return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
-                                     config.policy, profile_rank, profile_share)
+                                     config.policy, profile_rank, profile_share, sweep_seconds)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -1725,12 +1737,13 @@ class AdmissionServer:
                 pass
 
     def _progress_inputs(self, inputs: records.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int) -> records.QueueInputs:
+                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int,
+                         sweep_seconds: float) -> records.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
         attributed = iter(gate.attributed_step_uses(inputs))
         running: list[records.RunningStep] = []
         cutoff = inputs.now - step_estimator.HISTORY_DAYS * 86400
-        self.progress_history.prune(cutoff, rank=profile_rank, share_percent=profile_share)
+        self.progress_history.prune(cutoff, sweep_seconds, rank=profile_rank, share_percent=profile_share)
         for step in inputs.running:
             if not gate.running_has_reservation(step):
                 running.append(step)
@@ -1911,7 +1924,8 @@ class AdmissionServer:
         self.last_diagnostics = config.diagnostics
         self._settle_attempt_reports()
         self._prepare_placements()
-        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent)
+        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
+                              self.configuration.progress_profile_sweep_seconds)
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
@@ -2841,8 +2855,15 @@ done
         saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
         if saved is not None:
             state = self._assignment_state(saved)
-            if isinstance(state, placement.ClosedAssignment):
+            if isinstance(state, placement.ClosedAssignment) and saved.assignment.destination.provider == "local":
                 return self._placement_status(saved.assignment, state.reason)
+            if isinstance(state, placement.ClosedAssignment):
+                # A released provider claim is final only after a pass settles the attempt and its retry.
+                self.next_pass = min(self.next_pass, self.clock.monotonic())
+                return wire.PlacementWait(request.episode, request.since, 1,
+                    self.placement_eligibility.get(request.episode, ()),
+                    provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
+                    retry_notices=retry_notices)
             if saved.assignment.destination.provider == "local":
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
@@ -3631,7 +3652,8 @@ done
             return
         inherited = int(os.environ.get("LISTEN_FDS") or "0")
         if inherited and int(os.environ.get("LISTEN_PID", str(os.getpid()))) == os.getpid():
-            listener = socket.socket(fileno=3)
+            listener = socket.socket(fileno=LISTEN_FD)
+            self.inherited_listener = True
         else:
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3789,16 +3811,15 @@ done
         except (BrokenPipeError, ConnectionResetError):
             self._disconnect(connection)
 
-    def _source_stamps(self) -> dict[Path, tuple[int, int] | SourceMissing]:
-        scripts = Path(__file__).resolve().parents[1]
+    def _source_paths(self) -> set[Path]:
         paths: set[Path] = set()
         for module in list(sys.modules.values()):
             filename = cast(object, getattr(module, "__file__", None))
             if isinstance(filename, str):
                 path = Path(filename).resolve()
-                if path.is_relative_to(scripts):
+                if path.is_relative_to(self.source_root):
                     paths.add(path)
-        return {path: self._stamp(path) for path in paths}
+        return paths
 
     @staticmethod
     def _stamp(path: Path) -> tuple[int, int] | SourceMissing:
@@ -3810,6 +3831,11 @@ done
 
     def _check_sources(self) -> None:
         configuration = self.last_usable_configuration
+        if len(sys.modules) != self.source_module_count:
+            # A function-level import loads its module after start. Watch it from the first check after it loads.
+            self.source_module_count = len(sys.modules)
+            for path in self._source_paths() - self.sources.keys():
+                self.sources[path] = self._stamp(path)
         current = {path: self._stamp(path) for path in self.sources}
         now = self.clock.monotonic()
         if current != self.sources:
@@ -3819,7 +3845,9 @@ done
               and not isinstance(self.source_change_at, SourcesUnchanged)
               and now - self.source_change_at >= configuration.source_settle_seconds):
             self.persist()
-            _notify("STOPPING=1")
+            self.replace_in_place = self.inherited_listener
+            _notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1000}" if self.replace_in_place
+                    else "STOPPING=1")
             self.stopped = True
         self.next_source_check = (now + configuration.source_check_seconds
                                   if isinstance(configuration, records.MemoryConfig) else float("inf"))
@@ -4011,9 +4039,13 @@ done
             os.close(descriptor)
         self.watchers.clear()
         if not isinstance(self.listener, NoConnection):
-            self.listener.close()
-            if not os.environ.get("LISTEN_FDS"):
-                self.socket_path.unlink(missing_ok=True)
+            if self.replace_in_place:
+                # The descriptor stays open for the replacement process.
+                _ = self.listener.detach()
+            else:
+                self.listener.close()
+                if not os.environ.get("LISTEN_FDS"):
+                    self.socket_path.unlink(missing_ok=True)
         self.epoll.close()
 
 
@@ -4203,6 +4235,10 @@ def main() -> int:
         server.serve_forever()
     finally:
         server.close()
+    if server.replace_in_place:
+        # The new code takes the same socket without the systemd restart delay; a failed start restarts as before.
+        os.set_inheritable(LISTEN_FD, True)
+        os.execv(sys.executable, sys.orig_argv)
     return 0
 
 

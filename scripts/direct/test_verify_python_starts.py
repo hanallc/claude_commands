@@ -80,10 +80,12 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         invoke = home / ".claude/scripts/lint/invoke.sh"
         invoke.parent.mkdir(parents=True)
         _ = invoke.write_text("# private code input\n")
+        fix_return = home / "fix_return.py"
+        _ = fix_return.write_text("# places the lint copy\n")
         harness = self.root / "code-key.sh"
-        _ = harness.write_text("\n".join(shell_function(VERIFY.read_text(), name) for name in ("hash_stream", "lint_code_key")))
+        _ = harness.write_text("\n".join(shell_function(VERIFY.read_text(), name) for name in ("hash_stream", "lint_code_files", "lint_code_key")))
         environment = {**self.environment, "HOME": str(home), "LINT_CONFIG_FILE": str(self.config),
-                       "PY": str(self.root / "python-must-not-start")}
+                       "FIX_RETURN_SCRIPT": str(fix_return), "PY": str(self.root / "python-must-not-start")}
         bash = shutil.which("bash")
         assert bash is not None
 
@@ -101,7 +103,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
             return result.stdout
 
         original = key()
-        for path in (harness, invoke, self.config):
+        for path in (harness, invoke, fix_return, self.config):
             with self.subTest(path=path.name):
                 before = path.read_bytes()
                 _ = path.write_bytes(before + b"\n# changed input\n")
@@ -196,7 +198,7 @@ class PairedTreeKeyTests(TreeWatchFixture):
         harness = session / "keys.sh"
         _ = harness.write_text('set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
                                + 'GATE_METADATA=$TEST_METADATA\n'
-                               + "\n".join(shell_function(VERIFY.read_text(), name) for name in ("verify_helper", "tree_key", "set_verdict_keys")) + '''
+                               + "\n".join(shell_function(VERIFY.read_text(), name) for name in ("verify_helper", "lint_code_files", "tree_key", "set_verdict_keys")) + '''
 tree_key
 tree_key --tree-content
 set_verdict_keys --watch-start "$UNIT_SESSION_DIR/start"

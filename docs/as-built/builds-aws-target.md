@@ -216,7 +216,7 @@ The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
 Without approval, `hana-setup` prints only its local plan.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
-It creates a retained data volume, retained root disk, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
+It creates a retained data volume, launch template, persistent Spot instance, security group, private control bucket, and scaler policy.
 Its Spot interruption behavior is `stop`.
 Setup uses Hana sizes and prices from `config/hana_aws.conf`.
 It reserves setup costs within both account and workload limits before the stack request.
@@ -226,6 +226,33 @@ Setup resumes an existing stack through reads before another mutation.
 It refuses changed resource inputs or an expired reservation before another stack request.
 It registers the deployment only after the Spot request and stopped state match.
 Setup adds no route, target, or slot capacity.
+Setup changes the stack through a change set, never through `cloudformation deploy`.
+It refuses an Instance, Volume or VolumeAttachment replace or remove before it executes the change set.
+A failed create or update calls `spot_end.end_boxes` before it reports the error.
+That call keeps only the box that `hana/setup.json` records.
+It then deletes, through `retained.delete`, the disks and buckets that the rollback kept (`DELETE_SKIPPED`).
+A failed create also deletes the failed stack.
+The launch template sets `DeleteOnTermination` true on the root disk, so AWS deletes each root disk with its box.
+
+## Ending persistent Spot boxes
+
+AWS opens a persistent Spot request again when its box is terminated.
+The request then launches a new box with no tags.
+`scripts/aws_target/spot_end.py` ends such boxes in this order:
+1. Read the live boxes by deployment tag.
+2. Cancel every live request of those boxes and every request with the tag.
+3. Read the boxes again by tag and by request id, so a box launched between the read and the cancel is found.
+4. Terminate the boxes and wait until they are terminated.
+5. Read again. `SpotEndIncomplete` names any request or box that stays live.
+A failed cancel raises before any terminate.
+`deploy.py down --workload hana --approve-destroy` ends the Hana boxes, records the Hana spending end, and deletes the Hana stack.
+It then deletes the data disk and the control bucket, and removes the local Hana records.
+The data on those disks and in the bucket is lost; `--approve-destroy` is the approval.
+`test_spot_end.py` uses a fake EC2 that relaunches a box when a box under an active persistent request is terminated.
+It shows that a failed create and the Hana `down` each leave no request, box, disk, bucket or stack.
+A failed update keeps only the recorded box and its root disk.
+A template test shows that the Hana root disk has `DeleteOnTermination` true.
+It also shows that each one-time launch uses one-time Spot with terminate.
 
 The provider maps every remote operation through `PROVIDER_OPERATIONS`.
 A policy test derives its required IAM actions from that mapping.
@@ -282,6 +309,17 @@ The target registry contains `mac,natedev`.
 The builder configuration and offload route have been removed.
 Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
 Only historical cost, ownership, and teardown compatibility remain.
+The foundation template has no builder instance, launch template, data volume, roles or stop action.
+The `remove-builder` command and the `down` compute stage are removed.
+The foundation template has no builder parameters or outputs, such as `EnableCompute` or `ComputeEnabled`, since 2026-11-15.
+`deploy.py` has no legacy record migration, data volume adoption, saved builder image or compute request reconcile.
+`down` reads a record without `ComputeEnabled` as a foundation with no builder.
+The ledger still prices the recorded builder hours with `instance_type` and `spot_max_usd_per_hour`.
+
+On 2026-11-04 an `up` with `cloudformation deploy` replaced the builder instance, and the update failed.
+The rollback terminated the new instance, so its persistent Spot request opened again.
+AWS then launched a stopped box with no tags, which stayed until the user removed it.
+Since that day, `up` uses a change set and refuses an instance or volume replace before it executes.
 
 `deploy.py down --approve-destroy` can remove the remaining gate resources without registering the former target.
 Teardown resolves former builder claim and lock paths directly from the AWS state folder.
@@ -619,7 +657,9 @@ The user asked for this layout on 2026-11-14 through builds. Each line shows:
 4. The estimate: Spot price times that box time, plus the refusal wait cost.
 5. Paid USD/h: the bill's `SpotUsage:<type>` cost for the type and region, over its billed hours.
 6. Paid USD/run: that bill split between the runs of both kinds by box time, for the merge gates only.
-   Runs on days without a bill show `bill due`.
+   The cell also counts the runs whose day has no bill yet, such as `0.0314 (17 bill due)`.
+   A bill comes up to about a day late.
+   A region whose runs all wait for a bill shows `17 bill due`; a region with no own runs of the type shows `no runs`.
 7. Paid runs: the count of runs that paid USD/run covers.
 The bill names the region by its usage type prefix, such as `USE2-SpotUsage:c7a.8xlarge`.
 `ledger.REGION_USAGE_PREFIXES` maps each prefix to a region.

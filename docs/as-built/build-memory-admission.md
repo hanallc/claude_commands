@@ -584,6 +584,10 @@ Missing argv does not remove a compile count. A saved shape does not prove compi
 The join combines repeated attempts. Any positive count keeps the call in compile history.
 An unknown count or a missing join keeps the peak usable until the index supplies a known count.
 The peak's completion time controls its history window, including failed-build floors.
+The estimate reader decodes only rows that can be in the window (`HistoryWindow` in `step_estimator.py`).
+Rows append when steps end, so a binary search finds the first row that ended one day before the window.
+The day covers rows that came late; on 2026-11-15 the latest came 19 minutes late. A damaged row stops the search there.
+A row whose bytes do not hold the host and a requested step is not decoded.
 Merge-gate peaks keep their separate class and remain in the anonymous history.
 The gate uses its own cap, so Cargo estimates do not use those peaks.
 
@@ -914,6 +918,10 @@ The main loop clears the outage claim once after `silence_seconds` of continuous
 It uses the last usable configuration and retries a failed clear on a later loop.
 A shorter service start preserves the claim.
 Source changes stop the service after the settle interval. A missing source also counts as a change.
+Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
+It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
+A failed start of the new code exits, and `Restart=always` starts the service again.
+A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 A restored head override receives reconnect grace only after the listener is ready.
 `down-alert` waits `silence_seconds` and claims `build-admission`.
 It sends the outage message to the `builds` session first.
@@ -1135,7 +1143,9 @@ Only removal ends the holder's hold.
 It captures outermost gates that work, CI `Runner.Worker` processes, and builds that the enforcer could stop.
 A gate works when it has a cargo child, an admission reservation, or a Mac or AWS claim.
 A live step record also counts as a claim when the call cannot run on natedev, or waits for or runs on the Mac or AWS.
-`remote_step_callers` names these gates, and clear, drain and the enforcer never stop them.
+`remote_step_callers` names these gates in `LiveClaims.routed`, and clear and the enforcer never stop them.
+A drain does not keep a routed gate, so a later natedev step of that call waits for the release.
+An unreadable step record of a live writer makes the claims unreadable.
 On 2026-11-15 a natedev hold stopped two gates whose builds waited for or ran on the Mac.
 A gate that only waits is not kept. It waits for the release like new work, and the drain does not wait for it.
 Unreadable claims or admission state keep every outermost gate.
@@ -1192,7 +1202,11 @@ The cleanup removes the JSON record, the state file, and this call’s `.step-<c
 The `state` and `remove` Python CLI verbs no longer exist.
 
 `step_record.read` opens the state file before it reads the JSON record.
-It keeps that file open through the join, then closes it on every path before process validation.
+It checks the writer process before it decodes the record, and keeps the state file open until it returns.
+The writer is the record's `pid` and `proc_start`.
+When the JSON is damaged, the writer is the pid in the call id (`v<UTC stamp>-<pid>-<random>`).
+An ended writer, or a pid with another start time, returns `StaleRecord`, even when the record is damaged.
+So a damaged record of a killed gate does not make the hold claims unreadable for good.
 Without a state file, the reader keeps the original row.
 The open state file supplies the UTC update time from its modification time.
 An unknown state word returns `UnreadableRecord` through the existing validation path.
@@ -1998,6 +2012,10 @@ Scope evidence includes all recorded scope members, including helpers outside th
 The service reads process commands and `RssAnon` only for a new highest run value.
 Lower samples, equal samples, and lower bin peaks retain the previous process evidence.
 Active records retain this evidence across service restarts and completion.
+The history merge reads only each record's profile and time; it does not keep the process evidence in memory.
+Each pass reads stale histories for at most `progress_profile_sweep_seconds` (initially 0.05), and always reads at least one key.
+After a restart, the service reads the history of each running step's key at once, and the other keys over the next passes.
+The sweep also deletes expired records, so an expired record can stay on disk until the sweep reaches its key.
 Old records remain readable with `ReadingSourceNotRecorded` and `PeakProcessesNotRecorded`.
 Unavailable process commands and anonymous readings have named states with their read errors.
 The nextest test phase keeps its frozen baseline and margin as the fallback. Its live test peak remains a floor.

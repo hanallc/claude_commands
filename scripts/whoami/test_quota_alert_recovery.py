@@ -13,7 +13,7 @@ setUpModule = support.setUpModule
 
 class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_a_pending_claude_switch_restores_before_the_workers_back_notice(self) -> None:
-        _ = self.block([self.note("codex1.md", "active", "0")], self.now)
+        _ = self.block([self.note("codex1.md", "active", "0", credit_balance="0")], self.now)
         with quota_alert.state_file() as state:
             fallback = state["fallback"]
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
@@ -44,7 +44,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.routing_entries()[-1]["kind"], "routed back")
 
     def test_fallback_recovery_after_state_reload_keeps_its_pairing_time_and_journals_once(self) -> None:
-        notes = [self.note("codex1.md", "active", "0")]
+        notes = [self.note("codex1.md", "active", "0", credit_balance="0")]
         _ = self.block(notes, self.now)
         _ = self.block(notes, self.now)
         opened = self.routing_entries()

@@ -34,7 +34,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import conf, test_hang_guard
-from scripts.review_links import page_frame, review_link, test_serve
+from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.lib.build_steps import read_step_names
 from scripts.message import unit_labels
 from scripts.lint import memory_admit as gate
@@ -198,8 +198,9 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.configuration.write_text(text)
 
     def expected_page(self, seconds: float = 0.125) -> str:
-        return (Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-                .replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
+        page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
+        self.assertIn(console_theme.TOKENS, page)
+        return (page.replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
                 .replace("__PAGE_FRAME_STYLE__", page_frame.STYLE))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
