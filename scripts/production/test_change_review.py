@@ -1164,6 +1164,41 @@ class ReadyListTests(ProducerFixture):
         self.assertEqual(self.live(merged)[0], 0)
         self.assertEqual(change_review.pending(self.listing)[-1][change_review.IMAGE], identity)
 
+    def test_list_ready_and_live_copy_images_page_ids_without_removing_the_sources(self) -> None:
+        images = self.root / "links" / image_store.IMAGES_FOLDER
+        single = self.root / "single.png"
+        before = self.root / "before.png"
+        after = self.root / "after.png"
+        for path, content in ((single, b"single image"), (before, b"before image"), (after, b"after image")):
+            _ = path.write_bytes(content)
+        first = image_store.register_file(single, images, "One image")
+        pair = image_store.register_file(after, images, "A pair", before=before)
+        merged = self.merge_change(f"Change-Review: First | Read | First result | image {first['id']}\n"
+            + f"Change-Review: Held | Read | Later result | after restart | image {pair['id']}")
+        self.promote()
+        code, output, errors = self.ready()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertNotIn("no image", output)
+        self.assertEqual(len(change_review.pending(self.listing)), 1)
+        code, output, errors = self.live(merged)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertNotIn("no image", output)
+        rows = change_review.pending(self.listing)
+        self.assertEqual(len(rows), 2)
+        for row, source, expected in zip(rows, (first, pair), (single, after), strict=True):
+            with self.subTest(row=row["#"]):
+                identity = row[change_review.IMAGE]
+                self.assertNotEqual(identity, source["id"])
+                self.assertTrue(image_store.change_image(self.root / "links", identity))
+                folder = self.root / "links" / image_store.CHANGE_FOLDER / identity
+                record = image_store.read_record(folder)
+                self.assertEqual((folder / record["file"]).read_bytes(), expected.read_bytes())
+                original = images / source["id"]
+                self.assertEqual(image_store.read_record(original), source)
+                self.assertEqual((original / source["file"]).read_bytes(), expected.read_bytes())
+        assert "before" in pair
+        self.assertEqual((images / pair["id"] / pair["before"]).read_bytes(), before.read_bytes())
+
     def test_a_separate_promotion_makes_the_source_clone_add_each_row_once(self) -> None:
         merged = self.merge_change("Change-Review: First | Read | First result\n"
                                    + "Change-Review: Second | Read | Second result")

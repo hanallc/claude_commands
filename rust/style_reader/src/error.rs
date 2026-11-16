@@ -22,6 +22,12 @@ pub(crate) enum ReaderError {
         #[source]
         source: gix::Error,
     },
+    #[error("`{blob}` is not a full query blob id")]
+    QueryBlobId {
+        blob:   String,
+        #[source]
+        source: gix::Error,
+    },
     #[error("cannot read the tree of commit {commit}")]
     Tree {
         commit: String,

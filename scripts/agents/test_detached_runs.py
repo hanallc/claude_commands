@@ -43,7 +43,7 @@ from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.message.repeat_guard_test_support import install_guard_test_budget, wait_for_notice_exit
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, worker_admission
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
 
@@ -720,29 +720,39 @@ sys.exit(1)
         with patch("shutil.which", return_value=None):
             self.assertEqual(detached_runs.scope_prefix(marker, on), [])
 
-    def test_group_stop_ends_the_supervisor_and_command_and_reaps_the_result(self) -> None:
+    def test_stop_ends_the_command_group_and_the_supervisor_delivers_the_result(self) -> None:
         child_source = """import json, os, socket, sys
 with socket.socket(socket.AF_UNIX) as connection:
     connection.connect(sys.argv[1])
-    connection.sendall((json.dumps(dict(role='command', pid=os.getpid(), group=os.getpgrp())) + '\\n').encode())
+    connection.sendall((json.dumps(dict(role='command', pid=os.getpid(), group=os.getpgrp(), session=os.getsid(0))) + '\\n').encode())
     connection.recv(1)
 """
+        # The fake delivery process reports the result text over the socket instead of sending it.
         supervisor_source = """import json, os, runpy, signal, socket, subprocess, sys
+from pathlib import Path
 from unittest.mock import patch
 from scripts.agents import detached_runs
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 wait = subprocess.Popen.wait
 address = sys.argv[4]
-def checked_wait(process, *args, **kwargs):
+def report(row):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(address)
-        defaults = all(signal.getsignal(number) == signal.SIG_DFL for number in CANCELLATION_SIGNALS)
-        connection.sendall((json.dumps(dict(role='supervisor', defaults=defaults, group=os.getpgrp())) + '\\n').encode())
+        connection.sendall((json.dumps(row) + '\\n').encode())
+def checked_wait(process, *args, **kwargs):
+    defaults = all(signal.getsignal(number) == signal.SIG_DFL for number in CANCELLATION_SIGNALS)
+    report(dict(role='supervisor', defaults=defaults, group=os.getpgrp()))
     return wait(process, *args, **kwargs)
-with patch.object(subprocess.Popen, 'wait', checked_wait):
+def delivery(arguments, *args, **kwargs):
+    record = detached_runs._read_record(Path(arguments[-1]))
+    text = detached_runs.result_text(record, detached_runs.command_result(record))
+    report(dict(role='delivery', verb=arguments[-2], text=text))
+    return subprocess.CompletedProcess(arguments, 0)
+with patch.object(subprocess.Popen, 'wait', checked_wait), patch.object(subprocess, 'run', delivery):
     sys.argv = sys.argv[1:4]
     runpy.run_path(detached_runs.__file__, run_name='__main__')
 """
+        reason = "stopped for timed test; run again after the release"
         with short_socket_directory() as socket_root:
             address = Path(socket_root) / "ready.sock"
             runtime = Path(socket_root) / "runtime"
@@ -754,65 +764,92 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
             scope.chmod(0o755)
             with socket.socket(socket.AF_UNIX) as manager:
                 manager.bind(str(runtime / "systemd/private"))
+                stopped = 128 + signal.SIGTERM
                 for scoped in (False, True):
-                    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                        with self.subTest(scoped=scoped, signal=number), socket.socket(socket.AF_UNIX) as ready:
-                            guard = LauncherHangGuard("detached process group stop")
-                            ready.bind(str(address))
-                            ready.listen(2)
-                            path = self.record([sys.executable, "-c", child_source, str(address)])
-                            environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
-                                           "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
-                            with (Path(self.root / "supervisor.log").open("ab") as output,
-                                  subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
-                                                    "supervise", str(path), str(address)], env=environment,
-                                                   stdout=output, stderr=subprocess.STDOUT,
-                                                   start_new_session=True) as supervisor,
-                                  contextlib.ExitStack() as connections):
-                                self.update_record(path, pid=supervisor.pid)
-                                try:
-                                    observed: dict[str, dict[str, object]] = {}
-                                    command_connection: socket.socket | None = None
-                                    for _ in range(2):
-                                        self.assertTrue(select.select([ready], [], [], guard.remaining())[0],
-                                                        "the run did not report readiness")
-                                        connection = ready.accept()[0]
-                                        _ = connections.enter_context(connection)
-                                        connection.settimeout(guard.remaining())
-                                        stream = connections.enter_context(connection.makefile("rb"))
-                                        row = cast(dict[str, object], json.loads(stream.readline()))
-                                        observed[str(row["role"])] = row
-                                        if row["role"] == "command":
-                                            command_connection = connection
-                                    self.assertEqual(observed["supervisor"]["defaults"], True)
-                                    self.assertEqual(observed["supervisor"]["group"], supervisor.pid)
-                                    self.assertEqual(observed["command"]["group"], supervisor.pid)
-                                    saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-                                    self.assertEqual(process_start.process_start(supervisor.pid),
-                                                     process_start.Started(saved.get("supervisor_started", "")))
-                                    self.assertEqual(saved.get("command_pid"), observed["command"]["pid"])
-                                    self.assertEqual(process_start.process_start(saved.get("command_pid", 0)),
-                                                     process_start.Started(saved.get("command_started", "")))
-                                    self.assertEqual(path.with_suffix(".scope").exists(), scoped)
-                                    process_group.send_process_group(supervisor.pid, number)
-                                    self.assertEqual(supervisor.wait(timeout=guard.remaining()), -number)
-                                    assert command_connection is not None
-                                    self.assertEqual(command_connection.recv(1), b"")
-                                finally:
-                                    with contextlib.suppress(ProcessLookupError):
-                                        process_group.send_process_group(supervisor.pid, signal.SIGKILL)
-                                    _ = supervisor.wait(timeout=guard.remaining())
-                            address.unlink()
-                            before = len(self.sent)
-                            self.assertEqual(detached_runs.live_runs(path.parent, WORKER), [])
-                            wait_for_notice_exit(saved.get("command_pid", 0))
-                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), ["r1"])
-                            record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
-                            self.assertEqual((record["status"], record.get("ended")), ("finished", "supervisor gone"))
-                            self.assertNotIn("exit_code", record)
-                            self.assertEqual(len(self.sent), before + 1)
-                            self.assertIn("FAIL (no exit status)", self.sent[-1])
-                            self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+                    with self.subTest(scoped=scoped), socket.socket(socket.AF_UNIX) as ready:
+                        guard = LauncherHangGuard("detached process group stop")
+                        ready.bind(str(address))
+                        ready.listen(3)
+                        path = self.record([sys.executable, "-c", child_source, str(address)])
+                        environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
+                                       "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+                        with (Path(self.root / "supervisor.log").open("ab") as output,
+                              subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
+                                                "supervise", str(path), str(address)], env=environment,
+                                               stdout=output, stderr=subprocess.STDOUT,
+                                               start_new_session=True) as supervisor,
+                              contextlib.ExitStack() as connections):
+                            self.update_record(path, pid=supervisor.pid)
+
+                            def accept() -> tuple[socket.socket, dict[str, object]]:
+                                self.assertTrue(select.select([ready], [], [], guard.remaining())[0],
+                                                "the run did not report")
+                                connection = ready.accept()[0]
+                                _ = connections.enter_context(connection)
+                                connection.settimeout(guard.remaining())
+                                stream = connections.enter_context(connection.makefile("rb"))
+                                return connection, cast(dict[str, object], json.loads(stream.readline()))
+
+                            command_pid = 0
+                            try:
+                                observed: dict[str, dict[str, object]] = {}
+                                command_connection: socket.socket | None = None
+                                for _ in range(2):
+                                    connection, row = accept()
+                                    observed[str(row["role"])] = row
+                                    if row["role"] == "command":
+                                        command_connection = connection
+                                self.assertEqual(observed["supervisor"]["defaults"], True)
+                                self.assertEqual(observed["supervisor"]["group"], supervisor.pid)
+                                command_pid = cast(int, observed["command"]["pid"])
+                                # The command leads its own session, so a stop of its group spares the supervisor.
+                                self.assertEqual((observed["command"]["group"], observed["command"]["session"]),
+                                                 (command_pid, command_pid))
+                                saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                                self.assertEqual(saved.get("command_group"), command_pid)
+                                self.assertEqual(process_start.process_start(supervisor.pid),
+                                                 process_start.Started(saved.get("supervisor_started", "")))
+                                self.assertEqual(saved.get("command_pid"), command_pid)
+                                self.assertEqual(path.with_suffix(".scope").exists(), scoped)
+                                self.assertTrue(detached_runs.stop_command(path, reason))
+                                assert command_connection is not None
+                                self.assertEqual(command_connection.recv(1), b"")
+                                _, delivered = accept()
+                                self.assertEqual(supervisor.wait(timeout=guard.remaining()), 0)
+                            finally:
+                                for group in (supervisor.pid, command_pid):
+                                    with contextlib.suppress(ProcessLookupError, ValueError):
+                                        process_group.send_process_group(group, signal.SIGKILL)
+                                _ = supervisor.wait(timeout=guard.remaining())
+                        address.unlink()
+                        self.assertEqual(delivered["verb"], "deliver")
+                        self.assertIn(f"Result: STOPPED (exit {stopped})", str(delivered["text"]))
+                        self.assertIn(f"Stop reason: {reason}", str(delivered["text"]))
+                        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                        self.assertEqual((record["status"], record.get("exit_code"), record.get("ended")),
+                                         ("finished", stopped, None))
+                        self.assertFalse(path.with_suffix(".scope").exists())
+                        self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
+
+    def test_stop_refuses_a_record_without_a_current_command_group(self) -> None:
+        path = self.record([sys.executable, "-c", "pass"])
+        started = process_start.process_start(os.getpid())
+        assert isinstance(started, process_start.Started)
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("not published", {}),
+            ("leader gone", {"command_group": DEAD_PID, "command_started": started.start}),
+            ("finished", {"status": "finished", "command_group": DEAD_PID, "command_started": started.start}),
+        )
+        for name, fields in cases:
+            # The supervisor check passes, so each refusal comes from the command group record.
+            with (self.subTest(case=name), patch.object(process_group, "send_process_group") as send,
+                  patch.object(detached_run_process, "supervises", return_value=True)):
+                self.update_record(path, pid=os.getpid(), **fields)
+                with contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(detached_runs.main(["stop", "--reason", "fixture stop", str(path)]), 1)
+                self.assertIn("nothing stopped", error.getvalue())
+                send.assert_not_called()
+                self.assertNotIn("stop_reason", cast(dict[str, object], json.loads(path.read_text())))
 
     def test_command_receives_the_recorded_staff_owner_without_a_session_environment(self) -> None:
         command = [sys.executable, "-c", "import os; print(os.environ['BUILDLOG_OWNER_STAFF_ID'])"]
@@ -897,7 +934,7 @@ with patch.object(subprocess.Popen, 'wait', checked_wait):
         self.assertEqual(json.loads(path.read_text())["status"], "finished")
         messages = cast(list[str], self.pending()["messages"])
         self.assertEqual(len(messages), 1)
-        self.assertIn("FAIL (exit 143)", messages[0])
+        self.assertIn("Result: STOPPED (exit 143)", messages[0])
         self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
     def test_record_exit_rejects_a_reused_pid_and_a_finished_record(self) -> None:
@@ -1011,6 +1048,20 @@ exit 143
                 self.assertEqual(json.loads(path.read_text())["status"], "finished")
                 self.assertEqual(detached_runs.reap_orphans(str(self.session)), [])
 
+    def test_orphan_reaping_waits_for_live_members_of_the_command_group(self) -> None:
+        group = DEAD_PID + 2
+        path = self.record(["bash", "verify.sh"])
+        self.update_record(path, pid=DEAD_PID, supervisor_started="original-start", command_pid=group,
+                           command_group=group, command_started="original-command-start")
+        for members, reaped in ((f"{group} S\n{group} Z\n", []), (f"{group} Z\n{DEAD_PID} S\n", ["r1"])):
+            with self.subTest(members=members):
+                listing = subprocess.CompletedProcess(["ps"], 0, members, "")
+                with (patch.object(process_start, "process_start", return_value=process_start.Gone()),
+                      patch.object(subprocess, "run", return_value=listing) as group_scan):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.session)), reaped)
+                    group_scan.assert_called_once()
+        self.assertEqual(json.loads(path.read_text())["status"], "finished")
+
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])
         record = self.supervise(path)
@@ -1029,8 +1080,8 @@ exit 143
         ], done=str(done))
         record = self.supervise(path)
         message, = cast(list[str], self.pending()["messages"])
-        self.assertIn("Result: FAIL (exit 143)", message)
-        self.assertIn(reason, message)
+        self.assertIn("Result: STOPPED (exit 143)", message)
+        self.assertIn(f"Stop reason: {reason}", message)
         self.assertEqual(record.get("stop_reason"), reason)
         (session_staff.inbox_path(self.worker_id)).unlink()
         record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(1)"], done=str(done)))
