@@ -550,6 +550,16 @@ else
     PY="$VERIFY_START_DIR/../lib/py"
 fi
 
+# Send <signal> to child <pid>, then collect the child.
+# A trapped signal that arrives while Bash collects a child can lose that exit
+# status. The job table then shows the child as running, and wait never returns.
+# A child that Bash has not collected stays as a zombie, and kill still finds it.
+# So a failed kill means the child is gone, and no wait follows.
+collect_child() {
+    kill -s "$2" "$1" 2>/dev/null || return 0
+    wait "$1" 2>/dev/null || true
+}
+
 # One parent-owned helper serves command substitutions and cleanup traps.
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
@@ -674,6 +684,7 @@ LOCAL_RELEASE_WAIT_SCRIPT="${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$(cd "$(dirname "
 STEP_RECORD_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/step_record.py"
 FINAL_PASS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/final_pass.py"
 VERIFY_METADATA_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify_metadata.py"
+FIX_RETURN_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../mac_test" && pwd)/fix_return.py"
 FINAL_PASS_START=""
 finish_verify_run() {
     if [[ -n "$FINAL_PASS_START" ]]; then
@@ -1102,6 +1113,12 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
+    # During a copy pass Taplo writes the copy; the same relative paths name its files.
+    if [[ -n "${LINT_COPY_TREE:-}" ]]; then
+        local prefix
+        prefix="$(git rev-parse --show-prefix)" || return
+        cd "$LINT_COPY_TREE/$prefix" || return
+    fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
     if [[ "$status" != 0 && "${1:-}" == --check ]]; then
@@ -1339,6 +1356,15 @@ compose_nextest_args() {
     fi
 }
 
+# A stop during a Mac fix return leaves a record in the git folder (fix_return.py).
+# The run finishes it before any step reads the tree. Only a left record costs a Python call.
+finish_mac_fix() {
+    local record
+    record="$(git rev-parse --git-path mac-fix.json 2>/dev/null)" || return 0
+    [[ -e "$record" ]] || return 0
+    verify_helper "$VERIFY_START_DIR/../mac_test/fix_return.py" finish --repo-root "$(git rev-parse --show-toplevel)"
+}
+
 VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
@@ -1404,6 +1430,7 @@ if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ON
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
     trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
+finish_mac_fix || exit 2
 VERIFY_SETUP="$(verify_helper "$VERIFY_START_DIR/dev_features.py" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/Cargo.toml" "$CMD")" || exit 2
 DEV_FEATURES="${VERIFY_SETUP%%$'\n'*}"
 VERIFY_TEST_ENVIRONMENT=()
@@ -1597,7 +1624,7 @@ phase_wait_start() {
         for pending in "$HOLD_WAIT_DIR"/phase-close.*.memory.*; do
             [[ -s "$pending" ]] || continue
             read -r id < "$pending"
-            "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+            verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
                 || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
             rm -f "$pending"
         done
@@ -1641,7 +1668,7 @@ phase_wait_start() {
         previous=$(< "$holder_file")
         if [[ "$holder" == "$previous" && ! ( "$key" == memory && -n "$payload" ) ]]; then return 0; fi
         read -r id < "$file"
-        if "$PY" "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
+        if verify_helper "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
             --wait-id "$id" ${holder_args[@]+"${holder_args[@]}"}; then
             printf '%s' "$holder" > "$holder_file"
         else
@@ -1657,7 +1684,7 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
+    if id="$(verify_helper "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
         if [[ -n "$id" ]]; then
             printf '%s' "$holder" > "$holder_file"
             printf '%s\n' "$id" > "$file"
@@ -1677,7 +1704,7 @@ phase_wait_finish() {
         return 0
     fi
     read -r id < "$file"
-    if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
+    if verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file" "$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
@@ -1693,7 +1720,7 @@ phase_wait_finish_all() {
     for file in "$HOLD_WAIT_DIR"/phase-wait.* "$HOLD_WAIT_DIR"/phase-close.*; do
         [[ -s "$file" ]] || continue
         read -r id < "$file"
-        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
+        verify_helper "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
             || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
     done
 }
@@ -1945,10 +1972,7 @@ after_tree_change() {
 
 stop_tree_watch() {
     if [[ -n "$TREE_WATCH_PID" ]]; then
-        # A group signal can reap the watcher before this cleanup starts.
-        if kill "$TREE_WATCH_PID" 2>/dev/null; then
-            wait "$TREE_WATCH_PID" 2>/dev/null || true
-        fi
+        collect_child "$TREE_WATCH_PID" TERM
         TREE_WATCH_PID=""
     fi
 }
@@ -1970,8 +1994,7 @@ cancel_tree_run() {
     stop_tree_watch
     if [[ -n "$runner_pid" ]]; then
         # offload.py's TERM handler stops the remote run and releases its claim.
-        kill -TERM "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
     # Board release also stops a step's separately owned process group.
@@ -2152,6 +2175,10 @@ STEP_RAN_ON_MAC=0
 # LINT_MAC_FIX=1 sends mend --fix to the Mac as one fix pass (run_mac_lint_fix).
 LINT_MAC_FIX=0
 MAC_FIX_RESULT=""
+# The local lint fix pass runs on a private copy in a repository that cargo-berth
+# configures (lint_copy_begin). LINT_COPY_MODE is empty until the first pass asks.
+LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
+LINT_COPY_ARGS=()
 
 forward_mac_runner_signal() {
     local signal_name=$1 exit_status=$2 runner_pid
@@ -2163,8 +2190,7 @@ forward_mac_runner_signal() {
     TREE_WATCH_DIR=""
     trap - INT TERM HUP
     if [[ -n "$runner_pid" ]]; then
-        kill -s "$signal_name" "$runner_pid" 2>/dev/null || true
-        wait "$runner_pid" 2>/dev/null || true
+        collect_child "$runner_pid" "$signal_name"
     fi
     if [[ -n "$MAC_RESULT_FILE" ]]; then
         if [[ -d "$MAC_RESULT_FILE" ]]; then
@@ -2970,8 +2996,7 @@ stop_copy_watch() {
     local line copy_s="" copy_count="" natedev_s=""
     COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" COPY_STOPPED=""
     [[ -n "$COPY_WATCH_PID" ]] || return 0
-    kill -TERM "$COPY_WATCH_PID" 2>/dev/null || true
-    wait "$COPY_WATCH_PID" 2>/dev/null || true
+    collect_child "$COPY_WATCH_PID" TERM
     COPY_WATCH_PID=""
     if [[ -f "$COPY_WATCH_DIR/result" ]]; then
         while IFS= read -r line; do
@@ -3232,8 +3257,7 @@ hold_interrupted() {
         # A background Bash sleep inherits ignored INT. End that waiter with
         # TERM for every caller signal; keep the caller's status in the record.
         if [[ "$MAC_ONLY" == 1 ]]; then signal_name=TERM; fi
-        kill -s "$signal_name" "$HOLD_WAITER_PID" 2>/dev/null || true
-        wait "$HOLD_WAITER_PID" 2>/dev/null || true
+        collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
     note_event interrupted "$SECONDS" 0 "" 0 "$code"
@@ -3307,8 +3331,7 @@ token_wait_interrupted() {
     local signal_name=$1
     trap - INT TERM HUP
     if [[ -n "$TOKEN_WAITER_PID" ]]; then
-        kill "$TOKEN_WAITER_PID" 2>/dev/null || true
-        wait "$TOKEN_WAITER_PID" 2>/dev/null || true
+        collect_child "$TOKEN_WAITER_PID" TERM
     fi
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
@@ -3686,8 +3709,7 @@ start_token_renewer() {
                 renew_sleep_pid=$!
             fi
             if [[ -n "$renew_sleep_pid" ]]; then
-                kill "$renew_sleep_pid" 2>/dev/null || true
-                wait "$renew_sleep_pid" 2>/dev/null || true
+                collect_child "$renew_sleep_pid" TERM
             fi
             exit 0
         ' INT TERM HUP
@@ -3707,8 +3729,7 @@ start_token_renewer() {
 
 stop_token_renewer() {
     [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
-    kill "$TOKEN_RENEWER_PID" 2>/dev/null || true
-    wait "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    collect_child "$TOKEN_RENEWER_PID" TERM
     TOKEN_RENEWER_PID=""
 }
 
@@ -3923,7 +3944,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     # the invocation itself: "verify.sh test hana" names both the command that
     # ran and the script to open when a gate misbehaves, where a bare
     # "test hana" answered neither.
-    if "$PY" "${PROGRESS_HISTORY}" start-activity \
+    if verify_helper "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
         --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
@@ -3938,7 +3959,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
                 error) result="fail" ;;
                 cancelled) status=canceled ;;
             esac
-            "$PY" "${PROGRESS_HISTORY}" finish-activity \
+            verify_helper "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true
@@ -3955,6 +3976,7 @@ verify_cleanup() {
     stop_tree_watch
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
+    lint_copy_drop
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
     fi
@@ -4016,6 +4038,66 @@ trap 'verify_interrupted 2' INT
 trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 
+# In a repository that cargo-berth configures, mend, clippy --fix, fmt and taplo
+# write a private copy of the worktree, never the worktree. A rewrite in place
+# can write a path that another reservation holds; berth records that as an
+# incursion. return-copy writes back only the paths that this worktree holds
+# and reports the others (fix_return.py). Other repositories fix in place.
+lint_copy_begin() {
+    lint_copy_drop
+    [[ "${LINT_COPY_MODE:-}" != in-place ]] || return 0
+    local answer manifest
+    load_metadata
+    answer="$(verify_helper --stdin "$FIX_RETURN_SCRIPT" copy \
+        --repo-root "$(git rev-parse --show-toplevel)" --owner "$$" <<< "$GATE_METADATA")" || exit 2
+    if [[ "$answer" == in-place ]]; then
+        LINT_COPY_MODE=in-place
+        return 0
+    fi
+    LINT_COPY_MODE=copy
+    { read -r _; read -r LINT_COPY_DIR; read -r LINT_COPY_TREE; read -r manifest; read -r LINT_COPY_TARGET; } <<< "$answer"
+    LINT_COPY_ARGS=(--manifest-path "$manifest")
+}
+
+# Run one rewrite command: on the copy when a copy pass is open, otherwise in place.
+# The copy uses the worktree's cargo target folder, so the dependencies stay built.
+lint_rewrite() {
+    if [[ -z "${LINT_COPY_DIR:-}" ]]; then
+        "$@"
+        return
+    fi
+    local CARGO_TARGET_DIR="$LINT_COPY_TARGET"
+    export CARGO_TARGET_DIR
+    "$@" "${LINT_COPY_ARGS[@]}"
+}
+
+# Write the held changes of the copy into the worktree and delete the copy.
+# A fixed path that no reservation holds fails the pass.
+lint_copy_return() {
+    [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
+    local folder="$LINT_COPY_DIR"
+    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    LINT_COPY_ARGS=()
+    verify_helper "$FIX_RETURN_SCRIPT" return-copy \
+        --repo-root "$(git rev-parse --show-toplevel)" --folder "$folder"
+}
+
+lint_copy_drop() {
+    [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
+    rm -rf -- "$LINT_COPY_DIR"
+    LINT_COPY_DIR="" LINT_COPY_TREE=""
+    LINT_COPY_ARGS=()
+}
+
+# The clippy fix loop stops when its tree stops changing: the copy or the worktree.
+lint_fix_tree_key() {
+    if [[ -z "${LINT_COPY_DIR:-}" ]]; then
+        tree_key --tree-content
+        return
+    fi
+    (cd "$LINT_COPY_TREE" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum) 2>/dev/null || true
+}
+
 run_lint_judgment() {
     if lint_config_enabled clippy; then
         [[ -n "$PKG" ]] || echo 'style-lint: clippy start'
@@ -4046,11 +4128,12 @@ run_lint_judgment() {
                 [[ -z "$clippy_fix_limit" ]] || echo "verify.sh: invalid clippy_fix_pass_limit=$clippy_fix_limit; using 3." >&2
                 clippy_fix_limit=3
             fi
-            clippy_tree_before="$(tree_key --tree-content)"
+            lint_copy_begin
+            clippy_tree_before="$(lint_fix_tree_key)"
             for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
-                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key --tree-content)"
+                lint_rewrite invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+                clippy_tree_after="$(lint_fix_tree_key)"
                 if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                     break
                 fi
@@ -4060,6 +4143,7 @@ run_lint_judgment() {
                 fi
                 clippy_tree_before="$clippy_tree_after"
             done
+            lint_copy_return || exit 1
             start_tree_watch
             clippy_status=0
             invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
@@ -4081,13 +4165,20 @@ run_mac_lint_fix() {
     MAC_FIX_RESULT=""
     echo 'verify.sh: mend found findings on the Mac; running the fix pass there.'
     invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" || fix_status=$?
+    if [[ "$MAC_FIX_RESULT" == withheld ]]; then
+        # A fix that no reservation holds is withheld on natedev too.
+        echo 'verify.sh: the Mac fix pass fixed a path that no reservation holds; see above.' >&2
+        exit 1
+    fi
     if (( fix_status != 0 )) || [[ "$STEP_RAN_ON_MAC" != 1 \
             || ( "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ) ]]; then
         echo 'verify.sh: the Mac fix pass did not finish; natedev repairs the tree.'
         return 1
     fi
     # Format the returned files with natedev's rustfmt, then judge this tree.
-    fmt_cargo --all
+    lint_copy_begin
+    lint_rewrite fmt_cargo --all
+    lint_copy_return || exit 1
     if [[ -n "${RUN_LOG}" ]]; then
         set_verdict_keys
     fi
@@ -4097,9 +4188,10 @@ run_mac_lint_fix() {
 run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
     # Format locally; the Mac judges the resulting tree without fixes.
-    fmt_cargo --all
-    load_metadata
+    lint_copy_begin
+    lint_rewrite fmt_cargo --all
     workspace_taplo
+    lint_copy_return || exit 1
     lint_status=0
     if lint_config_enabled mend; then
         local mend_status=0
@@ -4186,14 +4278,17 @@ run_lint_sequence() {
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
         local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE=""
+        lint_copy_begin
         while true; do
-            if invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
+            if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
                 break
             else
                 mend_status=$?
             fi
             LINT_MEND_WAIT=0
             if (( mend_status == LINT_LEFT_QUEUE_STATUS )); then
+                # mend left the queue before it ran, so the copy has no fix yet.
+                lint_copy_drop
                 local force_mac=1
                 if [[ "$LINT_MEMORY_JUDGMENT" == 1 ]]; then force_mac=0; fi
                 run_lint_held_sequence "$force_mac"
@@ -4203,6 +4298,7 @@ run_lint_sequence() {
                 fi
                 HOLD_LINT=0
                 rm -f "$HOLD_WAIT_DIR/lint-held"
+                lint_copy_begin
                 continue
             fi
             if (( mend_status == 137 || mend_status == 125 )); then
@@ -4220,6 +4316,8 @@ run_lint_sequence() {
         LINT_MEND_WAIT=0
         rm -f "$MEND_LOG"
         MEND_LOG=""
+        # The fmt scope below reads the worktree, so mend's fixes go back first.
+        lint_copy_return || exit 1
         [[ -n "$PKG" ]] || echo 'style-lint: mend passed'
     else
         lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
@@ -4243,7 +4341,9 @@ run_lint_sequence() {
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt start'
     fi
-    fmt_cargo "${FMT_SCOPE[@]}"
+    lint_copy_begin
+    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+    lint_copy_return || exit 1
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt passed'
     fi

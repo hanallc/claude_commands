@@ -18,7 +18,8 @@ class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
         _ = shell.write_text('''
 hold_before_repair() {
     case "$BASH_COMMAND" in
-        'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*)
+        'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*\
+            |'lint_rewrite invoke_mend --workspace --fix '*|'lint_rewrite invoke_clippy_fix --workspace '*)
             printf held > "$BUILD_HOLD_DIR/other"
             ;;
     esac

@@ -602,6 +602,7 @@ class UsableAdmissionConfiguration:
     cloud_gate_stale_pushes: int
     progress_profile_rank: int
     peak_history_share_percent: int
+    progress_profile_sweep_seconds: float
 
 
 @dataclass(frozen=True)
@@ -618,10 +619,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             cloud_gate_stale_pushes = settings.whole("cloud_gate_stale_pushes")
             progress_profile_rank = settings.whole("progress_profile_rank")
             peak_history_share_percent = settings.whole("peak_history_share_percent")
+            progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
-            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent)
+            cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
+            progress_profile_sweep_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -1898,9 +1901,19 @@ def ci_readings(readings: Iterable[StepMemory]) -> tuple[UnownedSliceMemory, ...
                  if isinstance(reading, UnownedSliceMemory) and not isinstance(reading.job_state, NotServiceSlice))
 
 
+def ci_cap_use(readings: Iterable[StepMemory]) -> int:
+    """Return the CI use that the queue cap counts: swap-backed use, as for queued builds.
+
+    The CI file cache is in available RAM already, so the cap does not count it twice.
+    A reading without its swap-backed use counts its working set.
+    """
+    return sum(reading.anonymous.bytes if isinstance(reading.anonymous, AnonymousRunUse) else reading.bytes
+               for reading in ci_readings(readings))
+
+
 def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | ReadingUnavailable:
     """Calculate room from the captured run and CI readings."""
-    ci_use = sum(reading.bytes for reading in ci_readings(step.measured for step in inputs.running))
+    ci_use = ci_cap_use(step.measured for step in inputs.running)
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 

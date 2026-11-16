@@ -282,8 +282,8 @@ A question filed with parts (`ask --ask`) shows each part as its own section:
 A question stored as one text, from before the parts form, shows in sections too:
 
 1. It uses `reviewed` when that field exists. Otherwise, it uses `question`.
-2. The title uses the first reviewed line or the first raw question sentence ending with `?`.
-3. The body excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
+2. The title uses the first reviewed line when that line contains `?`. Otherwise, it uses that line's first sentence. For raw text, the title uses the first sentence that ends with `?`.
+3. For reviewed text, the body starts with the rest of the first line and excludes the title. Context paragraphs remain separate, and `- ` lines form a list.
 4. A raw question stored on one line shows each context sentence as a separate paragraph.
 5. **Items** holds runs marked `1)` `2)`, `1.` `2.`, `(1)` `(2)` or `(a)` `(b)`, in order.
 6. **Choices** uses numbered choices or labeled choices after `Choices:` as radio items.
@@ -295,6 +295,9 @@ In all question text, each `http` or `https` address is a link that opens in the
 A right click can open it in a new tab.
 In all question text, a span in backticks shows as code, and an address in a code span is not a link.
 An item that is only one backtick span, such as a command, shows as a code block.
+A fenced block or a backtick-only line after an item ending with `:` stays inside that item.
+The code block gets no separate number in either the parts form or the one-text form.
+Numbers inside code do not affect the item numbers.
 The form of a new question is in `~/.claude/docs/question_template.md`.
 The answer box has the label **Your answer** and this help line: `A choice fills this. Edit it or write your own. Nothing sends until you press Answer.`
 Three buttons share one row below the box: **Answer**, **Followup** and **Skip**.
@@ -1004,3 +1007,32 @@ The status line watches `change_review.conf` and `review_links.conf` so folder a
 The alert guard uses only the configured folder.
 `REVIEW_LINKS_ROOT` overrides the delivery folder.
 The page, the footer and `/next` use these same folder readers.
+
+
+Changes, Questions, and Images share one motion helper.
+A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
+A new switch completes the active switch first.
+The first load and an update that keeps the same card do not fade.
+A new card above the viewport scrolls into view smoothly.
+Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
+Other image cards stay visible.
+An image fades before removal, and the cards below close the gap over 270ms.
+Reduced motion disables fades and uses instant scrolling.
+
+Question items and change rows show a Lucide copy button inside the top right of each code block.
+Both Changes views recognize fenced code blocks and lines that contain only one backtick span.
+This applies to How to check, Proof, Question, Feedback, and Answer.
+The shared renderer emits each code block with its button.
+Plain text uses `<p>` blocks without a box or a copy button.
+The paragraph style preserves line breaks, including a two-line check without code.
+The renderer removes blank lines at each text part's edges.
+Code blocks and paragraphs use the same 16px margin.
+Inline code keeps its current style.
+The button copies the code text without the button or its label.
+The button shows a check and the label “Copied” for two seconds after success.
+A second click starts the two seconds again.
+A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
+The shared script uses the clipboard API when available.
+Plain HTTP pages use a temporary textarea and `execCommand('copy')` when the clipboard API is absent.
+The fallback restores focus and the previous selection.
+One document listener also handles code blocks from page updates.

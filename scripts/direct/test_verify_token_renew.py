@@ -25,7 +25,7 @@ SCRIPTS = VERIFY.parent.parent
 
 
 def token_renewal_functions() -> str:
-    return shell_functions(VERIFY, "start_token_renewer", "stop_token_renewer", "with_token_renewal")
+    return shell_functions(VERIFY, "collect_child", "start_token_renewer", "stop_token_renewer", "with_token_renewal")
 
 
 def token_admission_functions() -> str:
