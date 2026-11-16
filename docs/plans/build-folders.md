@@ -177,6 +177,29 @@ Coordinate shared files through sdlc; phase ownership does not transfer file own
 | 9 | Test run folders; runs beside Phase 2 | devtools | 4 | bf1 |
 | **Total** | | | **64** | |
 
+### Schedule to the cutover (queue, 2026-11-15 22:33 EST)
+
+The dates are the earliest when each phase starts the hour the phase before it merges. A phase with no owner run has no real start yet.
+
+| Step | Owner unit | Kind | Start | ETA | Assigned |
+| --- | --- | --- | --- | --- | --- |
+| Phase 4 with slot limits (batch656, `e75b8ec06`) | queue | Code that merges | done 11-15 | merges Mon 11-16, after batch648 | yes |
+| Phase 5 — other repository callers | verify (`verify.sh`, mirrors), style (style callers), devtools (unit and recovery worktrees) | Code that merges | Mon 11-16 | Tue 11-17 evening | **no** |
+| Phase 6 — one-offs and review folders | devtools; queue, verify and report edit their B files | Code that merges | Tue 11-17 | Wed 11-18 midday | **no** |
+| Phase 7 — remaining fixtures and source test | devtools; each builds unit migrates its own fixtures | Code that merges, one dispatch for each owner and folder | Wed 11-18 | Thu 11-19 morning | **no** |
+| Phase 8 — stall watch and alarm-only sweep | resources (sweep and alarm), devtools (stall watch, folder audit) | Code that merges | Thu 11-19 | Thu 11-19 evening | **no** |
+| Gate folders delete | resources | One-time run on natedev: deletes each `~/worktrees/gates` folder whose lock has no holder | Thu 11-19 | Thu 11-19 | named here only; not in the resources plan |
+| `copies.root` delete | queue (owns `config/copies.conf`) | Code that merges | Thu 11-19, after the user's separate go | Thu 11-19 | yes; waits for the user's go |
+| Other config key delete | queue (owns `config/build_folders.conf`) | Code that merges: deletes `roots.scratch*`, `roots.copies*`, `prefixes.*` | after Phase 8 merges | Fri 11-20 at the earliest | yes, after Phase 8 |
+
+On `e75b8ec06`, code outside tests still reads each key the cutover deletes:
+
+1. `roots.scratch*` and `roots.copies*`: `scratch.py`, `copy_record.py`, `tmp_sweep.py`, `pre-tool-use-scratch-guard.py`, `shot_report/transcripts.py`. Phases 6 to 8 move them.
+2. `prefixes.*`: `build_folders.py`, `style/crate_run.py`, `style/style_footprint.py`, `step_estimator.py`, `aws_target/ledger.py`, `pre-tool-use-build-hold-guard.py`. Phases 5 and 7 move them.
+3. `copies.root`: no reader. `copies.gates_root()` returns the slot root since Phase 4. Only the user's separate go holds this delete.
+
+So the delete of `roots.scratch*`, `roots.copies*` and `prefixes.*` cannot run on Thu 11-19. The gate folders delete and the `copies.root` delete depend on Phase 4 alone. They stay on Thu 11-19.
+
 Run the phases in this order.
 Migrate adjacent fixtures with their callers during Phases 4–6.
 Phase 7 completes the fixture audit and closes alternate allocation paths.
