@@ -1222,7 +1222,8 @@ class PassedTreeLedger:
 
     @property
     def path(self) -> Path:
-        directory = Path(os.environ.get("GATE_PASSED_DIR", land_runs.DEFAULT_STATE_DIR)).expanduser()
+        selected = os.environ.get("GATE_PASSED_DIR")
+        directory = land_runs.default_state_dir() if selected is None else Path(selected).expanduser()
         return directory / "passed-trees.jsonl"
 
     def report_error(self, error: Exception) -> None:
@@ -1935,7 +1936,8 @@ class NoRecordedPush:
 
 
 def push_record_path(repo: Path, operation: str, source: str) -> Path:
-    directory = Path(os.environ.get("GATE_PASSED_DIR", land_runs.DEFAULT_STATE_DIR)).expanduser()
+    selected = os.environ.get("GATE_PASSED_DIR")
+    directory = land_runs.default_state_dir() if selected is None else Path(selected).expanduser()
     identity = json.dumps([str(repo.resolve()), operation, source]).encode()
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 

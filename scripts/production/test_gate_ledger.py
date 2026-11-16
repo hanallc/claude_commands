@@ -13,7 +13,7 @@ from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
-from scripts.production import gate
+from scripts.production import gate, land_runs
 from scripts.lib import build_folders
 from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
@@ -201,6 +201,18 @@ class MergeGateLedgerTests(MergeGateFixture):
         ledger = gate.PassedTreeLedger(self.checkout, "tests-only", gate.clean_test_tree(self.checkout),
                                             sorted(self.suites))
         with mock.patch.dict(os.environ, self.environment):
+            with mock.patch.dict(os.environ, {"HOME": str(self.state / "default-home")}):
+                old = Path.home() / ".local/state/merge-gate"
+                old.mkdir(parents=True)
+                _ = os.environ.pop("GATE_PASSED_DIR", None)
+                with self.assertRaises(land_runs.GateStateMoveRequired):
+                    _ = ledger.path
+                with self.assertRaises(land_runs.GateStateMoveRequired):
+                    _ = gate.push_record_path(self.checkout, "checkpoint", "fixture")
+                os.environ["GATE_PASSED_DIR"] = str(self.state / "explicit-passes")
+                self.assertEqual(ledger.path, self.state / "explicit-passes/passed-trees.jsonl")
+                self.assertEqual(gate.push_record_path(self.checkout, "checkpoint", "fixture").parent,
+                                 self.state / "explicit-passes/push-recovery")
             ledger.record_pass(FullSuite("no certified base"))
             original = self.pass_records()[0]
             _ = original.pop("kind")  # Older full certifications remain usable.
