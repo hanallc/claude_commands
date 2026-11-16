@@ -12,17 +12,20 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
 import time
-from typing import cast
+from typing import TextIO, cast
 
 from scripts.lib import process_start as process_identity
 
 from scripts.lib.boot_identity import boot_identity
 
 
+# verify.sh names each call v<UTC stamp>-<its pid>-<random>.
+CALL_ID_PID = re.compile(r"v\d{8}T\d{6}-(\d+)-\d+")
 KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 STATES = ("waiting_hold", "waiting_mac", "waiting_ssh", "on_ssh", "on_mac", "on_natedev", "local_noncompiling")
 # Each rule holds the argument name, requirement, default and choices.
@@ -383,7 +386,22 @@ def _decode(value: object, call_id: str) -> StepRecord:
                       mac_disk_exclusions=tuple(cast(list[str], row.get("mac_disk_exclusions", []))))
 
 
+def recorded_caller(value: object, call_id: str) -> tuple[int, str] | tuple[int, None] | None:
+    """Name the verify process that wrote a record: its pid and start, or only the pid in its call id.
+
+    A damaged record still names its pid in the call id, so a dead writer reads as stale.
+    """
+    if isinstance(value, dict):
+        row = cast(dict[str, object], value)
+        pid, start = row.get("pid"), row.get("proc_start")
+        if type(pid) is int and pid > 0 and isinstance(start, str) and start:
+            return pid, start
+    match = CALL_ID_PID.fullmatch(call_id)
+    return (int(match.group(1)), None) if match else None
+
+
 def read(call_id: str) -> ReadResult:
+    # Open the state before the record: cleanup removes the record first, so an open state keeps its last word.
     try:
         state_file = state_path(call_id).open()
     except FileNotFoundError:
@@ -391,41 +409,55 @@ def read(call_id: str) -> ReadResult:
     except (OSError, ValueError) as error:
         return UnreadableRecord(call_id, str(error))
     try:
-        try:
-            value = cast(object, json.loads(record_path(call_id).read_text()))
-        except FileNotFoundError:
-            return MissingRecord(call_id)
-        except (OSError, ValueError) as error:
-            return UnreadableRecord(call_id, str(error))
-        try:
-            if state_file is not None:
-                words = state_file.read().split()
-                updated = datetime.fromtimestamp(os.fstat(state_file.fileno()).st_mtime, timezone.utc).isoformat()
-                if not isinstance(value, dict):
-                    raise ValueError("record must be an object")
-                row = cast(dict[str, object], value)
-                value = row
-                if words and words[0] == "writes_tree":
-                    row["runs_on"] = {"kind": "natedev_only", "reason": "step writes the tree"}
-                    if row.get("pinned_target"):
-                        row["pinned_target"] = "natedev"
-                    words = words[1:]
-                word = words[0] if words else ""
-                selected = words[1] if len(words) > 1 else "mac" if word == "on_mac" else "natedev" if word == "on_natedev" else ""
-                row.update(state=word, selected_target=selected, updated=updated)
-            record = _decode(value, call_id)
-        except (OSError, ValueError, TypeError) as error:
-            return UnreadableRecord(call_id, str(error))
+        return _read_open(call_id, state_file)
     finally:
         if state_file is not None:
             state_file.close()
+
+
+def _read_open(call_id: str, state_file: TextIO | None) -> ReadResult:
     try:
-        start = process_start(record.pid)
-    except (FileNotFoundError, ProcessLookupError):
-        return StaleRecord(call_id)
-    except (OSError, IndexError) as error:
+        text = record_path(call_id).read_text()
+    except FileNotFoundError:
+        return MissingRecord(call_id)
+    except (OSError, ValueError) as error:
         return UnreadableRecord(call_id, str(error))
-    return record if start == record.proc_start else StaleRecord(call_id)
+    try:
+        value = cast(object, json.loads(text))
+    except ValueError as error:
+        value = error
+    caller = recorded_caller(value, call_id)
+    if caller is not None:
+        pid, recorded_start = caller
+        try:
+            start = process_start(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return StaleRecord(call_id)
+        except (OSError, IndexError) as error:
+            return UnreadableRecord(call_id, str(error))
+        if recorded_start is not None and start != recorded_start:
+            return StaleRecord(call_id)
+    if isinstance(value, ValueError):
+        return UnreadableRecord(call_id, str(value))
+    try:
+        if state_file is not None:
+            words = state_file.read().split()
+            updated = datetime.fromtimestamp(os.fstat(state_file.fileno()).st_mtime, timezone.utc).isoformat()
+            if not isinstance(value, dict):
+                raise ValueError("record must be an object")
+            row = cast(dict[str, object], value)
+            value = row
+            if words and words[0] == "writes_tree":
+                row["runs_on"] = {"kind": "natedev_only", "reason": "step writes the tree"}
+                if row.get("pinned_target"):
+                    row["pinned_target"] = "natedev"
+                words = words[1:]
+            word = words[0] if words else ""
+            selected = words[1] if len(words) > 1 else "mac" if word == "on_mac" else "natedev" if word == "on_natedev" else ""
+            row.update(state=word, selected_target=selected, updated=updated)
+        return _decode(value, call_id)
+    except (OSError, ValueError, TypeError) as error:
+        return UnreadableRecord(call_id, str(error))
 
 
 def live_records() -> list[StepRecord]:

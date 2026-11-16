@@ -56,6 +56,21 @@ def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
 UNCONFIGURED = berth_board.Board((), configured=False)
 
 
+def cargo_workspace_search(manifest: Path) -> list[Path]:
+    """The Cargo.toml files that cargo reads above a package to find its workspace.
+
+    Cargo starts above the package folder and stops at a folder that ends in
+    target/package. The test models the rule, because tests must not run real cargo.
+    """
+    found: list[Path] = []
+    for folder in manifest.parent.parents:
+        if folder.parts[-2:] == ("target", "package"):
+            break
+        if (folder / "Cargo.toml").exists():
+            found.append(folder / "Cargo.toml")
+    return found
+
+
 def unconfigured(_: Path) -> berth_board.Board:
     return UNCONFIGURED
 
@@ -413,7 +428,7 @@ class LocalCopyTests(unittest.TestCase):
 
     def test_held_fixes_are_written_and_others_withheld(self) -> None:
         made = self.copy()
-        self.assertEqual(made.folder, self.target / fix_return.COPY_NAME)
+        self.assertEqual(made.folder, self.target / "package" / fix_return.COPY_NAME)
         self.assertEqual(made.manifest, made.tree / "ws/Cargo.toml")
         self.assertEqual(made.target, self.target)
         for name in ("held", "foreign", "free"):
@@ -462,6 +477,15 @@ class LocalCopyTests(unittest.TestCase):
         self.assertEqual(made, fix_return.InPlace())
         self.assertFalse(self.target.exists())
 
+    def test_repository_with_no_berth_ledger_fixes_in_place(self) -> None:
+        missing = berth_board.BoardUnavailable("the cargo-berth ledger is not initialized", ledger_missing=True)
+        with (patch("scripts.mac_test.fix_return.shutil.which", return_value="/bin/cargo-berth"),
+              patch.object(berth_board, "read_board", return_value=missing)):
+            self.assertEqual(fix_return.read_board(self.worktree), UNCONFIGURED)
+            made = fix_return.make_copy(self.worktree, self.metadata, os.getpid())
+        self.assertEqual(made, fix_return.InPlace())
+        self.assertFalse(self.target.exists())
+
     def test_unavailable_board_fails(self) -> None:
         self.board = berth_board.BoardUnavailable("ledger unreadable")
         made = fix_return.make_copy(self.worktree, self.metadata, os.getpid(), self.read)
@@ -473,7 +497,7 @@ class LocalCopyTests(unittest.TestCase):
         self.assertIsInstance(made, fix_return.FixFailed)
 
     def stale_copy(self, owner: int) -> Path:
-        folder = self.target / fix_return.COPY_NAME
+        folder = fix_return.copy_parent(self.target) / fix_return.COPY_NAME
         folder.mkdir(parents=True)
         _ = (folder / fix_return.OWNER_NAME).write_text(str(owner))
         _ = (folder / "stale").write_text("left\n")
@@ -485,7 +509,7 @@ class LocalCopyTests(unittest.TestCase):
         self.addCleanup(live.kill)
         folder = self.stale_copy(live.pid)
         made = self.copy()
-        self.assertEqual(made.folder, self.target / f"{fix_return.COPY_NAME}-{os.getpid()}")
+        self.assertEqual(made.folder, fix_return.copy_parent(self.target) / f"{fix_return.COPY_NAME}-{os.getpid()}")
         self.assertTrue((folder / "stale").exists())
         _ = fix_return.return_copy(self.worktree, made.folder, self.read)
         self.assertFalse(made.folder.exists())
@@ -497,6 +521,22 @@ class LocalCopyTests(unittest.TestCase):
         made = self.copy()
         self.assertEqual(made.folder, folder)
         self.assertFalse((folder / "stale").exists())
+
+    def test_member_the_copy_excludes_never_finds_the_worktree_workspace(self) -> None:
+        clay = self.worktree / "ws/vendor/clay"
+        (clay / "src").mkdir(parents=True)
+        _ = (self.worktree / "ws/Cargo.toml").write_text('[workspace]\nexclude = ["vendor/clay"]\n')
+        _ = (clay / "Cargo.toml").write_text('[package]\nname = "clay"\n')
+        commit_all(self.worktree)
+        for target in (self.worktree / "ws/target", self.worktree / "ws/out"):
+            with self.subTest(target=target.name):
+                self.metadata = fix_return.CargoMetadata(
+                    workspace_root=str(self.worktree / "ws"), target_directory=str(target))
+                made = self.copy()
+                self.addCleanup(shutil.rmtree, made.folder, True)
+                outside = [manifest for manifest in cargo_workspace_search(made.tree / "ws/vendor/clay/Cargo.toml")
+                           if not manifest.is_relative_to(made.tree)]
+                self.assertEqual(outside, [])
 
 
 class ApplyFixTests(unittest.TestCase):

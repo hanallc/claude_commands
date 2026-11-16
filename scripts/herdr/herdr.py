@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 # herdr refuses a longer `agent start --timeout`.
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
+PANE_POLL_SECONDS = 0.1
 _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
@@ -1443,6 +1444,7 @@ def forget_pane_evidence(session: str, pane: str) -> None:
                     _ = run.shell_processes.pop(key, None)
     observed = _pane_observations.get()
     if observed is not None:
+        _ = observed.replies.pop((session, ("pane", "list")), None)
         _ = observed.replies.pop((session, ("pane", "process-info", "--pane", pane)), None)
 
 
@@ -1494,7 +1496,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise failure
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
         _ = self.run("pane", "run", pane, shlex.join(command))
 
     def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
@@ -1896,7 +1898,7 @@ class Herdr:
             remaining = end - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
         return True
 
     def producer_row_tab(self, row_id: str, title: str, workspace: str,
@@ -2458,7 +2460,7 @@ class Herdr:
                     if (error.code != "agent_pane_busy"
                             or deadline <= time.monotonic()):
                         raise
-                    time.sleep(operation_deadline.remaining(min(0.1, deadline - time.monotonic())))
+                    time.sleep(operation_deadline.remaining(min(PANE_POLL_SECONDS, deadline - time.monotonic())))
                     attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000),
                                              _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     continue
@@ -2714,7 +2716,7 @@ class Herdr:
                 return state
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(0.1, remaining))
+                time.sleep(min(PANE_POLL_SECONDS, remaining))
         return PromptInputTimedOut(screen)
 
     def composer(self, pane: str) -> ComposerInput | NoComposer:
@@ -2738,7 +2740,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return result
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
     def submit_opening_prompt(self, pane: str, opening: OpeningPrompt, launched_at: datetime,
                               timeout_ms: int) -> PromptSubmitOutcome:
@@ -2966,7 +2968,7 @@ class Herdr:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HerdrFailure(f"{pane}: agent did not return to its shell")
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
     def wait_turn_end(self, pane: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
         _timeout(timeout_ms)
@@ -3620,7 +3622,7 @@ def start_server(name: str, timeout_ms: int, *,
             pass
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            time.sleep(min(0.1, remaining))
+            time.sleep(min(PANE_POLL_SECONDS, remaining))
 
 
 def restore_server(name: str, timeout_ms: int, *,
@@ -3655,7 +3657,7 @@ def restore_server(name: str, timeout_ms: int, *,
                 return WindowServerCreated()
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(0.1, remaining))
+                time.sleep(min(PANE_POLL_SECONDS, remaining))
     except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
         print(f"herdr {name}: desktop start is incomplete: {error}", file=sys.stderr)
     print(f"herdr {name}: desktop server is pending", file=sys.stderr)

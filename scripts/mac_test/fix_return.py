@@ -304,10 +304,18 @@ BoardReader = Callable[[Path], berth_board.Board | berth_board.BoardUnavailable]
 
 
 def read_board(repo_root: Path) -> berth_board.Board | berth_board.BoardUnavailable:
-    """Read the reservations. A host without cargo-berth has an unconfigured board."""
+    """Read the reservations. A host without cargo-berth has an unconfigured board.
+
+    A repository with no cargo-berth ledger, such as a copies.py clone, also has
+    an unconfigured board. No reservation can hold a path there, so the fix pass
+    writes the worktree in place.
+    """
     if shutil.which("cargo-berth") is None:
         return berth_board.Board((), configured=False)
-    return berth_board.read_board(repo_root)
+    board = berth_board.read_board(repo_root)
+    if isinstance(board, berth_board.BoardUnavailable) and board.ledger_missing:
+        return berth_board.Board((), configured=False)
+    return board
 
 
 def hold_filter(repo_root: Path, changes: MirrorChanges,
@@ -407,7 +415,7 @@ class CopyMade:
 
 @dataclass(frozen=True)
 class InPlace:
-    """cargo-berth does not configure the repository, so the fix pass writes the worktree."""
+    """cargo-berth does not configure the repository, or it has no ledger, so the fix pass writes the worktree."""
 
 
 def listed_files(repo_root: Path) -> list[str]:
@@ -456,18 +464,29 @@ def owner_alive(folder: Path, owner: int) -> bool:
     return True
 
 
-def claim_folder(target: Path, owner: int) -> Path:
-    """Take the copy folder in the cargo target folder.
+def copy_parent(target: Path) -> Path:
+    """The folder for the copies: a folder in the cargo target folder that ends in target/package.
+
+    Cargo looks up the folders for the workspace of a package, and it stops at a
+    folder that ends in target/package, where `cargo package` checks its copies.
+    Without that stop, a package that the copy's workspace excludes finds the
+    worktree's own Cargo.toml, and cargo refuses it as a member that is not listed.
+    """
+    return (target if target.name == "target" else target / "target") / "package"
+
+
+def claim_folder(parent: Path, owner: int) -> Path:
+    """Take the copy folder in parent.
 
     The name is the same in each run, so cargo finds the copy's earlier build
     of the workspace members fresh. A folder that a stopped run left is
     deleted. A folder that a live run owns gives a name with this owner.
     """
-    target.mkdir(parents=True, exist_ok=True)
-    staged = target / f".{COPY_NAME}-{owner}.new"
+    parent.mkdir(parents=True, exist_ok=True)
+    staged = parent / f".{COPY_NAME}-{owner}.new"
     shutil.rmtree(staged, ignore_errors=True)
     for name in (COPY_NAME, f"{COPY_NAME}-{owner}"):
-        folder = target / name
+        folder = parent / name
         if folder.exists() and not owner_alive(folder, owner):
             shutil.rmtree(folder)
         staged.mkdir()
@@ -478,7 +497,7 @@ def claim_folder(target: Path, owner: int) -> Path:
             shutil.rmtree(staged, ignore_errors=True)
             continue
         return folder
-    raise OSError(f"{target / COPY_NAME} is in use by another lint run")
+    raise OSError(f"{parent / COPY_NAME} is in use by another lint run")
 
 
 def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
@@ -494,7 +513,7 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
     if not workspace.is_relative_to(root):
         return FixFailed(f"the cargo workspace {workspace} is not inside {root}")
     try:
-        folder = claim_folder(Path(metadata["target_directory"]), owner)
+        folder = claim_folder(copy_parent(Path(metadata["target_directory"])), owner)
     except OSError as error:
         return FixFailed(str(error))
     tree = folder / TREE_NAME

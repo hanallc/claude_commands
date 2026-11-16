@@ -1,35 +1,25 @@
-/** Complete activity counts for one role. */
-export interface RoleSessionCounts {
-  busy: number;
-  idle: number;
-  paused: number;
-  exited: number;
-  total: number;
+import type { BoardLine } from '../hooks/lines';
+
+/** One board column, as `accounts.py status --json` writes it. */
+export interface AccountsBoardColumn {
+  key: string;
+  heading: string;
+  align: 'left' | 'right';
 }
-/** Older status producers also wrote starting and waiting counts, which are busy. */
-export interface StoredRoleSessionCounts extends RoleSessionCounts {
-  starting?: number;
-  waiting?: number;
+/** The cells of one table line, and the same facts for a pane too narrow for the table. */
+export interface AccountsBoardRow {
+  cells: Record<string, BoardLine>;
+  facts: BoardLine[];
 }
-export interface StoredAccount {
-  label: string;
-  tool: 'claude' | 'codex';
-  roles: string[];
-  selected_roles?: string[];
-  /** Combined counts in roles order; spare has no count. Only units and showrunners count exited members. */
-  role_counts: (StoredRoleSessionCounts | null)[];
-  /** Local and fresh peer counts, keyed by machine and role. */
-  role_counts_by_machine?: Record<string, Record<string, StoredRoleSessionCounts>>;
-  weekly_left_percent: number | null;
-  resets_at: string | null;
-  credits: number | 'unlimited' | null;
-  use_credits: boolean;
-  read_at: string | null;
-  read_ok?: boolean;
-  credits_in_use?: boolean;
+/** The board rows come from `accounts.status_board()`; the plugin only draws them. */
+export interface AccountsBoard {
+  columns: AccountsBoardColumn[];
+  rows: AccountsBoardRow[];
+  /** The reset text holds for one local day; the pane reads the board again from this ISO time. */
+  stale_at: string;
 }
 export interface StoredAccountsStatus {
-  accounts: StoredAccount[];
+  board: AccountsBoard;
   problems: string[];
   session_inputs?: string[];
   upcoming_moves?: string[];

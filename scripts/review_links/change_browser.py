@@ -230,7 +230,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
                   + f'data-pending="{str(change.waiting).lower()}"')
     if isinstance(page, UnavailableProduction):
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2>{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+<h2>Proof</h2>{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p>
 {change_page.change_details(row, shown)}'''
     else:
@@ -240,7 +240,7 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
         saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
-{change_page.review_text_html(row.get(change_review.CHECK, ''), "pre")}
+{change_page.review_html(row.get(change_review.CHECK, ''))}
 {anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
 {change_page.change_details(row, shown)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
@@ -253,8 +253,6 @@ ITEM_MARKS = (re.compile(r"(?<![\w(])(\d+)\)\s"), re.compile(r"\((\d+)\)\s"), re
               re.compile(r"\(([a-z])\)\s"))
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 BLANK_LINE = re.compile(r"\n\s*\n")
-ITEM_CODE = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
-                       + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
 CHOICE_LABEL_PATTERN = r'''(?:'[^'\n]+'|"[^"\n]+"|[^'"\n:.!?;]{1,60}?)(?:\s+\(recommended\))?:\s+'''
 CHOICE_LABEL = re.compile(CHOICE_LABEL_PATTERN, re.IGNORECASE)
 INLINE_CHOICE = re.compile(r"(?:^|(?<=[.!?;])\s+)" + CHOICE_LABEL_PATTERN, re.IGNORECASE)
@@ -270,7 +268,7 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
     Return the text before the run, the items and the text after a blank line in the last item."""
     best: list[re.Match[str]] = []
-    code_blocks = list(ITEM_CODE.finditer(text))
+    code_blocks = list(page_frame.CODE_BLOCK.finditer(text))
     for style in ITEM_MARKS:
         run: list[re.Match[str]] = []
         for mark in style.finditer(text):
@@ -288,7 +286,7 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
     ends = [mark.start() for mark in best[1:]] + [len(text)]
     items = [text[mark.end():end].strip() for mark, end in zip(best, ends)]
     last = items[-1]
-    blocks = list(ITEM_CODE.finditer(last))
+    blocks = list(page_frame.CODE_BLOCK.finditer(last))
     trailing = ""
     for blank in BLANK_LINE.finditer(last):
         if any(block.start() <= blank.start() < block.end()
@@ -301,11 +299,10 @@ def numbered_run(text: str) -> tuple[str, list[str], str]:
 
 def item_html(entry: str) -> str:
     """Show a code block alone or after an item's text that ends with a colon."""
-    whole = ITEM_CODE.fullmatch(entry.strip())
+    whole = page_frame.CODE_BLOCK.fullmatch(entry.strip())
     if whole is not None:
-        return ('<div class="code-block"><pre><code>' + html.escape(whole[1] if whole[1] is not None else whole[2])
-                + '</code></pre>' + page_frame.COPY_BUTTON + '</div>')
-    for block in ITEM_CODE.finditer(entry):
+        return page_frame.code_block_html(whole)
+    for block in page_frame.CODE_BLOCK.finditer(entry):
         before, after = entry[:block.start()].rstrip(), entry[block.end():].strip()
         if before.endswith(":"):
             return item_html(before) + item_html(block[0]) + (item_html(after) if after else "")
@@ -315,7 +312,7 @@ def item_html(entry: str) -> str:
 def item_list(items: list[str]) -> str:
     entries: list[str] = []
     for entry in items:
-        if entries and entries[-1].rstrip().endswith(":") and ITEM_CODE.fullmatch(entry.strip()) is not None:
+        if entries and entries[-1].rstrip().endswith(":") and page_frame.CODE_BLOCK.fullmatch(entry.strip()) is not None:
             entries[-1] += "\n" + entry
         else:
             entries.append(entry)
@@ -684,11 +681,11 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
 const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
 let rows,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
-let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0, refreshTimer;
+let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=0, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';
 function bindPage(){
  rows=[...content.querySelectorAll('section[data-key]')];
@@ -789,7 +786,7 @@ async function save(row,form,outcome){
  }finally{
   form.dataset.saving='false';activeSaves--;
   // Read after the save, so an older response cannot restore the saved item.
-  if(saved){await motion.settled();heldPage=null;newestRequest++;refreshPage(true);}
+  if(saved){await motion.settled();heldPage=null;newestRequest++;pageRefresh.refresh(true);}
   else applyHeldPage();
  }
 }
@@ -823,12 +820,10 @@ function applyHeldPage(){
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
  const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}
- window.scrollTo({left,top,behavior:'instant'});scheduleRefresh();
+ window.scrollTo({left,top,behavior:'instant'});pageRefresh.restart();
 }
-// A console frame that another page covers is hidden and loads no update.
-const paused=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
 async function refreshPage(supersede=false){
- if(paused() || (activeLoads && !supersede)) return;
+ if(activeLoads && !supersede) return;
  const request=++newestRequest;
  activeLoads++;
  try{
@@ -840,15 +835,10 @@ async function refreshPage(supersede=false){
  }catch(error){}
  finally{activeLoads--;}
 }
-function scheduleRefresh(){
- clearInterval(refreshTimer);
- if(document.visibilityState==='visible') refreshTimer=setInterval(refreshPage,Number(content.dataset.refreshSeconds)*1000);
-}
+const pageRefresh=createPageRefresh(refreshPage,()=>content.dataset.refreshSeconds);
 document.addEventListener('input',()=>applyHeldPage());
-document.addEventListener('visibilitychange',()=>{scheduleRefresh();if(document.visibilityState==='visible') refreshPage(true);});
-window.addEventListener('message',event=>{if(event.source===parent && event.origin===location.origin && event.data==='console-shown') refreshPage(true);});
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash){navigation++;clearNotice();}show();});
-bindPage();show();scheduleRefresh();
+bindPage();show();
 '''
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE
                                           + page_frame.COPY_SCRIPT + page_frame.COPY_STYLE + page_frame.COPY_BUTTON)

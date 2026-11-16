@@ -11,8 +11,10 @@ import subprocess
 import sys
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stderr
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from datetime import datetime
+from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
@@ -20,6 +22,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import refusals
+from scripts.agents import worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
@@ -322,7 +325,8 @@ class TurnEndTests(unittest.TestCase):
             self.assertNotEqual(*completions)
 
     def test_a_director_or_an_idle_worker_hook_changes_no_pass(self) -> None:
-        row = self.case.opened().row
+        opened = self.case.opened()
+        row = opened.row
         before = (self.case.run_dir / "progress_history_state.json").read_bytes()
         log = self.case.fixture.root / "state/herdr/turn-end-ignored.jsonl"
         for identity, name, reason in (
@@ -340,6 +344,8 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
         self.assertEqual(self.case.agent.notices, [])
         self.assertEqual(self.case.agent.submitted, [])
+        self.assertNotIn(opened.pane, self.case.fixture.world.locations)
+        self.assertEqual(self.case.fixture.world.closed, [(opened.pane, opened.terminal)])
 
         for cause, event, closes in (
                 ("empty delivery", turn_end.EventKind.TURN_END, True),
@@ -429,6 +435,61 @@ class TurnEndTests(unittest.TestCase):
             self.case.fixture.world.processes[pid] = process
             self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(process.current_identity))), turn_end.TurnOutcome.IGNORED)
             self.assertIn(consultation.pane, self.case.fixture.world.locations)
+
+    def test_ready_hook_waits_from_publication_through_dispatch(self) -> None:
+        for family in ("codex", "claude"):
+            with self.subTest(family=family), ThreadPoolExecutor(max_workers=1) as hooks:
+                _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
+                name = "launching-" + family
+                launcher = current_thread()
+                hook_started = Event()
+                pending: list[Future[turn_end.TurnOutcome]] = []
+                publication_checked = False
+                acquire = worker_panes.worker_lock
+                bind = worker_panes.WorkerLockHold.bind
+                guard = LauncherHangGuard("hook before fixed-id binding")
+                closed = self.case.fixture.world.closed.copy()
+
+                @contextmanager
+                def acquire_lock(parent: staff.StaffId, name: staff.WorkerName, *, blocking: bool = False,
+                                 deadline: float = worker_lifecycle.NO_LOCK_DEADLINE
+                                 ) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+                    if current_thread() is not launcher:
+                        hook_started.set()
+                    with acquire(parent, name, blocking=blocking, deadline=deadline) as hold:
+                        yield hold
+
+                def before_bind(hold: worker_panes.WorkerLockHold, row: staff.StaffRow, *,
+                                deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+                    nonlocal publication_checked
+                    if current_thread() is launcher and not publication_checked:
+                        publication_checked = True
+                        self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir), {})
+                        with acquire(hold.parent, hold.name) as competing:
+                            self.assertIsInstance(competing, worker_panes.Kept)
+                        pending.append(hooks.submit(turn_end.handle,
+                            turn_end.WorkerEvent(str(row.current_session), reply="ready")))
+                        self.assertTrue(hook_started.wait(guard.remaining()))
+                        self.assertFalse(pending[0].done())
+                    bind(hold, row, deadline=deadline)
+
+                def during_prompt() -> None:
+                    self.assertEqual(len(pending), 1)
+                    self.assertFalse(pending[0].done())
+                    self.assertEqual(self.case.fixture.world.closed, closed)
+
+                self.case.agent.finish_after = 100
+                with (patch.object(worker_panes, "worker_lock", acquire_lock),
+                      patch.object(worker_panes.WorkerLockHold, "bind", before_bind),
+                      patch.object(self.case.agent, "during_prompt", during_prompt)):
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(pending[0].result(timeout=guard.remaining()), turn_end.TurnOutcome.IGNORED)
+                pane = self.case.agent.submitted[-1][0]
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(self.case.fixture.world.closed, closed)
+                self.case.agent.complete(pane)
+                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                self.assertEqual(self.case.fixture.world.closed, [*closed, (pane, "terminal-" + pane)])
 
     def test_both_completion_events_apply_the_finished_run_exception(self) -> None:
         cases = [(event, reply_state) for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED)
